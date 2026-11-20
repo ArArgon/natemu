@@ -1,10 +1,14 @@
-# CPython regression test modules the i386 image runs, one test each (py-MODULE): integers, floats and their
-# formatting, threads, signals, processes, memory mappings.
+# CPython regression test modules the i386 image runs, one test each: integers, floats and their formatting, threads,
+# signals, processes, memory mappings. A line is `MODULE [regrtest options]` (the test py-MODULE) or `NAME: MODULE
+# [options]` (the test py-NAME). test_math and test_cmath run without the cases that meet natemu's x87 deviation
+# (libm for large arguments; the suite's expected failures), which run alone as test_math-files and test_cmath-values.
 test_int
 test_long
 test_float
-test_math
-test_cmath
+test_math -i test_mtestfile -i test_testfile
+test_math-files: test_math -m test_mtestfile -m test_testfile
+test_cmath -i test_specific_values
+test_cmath-values: test_cmath -m test_specific_values
 test_struct
 test_array
 test_thread

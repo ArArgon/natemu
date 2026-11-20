@@ -17,7 +17,7 @@ several hundred MiB: it stays in DIR, which the framework deletes after a pass.
 the initrd as run_boot_smoke.py's i386 case does), so the stream mixes 64-bit and 32-bit requests. NEW answers them all,
 in the recorded order, from one process; OLD answers only the 64-bit ones, since the compiler on `main` refuses 32-bit
 code until M2 merges (then OLD can answer them too: drop the filter). So the check also shows that a 64-bit reply does
-not depend on 32-bit requests answered before it by the same compiler process. No 32-bit request in the stream fails."""
+not depend on 32-bit requests answered before it by the same compiler process. The program must print its `natemu-i386-ok`, and a stream without a 32-bit request fails."""
 import argparse, os, pathlib, struct, subprocess, sys
 
 MARKER = 'natemu-replay-recorded'
@@ -50,6 +50,8 @@ def record(a):
     serial = (a.out / 'record.serial').read_text(errors='replace') if (a.out / 'record.serial').exists() else ''
     if r.returncode or not any(line.strip() == MARKER for line in serial.splitlines()):
         sys.exit(f'recording boot failed: exit {r.returncode}, {r.stderr.strip()[-400:]}')
+    if a.program32 and not any(line.strip() == 'natemu-i386-ok' for line in serial.splitlines()):
+        sys.exit('recording boot: the 32-bit program did not print natemu-i386-ok')
     return stream
 
 

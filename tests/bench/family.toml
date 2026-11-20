@@ -36,67 +36,67 @@ argv = ["python3", "tools/bench/boot.py", "--out", "{out}", "--name", "boot", "-
         "--kernel", "{kernel}"]
 
 [suite.cases.guest-build]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "build", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "build", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-zstd]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "natemu", "--vcpus", "1", "--bench", "zstd",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-hackbench]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "hackbench",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-locks]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "locks", "--emu", "natemu", "--vcpus", "1", "--bench", "locks",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "locks", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "locks",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-luajit]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "luajit",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-luajit-interp]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-interp", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit-interp",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-interp", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "luajit-interp",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-mem]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "mem", "--emu", "natemu", "--vcpus", "1", "--bench", "mem",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "mem", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "mem",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-cray]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray", "--emu", "natemu", "--vcpus", "1", "--bench", "cray",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-cray-strict]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-strict", "--emu", "natemu", "--vcpus", "1", "--bench", "cray-strict",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-strict", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray-strict",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-7zip]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "7zip", "--emu", "natemu", "--vcpus", "1", "--bench", "7zip",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "7zip", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "7zip",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-sqlite]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "sqlite",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-avx]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--emu", "natemu", "--vcpus", "1", "--bench", "avx",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "avx",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
 [suite.cases.guest-zstd-qemu]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "zstd",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
 
 # The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tests/bench/run_m1_perf.py): natemu at

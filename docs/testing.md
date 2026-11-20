@@ -278,6 +278,10 @@ tools/natemu-test run --tier bench                    # every benchmark, each al
 tools/natemu-test run --tier bench -k guest-zstd      # one
 ```
 
+`TESTKIT_BENCH_AT=REV tools/natemu-test run --tier bench ...` measures natemu and its compiler as committed at REV
+instead of the checkout's (built from `git archive`, cached), with the same cases, kernel and image: a baseline for
+the same round. `TESTKIT_BENCH_VCPUS=4` runs the guest benchmarks at 4 vCPUs (default 1).
+
 `tests/bench` wraps the existing `tools/bench` scripts unchanged: the micro-benchmarks against QEMU, the SMP tools, Linux
 boot times, and the guest benchmarks of [benchmarks](benchmarks.md) (12 programs at 1 vCPU, and `zstd` on QEMU for
 comparison). Each takes the whole machine. Numbers are written per machine, to
@@ -370,7 +374,10 @@ for the kernel selftests' `*_32` programs. The answers are files in the repo: ea
 To record them after changing a program or the recipe, run the suite with `TESTKIT_SEED_ANSWERS=1
 NATEMU_X86_HOST=user@host` (an x86-64 Linux machine with `zstd`, `cpio` and passwordless `sudo`): each part then runs
 there instead of under natemu, in the image's own root (`chroot`), and the verdict writes the answer files; commit
-them with the change. Such a run reports every test as unverified, never as passed.
+them with the change. Such a run reports every test as unverified, never as passed. For `torture32`, delete
+`torture32.txt` first and seed twice: a program whose output hash differs between the two runs (it prints an address)
+is recorded as `rc *` and compared by exit status alone, so seeding over an old file would mark changed programs that
+way too.
 
 A recipe may also write `<suite>-boot.txt`, one `PART [kernel=FILE] WORD...` line per part: the kernel that part boots
 (a file it built into the image folder, instead of the stock Debian kernel) and words added to its kernel command line.
