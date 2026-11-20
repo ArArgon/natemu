@@ -1,9 +1,9 @@
 # M2 task D: the `natemu` stub's reports (docs/restructure/m2-32bit-design.md, "Order of work" D): a stop, a guest spin
 # ended by the watchdog and a vCPU stuck waiting in the host each print the vCPU's report, and SIGINFO inspects a running
-# VM without stopping it. Each case boots a minimal bzImage built by tests/diag/diag.py (no inputs, no reference).
+# VM without stopping it. Each case boots a minimal bzImage built by tests/diag/run_diag.py (no inputs, no reference).
 [family]
 name = "diag"
-covers = ["crates/host/src/execution/diag.rs", "crates/host/src/execution.rs", "crates/host/src/linux.rs", "crates/cli/**", "tests/diag/**"]
+covers = ["crates/host/src/execution/diag.rs", "crates/host/src/execution.rs", "crates/host/src/linux.rs", "crates/cli/**", "tests/diag/**", "tests/lib/**"]
 
 [[suite]]
 name = "diag"
@@ -13,13 +13,13 @@ params = { timeout = 300 }
 needs = { cores = 1 }
 
 [suite.cases."unsupported"]
-argv = ["tests/diag/diag.py", "--case", "unsupported", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/diag/run_diag.py", "--case", "unsupported", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 smoke = true
 
 [suite.cases."spin"]
-argv = ["tests/diag/diag.py", "--case", "spin", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/diag/run_diag.py", "--case", "spin", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 smoke = true
 
 [suite.cases."host-wait"]
-argv = ["tests/diag/diag.py", "--case", "host-wait", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/diag/run_diag.py", "--case", "host-wait", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 smoke = true
