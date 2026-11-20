@@ -154,13 +154,11 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         let last = va.wrapping_add(size - 1);
         if alignment_check(&s.cpu) != 0
             && va & (size - 1) != 0
-            && paging::canonical(va)
-            && paging::canonical(last)
-            && last >= va
+            && !segments::outside(&s.cpu, va, size)
         {
             return Err(AC0);
         }
-        let gpa = segments::pages(s, va, size, true, false, GP0)?;
+        let gpa = segments::pages(s, va, size, true, false, GP0)?; // (ES: no override)
         if !super::mmio::ram(gpa[0]) || ((last ^ va) >> 12 != 0 && !super::mmio::ram(gpa[1])) {
             super::mmio::system_access(s)
         }
@@ -183,7 +181,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         }
         super::watch::access(s, va, size, true);
     } else {
-        segments::linear(s, va, element, false, false, GP0)?;
+        segments::linear(s, va, element, false, false, segments::noncanonical(&i))?;
         power = access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes)))).1;
     }
     super::watch::port(s, port, size);

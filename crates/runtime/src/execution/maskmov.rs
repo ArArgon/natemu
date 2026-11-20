@@ -79,9 +79,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if mmx
         && alignment_check(&s.cpu) != 0
         && at & 7 != 0
-        && paging::canonical(at)
-        && paging::canonical(at.wrapping_add(7))
-        && at <= at.wrapping_add(7)
+        && !super::segments::outside(&s.cpu, at, 8)
     {
         return Err([17, 0, 0]);
     }

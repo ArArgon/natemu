@@ -5,8 +5,8 @@
 ;  4 PUSH/POP of segment registers (DS to ES, GS to FS) and a load through FS
 ;  5 PUSHAD/POPAD, ARPL, BOUND within bounds, LDS
 ;  6 x87: FILD, FSQRT, FIMUL, FISTP (sqrt(2) * 10^6 rounds to 1414214), FNSAVE/FRSTOR
-;  7 BOUND out of bounds (#BR), INTO with OF set (#OF): SIGSEGV each; the handler moves EIP 2 bytes on (past BOUND,
-;    past the NOP after INTO) and returns through sigreturn
+;  7 BOUND out of bounds (#BR), INTO with OF set (#OF): SIGSEGV each, the saved EIP that of BOUND (a fault) and the
+;    one after INTO (a trap); the handler moves EIP 2 bytes on (past BOUND, past the NOP after INTO), through sigreturn
 ;  8 AAM 0 (#DE): SIGFPE, the same
 ;  9 SIGUSR1 from kill(getpid()): its handler runs, sigreturn back
 ; 10 CALL far through m16:32 to the program's own code segment, RET far
@@ -160,12 +160,16 @@ start:
     fail_unless z, 7
     mov eax, 50
     mov ebx, bounds
+    mov dword [expect], .bound
+.bound:
     bound eax, [ebx]
     cmp dword [skipped], 1
     fail_unless e, 7
     mov eax, 0x7fffffff
     add eax, 1
+    mov dword [expect], .into_next
     into
+.into_next:
     nop
     nop
     cmp dword [skipped], 2
@@ -176,6 +180,8 @@ start:
     xor edx, edx
     int 0x80
     mov eax, 0x1234
+    mov dword [expect], .aam
+.aam:
     aam 0
     cmp dword [skipped], 3
     fail_unless e, 8
@@ -213,9 +219,13 @@ exit:
     int 0x80
 
 ; Old-style handlers (sigaction, not SA_SIGINFO): [esp+4] the signal, the sigcontext from [esp+8]; its EIP at +56.
-skip:
-    add dword [esp + 8 + 56], 2
+skip:                                          ; counted only when the saved EIP is the expected one: the
+    mov eax, [esp + 8 + 56]                    ; instruction for the faults #BR and #DE, the one after INTO for the
+    cmp eax, [expect]                          ; trap #OF
+    jne .wrong
     inc dword [skipped]
+.wrong:
+    add dword [esp + 8 + 56], 2
     ret
 usr1:
     mov eax, [esp + 4]
@@ -248,6 +258,7 @@ far_code: dd far_target
 action: dd 0, 0, SA_RESTORER, restorer         ; handler, mask, flags, restorer
 sysinfo: dd 0
 skipped: dd 0
+expect: dd 0
 usr1_seen: dd 0
 result: dd 0
 align 16, db 0
