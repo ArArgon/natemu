@@ -1500,7 +1500,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
     Positive programs (1, 2 and 4 vCPUs) and fault cases against QEMU system mode (registers, captured memory, fault);
     every fault case's outcome (fault (vector, error, RIP, CR2) or completion) must be one segment_model permits, for
     natemu and for QEMU (unless listed in QEMU_DIFFERS); registers and memory are compared where both took the same one.
-    Refused cases (compatibility-mode CS, call gate) stop `unsupported_mode`/`unsupported_system` at the
+    Refused cases (compatibility-mode CS, call gate) stop `unsupported_code_mode`/`unsupported_system` at the
     instruction; QEMU is not run for them. The LTR race (natemu only) runs 10 times per block size: exactly one vCPU
     loads TR, every other takes #GP(0x70) at its LTR."""
     import segments
@@ -1523,7 +1523,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
             report.append(entry)
             continue
         if model and model['outcome'] == 'refused':
-            want_stop = prog['params'].get('stop') or ('unsupported_mode' if model['reason'].startswith('compatibility') else 'unsupported_system')
+            want_stop = prog['params'].get('stop') or ('unsupported_code_mode' if model['reason'].startswith('compatibility') else 'unsupported_system')
             for limit in ([], [1]):
                 rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
                 cpu = out and out['cpus'][0]

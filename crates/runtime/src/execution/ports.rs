@@ -144,8 +144,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     let reg = if i.kind == system::INS { 7 } else { 6 };
     let offset = c.gpr[reg] & wide;
     let base = match i.segment as usize {
-        SREG_FS => c.fs_base,
-        SREG_GS => c.gs_base,
+        sreg @ (SREG_FS | SREG_GS) => c.seg[sreg].base,
         _ => 0,
     };
     let va = offset.wrapping_add(base);

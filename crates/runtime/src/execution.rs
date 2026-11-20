@@ -110,6 +110,17 @@ fn halt(s: &State, reason: u64) -> ! {
     stop(SUCCESS, reason)
 }
 
+/// The bank's walk controls ([`Cpu::paging`]) while its code segment is a 64-bit one ([`Cpu::code_mode`]), the only
+/// mode that runs yet (M2 task 1 split the two checks; 32-bit code is a later task): else it stops, `unsupported_mode`
+/// for the paging mode or CPL, `unsupported_code_mode` for the code segment.
+fn controls(s: &State) -> paging::Control {
+    match (s.cpu.paging(), s.cpu.code_mode()) {
+        (Some(c), Some(CodeMode::Bits64)) => c,
+        (None, _) => halt(s, stop::UNSUPPORTED_MODE),
+        _ => halt(s, stop::UNSUPPORTED_CODE_MODE),
+    }
+}
+
 pub unsafe fn start() -> ! {
     crate::perf::start();
     #[cfg(feature = "page-study")]
@@ -119,14 +130,20 @@ pub unsafe fn start() -> ! {
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     fp::reset();
     let mut s = unsafe { load() };
+    let code64 = s.cpu.code_mode() == Some(CodeMode::Bits64);
     if !guest_state_alias_valid(cache::control().guest_state_va)
-        || s.cpu.control().is_none()
+        || s.cpu.paging().is_none()
+        || !code64
         || s.request != NONE
         || s.vcpu >= s.vcpus
         || s.vcpus as usize > cache::MAX_VCPUS
     {
-        // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
-        s.stop = stop::UNSUPPORTED_MODE;
+        // Before anything is shadowed or marked (and before the vCPU number is known to be valid). As [`controls`].
+        s.stop = if s.cpu.paging().is_some() && !code64 {
+            stop::UNSUPPORTED_CODE_MODE
+        } else {
+            stop::UNSUPPORTED_MODE
+        };
         unsafe { write_record(record(), &s) };
         stop(SUCCESS, s.stop)
     }
@@ -1545,9 +1562,7 @@ fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
 /// now (a step's source block is abandoned, and the linker checks that its source is not dead after finding the
 /// target), so an A write into a page holding translations just invalidates it ([`cache::written`]).
 fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
-    let Some(control) = s.cpu.control() else {
-        halt(s, stop::UNSUPPORTED_MODE)
-    };
+    let control = controls(s);
     loop {
         let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
         match paging::walk(
@@ -1923,8 +1938,8 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(value) };
     }
     for (at, base) in [
-        (frame::FS_BASE, s.cpu.fs_base),
-        (frame::GS_BASE, s.cpu.gs_base),
+        (frame::FS_BASE, s.cpu.seg[SREG_FS].base),
+        (frame::GS_BASE, s.cpu.seg[SREG_GS].base),
     ] {
         // SAFETY: as above; the fields are 8-byte aligned (abi `guest_state_page_layout`).
         unsafe {
@@ -2998,8 +3013,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 }
                 let v = match index {
                     cpu::MSR_EFER => c.efer,
-                    cpu::MSR_FS_BASE => c.fs_base,
-                    cpu::MSR_GS_BASE => c.gs_base,
+                    cpu::MSR_FS_BASE => c.seg[SREG_FS].base,
+                    cpu::MSR_GS_BASE => c.seg[SREG_GS].base,
                     cpu::MSR_TSC => tsc(),
                     _ => msr_get(at),
                 };
@@ -3013,8 +3028,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 match index {
                     cpu::MSR_EFER => s.cpu.efer = v & !EFER_LMA | c.efer & EFER_LMA, // LMA writes are ignored
                     // The bank's bases, which every block entry writes into the guest-state page (I7): no flush.
-                    cpu::MSR_FS_BASE => s.cpu.fs_base = v,
-                    cpu::MSR_GS_BASE => s.cpu.gs_base = v,
+                    cpu::MSR_FS_BASE => s.cpu.seg[SREG_FS].base = v,
+                    cpu::MSR_GS_BASE => s.cpu.seg[SREG_GS].base = v,
                     cpu::MSR_TSC => msr_set(at, v.wrapping_sub(tsc().wrapping_sub(msr_get(at)))),
                     cpu::MSR_MISC_ENABLE => msr_set(at, cpu::misc_enable_after_write(v)),
                     // EN/EXTD and the base select the LAPIC's mode and page (X3: its transitions, [`lapic::set_base`]).
@@ -3053,9 +3068,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
 /// Ends a system transaction: RIP past the instruction (it completed: RF ends, except the RF an IRET just loaded); with
 /// `flush_all`, a global TLB flush ([`tlb`]: shadows go, translations stay).
 fn commit(s: &mut State, i: System, flush_all: bool) {
-    if s.cpu.control().is_none() {
-        halt(s, stop::UNSUPPORTED_MODE)
-    }
+    controls(s);
     if i.kind != system::IRET {
         completed(s);
     } else {
@@ -3102,14 +3115,13 @@ fn tsc() -> u64 {
 /// or reset: blocks are keyed by CPL ([`Cpu::code_context`]: a fetch's U/S and SMEP checks were made at the CPL it was
 /// translated at), and shadows live in one space per privilege class, the CPL's loaded at every entry into generated
 /// code ([`tables::select`]), so a supervisor shadow never serves a CPL3 access. Implicit supervisor accesses
-/// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows. A CPL the bank
-/// cannot run at ([`Cpu::control`]: e.g. a compatibility-mode CS) stops
-/// `unsupported_mode` here, with the new CPL in the stop record and RIP still at the instruction.
+/// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows. A CPL the bank cannot
+/// run at ([`Cpu::paging`]: 1, 2 or above 3) stops `unsupported_mode` here, a CS it cannot run ([`Cpu::code_mode`]:
+/// e.g. a compatibility-mode one) `unsupported_code_mode` ([`controls`]), with the new CPL in the stop record and RIP
+/// still at the instruction.
 pub fn set_cpl(s: &mut State, cpl: u64) {
     s.cpu.cpl = cpl;
-    if cpl > 3 || s.cpu.control().is_none() {
-        halt(s, stop::UNSUPPORTED_MODE)
-    }
+    controls(s);
 }
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
@@ -3150,7 +3162,7 @@ fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
                 .byte_add(at as usize)
                 .read_volatile()
         };
-        cpu.gs_base = base(frame::GS_BASE);
+        cpu.seg[SREG_GS].base = base(frame::GS_BASE);
         msr_set(
             cpu::msr(cpu::MSR_KERNEL_GS_BASE).unwrap(),
             base(frame::KERNEL_GS_BASE),
@@ -3414,9 +3426,7 @@ fn translate(
     va: u64,
     access: Access,
 ) -> Option<(u64, bool)> {
-    let Some(control) = s.cpu.control() else {
-        halt(s, stop::UNSUPPORTED_MODE)
-    };
+    let control = controls(s);
     let walk = paging::walk(
         &mut GuestTables::observed(
             guest_ram(),

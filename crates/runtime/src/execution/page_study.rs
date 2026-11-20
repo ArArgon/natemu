@@ -65,7 +65,7 @@ pub fn cleared(cleared: u64) {
 
 /// A fetch walk of `va` for `who` ([`ps::REVAL`], [`ps::PLACE`]), with the record probed before it and compared after it.
 pub(super) fn translate(s: &mut State, va: u64, who: usize) -> Result<(u64, u32), [u64; 3]> {
-    let (user, pge) = match s.cpu.control() {
+    let (user, pge) = match s.cpu.paging() {
         Some(c) => (c.cpl == 3, s.cpu.cr4 & CR4_PGE != 0),
         // (No walk is possible: `fetch_walk` halts.)
         None => return fetch_walk(s, va),
