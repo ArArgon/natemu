@@ -99,6 +99,23 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--e
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
 
+# The Debian cloud-image workload (tests/io/run_io5.py, docs/benchmarks.md "Context-switch-heavy Debian workload") with its
+# build timed alone (--solo-build: configure and make -j4 again after the run, without the download and disk loops):
+# result.json's steps solo-configure and solo-make. Always 4 vCPUs, mitigations=off, as m1-perf's IO5 runs. About 15 minutes
+# and the network (apt, kernel.org). The framework holds the machine, so the runner's own VM lock is a private file. A suite of
+# its own (as m1-perf), so that preparing the other benchmarks never builds the IO5 inputs.
+[[suite]]
+name = "io5"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 7200 }
+
+[suite.cases.io5-solo]
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
+        "--solo-build", "--lock", "{out}/vm.lock"]
+
 # The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tests/bench/run_m1_perf.py): natemu at
 # the baseline commit against this checkout's build, in fio matrix runs on raw, qcow2 and overlay disks plus IO5, judged
 # by the driver (exit 0 only on PASS). About 80 minutes and 3-4 GiB of free disk. A suite of its own, so that preparing
