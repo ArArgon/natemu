@@ -5336,6 +5336,25 @@ mod tests {
     /// M2 task 1: a segment load keeps the descriptor's base and limit for every register (the resident stores
     /// `Segment::loaded` whole; FS.base and GS.base are those segments' `base`, with no second copy in [`Cpu`]).
     #[test]
+    fn top_run_test_is_whole() {
+        // M2 task 4: `ldrb w0, [x28, #X87_RUN]; cbnz w0, E` begins the top test only with the run's end at E and a `b` after
+        // it; the same two words begin the start of a run in x87 code (the branch then goes over the start's words).
+        let code = |end: bool| {
+            move |o: u64| match o {
+                4 => 0x3940_0380 | frame::X87_RUN << 10,
+                8 => 0x3500_0000 | (0x40 - 8) / 4 << 5,
+                0x40..=0x60 if end => RUN_END[((o - 0x40) / 4) as usize],
+                0x64 if end => 0x1400_0000 | ((0xc_u32.wrapping_sub(0x64)) / 4) & 0x3ff_ffff,
+                _ => 0xaa00_03e0,
+            }
+        };
+        assert_eq!(run_test_end(code(true), 0x80), Some(0x40));
+        assert_eq!(run_test_end(code(false), 0x80), None);
+        assert_eq!(run_test_end(code(true), 0x64), None); // (the return would lie past the code)
+        assert_eq!(run_test_end(|o| if o == 4 { 0xaa00_03e0 } else { code(true)(o) }, 0x80), None);
+    }
+
+    #[test]
     fn loaded_segments_keep_base_and_limit() {
         // Code (L = 0, D = 1, G = 1) at 0x8040_2010, limit 0xbbcde pages; data (G = 0) at 0xff00_0001, limit 0x1234.
         let code = Segment::loaded(0x23, 0x80cb_fa40_2010_bcde);

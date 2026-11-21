@@ -1081,6 +1081,13 @@ impl<'a> Verifier<'a> {
         if shape && run_tested && !self.c.bits32 {
             return fail(ENTRY_OFFSET, "x87 run test at the top of 64-bit code");
         }
+        // The run's end's return as admitted is to the block's third word (the resident points it at the hot copy's when
+        // it lays the block out): exactly that word, also with the code shape off.
+        if let Some(e) = self.run_test()
+            && self.word(e + 36) != 0x1400_0000 | (ENTRY_OFFSET + 8).wrapping_sub(e + 36) / 4 & 0x3ff_ffff
+        {
+            return fail(e + 36, "x87 run test's end does not return to the block's third word");
+        }
         // (Its return is among the branches only if `run_end_return` held.)
         if shape && run_tested && !self.branches.iter().any(|&(_, t)| t == ENTRY_OFFSET + 8) {
             return fail(ENTRY_OFFSET, "x87 run test at the block's top without the run's end and its return");
@@ -2784,6 +2791,16 @@ mod tests {
         for (at, new) in [(end + 36, word(end + 36) + 1), (end, NOP), (end + 32, NOP)] {
             let e = admit(&patched(block, at, word(at), new), false).expect_err("admitted");
             assert!(e.contains("not forward"), "{at:#x}: {e}");
+        }
+        // A branch forward from the run's end is no return (it would be taken for one by the resident's layout).
+        let e = admit(&patched(block, end + 36, word(end + 36), 0x1400_0001), false).expect_err("admitted");
+        assert!(e.contains("does not return to the block's third word"), "{e}");
+        // No other backward branch into the run's end: the last word of the code region, made `b` to it.
+        let last = h.code_region_end - 4;
+        if last > end + 36 {
+            let back = 0x1400_0000 | (end + 4).wrapping_sub(last) / 4 & 0x3ff_ffff;
+            let e = admit(&patched(block, last, word(last), back), false).expect_err("admitted");
+            assert!(e.contains("backward branch into the x87 run's end") || e.contains("not forward"), "{e}");
         }
         // A block that begins with the test opens no run (the code shape).
         let opened = patched(block, end + 32, word(end + 32), word(end + 32) & !31 | 1); // strb w1, [x28, #X87_RUN]
