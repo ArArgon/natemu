@@ -1059,7 +1059,7 @@ BREAK_USER = REGS32 + f"""    int3
 """
 
 # ---- an x87 run left open, then SSE code (M2 task 4: the second entry) --------------------------------------------------------
-# The x87 rounds down (FLDCW), SSE to nearest. A block of x87 code jumps to a block of SSE code, which jumps to another, three
+# The x87 rounds down (FLDCW), SSE to nearest. A block of x87 code jumps to a block of SSE code, which jumps to another,
 # six times round, so each link is used after it is made. The first SSE block must end the x87's run (its test at the top)
 # every time it is reached from the x87 block; the second is reached from SSE code, behind its test. Each block ends in a
 # jump and the x87 instructions at the end stand behind one, so the two SSE blocks hold no x87 instruction (a block that

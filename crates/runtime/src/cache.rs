@@ -1125,6 +1125,12 @@ pub fn shares(context: u64) -> bool {
 /// `None` (nothing filed): the code area or the arena is full, or the rewrite or its proof refused (counted
 /// [`count::UNPROVED`], a resident fault the check halts on).
 pub fn share(t: &Block) -> Option<&'static Block> {
+    // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return: as [`copy`]. 32-bit code, not
+    // relocatable today, so not reached.)
+    if run_tested(t) {
+        unsafe { (*block_ptr(t.number as usize)).flags |= UNSHAREABLE };
+        return None;
+    }
     let c = control();
     let start = c.code_used.next_multiple_of(CODE_ALIGN);
     let code = start + u64::from(PIC_LEAD);

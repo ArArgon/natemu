@@ -1344,6 +1344,18 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             };
         }
     }
+    // M2 task 4: the one word of a block's code the resident changes besides its link points: the return of the run's end
+    // of a top x87 run test, to the third word of the copy the block is entered at (its hot copy's when it has one).
+    for b in blocks.iter().filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM) == 0 && b.code_size != 0) {
+        if let Some(e) = exec::run_test_end(|o| word(u64::from(b.code) + o), u64::from(b.code_size)) {
+            let at = u64::from(b.code) + e + 36;
+            let w = word(at);
+            let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+            if w >> 26 != 5 || to != b.entry() - cache::CODE_VA + 8 {
+                return Err(format!("x87 run test of the block at {:#x}: its end returns by {w:#010x}", b.rip));
+            }
+        }
+    }
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)
         .map(|i| link_record(area, i))
         .collect();

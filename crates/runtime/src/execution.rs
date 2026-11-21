@@ -868,7 +868,11 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     // (M2 task 4: an IRET that set RF, into a block whose first instruction's test would fire: `find` runs that
     // instruction alone, [`first_test_fires`].)
     let Some(target) = found
-        .filter(|b| b.flags & cache::SYSTEM == 0 && !(s.cpu.rflags & RFLAGS_RF != 0 && first_test_fires(b)))
+        // (and into a block that starts with STI, which `find` does not enter with RF set either)
+        .filter(|b| {
+            b.flags & cache::SYSTEM == 0
+                && !(s.cpu.rflags & RFLAGS_RF != 0 && (b.flags & cache::STI_FIRST != 0 || first_test_fires(b)))
+        })
     else {
         declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
@@ -3859,8 +3863,8 @@ fn x87_guess_miss(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     }
     // The instructions before the test's completed. At the unit's first instruction too: the unit was reached from another
     // block (a link, the dispatcher: the resident's RF, if set, is that block's first instruction's, long completed), since
-    // the resident itself does not enter such a unit with RF set ([`find_from`]: the instruction then runs alone, so a
-    // breakpoint on it, already reported, is not reported again).
+    // the resident itself does not enter such a unit with RF set when its test would fire ([`find_from`],
+    // [`first_test_fires`]: the instruction then runs alone, so a breakpoint on it, already reported, is not reported again).
     completed(&mut s);
     unsafe { dispatch(&mut s) }
 }
