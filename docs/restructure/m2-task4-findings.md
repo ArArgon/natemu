@@ -865,6 +865,37 @@ behind other words than the run's end, is refused also with the code shape off; 
 refused by the code shape). The narrow families pass (17,691 cases: unit, static, system, programs, the fault
 families' x87 parts, the i386 campaign).
 
+**After the review of the two fixes** (no path to the second entry with a run open was found, and no RF a guest can
+see was missed; these were changed):
+
+- The link test did not test what it claimed: its second SSE block ran on into x87 instructions and so had no second
+  entry, and a wrong skip could not show. Rewritten (each block ends in a jump, the first SSE block divides by 7, six
+  trips); with the skip forced from x87 code it now fails, in the last bit of the squares.
+- The run's end, being cold, went back into the block's cold code, from where a block leaves through the shim
+  (nothing links cold exits). So x87 code jumping or returning into SSE code cost a trip through the linker each
+  time, which the in-line form before did not. The shim now points that return at the hot copy when it lays the
+  block out. `cray32-sse2`, SSE code that calls the C library's x87 `pow` for every highlight, reads 3.89 / 3.83 s
+  (3.97 / 3.91 before the second entry, 3.90 / 3.81 with its first version): no difference to be seen there either
+  way. The same return of the page-crossing stub (LU, about 10%) is not changed: those blocks are 64-bit code too,
+  which the shim copies, shares and re-checks word for word, and each of those paths would have to know the changed
+  word; estimate a day with its tests.
+- The RF rule cost more than it had to: every fault's return is an IRET that sets RF, and the rule sent each such
+  return into a block with a first-instruction test through a one-instruction unit (a round trip to the host), and
+  every such IRET off the one-pass path. It now applies only where the test would fire at that moment (the stack top
+  and tags against the block's constant, the pending-denormal byte), which is what makes the case ambiguous in the
+  first place. `startup32`: 7.53 / 7.20 s before the rule, 7.15 / 6.90 with its first version, 7.13 / 6.86 now;
+  64-bit `hackbench` 11.08 / 11.04, 10.95 / 10.91, 10.56 / 10.42 (its spread). No cost was measurable in either
+  version; the narrowing removes it by construction.
+- The linker's "begins with the test" now means the whole test (the two words, the run's end where they branch, a
+  branch after it): the two words alone also begin the start of a run in x87 code. Admission refuses any other
+  backward branch into the run's end. A shared block's sites are read from its translation.
+- Sparse across boots: the same build read 2,903 to 3,122 in one pair of boots and 2,716 to 2,784 in another (the
+  build before: 2,476 to 2,540 throughout). So the gain is 8 to 24% depending on the boot, which is the placement
+  sensitivity described above showing again.
+- RF, the direction with no test: confirmed by the reviewer that no guest-only test can show it. A deterministic test
+  needs a hook in the shim that posts an interrupt at the miss and a driver that arms it (the existing test-hook
+  feature has the pattern for the fast miss path); not built, more than the couple of hours offered. Known gap.
+
 ### Macs without AFP (M1, M2): the same round's 32-bit cases with AFP hidden
 
 A separate step, at the owner's request. AFP is the Arm feature (M4 has it; M1 and M2 do not) that lets Arm arithmetic
@@ -904,6 +935,51 @@ system-call work do not depend on AFP (LU: 4,399). The sparse multiply does not 
 so no test). What it would take: the same caches with the NaN and denormal fix-ups done per operation inside a run; a
 design of its own, not estimated here.
 
+
+### Macs without AFP, again on the final code (the owner's request)
+
+One round, alone on the machine, 1 vCPU, at the head with the review fixes (`30a7d1d4`): AFP hidden at the head, AFP
+hidden at the starting commit (`4d7ea93e`), and the head with AFP for the ratio. Seconds (run 1 / run 2) unless Mflops.
+No full-size x87 c-ray (it does not finish in the time allowed without AFP).
+
+| | start, no AFP | head, no AFP | head, AFP |
+| --- | --- | --- | --- |
+| `cray` (64-bit) | 4.60 / 4.54 | 4.22 / 4.16 | 3.04 / 2.99 |
+| `cray-strict` (64-bit) | 5.81 / 5.78 | 4.96 / 4.95 | 3.28 / 3.15 |
+| `cray32-small` | 121.0 / 121.0 | 104.8 / 104.7 | 0.69 / 0.55 |
+| `cray32-strict-small` | 70.8 / 70.7 | 61.9 / 61.8 | 0.60 / 0.54 |
+| `cray32-sse2` | 8.26 / 8.21 | 6.97 / 6.89 | 3.86 / 3.79 |
+| `sqlite` (64-bit) | 5.81 / 5.65 | 5.64 / 5.36 | 5.99 / 5.73 |
+| `sqlite32` | 8.11 / 7.86 | 7.67 / 7.40 | 7.85 / 7.57 |
+| `startup32` | 7.42 / 7.12 | 7.10 / 6.83 | 7.12 / 6.93 |
+| `hackbench` (64-bit) | 10.44 / 10.35 | 10.17 / 10.14 | 10.85 / 11.01 |
+| `hackbench32` | 13.14 / 13.05 | 10.00 / 9.94 | 10.64 / 12.53 |
+
+| SciMark (Mflops, run 1) | composite | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64-bit: start, no AFP | 2079 | 2269 | 1754 | 946 | 3141 | 2286 |
+| 64-bit: head, no AFP | 2281 | 1403 | 1756 | 951 | 3366 | 3929 |
+| 64-bit: head, AFP | 2814 | 1958 | 4263 | 945 | 3172 | 3730 |
+| 32-bit x87: start, no AFP | 32 | 17 | 44 | 24 | 38 | 34 |
+| 32-bit x87: head, no AFP | 35 | 20 | 51 | 26 | 41 | 39 |
+| 32-bit x87: head, AFP | 1213 | 911 | 1735 | 293 | 1188 | 1940 |
+| 32-bit SSE2: start, no AFP | 1797 | 667 | 1717 | 56 | 3636 | 2910 |
+| 32-bit SSE2: head, no AFP | 1932 | 705 | 1758 | 61 | 2642 | 4494 |
+| 32-bit SSE2: head, AFP | 2644 | 1571 | 4103 | 255 | 2978 | 4312 |
+
+What task 4 changed for a Mac without AFP: x87 code 10 to 15% faster (the register caching: `cray32-small` 121 to
+105 s, SciMark x87 32 to 35), 64-bit c-ray 8 to 15% faster (which of the changes does that was not looked into),
+`cray32-sse2` 16% faster, LU 1.5 to 1.7
+times (the page-crossing stores), `hackbench32` 1.3 times (the system-call path), `sqlite32` and `startup32` 4 to 5%.
+It did not change the picture: 32-bit x87 code there is 35 times slower than with AFP by SciMark's composite and 150
+to 190 times by c-ray, and SOR in both SSE builds is 2.4 times slower without AFP (64-bit too: not task 4's).
+
+Two readings to be careful with. The sparse multiply in the 32-bit SSE2 build reads 2,642 at the head without AFP
+against 3,636 at the start, although without AFP the code of that loop is the same at both commits (no x87 runs, so
+no test); the earlier no-AFP round at the head read 3,567 and 3,672. This is the placement sensitivity of that loop
+again, here with nothing else to blame, and it means the with-AFP "regression" of that kernel was only partly the
+test. And `hackbench32` with AFP read 10.64 / 12.53 in this round (its second run an outlier; 10.24 / 10.30 an hour
+before on the same code).
 
 ## Paused (November 20, about 14:50)
 
