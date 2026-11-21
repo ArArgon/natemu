@@ -213,7 +213,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb', 'x87tag': 'brk #0xc'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb', 'x87tag': 'brk #0xc', 'x87guess': 'brk #0xd'}
 M64 = (1 << 64) - 1
 
 
@@ -306,6 +306,13 @@ def guards(d, dis, order):
             if s['kind'] == 'x87tag' and not (re.fullmatch(rf'tbn?z w0, #(0x)?0, {at:#x}', dis.get(t, '')) and re.fullmatch(r'lsr w0, w\d+, w\d+', dis.get(t - 4, ''))):
                 out.append(f'stub +{at} (x87tag): its check is not `lsr w0, wF, wI; tbz|tbnz w0, #0`')
             elif s['kind'] == 'x87tag':
+                ok.add(t)
+            # M2 task 4, a unit compiled for an x87 stack top and tag byte: the pair's test.
+            if s['kind'] == 'x87guess' and not (dis.get(t) == f'cbnz w0, {at:#x}' and re.fullmatch(r'sub w0, w0, #0x[0-9a-f]+', dis.get(t - 4, '')) and
+                                                dis.get(t - 8) == 'orr w0, w1, w0, lsl #8' and dis.get(t - 12) == 'ldrb w1, [x28, #0x4b2]' and
+                                                dis.get(t - 16) == 'ldrb w0, [x28, #0x41b]'):
+                out.append(f'stub +{at} (x87guess): its check is not `ldrb w0, [x28, #0x41b]; ldrb w1, [x28, #0x4b2]; orr w0, w1, w0, lsl #8; sub w0, w0, #V; cbnz w0`')
+            elif s['kind'] == 'x87guess':
                 ok.add(t)
     cost['stub'] = len(stubs)
     if {o for o in order if dis[o].startswith('brk')} != set(stubs):
@@ -707,7 +714,8 @@ GUEST_STATE_DF = {0x3f0 + 10}
 GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
 # I6: the x87 state (abi `frame::X87_*`): FEX's IE, C0..C2, TOP and C3 bytes, the abridged tag word and the x87 exception word,
 # read and written; FCW read only; ST(i) through `add x0, x28, xI, lsl #4; ldr|str dN, [x0, #0x420]` (check_sites.x87_slot).
-X87_STATE = ((0x412, 1), (0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
+X87_STATE = ((0x412, 1), (0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4),
+             (0x420, 128))   # (M2 task 4: ST(i) also as a field at a fixed offset, in a unit compiled for a known stack top)
 X87_FCW = (0x4b0, 2)
 X87_PENDING = 0x412
 # M2 task 4, x87 runs (shim/fexc_hook.h): the SIMD flag byte (FPSR's flags move into it at a run's start: MXCSR is their OR
@@ -862,8 +870,8 @@ def cost(d, tmp):
 BITS = []          # ['--bitness', '32'] under --bits32
 
 
-def compile_(fexc, hexs, rip):
-    r = subprocess.run([fexc, '--profile', 'slice1', '--hex', hexs, '--rip', rip, *BITS], capture_output=True, text=True, timeout=120)
+def compile_(fexc, hexs, rip, extra=()):
+    r = subprocess.run([fexc, '--profile', 'slice1', '--hex', hexs, '--rip', rip, *BITS, *extra], capture_output=True, text=True, timeout=120)
     return json.loads(r.stdout)
 
 
@@ -964,6 +972,12 @@ PROGRAMS32 = {
     'bcd': (['daa', 'das', 'aaa', 'aas', 'aad', 'salc', 'mov dword ptr [ebx], eax'], False),
     'x87': (['fld dword ptr [eax]', 'fadd qword ptr [ebx]', 'fild dword ptr [esi]', 'fistp dword ptr [edi]', 'fild qword ptr [ecx]', 'fistp qword ptr [esp+0x38]',
              'fnstcw word ptr [esp]', 'fstp qword ptr [ebx]'], False),
+    # M2 task 4: the x87 stack in host registers: register forms between memory forms, pushes, pops, an exchange, a compare,
+    # FNSTSW (the flags' fold), a store that converts first (the hold). corpora32 also compiles both x87 programs for a stack
+    # top and tag byte (--x87-guess: the registers as fields, the tag byte a constant, the pair's test).
+    'x87-stack': (['fld qword ptr [eax]', 'fld st(0)', 'fmul st, st(1)', 'fadd qword ptr [ebx]', 'fxch st(1)', 'fstp qword ptr [esi]', 'fsqrt',
+                   'fld1', 'faddp st(1), st', 'fcomip st, st(1)', 'fnstsw word ptr [edi]', 'fst dword ptr [ecx]', 'fistp dword ptr [esp+0x38]',
+                   'fstp st(0)', 'fild dword ptr [eax]', 'fstp qword ptr [ebx]'], False),
     'sse': (['movaps xmm0, xmmword ptr [eax]', 'addps xmm1, xmmword ptr [ebx]', 'movdqu xmmword ptr [esi], xmm7', 'cvtsi2sd xmm2, dword ptr [edi]',
              'movq qword ptr [esp], xmm3', 'pshufb xmm4, xmmword ptr [ecx]'], False),
     'ret': (['add eax, ecx', 'ret'], False), 'ret-imm': (['ret 8'], False), 'call-reg': (['call eax'], False), 'call-esp': (['call esp'], False),
@@ -989,6 +1003,8 @@ def corpora32():
     for name, (asm, annotated) in PROGRAMS32.items():   # (a REP ends its block: each is a program of its own)
         progs.append({'name': name, 'code': ref.assemble('.code32\n' + '\n'.join(asm)).hex(), 'rip': '0xfffff000' if name == 'call-rel' else '0x8048000'}
                      | ({'insns': [gen_slice1.annotate(a) for a in asm]} if annotated else {}))
+    progs += [p | {'name': p['name'] + f' guess {g:#x}', 'extra': ('--x87-guess', hex(g))} for p in progs if p['name'].startswith('x87')
+              for g in (0x1000, 0x1700, 0x15e0, 0x13ff)]   # empty at TOP 0 and 7; three registers at TOP 5; full at TOP 3 (a push overflows)
     return [('matrix32', matrix), ('programs32', progs)]
 
 
@@ -1014,7 +1030,7 @@ def run_corpus(label, progs, tmp, before=None):
     progs = [q for p in progs for q in (check_sites.blocks(p) if 'asm' in p else [p])]   # I2: a REP ends its block
     progs = progs[SHARD[0]::SHARD[1]]
     for p in progs:
-        d = compile_(FEXC, p['code'], p['rip'])
+        d = compile_(FEXC, p['code'], p['rip'], p.get('extra', ()))
         if d['status'] != 'ok':
             continue
         ok += 1

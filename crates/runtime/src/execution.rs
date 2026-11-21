@@ -1019,6 +1019,16 @@ fn fetch_first(s: &mut State, block: bool) {
 unsafe fn ask(s: &mut State, kind: u64) -> Reply {
     let block = kind == REQUEST_TRANSLATE;
     let page = s.cpu.rip & !4095;
+    // M2 task 4: the x87 stack top and tags the block is about to run on, for a unit of 32-bit code compiled for them.
+    s.x87_guess = 0;
+    if block && s.cpu.code_mode() == Some(CodeMode::Compat32) {
+        let (word, bit) = natemu_abi::execution::cache::x87_varied_bit(s.cpu.rip);
+        if cache::control().x87_varied[word] & bit == 0 {
+            // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the bytes lie inside it.
+            let byte = |at: u32| u64::from(unsafe { (FRAME_VA as *const u8).add(at as usize).read_volatile() });
+            s.x87_guess = 0x1000 | (byte(frame::X87_TOP) & 7) << 8 | byte(frame::X87_FTW);
+        }
+    }
     loop {
         unsafe {
             s.request = kind;
@@ -3624,6 +3634,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::STACK => brk(10),
                     object::kind::FLDCW => brk(11),
                     object::kind::X87TAG => brk(12),
+                    object::kind::X87GUESS => brk(13),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => {
@@ -3675,6 +3686,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                 fp_exception(s, f, b, &site, spsr)
             }
             object::kind::DENORM => denormal_exit(s, f, b, &site),
+            object::kind::X87GUESS => x87_guess_miss(s, f, b, &site),
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             // An 8-byte push found its stack pointer misaligned (fexc --push-run): the push runs alone, in a step block
             // whose split check completes or faults it exactly; the block after it starts at the next instruction.
@@ -3699,6 +3711,21 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 /// last check, and the code that follows skipped the screens of operands it took for such results. The pending byte is cleared and the vCPU
 /// leaves the block at the instruction the stub precedes (the bank holds the state before it, as at any site; the instructions before it
 /// completed): the dispatcher's next block screens every operand of that instruction as a block-entry value.
+/// M2 task 4: a unit compiled for an x87 stack top and tag byte ([`State::x87_guess`]) met another pair at the test before
+/// an x87 instruction (`X87GUESS` stub; the bank holds the state before that instruction, the instructions before it
+/// completed). The unit is retired and its RIP noted, so the next request for it comes without a guess, and the vCPU goes
+/// on at the instruction through the dispatcher.
+#[inline(never)]
+fn x87_guess_miss(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+    let (word, bit) = natemu_abi::execution::cache::x87_varied_bit(cache::running_rip(b));
+    cache::control().x87_varied[word] |= bit;
+    bank_at(&mut s, f, b, site);
+    if b.flags & cache::DEAD == 0 && cache::discard(b).is_none() {
+        halt(&s, stop::BAD_LINK)
+    }
+    completed(&mut s);
+    unsafe { dispatch(&mut s) }
+}
 #[inline(never)]
 fn denormal_exit(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.

@@ -2396,24 +2396,27 @@ class Slice1X87Commit(unittest.TestCase):
 
     @needs_afp_host
     def test_the_page_holds_the_x87_state_before_every_fault_point(self):
-        points = stubs_seen = 0
-        for bits in (64, 32):
+        # (guess: the 32-bit block also compiled for the stack top and tags it starts with, `--x87-guess`: the registers are
+        # fields at fixed offsets and the tag byte a constant; its test's stub is a fault point like the others.)
+        points = stubs_seen = guessed = 0
+        for bits, guess in ((64, False), (32, False), (32, True)):
             extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else [])
             for prog in self.X87_PROGRAMS:
                 lines = [l.replace('rbx', 'ebx').replace('rax', 'eax').replace('rcx', 'ecx') for l in prog] if bits == 32 else prog
                 each = [x86_asm((['.code32'] if bits == 32 else []) + [l]) for l in lines]
                 starts = [sum(len(h) // 2 for h in each[:i]) for i in range(len(each))]
-                d, rc = run(''.join(each), RIP, *extra)
-                self.assertEqual((rc, d['guest']['instructions_translated'], d['code']['layout']['spill_bytes']), (0, len(each), 0), (bits, prog))
-                ptr = d['state_abi']['static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af'][3]
-                code = bytes.fromhex(d['code']['hex'])
-                stubs = {s['native_offset'] for s in d['sites'] if s['kind'] in check_sites.STUBS}
                 for filled in (0, 3):
                     buf = bytearray(8192)
                     buf[0x41b] = 5 if filled else 0
                     buf[0x4b2] = sum(1 << (5 + i & 7) for i in range(filled))
                     for i in range(filled): buf[0x420 + 16 * (5 + i & 7):0x428 + 16 * (5 + i & 7)] = struct.pack('<d', 10.0 + i)
                     buf[0x1000:0x1000 + len(self.X87_MEMORY)] = self.X87_MEMORY
+                    d, rc = run(''.join(each), RIP, *extra, *(['--x87-guess', hex(0x1000 | buf[0x41b] << 8 | buf[0x4b2])] if guess else []))
+                    self.assertEqual((rc, d['guest']['instructions_translated'], d['code']['layout']['spill_bytes']), (0, len(each), 0), (bits, prog))
+                    ptr = d['state_abi']['static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af'][3]
+                    code = bytes.fromhex(d['code']['hex'])
+                    stubs = {s['native_offset'] for s in d['sites'] if s['kind'] in check_sites.STUBS}
+                    self.assertEqual(any(s['kind'] == 'x87guess' for s in d['sites']), guess, (bits, prog))
                     # the state before each instruction, each one alone before it
                     before, ref, fault = [], bytearray(buf), None
                     for i, h in enumerate(each):
@@ -2433,15 +2436,18 @@ class Slice1X87Commit(unittest.TestCase):
                         if fault is not None and i > fault: continue
                         cut = s['native_offset']
                         if s['kind'] in check_sites.STUBS:
-                            if s['kind'] != 'x87tag': continue   # (a split store's check: its store site is checked)
+                            if s['kind'] not in ('x87tag', 'x87guess'): continue   # (a split store's check: its store site is checked)
                             cut = next(o for o in range(d['code']['layout']['code_region_begin'], s['native_offset'], 4)
-                                       if (w := int.from_bytes(code[o:o + 4], 'little')) & 0x7e000000 == 0x36000000 and o + 4 * (w >> 5 & 0x3fff) == s['native_offset'])
-                            stubs_seen += 1
+                                       if (w := int.from_bytes(code[o:o + 4], 'little')) & 0x7e000000 == (0x34000000 if s['kind'] == 'x87guess' else 0x36000000) and
+                                       o + 4 * (w >> 5 & (0x7ffff if s['kind'] == 'x87guess' else 0x3fff)) == s['native_offset'])
+                            stubs_seen += s['kind'] == 'x87tag'
+                            guessed += s['kind'] == 'x87guess'
                         got, fpsr = self.x87_run(d, cut, buf, ptr, stubs)
-                        self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, filled, lines[i], s['kind'], s['native_offset']))
+                        self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, guess, filled, lines[i], s['kind'], s['native_offset']))
                         points += 1
-        self.assertGreater(points, 150)
+        self.assertGreater(points, 250)
         self.assertGreater(stubs_seen, 40)
+        self.assertGreaterEqual(guessed, 2 * len(self.X87_PROGRAMS))
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')

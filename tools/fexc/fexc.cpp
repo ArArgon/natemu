@@ -279,7 +279,7 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag"};
+                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag", "x87guess"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -386,7 +386,7 @@ static void ResetGlobals() {
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
-  fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
+  fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_guess = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
   fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED;
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
@@ -409,7 +409,7 @@ struct Setup {
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
   bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
-  uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
+  uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0, x87_guess = 0;
   uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2, --ds-null 4, --es-null 8): 32-bit code only
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
@@ -457,6 +457,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
     else if (a == "--simd-unmasked") s.simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
+    else if (a == "--x87-guess") s.x87_guess = strtoull(next(), nullptr, 0) & 0x17ff;       // slice1 (M2 task 4): 0x1000 | TOP << 8 | tags
     else if (a == "--x87-unmasked") s.x87_unmasked = strtoull(next(), nullptr, 0) & 0x3f;     // slice1 (I5c): FCW's unmasked exceptions
     else if (a == "--daz") s.daz = true;               // slice1 (AFP fallback 3a): MXCSR.DAZ, without AFP only
     else if (a == "--ftz") s.ftz = true;               // slice1 (AFP fallback 3a): FTZ with UM masked, without AFP only
@@ -508,7 +509,7 @@ static bool ExtAbandon(IR::IRListView& View);   // (below, with the compile atte
 static void Arm(const Setup& s) {
   fexc_sse_gated = s.sse_gated; fexc_avx_gated = s.avx_gated; fexc_alignment_gated = s.alignment_gated; fexc_x87_gated = s.x87_gated;
   fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_bulk = s.bulk; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
-  fexc_x87_unmasked = s.x87_unmasked; fexc_daz = s.daz; fexc_ftz = s.ftz; fexc_accurate = s.accurate;
+  fexc_x87_guess = s.x87_guess; fexc_x87_unmasked = s.x87_unmasked; fexc_daz = s.daz; fexc_ftz = s.ftz; fexc_accurate = s.accurate;
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
   fexc_push_run = s.push_run && s.slice1; fexc_narrow_cmp = s.narrow_cmp && s.slice1; fexc_step_unit = s.st.max_insts == 1;
