@@ -306,14 +306,41 @@ So the top is predictable. What a known top would still save, as an **estimate**
 numbers become constants (15 instructions), the address arithmetic of each write goes (49), and the tag masks become
 constants (about 73 of 129): about 137 of 477 instructions, 29%, less an entry check of three or four instructions per
 block. The tag tests themselves are already cheap (16 instructions here). It needs a second version of a block for the
-misses (a trap per miss would cost more than it saves at c-ray's 0.2%), which the shim cannot do today. Not built;
-estimated at 8 to 12 agent hours.
+misses (a trap per miss would cost more than it saves at c-ray's 0.2%). Built since: see below.
 
 The larger lead, also an **estimate**: not writing the x87 state before instructions that can fault at all, and
 letting the shim rebuild it at a fault from a record of where each register lives (as it already does for the
 general registers). That would remove most of the 98 write instructions and of the tag and top traffic that goes with
 them: about 200 of 477 instructions, 40%. It touches the site records, the shim, admission and the checkers; a guess
 of 15 to 25 agent hours. Keeping the x87 registers in fixed host registers across blocks would add to either.
+
+### Built: 32-bit code compiled for the stack top it starts with
+
+The owner asked for it. When the shim asks for a translation of 32-bit code it now sends the x87 stack top and tag byte
+the program has at that moment. The compiler builds the block for that pair: each x87 register is a field at a fixed
+place, the top and the tag byte are constants. The first x87 instruction of each piece of the block tests the pair (five
+instructions). When the program arrives with another pair, that test leaves to the shim, which throws the block away,
+remembers its address, and goes on at that instruction; the address is translated without a guess from then on, which
+is exactly the code from before. So a miss costs one trap once per block, and runs what ran before. 64-bit code and
+single-stepped instructions get no guess.
+
+| | c-ray's hottest block | cray32-small (s) | cray32 (s) | sqlite32 (s) | startup32 (s) |
+| --- | --- | --- | --- | --- | --- |
+| Before (stack in host registers) | 494 instructions | 1.95 / 1.83 | 26.8 / 27.1 | not measured | not measured |
+| With the guess | 372 | 1.22 / 1.16 | 18.9 / 18.7 | 8.02 / 7.76 | 7.16 / 6.94 |
+
+Pictures and hashes unchanged. Against real x86's 9.19 s the x87 build is now at 2.0 times (it was 2.9). The estimate
+had been 29% fewer instructions on the hot block; measured 25%, and 36% less time on c-ray.
+
+Checked by the same test as before, now also on guessed blocks (the guess's test is one more point where the state must
+be complete), the precision checker on x87 programs compiled for four different pairs, and the i386 campaign (126
+passed, 18 expected failures), where real programs take the miss path.
+
+What is left in the hot block after this, counted the same way (361 instructions): the work itself about 131; writing
+x87 registers to the guest state before instructions that can fault 49; the constants and stores that keep the top and
+tag byte current there about 104; condition bits, flags and the rest about 77. So the second lead (not writing the state
+before instructions that can fault, the shim rebuilding it at a fault) would now remove about 150 of 361 instructions,
+around 40%, as an **estimate**.
 
 ### INT 0x80 again: where its time goes (parked, not built)
 
