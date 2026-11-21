@@ -219,8 +219,11 @@ def command(args, disk, cache, phase='use'):
             '-device', 'virtio-rng-pci']
 
 
-def launch(cmd, work, phase, host, limit):
-    """Boot, log in on the console, run io5.sh PHASE, power off. Returns (exit status, timed out, seconds)."""
+def launch(cmd, work, phase, host, limit, script='io5'):
+    """Boot, log in on the console, run SCRIPT.sh PHASE HOST (served from `host`), power off. Returns (exit status, timed
+    out, seconds). The script's console markers start with "SCRIPT-upper-cased " ("IO5 "); tests/bench/run_paper.py
+    runs its own script through this too."""
+    tag = script.upper().encode()
     master, slave = pty.openpty()
     log = open(work / f'serial-{phase}.log', 'wb')
     # Host arrival time of each marker line on CLOCK_UPTIME_RAW, natemu's perf-log clock (Python's monotonic_ns counts from
@@ -232,8 +235,9 @@ def launch(cmd, work, phase, host, limit):
     t0 = time.time(); deadline = t0 + limit; buf = b''
     # The serial line ends lines with \r\r\n; the end marker is computed in the guest so the echoed command cannot match.
     steps = ((rb'login: $', 'root\n'), (rb'Password: $', PASSWORD + '\n'), (rb'# $',
-             f'curl -fsS http://{host}/io5.sh -o /root/io5.sh && bash /root/io5.sh {phase} {host}; echo IO5-$((40+2))-END\n'),
-             (rb'IO5-42-END\r*\n', 'poweroff\n'))
+             f'curl -fsS http://{host}/{script}.sh -o /root/{script}.sh && bash /root/{script}.sh {phase} {host}; '
+             f'echo {tag.decode()}-$((40+2))-END\n'),
+             (tag + rb'-42-END\r*\n', 'poweroff\n'))
     timed_out = False
     try:
         for pattern, text in steps:
@@ -245,8 +249,8 @@ def launch(cmd, work, phase, host, limit):
                     log.write(data); log.flush(); buf = (buf + data)[-4096:]
                     pending += data; *lines, pending = pending.split(b'\n')
                     for line in lines:
-                        if b'IO5 ' in line:   # a terminal escape can precede the first marker after the command line
-                            marker = line[line.index(b'IO5 '):].decode(errors='replace').strip()
+                        if tag + b' ' in line:   # a terminal escape can precede the first marker after the command line
+                            marker = line[line.index(tag + b' '):].decode(errors='replace').strip()
                             stamps.write(f'{time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)}\t{marker}\n'); stamps.flush()
             buf = b''; os.write(master, text.encode())
         while p.poll() is None and time.time() < deadline:

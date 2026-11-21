@@ -11,6 +11,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {natemu_baseline}   the same for the case's `baseline` revision (artifacts.natemu_at)
     {fio_prep} {block_inputs} {io5_inputs}   writable clones, in the case folder, of inputs.fio_prep(),
                         inputs.block_inputs() and inputs.io5_inputs() (APFS clones: no space until written)
+    {paper_inputs}      inputs.paper_inputs(), read-only: the Paper and Mojang jars and the guest's Debian packages
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
     {resume_dir}        a results folder kept across runs, the same while the case and what it names are (resume_dir())
 """
@@ -26,9 +27,10 @@ from testkit import artifacts, cache, host, inputs, paths, resources
 from testkit.family import Needs
 from testkit.harness import CaseResult, Requirement, runner
 
-INPUTS = {'fio_prep': 'fio-prep', 'block_inputs': 'block-inputs', 'io5_inputs': 'io5-inputs'}     # placeholder -> input name
+INPUTS = {'fio_prep': 'fio-prep', 'block_inputs': 'block-inputs', 'io5_inputs': 'io5-inputs',   # placeholder -> input name
+          'paper_inputs': 'paper-inputs'}
 INPUT_FNS = {'fio-prep': lambda: inputs.fio_prep(), 'block-inputs': lambda: inputs.block_inputs(),
-             'io5-inputs': lambda: inputs.io5_inputs()}
+             'io5-inputs': lambda: inputs.io5_inputs(), 'paper-inputs': lambda: inputs.paper_inputs()}
 # Given as writable clones: run_io_matrix.py prepare writes into the folders it copies from fio_prep and block_inputs;
 # run_io5.py run clones disk.raw (keeping its mode) and grows the clone to 16 GiB.
 WRITABLE = {'fio_prep', 'block_inputs', 'io5_inputs'}

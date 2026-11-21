@@ -44,6 +44,9 @@ def test_m1_perf_requires_its_builds_and_inputs():
     other = HARNESS.requirements(fam, suites['bench'], None)
     assert Requirement('artifact', 'bench-image') in other
     assert not {r for r in other if r.kind in ('natemu-at', 'input')}
+    paper = set(HARNESS.requirements(fam, suites['paper'], None))           # guest-paper: its own suite, for the same reason
+    assert {Requirement('input', 'io5-inputs'), Requirement('input', 'paper-inputs')} <= paper
+    assert not {r for r in paper if r.kind == 'natemu-at'} and Requirement('artifact', 'bench-image') not in paper
 
 
 def test_m1_perf_baseline_is_the_runners():

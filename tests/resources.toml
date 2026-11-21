@@ -86,3 +86,66 @@ sha256 = "f0da43fc318346cd2af1365b161db6bbbf650a124f8be35bd6acbd877679c290"
 # The CPython 3.13.18 source tarball IO5 builds in its guest (tests/io/run_io5.py PYTHON_SHA, the same pin).
 urls = ["https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz"]
 sha256 = "abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68"
+
+[resource.paper-jar]
+# The Paper (Minecraft server) 26.3 build 257 jar the guest-paper benchmark starts (tests/bench/run_paper.py), as PaperMC
+# publishes it: its download URL is the file's own sha256.
+urls = ["https://fill-data.papermc.io/v1/objects/64a5bd44910cb982b2648e9a35036cc95a6de4d561e15812aecf5411f84f7b01/paper-26.3-257.jar"]
+sha256 = "64a5bd44910cb982b2648e9a35036cc95a6de4d561e15812aecf5411f84f7b01"
+
+[resource."minecraft-server-26.3"]
+# Mojang's server jar for 26.3: Paper's launcher patches it on the first start and pins its sha256 in the Paper jar
+# (META-INF/download-context); tests/bench/run_paper.py places it in the guest so the launcher downloads nothing.
+urls = ["https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar"]
+sha256 = "d052f14d7a173734fba553711e5b570162e2f2a313267ee31a21b975a679be64"
+
+# The 12 Debian packages the guest-paper guest installs from local files (OpenJDK 25 and what it, growpart and fdisk need
+# beyond the IO5 cloud image), at snapshot.debian.org 20261120T000000Z: the list apt resolved there (`--print-uris`), each
+# checked against apt's MD5 or the archive's Packages index. testkit/inputs.py:paper_inputs takes every `paper-deb-*`.
+[resource.paper-deb-libfdisk1]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/u/util-linux/libfdisk1_2.41.5-0%2bdeb13u1_amd64.deb"]
+sha256 = "7f96d173cc01787201691f80ca9b335b8c7d6cdcc6fb81011302d4a005ff5089"
+
+[resource.paper-deb-fdisk]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/u/util-linux/fdisk_2.41.5-0%2bdeb13u1_amd64.deb"]
+sha256 = "7f37094ca3f63c3a07b4431532b0bcc4aa64291e75c48cabebf41bf42ad706b1"
+
+[resource.paper-deb-ca-certificates]
+urls = ["https://snapshot.debian.org/archive/debian-security/20261120T000000Z/pool/updates/main/c/ca-certificates/ca-certificates_20250419%2bdeb13u1_all.deb"]
+sha256 = "c10585ac22c7f617a73d394eea29ba71d0356f350ae973b19043d1b017f80f54"
+
+[resource.paper-deb-ca-certificates-java]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/c/ca-certificates-java/ca-certificates-java_20240118_all.deb"]
+sha256 = "176db8376cd024879056f81811fef78251600906bd74cc4a6eb18db7050433b8"
+
+[resource.paper-deb-cloud-guest-utils]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/c/cloud-utils/cloud-guest-utils_0.33-1_all.deb"]
+sha256 = "d41d092d2bbf1edc6f44f3999f62f1cca7ec79e149e684c2bb86fb9765638c11"
+
+[resource.paper-deb-java-common]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/j/java-common/java-common_0.76_all.deb"]
+sha256 = "4fcd0d8965fb339c941dfdc17cfe08a0239e0b95962bfc96fa5e871da5dc1e50"
+
+[resource.paper-deb-libjpeg62-turbo]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/libj/libjpeg-turbo/libjpeg62-turbo_2.1.5-4_amd64.deb"]
+sha256 = "5504299ad0e3c0a9ca9f962a68a650a040db52f9f416a109e74df48d55601d3f"
+
+[resource.paper-deb-liblcms2-2]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/l/lcms2/liblcms2-2_2.16-2%2bdeb13u2_amd64.deb"]
+sha256 = "32e53c2002ccea8c60c02779bea0ba49ac132fef702988a30d64af79b6617806"
+
+[resource.paper-deb-libnspr4]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/n/nspr/libnspr4_4.36-1_amd64.deb"]
+sha256 = "87fc2039ee89cff2b8010fa9535706b1def40031acfc52bf12197dcb3cb7b064"
+
+[resource.paper-deb-libnss3]
+urls = ["https://snapshot.debian.org/archive/debian-security/20261120T000000Z/pool/updates/main/n/nss/libnss3_3.110-1%2bdeb13u5_amd64.deb"]
+sha256 = "7059839165c39e734ff59c712fde83ef5ea01328872819dfbabd1c08e75f3116"
+
+[resource.paper-deb-libpcsclite1]
+urls = ["https://snapshot.debian.org/archive/debian/20261120T000000Z/pool/main/p/pcsc-lite/libpcsclite1_2.3.3-1_amd64.deb"]
+sha256 = "a8bc4725549060d1e696d358e32a3699d947d5381871553a290389830bebccbd"
+
+[resource.paper-deb-openjdk-25-jre-headless]
+urls = ["https://snapshot.debian.org/archive/debian-security/20261120T000000Z/pool/updates/main/o/openjdk-25/openjdk-25-jre-headless_25.0.5.1%2b2-1%7edeb13u1_amd64.deb"]
+sha256 = "9540ecfe0082ef35a5649df546635780be6232432416383f2457b0d726efe837"

@@ -112,7 +112,8 @@ its writable bit for P is clear. A peer that reset in the meantime satisfies it 
 for peers) and `slots_full` (requests that fell back to `SHADOWS`).
 
 Effect on a Paper start (per vCPU): full resets about 33 k to about 1.1 k, shadow misses about 16 M to 4-5.6 M; a traced
-start 55.2 to 41.45 s.
+start 55.2 to 41.45 s. These numbers come from a scratch driver and a hand-prepared disk that no longer exist, so they cannot be
+repeated; the bench case `guest-paper` (tests/bench/run_paper.py) is how a Paper start is measured now.
 
 An independent review of stage 2 found no soundness problem; it listed stale comments, now fixed.
 

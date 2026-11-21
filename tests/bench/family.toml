@@ -118,3 +118,19 @@ argv = ["python3", "tests/bench/run_m1_perf.py", "full", "--dir", "{resume_dir}"
         "--final-build", "{natemu_entry}", "--fexc", "{fexc}", "--fio-prep", "{fio_prep}", "--block-inputs", "{block_inputs}",
         "--inputs", "{resume_dir}/matrix-inputs", "--io5-inputs", "{io5_inputs}"]
 env = { NATEMU_QEMU_IMG = "{qemu_img}" }
+
+# A Paper (Minecraft server) start on 4 vCPUs and 2 GiB, a fixed 1 GiB Java heap (tests/bench/run_paper.py), air-gapped: the IO5 cloud image, the pinned
+# JDK packages, Paper jar and Mojang jar (input paper-inputs); a setup boot (packages, world), then 3 boots of two timed starts
+# each (median per start position); PTI off (--speculation-barriers, as the README advises). About 6 minutes. A suite of its own,
+# so that preparing the other guest benchmarks never fetches the cloud image or the Paper inputs.
+[[suite]]
+name = "paper"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 7200 }
+
+[suite.cases.guest-paper]
+argv = ["python3", "tests/bench/run_paper.py", "run", "--inputs", "{io5_inputs}", "--paper-inputs", "{paper_inputs}", "--out", "{out}",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}", "--vcpus", "4", "--ram", "2", "--starts", "2",
+        "--boots", "3", "--speculation-barriers"]

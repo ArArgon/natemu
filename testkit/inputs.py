@@ -287,6 +287,24 @@ def io5_inputs() -> pathlib.Path:
                              srcs + [io / 'run_io5.py', lib / 'io_common.py', io / 'run_net_linux.py', t / 'raw_root.py']) / 'inputs'
 
 
+def _paper_recipe(out: pathlib.Path, inputs: list) -> None:
+    import urllib.parse
+    jar, mojang, *debs = map(pathlib.Path, inputs)
+    d = out / 'inputs'; (d / 'debs').mkdir(parents=True)
+    cache.clone(jar, d / 'paper.jar'); cache.clone(mojang, d / 'mojang.jar')
+    for f in debs: cache.clone(f, d / 'debs' / urllib.parse.unquote(f.name))
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    (d / 'debs.sha256').write_text(''.join(f'{sha(f)}  {f.name}\n' for f in sorted((d / 'debs').iterdir())))
+
+
+def paper_inputs() -> pathlib.Path:
+    """tests/bench/run_paper.py's inputs, so its guest needs no network: the Paper jar (paper-jar), Mojang's server jar it
+    patches (minecraft-server-26.3) and every `paper-deb-*` package (the JDK and what it needs beyond the IO5 image),
+    with debs.sha256 listing the packages. All pinned downloads (tests/resources.toml)."""
+    names = ['paper-jar', 'minecraft-server-26.3'] + sorted(n for n in resources.declarations() if n.startswith('paper-deb-'))
+    return resources.derived('paper-inputs', _paper_recipe, [str(resources.fetch(n)) for n in names]) / 'inputs'
+
+
 def recipe_sha256(recipe: pathlib.Path) -> str:
     """sha256 of the recipe folder's `sha256sum` listing (every file, sorted relative paths)."""
     files = sorted(p for p in recipe.rglob('*') if p.is_file() and '__pycache__' not in p.parts)

@@ -3,6 +3,9 @@
 What one fexc compile costs, where the time goes, and the per-request waste removed in November 2026. Measured on an
 M2 Max with a Paper (Minecraft server) start under openjdk 25: about 507,000 requests over boot plus one start, almost all
 small blocks of JIT-compiled Java (median 34 guest bytes; 9 of 20,000 Paper-phase blocks have any floating-point op).
+The start times below come from a scratch driver and disk that no longer exist; the bench case `guest-paper`
+(tests/bench/run_paper.py) is how a Paper start is measured now. The per-request costs can be measured again on any run
+with the method below.
 
 ## How to measure without a VM
 

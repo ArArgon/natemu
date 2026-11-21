@@ -9,6 +9,11 @@ the same Mac.
 | 11 benchmarks, 4 vCPUs | **4.5×** (geometric mean; 1.6× to 38×) |
 | Context-switch-heavy Debian workload (cloud image), 4 vCPUs | **1.7×** |
 
+Where the numbers come from: each table names its bench case (`tests/bench/family.toml`, run by
+`tools/natemu-test run --tier bench`), the machine, the natemu commit and the date. The tables from November 14
+were measured before the bench cases existed (with `tools/bench/run.py` directly) and are to be measured again
+through them; numbers from experiments elsewhere in `docs/` are labelled as such and are not this page's numbers.
+
 ## Setup
 
 - **Host:** Apple M4, macOS 26. One emulator ran at a time, with no other VM on the machine.
@@ -80,6 +85,27 @@ the Linux source from kernel.org and another writes, drops from cache and re-rea
 The download and disk loops run for as long as the build does, so their share of the work is not
 identical between the two emulators.
 
+## Paper (Minecraft server) start
+
+A Paper 26.3 server (build 257) on OpenJDK 25 starts in the stock Debian 13 cloud image: the JVM interprets, then
+compiles Java with its JIT while the server loads, so natemu translates a stream of freshly written guest code. 4 vCPUs,
+2 GiB, a fixed 1 GiB Java heap, PTI off (`--speculation-barriers`), natemu's translation cache off. An untimed setup boot installs the pinned
+packages and generates a world with a fixed seed; then 3 boots, each with the network cut and two timed starts. Before
+each start the server folder is restored from a copy of the setup's and the page cache dropped, so every start loads
+the same files. A start is timed from `java -jar` to Paper's "Done" line, after which the server is killed. The guest
+has no internet at any point it is measured, and Paper needs none: its launcher finds Mojang's server jar already in
+place. `tests/bench/run_paper.py` describes the case in full.
+
+Bench case `guest-paper`; Apple M2 Max; natemu 41e78e44; November 21, 2026; median of 3 boots:
+
+| Start in the boot | Time | The 3 boots | Paper's own "Done" |
+| --- | ---: | ---: | ---: |
+| first | 29.7 s | 29.4, 30.4, 29.7 s | 26.6 s |
+| second | 29.0 s | 29.3, 28.9, 29.0 s | 26.5 s |
+
+Experiment (an earlier version of the case: 8 GiB and Java's default heap, one boot, with internet, November 20, M2 Max): without
+`--speculation-barriers`, so with PTI on, the two starts took 191.7 s and 170.8 s, against 32.6 s and 35.1 s with it.
+
 ## CPU vulnerability mitigations
 
 The numbers above use `mitigations=off`. On a default kernel command line natemu reports its virtual
@@ -99,5 +125,8 @@ mitigations cost about 1% once PTI is off. See the
 
 ## Reproducing
 
-`tools/bench/run.py` boots one benchmark on natemu or QEMU and records its time. Its documentation
-lists the options. The benchmark guest image is not published yet.
+Every benchmark is a case of the bench family: `tools/natemu-test run --tier bench` runs them all, each alone on
+the machine, and `-k guest-paper` (any case name) one. The framework builds or downloads everything they need into
+its cache on first use (the guest initramfs from `tools/bench/image`, the Debian kernel and cloud image, the Paper jar:
+pinned in `tests/resources.toml`), so a fresh clone on any Mac can run them. Results stay per machine: compare
+numbers only within one machine.

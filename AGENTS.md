@@ -31,6 +31,27 @@ framework's queue, and do not read test inputs from `natemu-raw`: the framework 
 Older pages under `docs/restructure/` that run `tools/run_suite.py` or scripts under `tools/` are historical records;
 those commands no longer run ([docs/restructure/README.md](docs/restructure/README.md)).
 
+### Every test is self-contained
+
+A new Mac with a fresh clone, the prerequisites the [README](README.md) lists and `tools/natemu-test` must
+be able to run every test and benchmark: the framework builds or downloads each input from what the repository declares
+(a recipe in the repo, a fixed upstream source), into its own cache. Nothing may depend on what happens to be on one
+machine: no file in a home folder, scratchpad, `/tmp` or another checkout, no image or disk prepared by hand, no
+container image left on a build box, no tool installed outside the declared prerequisites (a tool a test needs is
+declared so the framework checks it before the run, not discovered by a failure). The same holds for numbers: one
+that goes into a doc, a commit message or a decision comes from a case the framework runs, so anyone can repeat it from
+the repo, and says which case and machine ("bench case `guest-paper`, M2 Max", not a run folder's id). A one-off
+script is fine while exploring; a number from it is an experiment and is called one, with what ran and where.
+Done when deleting every machine's caches and scratch folders loses nothing but time.
+
+### Benchmark numbers
+
+[docs/benchmarks.md](docs/benchmarks.md) is natemu's performance record, and it stays current: a change that adds a
+benchmark, or moves one by more than its noise, updates the page in the same change. Its numbers come from the
+framework's bench cases, and each table says which: the case, the machine, the natemu commit and the date. An
+experiment (a profile, a prototype, an A/B of two builds, a case run with other options) may show its numbers where it
+is discussed, labelled as an experiment; they become the page's numbers once a bench case measures them.
+
 ## README
 
 `README.md` is for a newcomer who wants to run natemu: plain prose, what to do and what they will see, hardware named by chip
