@@ -2886,6 +2886,12 @@ impl Compiler {
                 reply.extent as usize >= bytes.len(),
                 bytes.len().min(reply.extent as usize),
             );
+            // Every argument fexc read must be one the kept answers are matched by ([`Compiler::gating`]): an answer that read
+            // another would never be served again, silently (M2 task 4's review: the x87 guess, read for 64-bit code too).
+            // 32-bit code's answers are not kept; its guess is beyond the gating arguments.
+            if !self.bits32 && reply.read >> GATING != 0 {
+                return Err(format!("fexc read an argument beyond the gating arguments ({:#x}) for 64-bit code", reply.read));
+            }
             let (read, prefix) = (reply.read, bytes[..end].to_vec());
             let entry = Arc::new(Entry {
                 rip: at,

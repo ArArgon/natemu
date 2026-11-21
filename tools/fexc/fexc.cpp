@@ -744,6 +744,8 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       fexc_no_afp = !hf.SupportsAFP;
     }
     fexc_ext_conds = 0;
+    // (shim/fexc_hook.h) With every x87 instruction held no fault point can lack its hold: a hard failure, not unheld code.
+    if (fexc_x87_hold_missing) return Fail("an x87 fault point after a floating-point op without a hold, with every x87 instruction held", 3);
   }
 
   // ---- describe

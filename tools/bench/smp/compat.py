@@ -746,6 +746,43 @@ X87_USER = REGS32 + f"""    fninit
     int 0x80
 .three: dd 3
 """
+# ---- x87 code entered with different stack tops (M2 task 4) ------------------------------------------------------------------
+# A translation of 32-bit code is made for the x87 stack top and tags the program has when it is first needed, with a test
+# before its first x87 instruction; entered with another pair, the translation is retired and made again without the guess.
+# The loop calls one function with nothing on the x87 stack and with one register on it, by turns, and its body joins two
+# paths that leave different tops: the function, the join and the loop's blocks each meet a pair they were not made for.
+# 6 turns add 3 * 3 each to a sum in memory (54), the odd turns also count (3 turns: 3.0); then the status word and the
+# environment (the top back where it began, every register empty).
+DEPTH_USER = REGS32 + f"""    fninit
+    fldz
+    fstp qword [{R:#x}]
+    fldz
+    fstp qword [{R + 8:#x}]
+    mov ecx, 6
+.turn:
+    test ecx, 1
+    jz .even
+    fld1
+.even:
+    call .square
+    test ecx, 1
+    jz .next
+    fadd qword [{R + 8:#x}]
+    fstp qword [{R + 8:#x}]
+.next:
+    dec ecx
+    jnz .turn
+    fnstsw [{R + 0x10:#x}]
+    fnstenv [{R + 0x20:#x}]
+""" + _zero(R + 0x20 + 12, 16) + f"""    int 0x80
+.square:
+    fild dword [.three]
+    fmul st0, st0
+    fadd qword [{R:#x}]
+    fstp qword [{R:#x}]
+    ret
+.three: dd 3
+"""
 A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
 X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
               A5(R + 0x6c0, 0x80), P.zero(R + 0x740, 0x8c0)]
@@ -866,6 +903,7 @@ def positive32():
     return [program('c32-stack@1', ENTER() + handlers(), STACK_USER, WRAP + [P.zero(R, 0x100)]),
             program('c32-forms@1', ENTER() + handlers(), FORMS_USER, FORMS_MEMORY),
             program('c32-x87@1', X87_BODY, X87_USER, X87_MEMORY),
+            program('c32-x87-depth@1', X87_BODY, DEPTH_USER, [P.zero(R, 0x100)]),
             program('c32-faults@1', GATES + ENTER() + handlers(END + RESUME, **vec), FAULT_USER32, log=0x1000),
             program('c32-memfaults@1', GATES + UNMAP + ENTER() + handlers(END + MAP + RESUME, **vec), MEMFAULT_USER,
                     [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
