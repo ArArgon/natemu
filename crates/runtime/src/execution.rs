@@ -1650,18 +1650,20 @@ impl CodePages for FetchWrites<'_> {
 }
 
 /// Marks `gpa`'s page as holding this vCPU's translations before the host copies its bytes, then makes sure no vCPU
-/// keeps a writable shadow of it (the one synchronous shootdown): this vCPU's own shadows are reset; each peer with a
-/// writable bit is asked to reset its shadows (`SHADOWS`, a kick) and waited for until its reset counter moves (not
-/// until its bit clears: it may set it again, but then it sees this mark and takes the code-write path). The counter is
-/// read before the bit is checked again, so a reset in between is never waited for twice (a vCPU that has stopped for
-/// good reset its shadows first). While waiting, this vCPU drains its own record, so two vCPUs waiting for each other
-/// both progress; a write to the page that clears this vCPU's mark ends the wait (the block placed from it is stepped,
-/// see [`find`]).
+/// keeps a writable shadow of it (the one synchronous shootdown; docs/writable-drop.md): this vCPU drops its own writable
+/// shadows of the page ([`drop_writable`]: all its shadows when its reverse map does not know them all); each peer with a
+/// writable bit is asked to drop the page's ([`cache::DROPS`], a kick; a full reset, `SHADOWS`, when its slots are
+/// taken) and waited for until it empties the slot or its reset counter moves (not until its bit clears: it may set it
+/// again, but then it sees this mark and takes the code-write path). The counter is read before the bit is checked again,
+/// so a reset in between is never waited for twice (a vCPU that has stopped for good reset its shadows first). While
+/// waiting, this vCPU serves its own record, so two vCPUs waiting for each other both progress; a write to the page that
+/// clears this vCPU's mark ends the wait (the block placed from it is stepped, see [`find`]).
 fn mark(s: &mut State, gpa: u64) {
     let writers = cache::mark(gpa);
     let own = (1 as natemu_abi::execution::cache::CpuMask) << s.vcpu;
+    // docs/writable-drop.md: this vCPU's writable shadows of the page go alone when its reverse map knows them all.
     if writers & own != 0 {
-        reset_shadows(s);
+        drop_writable(s, gpa);
     }
     for p in (0..cache::MAX_VCPUS).filter(|&p| writers & !own & 1 << p != 0) {
         let count = cache::resets_of(p);
@@ -1669,13 +1671,54 @@ fn mark(s: &mut State, gpa: u64) {
             continue;
         }
         s.shootdowns += 1;
-        cache::ask_shadows(p);
+        // docs/writable-drop.md (stage 2): the peer is asked to drop this page's writable shadows ([`cache::DROPS`]); a full
+        // reset only when its slots are taken. Either way the wait ends at its reset, or when it empties the slot.
+        let asked = cache::ask_drop(p, gpa);
+        if asked.is_none() {
+            cache::ask_shadows(p);
+        }
         let from = crate::perf::enter(crate::perf::SHOOTDOWN);
-        while cache::resets_of(p) == count && cache::marked(gpa) {
+        while cache::resets_of(p) == count
+            && cache::marked(gpa)
+            && asked.is_none_or(|a| cache::drop_waiting(p, a))
+        {
             take_invalidations(s);
             core::hint::spin_loop();
         }
         crate::perf::leave(from);
+    }
+}
+/// docs/writable-drop.md: removes this vCPU's writable shadows of `gpa`'s page (and its writable bit of it) when the reverse
+/// map knows them all, else every shadow. `shadow_generation` moves either way: [`install`] reads an unmoved generation as
+/// "this vCPU's writable bit of the page it installs is still set".
+fn drop_writable(s: &mut State, gpa: u64) {
+    match cache::drop_writable(gpa) {
+        Ok(true) => s.shadow_generation += 1,
+        Ok(false) => reset_shadows(s),
+        Err(_) => halt(s, stop::SHADOW),
+    }
+}
+/// Serves peers' shadow requests taken from the record (`bits`): [`cache::SHADOWS`] by a full reset, [`cache::DROPS`] slot by
+/// slot (a slot is emptied once this vCPU holds no writable shadow of its page: after the reset, or its own drop). A slot
+/// claimed after `bits` were taken is served here or at the next take (its asker posts the bit after claiming it).
+fn serve_peers(s: &mut State, bits: u64) {
+    let mut reset = false;
+    if bits & cache::SHADOWS != 0 {
+        reset_shadows(s);
+        reset = true;
+    }
+    if bits & cache::DROPS != 0 {
+        for i in 0..cache::DROP_SLOTS {
+            let Some((value, gpa)) = cache::drop_asked(i) else {
+                continue;
+            };
+            if !reset {
+                let before = cache::resets_of(s.vcpu as usize);
+                drop_writable(s, gpa);
+                reset = cache::resets_of(s.vcpu as usize) != before;
+            }
+            cache::drop_served(i, value);
+        }
     }
 }
 
@@ -1691,9 +1734,7 @@ fn take_invalidations(s: &mut State) {
     if pending & cache::FLUSH != 0 {
         flush(s);
     }
-    if pending & cache::SHADOWS != 0 {
-        reset_shadows(s);
-    }
+    serve_peers(s, pending & (cache::SHADOWS | cache::DROPS));
 }
 
 /// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked: first
@@ -1730,6 +1771,7 @@ fn tlb(s: &mut State, global: bool) {
         crate::study::holding(false);
     } else {
         cache::control().kept_resets += 1;
+        cache::writers_cr3();
         s.shadow_generation += 1;
     }
     cache::control().tlb_ticks += ticks() - t0;
@@ -1762,6 +1804,7 @@ pub(super) fn page_faulted(s: &mut State, cr2: u64) {
 fn reset_shadows(s: &mut State) {
     crate::study::reset();
     tables::reset();
+    cache::writers_reset();
     cache::shadows_reset();
     s.shadow_generation += 1;
 }
@@ -1830,8 +1873,9 @@ fn io_checkpoint(s: &mut State) {
             // A peer may ask AFTER our acknowledgement while finishing a split atomic or code
             // mark. It cannot acknowledge until we release its shadow dependency. This touches
             // only resident mappings/metadata, never guest RAM, and is safe during the host copy.
-            if cache::take_shadows() {
-                reset_shadows(s);
+            let bits = cache::take_shadows();
+            if bits != 0 {
+                serve_peers(s, bits);
                 #[cfg(feature = "io-test-hooks")]
                 crate::io_test::late_shadows(s.vcpu as usize);
             }
@@ -4081,8 +4125,9 @@ unsafe fn split_lock(
         natemu_abi::execution::cache::io_test::BEFORE_SPLIT,
     );
     cache::split_begin(gpa, s.vcpus as usize, || {
-        if cache::take_shadows() {
-            reset_shadows(&mut s)
+        let bits = cache::take_shadows();
+        if bits != 0 {
+            serve_peers(&mut s, bits)
         }
     });
     crate::perf::leave(p);
@@ -4167,8 +4212,9 @@ pub(super) fn split_wait(s: &mut State, gpa: &[u64]) {
             return;
         }
         while gpa.iter().any(|&page| cache::split_held(page)) {
-            if cache::take_shadows() {
-                reset_shadows(s)
+            let bits = cache::take_shadows();
+            if bits != 0 {
+                serve_peers(s, bits)
             }
             core::hint::spin_loop();
         }
@@ -4205,7 +4251,12 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
         }
     };
     match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
-        Ok(()) => crate::study::installed(s.cpu.cpl == 3, va, writable, global),
+        Ok(()) => {
+            if writable {
+                cache::writable_installed(s.cpu.cpl == 3, va, gpa);
+            }
+            crate::study::installed(s.cpu.cpl == 3, va, writable, global)
+        }
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
             split_wait(s, &[gpa]); // the reset cleared this vCPU's shadow flag: set again before the install
@@ -4216,6 +4267,9 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
             s.evictions += 1;
             if tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global).is_err() {
                 halt(s, stop::SHADOW)
+            }
+            if writable {
+                cache::writable_installed(s.cpu.cpl == 3, va, gpa);
             }
             crate::study::installed(s.cpu.cpl == 3, va, writable, global);
         }
