@@ -1058,6 +1058,26 @@ BREAK_USER = REGS32 + f"""    int3
     int 0x80
 """
 
+# An instruction breakpoint on the first instruction of a block compiled for an x87 stack top (M2 task 4), met twice, the
+# second time with another top: each time one #DB, then the handler resumes with RF set and the instruction runs (not a
+# second #DB when the block's test for its top fails right at that instruction: the instruction then runs alone).
+RF_USER = REGS32 + f"""    fninit
+    mov ecx, 2
+.again:
+    jmp .bp
+    times {BP - U}-($-$$) nop
+.bp:
+    fld1
+    fstp qword [{W + 0x60:#x}]
+    dec ecx
+    jz .done
+    fldz
+    jmp .again
+.done:
+    fninit
+    int 0x80
+"""
+
 # ---- INT n at the top of 4 GiB: the pushed EIP wraps to 0 -----------------------------------------------------------------
 # The resident's PUSH DS at FFFF_FFFDH, then INT 0x80 at FFFF_FFFEH: the frame's RIP is 0 (EIP wraps: the code segment's
 # 4 GiB limit holds the instruction; Vol.3 "Limit Checking"). Pinned QEMU pushes 1_0000_0000H: the SDM's byte is compared.
@@ -1097,6 +1117,9 @@ def positive32():
             program('c32-breakpoints@1', GATES + BREAK_BODY + ENTER() +
                     handlers('    cmp qword [rsp], 0x80\n    jne .go\n    xor eax, eax\n    mov dr7, rax\n    jmp .fin\n.go:\n' + DB + RESUME, **vec),
                     BREAK_USER, log=0x1000),
+            program('c32-x87-rf@1', GATES + BREAK_BODY + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() +
+                    handlers('    cmp qword [rsp], 0x80\n    jne .go\n    xor eax, eax\n    mov dr7, rax\n    jmp .fin\n.go:\n' + DB + RESUME, **vec),
+                    RF_USER, log=0x1000),
             program('c32-int-top@1', ENTER() + handlers(), TOP_USER, TOP_MEMORY, {'sdm_bytes': TOP_SDM})]
 
 

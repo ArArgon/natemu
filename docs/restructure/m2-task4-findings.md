@@ -782,6 +782,36 @@ reports for a probe's fault at every kind of address (anything unexpected stops 
 that x87 runs end before floating-point operations chosen by name, which a future operation with another name would
 escape.
 
+### After the round: the two open items, decided by the owner ("fix both")
+
+**Design note 1, the resume flag.** The shim cannot tell, when a guessed block's test fires at the block's first
+instruction, whether it entered the block itself (nothing completed; an RF set by IRET belongs to this instruction
+and must stay) or another block jumped into it (instructions completed; a stale RF must go). The translated code has
+nothing to say about it either, and a second entry would not help: a block can jump to itself. So the first case is
+removed instead of recognized: the shim does not enter a block with RF set if the block's first instruction carries
+such a test (the x87 guess, a pending denormal); it runs that one instruction alone, in a one-instruction unit, which
+has no test. Then a test that fires at a first instruction always means "reached from another block", and the shim
+again treats everything before it as completed, as it did before the first review. Both errors are closed: RF is
+never cleared for an instruction that did not run, and never kept past one that did. The same pattern is already
+used for a block that starts with STI. The cost falls on returns with RF set into such a block only (after a
+breakpoint on an x87 instruction).
+
+**Design note 2, the test for an open x87 run.** Where: at the top of the block instead of before its first SSE
+instruction, and only in 32-bit blocks that contain no x87 instruction at all but do contain an SSE instruction that
+needs the run closed. Such a block cannot open a run, so after its test, or when entered behind it, no run is open
+anywhere in it and at every one of its exits: "no run is open when I leave" is a property of the block, not of a
+path. The block's second entry is the word after the test's eleven words. The linker uses the second entry of the
+target exactly when both blocks have the test at their top (it reads the two words; the host's object validation pins
+the rest), because then the predecessor leaves with no run open and the eleven words would do nothing. Every other
+way in takes the first entry and runs the test: the dispatcher and its table, the shim's own entries, the fast miss
+and system-call paths, links from blocks without the property (x87 code, integer-only code, 64-bit code), and links
+through a dispatcher slot (shared code). A copy of a block has the same words, so the same property. A link is
+removed with either block, as every link is. Moving the test up is itself exact: it only ends a run earlier, at a
+point where the state is consistent (the block's start), and nothing between the top and the SSE instruction depends
+on the x87's control register. The checkers: object validation requires the exact eleven words when a block starts
+with the test's first word; the code-shape check and `verify_precision.py` require that a block with the test never
+writes a non-zero run byte (so the property holds) and that it is 32-bit code.
+
 ### Macs without AFP (M1, M2): the same round's 32-bit cases with AFP hidden
 
 A separate step, at the owner's request. AFP is the Arm feature (M4 has it; M1 and M2 do not) that lets Arm arithmetic

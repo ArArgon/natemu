@@ -412,6 +412,22 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             );
             continue;
         }
+        // M2 task 4: a block whose first instruction carries a test that leaves the block before anything ran (the x87 guess
+        // of a unit compiled for a stack top, a pending denormal) is not entered with RF set: that instruction runs alone
+        // (a one-instruction unit has neither test). So such a test, when it fires at the block's first instruction, never
+        // sees an RF that belongs to that very instruction, and may take every instruction before it as completed, which
+        // is right for a block reached by a link or the dispatcher with the resident's RF stale ([`x87_guess_miss`]).
+        if s.cpu.rflags & RFLAGS_RF != 0
+            && block.flags & cache::STEP == 0
+            && cache::sites(block)
+                .iter()
+                .any(|x| x.guest_offset == 0 && matches!(x.kind, object::kind::X87GUESS | object::kind::DENORM))
+        {
+            match unsafe { step_here(s) } {
+                Some(block) => return Some(block),
+                None => continue,
+            }
+        }
         // S4: a block at an armed instruction breakpoint is entered only from here, after the check above.
         if !at_breakpoint(&s.cpu, block) {
             cache::fill_l1(s.cpu.rip, block);
@@ -813,8 +829,9 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     s.l2_hits += 1;
     system(s, i);
     // (SYSRETL into 32-bit code whose segments translated code cannot run, `Cpu::compat_refused`: `find` raises its #GP.)
+    // (An IRET that sets RF: `find` decides how the target is entered, M2 task 4.)
     if s.debug != 0
-        || s.cpu.rflags & RFLAGS_TF != 0
+        || s.cpu.rflags & (RFLAGS_TF | RFLAGS_RF) != 0
         || !events::none(s)
         || (s.cpu.seg[SREG_CS].attributes & ATTR_L == 0 && s.cpu.compat_refused().is_some())
     {
@@ -3814,11 +3831,11 @@ fn x87_guess_miss(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
             None => halt(&s, stop::BAD_LINK),
         }
     }
-    // The instructions before the test's completed; at the unit's first instruction none did (RF stays: a breakpoint on
-    // that instruction, already reported, is not reported again).
-    if site.guest_offset != 0 {
-        completed(&mut s);
-    }
+    // The instructions before the test's completed. At the unit's first instruction too: the unit was reached from another
+    // block (a link, the dispatcher: the resident's RF, if set, is that block's first instruction's, long completed), since
+    // the resident itself does not enter such a unit with RF set ([`find_from`]: the instruction then runs alone, so a
+    // breakpoint on it, already reported, is not reported again).
+    completed(&mut s);
     unsafe { dispatch(&mut s) }
 }
 #[inline(never)]
@@ -3826,8 +3843,9 @@ fn denormal_exit(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
     unsafe { (FRAME_VA as *mut u8).add(frame::DE_PENDING as usize).write_volatile(0) };
     bank_at(&mut s, f, b, site);
-    // (At the block's first instruction no instruction completed: RF stays, as in `x87_guess_miss`.)
-    if site.guest_offset != 0 {
+    // (As in `x87_guess_miss`; a step block, which the resident enters whatever RF is, completed nothing before its
+    // first instruction.)
+    if site.guest_offset != 0 || b.flags & cache::STEP == 0 {
         completed(&mut s);
     }
     unsafe { dispatch(&mut s) }
