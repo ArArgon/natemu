@@ -2341,6 +2341,109 @@ class Slice1X87Commit(unittest.TestCase):
             self.assertTrue(any('store' in e and 'before the site' in e for e in vp.verify(bad, Path(t))[0]))
 
 
+    # M2 task 4: the x87 stack pass keeps ST(i), TOP and the tags in host registers across the instructions of a block and
+    # the exception flags in FPSR, and writes the guest-state page before every instruction that can fault. The check, by
+    # running the code: a block is run natively up to each of its fault points (an access site; an x87 stack check's
+    # branch), and the page's x87 state there (with FPSR's flags as the resident's bank takes them) must be the state
+    # the instructions before it leave when each runs alone, as a one-instruction unit (--max-insts 1: no cache, the
+    # masked stack fault response inline). Programs: memory and register forms mixed, pushes and pops, exchanges, a
+    # store that converts first, compares, FNSTSW, integer instructions between; from an empty and from a part-filled
+    # stack, with a stack underflow and an overflow (the instruction with the fault is not run: its stub is the point).
+    X87_PROGRAMS = [
+        ['fld qword ptr [rbx]', 'fld qword ptr [rbx+8]', 'fmul st, st(1)', 'fadd qword ptr [rbx+16]', 'fxch st(1)', 'fstp qword ptr [rbx+64]',
+         'fsqrt', 'fst dword ptr [rbx+72]', 'fchs', 'fistp dword ptr [rbx+80]'],
+        ['fld1', 'fldz', 'fld st(1)', 'faddp st(2), st', 'fcomip st, st(1)', 'fadd dword ptr [rbx+32]', 'fnstsw word ptr [rbx+88]',
+         'fild dword ptr [rbx+40]', 'fdivrp st(1), st', 'fstp qword ptr [rbx+96]'],
+        ['fld qword ptr [rbx+16]', 'add rax, 1', 'fld st(0)', 'fmul st, st(0)', 'mov rcx, [rbx]', 'fsubp st(1), st', 'fabs',
+         'fcom qword ptr [rbx+8]', 'fnstsw ax', 'fstp dword ptr [rbx+104]'],
+        ['fadd st, st(1)', 'fld qword ptr [rbx]', 'fxch st(2)', 'fmul qword ptr [rbx+24]', 'ffree st(1)', 'fadd st, st(1)', 'fst qword ptr [rbx+112]',
+         'fstp st(1)', 'fistp qword ptr [rbx+120]'],
+        ['fld qword ptr [rbx+48]', 'fld qword ptr [rbx+56]', 'fdiv st, st(1)', 'fmul dword ptr [rbx+36]', 'fstp dword ptr [rbx+128]', 'frndint',
+         'fld qword ptr [rbx]', 'fucomip st, st(1)', 'fstp qword ptr [rbx+136]'],
+        ['fld qword ptr [rbx]'] * 9 + ['fstp qword ptr [rbx+64]', 'fadd qword ptr [rbx+8]'],
+        ['fstp qword ptr [rbx+64]', 'fld qword ptr [rbx]', 'faddp st(1), st', 'fmul qword ptr [rbx+8]', 'fstp qword ptr [rbx+72]', 'fstp qword ptr [rbx+80]',
+         'fadd qword ptr [rbx]', 'fst qword ptr [rbx+88]'],
+    ]
+    X87_MEMORY = struct.pack('<8d', 1.5, -2.25, 1e300, 1e-320, 3.0, float('inf'), 7.0, 0.1) + bytes(8)
+    X87_MEMORY = X87_MEMORY[:32] + struct.pack('<ff', 1e-40, 2.5) + struct.pack('<i', -7) + X87_MEMORY[44:]
+
+    @staticmethod
+    def x87_state(buf, fpsr):
+        """The x87 state the resident would bank: the registers, TOP, the tags, the flag bytes, and the exception word with the
+        flags an open run still holds (runtime x87::fold_run), and the memory the program wrote."""
+        word = int.from_bytes(buf[0x4b4:0x4b8], 'little')
+        if buf[0x414]:
+            word |= (buf[0x412] if buf[0x412] & 0x20 else fpsr) & 0x9f
+        flags = bytes(buf[0x410 + k] for k in (0, 5, 6, 8, 9, 10, 11, 14))   # IE PE SF C0 C1 C2 TOP C3
+        return [buf[0x420 + 16 * i:0x428 + 16 * i].hex() for i in range(8)], flags.hex(), buf[0x4b2], hex(word), buf[0x1000:0x1100].hex()
+
+    def x87_run(self, d, cut, buf, ptr, patch=()):
+        """Runs the code of compile `d` up to the word at `cut` on `buf`; (buf after, FPSR). Branches to stubs fall through."""
+        lay = d['code']['layout']
+        code = bytes.fromhex(d['code']['hex'])
+        b = lay['code_region_begin']
+        words = list(struct.unpack(f'<{(cut - b) // 4}I', code[b:cut]))
+        for k, w in enumerate(words):
+            at = b + 4 * k
+            t = at + 4 * ((w >> 5 & 0x3fff) - (1 << 14 if w >> 18 & 1 else 0)) if w & 0x7e000000 == 0x36000000 else \
+                at + 4 * ((w >> 5 & 0x7ffff) - (1 << 19 if w >> 23 & 1 else 0)) if w & 0x7e000000 == 0x34000000 or w & 0xff000010 == 0x54000000 else \
+                at + 4 * ((w & 0x3ffffff) - (1 << 26 if w >> 25 & 1 else 0)) if w & 0x7c000000 == 0x14000000 else None
+            if t is not None and t >= cut:
+                self.assertIn(t, patch, f'a branch at +{at} leaves the code before +{cut}')
+                words[k] = 0xd503201f
+        x, _, out = native_run(words + [0xd53b4420], buf=bytes(buf), ptrs=[(ptr, 0x1000)], fpcr=6)   # mrs x0, fpsr
+        return bytearray(out), x[0]
+
+    @needs_afp_host
+    def test_the_page_holds_the_x87_state_before_every_fault_point(self):
+        points = stubs_seen = 0
+        for bits in (64, 32):
+            extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else [])
+            for prog in self.X87_PROGRAMS:
+                lines = [l.replace('rbx', 'ebx').replace('rax', 'eax').replace('rcx', 'ecx') for l in prog] if bits == 32 else prog
+                each = [x86_asm((['.code32'] if bits == 32 else []) + [l]) for l in lines]
+                starts = [sum(len(h) // 2 for h in each[:i]) for i in range(len(each))]
+                d, rc = run(''.join(each), RIP, *extra)
+                self.assertEqual((rc, d['guest']['instructions_translated'], d['code']['layout']['spill_bytes']), (0, len(each), 0), (bits, prog))
+                ptr = d['state_abi']['static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af'][3]
+                code = bytes.fromhex(d['code']['hex'])
+                stubs = {s['native_offset'] for s in d['sites'] if s['kind'] in check_sites.STUBS}
+                for filled in (0, 3):
+                    buf = bytearray(8192)
+                    buf[0x41b] = 5 if filled else 0
+                    buf[0x4b2] = sum(1 << (5 + i & 7) for i in range(filled))
+                    for i in range(filled): buf[0x420 + 16 * (5 + i & 7):0x428 + 16 * (5 + i & 7)] = struct.pack('<d', 10.0 + i)
+                    buf[0x1000:0x1000 + len(self.X87_MEMORY)] = self.X87_MEMORY
+                    # the state before each instruction, each one alone before it
+                    before, ref, fault = [], bytearray(buf), None
+                    for i, h in enumerate(each):
+                        before.append(self.x87_state(ref, 0))
+                        one, rc1 = run(h, RIP + starts[i], *extra, '--max-insts', '1')
+                        self.assertEqual(rc1, 0, (bits, lines[i]))
+                        c1 = bytes.fromhex(one['code']['hex'])
+                        lay = one['code']['layout']
+                        end = next(o for o in range(lay['code_region_begin'], lay['code_region_end'], 4) if int.from_bytes(c1[o:o + 4], 'little') & 0xffe0001f == 0xd4000001)
+                        ref, fpsr = self.x87_run(one, end, ref, ptr, {s['native_offset'] for s in one['sites'] if s['kind'] in check_sites.STUBS})
+                        word = int.from_bytes(ref[0x4b4:0x4b8], 'little') | ((ref[0x412] if ref[0x412] & 0x20 else fpsr) & 0x9f if ref[0x414] else 0)
+                        ref[0x4b4:0x4b8] = word.to_bytes(4, 'little')   # as the resident's bank does; the next unit starts with no run open
+                        ref[0x411] = ref[0x412] = ref[0x414] = 0
+                        if fault is None and ref[0x416]: fault = i   # (SF: the block's code past its stub is not what runs after a stack fault)
+                    for s in d['sites']:
+                        i = starts.index(s['guest_offset'])
+                        if fault is not None and i > fault: continue
+                        cut = s['native_offset']
+                        if s['kind'] in check_sites.STUBS:
+                            if s['kind'] != 'x87tag': continue   # (a split store's check: its store site is checked)
+                            cut = next(o for o in range(d['code']['layout']['code_region_begin'], s['native_offset'], 4)
+                                       if (w := int.from_bytes(code[o:o + 4], 'little')) & 0x7e000000 == 0x36000000 and o + 4 * (w >> 5 & 0x3fff) == s['native_offset'])
+                            stubs_seen += 1
+                        got, fpsr = self.x87_run(d, cut, buf, ptr, stubs)
+                        self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, filled, lines[i], s['kind'], s['native_offset']))
+                        points += 1
+        self.assertGreater(points, 150)
+        self.assertGreater(stubs_seen, 40)
+
+
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1DivisionChecks(unittest.TestCase):
     def test_p11_pins_the_exact_check(self):

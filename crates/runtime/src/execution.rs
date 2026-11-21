@@ -3623,6 +3623,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::DENORM => brk(9),
                     object::kind::STACK => brk(10),
                     object::kind::FLDCW => brk(11),
+                    object::kind::X87TAG => brk(12),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => {
@@ -3686,6 +3687,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             // M2 task 4: a translated FLDCW whose word changes the exception masks: the instruction runs alone, as the
             // resident's transaction (a one-instruction unit cuts it).
             object::kind::FLDCW if b.flags & cache::STEP == 0 => step_from(s, f, b, &site),
+            // M2 task 4: an x87 stack fault found by the instruction's check at its start: the instruction runs alone (its
+            // one-instruction unit has no such check: it computes the masked response).
+            object::kind::X87TAG if b.flags & cache::STEP == 0 => step_from(s, f, b, &site),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }

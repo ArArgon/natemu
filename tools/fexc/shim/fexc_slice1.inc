@@ -1015,6 +1015,10 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
       if (!nowait) fexc_x87_waiting.insert(rip);
       if (memory && (op == 0xD9 || op == 0xDD) && (r == 2 || r == 3)) fexc_x87_store.insert(rip);
       fexc_x87_length[rip] = uint8_t(d.InstSize);
+      if (!memory) fexc_x87_quiet.insert(rip);
+      // fst(p) m32; fisttp/fist/fistp m32, m16; fistp m64, fisttp m64 (FST m64 and m80 convert with integer words: no flag)
+      if (memory && ((op == 0xD9 && (r == 2 || r == 3)) || ((op == 0xDB || op == 0xDF) && r >= 1 && r <= 3) || (op == 0xDF && r == 7) || (op == 0xDD && r == 1)))
+        fexc_x87_hold.insert(rip);
     }
     if (v.x87 == 1) {   // I6: FSW exception flags from FPSR, the x87 FPCR; FCOM forms and FTST signal, FIST/FRNDINT raise PE
       const uint8_t m = d.ModRM, r = (m >> 3) & 7;

@@ -2306,7 +2306,7 @@ impl Verifier<'_> {
         use object::kind::*;
         for i in 0..self.c.stubs.len() {
             let (st, c) = (self.c.stubs[i], self.checks[i]);
-            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM | FLDCW) {
+            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM | FLDCW | X87TAG) {
                 continue;
             }
             let at = st.native_offset;
@@ -2373,6 +2373,16 @@ impl Verifier<'_> {
                         return fail();
                     }
                     c.start - 12
+                }
+                X87TAG => {
+                    // M2 task 4, an x87 instruction's stack check: `lsr w0, wF, wI; tbz|tbnz w0, #0, stub`.
+                    let ok = matches!(c.cond, Some(0x3600_0000 | 0x3700_0000))
+                        && c.start == c.end
+                        && words(1).is_some_and(|w| w[0] & 0xffe0_fc1f == 0x1ac0_2400);
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 4
                 }
                 DENORM => {
                     // The in-block DE screen skip's check: `ldrb w0, [x28, #DE_PENDING]; cbnz w0, stub`, before its instruction's first floating-point

@@ -213,7 +213,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb', 'x87tag': 'brk #0xc'}
 M64 = (1 << 64) - 1
 
 
@@ -301,6 +301,11 @@ def guards(d, dis, order):
                                              re.fullmatch(r'eor w0, w0, w\d+', dis.get(t - 8, '')) and dis.get(t - 12) == 'ldrh w0, [x28, #0x4b0]'):
                 out.append(f'stub +{at} (fldcw): its check is not `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0`')
             elif s['kind'] == 'fldcw':
+                ok.add(t)
+            # M2 task 4, an x87 instruction's stack check: `lsr w0, wF, wI; tbz|tbnz w0, #0, stub`.
+            if s['kind'] == 'x87tag' and not (re.fullmatch(rf'tbn?z w0, #(0x)?0, {at:#x}', dis.get(t, '')) and re.fullmatch(r'lsr w0, w\d+, w\d+', dis.get(t - 4, ''))):
+                out.append(f'stub +{at} (x87tag): its check is not `lsr w0, wF, wI; tbz|tbnz w0, #0`')
+            elif s['kind'] == 'x87tag':
                 ok.add(t)
     cost['stub'] = len(stubs)
     if {o for o in order if dis[o].startswith('brk')} != set(stubs):
@@ -709,6 +714,11 @@ X87_PENDING = 0x412
 # either way), the run byte and the FPCR the run started with. Bookkeeping, not guest state: a store of one before a fault
 # site changes nothing the guest can see.
 X87_RUN_STATE = ((0x411, 1), (0x414, 1), (0xb0, 4))
+# M2 task 4, lazy x87 flags (shim/fexc_hook.h): inside an x87 run the flags of the x87 instructions that completed are in FPSR
+# until these five words or them into the exception word. The guest's status word is the OR of the two either way, so the
+# store changes nothing a fault at a later site of the instruction can show (FNSTSW m16, a run that ends inside an SSE
+# instruction).
+X87_FOLD = (('mrs x0, fpsr', None), ('and w0, w0, #0xff', None), ('ldr w1, [x28, #0x4b4]', None), ('orr w1, w1, w0', None), ('str w1, [x28, #0x4b4]', 0x4b4))
 # I8: the YMM upper halves (abi `frame::AVX_HIGH`, FEX's avx_high[16][2]), read and written (single or paired Q, `stp xzr`).
 AVX_HIGH = ((0xc0, 256),)
 
@@ -795,6 +805,9 @@ def verify(d, tmp, insns=None):
                 pass   # Private per-instruction flags; discarded on a fault, committed only at the instruction's end.
             elif acc and acc[0] == 'store' and acc[2:4] == ('x28', None) and acc[5] == 'none' and (acc[4], acc[1]) in X87_RUN_STATE:
                 pass   # an x87 run's bookkeeping (X87_RUN_STATE)
+            elif acc and acc[:6] == ('store', 4, 'x28', None, X87_FOLD[-1][1], 'none') and \
+                    [dis.get(off - 4 * k, '').lower().split(';')[0].strip() for k in (4, 3, 2, 1)] == [t for t, _ in X87_FOLD[:-1]] and text.lower().strip() == X87_FOLD[-1][0]:
+                pass   # M2 task 4, lazy x87 flags: FPSR's flags of completed x87 instructions or-ed into the exception word (X87_FOLD)
             elif acc and acc[0] == 'store':
                 out.append(f'{tag}: store +{off} "{text}" before the site')
             bad = dests & sra
