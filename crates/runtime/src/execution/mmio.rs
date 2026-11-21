@@ -147,6 +147,45 @@ fn local(s: &mut State, gpa: u64, width: u64, data: Option<u64>) -> Option<u64> 
     }
 }
 
+/// M2 task 4: a 4-byte load of a local APIC register, completed in place: the Arm load word that aborted (`ldr wT`, checked
+/// here to be one: unsigned offset, register offset or unscaled, no writeback) gets the register's value in `wT` and the
+/// block goes on after it, as after a load from RAM, where [`device`] would bank the state, end the block and dispatch at
+/// the next RIP. The same access, made once: a read of an APIC register has no effect ([`super::lapic::peek`] answers only
+/// those), and nothing [`device`] does after its access has anything to do here (no data breakpoint is armed, and the
+/// instruction's end is the block's business as for any load). Linux reads the in-service register at every INT 0x80
+/// system call (since 6.7, to tell the instruction from an external interrupt on its vector) and the timer's current
+/// count from its clock event code. Returns when the access is not such a load.
+pub(super) fn load_in_place(s: &State, site: &Site, gpa: u64, elr: u64, spsr: u64) {
+    if site.kind != object::kind::LOAD || site.width != 4 || site.writeback != object::WB_NONE || s.cpu.dr[5] & DR7_ENABLES != 0 {
+        return;
+    }
+    // SAFETY: `elr` is the aborted word of a live block (the caller found its site there).
+    let word = unsafe { (elr as *const u32).read() };
+    let plain = match word >> 21 {
+        0x5ca | 0x5cb => true,                                        // ldr wT, [xN, #imm]
+        0x5c3 => word >> 10 & 3 == 2,                                 // ldr wT, [xN, xM/wM, extend]
+        0x5c2 => word >> 10 & 3 == 0,                                 // ldur wT, [xN, #imm]
+        _ => false,
+    };
+    if !plain {
+        return;
+    }
+    let Some(value) = super::lapic::peek(s, gpa) else {
+        return;
+    };
+    unsafe {
+        let frame = &raw mut (*shared()).captured;
+        if word & 31 != 31 {
+            (*frame).x[(word & 31) as usize] = value & 0xffff_ffff;
+        }
+        let mut m = read_record(exchange());
+        m.completed += 1;
+        write_record(exchange(), &m);
+        write_record(record(), s);
+        resume(s, frame, elr + 4, spsr)
+    }
+}
+
 /// Completes the access at `site` of `b` to device byte `gpa` (`None`: the access crosses a page, refused).
 pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa: Option<u64>) -> ! {
     match site.kind {

@@ -463,6 +463,11 @@ pub(super) fn mmio(
         }),
     }))
 }
+/// The value a 4-byte load of the xAPIC page at `gpa` reads, when it is one [`mmio`] would answer from a register with no
+/// effect (this vCPU's page, the APIC in xAPIC mode, a register that exists and can be read): what [`super::mmio::load_in_place`] serves.
+pub(super) fn peek(s: &State, gpa: u64) -> Option<u64> {
+    (claims(gpa) && base() & (EN | EXTD) == EN && gpa & 0xf == 0).then(|| read(s, (gpa & 0xfff) >> 4, false))?
+}
 /// A register's value (register numbers are xAPIC offset / 16 = x2APIC MSR - 0x800), `None` for an index the APIC does
 /// not implement or a write-only one (x2APIC: #GP; xAPIC: an illegal register access, read as 0).
 fn read(s: &State, reg: u64, x2apic: bool) -> Option<u64> {

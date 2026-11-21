@@ -516,6 +516,30 @@ this kernel reaches through an indirect jump, so it arrives by a dispatcher miss
 change would serve every IRET that a block exits into directly, in 64-bit kernels too. With it the system and SMP
 families pass (35,323 cases).
 
+Built after the owner's decision ("cheaper APIC, more efficient IRET"; merged, with the one-pass path above):
+
+- **The APIC read in place.** Linux does not use x2APIC here although natemu offers it: without interrupt remapping it
+  enables x2APIC only under a hypervisor it recognizes, and natemu presents a bare machine. So the read stays a
+  memory-mapped one, and what could go was what followed it: the shim banked the whole state, ended the block and
+  dispatched at the next instruction. Now a 4-byte load of a local APIC register puts the value in the Arm load's
+  register and the block goes on, as after a load from RAM (a register read has no effect; with a data breakpoint
+  armed, or any other access form, the old path runs). Generic: every kernel that reads its local APIC through memory
+  (the timer's current count, the in-service register) gets it.
+- **IRET reached by an indirect jump.** Linux's return path jumps to its IRET through a register, so it arrives as a
+  dispatcher miss, not as a block's exit. The miss path, which already has made every check the one-pass path needs,
+  now runs a kept IRET itself instead of declining to the full path.
+
+| `hackbench32-int80` (s), one boot each, same hour | run 1 | run 2 |
+| --- | --- | --- |
+| Before (the head without the three changes) | 28.75 | 28.47 |
+| After | 24.91 | 24.93 |
+
+13% faster. 64-bit `hackbench`, four variants in three alternating rounds (the head; with the one-pass path; with the
+APIC read only; with all): 10.99, 10.95, 10.89 and 10.98 s on average, the rounds themselves differing by 0.3 to 0.8 s,
+so no change that can be told from a boot's noise. (A first comparison of two pairs had suggested 1 to 2% slower; the
+rounds did not confirm it.) The system, SMP and fault families pass with it (77,181 cases). Still there per call: the
+delivery itself (the IDT entry, the stack switch, five pushes) and the APIC read's trap and page walk.
+
 ## 64-bit integers through the x87: two prototypes for the owner's choice
 
 Compilers copy a 64-bit integer on i686 with FILD m64 then FISTP m64 (atomic loads and stores); natemu's x87 registers
