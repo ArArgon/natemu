@@ -2483,6 +2483,22 @@ class Slice1X87Commit(unittest.TestCase):
         self.assertGreater(stale, mapped // 2)
 
 
+    def test_a_restarted_compile_keeps_no_x87_map_of_the_first_attempt(self):
+        # (The review of M2 task 4's map.) FEX's JIT starts a unit over when its code outgrows the buffer or a branch's
+        # reach; what the x87 hooks recorded for the first attempt (the maps, the slots of a map not yet closed) must go
+        # with it. 2,400 instructions restart: one map per instruction's start then, each at a PC-table entry of its
+        # instruction, none twice (the compiler before the fix gave 4,798 records for 2,399 instructions).
+        body = ['fld qword ptr [eax]', 'fstp qword ptr [ebx]', 'pshufb xmm1, xmmword ptr [ecx]', 'bsf edx, dword ptr [esi]'] * 600
+        d, rc = run(x86_asm(['.code32'] + body), RIP, '--bitness', '32', '--ext-conds', '4', '--push-run', '--narrow-cmp', '--x87-guess', '0x1000')
+        self.assertEqual((rc, d['guest']['instructions_translated'], d['code']['layout']['spill_bytes']), (0, len(body), 0))
+        entries = {(e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries']}
+        keys = [m['insn_native_offset'] for m in d['x87_maps']]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(len(keys), len(body) - 1)   # (every instruction but the first has pending x87 state before it)
+        self.assertTrue(all((m['insn_native_offset'], m['guest_offset']) in entries for m in d['x87_maps']))
+        self.assertTrue(all(sum(r != 255 for r in m['regs']) <= 2 for m in d['x87_maps']))   # (at most the two registers the pair of instructions wrote)
+
+
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1DivisionChecks(unittest.TestCase):
     def test_p11_pins_the_exact_check(self):

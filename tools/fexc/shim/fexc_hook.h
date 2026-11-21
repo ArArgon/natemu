@@ -114,6 +114,7 @@ inline std::vector<FexcSiteInfo> fexc_sites;
 struct FexcX87MapInfo { uint32_t insn_native_offset; uint32_t guest_offset; uint8_t top; uint8_t tags; uint8_t reg[8]; };
 inline std::vector<FexcX87MapInfo> fexc_x87_maps;
 inline uint8_t fexc_x87_slots[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};   // the FexcX87Slot ops since the last FexcX87Map
+inline uint32_t fexc_x87_slots_guest = ~0u;    // the guest instruction those slots were recorded in (a map takes its own instruction's only)
 inline std::vector<FexcInsnInfo> fexc_insns;
 inline FexcMapT<uint64_t, bool> fexc_cf_inverted; // guest offset -> CF inversion at that instruction's start (dispatcher state)
 inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue subtracts from sp (ResetStack restores them)

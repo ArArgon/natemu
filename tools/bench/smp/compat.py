@@ -783,6 +783,28 @@ DEPTH_USER = REGS32 + f"""    fninit
     ret
 .three: dd 3
 """
+# ---- faults with x87 registers not yet in the guest state (M2 task 4) --------------------------------------------------------
+# In a translation made for a known x87 stack top, the registers pushed and changed so far stay in host registers across
+# instructions with memory operands; at a fault the resident rebuilds them from the instruction's record. Three registers
+# pushed and one changed, then an x87 store to a page not present (the handler maps it and the store runs again), a push,
+# an integer store to another page not present, more arithmetic; FNSAVE then shows every register, the top and the tags.
+X87FAULT_USER = REGS32 + f"""    fninit
+    fld1
+    fldz
+    fild dword [.three]
+    fadd st0, st2
+    fst qword [{VPAGE + 0x10:#x}]
+    fld st0
+    fmul st0, st1
+    mov [{XPAGE + 0x20:#x}], eax
+    fxch st2
+    fsubp st1, st0
+    fild dword [.three]
+    fistp dword [{VPAGE + 0x20:#x}]
+    fnsave [{XPAGE + 0x100:#x}]
+""" + _zero(XPAGE + 0x100 + 12, 16) + f"""    int 0x80
+.three: dd 3
+"""
 A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
 X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
               A5(R + 0x6c0, 0x80), P.zero(R + 0x740, 0x8c0)]
@@ -904,6 +926,8 @@ def positive32():
             program('c32-forms@1', ENTER() + handlers(), FORMS_USER, FORMS_MEMORY),
             program('c32-x87@1', X87_BODY, X87_USER, X87_MEMORY),
             program('c32-x87-depth@1', X87_BODY, DEPTH_USER, [P.zero(R, 0x100)]),
+            program('c32-x87-faults@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
+                    X87FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
             program('c32-faults@1', GATES + ENTER() + handlers(END + RESUME, **vec), FAULT_USER32, log=0x1000),
             program('c32-memfaults@1', GATES + UNMAP + ENTER() + handlers(END + MAP + RESUME, **vec), MEMFAULT_USER,
                     [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
