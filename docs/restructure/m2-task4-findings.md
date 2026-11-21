@@ -790,9 +790,16 @@ Speed, 1 vCPU, seconds (run 1 / run 2) or Mflops:
 | SciMark 32-bit x87, composite | 1285 | 35 |
 | SciMark 32-bit SSE2: composite, FFT, SOR, Monte Carlo, sparse, LU | 2699, 2595, 3945, 256, 2539, 4159 | 2106, 746, 1758, 61, 3567, 4399 |
 
-So nothing of this task's x87 work reaches a Mac without AFP: x87 code there is where it was at the start (the stack in
-host registers, the lazy flags, the runs and the integer FLD are all built on AFP's results, and without it every x87
-operation still goes through the per-operation wrapper with its fix-ups). 32-bit x87 programs are about 150 times
+So almost nothing of this task's x87 speed reaches a Mac without AFP. Exactly what runs there: the x87 stack is kept in
+host registers across a block, the block is compiled for its starting stack top, and no state is written before
+instructions that can fault, as with AFP (the pass's `FexcCache()` has no AFP condition; the state test runs the no-AFP
+code too). What stays per operation is the wrapper: each x87 operation switches Arm's control and status registers to
+the x87's and back and copies its flags, and FLDCW stays in the shim. Those are the parts with the AFP condition:
+`FexcX87Runs()` in `tools/fexc/shim/fexc_sites.inc`, `FexcX87Lazy()` and `FexcFldcwInline()` in
+`tools/fexc/shim/fexc_hook.h` (each has `!fexc_no_afp`). The wrapper is what the time goes to: `cray32-small` takes
+105 s there against 123 s at the start, so the register caching alone is worth 15%. (An earlier note of this page's
+author said hosts without AFP "get the register caching but keep the per-operation flag copy": that is the same
+state; this section's first wording, "nothing reaches", was too strong.) 32-bit x87 programs are about 150 times
 slower on such a Mac than on an M4-class core, beyond the cores' own difference. The page-crossing stores and the
 system-call work do not depend on AFP (LU: 4,399). The sparse multiply does not have the regression there (no runs,
 so no test). What it would take: the same caches with the NaN and denormal fix-ups done per operation inside a run; a
