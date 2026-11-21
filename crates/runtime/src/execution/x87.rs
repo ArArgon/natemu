@@ -111,6 +111,17 @@ pub(super) fn fold_run(fpsr: u64) {
     let flags = if held & 0x20 != 0 { held } else { fpsr } & 0x9f;
     set32(frame::X87_EXCEPTIONS, get32(frame::X87_EXCEPTIONS) | flags);
 }
+/// M2 task 4: the x87 stack state at a fault point of an instruction before which generated code wrote nothing of it
+/// ([`natemu_abi::code_object::X87Map`]): the registers still in host registers, TOP and the tag byte, into the page.
+pub(super) fn rebuild(map: &natemu_abi::code_object::X87Map, f: &NativeFrame) {
+    for (r, &v) in map.reg.iter().enumerate() {
+        if let Some(q) = f.q.get(v as usize) {
+            set_mm(r as u64, u64::from_le_bytes(q[..8].try_into().unwrap()));
+        }
+    }
+    set8(frame::X87_TOP, u64::from(map.top));
+    set_abridged(u64::from(map.tags));
+}
 /// The full tag word (SDM Vol.1 8.1.7): 11 empty, else from the double: 01 zero, 10 NaN or infinity, 00 valid (a denormal
 /// double is a normal 80-bit value).
 pub(super) fn ftw() -> u64 {

@@ -192,13 +192,14 @@ struct Capture {
   std::vector<Inst> insts;
   std::vector<Block> blocks;
   std::vector<FexcSiteInfo> sites;
+  std::vector<FexcX87MapInfo> x87_maps;
   std::vector<FexcInsnInfo> insn_info;
   uint32_t spill_bytes = 0;
   // Emptied for the next request with every vector's storage kept (a fresh Capture freed and regrew them all each time).
   void Clear() {
     fired = false; info = {}; spill_bytes = 0;
     code.clear(); pcs.clear(); subblocks.clear(); prologues.clear(); relocs.clear(); dispatch_exits.clear(); sra_gpr.clear(); sra_fpr.clear();
-    insts.clear(); blocks.clear(); sites.clear(); insn_info.clear();
+    insts.clear(); blocks.clear(); sites.clear(); x87_maps.clear(); insn_info.clear();
   }
 } Cap;
 
@@ -279,7 +280,7 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag", "x87guess"};
+                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag", "x87guess", "x87map"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -297,6 +298,7 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
   Cap.sra_gpr.assign(dd.FexcSRAGPR, dd.FexcSRAGPR + dd.FexcSRAGPRCount);
   Cap.sra_fpr.assign(dd.FexcSRAFPR, dd.FexcSRAFPR + dd.FexcSRAFPRCount);
   Cap.sites = fexc_sites;
+  Cap.x87_maps = fexc_x87_maps;
   Cap.insn_info = fexc_insns;
   Cap.spill_bytes = fexc_spill_bytes;
   const auto* bi = t->FrontendDecoder->GetDecodedBlockInfo();
@@ -382,7 +384,7 @@ static void ResetGlobals() {
   Cap.Clear();
   Diagnostics.clear();
   W = {};
-  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0; fexc_self_exits = 0;
+  fexc_sites.clear(); fexc_x87_maps.clear(); memset(fexc_x87_slots, 0xff, 8); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0; fexc_self_exits = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
@@ -995,6 +997,14 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     j.end_arr();
 
     // Access sites: every native instruction FEX emitted for a guest memory access, recorded at emission.
+    // M2 task 4 (shim/fexc_hook.h): the x87 stack state at the fault points of an instruction, where the code did not write it.
+    j.arr("x87_maps");
+    for (auto& m : Cap.x87_maps) {
+      j.elem_obj().kv("insn_native_offset", m.insn_native_offset).kv("guest_offset", m.guest_offset).kv("top", int(m.top)).kv("tags", int(m.tags));
+      j.arr("regs"); for (uint8_t r : m.reg) { j.sep(); j.s += std::to_string(r); } j.end_arr();
+      j.end_obj();
+    }
+    j.end_arr();
     j.arr("sites");
     for (auto& s : Cap.sites) {
       j.elem_obj().kv("native_offset", s.native_offset).kv("guest_offset", s.guest_offset);
@@ -1070,10 +1080,24 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     put(56, tail_off, 4); put(60, Cap.spill_bytes, 4);
     f.insert(f.end(), code.begin(), code.end());
     pad(8);
-    put(64, f.size(), 4); put(68, Cap.sites.size(), 4);
-    for (auto& s : Cap.sites) {
+    // The site table: the access sites and stubs, and each x87 map as a record of kind X87MAP at its instruction's native
+    // offset + 1 (no word is there: found by that key alone): TOP and the tag byte in guest_offset2, the eight host registers
+    // in imm (registers 0..3) and base_reg, index_reg, extend, shift (4..7).
+    std::vector<FexcSiteInfo> rows = Cap.sites;
+    for (auto& m : Cap.x87_maps) {
+      FexcSiteInfo s {};
+      s.native_offset = m.insn_native_offset | 1; s.guest_offset = m.guest_offset; s.guest_offset2 = uint32_t(m.top) | uint32_t(m.tags) << 8;
+      s.insn_native_offset = m.insn_native_offset; s.kind = FEXC_SITE_X87MAP; s.located = 1;
+      s.imm = int32_t(uint32_t(m.reg[0]) | uint32_t(m.reg[1]) << 8 | uint32_t(m.reg[2]) << 16 | uint32_t(m.reg[3]) << 24);
+      s.base_reg = m.reg[4]; s.index_reg = m.reg[5]; s.extend = m.reg[6]; s.shift = m.reg[7];
+      s.access_native_offset = FEXC_NONE32; s.ir_op = "x87map";
+      rows.push_back(s);
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; });
+    put(64, f.size(), 4); put(68, rows.size(), 4);
+    for (auto& s : rows) {
       const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN || s.kind == FEXC_SITE_STACK;   // a stub's guest_offset2 is its access site
-      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
+      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.kind != FEXC_SITE_X87MAP && MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
                         s.flags_written_before, s.ordering, s.completed_effects, s.located}) f.push_back(b);

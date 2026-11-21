@@ -3350,6 +3350,13 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     };
     bank(&mut s.cpu, f, nzcv, site.cf_inverted != 0);
     s.cpu.rip = cache::running_rip(b).wrapping_add(site.guest_offset as u64);
+    // M2 task 4: the x87 stack state generated code did not write before this instruction ([`object::kind::X87MAP`]).
+    let sites = cache::sites(b);
+    if let Ok(i) = sites.binary_search_by_key(&(site.insn_native_offset | 1), |m| m.native_offset)
+        && let Some(map) = object::x87_map(&sites[i])
+    {
+        x87::rebuild(&map, f);
+    }
 }
 
 /// Self-modifying code: the instruction at `site` of `b` writes `gpa`'s page (a store, a split store or its walk's

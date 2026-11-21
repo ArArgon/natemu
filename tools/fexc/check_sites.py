@@ -400,6 +400,14 @@ def check_program(p, tmp):
         if sp['code']['hex'][:2 * end] != d['code']['hex'][:2 * end]:
             problems.append(('ERROR', 'sparse and dense PC tables give different code bytes'))
     o = read_object(tmp / 'o.bin')
+    # M2 task 4: the object's site table also holds the x87 maps (kind 24, at an instruction's native offset + 1): compared
+    # with the JSON's `x87_maps`, then set aside.
+    maps = [r for r in o['sites'] if r[5] == 24]
+    o['sites'] = [r for r in o['sites'] if r[5] != 24]
+    want = [(m['insn_native_offset'] | 1, m['guest_offset'], m['top'] | m['tags'] << 8, m['insn_native_offset'], int.from_bytes(bytes(m['regs'][:4]), 'little', signed=True),
+             24, *m['regs'][4:]) for m in d.get('x87_maps', [])]
+    if [(r[0], r[1], r[2], r[3], r[4], r[5], r[10], r[11], r[12], r[13]) for r in maps] != want:
+        problems.append(('ERROR', 'object x87 maps disagree with the JSON'))
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
     kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap', 'atomic', 'align',

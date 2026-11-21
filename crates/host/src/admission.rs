@@ -650,6 +650,17 @@ fn admit_records(
     }
     // The FMA NaN checks (AFP accurate plan chunk 4) are in the body, between the access sites: apart; then the access sites, then the
     // check stubs placed after the body.
+    // M2 task 4: the x87 maps are no access and no stub: apart, each a well-formed record at an instruction's start (a PC-table
+    // entry of its guest offset). A wrong map could only give the guest a wrong x87 state of its own.
+    let (maps, sites): (Vec<Site>, Vec<Site>) = sites.iter().partition(|s| s.kind == object::kind::X87MAP);
+    for s in &maps {
+        if object::x87_map(s).is_none()
+            || s.guest_offset >= h.guest_bytes
+            || !pcs.iter().any(|p| (p.native_offset, p.guest_offset) == (s.insn_native_offset, s.guest_offset))
+        {
+            return fail(&format!("x87 map at native offset {:#x}", s.native_offset));
+        }
+    }
     let (fma, rest): (Vec<Site>, Vec<Site>) = sites.iter().partition(|s| s.kind == object::kind::FMA);
     for s in &fma {
         if !site_fields_valid(s, &h, region) || !fma_site_ok(s) {

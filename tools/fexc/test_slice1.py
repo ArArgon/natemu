@@ -2384,7 +2384,7 @@ class Slice1X87Commit(unittest.TestCase):
         flags = bytes(buf[0x410 + k] for k in (0, 5, 6, 8, 9, 10, 11, 14))   # IE PE SF C0 C1 C2 TOP C3
         return [buf[0x420 + 16 * i:0x428 + 16 * i].hex() for i in range(8)], flags.hex(), buf[0x4b2], hex(word), buf[0x1000:0x1100].hex()
 
-    def x87_run(self, d, cut, buf, ptr, patch=(), fpcr=6):
+    def x87_run(self, d, cut, buf, ptr, patch=(), fpcr=6, maps=None, insn=None):
         """Runs the code of compile `d` up to the word at `cut` on `buf`; (buf after, FPSR). Branches to stubs fall through."""
         lay = d['code']['layout']
         code = bytes.fromhex(d['code']['hex'])
@@ -2398,15 +2398,24 @@ class Slice1X87Commit(unittest.TestCase):
             if t is not None and t >= cut:
                 self.assertIn(t, patch, f'a branch at +{at} leaves the code before +{cut}')
                 words[k] = 0xd503201f
-        x, _, out = native_run(words + [0xd53b4420], buf=bytes(buf), ptrs=[(ptr, 0x1000)], fpcr=fpcr)   # mrs x0, fpsr
-        return bytearray(out), x[0]
+        x, v, out = native_run(words + [0xd53b4420], buf=bytes(buf), ptrs=[(ptr, 0x1000)], fpcr=fpcr)   # mrs x0, fpsr
+        out = bytearray(out)
+        if maps is not None and (m := maps.get(insn)):
+            # The x87 map of the instruction (the code wrote nothing of the x87 state before it): as the resident rebuilds
+            # the page from it when it banks the state at one of the instruction's fault points (runtime x87::rebuild).
+            for r, reg in enumerate(m['regs']):
+                if reg != 255: out[0x420 + 16 * r:0x428 + 16 * r] = (v[reg] & (1 << 64) - 1).to_bytes(8, 'little')
+            out[0x41b], out[0x4b2] = m['top'], m['tags']
+        return out, x[0]
 
     @needs_afp_host
     def test_the_page_holds_the_x87_state_before_every_fault_point(self):
         # (guess: the 32-bit block also compiled for the stack top and tags it starts with, `--x87-guess`: the registers are
-        # fields at fixed offsets and the tag byte a constant; its test's stub is a fault point like the others.)
+        # fields at fixed offsets and the tag byte a constant; its test's stub is a fault point like the others. Such a block
+        # writes no x87 state before an instruction that can fault: at its fault points the state is the page's with the
+        # instruction's x87 map applied, which must again be what the instructions before it leave when run alone.)
         # (afp: the code for a Mac without AFP, run here under its FPCR: the same caches, the flags copied after each op.)
-        points = stubs_seen = guessed = exits = 0
+        points = stubs_seen = guessed = exits = mapped = stale = 0
         for bits, guess, afp in ((64, False, True), (32, False, True), (32, True, True), (64, False, False), (32, True, False)):
             extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else []) + ([] if afp else ['--feature', 'afp=0'])
             fpcr = 6 if afp else 0
@@ -2426,6 +2435,8 @@ class Slice1X87Commit(unittest.TestCase):
                     code = bytes.fromhex(d['code']['hex'])
                     stubs = {s['native_offset'] for s in d['sites'] if s['kind'] in check_sites.STUBS}
                     self.assertEqual(any(s['kind'] == 'x87guess' for s in d['sites']), guess, (bits, prog))
+                    maps = {m['insn_native_offset']: m for m in d['x87_maps']}
+                    self.assertTrue(guess or not maps, (bits, prog))   # (the map needs the guess: every register's number)
                     # the state before each instruction, each one alone before it
                     before, ref, fault = [], bytearray(buf), None
                     for i, h in enumerate(each):
@@ -2451,8 +2462,12 @@ class Slice1X87Commit(unittest.TestCase):
                                        o + 4 * (w >> 5 & (0x7ffff if s['kind'] == 'x87guess' else 0x3fff)) == s['native_offset'])
                             stubs_seen += s['kind'] == 'x87tag'
                             guessed += s['kind'] == 'x87guess'
-                        got, fpsr = self.x87_run(d, cut, buf, ptr, stubs, fpcr)
+                        got, fpsr = self.x87_run(d, cut, buf, ptr, stubs, fpcr, maps, s['insn_native_offset'])
                         self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, guess, afp, filled, lines[i], s['kind'], s['native_offset']))
+                        if s['insn_native_offset'] in maps:
+                            mapped += 1
+                            raw, fpsr = self.x87_run(d, cut, buf, ptr, stubs, fpcr)   # (without the map the page alone is not the state)
+                            stale += self.x87_state(raw, fpsr) != before[i]
                         points += 1
                     if fault is None:   # the block's exit (its last instructions may be register-only: nothing after them wrote the page but the exit)
                         lay = d['code']['layout']
@@ -2464,6 +2479,8 @@ class Slice1X87Commit(unittest.TestCase):
         self.assertGreater(stubs_seen, 80)
         self.assertGreaterEqual(guessed, 4 * len(self.X87_PROGRAMS))
         self.assertGreater(exits, 30)
+        self.assertGreater(mapped, 100)
+        self.assertGreater(stale, mapped // 2)
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
