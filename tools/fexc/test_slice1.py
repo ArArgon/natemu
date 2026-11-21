@@ -2325,6 +2325,14 @@ class Slice1Exits(unittest.TestCase):
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1X87Commit(unittest.TestCase):
+    def test_the_integer_pair_is_taken_only_where_a_full_stack_leaves_the_unit(self):
+        # FILD m64, FISTP m64 stores the integer read (the store's site marked for the resident). With an x87 exception
+        # unmasked the FILD's stack check is inline: onto a full stack it pushes the indefinite, which the FISTP must
+        # convert (the integer indefinite, IE; QEMU has no x87 stack faults to compare a VM case with), so no pair there.
+        marked = lambda *extra: [s['guest_offset2'] for s in run('df2bdf7b08', RIP, *extra)[0]['sites'] if s['kind'] == 'store']
+        self.assertEqual(marked(), [0xC0000001])
+        self.assertEqual(marked('--x87-unmasked', '0x4'), [None])
+
     def test_fault_site_allows_pending_flags_but_rejects_early_architectural_flags(self):
         import verify_precision as vp
         d, rc = run('df38')  # FISTP qword ptr [rax]: conversion precedes the faultable store.
@@ -2373,13 +2381,14 @@ class Slice1X87Commit(unittest.TestCase):
         # one-instruction units' quieting multiply
         ['fld qword ptr [rbx+24]', 'fld qword ptr [rbx+200]', 'fxch st(1)', 'fstp qword ptr [rbx+64]', 'fld qword ptr [rbx]', 'fld qword ptr [rbx+208]',
          'fstp qword ptr [rbx+72]', 'fstp qword ptr [rbx+80]', 'fstp qword ptr [rbx+88]'],
+        ['fld qword ptr [rbx+40]', 'fld qword ptr [rbx+216]', 'fstp qword ptr [rbx+64]', 'fstp qword ptr [rbx+72]'],   # (infinity, -0)
         # MMX between x87 instructions: two MMX instructions in a row (the top and tags set once), EMMS, x87 again
         ['fld1', 'fld qword ptr [rbx]', 'movq mm1, qword ptr [rbx+16]', 'paddb mm1, mm1', 'movq qword ptr [rbx+64], mm1', 'emms', 'fldz',
          'fadd qword ptr [rbx+8]', 'fstp qword ptr [rbx+72]'],
     ]
     X87_MEMORY = struct.pack('<8d', 1.5, -2.25, 1e300, 1e-320, 3.0, float('inf'), 7.0, 0.1) + bytes(8)
     X87_MEMORY = X87_MEMORY[:32] + struct.pack('<ff', 1e-40, 2.5) + struct.pack('<i', -7) + X87_MEMORY[44:]
-    X87_MEMORY = X87_MEMORY.ljust(200, b'\0') + struct.pack('<QQ', 0x7ff0000000000001, 0xfff8000000001234)   # an SNaN, a QNaN with a payload
+    X87_MEMORY = X87_MEMORY.ljust(200, b'\0') + struct.pack('<QQQ', 0x7ff0000000000001, 0xfff8000000001234, 1 << 63)   # an SNaN, a QNaN with a payload, -0
 
     @staticmethod
     def x87_state(buf, fpsr):

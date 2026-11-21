@@ -145,11 +145,57 @@ pub(super) fn forget_integer() {
         unsafe { (page(at) as *mut u64).write_volatile(0) }
     }
 }
-/// CR3 was loaded: the kept integer is another address space's unless its CR3 is this one ([`frame::x87_int_live`]).
-pub(super) fn address_space(cr3: u64) {
-    let get = |at: u32| unsafe { (page(at) as *const u64).read_volatile() };
-    let live = frame::x87_int_live(get(frame::X87_INT_KEPT_RIP), get(frame::X87_INT_CR3), cr3);
-    unsafe { (page(frame::X87_INT_RIP) as *mut u64).write_volatile(live) }
+fn get64(at: u32) -> u64 {
+    unsafe { (page(at) as *const u64).read_volatile() }
+}
+fn set64(at: u32, v: u64) {
+    unsafe { (page(at) as *mut u64).write_volatile(v) }
+}
+/// The entry, if there is one under `cr3` ([`frame::x87_int_kept`]: not one generated code used or cleared) and ST(0) is
+/// still its double: the integer ST(0) stands for.
+pub(super) fn kept_integer(cr3: u64) -> Option<u64> {
+    (frame::x87_int_kept(
+        get64(frame::X87_INT_KEPT_RIP),
+        get64(frame::X87_INT_CR3),
+        get64(frame::X87_INT_RIP),
+        cr3,
+    ) && valid(top())
+        && mm(top()) == get64(frame::X87_INT_ST0))
+    .then(|| get64(frame::X87_INT))
+}
+/// CR3 goes from `old` to `new`: an entry gone under `old` is dropped; the kept integer is another address space's unless
+/// its CR3 is the new one ([`frame::x87_int_live`]).
+pub(super) fn address_space(old: u64, new: u64) {
+    let (rip, cr3) = (get64(frame::X87_INT_KEPT_RIP), get64(frame::X87_INT_CR3));
+    if !frame::x87_int_kept(rip, cr3, get64(frame::X87_INT_RIP), old) {
+        return forget_integer();
+    }
+    set64(frame::X87_INT_RIP, frame::x87_int_live(rip, cr3, new));
+}
+/// The review of the kept integer: the entry lives through a save and restore of the x87 registers between the fault and
+/// the FISTP m64's second run (the fault sleeps and another task runs, the task moves to another vCPU, a signal is
+/// delivered on the way back, the kernel uses the FPU: `kernel_fpu_begin`). The save image holds ST(0) as the integer
+/// itself (the 80-bit format holds every 64-bit integer: what hardware's image holds; [`super::xsave`]), and a restore
+/// whose ST(0) is such an integer, one that no double holds, makes the entry again, here: for the register's double as
+/// restored, and for the RIP and address space of the next return to CPL 3 ([`bind_integer`]), which the kernel makes
+/// right after it restores a task's registers. A program that restores such an image itself and does not return to a
+/// FISTP m64 leaves an entry for an RIP it is not at: as any stale entry, it can only give an integer that converts to
+/// exactly the double in ST(0).
+pub(super) fn restored_integer(integer: u64) {
+    set64(frame::X87_INT, integer);
+    set64(frame::X87_INT_ST0, mm(top()));
+    set64(frame::X87_INT_CR3, frame::X87_INT_UNBOUND);
+    set64(frame::X87_INT_KEPT_RIP, frame::X87_INT_UNBOUND);
+    set64(frame::X87_INT_RIP, 0);
+}
+/// A system instruction went to CPL 3 at `rip` under `cr3`: a restored entry is for that instruction.
+#[inline(always)]
+pub(super) fn bind_integer(rip: u64, cr3: u64) {
+    if get64(frame::X87_INT_KEPT_RIP) == frame::X87_INT_UNBOUND {
+        set64(frame::X87_INT_CR3, cr3);
+        set64(frame::X87_INT_KEPT_RIP, rip);
+        set64(frame::X87_INT_RIP, rip);
+    }
 }
 /// The full tag word (SDM Vol.1 8.1.7): 11 empty, else from the double: 01 zero, 10 NaN or infinity, 00 valid (a denormal
 /// double is a normal 80-bit value).

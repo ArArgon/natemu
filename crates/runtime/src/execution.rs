@@ -2589,8 +2589,13 @@ fn system(s: &mut State, i: System) {
     }
     #[cfg(feature = "perf")]
     let t0 = perf_ticks();
+    let cpl = s.cpu.cpl;
     if let Err(e) = transaction(s, i) {
         deliver(s, Event::Exception(e))
+    }
+    // M2 task 4: a return to CPL 3 (IRET, SYSRET, SYSEXIT) is what an integer kept by a restore of the x87 registers is for.
+    if cpl != 3 && s.cpu.cpl == 3 {
+        x87::bind_integer(s.cpu.rip, s.cpu.cr3 & !(1 << 63));
     }
     cache::control().system_counts[(i.kind & 127) as usize] += 1;
     #[cfg(feature = "perf")]
@@ -2902,8 +2907,9 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                             (0..256).all(|i| unsafe { p.cast::<u64>().add(i).read() } == 0)
                         })
                     });
+                    let old = s.cpu.cr3 & !(1 << 63);
                     s.cpu.cr3 = v;
-                    x87::address_space(v & !(1 << 63)); // M2 task 4: the integer kept for a FISTP m64 is one address space's
+                    x87::address_space(old, v & !(1 << 63)); // M2 task 4: the integer kept for a FISTP m64 is one address space's
                     // A new address space starts with the shared stack check again: the count and so code context bit 33 clear (the
                     // next dispatch recomputes the context and selects its table; both variants stay in the pool). A process that
                     // trips the check `STACK_TRAP_LIMIT` times costs only its own space, not the vCPU's later code, kernel included.

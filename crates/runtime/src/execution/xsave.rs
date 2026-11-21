@@ -26,7 +26,7 @@
 use super::segments::{Exception, address, linear, noncanonical, pages};
 use super::*;
 
-use natemu_abi::x87::{from_f80, to_f80};
+use natemu_abi::x87::{f80_int, from_f80, int_f80, to_f80};
 
 const NM: Exception = [7, 0, 0];
 /// The legacy region bytes the processor writes, the XSAVE header and the AVX component (offset and size, CPUID.0DH.2).
@@ -312,8 +312,13 @@ fn legacy(c: &Cpu, img: &mut [u8]) {
     img[24..28].copy_from_slice(&(c.mxcsr as u32).to_le_bytes());
     img[28..32].copy_from_slice(&(MXCSR_MASK as u32).to_le_bytes());
     let top = x87::top();
+    // M2 task 4: ST(0) standing for a kept integer is saved as that integer ([`x87::restored_integer`]).
+    let kept = x87::kept_integer(c.cr3 & !(1 << 63)).filter(|&i| i != 0);
     for k in 0..8 {
-        let (mant, se) = to_f80(x87::mm(top + k));
+        let (mant, se) = match kept {
+            Some(i) if k == 0 => int_f80(i),
+            _ => to_f80(x87::mm(top + k)),
+        };
         let at = 32 + 16 * k as usize;
         img[at..at + 8].copy_from_slice(&mant.to_le_bytes());
         img[at + 8..at + 10].copy_from_slice(&se.to_le_bytes());
@@ -346,6 +351,14 @@ fn load_x87(s: &mut State, img: &[u8]) {
                 fcw >> 10 & 3,
             ),
         );
+    }
+    // M2 task 4: ST(0) an integer that no double holds (and not empty) is kept for a FISTP m64 ([`x87::restored_integer`]).
+    let st0 = f80_int(
+        u64::from_le_bytes(img[32..40].try_into().unwrap()),
+        u16::from_le_bytes([img[40], img[41]]),
+    );
+    if let Some(i) = st0.filter(|_| img[4] >> (fsw >> 11 & 7) & 1 != 0) {
+        x87::restored_integer(i);
     }
 }
 /// XMM0..`n` from the image, or zero (their initial configuration).

@@ -821,6 +821,8 @@ INT64_USER = REGS32 + f"""    fninit
     fild qword [.max]
     mov eax, ebx
     fistp qword [{VPAGE + 0x50:#x}]
+    fild qword [.odd]
+    fisttp qword [{VPAGE + 0x58:#x}]
     int 0x80
 .odd: dq 0x4000000000000001
 .max: dq 0x7fffffffffffffff
@@ -853,6 +855,57 @@ INT64_SPACE_USER = REGS32 + f"""    fninit
     fistp qword [{VPAGE + 0x30:#x}]
     int 0x80
 .odd: dq 0x4000000000000001
+"""
+# The review of the kept integer, two cases.
+# (1) An entry that was used does not come back: the #PF handler loads CR3 again each time (a kernel with page-table
+# isolation does at every return). The FISTP's second run stores the kept 2^62 + 1; later the same FISTP is reached by a
+# jump, starting a block, with 2^62 in ST(0) (the double 2^62 + 1 was held as) after another fault: it stores 2^62.
+_PF = f"""    cmp qword [rsp], 14
+    jne .not_pf
+    and qword [rsp+32], ~0x10000
+    mov rax, cr2
+    invlpg [rax]
+    shr rax, 12
+    or qword [{PTE(0):#x} + rax*8], 3
+"""
+INT64_AGAIN = _PF + """    mov rax, cr3
+    mov cr3, rax
+    jmp .resume
+.not_pf:
+"""
+INT64_AGAIN_USER = REGS32 + f"""    fninit
+    fild qword [.odd]
+.store:
+    fistp qword [{VPAGE + 0x30:#x}]
+    cmp dword [{VPAGE + 0x40:#x}], 0
+    jne .done
+    mov eax, [{VPAGE + 0x30:#x}]
+    mov [{VPAGE + 0x48:#x}], eax
+    mov eax, [{VPAGE + 0x34:#x}]
+    mov [{VPAGE + 0x4c:#x}], eax
+    mov dword [{VPAGE + 0x40:#x}], 1
+    mov [{XPAGE + 0x10:#x}], eax
+    fild qword [.other]
+    mov eax, .store
+    jmp eax
+.done:
+    int 0x80
+.odd: dq 0x4000000000000001
+.other: dq 0x4000000000000000
+"""
+# (2) The x87 registers saved and restored between the fault and the second run (what a kernel does when the fault sleeps
+# and another task runs, when it delivers a signal, when it uses the FPU itself): FXSAVE, FNINIT, a push, FXRSTOR in the
+# handler. The image holds ST(0) as the 80-bit 2^62 + 1 (copied out to be compared), and the FISTP stores 2^62 + 1.
+INT64_SAVED = _PF + f"""    fxsave [{LOW1:#x}]
+    fninit
+    fldpi
+    fxrstor [{LOW1:#x}]
+    mov rax, [{LOW1 + 32:#x}]
+    mov [{VPAGE + 0x60:#x}], rax
+    movzx eax, word [{LOW1 + 40:#x}]
+    mov [{VPAGE + 0x68:#x}], rax
+    jmp .resume
+.not_pf:
 """
 A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
 X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
@@ -978,6 +1031,10 @@ def positive32():
             program('c32-x87-int64@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
                     INT64_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             program('c32-x87-int64-space@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_SPACE + RESUME, **vec),
+                    INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
+            program('c32-x87-int64-again@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_AGAIN + RESUME, **vec),
+                    INT64_AGAIN_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
+            program('c32-x87-int64-saved@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_SAVED + RESUME, **vec),
                     INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             program('c32-x87-faults@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
                     X87FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),

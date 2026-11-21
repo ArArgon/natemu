@@ -1,4 +1,26 @@
 # Written by `natemu-test lock`; do not edit (docs/testing.md).
+[answers.068c765bce3bf85e22a6a245e7f88cd95ef3bf6e787db707d33645982d5ba1ca]
+aux = "{\"ncpu\":1}"
+repro = "1251e4d561b3 image_sha256=2f852042d350e4cf728c9d61167a1f72915b74d30ef3a4d58506f3bcdfa085fc"
+sha256 = "e17c511640f68e25ed088e1b149ecb8ee9556ff257e129deff0d210f82ed8ca8"
+
+[answers."068c765bce3bf85e22a6a245e7f88cd95ef3bf6e787db707d33645982d5ba1ca#exit"]
+aux = "{\"rc\":1}"
+repro = "0769aa0dc550 image_sha256=2f852042d350e4cf728c9d61167a1f72915b74d30ef3a4d58506f3bcdfa085fc"
+sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
+value = "exit 1"
+
+[answers."068c765bce3bf85e22a6a245e7f88cd95ef3bf6e787db707d33645982d5ba1ca/qemu_fault"]
+aux = "{\"ncpu\":1}"
+repro = "72ce5871a40d image_sha256=2f852042d350e4cf728c9d61167a1f72915b74d30ef3a4d58506f3bcdfa085fc"
+sha256 = "e17c511640f68e25ed088e1b149ecb8ee9556ff257e129deff0d210f82ed8ca8"
+
+[answers."068c765bce3bf85e22a6a245e7f88cd95ef3bf6e787db707d33645982d5ba1ca/qemu_fault#faults"]
+aux = "{\"value\":[null]}"
+repro = "55be81b8f107 image_sha256=2f852042d350e4cf728c9d61167a1f72915b74d30ef3a4d58506f3bcdfa085fc"
+sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
+value = "[null]"
+
 [answers.0b7f30fc525af05bc47405850b76c94f2fbca8b5b376b94b7fff7af5e9b66b14]
 aux = "{\"ncpu\":1}"
 repro = "1251e4d561b3 image_sha256=bcff633629762790b1fc62af8b75ac4adef5dd0f70b5c52d55136eae6512e750"
@@ -119,6 +141,28 @@ sha256 = "a8479b5a90d9bcdda19079c714a3c37264b79cb263315d3278f9f916f9065d39"
 [answers."1e02d84a484fce976a76ddc256ba8c9f300de87bd0d8f780630e72db71e60bd7/qemu_fault#faults"]
 aux = "{\"value\":[null]}"
 repro = "55be81b8f107 image_sha256=f98b3c5e3cc36fbebba144efa19125517f7d79502596c81551d784b16b3e4010"
+sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
+value = "[null]"
+
+[answers.1f04d921ada933099343d598f734bccec94dbb3369e360a0a182d82328c5468c]
+aux = "{\"ncpu\":1}"
+repro = "1251e4d561b3 image_sha256=c02fc4491c6d8f4780d1261409da532bcd2e75a5f36b82e551e2c882b5b58724"
+sha256 = "6bf08b35e7bf1ffec6aded5d5b6d94b8598c242894608601ff986f149068b4f9"
+
+[answers."1f04d921ada933099343d598f734bccec94dbb3369e360a0a182d82328c5468c#exit"]
+aux = "{\"rc\":1}"
+repro = "0769aa0dc550 image_sha256=c02fc4491c6d8f4780d1261409da532bcd2e75a5f36b82e551e2c882b5b58724"
+sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
+value = "exit 1"
+
+[answers."1f04d921ada933099343d598f734bccec94dbb3369e360a0a182d82328c5468c/qemu_fault"]
+aux = "{\"ncpu\":1}"
+repro = "72ce5871a40d image_sha256=c02fc4491c6d8f4780d1261409da532bcd2e75a5f36b82e551e2c882b5b58724"
+sha256 = "6bf08b35e7bf1ffec6aded5d5b6d94b8598c242894608601ff986f149068b4f9"
+
+[answers."1f04d921ada933099343d598f734bccec94dbb3369e360a0a182d82328c5468c/qemu_fault#faults"]
+aux = "{\"value\":[null]}"
+repro = "55be81b8f107 image_sha256=c02fc4491c6d8f4780d1261409da532bcd2e75a5f36b82e551e2c882b5b58724"
 sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
 value = "[null]"
 
@@ -1105,6 +1149,28 @@ sha256 = "240a2309b58ebdd35816b3de56869544f0e6cd53486f715c6924d337ef32c431"
 [answers."f340225f1cae50ac4df6c09e5abb9355a5424cc707c5897a25f59cac5451e36d/qemu_fault#faults"]
 aux = "{\"value\":[null]}"
 repro = "55be81b8f107 image_sha256=abe694c555817a84586b8e81411b9e5fe3edbfaafdbc67ff4bdda6f38f0cc975"
+sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
+value = "[null]"
+
+[answers.f5cb2d5ac6d118bfd91bb7221e8b201df210042a13cf3fbf91b0a04cc69a4366]
+aux = "{\"ncpu\":1}"
+repro = "1251e4d561b3 image_sha256=039ccfcb854e4c3043ae1bc408ad8c07adee890be1acf7b217a5991b1bc60565"
+sha256 = "032989ecf0667c6de463f9651dc0c84e9d63ed6be321c6ef3fba29c3bc03ef48"
+
+[answers."f5cb2d5ac6d118bfd91bb7221e8b201df210042a13cf3fbf91b0a04cc69a4366#exit"]
+aux = "{\"rc\":1}"
+repro = "0769aa0dc550 image_sha256=039ccfcb854e4c3043ae1bc408ad8c07adee890be1acf7b217a5991b1bc60565"
+sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
+value = "exit 1"
+
+[answers."f5cb2d5ac6d118bfd91bb7221e8b201df210042a13cf3fbf91b0a04cc69a4366/qemu_fault"]
+aux = "{\"ncpu\":1}"
+repro = "72ce5871a40d image_sha256=039ccfcb854e4c3043ae1bc408ad8c07adee890be1acf7b217a5991b1bc60565"
+sha256 = "032989ecf0667c6de463f9651dc0c84e9d63ed6be321c6ef3fba29c3bc03ef48"
+
+[answers."f5cb2d5ac6d118bfd91bb7221e8b201df210042a13cf3fbf91b0a04cc69a4366/qemu_fault#faults"]
+aux = "{\"value\":[null]}"
+repro = "55be81b8f107 image_sha256=039ccfcb854e4c3043ae1bc408ad8c07adee890be1acf7b217a5991b1bc60565"
 sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
 value = "[null]"
 
