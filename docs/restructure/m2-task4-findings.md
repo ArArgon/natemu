@@ -256,6 +256,65 @@ What changes elsewhere:
   constant" to mean "this is FLD's own multiply by one", which a constant pushed by an earlier instruction (FLDZ) now
   also looks like. It now checks that the constant is 1.0.
 
+### Where c-ray stands now, and the floor
+
+Full-size `cray32` at this head: **26.8 / 27.1 s** (526.9 / 523.2 before the change; more than 1,800 at checkpoint A).
+
+The same two binaries run natively on the x86 reference machine (a Ryzen 7 8845HS, one thread, three runs each, all
+within 0.01 s):
+
+| | 64-bit c-ray (SSE) | 32-bit c-ray (x87) | x87 / SSE |
+| --- | --- | --- | --- |
+| Real x86, 1280x960 | 3.62 s | 9.19 s | 2.5 |
+| natemu on the M4, 1280x960 | 3.17 s | 26.8 s | 8.5 |
+| natemu / real x86 | 0.88 | 2.9 | |
+| Real x86, 320x240 (x87 build) | | 0.58 s (natemu 1.83 to 1.95) | |
+
+So a factor of 2.5 between the two builds is the program's own (x87 code is slower on real hardware too), and the
+x87 build's picture is bit for bit the real machine's at both sizes (hashes 564b520c... and 2cf47b1e...). What is ours
+is the remaining factor of about 3.3: natemu runs the SSE build at 0.88 of the Ryzen's time and the x87 build at 2.9.
+
+A profile of `cray32-small` (the whole boot, both runs; 5.7 s): 3.92 s in translated code, 1.17 s in the host (0.75 s
+of it compiling: 65,200 compiles, because 32-bit code is compiled again at every program start and the benchmark runs
+with the disk cache off), about 0.55 s in the shim (links 0.14, system instructions 0.11, the rest under 0.06 each).
+No floating-point trap, no stack-check trap. So the runs themselves are about 95% translated code.
+
+What the translated code is made of, counted on c-ray's hottest block (477 Arm instructions for 85 x87 instructions; a
+static count of one block, not weighted over the run, which the tools at hand cannot do cheaply):
+
+| | Instructions | Share |
+| --- | --- | --- |
+| The work itself: arithmetic, the program's loads and stores, FLD's quieting multiply, page-crossing checks of stores | 131 | 27% |
+| Writing x87 registers to the guest state before instructions that can fault | 98 | 21% |
+| Tag bits: the masks, the tag byte, the two-instruction tests | 129 | 27% |
+| The stack top: its byte and the register numbers derived from it | 43 | 9% |
+| Flags, condition bits, starting the run, the rest | 76 | 16% |
+
+### Would predicting the stack top pay? The hit rate
+
+Measured with a probe (not kept: a call into the shim at the first x87 instruction of each block piece, which
+compares the stack top and the tag byte with what the same place saw the first time):
+
+| Workload | Entries with the top as first seen | Different | Hit rate | Tags also as first seen |
+| --- | --- | --- | --- | --- |
+| cray32-small (two runs) | 273,059,516 | 551,156 | 99.80% | in every hit |
+| sqlite32 | 1,685,617 | 0 | 100% | in every hit |
+| startup32 | 2,535,587 | 0 | 100% | in every hit |
+| CPython's regression modules (i386 campaign, 1 vCPU) | 89,720,685 | 501,311 | 99.44% | in every hit |
+
+So the top is predictable. What a known top would still save, as an **estimate** from the block above: the register
+numbers become constants (15 instructions), the address arithmetic of each write goes (49), and the tag masks become
+constants (about 73 of 129): about 137 of 477 instructions, 29%, less an entry check of three or four instructions per
+block. The tag tests themselves are already cheap (16 instructions here). It needs a second version of a block for the
+misses (a trap per miss would cost more than it saves at c-ray's 0.2%), which the shim cannot do today. Not built;
+estimated at 8 to 12 agent hours.
+
+The larger lead, also an **estimate**: not writing the x87 state before instructions that can fault at all, and
+letting the shim rebuild it at a fault from a record of where each register lives (as it already does for the
+general registers). That would remove most of the 98 write instructions and of the tag and top traffic that goes with
+them: about 200 of 477 instructions, 40%. It touches the site records, the shim, admission and the checkers; a guess
+of 15 to 25 agent hours. Keeping the x87 registers in fixed host registers across blocks would add to either.
+
 ## 64-bit integers through the x87: two prototypes for the owner's choice
 
 Compilers copy a 64-bit integer on i686 with FILD m64 then FISTP m64 (atomic loads and stores); natemu's x87 registers
