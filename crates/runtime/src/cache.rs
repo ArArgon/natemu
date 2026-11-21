@@ -85,6 +85,14 @@ fn split_point(
         return (0, 0);
     }
     let exit = |o: u64| e[..n].contains(&(o as u32));
+    // M2 task 4: the run's end a block's top test for an open x87 run branches to ([`run_tested`]) stands behind the body's
+    // exits and is no site: cold, as the check stubs (it runs when x87 code jumped to SSE code, and then goes on in the
+    // block's code below).
+    let entry = u64::from(natemu_abi::execution::ENTRY_OFFSET);
+    let cbnz = word(entry + 4);
+    let run_end = (word(entry) == 0x3940_0380 | natemu_abi::execution::frame::X87_RUN << 10 && cbnz & 0xff80_001f == 0x3500_0000)
+        .then(|| entry + 4 + u64::from(cbnz >> 5 & 0x7_ffff) * 4);
+    let stub = |o: u64| stub(o) || run_end == Some(o);
     let Some(h) = natemu_abi::execution::body_end(word, u64::from(size), |o| exit(o) || stub(o)) else {
         return (0, 0);
     };
@@ -1949,6 +1957,27 @@ pub enum Link {
     /// `source` has no link point to the target, or one holds a word the cache did not put there.
     Bad,
 }
+/// M2 task 4, the second entry: whether `code` (a block with code) begins with the test for an open x87 run (`ldrb w0,
+/// [x28, #X87_RUN]; cbnz w0, <the run's end, behind the body>`: fexc puts it there, and only there, in a unit of 32-bit code
+/// that has no x87 instruction and an SSE instruction that needs the run closed; the host's code shape check pins the run's
+/// end and that the block opens no run). Such a block opens no run, so behind its test none is open, to its every exit.
+/// (The word after a conditional branch is a word the block reaches anyway: entering there needs no trust in the rest.)
+fn run_tested(code: &Block) -> bool {
+    let at = code.entry() - area::CODE_VA;
+    code.code_size != 0
+        && code.flags & (SYSTEM | STEP) == 0
+        && word(at) == 0x3940_0380 | natemu_abi::execution::frame::X87_RUN << 10
+        && word(at + 4) & 0xff00_001f == 0x3500_0000
+}
+/// Where a plain link from `source`'s code enters `code` (code-area offset): its body entry, or, from a block that leaves
+/// with no x87 run open into a block that begins with the test for one, the word after the test's two ([`run_tested`]:
+/// the test would find nothing). A property of the two blocks' words alone, so the same whenever the link is made, checked
+/// or made again. Every other entry into a block runs its test: the dispatcher and L1, the resident's own entries, a link
+/// through a dispatcher slot, a link from any other block.
+fn link_entry(source: &Block, code: &Block) -> u64 {
+    let skip = if run_tested(code_of(source)) && run_tested(code) { 8 } else { 0 };
+    code.entry() - area::CODE_VA + skip
+}
 /// Links every link point of `source` to `target.rip` (in the same context) to `target`: its first word becomes `b`
 /// to the target's entry, recorded with the original word in the segment of its kind ([`Control::links_tlb`]: local,
 /// else by the target's [`GLOBAL`], which stays as it is while the target is current, that is while the link is there).
@@ -2013,7 +2042,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
             d => d,
         }
     } else {
-        code.entry() - area::CODE_VA
+        link_entry(source, code)
     };
     // (The record keeps the native offset; the word a plain link patches is [`link_at`]'s.)
     let offset_of = |p: &LinkPoint| if checked { svc_slot(source, p) } else { u64::from(p.offset) };
@@ -2522,7 +2551,7 @@ fn unlink_word(r: LinkRecord) -> Option<u64> {
         let into = word(at) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(at));
         return (into && r.original == pic::SVC_LINK).then(|| restore(at));
     }
-    let entry = block(r.target as usize).entry() - area::CODE_VA;
+    let entry = link_entry(source, block(r.target as usize));
     links_to(at, entry).then(|| restore(at))
 }
 
@@ -2998,7 +3027,6 @@ fn relink(n: usize) {
         crate::execution::halt_native([n as u64, control().armed, 0], natemu_abi::execution::stop::BAD_LINK)
     }
     let global = block(n).flags & GLOBAL != 0;
-    let entry = block(n).entry() - area::CODE_VA;
     let mut batch = [0u32; 64];
     let mut held = 0;
     let mut at = block(n).inbound;
@@ -3026,7 +3054,7 @@ fn relink(n: usize) {
             control().relink_dropped += 1;
             continue;
         }
-        unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(link_word(word_at, entry)) };
+        unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(link_word(word_at, link_entry(source, block(n)))) };
         batch[held] = word_at as u32;
         held += 1;
         if held == batch.len() {

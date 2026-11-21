@@ -623,6 +623,11 @@ fn bulk_words(w: u32) -> Vec<(u32, Bulk)> {
 }
 /// How a stub is reached: the words `start..=end` end in its branch; `cond` is the normalized conditional branch
 /// (the far form `!cond +8; b stub` normalized to `cond`), `None` for a plain `b`.
+/// M2 task 4: the end of an x87 run (fexc `FexcX87RunEnd`): the run's flags from FPSR into the x87 exception word, FPCR back,
+/// FPSR and the run byte cleared.
+const RUN_END: [u32; 9] =
+    [0xd53b_4420, 0x1200_1c00, 0xb944_b781, 0x2a00_0021, 0xb904_b781, 0xb940_b380, 0xd51b_4400, 0xd51b_443f, 0x3910_539f];
+const _: () = assert!(RUN_END[8] == 0x3900_039f | frame::X87_RUN << 10);
 #[derive(Clone, Copy)]
 struct Check {
     start: u32,
@@ -792,8 +797,10 @@ impl<'a> Verifier<'a> {
             bulk: Vec::new(),
             aligned_before: Vec::new(),
         };
-        // A probing split stub's branch back to its store: a branch like the others for every rule on targets.
-        let (returns, back): (Vec<_>, Vec<_>) = back.into_iter().partition(|&(at, t)| v.probe_return(at, t));
+        // A probing split stub's branch back to its store, and the branch back from the run's end of a top x87 run test:
+        // branches like the others for every rule on targets.
+        let (returns, back): (Vec<_>, Vec<_>) =
+            back.into_iter().partition(|&(at, t)| v.probe_return(at, t) || v.run_end_return(at, t));
         v.branches.extend(returns);
         for (at, t) in back {
             let words = v.bulk_loop(at, t).ok_or(format!(
@@ -1063,9 +1070,26 @@ impl<'a> Verifier<'a> {
                 .binary_search_by_key(&at, |s| s.native_offset)
                 .is_ok()
         };
+        // M2 task 4, the second entry: a block that begins with the test for an open x87 run (`ldrb w0, [x28, #X87_RUN];
+        // cbnz w0, E`; the resident's linker enters it behind those two words from another such block,
+        // `runtime::cache::link_entry`) is 32-bit code, has at E exactly the run's end and the branch back to its third
+        // word ([`Self::run_end_return`]), and never opens a run: no store to the run byte but of zero. So behind the test
+        // no run is open, to every exit, which is what a link that skips the next block's test relies on.
+        let run_tested = self.run_test().is_some();
+        if shape && run_tested && !self.c.bits32 {
+            return fail(ENTRY_OFFSET, "x87 run test at the top of 64-bit code");
+        }
+        // (Its return is among the branches only if `run_end_return` held.)
+        if shape && run_tested && !self.branches.iter().any(|&(_, t)| t == ENTRY_OFFSET + 8) {
+            return fail(ENTRY_OFFSET, "x87 run test at the block's top without the run's end and its return");
+        }
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             let Some(i) = self.insn(at) else { continue };
             let w = self.word(at);
+            // (strb wN, [x28, #X87_RUN], N not the zero register: a run opened.)
+            if shape && run_tested && w & !31 == RUN_END[8] & !31 && w & 31 != 31 {
+                return fail(at, "x87 run opened in a block that begins with the test for one");
+            }
             if i.writes() & 1 << 28 != 0 {
                 return fail(at, "write to x28");
             }
@@ -1451,6 +1475,30 @@ impl<'a> Verifier<'a> {
             let k = i64::from(at) - i64::from(s.native_offset) - 24;
             (s.kind == object::kind::SPLIT && (-24..=16).contains(&k) && matches!(self.insn(s.native_offset + 24), Some(Insn::Probe(_))))
                 .then_some((i, k))
+        })
+    }
+    /// The block's top test for an open x87 run (M2 task 4: `ldrb w0, [x28, #X87_RUN]; cbnz w0, E` as its first two words):
+    /// E, where the run's end must be.
+    fn run_test(&self) -> Option<u32> {
+        if (self.c.code.len() as u32) < ENTRY_OFFSET + 12 {
+            return None;
+        }
+        let cbnz = self.word(ENTRY_OFFSET + 4);
+        (self.word(ENTRY_OFFSET) == 0x3940_0380 | frame::X87_RUN << 10
+            && cbnz & 0xff00_001f == 0x3500_0000)
+            .then(|| ENTRY_OFFSET + 4 + (cbnz >> 5 & 0x7_ffff) * 4)
+            .filter(|&e| cbnz >> 23 & 1 == 0 && e > ENTRY_OFFSET + 8 && e + 40 <= self.c.code.len() as u32)
+    }
+    /// The backward branch at `at` to `t` is the return from the run's end of the block's top test: the run's end's nine
+    /// words stand where the test branches, this branch after them, back to the block's third word (the test's fall-through),
+    /// and nothing else enters them. It closes no loop: only the test, before `t`, leads here.
+    fn run_end_return(&self, at: u32, t: u32) -> bool {
+        self.run_test().is_some_and(|e| {
+            at == e + 36
+                && t == ENTRY_OFFSET + 8
+                && (0..9).all(|k| self.word(e + 4 * k) == RUN_END[k as usize])
+                && self.insn(e - 4).is_none_or(|x| !x.falls_through())
+                && self.branches_into(e - 4, at).all(|(src, to)| src == ENTRY_OFFSET + 4 && to == e)
         })
     }
     /// The backward branch at `at` to `t` is a probing split stub's return to its store, and makes no loop: it goes to a
@@ -2706,6 +2754,45 @@ mod tests {
         // A probe anywhere else; a second way into the stub, from after the word it returns to.
         validated(block, 0x4, 0x9100_20c1, 0x383f_003f, Some("page probe outside a split stub"));
         assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24
+    }
+
+    /// M2 task 4, with `FEXC` set: the test for an open x87 run at the top of a 32-bit block of SSE code (`mulsd xmm0, xmm1`):
+    /// `ldrb w0, [x28, #X87_RUN]` at 0x4, `cbnz w0, E` at 0x8, the run's end's nine words at E and the branch back to 0xc.
+    #[test]
+    fn top_run_tests_are_verified() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let object = std::env::temp_dir().join(format!("natemu-admit-run-{}", std::process::id()));
+        let out = std::process::Command::new(&fexc)
+            .args(["--hex", "f20f59c1", "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--ext-conds", "4", "--object"])
+            .arg(&object)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let block = (std::fs::read(&object).unwrap(), vec![0xf2, 0x0f, 0x59, 0xc1]);
+        let _ = std::fs::remove_file(&object);
+        let block = (&block.0[..], &block.1[..]);
+        let admit = |o: &[u8], shape: bool| {
+            let h: Header = super::super::record(o, 0);
+            super::super::admit_mode(o, h.guest_rip, block.1, u64::MAX, shape, false, true).map(|_| ())
+        };
+        admit(block.0, true).unwrap();
+        admit(block.0, false).unwrap();
+        let h: Header = super::super::record(block.0, 0);
+        let word = |at: u32| u32::from_le_bytes(block.0[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+        assert_eq!(word(4), 0x3940_0380 | frame::X87_RUN << 10);
+        let end = 8 + (word(8) >> 5 & 0x7_ffff) * 4;
+        assert_eq!((word(8) & 0xff00_001f, word(end), word(end + 36)), (0x3500_0000, RUN_END[0], 0x1400_0000 | (0xc_u32.wrapping_sub(end + 36) / 4) & 0x3ff_ffff));
+        // The return is the one backward branch: not to another word, and only behind the run's end's exact words (so
+        // also with the code shape off).
+        for (at, new) in [(end + 36, word(end + 36) + 1), (end, NOP), (end + 32, NOP)] {
+            let e = admit(&patched(block, at, word(at), new), false).expect_err("admitted");
+            assert!(e.contains("not forward"), "{at:#x}: {e}");
+        }
+        // A block that begins with the test opens no run (the code shape).
+        let opened = patched(block, end + 32, word(end + 32), word(end + 32) & !31 | 1); // strb w1, [x28, #X87_RUN]
+        assert!(admit(&opened, true).is_err());
     }
 
     #[test]

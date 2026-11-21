@@ -800,17 +800,70 @@ breakpoint on an x87 instruction).
 instruction, and only in 32-bit blocks that contain no x87 instruction at all but do contain an SSE instruction that
 needs the run closed. Such a block cannot open a run, so after its test, or when entered behind it, no run is open
 anywhere in it and at every one of its exits: "no run is open when I leave" is a property of the block, not of a
-path. The block's second entry is the word after the test's eleven words. The linker uses the second entry of the
-target exactly when both blocks have the test at their top (it reads the two words; the host's object validation pins
-the rest), because then the predecessor leaves with no run open and the eleven words would do nothing. Every other
-way in takes the first entry and runs the test: the dispatcher and its table, the shim's own entries, the fast miss
-and system-call paths, links from blocks without the property (x87 code, integer-only code, 64-bit code), and links
-through a dispatcher slot (shared code). A copy of a block has the same words, so the same property. A link is
-removed with either block, as every link is. Moving the test up is itself exact: it only ends a run earlier, at a
-point where the state is consistent (the block's start), and nothing between the top and the SSE instruction depends
-on the x87's control register. The checkers: object validation requires the exact eleven words when a block starts
-with the test's first word; the code-shape check and `verify_precision.py` require that a block with the test never
-writes a non-zero run byte (so the property holds) and that it is 32-bit code.
+path. The test is two words (load the run byte, branch if set); the run's end it branches to stands behind the
+block's body and branches back. The block's second entry is the word after the test. The linker uses the second
+entry of the target exactly when both blocks begin with the test (it reads the two words; the word after a
+conditional branch is a word the block reaches anyway, so nothing new is trusted), because then the predecessor
+leaves with no run open and the test would find nothing. Every other way in takes the first entry and runs the test:
+the dispatcher and its table, the shim's own entries, the fast miss and system-call paths, links from blocks without
+the property (x87 code, integer-only code, 64-bit code), and links through a dispatcher slot (shared code). A copy of
+a block has the same words, so the same property. A link is removed with either block, as every link is. Moving the
+test up is itself exact: it only ends a run earlier, at a point where the state is consistent (the block's start),
+and nothing between the top and the SSE instruction depends on the x87's control register. The checkers (the host's
+code-shape check and `verify_precision.py`) require of a block that begins with the test: 32-bit code, the run's
+end's exact nine words where the test branches and the branch back to the block's third word after them (the second
+backward branch the host admits besides the probing stub's: reached only from the test, so it closes no loop), and
+no store to the run byte but of zero anywhere in the block, which is the property the skipped test relies on. The
+host's audit of link words after a run accepts a link behind the test between two such blocks and nowhere else.
+
+**Built, both.** The resume flag: `c32-x87-rf` (a breakpoint on a guessed block's first instruction, met twice, the
+second time with another stack top; one #DB each time, as QEMU; a second #DB with the rule taken out). The direction
+the review found, a stale RF kept after a jump from another block, has no test that fails deterministically: arming a
+breakpoint drops the vCPU's translations and a block at a breakpoint is never jumped into directly, so all that could
+show it is the RF bit in the frame of an interrupt that arrives at that very boundary.
+
+The second entry, 32-bit SSE2 SciMark, two alternating rounds against the commit before it (Mflops, run 1 / run 2):
+
+| | before | after |
+| --- | --- | --- |
+| sparse multiply | 2512 / 2517, 2514 / 2540 | 3085 / 3122, 2942 / 2903 |
+| SOR | 3832 / 3872, 3932 / 3941 | 4026 / 4030, 4062 / 4066 |
+| LU | 4084 / 4110, 4178 / 4176 | 4320 / 4353, 4361 / 4365 |
+| `cray32-sse2` (s) | 4.00 / 3.91, 4.01 / 3.96 | 3.89 / 3.82, 3.93 / 3.85 |
+| `cray32` (s) | 9.23 / 9.14, 9.16 / 9.11 | 9.23 / 9.12, 9.16 / 9.15 |
+| `hackbench32` (s) | 11.00 / 10.56, 10.67 / 10.67 | 10.71 / 10.53, 11.12 / 11.04 |
+
+Sparse is 15 to 24% faster, SOR 4%, LU 5%, c-ray with SSE2 3%; x87 c-ray and hackbench32 did not move (hackbench32's
+rounds differ among themselves by more than the two columns do). SOR and LU are now where they are with no test at
+all (measured by leaving the test out: 4,160 and 4,400). **Sparse is not back at the starting commit's 3,650**, and
+the experiments made on the way say why it cannot be promised:
+
+- The first form built had the run's end in line behind the test, the test's branch jumping over nine words every
+  time. That form lost LU 16% and gave sparse only half of what it now has: a taken branch in a block's first words,
+  right after the jump into the block, is expensive on this core. Hence the two-word test that falls through, with the
+  run's end out of line. The tests that remain in line, in blocks that mix x87 and SSE code and before the first x87
+  instruction of every 32-bit block ("is a run open already?", a branch taken on c-ray's hot path), have the same
+  shape and were not changed: a lead, with this evidence, not measured.
+- With no test at all in these blocks, sparse reads 3,675. With the test and every link behind it (also where that is
+  wrong, to measure), 2,930: the same instructions run as with no test, yet 20% slower. With two no-ops in place of
+  the test, 2,745. With the second entry sixteen bytes in instead of eight, 3,010 to 3,040. So what is left is not
+  the test's work but where the loop's words lie: this seven-instruction loop over five elements per row is sensitive
+  to its placement in a way not explained here (SOR and LU are not). The 3,650 at the starting commit is that loop at
+  a placement that happens to suit it.
+- A side finding: when the run's end stood among the block's body words (an intermediate form), blocks were laid out
+  without their hot copy's exits apart, and LU read 4,850 with all of its time in translated code. So the
+  page-crossing stub's return into the block's cold code, from which the block leaves through the shim once per
+  crossing store (the code review's note), costs LU about 10%. Not changed here; the stub would have to return into
+  the hot copy.
+
+Tests for the second entry: `c32-x87-sse-link` (the x87 rounds down, SSE to nearest; an x87 block jumps to an SSE
+block, that one to another, three times round: the first SSE block's test must run every time, the second is entered
+behind its own; the results differ in the last bit otherwise, and did when the link was made to skip the test from
+x87 code); the host's audit of link words, which every VM test ends with, accepts a link behind the test between two
+blocks that begin with it and nowhere else; a unit test of the checker's rules (the return to another word, or
+behind other words than the run's end, is refused also with the code shape off; a run opened in such a block is
+refused by the code shape). The narrow families pass (17,691 cases: unit, static, system, programs, the fault
+families' x87 parts, the i386 campaign).
 
 ### Macs without AFP (M1, M2): the same round's 32-bit cases with AFP hidden
 

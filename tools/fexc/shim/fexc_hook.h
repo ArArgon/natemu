@@ -376,6 +376,13 @@ inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_see
 inline bool fexc_x87_hold_missing = false, fexc_x87_hold_all = false;
 inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
+// fexc_x87_run_entry: what it is at the unit's entry (a JIT attempt that starts over starts from it again).
+// fexc_x87_run_top (M2 task 4, the second entry): the unit is 32-bit code with no x87 instruction and an SSE instruction that
+// needs the run closed: its test for an open run stands at the unit's top (two words; the run's end behind the body) and
+// nowhere else, no run is open anywhere behind it, and so at none of its exits. The resident's linker enters such a unit behind the test from another
+// such unit (crates/runtime cache.rs `link`).
+inline int fexc_x87_run_entry = FEXC_RUN_CLOSED;
+inline bool fexc_x87_run_top = false;
 inline int fexc_x87_run = FEXC_RUN_CLOSED;     // whether an x87 run is open at the emit cursor (unknown: 32-bit code, at an IR block's start)
 inline bool fexc_x87_m32_convert = false;      // the op being emitted is an x87 instruction's m32 convert (FexcX87Begin)
 // FEX's X87FLAG_OE_LOC byte (no FEX code uses it): set by the resident's FP trap handler when it writes a result that may be a denormal
