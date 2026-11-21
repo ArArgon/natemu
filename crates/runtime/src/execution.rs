@@ -743,7 +743,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let Some(i) = found
         .filter(|b| b.flags & cache::SYSTEM != 0)
         .map(cache::system_of)
-        .filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET | system::SYSENTER))
+        .filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET | system::SYSENTER | system::INT | system::IRET))
     else {
         return declined(s, rip, SysFastDecline::NotCurrent);
     };
@@ -771,6 +771,15 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     {
         return declined(s, rip, SysFastDecline::Boundary);
     }
+    unsafe { sys_commit(s, frame, rip, i, Some(ran)) }
+}
+/// [`sys_fast`] from the bank on: the boundary before the instruction `i` at `rip` has nothing to do but the events (tested
+/// here, after the bank), and `ran` is the block whose literal exit came here. M2 task 4: also for a dispatcher miss into a
+/// kept IRET ([`miss_fast`], whose checks are that boundary's; `ran` is `None`: a computed exit has no link to be stale):
+/// the kernel's return from an interrupt or an INT 0x80 system call is reached by an indirect jump in Linux. Returns as
+/// `sys_fast` does when it declines.
+#[inline(always)]
+unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ran: Option<&Block>) {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     s.cpu.rip = rip;
     completed(s);
@@ -785,13 +794,20 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
             system::SYSCALL => sce && s.cpu.code_mode() == Some(CodeMode::Bits64),
             system::SYSRET => sce && s.cpu.cpl == 0 && (i.size != 8 || paging::canonical(s.cpu.gpr[1])),
             system::SYSENTER => msr_get(cpu::msr(cpu::MSR_SYSENTER_CS).unwrap()) & 0xfffc != 0,
+            // M2 task 4: INT n (a 32-bit program's system call without the kernel's helper page: Go's 386 runtime) and
+            // IRET (the kernel's way back from it). Unlike the three above they read and write guest memory and may
+            // fault: the transaction delivers its own fault ([`system`]), and everything after it here (the debug state,
+            // the events now takeable, the target's segments, the lookup at the RIP it left) is what `find` would do
+            // after any system instruction, so nothing needs them to succeed. Nothing before this point has walked or
+            // written guest memory, as for the others.
+            system::INT | system::IRET => true,
             _ => false,
         };
     if !commits {
         return declined(s, rip, SysFastDecline::Other);
     }
     let generation = s.generation;
-    s.linker += 1;
+    s.linker += u64::from(ran.is_some());
     s.l2_hits += 1;
     system(s, i);
     // (SYSRETL into 32-bit code whose segments translated code cannot run, `Cpu::compat_refused`: `find` raises its #GP.)
@@ -814,7 +830,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     };
     s.l2_hits += 1;
     // As `linker` counts it: the exit's block killed meanwhile (an A write of the target's revalidation walk).
-    if s.generation != generation || ran.flags & cache::DEAD != 0 {
+    if ran.is_some_and(|ran| s.generation != generation || ran.flags & cache::DEAD != 0) {
         s.stale_links += 1;
     }
     // (DR7 arms nothing: no block is at a breakpoint.)
@@ -912,6 +928,11 @@ unsafe fn miss_fast(frame: &NativeFrame) {
         return decline_fast(if unknown { fast_decline::UNKNOWN } else { fast_decline::NO_BLOCK });
     };
     if target.flags & cache::SYSTEM != 0 {
+        // M2 task 4: a kept IRET runs from here in one pass ([`sys_commit`]); it returns only having declined.
+        let i = cache::system_of(target);
+        if i.kind == system::IRET {
+            unsafe { sys_commit(s, frame, rip, i, None) };
+        }
         return decline_fast(fast_decline::SYSTEM);
     }
     if target.flags & cache::STEP != 0 {
@@ -959,7 +980,7 @@ fn declined(s: &State, rip: u64, reason: SysFastDecline) {
     {
         let syscall = |b: &Block| {
             b.flags & cache::SYSTEM != 0
-                && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET | system::SYSENTER)
+                && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET | system::SYSENTER | system::INT | system::IRET)
         };
         if reason == SysFastDecline::After
             || cache::kept_at(rip, s.cpu.code_context()).is_some_and(syscall)
@@ -973,11 +994,11 @@ fn declined(s: &State, rip: u64, reason: SysFastDecline) {
 /// [`sys_fast`] after its instruction committed: the state is in the record; `find` goes on from its next boundary, and
 /// the rest is the linker's (`ran`, the block whose exit it was; `generation`, the cache's before the instruction).
 #[inline(never)]
-unsafe fn after_system(ran: &Block, generation: u64) -> ! {
+unsafe fn after_system(ran: Option<&Block>, generation: u64) -> ! {
     let mut s = unsafe { load() };
     let found = unsafe { find_from(&mut s, true) };
     // As `linker` counts them: a target killed as it was placed (stepped), or the exit's block gone meanwhile.
-    if found.is_none() || s.generation != generation || ran.flags & cache::DEAD != 0 {
+    if ran.is_some_and(|ran| found.is_none() || s.generation != generation || ran.flags & cache::DEAD != 0) {
         s.stale_links += 1;
     }
     match found {
@@ -3930,6 +3951,9 @@ unsafe fn access_aborted(
     // L3 (amendment): a read whose non-RAM pages are all unassigned shadows them onto the all-ones page and retries, so
     // every read form runs natively; anything else (a write, a device's page) takes the device path.
     if device != [None; 2] && (write || !mmio::ones(&mut s, f, b, site, touched, device)) {
+        if let ([Some(gpa), None], [_, None], false) = (device, touched, write) {
+            mmio::load_in_place(&s, site, gpa, elr, spsr);
+        }
         mmio::device(s, f, b, site, device[0].filter(|_| touched[1].is_none()))
     }
     // M2 (UC): an access touching UC RAM (either page of a crossing one) runs its instruction alone, from its start; in
