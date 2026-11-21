@@ -3727,10 +3727,18 @@ fn x87_guess_miss(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     let (word, bit) = natemu_abi::execution::cache::x87_varied_bit(cache::running_rip(b));
     cache::control().x87_varied[word] |= bit;
     bank_at(&mut s, f, b, site);
-    if b.flags & cache::DEAD == 0 && cache::discard(b).is_none() {
-        halt(&s, stop::BAD_LINK)
+    // (Counted as an invalidation: the RIP is requested again.)
+    if b.flags & cache::DEAD == 0 {
+        match cache::discard(b) {
+            Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
+            None => halt(&s, stop::BAD_LINK),
+        }
     }
-    completed(&mut s);
+    // The instructions before the test's completed; at the unit's first instruction none did (RF stays: a breakpoint on
+    // that instruction, already reported, is not reported again).
+    if site.guest_offset != 0 {
+        completed(&mut s);
+    }
     unsafe { dispatch(&mut s) }
 }
 #[inline(never)]
@@ -3738,7 +3746,10 @@ fn denormal_exit(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
     unsafe { (FRAME_VA as *mut u8).add(frame::DE_PENDING as usize).write_volatile(0) };
     bank_at(&mut s, f, b, site);
-    completed(&mut s);
+    // (At the block's first instruction no instruction completed: RF stays, as in `x87_guess_miss`.)
+    if site.guest_offset != 0 {
+        completed(&mut s);
+    }
     unsafe { dispatch(&mut s) }
 }
 
