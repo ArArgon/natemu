@@ -174,6 +174,26 @@ inline bool SimdFPOp(FEXCore::IR::IROps Op) {
   default: return false;
   }
 }
+// Whether the precision passes below have anything to do in this IR: a floating-point op (SimdFPOp lists every op that FlushRuleOf,
+// FlushedResultOf, the FMA passes, PlaceFPChecks' `Fp` and MarkUpperZero's scalar-insert list react to) or an x87 instruction (PlaceFPChecks
+// checks an x87 instruction's stack fault even without one). Without either, each pass leaves the IR and every global as it found them but
+// for the per-compile clears, so the callers return right after those. Most translated code is integer only (a Java server start: 9 blocks
+// in 20,000 have any floating-point op), and the passes' per-block containers were most of their cost.
+// The answer is scanned once per compile: PlaceFlushes, the first of the passes (DeadFlagCalculationEliminination::Run), scans and keeps it
+// in `FexcFpWork`, the others read it, and MarkUpperZero, the last, forgets it (-1: scan again). Kept across the passes it stays right: a
+// pass adds ops only to an IR that has floating-point ops (1: every pass runs in full, as without the cache), so an IR without stays without.
+inline int FexcFpWork = -1;
+inline bool ScanFpWork(const FEXCore::IR::IRListView& IR) {
+  if (!fexc_x87.empty()) return true;
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks())
+    for (auto [CodeNode, IROp] : IR.GetCode(BlockNode))
+      if (SimdFPOp(IROp->Op)) return true;
+  return false;
+}
+inline bool AnyFpWork(const FEXCore::IR::IRListView& IR) {
+  if (FexcFpWork < 0) FexcFpWork = ScanFpWork(IR);
+  return FexcFpWork != 0;
+}
 // The FPSR bits a SIMD check tests: those of the unmasked MXCSR exceptions (x86 flag order IE DE ZE OE UE PE -> IOC IDC DZC OFC UFC
 // IXC). AFP fallback chunk 3a, row 3: without AFP an FZ flush (DAZ and FTZ both set) raises UFC and no IXC, but x86 sets PE for a
 // flush: under effective FTZ (`--ftz`) an unmasked PE is tested through UFC too (UE is masked then, so every UFC is a flush).
@@ -549,6 +569,7 @@ inline bool NzcvWriterOp(FEXCore::IR::IROps Op) {
 template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a template: IREmitter is complete only in its caller)
   using namespace FEXCore::IR;
   auto IR = IREmit->ViewIR();
+  if (!AnyFpWork(IR)) return;   // (every instruction's Finish would return at once: no floating-point op, no x87 instruction)
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
   // In-block skip of the masked DE screen (accurate mode, no AFP, DE masked, DAZ and FTZ clear): an operand lane that is the result of an
   // earlier floating-point arithmetic op of an earlier guest instruction in the block, at the same element size and lanes (as PlaceFlushes'
@@ -889,8 +910,10 @@ inline uint8_t FlushMode(FEXCore::IR::OpSize Size, bool Scalar) {
 }
 template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   using namespace FEXCore::IR;
+  FexcFpWork = -1;   // (the first pass of a compile: scan this IR afresh)
   if (!fexc_no_afp) return;
   auto IR = IREmit->ViewIR();
+  if (!AnyFpWork(IR)) return;   // (no op FlushRuleOf names: `Ops` would stay empty)
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
   struct Found { Ref Node; uint64_t Rip; Ref Block; };
   std::vector<Found> Ops;
@@ -1020,6 +1043,7 @@ template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
   if (!fexc_no_afp) return;
   FexcMade.clear();   // (node addresses are reused from one compile to the next)
   auto IR = IREmit->ViewIR();
+  if (!AnyFpWork(IR)) return;   // (no FMA)
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
   std::vector<Ref> Ops;
   uint64_t Rip = ~0ull;
@@ -1069,6 +1093,7 @@ template<class Emitter> inline void PlaceFmaChecks(Emitter* IREmit) {
   using Ref = FEXCore::IR::Ref;
   if (!fexc_no_afp) return;
   auto IR = IREmit->ViewIR();
+  if (!AnyFpWork(IR)) return;   // (no FMA)
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
   std::vector<Ref> Ops;
   uint64_t Rip = ~0ull;
@@ -1171,8 +1196,10 @@ inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
 template<class Emitter> inline void MarkUpperZero(Emitter* IREmit) {
   using namespace FEXCore::IR;
   UpperZeroOps.clear();
+  struct Forget { ~Forget() { FexcFpWork = -1; } } Forget;   // (the last pass: the next compile scans its own IR)
   if (!fexc_no_afp) return;
   auto View = IREmit->ViewIR();
+  if (!AnyFpWork(View)) return;   // (no scalar-insert op to mark)
   std::vector<uint8_t> From(View.GetSSACount(), 16);
   auto Z = [&](auto Node) -> uint32_t {
     const uint32_t Id = [&] { if constexpr (std::is_same_v<decltype(Node), Ref>) return View.GetID(Node).Value; else return Node.ID().Value; }();

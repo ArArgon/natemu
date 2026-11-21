@@ -100,6 +100,21 @@ bool FexcIsOtherMemoryOp(std::string_view n) {
   for (auto s : names) if (s == n) return true;
   return false;
 }
+// The two name tests above by op number, built once from the op names (FexcRecordOp asks for every IR op it sees, most of which
+// are neither: 39 string compares each).
+struct FexcOpNames { bool nzcv_writer[IR::IROps::OP_LAST + 1]; bool other_memory[IR::IROps::OP_LAST + 1]; };
+const FexcOpNames& FexcNamesByOp() {
+  static const FexcOpNames T = [] {
+    FexcOpNames t {};
+    for (int i = 0; i <= int(IR::IROps::OP_LAST); ++i) {
+      const std::string_view n = IR::GetName(IR::IROps(i));
+      t.nzcv_writer[i] = FexcIsNzcvWriter(n);
+      t.other_memory[i] = FexcIsOtherMemoryOp(n);
+    }
+    return t;
+  }();
+  return T;
+}
 } // namespace
 
 // I5a: RCPPS/RCPSS/RSQRTPS/RSQRTSS raise no SIMD exception on x86; FEX's exact division would (ZE, PE, IE): FPSR around it.
@@ -922,7 +937,6 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
 
 void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   const uint32_t End = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
-  const std::string_view Name = IR::GetName(IROp->Op);
   using IR::IROps;
 
   if (IROp->Op == IROps::OP_GUESTOPCODE) {
@@ -1074,8 +1088,8 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   }
   default:
     Record = false;
-    if (FexcIsNzcvWriter(Name) || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
-    if (FexcIsOtherMemoryOp(Name)) { S.kind = FEXC_SITE_OTHER; Record = true; }
+    if (FexcNamesByOp().nzcv_writer[IROp->Op] || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
+    if (FexcNamesByOp().other_memory[IROp->Op]) { S.kind = FEXC_SITE_OTHER; Record = true; }
     break;
   }
   if (!Record) return;

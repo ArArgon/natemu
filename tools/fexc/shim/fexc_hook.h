@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory_resource>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -11,6 +12,9 @@ namespace FEXCore::Core {
 struct InternalThreadState;
 struct DebugData;
 } // namespace FEXCore::Core
+namespace FEXCore::IR {
+class IRListView;
+} // namespace FEXCore::IR
 
 struct FexcCompileInfo {
   uint64_t GuestRIP;          // entry RIP of the compiled unit
@@ -20,6 +24,13 @@ struct FexcCompileInfo {
   uint64_t TotalLength;       // bytes of those instructions
 };
 
+// The per-request tables below (every one ResetGlobals clears, fexc.cpp) take their nodes from one arena that ResetGlobals releases
+// after clearing them all: a request's inserts are pointer bumps and its reset frees nothing node by node (allocation was a fifth
+// of a compile). Only tables cleared there may use it; a table kept across requests would point into released memory.
+alignas(64) inline std::byte fexc_request_buffer[256 << 10];
+inline std::pmr::monotonic_buffer_resource fexc_request_arena {fexc_request_buffer, sizeof fexc_request_buffer, std::pmr::new_delete_resource()};
+template<class K> struct FexcSetT : std::pmr::set<K> { FexcSetT() : std::pmr::set<K>(&fexc_request_arena) {} };
+template<class K, class V> struct FexcMapT : std::pmr::map<K, V> { FexcMapT() : std::pmr::map<K, V>(&fexc_request_arena) {} };
 // Called after CPUBackend::CompileCode with the finished block (still in FEX's code buffer).
 inline void (*fexc_compile_hook)(FEXCore::Core::InternalThreadState*, const FexcCompileInfo&, const uint8_t* Code, size_t Size,
                                  const FEXCore::Core::DebugData&) = nullptr;
@@ -87,7 +98,7 @@ struct FexcSiteInfo {
 struct FexcInsnInfo { uint32_t guest_offset; uint32_t native_offset; bool cf_inverted; };
 inline std::vector<FexcSiteInfo> fexc_sites;
 inline std::vector<FexcInsnInfo> fexc_insns;
-inline std::map<uint64_t, bool> fexc_cf_inverted; // guest offset -> CF inversion at that instruction's start (dispatcher state)
+inline FexcMapT<uint64_t, bool> fexc_cf_inverted; // guest offset -> CF inversion at that instruction's start (dispatcher state)
 inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue subtracts from sp (ResetStack restores them)
 
 // ---------------------------------------------------------------------------------------------
@@ -102,6 +113,10 @@ inline bool fexc_slice1 = false;
 // fexc_ext_stop: set by GenerateIR to the last decoded block a retry may keep (a cut or early end inside a non-final one).
 inline int fexc_ext_conds = 0;
 inline int fexc_ext_stop = -1;
+// Asked by GenerateIR with the dispatcher's IR, before the passes (fexc.cpp ExtAbandon): true when the extended-block loop would
+// compile the unit again anyway; GenerateIR then returns no IR and sets fexc_ext_abandoned (the caller resets it).
+inline bool (*fexc_ext_abandon)(FEXCore::IR::IRListView&) = nullptr;
+inline bool fexc_ext_abandoned = false;
 // Request arguments (the host always sends them; fexc's own default is off): --push-run drops the split check of 2/4/8-byte stores at an 8-byte aligned base +
 // 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter); --narrow-cmp compares 8/16-bit
 // operands with a constant without materialising it (FEX Flags.cpp CalculateFlags_SUB, JIT ALUOps.cpp SubNZCV). fexc_step_unit:
@@ -149,15 +164,15 @@ inline uint64_t fexc_after_rep = 0;   // slice1: the RIP after the block's self-
 inline uint8_t fexc_self_exits = 0;
 // Profile slice1, filled by FexcPrecision::Prescan before register allocation (post-RA the JIT sees physical registers,
 // not the SSA nodes behind them); keys are IR node IDs, which RA does not change.
-inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
+inline FexcMapT<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
 struct FexcTarget { uint32_t def; int sra; };            // the target's node, or (sra >= 0) the static register it reads
-inline std::map<uint32_t, FexcTarget> fexc_target_check; // node after which to check an indirect exit's target
+inline FexcMapT<uint32_t, FexcTarget> fexc_target_check; // node after which to check an indirect exit's target
 // Profile slice1, recorded by the dispatcher's DIVOp/IDIVOp: guest RIP of each div/idiv -> its x86 operand width in bytes
 // (the #DE check needs it; FEX's IR widens the 8-bit forms).
-inline std::map<uint64_t, uint8_t> fexc_div_width;
+inline FexcMapT<uint64_t, uint8_t> fexc_div_width;
 // Profile slice1 (I2), recorded by the dispatcher's string instructions: guest RIP of each MOVS, whose load and store are two
 // memory operands (DS:RSI read, ES:RDI written), not a read-modify-write of one.
-inline std::set<uint64_t> fexc_movs;
+inline FexcSetT<uint64_t> fexc_movs;
 // The request arguments that gate forms (`--sse-gated` ... `--x87-fpcr`): reading one through its conversion sets its bit in
 // `fexc_args_read` (bit = FexcArg's Bit), so fexc can tell its caller which of them this compile depended on (fexc never read
 // the others: the compile is the same under any value of them, which lets the host's cache leave them out of its key).
@@ -209,7 +224,7 @@ constexpr uint32_t FEXC_VERW_GDT_BASE = 0x4a0;
 constexpr uint32_t FEXC_VERW_GDT_LIMIT = 0x4a8;
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
-inline std::set<uint64_t> fexc_lock_cas;
+inline FexcSetT<uint64_t> fexc_lock_cas;
 // Profile slice1 (I5a): the vCPU runs with CR0.EM or CR0.TS set or CR4.OSFXSR clear (`--sse-gated`, from the host): every SSE
 // form is cut as a system instruction (the resident raises #UD or #NM, SDM Vol.3 Table 2-2 and the SSE exception tables).
 inline FexcArg<bool, FEXC_ARG_SSE_GATED> fexc_sse_gated;
@@ -219,9 +234,9 @@ inline FexcArg<bool, FEXC_ARG_SSE_GATED> fexc_sse_gated;
 inline FexcArg<bool, FEXC_ARG_ALIGNMENT_GATED> fexc_alignment_gated;
 // Profile slice1 (I5a), recorded by the allowlist: guest RIP of each legacy SSE instruction whose 16-byte memory operand must be
 // 16-byte aligned (#GP(0) otherwise: SDM Vol.2 2.5, exception classes 1, 2 and 4); its first access gets an alignment check.
-inline std::set<uint64_t> fexc_align16;
+inline FexcSetT<uint64_t> fexc_align16;
 // Profile slice1 (I8): the same for VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT* ymm, whose 32-byte memory operand must be 32-byte aligned.
-inline std::set<uint64_t> fexc_align32;
+inline FexcSetT<uint64_t> fexc_align32;
 // Profile slice1 (I8): the vCPU's controls gate the VEX AVX forms (`--avx-gated`, from the host: CR4.OSXSAVE clear, XCR0[2:1]
 // not 11b, or CR0.TS): every one is cut as a system instruction (the resident raises #UD, else #NM).
 inline FexcArg<bool, FEXC_ARG_AVX_GATED> fexc_avx_gated;
@@ -230,10 +245,10 @@ inline FexcArg<bool, FEXC_ARG_AVX_GATED> fexc_avx_gated;
 // RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op) and get the SDM's fixed results for
 // denormal sources and RCP's tiny results (integer words around the op, shim/fexc_sites.inc FexcApproxScalar); ROUNDPS/PD/SS/SD with imm8
 // bit 3 clear raise PE when inexact (`frintx`, under the instruction's rounding mode when imm8 bit 2 is clear).
-inline std::set<uint64_t> fexc_fp_signal, fexc_fp_quiet, fexc_round_inexact;
+inline FexcSetT<uint64_t> fexc_fp_signal, fexc_fp_quiet, fexc_round_inexact;
 // Profile slice1 (M3), recorded by the allowlist: guest RIP of each MOV-family instruction -> its completion record for a
 // device access (shim/fexc_mmio.inc); fexc.cpp attaches it to the instruction's one load or store site.
-inline std::map<uint64_t, uint32_t> fexc_mmio;
+inline FexcMapT<uint64_t, uint32_t> fexc_mmio;
 // Profile slice1 (I6): x87 in FEX's reduced-precision mode (X87REDUCEDPRECISION, set by fexc for slice1): ST(i) as doubles in
 // the guest-state page (`mm[i]`, low 8 bytes), TOP/C0..C3 in FEX's flag bytes, FCW and the abridged tag word in their FEX
 // fields. From the host: `--x87-gated` (CR0.EM or CR0.TS) cuts every x87 form d8..df as a system instruction (#NM),
@@ -248,7 +263,7 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_FPCR> fexc_x87_fpcr;
 // with FPSR cleared (MXCSR's flags saved around them) and, with `fexc_x87_fpcr`, under that FPCR; the cumulative FPSR flags
 // they raise are or-ed into the x87 exception word at FEXC_X87_EXCEPTIONS (a guest-state field in FEX's CPUState padding
 // after AbridgedFTW: FPSR bit order, IOC IE, DZC ZE, OFC OE, UFC UE, IXC PE, IDC DE; bit 6 is the resident's stack fault SF).
-inline std::set<uint64_t> fexc_x87;
+inline FexcSetT<uint64_t> fexc_x87;
 constexpr uint32_t FEXC_X87_EXCEPTIONS = 0x4b4;
 // Profile slice1 (I5c): unmasked floating-point exceptions. From the host, in x86 flag order (bit 0 IE, 1 DE, 2 ZE, 3 OE, 4 UE,
 // 5 PE): `--simd-unmasked M`, the MXCSR exceptions whose mask is clear (DE left out under DAZ, which never raises it), and
@@ -286,14 +301,14 @@ constexpr uint32_t FEXC_DE_PENDING = 0x3f0 + 35;
 // Recorded by the allowlist (I5c): guest RIP of each waiting x87 instruction, WAIT/FWAIT and MMX instruction (it delivers a
 // pending x87 exception, #MF, before it runs: SDM Vol.1 8.7.1), of each FST/FSTP m32/m64 (an unmasked OE/UE stores nothing)
 // and each x87 instruction's length (the resident resumes after one whose unmasked exception left its operands unaltered).
-inline std::set<uint64_t> fexc_x87_waiting, fexc_x87_store, fexc_x87_m32;   // fexc_x87_m32: x87 instructions with an m32 convert (AFP hosts' DE fix-up)
-inline std::map<uint64_t, uint8_t> fexc_x87_length;
+inline FexcSetT<uint64_t> fexc_x87_waiting, fexc_x87_store, fexc_x87_m32;   // fexc_x87_m32: x87 instructions with an m32 convert (AFP hosts' DE fix-up)
+inline FexcMapT<uint64_t, uint8_t> fexc_x87_length;
 // The x87 lowering's check operands per guest RIP (I5c; IR nodes, FEX's Ref): stack fault, stack overflow, invalid operand
 // (FST m64's SNaN, FIST's out-of-range value) and exact tiny (FST m64), each a 0/1 value or null.
 struct FexcX87Extras { void* fault {}; void* overflow {}; void* invalid {}; void* tiny {}; };
-inline std::map<uint64_t, FexcX87Extras> fexc_x87_extra;
+inline FexcMapT<uint64_t, FexcX87Extras> fexc_x87_extra;
 // Filled when the checks are placed (I5c): guest RIP of each instruction given a SIMD exception check.
-inline std::set<uint64_t> fexc_simd_checked;
+inline FexcSetT<uint64_t> fexc_simd_checked;
 // AFP accurate plan, chunk 2 (B): the instructions (RIPs) whose software DE flag is set with DE masked (accurate mode, no AFP, MXCSR.DM set, no
 // DAZ): PlaceFPChecks fills it, FexcDenormalStep (DPPS/DPPD's add levels, inside the JIT) reads it.
-inline std::set<uint64_t> fexc_simd_de_masked;
+inline FexcSetT<uint64_t> fexc_simd_de_masked;
