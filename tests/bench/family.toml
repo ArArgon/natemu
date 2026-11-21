@@ -108,7 +108,7 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench3
         "--compile-cache", "off", "--append", "vdso32=0"]
 
 [suite.cases.guest-cray32]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32", "--emu", "natemu", "--vcpus", "1", "--bench", "cray32",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off", "--cap", "1800"]
 
@@ -118,7 +118,44 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite32",
         "--compile-cache", "off"]
 
 [suite.cases.guest-cray32-small]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small", "--emu", "natemu", "--vcpus", "1", "--bench", "cray32-small",
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+# More 32-bit floating point (the owner's request, M2 task 4): c-ray as x87 code without -ffast-math and as SSE2 code, each
+# also at 320x240, and SciMark 2.0 (64-bit, 32-bit x87, 32-bit SSE2; its result is the Mflops it prints, in the serial log).
+[suite.cases.guest-cray32-strict]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-strict", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32-strict",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray32-strict-small]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-strict-small", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32-strict-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray32-sse2]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-sse2", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32-sse2",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray32-sse2-small]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-sse2-small", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "cray32-sse2-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-scimark]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-scimark32]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-scimark32-sse2]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32-sse2",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 

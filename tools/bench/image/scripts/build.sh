@@ -52,6 +52,8 @@ fetch https://deb.debian.org/debian/pool/main/s/stress-ng/stress-ng_0.19.02.orig
       ffe8907154cc3b65cc66cde8663106355f88c948b58169cee1badbde9e0f52bd
 fetch https://github.com/LuaJIT/LuaJIT-test-cleanup/archive/014708bceb70550a3ab8d539cff14d9085ca9cb8.tar.gz LuaJIT-test-cleanup-014708b.tar.gz \
       6003d032d74e48516526a5e81f1e40ea13072395af85c79b63aeffd415756fba
+fetch https://math.nist.gov/scimark2/scimark2_1c.zip scimark2_1c.zip \
+      223464cd7e90b4c22e2af08dbae6f6faa33e65b01e1c58e5a176837bc67958be
 fetch https://github.com/jtsiomb/c-ray/releases/download/c-ray-1.1/c-ray-1.1.tar.gz c-ray-1.1.tar.gz \
       6f507aae47a9367334b8cb50f50eb4ad0f6fef99aeae9f2f7d55ba9818e798bf
 fetch https://deb.debian.org/debian/pool/main/7/7zip/7zip_25.01+dfsg.orig.tar.xz 7zip_25.01+dfsg.orig.tar.xz \
@@ -104,6 +106,18 @@ $CC -O3 -ffast-math -msse4.2 -static -o "$B/out/bin/c-ray-mt" cray-src/c-ray-mt.
 # c-ray-strict: the same source without -ffast-math (so no crtfastmath/set_fast_math: MXCSR DAZ and FTZ stay clear).
 $CC -O3 -msse4.2 -static -o "$B/out/bin/c-ray-mt-strict" cray-src/c-ray-mt.c -lm -lpthread
 $CC32 -O3 -ffast-math -static -o "$B/out/bin/c-ray-mt32" cray-src/c-ray-mt.c -lm -lpthread
+# More 32-bit floating point. c-ray-mt32-strict: x87 without -ffast-math, as c-ray-mt-strict (intermediate results keep the
+# x87's 64-bit precision on hardware: its picture may differ under an emulator that computes x87 in doubles). c-ray-mt32-sse2:
+# 32-bit code with SSE2 floating point (-mfpmath=sse), as i386 programs built for newer baselines than Debian's are.
+$CC32 -O3 -static -o "$B/out/bin/c-ray-mt32-strict" cray-src/c-ray-mt.c -lm -lpthread
+$CC32 -O3 -ffast-math -msse2 -mfpmath=sse -static -o "$B/out/bin/c-ray-mt32-sse2" cray-src/c-ray-mt.c -lm -lpthread
+# SciMark 2.0 (NIST, ANSI C: FFT, SOR, Monte Carlo, sparse matrix multiply, LU; each kernel runs for at least 2 s and
+# reports Mflops, so the result is a rate, not a time): 64-bit, 32-bit x87 and 32-bit SSE2 builds of the same source.
+rm -rf scimark-src; mkdir scimark-src; python3 -m zipfile -e scimark2_1c.zip scimark-src
+SM="scimark-src/scimark2.c scimark-src/FFT.c scimark-src/kernel.c scimark-src/Stopwatch.c scimark-src/Random.c scimark-src/SOR.c scimark-src/SparseCompRow.c scimark-src/array.c scimark-src/MonteCarlo.c scimark-src/LU.c"
+$CC -O3 -static -w -o "$B/out/bin/scimark2" $SM -lm
+$CC32 -O3 -static -w -o "$B/out/bin/scimark2-32" $SM -lm
+$CC32 -O3 -msse2 -mfpmath=sse -static -w -o "$B/out/bin/scimark2-32sse2" $SM -lm
 cp cray-src/sphfract "$B/out/sphfract"
 # 7-Zip 25.01 (Debian's +dfsg orig tarball, no unRAR): the `7zz` console program, C++ with the C fallbacks (no assembler: USE_ASM
 # unset), static; AES-NI/SHA/CRC code selected at run time by CPUID. `7zz b` is not used: it sizes its passes by measured time.
