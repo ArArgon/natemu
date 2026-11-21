@@ -359,8 +359,11 @@ Ideas to try only if a measurement points at them; none is part of the plan.
   like the existing alignment tracking (`tools/fexc/shim/fexc_sites.inc`, `FexcAlignedAfter`) and a one-line hook in
   the fork. The decisions (identity, trap, emitted check) stay in fexc's hooks. Not in FEX proper: the policy is ours.
 - **Cost:** none at run time beyond the one compare per inline FLDCW. At compile time, one linear pass over a block's IR
-  (one compile is about 27 us); unmeasured. Cross-block analysis is not worth it: blocks are compiled on demand and
-  invalidated by code writes.
+  (one compile is about 27 us); unmeasured. Cross-block knowledge was dismissed here as not worth it (blocks are
+  compiled on demand and invalidated by code writes); that was never measured, and a guarded prediction needs no
+  whole-program analysis: compile a block with the value seen at compile time (x87 TOP, the control word) and check it
+  at entry, falling back on a mismatch. Task 4's findings carry the measured x87 costs and this lead
+  (`m2-task4-findings.md`; the in-block caching of FEX's x87 pass, disabled for slice1, comes first).
 
 ## Order of work: tasks and checkpoints
 
