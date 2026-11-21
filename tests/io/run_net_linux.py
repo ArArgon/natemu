@@ -61,7 +61,7 @@ BLOCK_INPUTS = RAW_ROOT / 'io3-block-20261108-01/inputs-01'
 TOOLS_ROOTFS = RAW_ROOT / 'io-network-tools-20261108-01/rootfs'
 MODULES = {'virtio_mmio': [], 'failover': [], 'net_failover': ['failover'], 'virtio_net': ['net_failover', 'failover']}
 APPLETS = ('sh', 'mount', 'modprobe', 'cat', 'grep', 'sed', 'awk', 'ip', 'udhcpc', 'nslookup', 'ping', 'sha256sum', 'ls',
-           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq', 'cut', 'timeout')
+           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq', 'cut', 'timeout', 'stty')
 CASES = ('forward', 'loopback-off', 'loopback-on', 'basic', 'rebind', 'cancel', 'reboot', 'nodriver')
 EXTRA_CASES = ('stress',)
 LOCAL_CASES = ('forward', 'loopback-off', 'loopback-on', 'nodriver')
@@ -80,10 +80,13 @@ mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 # Keep kernel warnings/errors on the console; info (including ACPI shutdown) must not split phase JSON.
 echo 5 > /proc/sys/kernel/printk
 arg() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+# poweroff -f / reboot -f drop queued console output (the kernel's power-down line then lands inside the last JSON, host timing decides
+# the race): wait for the serial console to drain first (stty TCSADRAIN, as the other runners do).
+drain_console() { m=$(stty -F /dev/console -g) && stty -F /dev/console "$m"; }
 C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)
 echo "NET-BEGIN case=$C cpus=$(nproc) kernel=$(cat /proc/sys/kernel/osrelease)"
 modprobe virtio_mmio; ip link set lo up
-if [ $C = nodriver ]; then echo "NET-NO-ETH0 $(ls /sys/class/net | grep -c eth0)"; echo NET-END; poweroff -f; fi
+if [ $C = nodriver ]; then echo "NET-NO-ETH0 $(ls /sys/class/net | grep -c eth0)"; echo NET-END; drain_console; poweroff -f; fi
 modprobe virtio_net
 dhcp() { ip link set eth0 up; udhcpc -i eth0 -n -q -t 5 -T 2 -f -s /etc/dhcp.sh 2>&1 | grep NET-DHCP; }
 fetch() { echo "NET-FETCH $1 $(curl -sS --max-time 60 http://$H:8000/blob | sha256sum | cut -d' ' -f1)"; }
@@ -150,7 +153,7 @@ rebind)
   done
   fetch rebound;;
 reboot)
-  fetch first; echo NET-END; reboot -f;;
+  fetch first; echo NET-END; drain_console; reboot -f;;
 stress)
   iperf3 -c $H -t 60 -P 8 --bidir -f m 2>&1 | grep -E 'SUM.*(TX|RX)-C.* (sender|receiver)|error' | sed 's/^/NET-STRESS bidir /'
   iperf3 -c $H -t 5 -P 100 -f m 2>&1 | grep -E 'SUM.* (sender|receiver)|error' | sed 's/^/NET-STRESS p100 /'
@@ -176,17 +179,16 @@ cancel)
   wait $L;;
 esac
 echo NET-END
+drain_console
 poweroff -f
 '''
-# --transport pci: the guest prints the PCI probe before NET-END and drains the console (stty TCSADRAIN, as the other runners do)
-# before poweroff -f / reboot -f, which would drop queued output.
+# --transport pci: the guest prints the PCI probe before NET-END.
 INIT_PCI = patch(INIT, [
     ('C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)\n',
-     'C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)\n' + PCI_PROBE.replace('@P@', 'NET')
-     + 'drain_console() { m=$(stty -F /dev/console -g) && stty -F /dev/console "$m"; }\n'),
-    ('  fetch first; echo NET-END; reboot -f;;', '  fetch first; pci_probe; echo NET-END; drain_console; reboot -f;;'),
-    ('esac\necho NET-END\npoweroff -f\n', 'esac\npci_probe\necho NET-END\ndrain_console\npoweroff -f\n')])
-APPLETS_PCI = APPLETS + ('dmesg', 'stty')
+     'C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)\n' + PCI_PROBE.replace('@P@', 'NET')),
+    ('  fetch first; echo NET-END; drain_console; reboot -f;;', '  fetch first; pci_probe; echo NET-END; drain_console; reboot -f;;'),
+    ('esac\necho NET-END\ndrain_console\npoweroff -f\n', 'esac\npci_probe\necho NET-END\ndrain_console\npoweroff -f\n')])
+APPLETS_PCI = APPLETS + ('dmesg',)
 
 
 def prepare(out, transport='mmio'):
