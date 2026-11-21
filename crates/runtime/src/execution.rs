@@ -114,7 +114,10 @@ fn halt(s: &State, reason: u64) -> ! {
 /// The bank's walk controls ([`Cpu::paging`]) while its code segment is one that runs ([`Cpu::code_mode`]): a 64-bit
 /// one, or at CPL 3 a compatibility-mode one (M2 task 3a: 32-bit code with flat segments runs; any other shape takes a
 /// #GP before its first instruction, [`find`]); else it stops, `unsupported_mode` for the paging mode or CPL,
-/// `unsupported_code_mode` for the code segment (compatibility-mode code at CPL 0).
+/// `unsupported_code_mode` for the code segment (compatibility-mode code at CPL 0). Inlined: out of line (the resident is
+/// built for size) it copied the `Control` out through a `memcpy` call even where it is discarded (`set_cpl`, `commit`:
+/// each SYSCALL and SYSRET passes through both).
+#[inline(always)]
 fn controls(s: &State) -> paging::Control {
     match (s.cpu.paging(), s.cpu.code_mode()) {
         (Some(c), Some(CodeMode::Bits64)) => c,
