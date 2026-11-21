@@ -2631,13 +2631,13 @@ impl Cpu {
     /// The code segment's mode from CS.L and CS.D; `None` for L = D = 1 (reserved: a load of it is #GP, SDM Vol.3
     /// 5.2.1). IA-32e mode is taken as given: every place that runs code requires [`Self::paging`] (EFER.LMA) too, and
     /// the modes outside it (M2 Part 2, not built) would be told apart here.
+    /// A table, not a `match`: the resident (built without jump tables) made the match a chain of branches in
+    /// [`Self::code_context`], which every block lookup computes.
     pub fn code_mode(&self) -> Option<CodeMode> {
-        match self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) {
-            ATTR_L => Some(CodeMode::Bits64),
-            ATTR_D => Some(CodeMode::Compat32),
-            0 => Some(CodeMode::Compat16),
-            _ => None,
-        }
+        const _: () = assert!(ATTR_L == 1 << 13 && ATTR_D == 1 << 14);
+        // Indexed by L (bit 0) and D (bit 1).
+        const MODES: [Option<CodeMode>; 4] = [Some(CodeMode::Compat16), Some(CodeMode::Bits64), Some(CodeMode::Compat32), None];
+        MODES[usize::from(self.seg[SREG_CS].attributes >> 13 & 3)]
     }
     /// M2 task 3a: why compatibility-mode code at CPL 3 cannot run under the bank's segments, as the selector to name in
     /// the #GP that ends it (a recorded deviation: x86 runs such code, translated code would run it wrongly without a
