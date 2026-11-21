@@ -441,6 +441,10 @@ template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, cons
         Ref Bits = nullptr;
         const uint32_t Elem = X87MemBits(View, Op->Args[m], Bits);
         if (!Elem) continue;
+        // (M2 task 4: a converted m32 that an earlier instruction of the block pushed, FLD m32's, is a stack register here, not
+        // this instruction's memory operand: only a convert among this instruction's own ops counts.)
+        if (View.template GetOp<IROp_Header>(Op->Args[m])->Op == OP_FLOAT_FTOF &&
+            std::none_of(Ops.begin(), Ops.begin() + Count, [&](const auto& O) { return O.first == View.GetNode(Op->Args[m]); })) continue;
         // FLD m64's multiply by 1.0. (The constant itself is looked at: since M2 task 4 the other operand of an arithmetic op
         // may be a constant an earlier instruction of the block pushed, FLDZ's; a multiply by a pushed 1.0 needs no screen either.)
         const auto Other = View.template GetOp<IROp_Header>(Op->Args[1 - m]);

@@ -349,6 +349,9 @@ inline bool FexcX87Lazy() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_
 inline FexcArg<uint64_t, FEXC_ARG_X87_GUESS> fexc_x87_guess;
 inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
 inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
+// A fault point after a floating-point op of its own x87 instruction that fexc_x87_hold does not list (none known): the unit is
+// compiled again with every x87 instruction held (fexc.cpp), which is exact for any form.
+inline bool fexc_x87_hold_missing = false, fexc_x87_hold_all = false;
 inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
 inline int fexc_x87_run = FEXC_RUN_CLOSED;     // whether an x87 run is open at the emit cursor (unknown: 32-bit code, at an IR block's start)

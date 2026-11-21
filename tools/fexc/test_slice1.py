@@ -2363,6 +2363,13 @@ class Slice1X87Commit(unittest.TestCase):
         ['fld qword ptr [rbx]'] * 9 + ['fstp qword ptr [rbx+64]', 'fadd qword ptr [rbx+8]'],
         ['fstp qword ptr [rbx+64]', 'fld qword ptr [rbx]', 'faddp st(1), st', 'fmul qword ptr [rbx+8]', 'fstp qword ptr [rbx+72]', 'fstp qword ptr [rbx+80]',
          'fadd qword ptr [rbx]', 'fst qword ptr [rbx+88]'],
+        # (the review of M2 task 4) forms beside the usual: FXAM and FTST, the top moved without a push or pop, FFREEP,
+        # the deepest register read (FCMOV is not here: the runs carry no flags from one instruction to the next), and a block that ends in register-only instructions (its state at the exit is compared)
+        ['fld qword ptr [rbx+8]', 'fxam', 'fnstsw word ptr [rbx+88]', 'ftst', 'fld qword ptr [rbx]', 'fincstp', 'fst qword ptr [rbx+64]', 'fdecstp',
+         'fld st(7)', 'fstp qword ptr [rbx+72]', 'ffreep st(0)', 'fadd st, st(0)', 'fchs', 'fld1', 'fxch st(1)'],
+        # MMX between x87 instructions: two MMX instructions in a row (the top and tags set once), EMMS, x87 again
+        ['fld1', 'fld qword ptr [rbx]', 'movq mm1, qword ptr [rbx+16]', 'paddb mm1, mm1', 'movq qword ptr [rbx+64], mm1', 'emms', 'fldz',
+         'fadd qword ptr [rbx+8]', 'fstp qword ptr [rbx+72]'],
     ]
     X87_MEMORY = struct.pack('<8d', 1.5, -2.25, 1e300, 1e-320, 3.0, float('inf'), 7.0, 0.1) + bytes(8)
     X87_MEMORY = X87_MEMORY[:32] + struct.pack('<ff', 1e-40, 2.5) + struct.pack('<i', -7) + X87_MEMORY[44:]
@@ -2377,7 +2384,7 @@ class Slice1X87Commit(unittest.TestCase):
         flags = bytes(buf[0x410 + k] for k in (0, 5, 6, 8, 9, 10, 11, 14))   # IE PE SF C0 C1 C2 TOP C3
         return [buf[0x420 + 16 * i:0x428 + 16 * i].hex() for i in range(8)], flags.hex(), buf[0x4b2], hex(word), buf[0x1000:0x1100].hex()
 
-    def x87_run(self, d, cut, buf, ptr, patch=()):
+    def x87_run(self, d, cut, buf, ptr, patch=(), fpcr=6):
         """Runs the code of compile `d` up to the word at `cut` on `buf`; (buf after, FPSR). Branches to stubs fall through."""
         lay = d['code']['layout']
         code = bytes.fromhex(d['code']['hex'])
@@ -2391,16 +2398,18 @@ class Slice1X87Commit(unittest.TestCase):
             if t is not None and t >= cut:
                 self.assertIn(t, patch, f'a branch at +{at} leaves the code before +{cut}')
                 words[k] = 0xd503201f
-        x, _, out = native_run(words + [0xd53b4420], buf=bytes(buf), ptrs=[(ptr, 0x1000)], fpcr=6)   # mrs x0, fpsr
+        x, _, out = native_run(words + [0xd53b4420], buf=bytes(buf), ptrs=[(ptr, 0x1000)], fpcr=fpcr)   # mrs x0, fpsr
         return bytearray(out), x[0]
 
     @needs_afp_host
     def test_the_page_holds_the_x87_state_before_every_fault_point(self):
         # (guess: the 32-bit block also compiled for the stack top and tags it starts with, `--x87-guess`: the registers are
         # fields at fixed offsets and the tag byte a constant; its test's stub is a fault point like the others.)
-        points = stubs_seen = guessed = 0
-        for bits, guess in ((64, False), (32, False), (32, True)):
-            extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else [])
+        # (afp: the code for a Mac without AFP, run here under its FPCR: the same caches, the flags copied after each op.)
+        points = stubs_seen = guessed = exits = 0
+        for bits, guess, afp in ((64, False, True), (32, False, True), (32, True, True), (64, False, False), (32, True, False)):
+            extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else []) + ([] if afp else ['--feature', 'afp=0'])
+            fpcr = 6 if afp else 0
             for prog in self.X87_PROGRAMS:
                 lines = [l.replace('rbx', 'ebx').replace('rax', 'eax').replace('rcx', 'ecx') for l in prog] if bits == 32 else prog
                 each = [x86_asm((['.code32'] if bits == 32 else []) + [l]) for l in lines]
@@ -2426,7 +2435,7 @@ class Slice1X87Commit(unittest.TestCase):
                         c1 = bytes.fromhex(one['code']['hex'])
                         lay = one['code']['layout']
                         end = next(o for o in range(lay['code_region_begin'], lay['code_region_end'], 4) if int.from_bytes(c1[o:o + 4], 'little') & 0xffe0001f == 0xd4000001)
-                        ref, fpsr = self.x87_run(one, end, ref, ptr, {s['native_offset'] for s in one['sites'] if s['kind'] in check_sites.STUBS})
+                        ref, fpsr = self.x87_run(one, end, ref, ptr, {s['native_offset'] for s in one['sites'] if s['kind'] in check_sites.STUBS}, fpcr)
                         word = int.from_bytes(ref[0x4b4:0x4b8], 'little') | ((ref[0x412] if ref[0x412] & 0x20 else fpsr) & 0x9f if ref[0x414] else 0)
                         ref[0x4b4:0x4b8] = word.to_bytes(4, 'little')   # as the resident's bank does; the next unit starts with no run open
                         ref[0x411] = ref[0x412] = ref[0x414] = 0
@@ -2442,12 +2451,19 @@ class Slice1X87Commit(unittest.TestCase):
                                        o + 4 * (w >> 5 & (0x7ffff if s['kind'] == 'x87guess' else 0x3fff)) == s['native_offset'])
                             stubs_seen += s['kind'] == 'x87tag'
                             guessed += s['kind'] == 'x87guess'
-                        got, fpsr = self.x87_run(d, cut, buf, ptr, stubs)
-                        self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, guess, filled, lines[i], s['kind'], s['native_offset']))
+                        got, fpsr = self.x87_run(d, cut, buf, ptr, stubs, fpcr)
+                        self.assertEqual(self.x87_state(got, fpsr), before[i], (bits, guess, afp, filled, lines[i], s['kind'], s['native_offset']))
                         points += 1
-        self.assertGreater(points, 250)
-        self.assertGreater(stubs_seen, 40)
-        self.assertGreaterEqual(guessed, 2 * len(self.X87_PROGRAMS))
+                    if fault is None:   # the block's exit (its last instructions may be register-only: nothing after them wrote the page but the exit)
+                        lay = d['code']['layout']
+                        end = next(o for o in range(lay['code_region_begin'], lay['code_region_end'], 4) if int.from_bytes(code[o:o + 4], 'little') & 0xffe0001f == 0xd4000001)
+                        got, fpsr = self.x87_run(d, end, buf, ptr, stubs, fpcr)
+                        self.assertEqual(self.x87_state(got, fpsr), self.x87_state(ref, 0), (bits, guess, afp, filled, 'exit'))
+                        exits += 1
+        self.assertGreater(points, 500)
+        self.assertGreater(stubs_seen, 80)
+        self.assertGreaterEqual(guessed, 4 * len(self.X87_PROGRAMS))
+        self.assertGreater(exits, 30)
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
