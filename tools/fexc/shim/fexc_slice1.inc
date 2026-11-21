@@ -1016,6 +1016,12 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
       if (memory && (op == 0xD9 || op == 0xDD) && (r == 2 || r == 3)) fexc_x87_store.insert(rip);
       fexc_x87_length[rip] = uint8_t(d.InstSize);
       if (!memory) fexc_x87_quiet.insert(rip);
+      // The forms that compute nothing (fexc_x87_fp lists the others): fld/fst/fstp m64, fnstcw, fnstsw, fldcw; fld st(i), fxch,
+      // fnop, the constants, ffree, fst/fstp st(i), ffreep, fincstp/fdecstp.
+      const bool plain = memory ? (op == 0xDD && (r == 0 || r == 2 || r == 3 || r == 7)) || (op == 0xD9 && (r == 5 || r == 7))
+                                : (op == 0xD9 && (m <= 0xCF || m == 0xD0 || (m >= 0xE8 && m <= 0xEE) || m == 0xF6 || m == 0xF7)) ||
+                                  (op == 0xDD && (m <= 0xC7 || (m >= 0xD0 && m <= 0xDF))) || (op == 0xDF && (m <= 0xC7 || m == 0xE0));
+      if (!plain) fexc_x87_fp.insert(rip);
       // fst(p) m32; fisttp/fist/fistp m32, m16; fistp m64, fisttp m64 (FST m64 and m80 convert with integer words: no flag)
       if (memory && ((op == 0xD9 && (r == 2 || r == 3)) || ((op == 0xDB || op == 0xDF) && r >= 1 && r <= 3) || (op == 0xDF && r == 7) || (op == 0xDD && r == 1)))
         fexc_x87_hold.insert(rip);

@@ -186,6 +186,21 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench3
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--compile-cache", "off", "--perf-log", "--append", "vdso32=0"]
 
+[suite.cases.guest-scimark-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
+[suite.cases.guest-scimark32-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
+[suite.cases.guest-scimark32-sse2-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32-sse2",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]

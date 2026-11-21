@@ -1490,6 +1490,7 @@ class AfpX87(unittest.TestCase):
         if mem is not None: buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
         out = bytearray(native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500])
         out[0xb0:0xb4] = bytes(4); out[0x411] = 0; out[0x414] = 0   # an x87 run's bookkeeping (hosts with AFP only: M2 task 4)
+        out[0x4b4] |= out[0x410] & 1; out[0x410] = 0   # FSW.IE is the IE byte or the word's bit 0: either may hold it
         return bytes(out)
 
     @needs_afp_host
@@ -2367,12 +2368,18 @@ class Slice1X87Commit(unittest.TestCase):
         # the deepest register read (FCMOV is not here: the runs carry no flags from one instruction to the next), and a block that ends in register-only instructions (its state at the exit is compared)
         ['fld qword ptr [rbx+8]', 'fxam', 'fnstsw word ptr [rbx+88]', 'ftst', 'fld qword ptr [rbx]', 'fincstp', 'fst qword ptr [rbx+64]', 'fdecstp',
          'fld st(7)', 'fstp qword ptr [rbx+72]', 'ffreep st(0)', 'fadd st, st(0)', 'fchs', 'fld1', 'fxch st(1)'],
+        # a block with no x87 arithmetic (what 32-bit SSE code has around a call that returns a double): FLD m64 is done with
+        # integer words and no x87 run; a denormal (DE), a signalling NaN (IE, quieted), ordinary values, against the
+        # one-instruction units' quieting multiply
+        ['fld qword ptr [rbx+24]', 'fld qword ptr [rbx+200]', 'fxch st(1)', 'fstp qword ptr [rbx+64]', 'fld qword ptr [rbx]', 'fld qword ptr [rbx+208]',
+         'fstp qword ptr [rbx+72]', 'fstp qword ptr [rbx+80]', 'fstp qword ptr [rbx+88]'],
         # MMX between x87 instructions: two MMX instructions in a row (the top and tags set once), EMMS, x87 again
         ['fld1', 'fld qword ptr [rbx]', 'movq mm1, qword ptr [rbx+16]', 'paddb mm1, mm1', 'movq qword ptr [rbx+64], mm1', 'emms', 'fldz',
          'fadd qword ptr [rbx+8]', 'fstp qword ptr [rbx+72]'],
     ]
     X87_MEMORY = struct.pack('<8d', 1.5, -2.25, 1e300, 1e-320, 3.0, float('inf'), 7.0, 0.1) + bytes(8)
     X87_MEMORY = X87_MEMORY[:32] + struct.pack('<ff', 1e-40, 2.5) + struct.pack('<i', -7) + X87_MEMORY[44:]
+    X87_MEMORY = X87_MEMORY.ljust(200, b'\0') + struct.pack('<QQ', 0x7ff0000000000001, 0xfff8000000001234)   # an SNaN, a QNaN with a payload
 
     @staticmethod
     def x87_state(buf, fpsr):
@@ -2381,7 +2388,8 @@ class Slice1X87Commit(unittest.TestCase):
         word = int.from_bytes(buf[0x4b4:0x4b8], 'little')
         if buf[0x414]:
             word |= (buf[0x412] if buf[0x412] & 0x20 else fpsr) & 0x9f
-        flags = bytes(buf[0x410 + k] for k in (0, 5, 6, 8, 9, 10, 11, 14))   # IE PE SF C0 C1 C2 TOP C3
+        word |= buf[0x410] & 1   # (FSW.IE is the IE byte or the word's bit 0: either may hold it)
+        flags = bytes(buf[0x410 + k] for k in (5, 6, 8, 9, 10, 11, 14))   # PE SF C0 C1 C2 TOP C3
         return [buf[0x420 + 16 * i:0x428 + 16 * i].hex() for i in range(8)], flags.hex(), buf[0x4b2], hex(word), buf[0x1000:0x1100].hex()
 
     def x87_run(self, d, cut, buf, ptr, patch=(), fpcr=6, maps=None, insn=None):

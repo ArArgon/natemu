@@ -363,6 +363,10 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_GUESS> fexc_x87_guess;
 // code never uses: the general registers are static), and the FISTP m64 that starts the next unit at that RIP stores the
 // integer again when ST(0) is still that double (32-bit code).
 inline std::set<uint64_t> fexc_x87_int_pair;
+// M2 task 4: guest RIP of each admitted x87 instruction that computes: every form but the loads and stores of doubles, the
+// moves on the register stack, the constants and the control and status word forms. A unit with none (32-bit SSE code around
+// a call that returns a double in ST(0)) loads a double without the quieting multiply, so without an x87 run (FEX's FLDF64).
+inline std::set<uint64_t> fexc_x87_fp;
 constexpr uint32_t FEXC_X87_INT64 = 0xC000'0001u, FEXC_X87_INT_RIP = 0x20, FEXC_X87_INT = 0x28, FEXC_X87_INT_ST0 = 0x30;
 inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
 inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
