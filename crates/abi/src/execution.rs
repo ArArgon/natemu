@@ -1632,6 +1632,11 @@ pub mod frame {
     /// holds x87's flags, not MXCSR's ([`SIMD_FLAGS`] took those at the run's start), so a bank inside a run leaves FPSR
     /// out. Generated code sets and clears it; the resident clears it at every entry. [`X87_FPCR`]: the FPCR a run under
     /// its own x87 FPCR started with (4 bytes in FEX's `callret_sp`, unused in slice1), which the run's end loads back.
+    /// Lazy flags (M2 task 4): inside a run the x87 instructions' flags stay in FPSR; generated code ors them into
+    /// [`X87_EXCEPTIONS`] where it reads the word (FNSTSW) and at the run's end, the resident at a bank inside a run. An
+    /// instruction that may have to drop its own flags (a store that converts before its fault site; in a one-instruction
+    /// unit, one with a stack check) first saves FPSR's flag byte with bit 5 set in [`X87_PENDING`] and clears the byte at
+    /// its end: at a bank the resident takes the saved byte when bit 5 is set, else FPSR.
     /// Guest-writable like the rest of the page: a forged value changes only the guest's own floating-point state.
     pub const X87_RUN: u32 = FLAGS + 36;
     pub const X87_FPCR: u32 = 0xb0;

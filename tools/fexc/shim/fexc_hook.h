@@ -63,6 +63,9 @@ enum FexcSiteKind : uint8_t {
                                             // last check; exit to the dispatcher at this instruction (no access, no address, the state before it)
   FEXC_SITE_STACK = 20,                     // slice1 stub (--push-run): the guest RSP is not 8-byte aligned (32-bit code: ESP not 4-byte aligned) at a store it would cover; the
                                             // resident steps the instruction alone (its step unit has the split check)
+  FEXC_SITE_X87TAG = 22,                    // slice1 stub (M2 task 4): an x87 instruction's stack check (FexcX87Tag), at its start: a register
+                                            // it reads is empty or the one it pushes onto is not; the resident steps the instruction alone
+                                            // (its step unit has the masked response)
   FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
                                             // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };
@@ -330,6 +333,16 @@ constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
 // zero), so x87 rounding is honoured per run whatever MXCSR says and the rounding control is no part of the code identity;
 // FLDCW is translated when it keeps the exception masks (`FexcFldcwInline`): it ends the run and stores the word.
 constexpr uint32_t FEXC_X87_RUN = 0x3f0 + 36, FEXC_X87_FPCR = 0xb0;
+// M2 task 4, lazy x87 flags: where x87 ops run in runs, FPSR keeps the flags of the run's x87 instructions and nothing copies
+// them per op or per instruction. They are or-ed into the exception word where it is read or FPSR is taken back: a run's end,
+// FNSTSW (FexcX87Fold), and the resident's bank inside a run. An instruction that may have to drop its own flags saves FPSR's
+// flag byte, with bit 5 set, in the pending byte before its first floating-point op and clears the byte at its end (a "hold"):
+// one whose floating-point op comes before a fault site of its own (the narrowing stores: fexc_x87_hold, checked when a site
+// is recorded), and one with a stack check (FexcX87Hold, FexcX87Release: after a stack fault FPSR's flags are the saved ones
+// again). At a bank inside a run the resident takes the saved byte when bit 5 is set, else FPSR.
+inline bool FexcX87Lazy() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
+inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
 inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
 inline int fexc_x87_run = FEXC_RUN_CLOSED;     // whether an x87 run is open at the emit cursor (unknown: 32-bit code, at an IR block's start)
@@ -342,6 +355,10 @@ constexpr uint32_t FEXC_DE_PENDING = 0x3f0 + 35;
 // and each x87 instruction's length (the resident resumes after one whose unmasked exception left its operands unaltered).
 inline FexcSetT<uint64_t> fexc_x87_waiting, fexc_x87_store, fexc_x87_m32;   // fexc_x87_m32: x87 instructions with an m32 convert (AFP hosts' DE fix-up)
 inline FexcMapT<uint64_t, uint8_t> fexc_x87_length;
+// M2 task 4: guest RIP of each admitted x87 instruction with a register operand only (ModRM.mod = 3): it has no access site,
+// and with every x87 exception masked no stub. The x87 stack pass keeps what such instructions change in registers and writes
+// it to the guest-state page before the next instruction that is not one of them (FEX's x87StackOptimizationPass, FexcCache).
+inline std::set<uint64_t> fexc_x87_quiet;
 // The x87 lowering's check operands per guest RIP (I5c; IR nodes, FEX's Ref): stack fault, stack overflow, invalid operand
 // (FST m64's SNaN, FIST's out-of-range value) and exact tiny (FST m64), each a 0/1 value or null.
 struct FexcX87Extras { void* fault {}; void* overflow {}; void* invalid {}; void* tiny {}; };

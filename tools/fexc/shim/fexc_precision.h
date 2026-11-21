@@ -51,7 +51,7 @@ inline bool LoadsInto(FEXCore::IR::IROps Op) {
 // state before the instruction.
 inline bool CheckOp(FEXCore::IR::IROps Op) {
   return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
-         Op == FEXCore::IR::OP_FEXCX87CHECKDE || Op == FEXCore::IR::OP_FEXCFLDCW;   // (FLDCW's stub: M2 task 4)
+         Op == FEXCore::IR::OP_FEXCX87CHECKDE || Op == FEXCore::IR::OP_FEXCFLDCW || Op == FEXCore::IR::OP_FEXCX87TAG;   // (FLDCW's stub, the x87 stack check's: M2 task 4)
 }
 // AFP accurate plan, chunk 4: the FMA NaN check is no fault point (the resident resumes after it, no guest exception comes of it), but for
 // register allocation it is as a check: no value is coalesced into its static register across it (the guest register is written only after
@@ -441,7 +441,11 @@ template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, cons
         Ref Bits = nullptr;
         const uint32_t Elem = X87MemBits(View, Op->Args[m], Bits);
         if (!Elem) continue;
-        const bool Const = View.template GetOp<IROp_Header>(Op->Args[1 - m])->Op == OP_VCASTFROMGPR;   // FLD m64's multiply by 1.0
+        // FLD m64's multiply by 1.0. (The constant itself is looked at: since M2 task 4 the other operand of an arithmetic op
+        // may be a constant an earlier instruction of the block pushed, FLDZ's; a multiply by a pushed 1.0 needs no screen either.)
+        const auto Other = View.template GetOp<IROp_Header>(Op->Args[1 - m]);
+        const bool Const = Op->Op == OP_VFMUL && Other->Op == OP_VCASTFROMGPR && View.template GetOp<IROp_Header>(Other->Args[0])->Op == OP_CONSTANT &&
+                           View.template GetOp<IROp_Header>(Other->Args[0])->template C<IROp_Constant>()->Constant == 0x3ff0'0000'0000'0000ULL;
         Hits.push_back({Ops[i].first, Bits, Const ? nullptr : View.GetNode(Op->Args[1 - m]), Elem, Op->Op == OP_VFDIV && m == 0});
         Arith |= !Const;
         break;

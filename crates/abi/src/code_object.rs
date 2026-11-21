@@ -85,6 +85,11 @@ pub mod kind {
     /// loaded word has other exception masks than the control word in the guest state. At the stub the state is the state
     /// before the instruction: the resident steps it alone (in a one-instruction unit FLDCW is the resident's transaction).
     pub const FLDCW: u8 = 21;
+    /// M2 task 4: an x87 instruction's stack check `lsr w0, wF, wI; tbnz w0, #0` (a push: the register TOP - 1 must be empty)
+    /// or `tbz w0, #0` (a read: the register must not be), wF the tag byte and wI the register's number (`brk #12`), at the
+    /// instruction's start. At the stub (a stack fault) the state is the state before the instruction: the resident steps it
+    /// alone, and its one-instruction unit computes the masked response inline.
+    pub const X87TAG: u8 = 22;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

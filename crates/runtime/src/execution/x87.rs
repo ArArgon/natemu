@@ -102,6 +102,15 @@ pub(super) fn set_fsw(v: u64) {
         v & 1 | (v >> 1 & 1) << 7 | (v >> 2 & 0xf) << 1 | v & FSW_SF,
     );
 }
+/// M2 task 4, lazy x87 flags (tools/fexc/shim/fexc_hook.h): at a bank inside an x87 run, the run's flags that are not in the
+/// exception word yet. They are in FPSR; when the interrupted instruction saved FPSR's flags before its own floating-point
+/// ops (the pending byte with bit 5 set: a store that converts first, an instruction with a stack check), the saved ones
+/// count and its own are dropped with it.
+pub(super) fn fold_run(fpsr: u64) {
+    let held = get8(frame::X87_PENDING);
+    let flags = if held & 0x20 != 0 { held } else { fpsr } & 0x9f;
+    set32(frame::X87_EXCEPTIONS, get32(frame::X87_EXCEPTIONS) | flags);
+}
 /// The full tag word (SDM Vol.1 8.1.7): 11 empty, else from the double: 01 zero, 10 NaN or infinity, 00 valid (a denormal
 /// double is a normal 80-bit value).
 pub(super) fn ftw() -> u64 {

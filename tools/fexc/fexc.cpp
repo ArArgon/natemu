@@ -279,7 +279,7 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw"};
+                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -386,7 +386,7 @@ static void ResetGlobals() {
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
-  fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
+  fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
   fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED;
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }

@@ -195,6 +195,24 @@ bool Arm64JITCore::FexcX87Op(const IR::IROp_Header* IROp) {
 // before an op). `fexc_x87_run`: what is known at the emit cursor, FEXC_RUN_CLOSED, _OPEN, or (32-bit code, at an IR block's
 // start) _UNKNOWN: the run byte says, and the start or end is skipped by a branch when it is already so.
 static bool FexcX87Runs() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+// M2 task 4, lazy x87 flags (fexc_hook.h): FPSR's flags of the run or-ed into the x87 exception word (x0 = FPSR's flag byte after).
+static void FexcX87FoldWords(Arm64JITCore& J) {
+  J.mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  J.and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0xff);   // IOC DZC OFC UFC IXC, IDC (bits 6:5 are RES0)
+  J.ldr(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+  J.orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
+  J.str(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+}
+// The end of a hold: the instruction is complete, its flags stay.
+static void FexcX87HoldEnd(Arm64JITCore& J) {
+  if (fexc_x87_held) J.strb(ARMEmitter::WReg::zr, STATE, FEXC_X87_PENDING);
+  fexc_x87_held = false;
+}
+// M2 task 4, lazy x87 flags: a fault point after a floating-point op of its own x87 instruction needs the hold (the resident
+// would take the instruction's flags from FPSR): a hard check of fexc_x87_hold's list.
+static void FexcX87SiteCheck() {
+  if (fexc_x87_fp_seen && !fexc_x87_held && FexcX87Lazy()) ERROR_AND_DIE_FMT("fexc slice1 (M2 task 4): a fault point after an x87 floating-point op without a hold");
+}
 static void FexcX87RunEnd(Arm64JITCore& J) {
   if (fexc_x87_run == FEXC_RUN_CLOSED) return;
   ARMEmitter::ForwardLabel Closed;
@@ -202,6 +220,7 @@ static void FexcX87RunEnd(Arm64JITCore& J) {
     J.ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
     (void)J.cbz(ARMEmitter::Size::i32Bit, TMP1, &Closed);
   }
+  FexcX87FoldWords(J);   // the run's flags, still in FPSR
   J.ldr(TMP1.W(), STATE, FEXC_X87_FPCR);
   J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   J.msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
@@ -245,15 +264,24 @@ void Arm64JITCore::FexcX87Begin() {
     // An m32 operand's convert, the first floating-point op of its instruction: the DE fix-up after the instruction's next op
     // (FexcAfterOp) reads that op's DZC and the instruction's IDC, so neither may be left from earlier in the run. Every flag
     // in FPSR here is of a completed instruction, committed already: when one of the two is set FPSR is cleared (rare).
+    // (Lazy flags: those flags are not in the exception word yet; they are or-ed into it first.)
     if (fexc_x87_m32_convert) {
       ARMEmitter::ForwardLabel Set, Clear;
       mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
       (void)tbnz(TMP1, 1, &Set);     // DZC
       (void)tbz(TMP1, 7, &Clear);    // IDC
       (void)Bind(&Set);
+      FexcX87FoldWords(*this);
       msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
       (void)Bind(&Clear);
     }
+    if (fexc_x87_hold_wanted && !fexc_x87_held) {   // the hold: FPSR's flags before the instruction's own, bit 5 set
+      mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+      orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0x20);
+      strb(TMP1.W(), STATE, FEXC_X87_PENDING);
+      fexc_x87_held = true;
+    }
+    fexc_x87_fp_seen = true;
     return;
   }
   mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
@@ -278,6 +306,38 @@ DEF_OP(FexcFldcw) {
   and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0x3f);
   cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_FLDCW, false));
   strh(New.W(), STATE, offsetof(FEXCore::Core::CPUState, FCW));
+}
+// M2 task 4: an x87 instruction's stack check as a stub, at the instruction's start (the x87 stack pass's TagStub):
+// `lsr w0, wFTW, wI; tbnz w0, #0, K` for a push (the register must be empty), `tbz` for a read (it must not be).
+DEF_OP(FexcX87Tag) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Tag>();
+  lsrv(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->FTW), GetReg(Op->Index));
+  if (Op->Push) tbnz_OrRestart(TMP1, 0, FexcStub(FEXC_SITE_X87TAG, false));
+  else tbz_OrRestart(TMP1, 0, FexcStub(FEXC_SITE_X87TAG, false));
+}
+DEF_OP(FexcX87Fold) {
+  if (fexc_x87_run == FEXC_RUN_CLOSED) return;   // FPSR is MXCSR's: every x87 flag is in the word
+  ARMEmitter::ForwardLabel Closed;
+  if (fexc_x87_run == FEXC_RUN_UNKNOWN) {
+    ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
+    (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &Closed);
+  }
+  FexcX87FoldWords(*this);
+  (void)Bind(&Closed);
+}
+DEF_OP(FexcX87Hold) {
+  fexc_x87_hold_wanted = true;   // the first floating-point op of the instruction emits it (FexcX87Begin): none, no flag to drop
+}
+// `cbz wF, done; ldrb w0, [x28, #pending]; and w0, w0, #0xffffffdf; msr fpsr, x0; done: strb wzr, [x28, #pending]`
+DEF_OP(FexcX87Release) {
+  if (!fexc_x87_held) return;
+  ARMEmitter::ForwardLabel Done;
+  (void)cbz(ARMEmitter::Size::i32Bit, GetReg(IROp->C<IR::IROp_FexcX87Release>()->Fault), &Done);
+  ldrb(TMP1.W(), STATE, FEXC_X87_PENDING);
+  and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0xffffffdfu);   // (the hold's bit 5)
+  msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+  (void)Bind(&Done);
+  FexcX87HoldEnd(*this);
 }
 DEF_OP(FexcX87Svc) {
   const auto Op = IROp->C<IR::IROp_FexcX87Svc>();
@@ -309,6 +369,7 @@ void Arm64JITCore::FexcStringSvc(const IR::IROp_Header* IROp, IR::Ref Node) {
 }
 
 void Arm64JITCore::FexcX87End() {
+  if (FexcX87Lazy()) return;   // M2 task 4: the flags stay in FPSR (fexc_hook.h)
   const bool Run = fexc_x87_run == FEXC_RUN_OPEN;   // (the run's flags so far: sticky, so committed already but for this op's)
   if (fexc_x87_fpcr && !Run) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
@@ -935,7 +996,9 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
     } else if (fexc_x87_m32.count(Rip) && (Cmp || IROp->Op == IROps::OP_VFADD || IROp->Op == IROps::OP_VFSUB || IROp->Op == IROps::OP_VFMUL ||
                                            IROp->Op == IROps::OP_VFDIV)) {
       ARMEmitter::ForwardLabel Clear, Done;
-      (void)tbz(TMP2, 7, &Done);
+      const bool Lazy = FexcX87Lazy();   // (M2 task 4: the instruction's IDC and the op's DZC are in FPSR, which the convert found without them)
+      if (Lazy) mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+      (void)tbz(Lazy ? TMP1 : TMP2, 7, &Done);
       (void)tbnz(TMP1, 1, &Clear);
       movz(ARMEmitter::Size::i64Bit, TMP4, 0x7ff0, 48);
       for (int i = 0; i < (Cmp ? 2 : 1); ++i) {
@@ -946,8 +1009,13 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
       }
       (void)b(&Done);
       (void)Bind(&Clear);
-      and_(ARMEmitter::Size::i32Bit, TMP2, TMP2, 0xffffff7fu);
-      strb(TMP2.W(), STATE, FEXC_X87_PENDING);
+      if (Lazy) {
+        and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0xffffff7fu);
+        msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+      } else {
+        and_(ARMEmitter::Size::i32Bit, TMP2, TMP2, 0xffffff7fu);
+        strb(TMP2.W(), STATE, FEXC_X87_PENDING);
+      }
       (void)Bind(&Done);
     }
   }
@@ -1030,6 +1098,9 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     for (auto i : FexcPendingFused) fexc_sites[i].guest_offset2 = FexcGuest;
     FexcPendingFused.clear();
     fexc_insns.push_back({FexcGuest, Begin, FexcCf});
+    FexcX87HoldEnd(*this);   // M2 task 4: the instruction before is complete
+    fexc_x87_fp_seen = false;
+    fexc_x87_hold_wanted = fexc_x87_hold.count(Op->GuestEntryOffset + Entry) != 0 && FexcX87Lazy();   // (the set first: FexcX87Lazy reads a request argument)
     if (fexc_slice1 && fexc_x87_waiting.count(Op->GuestEntryOffset + Entry)) FexcPendingCheck();   // I5c: #MF before it runs
     if (fexc_slice1 && fexc_pre_nzcv.count(Op->GuestEntryOffset)) {
       static_assert(FexcPrecision::PreNzcvReg == 25);
@@ -1213,6 +1284,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   // starts from the state at the instruction: they do not count as committed effects.)
   if ((S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
        S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) && IROp->Op != IROps::OP_FEXCREPSTOS) FexcStoreSeen = true;
+  FexcX87SiteCheck();
   fexc_sites.push_back(S);
 }
 
@@ -1236,7 +1308,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11, FexcBrkX87Tag = 12;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1260,8 +1332,9 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
   S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
-            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : "guard";
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : Kind == FEXC_SITE_X87TAG ? "x87tag" : "guard";
   const size_t Index = fexc_sites.size();
+  FexcX87SiteCheck();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
   return &FexcStubs[Index];
@@ -1288,6 +1361,8 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
+  if (fexc_x87_held && (IROp->Op == IROps::OP_JUMP || IROp->Op == IROps::OP_CONDJUMP || IROp->Op == IROps::OP_EXITFUNCTION || IROp->Op == IROps::OP_BREAK))
+    FexcX87HoldEnd(*this);   // (an x87 instruction that ends its IR block)
   if (fexc_x87_run != FEXC_RUN_CLOSED || FexcX87Op(IROp)) {   // M2 task 4: where an x87 run ends (fexc_hook.h)
     const bool X87 = fexc_x87.count(Entry + FexcGuest) != 0;
     const std::string_view Name = IR::GetName(IROp->Op);
@@ -1470,7 +1545,7 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+    brk(K == FEXC_SITE_X87TAG ? FexcBrkX87Tag : K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
         K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }
