@@ -412,7 +412,7 @@ double. That is a result about c-ray, not a proof for other programs.
 | 32-bit SSE2, real x86 | 4719 | 4098 | 2887 | 796 | 5541 | 10276 |
 | 32-bit SSE2, natemu | 2427 / 2296 | 2614 / 1905 | 4042 / 4040 | 59 / 59 | 2558 / 2573 | 2862 / 2904 |
 
-What stands out, as findings to follow up, none of them fixed here:
+What stands out (profiled in the next section; Monte Carlo in the SSE2 build is fixed there):
 
 - **Monte Carlo in the 32-bit SSE2 build is 13 times slower than on real x86** (59 against 796). The likely cause, not
   yet verified by a profile: on i386 a function returns a double on the x87 stack whatever the floating-point
@@ -424,6 +424,64 @@ What stands out, as findings to follow up, none of them fixed here:
   SOR is faster on the M4 than on the Ryzen. LU is not x87 code; this is a 64-bit finding too.
 - **Monte Carlo and the sparse multiply in the x87 build** are three to four times slower than real x86, where c-ray's
   x87 code is now at parity.
+
+### SciMark profiled: Monte Carlo fixed, the other gaps explained
+
+One profile group (`guest-scimark-profile`, `guest-scimark32-profile`, `guest-scimark32-sse2-profile`; the timing
+build, sliced by kernel), the hot loops' translations read next to their x86 code, and SciMark built natively for the
+M4 (arm64, clang -O3) as the ceiling of this hardware:
+
+| SciMark 2.0 (Mflops) | composite | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | --- | --- | --- | --- | --- | --- |
+| native arm64 on the M4 | about 7090 | 5555 | 5370 | 1930 | 6500 | 16070 |
+
+**Monte Carlo, 32-bit SSE2: the cause confirmed and fixed (59 to about 260 Mflops in the profile build; the final
+round has the number).** The disassembly shows what was guessed: the random-number function ends in
+`movsd [esp],xmm0; fld qword [esp]; ret` and its caller does `fstp qword [esp]; movsd xmm0,[esp]`. The FLD's quieting
+multiply by 1.0 opened an x87 run (status and control registers switched) that the next SSE instruction closed, at
+every call. Now a FLD of a double in a unit with no computing x87 instruction loads without the multiply and without a
+run: the signalling NaN is quieted and IE set with integer instructions, a denormal sets DE. Exact, and generic: every
+i386 function that returns a double computed with SSE does this. The same form for a returned `float` (FLD m32, which
+converts) is not built. What is left of the gap to real x86 (796) is the next item.
+
+**Monte Carlo, both 32-bit builds (about 260 to 290 against 800 to 850): calls and returns.** The kernel is one small
+function called twice per sample; each CALL and RET leaves the translated code through the dispatcher's lookup, and in
+the x87 build each block starts with the five-instruction test of its stack-top guess and ends with the write of the
+top, tags and slots. 64-bit Monte Carlo (962 against 983 on x86) does not have this: its compiler inlined the call. A
+fix is return prediction for 32-bit code; the earlier experiment with pairing returns lost time on 64-bit code
+(see the translated-code experiments), so this is a design question, not an afternoon. Estimate: two times on this
+kernel if returns chain like direct jumps; not measured.
+
+**Sparse multiply, x87 build (1,197 against 4,378).** All of its time is in translated code. The inner loop's seven x86
+instructions (`mov; fld qword; fmul qword; add; faddp; cmp; jne`) run about 42 Arm instructions per iteration. The
+extras: the loop is a block that jumps to itself, so every iteration tests the guess (5), writes the top, tags and one
+slot twice (10, before the FADDP's flush and at the block's end) and reloads; the FLD keeps its multiply by 1.0 (4,
+the unit computes); the stack check of FADDP is done with two constants at run time (4) where the compiler knows the
+answer. A fix is to let a block that jumps to itself with the top it started with skip the test and keep the stack in
+registers around the loop (a loop-carried x87 map): estimate 42 to about 15 instructions, two to three times on this
+kernel and on any tight x87 loop (c-ray's blocks are long, which is why it did not show there). Estimate of work: a
+day, with the same exactness questions as the map (state complete at every fault site). Not started.
+
+**LU, both SSE builds (2,300 and 2,900 against 11,600 and 10,300): unaligned 16-byte stores that cross a page.** Only
+50 to 57% of the LU phase is in translated code; the rest is the trap path (abort 14 to 17%, shadow 14 to 17%, link,
+enter, patch). The inner loop is a `movups` load, multiply, subtract, `movups` store over rows that malloc put at any
+8-byte address, so in a row that straddles a 4K boundary one store per pass crosses it, and a crossing store takes the
+split-store stub into the resident, about 650 ns each, against about 30 ns for the rest of the row. The x87 build's LU
+(8-byte stores at 8-byte alignment never cross) is 100% in translated code. So yes, LU pays for page crossing: twice,
+by the four-instruction crossing check in front of each 16-byte access (4 of the loop's about 14 Arm instructions for
+7 x86), and by the trap when the check fires. A fix is a crossing store done in translated code out of line (probe
+both pages for write, then store), with the exactness rule that nothing is written when the second page faults;
+estimate: the phase back to nearly all translated code, LU about 1.8 to 2 times faster in both SSE builds and in
+64-bit code generally where `movups`/`movdqu` stores cross pages (memcpy-like loops). The rest of the gap to x86 would
+remain. Estimate of work: half a day to a day. Not started.
+
+**FFT, 64-bit (2,043 against 4,213; native arm64 5,555).** 100% in translated code. The inner loop's 27 x86
+instructions become about 46 Arm instructions (1.7 per instruction). The extras: page-crossing checks in front of the
+16-byte accesses (about 22% of the loop), a `ldr d2; mov v16,v2` pair where one load into the target register would
+do (scalar loads that must zero the upper half), and the AF flag's `eor` after integer arithmetic whose flags nothing
+reads. FFT's result also varies from run to run under natemu (1,692 to 3,182 across boots); not explained (the
+transform's arrays' alignment against pages is the first suspect, given the crossing checks). No fix made: none of it
+is the Monte Carlo fix.
 
 ### INT 0x80 again: where its time goes
 
