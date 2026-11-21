@@ -672,7 +672,9 @@ fn admit_records(
         if !site_fields_valid(s, &h, region)
             // M3: a load or store site may carry its instruction's completion record (fexc series23-m3): its length must end
             // at the next instruction boundary of the PC table, or at the block's end.
+            // (M2 task 4: or the mark of a FISTP m64's integer store, an 8-byte store of a general register.)
             || (s.guest_offset2 != object::NONE32
+                && !(s.guest_offset2 == object::X87_INT64 && (s.kind, s.width, s.data_class) == (object::kind::STORE, 8, object::CLASS_GPR))
                 && object::completion(s).is_none_or(|c| {
                     let end = s.guest_offset + u32::from(c.length);
                     let next = pcs.iter().map(|p| p.guest_offset).filter(|&g| g > s.guest_offset).min().unwrap_or(h.guest_bytes);

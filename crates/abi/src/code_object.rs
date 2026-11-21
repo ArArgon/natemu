@@ -100,6 +100,10 @@ pub mod kind {
     /// that instruction. Its `native_offset` is that offset + 1 (no word is there: the record is found by this key).
     pub const X87MAP: u8 = 24;
 }
+/// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
+/// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault
+/// there the resident keeps that integer for the instruction's rerun ([`crate::execution::frame::X87_INT`]).
+pub const X87_INT64: u32 = 0xC000_0001;
 /// An [`kind::X87MAP`] record: x87 register r (its number) is the low 64 bits of host register v`reg[r]` (`NO_REG`: as the
 /// guest-state page holds it), TOP is `top` and the abridged tag byte `tags`. Numbers, not changes: applying it again
 /// changes nothing.

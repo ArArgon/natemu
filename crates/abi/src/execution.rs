@@ -1630,6 +1630,27 @@ pub mod frame {
     pub const X87_FCW: u32 = 0x4b0;
     pub const X87_FTW: u32 = 0x4b2;
     pub const X87_EXCEPTIONS: u32 = 0x4b4;
+    /// M2 task 4, 64-bit integers through the x87 (FEX's `gregs[0..2]`, which slice1 code never uses otherwise): what the
+    /// resident keeps when the store of a FISTP m64 faults that was storing the integer its block's FILD m64 loaded
+    /// ([`crate::code_object::X87_INT64`]): the instruction's RIP, the integer, and ST(0)'s bits then. The FISTP m64 that
+    /// starts the next unit at that RIP stores the integer when ST(0) is still that double (the instruction run again after
+    /// the fault), and clears the RIP after its store. A stale entry can only give an integer that converts to exactly the
+    /// double in ST(0), as the conversion it replaces does.
+    /// The entry belongs to one address space: 32-bit processes share their addresses, so another process may run a FISTP
+    /// m64 at the same RIP with an equal double. The resident keeps the entry's CR3 and RIP beside it ([`X87_INT_CR3`],
+    /// [`X87_INT_KEPT_RIP`]: generated code never reads these two) and holds [`X87_INT_RIP`] at 0 while CR3 is another
+    /// ([`x87_int_live`], at every load of CR3); it drops the entry whenever it writes an x87 register or runs an x87
+    /// transaction (FNINIT, FLDENV, FRSTOR, FXRSTOR, XRSTOR: the register file is replaced), so the entry lives through a
+    /// page fault and the IRET back, not through a context switch.
+    pub const X87_INT_RIP: u32 = 0x20;
+    pub const X87_INT: u32 = 0x28;
+    pub const X87_INT_ST0: u32 = 0x30;
+    pub const X87_INT_CR3: u32 = 0x38;
+    pub const X87_INT_KEPT_RIP: u32 = 0x40;
+    /// What [`X87_INT_RIP`] holds under `cr3`: the kept RIP in the entry's own address space, else 0 (no entry).
+    pub const fn x87_int_live(kept_rip: u64, kept_cr3: u64, cr3: u64) -> u64 {
+        if kept_cr3 == cr3 { kept_rip } else { 0 }
+    }
     /// I5c (unmasked floating-point exceptions), two bytes of FEX's flag array FEX's code never uses (its X87FLAG_DE_LOC and
     /// X87FLAG_ZE_LOC), both in FPSR's flag order: the MXCSR flags SIMD-checked instructions raised since the last resident
     /// entry (generated code folds each checked instruction's FPSR into it; the resident ORs it into MXCSR and clears it at
@@ -1663,7 +1684,8 @@ pub mod frame {
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 21] = [
+    pub const GUEST_STATE: [(u32, u32); 22] = [
+        (X87_INT_RIP, 40),
         (X87_FPCR, 4),
         (X87_RUN, 1),
         (TSC_OFFSET, 8),
@@ -1691,7 +1713,8 @@ pub mod frame {
     /// resident reads the rounding and precision controls back at every bank (FNINIT, FLDENV, FRSTOR and a FLDCW changing the
     /// masks are transactions); IF too but in a CPL-0
     /// block's CLI and STI ([`IF`]).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 12] = [
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 13] = [
+        (X87_INT_RIP, 8),
         (X87_FCW, 2),
         (X87_FPCR, 4),
         (X87_RUN, 1),
@@ -4535,6 +4558,10 @@ mod tests {
         );
         // I5c: the SIMD flag byte and the x87 pending byte, FEX's flag bytes 33 and 34, readable and writable.
         assert_eq!((frame::SIMD_FLAGS, frame::X87_PENDING), (0x411, 0x412));
+        // M2 task 4: the integer kept for a FISTP m64's rerun is live only under the CR3 it was kept under.
+        assert_eq!(frame::x87_int_live(0x8049d5d, 0x1000, 0x1000), 0x8049d5d);
+        assert_eq!(frame::x87_int_live(0x8049d5d, 0x1000, 0x2000), 0);
+        assert_eq!(frame::x87_int_live(0, 0x1000, 0x1000), 0);
         assert!(
             [frame::SIMD_FLAGS, frame::X87_PENDING]
                 .iter()

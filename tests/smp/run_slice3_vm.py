@@ -1601,7 +1601,9 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
                 if name in QEMU_DIFFERS: entry['qemu_differs'] = QEMU_DIFFERS[name]
                 else: failures.append(f"{name}: QEMU {qf}, segment_model permits {sorted(permitted, key=str)}")
             elif name in QEMU_DIFFERS: failures.append(f'{name}: listed in QEMU_DIFFERS but QEMU is permitted')
-        for limit in ([], [1]):
+        # (`whole_blocks`: a program about something natemu does within one block, as the FILD m64, FISTP m64 pair, which one
+        # instruction per block does not keep exact: the recorded x87-in-doubles deviation.)
+        for limit in ([],) if prog['params'].get('whole_blocks') else ([], [1]):
             rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
             if rc:
                 diffs = [f'driver exit {rc}: {err.strip()[-300:]}']
@@ -1720,7 +1722,9 @@ def cmd_system(a, host, runtime):
             entry['modes_model'] = (model_profile, last['vector'])
             if last['vector'] != faults[0][0]:
                 failures.append(f"{name}: modes_model profile {model_profile} gives vector {last['vector']}")
-        for limit in ([], [1]):
+        # (`whole_blocks`: a program about something natemu does within one block, as the FILD m64, FISTP m64 pair, which one
+        # instruction per block does not keep exact: the recorded x87-in-doubles deviation.)
+        for limit in ([],) if prog['params'].get('whole_blocks') else ([], [1]):
             rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
             if rc:
                 diffs = [f'driver exit {rc}: {err.strip()[-300:]}']

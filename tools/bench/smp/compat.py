@@ -805,6 +805,55 @@ X87FAULT_USER = REGS32 + f"""    fninit
 """ + _zero(XPAGE + 0x100 + 12, 16) + f"""    int 0x80
 .three: dd 3
 """
+# ---- 64-bit integers through the x87 (M2 task 4) ------------------------------------------------------------------------------
+# FILD m64 then FISTP m64 is how i686 code copies a 64-bit integer in one piece (atomic loads and stores). natemu's x87
+# registers are doubles, so the pair is translated as a copy of the integer. Here with integers a double cannot hold
+# (2^62 + 1; 2^63 - 1, which as a double is 2^63, out of range for the store): into a page not present (the handler maps it
+# and the FISTP runs again, alone, with the integer the resident kept), into a mapped page, and with an integer
+# instruction between the two.
+INT64_USER = REGS32 + f"""    fninit
+    fild qword [.odd]
+    fistp qword [{VPAGE + 0x30:#x}]
+    fild qword [.max]
+    fistp qword [{XPAGE + 0x10:#x}]
+    fild qword [.odd]
+    fistp qword [{VPAGE + 0x40:#x}]
+    fild qword [.max]
+    mov eax, ebx
+    fistp qword [{VPAGE + 0x50:#x}]
+    int 0x80
+.odd: dq 0x4000000000000001
+.max: dq 0x7fffffffffffffff
+"""
+# The same store, with another address space between the fault and the instruction's second run (the security review of
+# the kept integer): the #PF handler maps the page, copies the top-level table to a free page and loads CR3 with it (another
+# process at the same addresses), replaces ST(0) by 2^62 itself, the double that 2^62 + 1 also converts to, and returns to
+# the same FISTP. It must store 2^62, the register's value, not the integer kept for the first address space.
+INT64_SPACE = f"""    cmp qword [rsp], 14
+    jne .not_pf
+    and qword [rsp+32], ~0x10000
+    mov rax, cr2
+    invlpg [rax]
+    shr rax, 12
+    or qword [{PTE(0):#x} + rax*8], 3
+    mov rsi, cr3
+    mov edi, {LOW1:#x}
+    mov ecx, 512
+    rep movsq
+    mov eax, {LOW1:#x}
+    mov cr3, rax
+    fstp st0
+    fild qword [rel .other]
+    jmp .resume
+.other: dq 0x4000000000000000
+.not_pf:
+"""
+INT64_SPACE_USER = REGS32 + f"""    fninit
+    fild qword [.odd]
+    fistp qword [{VPAGE + 0x30:#x}]
+    int 0x80
+.odd: dq 0x4000000000000001
+"""
 A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
 X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
               A5(R + 0x6c0, 0x80), P.zero(R + 0x740, 0x8c0)]
@@ -926,6 +975,10 @@ def positive32():
             program('c32-forms@1', ENTER() + handlers(), FORMS_USER, FORMS_MEMORY),
             program('c32-x87@1', X87_BODY, X87_USER, X87_MEMORY),
             program('c32-x87-depth@1', X87_BODY, DEPTH_USER, [P.zero(R, 0x100)]),
+            program('c32-x87-int64@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
+                    INT64_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
+            program('c32-x87-int64-space@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_SPACE + RESUME, **vec),
+                    INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             program('c32-x87-faults@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
                     X87FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
             program('c32-faults@1', GATES + ENTER() + handlers(END + RESUME, **vec), FAULT_USER32, log=0x1000),

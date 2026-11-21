@@ -2903,6 +2903,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                         })
                     });
                     s.cpu.cr3 = v;
+                    x87::address_space(v & !(1 << 63)); // M2 task 4: the integer kept for a FISTP m64 is one address space's
                     // A new address space starts with the shared stack check again: the count and so code context bit 33 clear (the
                     // next dispatch recomputes the context and selects its table; both variants stay in the pool). A process that
                     // trips the check `STACK_TRAP_LIMIT` times costs only its own space, not the vCPU's later code, kernel included.
@@ -3356,6 +3357,11 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
         && let Some(map) = object::x87_map(&sites[i])
     {
         x87::rebuild(&map, f);
+    }
+    // M2 task 4: the store of a FISTP m64 that was storing its block's FILD m64's integer: kept for the instruction's rerun
+    // ([`frame::X87_INT`]; 32-bit code, where the FISTP that starts a unit looks for it).
+    if site.guest_offset2 == object::X87_INT64 && site.kind == object::kind::STORE && s.cpu.code_mode() == Some(CodeMode::Compat32) {
+        x87::keep_integer(s.cpu.rip, f.x[site.data_reg[0] as usize & 31], s.cpu.cr3 & !(1 << 63));
     }
 }
 

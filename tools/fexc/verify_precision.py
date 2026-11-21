@@ -711,11 +711,12 @@ def divides(d, dis, order, stubs, check_at):
 GUEST_STATE_FLAGS = {0x3f0 + b for b in (8, 9, 10, 12, 14, 16, 17, 18, 19, 20, 21)}
 GUEST_STATE_DF = {0x3f0 + 10}
 # I7: FEX's gs_cached (0x3e0) and fs_cached (0x3e8), 8 bytes each: loads only (an FS-/GS-prefixed access adds the base).
-GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
+GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8),
+                     (0x20, 24))   # (M2 task 4: the integer kept for a FISTP m64's rerun, its RIP and ST(0)'s bits: loads; the RIP is cleared, X87_STATE)
 # I6: the x87 state (abi `frame::X87_*`): FEX's IE, C0..C2, TOP and C3 bytes, the abridged tag word and the x87 exception word,
 # read and written; FCW read only; ST(i) through `add x0, x28, xI, lsl #4; ldr|str dN, [x0, #0x420]` (check_sites.x87_slot).
 X87_STATE = ((0x412, 1), (0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4),
-             (0x420, 128))   # (M2 task 4: ST(i) also as a field at a fixed offset, in a unit compiled for a known stack top)
+             (0x20, 8), (0x420, 128))   # (M2 task 4: the kept integer's RIP, cleared by the FISTP m64 that looked; ST(i) also as a field at a fixed offset, in a unit compiled for a known stack top)
 X87_FCW = (0x4b0, 2)
 X87_PENDING = 0x412
 # M2 task 4, x87 runs (shim/fexc_hook.h): the SIMD flag byte (FPSR's flags move into it at a run's start: MXCSR is their OR
