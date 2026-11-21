@@ -1,0 +1,5 @@
+# Known natemu bugs these tests catch (testkit/known_bugs.py): reported as `known-bug`, never a gate failure.
+
+[bug.pending-compiler-peer-ack]
+note = "io-pending-compiler: while vCPU 0's compile reply is held, vCPU 1 sometimes does not acknowledge the copy window within 300 ms ('no positively observed pending epoch and peer acknowledgement', in stage 0 or 1). Fails 5 of 10 fresh runs on main f0feda92 (and its code at 2e24865f) on the idle M2 Max, November 20, 2026, as often as on paper-start. Unconfirmed cause: vCPU 1's split-lock wait for vCPU 0's shadow reset while vCPU 0 is in the host for the held compile (cache::split_begin)."
+cases = ["io-program/io-pending-compiler", "io-program/io-pending-compiler::*"]
