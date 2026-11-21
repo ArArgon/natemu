@@ -1183,6 +1183,7 @@ template<class ZFn> inline uint32_t UpperZeroFrom(const FEXCore::IR::IROp_Header
 inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
   using namespace FEXCore::IR;
   switch (Op) {
+  case OP_FEXCX87SLOT: case OP_FEXCX87MAP:   // (M2 task 4: the x87 map's ops emit nothing)
   case OP_DUMMY: case OP_INVALIDATEFLAGS: case OP_GUESTOPCODE: case OP_SETROUNDINGMODE: case OP_PUSHROUNDINGMODE:
   case OP_POPROUNDINGMODE: case OP_STOREPF: case OP_STOREAF: case OP_LOADCONTEXTPAIR: case OP_STORECONTEXT: case OP_STORECONTEXTPAIR:
   case OP_STORECONTEXTINDEXED: case OP_STORENZCV: case OP_LOADMEMPAIR: case OP_STOREMEM: case OP_STOREMEMPAIR: case OP_STOREMEMTSO:

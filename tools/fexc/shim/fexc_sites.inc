@@ -329,13 +329,17 @@ DEF_OP(FexcX87Guess) {
 // M2 task 4, the x87 map (fexc_hook.h): no code. (A unit with a spill slot is not run: the host compiles a shorter one.)
 DEF_OP(FexcX87Slot) {
   const auto Op = IROp->C<IR::IROp_FexcX87Slot>();
+  if (fexc_x87_slots_guest != ~0u && fexc_x87_slots_guest != FexcGuest) std::abort();   // a hard check: slots left by another instruction
+  fexc_x87_slots_guest = FexcGuest;
   fexc_x87_slots[Op->Register & 7] = uint8_t(GetVReg(Op->Value).Idx());
 }
 DEF_OP(FexcX87Map) {
   const auto Op = IROp->C<IR::IROp_FexcX87Map>();
   FexcX87MapInfo M {FexcInsnNative, FexcGuest, Op->Top, Op->Tags, {}};
+  if (fexc_x87_slots_guest != ~0u && fexc_x87_slots_guest != FexcGuest) std::abort();   // a hard check: the map's slots are its instruction's
   std::memcpy(M.reg, fexc_x87_slots, 8);
   std::memset(fexc_x87_slots, 0xff, 8);
+  fexc_x87_slots_guest = ~0u;
   // (An instruction that emits no word shares its native offset with the next one, and the x87 state too: one record.)
   if (!fexc_x87_maps.empty() && fexc_x87_maps.back().insn_native_offset == M.insn_native_offset) fexc_x87_maps.pop_back();
   fexc_x87_maps.push_back(M);
