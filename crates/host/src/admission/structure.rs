@@ -623,11 +623,7 @@ fn bulk_words(w: u32) -> Vec<(u32, Bulk)> {
 }
 /// How a stub is reached: the words `start..=end` end in its branch; `cond` is the normalized conditional branch
 /// (the far form `!cond +8; b stub` normalized to `cond`), `None` for a plain `b`.
-/// M2 task 4: the end of an x87 run (fexc `FexcX87RunEnd`): the run's flags from FPSR into the x87 exception word, FPCR back,
-/// FPSR and the run byte cleared.
-const RUN_END: [u32; 9] =
-    [0xd53b_4420, 0x1200_1c00, 0xb944_b781, 0x2a00_0021, 0xb904_b781, 0xb940_b380, 0xd51b_4400, 0xd51b_443f, 0x3910_539f];
-const _: () = assert!(RUN_END[8] == 0x3900_039f | frame::X87_RUN << 10);
+use natemu_abi::execution::RUN_END;
 #[derive(Clone, Copy)]
 struct Check {
     start: u32,
@@ -801,6 +797,12 @@ impl<'a> Verifier<'a> {
         // branches like the others for every rule on targets.
         let (returns, back): (Vec<_>, Vec<_>) =
             back.into_iter().partition(|&(at, t)| v.probe_return(at, t) || v.run_end_return(at, t));
+        // (No other backward branch into the run's end: its return is reached from the test alone.)
+        if let Some(e) = v.run_test()
+            && returns.iter().chain(&back).any(|&(at, t)| at != e + 36 && t >= e && t <= e + 36)
+        {
+            return Err(format!("backward branch into the x87 run's end at {e:#x}"));
+        }
         v.branches.extend(returns);
         for (at, t) in back {
             let words = v.bulk_loop(at, t).ok_or(format!(
@@ -1477,17 +1479,11 @@ impl<'a> Verifier<'a> {
                 .then_some((i, k))
         })
     }
-    /// The block's top test for an open x87 run (M2 task 4: `ldrb w0, [x28, #X87_RUN]; cbnz w0, E` as its first two words):
-    /// E, where the run's end must be.
+    /// The block's top test for an open x87 run (M2 task 4, [`natemu_abi::execution::run_test_end`]: its two words, the
+    /// run's end where they branch and a `b` after it): where the run's end is. (An x87 block may begin with the same two
+    /// words, the start of a run: no run's end behind them, no top test.)
     fn run_test(&self) -> Option<u32> {
-        if (self.c.code.len() as u32) < ENTRY_OFFSET + 12 {
-            return None;
-        }
-        let cbnz = self.word(ENTRY_OFFSET + 4);
-        (self.word(ENTRY_OFFSET) == 0x3940_0380 | frame::X87_RUN << 10
-            && cbnz & 0xff00_001f == 0x3500_0000)
-            .then(|| ENTRY_OFFSET + 4 + (cbnz >> 5 & 0x7_ffff) * 4)
-            .filter(|&e| cbnz >> 23 & 1 == 0 && e > ENTRY_OFFSET + 8 && e + 40 <= self.c.code.len() as u32)
+        natemu_abi::execution::run_test_end(|o| self.word(o as u32), self.c.code.len() as u64).map(|e| e as u32)
     }
     /// The backward branch at `at` to `t` is the return from the run's end of the block's top test: the run's end's nine
     /// words stand where the test branches, this branch after them, back to the block's third word (the test's fall-through),
@@ -1496,7 +1492,6 @@ impl<'a> Verifier<'a> {
         self.run_test().is_some_and(|e| {
             at == e + 36
                 && t == ENTRY_OFFSET + 8
-                && (0..9).all(|k| self.word(e + 4 * k) == RUN_END[k as usize])
                 && self.insn(e - 4).is_none_or(|x| !x.falls_through())
                 && self.branches_into(e - 4, at).all(|(src, to)| src == ENTRY_OFFSET + 4 && to == e)
         })

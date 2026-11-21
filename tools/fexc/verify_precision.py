@@ -238,23 +238,25 @@ RUN_END = ['mrs x0, fpsr', 'and w0, w0, #0xff', 'ldr w1, [x28, #0x4b4]', 'orr w1
 
 
 def run_test_end(d, dis):
-    """M2 task 4, the second entry: where the run's end of the block's top test for an open x87 run stands (`ldrb w0, [x28,
-    #0x414]; cbnz w0, E` as the block's first two words), else None."""
+    """M2 task 4, the second entry: where the run's end of the block's top test for an open x87 run stands: `ldrb w0, [x28,
+    #0x414]; cbnz w0, E` as the block's first two words and the run's end's nine words at E (an x87 block may begin with
+    the same two words, the start of a run: no top test), else None."""
     first = d['code']['layout']['code_region_begin']
     m = re.fullmatch(r'cbnz w0, 0x([0-9a-f]+)', dis.get(first + 4, ''))
-    return int(m[1], 16) if dis.get(first) == 'ldrb w0, [x28, #0x414]' and m else None
+    if dis.get(first) != 'ldrb w0, [x28, #0x414]' or not m: return None
+    e = int(m[1], 16)
+    return e if [str(dis.get(e + 4 * k)).lower() for k in range(9)] == RUN_END else None
 
 
 def run_test(d, dis, order):
-    """A block with the top test (the resident's linker enters it behind the test from another such block) is 32-bit code, has at
-    E exactly the run's end and the branch back to its third word, and opens no run anywhere (no store to the run byte but
-    of zero): so no run is open behind the test, to every exit."""
+    """A block with the top test (the resident's linker enters it behind the test from another such block) is 32-bit code, has
+    after the run's end the branch back to its third word, and opens no run anywhere (no store to the run byte but of zero):
+    so no run is open behind the test, to every exit."""
     e, first = run_test_end(d, dis), d['code']['layout']['code_region_begin']
     if e is None: return []
     out = []
     if not BITS: out.append('the x87 run test at the top of 64-bit code')
-    if [str(dis.get(e + 4 * k)).lower() for k in range(9)] != RUN_END or dis.get(e + 36) != f'b {first + 8:#x}':
-        out.append("the x87 run test at the block's top does not lead to the run's end and back")
+    if dis.get(e + 36) != f'b {first + 8:#x}': out.append("the x87 run test's end does not go back to the block's third word")
     out += [f'+{o} "{dis[o]}" opens an x87 run in a block that begins with the test for one' for o in order
             if re.fullmatch(r'strb w\d+, \[x28, #0x414\]', dis[o])]
     return out
