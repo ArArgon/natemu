@@ -504,10 +504,14 @@ when it enters the shim, which it does not between the probes and the store (an 
 sentence is what the design rests on; it is written at the code. Details that follow from it or guard it:
 
 - Any return from the shim into the stub goes to the stub's first word, never to the second probe.
-- One-instruction blocks keep the trap, so single-stepping, data breakpoints and uncached-memory ordering are untouched.
-- 32-bit code: the stub first tests for an address above 4 GiB (FEX computes addresses in 64 bits; a store running
-  across 4 GiB) and takes the trap for it, since the page tables may map something up there for the same task's 64-bit
-  code and the probe would pass.
+- One-instruction blocks keep the trap, so single-stepping and uncached-memory ordering are untouched.
+- While a breakpoint is armed (DR7), the stub takes the trap as before: it first reads a byte the shim keeps for it
+  (found by the code review: the sentence above is about faults, and a store that crossed a page and then met a
+  watchpoint might have written its first part before the instruction is run again alone).
+- The stub also takes the trap for a store that wraps at the top of the address space (64-bit code; the review again)
+  and, in 32-bit code, for an address above 4 GiB (FEX computes addresses in 64 bits; a store running across 4 GiB),
+  since the page tables may map something up there for the same task's 64-bit code and the probe would pass. The whole
+  stub is eleven Arm instructions, all behind the block.
 - With x86 alignment checking on, the probes (bytes) pass and the misaligned store itself takes Arm's alignment fault,
   which was already delivered as #AC.
 - A probe that hits a hardware watchpoint goes to the same handler, which tests the debug registers as before.
@@ -526,9 +530,16 @@ phase is now all translated code was not rerun). The other kernels did not move 
 rest of LU's gap to real x86 is translated-code quality (the four-instruction check in front of each 16-byte access
 among them).
 
-`fexc-replay` fails with this change, by its design: it shows that a compiler change left the code of a recorded
-64-bit boot alone, and this change alters every block with a store wider than a byte (the stubs behind the block; the
-block's own words are the same). Judged by the other suites, as its description says.
+`fexc-replay` shows that a compiler change left the code of a recorded 64-bit boot alone, and this change alters every
+block with a store wider than a byte. The check now bounds the intended change instead of failing on it
+(`replay.py`, `only_probes`): a reply may differ only in that split stubs are the eleven probing words where the old
+compiler has the trap word, with what follows from their size (later stubs and FEX's tail at other offsets, the
+branches to moved stubs with other displacements, the sizes in the header and the tail). Everything else is compared
+byte for byte: every word of every block before its first stub, the other stubs, every site record, the PC table, the
+relocations, the report, the extent and the arguments read. Result on the recorded boot: 54,940 requests, 10,728
+replies differ, all of them only in that way, 0 otherwise. The check's by-product, that a 64-bit reply does not depend
+on the 32-bit requests the same compiler process answered before it, is now its own case (`fexc-replay-order`: the new
+compiler against itself, one process answering every request and one only the 64-bit ones): 0 differences.
 
 Tests: no new family. The existing cases of crossing stores now run through the probes in ordinary blocks and through
 the trap in their one-instruction variants, and all pass: the fault families (page not present, read-only, supervisor,
@@ -536,8 +547,18 @@ reserved bits on either side; 2 to 32 bytes; PUSH and a CALL's push; read-modify
 straddles; first-page-first order), uncached memory on either side (`m2`), a device page on either side (`m3`), three
 vCPUs with crossing vector stores and split locks (`vector-split-smp`), #AC (`vector-ac`), the 32-bit wrap cases
 (`compat32`), and a crossing FILD/FISTP pair (`c32-x87-int64-cross`, new, which also found that the kept integer was
-not kept when the fault was taken at a stub: fixed). Not written: a data breakpoint on each byte of a crossing store
-in an ordinary block, and a multi-vCPU run with mprotect or munmap racing a crossing read-modify-write.
+not kept when the fault was taken at a stub: fixed). Added after the code review: crossing stores with a write
+breakpoint on bytes of the second page (`s4-d-forms`: ADD to 4 and 8 bytes and a 16-byte MOVUPS, the breakpoint on the
+last byte and on interior bytes only; the memory compared with QEMU), and the checker's refusals as a unit test (a
+return to a word after the store or before the code, a probe on another register, a stub without its tests or its
+trap word, a probe outside a stub, a second way into a stub). Not written: a store that wraps at 2^64 or crosses next
+to the guest-state page's alias, a return into a literal slot (the rule is one line; no block here has a literal to
+aim at), and a multi-vCPU run with mprotect or munmap racing a crossing read-modify-write.
+
+For whoever runs the gate: the hold cases of `k1` and the `pic-*` cases use a second host built with test hooks in
+`target/hooks`, and reuse it when it exists (`NATEMU_PREBUILT=1`). After a change to the host's admission that binary
+is stale and refuses new code ("object refused: check stub ..."); delete `target/hooks/release/natemu-host` and the
+resident beside it and they are built again. Not fixed here (a change to the test framework).
 
 ### INT 0x80 again: where its time goes
 
@@ -596,8 +617,9 @@ so no change that can be told from a boot's noise. (A first comparison of two pa
 rounds did not confirm it.) The system, SMP and fault families pass with it (77,181 cases). Added after its review: the
 APIC register program also reads with ADD and CMP (forms the old path refused; the load in place serves any 4-byte
 load) and reads a register that does not exist (0, and the error register's illegal-register bit through the old
-path); the priority program's handlers return through a computed jump to their IRETQ, with interrupts pending; three
-faulting IRETQs are reached by a computed jump. Not written: an IRET in an NMI handler with a second NMI pending, the
+path); a copy of the priority program whose handlers return through a computed jump to their IRETQ, with interrupts
+pending (`apic-prio-jmp`). Not written: a faulting IRETQ reached by a computed jump (tried in the segment cases; the
+position-independent jump disturbed what their model compares), an IRET in an NMI handler with a second NMI pending, the
 APIC page read at CPL 3, with a data breakpoint armed, and in x2APIC or disabled mode through this path. Still there per call: the
 delivery itself (the IDT entry, the stack switch, five pushes) and the APIC read's trap and page walk.
 

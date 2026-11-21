@@ -1681,6 +1681,10 @@ pub mod frame {
     /// Guest-writable like the rest of the page: a forged value changes only the guest's own floating-point state.
     pub const X87_RUN: u32 = FLAGS + 36;
     pub const X87_FPCR: u32 = 0xb0;
+    /// M2 task 4, page-crossing stores: 1 while DR7 arms a breakpoint (the byte after [`X87_FPCR`] in FEX's `callret_sp`),
+    /// the resident's, written before generated code runs ([`EVENT_PENDING`]'s times). A split stub reads it and takes its
+    /// `brk` instead of probing: a store that crossed a page and then met a watchpoint might have written part.
+    pub const WATCH_ARMED: u32 = X87_FPCR + 4;
     pub const SIMD_FLAGS: u32 = FLAGS + 33;
     pub const X87_PENDING: u32 = FLAGS + 34;
     /// FEX's X87FLAG_OE_LOC byte (no FEX code uses it): 1 when the resident's FP trap handler (accurate mode without AFP, DAZ and FTZ
@@ -1695,9 +1699,10 @@ pub mod frame {
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 22] = [
+    pub const GUEST_STATE: [(u32, u32); 23] = [
         (X87_INT_RIP, 40),
         (X87_FPCR, 4),
+        (WATCH_ARMED, 1),
         (X87_RUN, 1),
         (TSC_OFFSET, 8),
         (AVX_HIGH, 256),

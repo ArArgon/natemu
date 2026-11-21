@@ -77,6 +77,15 @@ argv = ["tools/fexc/replay.py", "--fexc", "{fexc}", "--old", "{fexc_base}", "--s
         "--program32", "tests/boot/i386_static.asm"]
 needs = { cores = 2, perf = true }
 
+# The same stream answered twice by the new compiler, one process answering every request and one only the 64-bit ones: a
+# 64-bit reply does not depend on the 32-bit requests answered before it. (fexc-replay showed this as a by-product while
+# OLD and NEW gave the same replies; since M2 task 4's split stubs they differ, within replay.py's `only_probes`.)
+[suite.cases."fexc-replay-order"]
+argv = ["tools/fexc/replay.py", "--fexc", "{fexc}", "--old", "{fexc}", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}",
+        "--kernel", "{raw}/kernel-census-20261028-01/dl/linux", "--initrd", "{raw}/kernel-census-20261028-01/dl/initrd.gz", "--out", "{out}",
+        "--program32", "tests/boot/i386_static.asm"]
+needs = { cores = 2, perf = true }
+
 [suite.cases."fexc-skips"]
 argv = ["tools/fexc/scan_skips.py", "{fexc}"]
 

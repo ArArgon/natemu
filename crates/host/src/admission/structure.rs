@@ -15,7 +15,9 @@
 //!   fields (perf P2: its VERW); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
 //!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region, but the one back edge of a
-//!   bulk REP STOS loop (perf chunk 26, [`Verifier::bulk_loop`]: its exact words, whose count is at most 256); no word falls
+//!   bulk REP STOS loop (perf chunk 26, [`Verifier::bulk_loop`]: its exact words, whose count is at most 256) and a probing
+//!   split stub's return to its store (M2 task 4, [`Verifier::probe_return`]: to an instruction at or before the stub's
+//!   access, from a stub that nothing after that instruction reaches, so it closes no loop); no word falls
 //!   through into a literal slot, a check stub or past the region. So every path ends at an exit the resident knows (a link
 //!   point or the dispatch branch, which a precise stop patches) or at a check stub.
 //! - Sites: each access site lies inside its guest instruction and its word is a load, store, swap or LOCK atomic
@@ -1094,7 +1096,7 @@ impl<'a> Verifier<'a> {
                 }
                 Insn::Atomic { rn: 28, .. } => return fail(at, "frame access by an atomic"),
                 Insn::Probe(28) => return fail(at, "frame access by a probe"),
-                // A probe is a split stub's first or third word (after 32-bit code's four test words).
+                // A probe is a split stub's seventh or ninth word.
                 Insn::Probe(_) if !self.probing(at).is_some_and(|(_, k)| k == 0 || k == 8) => {
                     return fail(at, "page probe outside a split stub");
                 }
@@ -1441,18 +1443,14 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// The probing split stub the word at `at` belongs to (its index), and the word's offset from the stub's first probe:
-    /// 0 and 8 the probes, 12 the branch back to the store, 16 the `brk` of 32-bit code (whose first probe is the stub's
-    /// fifth word); negative in that code's four test words. Object validation checked the stub's words.
+    /// The probing split stub the word at `at` belongs to (its index), and the word's offset from the stub's first probe
+    /// (its seventh word): 0 and 8 the probes, 12 the branch back to the store, 16 the `brk`; negative in the six test
+    /// words. Object validation checked the stub's words.
     fn probing(&self, at: u32) -> Option<(usize, i64)> {
-        let first = if self.c.bits32 { 16 } else { 0 };
         self.c.stubs.iter().enumerate().find_map(|(i, s)| {
-            let k = i64::from(at) - i64::from(s.native_offset + first);
-            let first = i64::from(first);
-            (s.kind == object::kind::SPLIT
-                && (-first..16 + first / 4).contains(&k)
-                && matches!(self.insn((i64::from(s.native_offset) + first) as u32), Some(Insn::Probe(_))))
-            .then_some((i, k))
+            let k = i64::from(at) - i64::from(s.native_offset) - 24;
+            (s.kind == object::kind::SPLIT && (-24..=16).contains(&k) && matches!(self.insn(s.native_offset + 24), Some(Insn::Probe(_))))
+                .then_some((i, k))
         })
     }
     /// The backward branch at `at` to `t` is a probing split stub's return to its store, and makes no loop: it goes to a
@@ -1463,9 +1461,10 @@ impl<'a> Verifier<'a> {
             return false;
         };
         let s = &self.c.stubs[i];
-        let last = at + if self.c.bits32 { 4 } else { 0 }; // (32-bit code: the `brk` after the branch too)
+        let last = at + 4; // (the `brk` after the branch too)
         let stub = s.native_offset..=last;
         t <= s.guest_offset2
+            && self.insn(t).is_some()
             && self.insn(s.native_offset - 4).is_none_or(|x| !x.falls_through())
             && self
                 .branches_into(s.native_offset - 4, last)
@@ -1752,7 +1751,7 @@ impl<'a> Verifier<'a> {
                         );
                     }
                     // A stub that probes goes back to the word after its check.
-                    let first = st.native_offset + if self.c.bits32 { 16 } else { 0 };
+                    let first = st.native_offset + 24;
                     if matches!(self.insn(first), Some(Insn::Probe(_)))
                         && !matches!(self.insn(first + 12), Some(Insn::B(t)) if t == i64::from(c.end) + 4)
                     {
@@ -2674,6 +2673,41 @@ mod tests {
     /// M2, with `FEXC` set: 32-bit code (`--bitness 32`) is admitted under its mode only, with FEX's compact register map,
     /// branch targets and return addresses that wrap at 4 GiB, and the ES/CS/SS/DS base loads; a 64-bit object is refused
     /// under the 32-bit mode, and a base load patched into 64-bit code stays refused (`frame_fields`).
+    /// M2 task 4, with `FEXC` set: a split stub that probes. `mov [rbx+8], rax`: the check at 0x4..0x10, the store at 0x14,
+    /// the stub at 0x24 (its tests, the probes at 0x3c and 0x44, the branch back at 0x48, the `brk` at 0x4c).
+    #[test]
+    fn probing_split_stubs_are_verified() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let object = std::env::temp_dir().join(format!("natemu-admit-probe-{}", std::process::id()));
+        let out = std::process::Command::new(&fexc)
+            .args(["--hex", "48894308", "--rip", "0x8048000", "--profile", "slice1", "--narrow-cmp", "--ext-conds", "4", "--object"])
+            .arg(&object)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let block = (std::fs::read(&object).unwrap(), vec![0x48, 0x89, 0x43, 0x08]);
+        let _ = std::fs::remove_file(&object);
+        let block = (&block.0[..], &block.1[..]);
+        admit(block).unwrap();
+        admit_with(block, false).unwrap();
+        // Object validation (so also with the code shape off): the stub's words exactly.
+        for (at, old, new) in [
+            (0x48, 0x17ff_fff3, 0x17ff_fff4), // b 0x18: back to a word after the access
+            (0x48, 0x17ff_fff3, 0x17ff_ffee), // b 0x0: before the code
+            (0x3c, 0x383f_003f, 0x383f_005f), // staddb wzr, [x2]: not the store's address register
+            (0x30, 0x8a20_0020, NOP),         // without the test for a store that wraps
+            (0x24, 0x3942_d380, NOP),         // without the read of the armed-breakpoint byte
+            (0x4c, 0xd420_0040, NOP),         // without its `brk`
+        ] {
+            validated(block, at, old, new, Some("check stub at native offset 0x24"));
+        }
+        // A probe anywhere else; a second way into the stub, from after the word it returns to.
+        validated(block, 0x4, 0x9100_20c1, 0x383f_003f, Some("page probe outside a split stub"));
+        assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24
+    }
+
     #[test]
     fn code_of_32_bit_mode_is_admitted_under_its_mode_only() {
         let Some(fexc) = std::env::var_os("FEXC") else {
