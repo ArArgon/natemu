@@ -115,14 +115,21 @@ pub(super) fn fold_run(fpsr: u64) {
 }
 /// M2 task 4: the x87 stack state at a fault point of an instruction before which generated code wrote nothing of it
 /// ([`natemu_abi::code_object::X87Map`]): the registers still in host registers, TOP and the tag byte, into the page.
+/// (A map that changes nothing leaves the kept integer: its FISTP m64, faulting again in its second run, is not a pair's
+/// site, so nothing would keep the integer anew.)
 pub(super) fn rebuild(map: &natemu_abi::code_object::X87Map, f: &NativeFrame) {
+    let before = (top(), abridged(), [0, 1, 2, 3, 4, 5, 6, 7].map(mm));
     for (r, &v) in map.reg.iter().enumerate() {
         if let Some(q) = f.q.get(v as usize) {
-            set_mm(r as u64, u64::from_le_bytes(q[..8].try_into().unwrap()));
+            let d = u64::from_le_bytes(q[..8].try_into().unwrap());
+            unsafe { (page(frame::X87_MM + 16 * r as u32) as *mut u64).write_volatile(d) }
         }
     }
     set8(frame::X87_TOP, u64::from(map.top));
     set_abridged(u64::from(map.tags));
+    if before != (top(), abridged(), [0, 1, 2, 3, 4, 5, 6, 7].map(mm)) {
+        forget_integer();
+    }
 }
 /// M2 task 4 ([`frame::X87_INT`]): the integer a faulting FISTP m64 at `rip` was storing under the address space `cr3`,
 /// with ST(0)'s bits as they are.
