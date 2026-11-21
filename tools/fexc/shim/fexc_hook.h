@@ -66,6 +66,9 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_X87TAG = 22,                    // slice1 stub (M2 task 4): an x87 instruction's stack check (FexcX87Tag), at its start: a register
                                             // it reads is empty or the one it pushes onto is not; the resident steps the instruction alone
                                             // (its step unit has the masked response)
+  FEXC_SITE_X87GUESS = 23,                  // slice1 stub (M2 task 4): the unit was compiled for another x87 stack top or tag byte than the
+                                            // guest state holds (FexcX87Guess, at an IR block's first x87 instruction): the resident retires
+                                            // the unit and goes on at this instruction
   FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
                                             // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };
@@ -198,7 +201,7 @@ struct FexcArg {
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
              FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK, FEXC_ARG_DAZ, FEXC_ARG_FTZ,
-             FEXC_ARG_ACCURATE, FEXC_ARG_PUSH_RUN };
+             FEXC_ARG_ACCURATE, FEXC_ARG_PUSH_RUN, FEXC_ARG_X87_GUESS };
 // `--push-run` (the host asks for it unless the vCPU's stack pointer keeps tripping the run check): a gating argument, so an answer
 // compiled with it is not reused for a request without it.
 inline FexcArg<bool, FEXC_ARG_PUSH_RUN> fexc_push_run;
@@ -341,6 +344,9 @@ constexpr uint32_t FEXC_X87_RUN = 0x3f0 + 36, FEXC_X87_FPCR = 0xb0;
 // is recorded), and one with a stack check (FexcX87Hold, FexcX87Release: after a stack fault FPSR's flags are the saved ones
 // again). At a bank inside a run the resident takes the saved byte when bit 5 is set, else FPSR.
 inline bool FexcX87Lazy() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+// M2 task 4, `--x87-guess V` (32-bit code; V = 0x1000 | TOP << 8 | the tag byte, as the guest state held them when the unit
+// was requested; 0: none): the x87 stack pass compiles the unit for that pair (FEX's x87StackOptimizationPass, TopAbs).
+inline FexcArg<uint64_t, FEXC_ARG_X87_GUESS> fexc_x87_guess;
 inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
 inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
 inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }

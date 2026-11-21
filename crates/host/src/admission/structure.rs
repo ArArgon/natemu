@@ -2306,7 +2306,7 @@ impl Verifier<'_> {
         use object::kind::*;
         for i in 0..self.c.stubs.len() {
             let (st, c) = (self.c.stubs[i], self.checks[i]);
-            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM | FLDCW | X87TAG) {
+            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM | FLDCW | X87TAG | X87GUESS) {
                 continue;
             }
             let at = st.native_offset;
@@ -2373,6 +2373,20 @@ impl Verifier<'_> {
                         return fail();
                     }
                     c.start - 12
+                }
+                X87GUESS => {
+                    // M2 task 4, a unit compiled for an x87 stack top and tag byte: `ldrb w0, [x28, #TOP]; ldrb w1, [x28, #FTW];
+                    // orr w0, w1, w0, lsl #8; sub w0, w0, #V; cbnz w0, stub`.
+                    let ok = c.cond == Some(CBNZ_W) && c.start == c.end && words(4).is_some_and(|w| {
+                        w[0] == ldr_state(1, 0, frame::X87_TOP)
+                            && w[1] == ldr_state(1, 1, frame::X87_FTW)
+                            && w[2] == 0x2a00_2020
+                            && w[3] & 0xffc0_03ff == 0x5100_0000
+                    });
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 16
                 }
                 X87TAG => {
                     // M2 task 4, an x87 instruction's stack check: `lsr w0, wF, wI; tbz|tbnz w0, #0, stub`.

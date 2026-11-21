@@ -90,6 +90,11 @@ pub mod kind {
     /// instruction's start. At the stub (a stack fault) the state is the state before the instruction: the resident steps it
     /// alone, and its one-instruction unit computes the masked response inline.
     pub const X87TAG: u8 = 22;
+    /// M2 task 4: the test of a unit compiled for an x87 stack top and tag byte (fexc `--x87-guess`), at an IR block's first
+    /// x87 instruction: `ldrb w0, [x28, #TOP]; ldrb w1, [x28, #FTW]; orr w0, w1, w0, lsl #8; sub w0, w0, #V; cbnz w0`
+    /// (`brk #13`). At the stub (the guest state holds another pair) the state is the state before the instruction: the
+    /// resident retires the unit, notes its RIP ([`crate::execution::cache::Control::x87_varied`]) and goes on at the instruction.
+    pub const X87GUESS: u8 = 23;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

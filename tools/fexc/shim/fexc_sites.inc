@@ -315,6 +315,16 @@ DEF_OP(FexcX87Tag) {
   if (Op->Push) tbnz_OrRestart(TMP1, 0, FexcStub(FEXC_SITE_X87TAG, false));
   else tbz_OrRestart(TMP1, 0, FexcStub(FEXC_SITE_X87TAG, false));
 }
+// M2 task 4: the guess's test. `ldrb w0, [x28, #top]; ldrb w1, [x28, #ftw]; orr w0, w1, w0, lsl #8; sub w0, w0, #V; cbnz w0, K`
+// (V = TOP << 8 | tags, under 0x800; no flag is written).
+DEF_OP(FexcX87Guess) {
+  const uint32_t V = IROp->C<IR::IROp_FexcX87Guess>()->Value;
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_TOP_LOC);
+  ldrb(TMP2.W(), STATE, offsetof(FEXCore::Core::CPUState, AbridgedFTW));
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP2, TMP1, ARMEmitter::ShiftType::LSL, 8);
+  sub(ARMEmitter::Size::i32Bit, TMP1, TMP1, V);
+  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_X87GUESS, false));
+}
 DEF_OP(FexcX87Fold) {
   if (fexc_x87_run == FEXC_RUN_CLOSED) return;   // FPSR is MXCSR's: every x87 flag is in the word
   ARMEmitter::ForwardLabel Closed;
@@ -1308,7 +1318,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11, FexcBrkX87Tag = 12;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11, FexcBrkX87Tag = 12, FexcBrkX87Guess = 13;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1332,7 +1342,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
   S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
-            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : Kind == FEXC_SITE_X87TAG ? "x87tag" : "guard";
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : Kind == FEXC_SITE_X87TAG ? "x87tag" : Kind == FEXC_SITE_X87GUESS ? "x87guess" : "guard";
   const size_t Index = fexc_sites.size();
   FexcX87SiteCheck();
   fexc_sites.push_back(S);
@@ -1545,7 +1555,7 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_X87TAG ? FexcBrkX87Tag : K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+    brk(K == FEXC_SITE_X87GUESS ? FexcBrkX87Guess : K == FEXC_SITE_X87TAG ? FexcBrkX87Tag : K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
         K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }

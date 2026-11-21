@@ -630,6 +630,11 @@ pub mod cache {
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
     }
 
+    /// The word and bit of `rip` in [`Control::x87_varied`].
+    pub fn x87_varied_bit(rip: u64) -> (usize, u64) {
+        let h = rip.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
+        ((h >> 6) as usize, 1 << (h & 63))
+    }
     /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) and
     /// `ram_bytes` (the VM's guest RAM, R) and `guest_state_va` at prepare; the resident owns the rest.
     #[repr(C)]
@@ -775,6 +780,10 @@ pub mod cache {
         /// only, the CNTVCT ticks of their transactions; by the perf bucket current
         /// when each began (the resident entry that reached it: `link`, `miss`, ...; modulo 32); and those that followed
         /// another system instruction in the same block search (no block between them).
+        /// M2 task 4: RIPs (a bit each, by [`x87_varied_bit`]) whose unit, compiled for an x87 stack top and tag byte, was
+        /// entered with another pair: requested without a guess from then on. Never cleared (a set bit costs the constants
+        /// of a guess, nothing else); bits alias, so some units that never varied go without too.
+        pub x87_varied: [u64; 64],
         pub system_counts: [u64; 128],
         pub system_ticks: [u64; 128],
         pub system_from: [u64; 32],
@@ -3604,6 +3613,11 @@ pub struct State {
     /// resident's own ([`halt_poll::next`]).
     pub halt_poll_max_us: u64,
     pub halt_poll: u64,
+    /// M2 task 4, with a translate request for 32-bit code: 0x1000 | TOP << 8 | the abridged tag byte, as the guest-state page
+    /// holds them (the x87 stack the block is about to run on), or 0: no guess (a RIP whose unit met another pair before,
+    /// [`cache::Control::x87_varied`]). fexc compiles the unit for that pair (`--x87-guess`), with a test at its first x87
+    /// instruction ([`crate::code_object::kind::X87GUESS`]).
+    pub x87_guess: u64,
 }
 /// The default of [`State::halt_poll_max_us`]. Measured on an M2 Max (November 14, 2026; depth-1 4 KiB direct reads over
 /// virtio-PCI, host CPU per request in brackets). At 2 vCPUs, without polling: 68-70 MB/s (68-70 us). 15 us: 74-85 MB/s
@@ -3732,6 +3746,7 @@ impl State {
             sti_first: 0,
             halt_poll_max_us: HALT_POLL_MAX_US,
             halt_poll: 0,
+            x87_guess: 0,
         }
     }
 }

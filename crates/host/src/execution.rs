@@ -2571,6 +2571,8 @@ pub struct Compiler {
     /// fexc's `--push-run` (the default; false for a vCPU past [`exec::STACK_TRAP_LIMIT`] stack-check firings: part of the
     /// code context, bit 33, and the last gating argument).
     pub(crate) push_run: bool,
+    /// M2 task 4: fexc's `--x87-guess` for a request for 32-bit code ([`exec::State::x87_guess`]; 0: none).
+    pub(crate) x87_guess: u64,
     /// M2: a request for 32-bit code (the code segment's mode): fexc's `--bitness 32` and admission's 32-bit rules
     /// ([`admission::admit_mode`]). Such a request is always compiled: no kept answer (so none relocated to another RIP), no
     /// persistent cache, no template for the pool or the resident. (`--push-run` is sent as for 64-bit code since M2 task 4: fexc
@@ -2769,6 +2771,7 @@ impl Compiler {
             cpl3: false,
             bulk: false,
             push_run: true,
+            x87_guess: 0,
             bits32: false,
             null_segments: [false; 4],
             perf: None,
@@ -3358,6 +3361,10 @@ impl Compiler {
         }
         for a in &self.x87 {
             arg(&mut body, a.as_bytes());
+        }
+        if self.bits32 && self.x87_guess != 0 {
+            arg(&mut body, b"--x87-guess");
+            arg(&mut body, format!("{:#x}", self.x87_guess).as_bytes());
         }
         for (on, a) in [(self.cpl0, &b"--cpl0"[..]), (self.tsc, b"--tsc"), (self.bulk, b"--bulk")] {
             if on {
@@ -4271,6 +4278,8 @@ fn translation(
         compiler.sse_gated = sse_gated(&state.cpu);
         compiler.avx_gated = avx_gated(&state.cpu);
         compiler.x87 = x87_args(&state.cpu, compiler.supported);
+        // M2 task 4: 32-bit code is compiled for the x87 stack top and tags the resident found ([`exec::State::x87_guess`]).
+        compiler.x87_guess = if step { 0 } else { state.x87_guess };
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         // M2: the code segment's mode (the resident asks only for 64-bit code and, at CPL 3, 32-bit code with flat
         // segments: `Cpu::compat_refused`), and in 32-bit code the null FS, GS, DS and ES.
