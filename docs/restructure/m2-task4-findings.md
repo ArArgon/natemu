@@ -379,6 +379,52 @@ What is left in the hot block (228 instructions for 85 x87 instructions): arithm
 29; the page-crossing checks of its 8-byte stores 30; FLD's quieting multiply 18; flags and the run 17; condition bits 13;
 state writes 12; the rest 55.
 
+### More 32-bit floating point: c-ray strict, c-ray with SSE2, SciMark
+
+Added at the owner's request to the benchmark image: c-ray as x87 code without `-ffast-math` (`cray32-strict`), c-ray as
+32-bit code with SSE2 floating point (`cray32-sse2`, the way i386 programs for newer baselines than Debian's are built),
+each also at 320x240, and SciMark 2.0 from NIST (ANSI C: FFT, SOR, Monte Carlo, sparse matrix multiply, LU), built for
+64 bits, for 32-bit x87 and for 32-bit SSE2. SciMark was chosen as the established suite: one small zip from NIST,
+plain C, no input files, and each kernel runs for at least two seconds and reports a rate (Mflops, higher is better),
+so its result does not depend on how long a run is. First numbers, 1 vCPU, one boot (two runs) under natemu and two or
+three native runs on the x86 reference machine (Ryzen 7 8845HS), before the final round:
+
+| c-ray (s) | real x86 | natemu on the M4 | natemu / x86 |
+| --- | --- | --- | --- |
+| 64-bit, strict | 3.81 | (final round) | |
+| 32-bit x87, fast-math (`cray32`) | 9.19 | 9.01 / 8.93 | 0.98 |
+| 32-bit x87, strict (`cray32-strict`) | 9.63 to 9.66 | 8.35 / 8.33 | 0.86 |
+| 32-bit SSE2 (`cray32-sse2`) | 3.89 to 3.93 | 3.96 / 3.90 | 1.0 |
+| x87 strict at 320x240 | 0.61 | 0.60 / 0.55 | |
+| SSE2 at 320x240 | 0.25 | 0.30 / 0.25 | |
+
+The strict x87 picture under natemu is bit for bit the real machine's at both sizes (md5 460bdb17... and f356a121...), and
+it is the same picture as the 64-bit SSE build's. So for this program the x87's extra precision, which natemu does not
+keep (its x87 registers are doubles), changes nothing in the output: c-ray stores every intermediate result in a
+double. That is a result about c-ray, not a proof for other programs.
+
+| SciMark 2.0 (Mflops) | composite | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64-bit, real x86 | 5042 | 4213 | 2877 | 983 | 5499 | 11639 |
+| 64-bit, natemu | 2751 / 2625 | 2043 / 1692 | 4313 | 962 / 955 | 4142 / 3890 | 2295 / 2275 |
+| 32-bit x87, real x86 | 2579 | 1869 | 1226 | 852 | 4378 | 4571 |
+| 32-bit x87, natemu | 1310 / 1345 | 1239 / 1439 | 1823 / 1813 | 296 / 295 | 1197 / 1181 | 1995 / 1994 |
+| 32-bit SSE2, real x86 | 4719 | 4098 | 2887 | 796 | 5541 | 10276 |
+| 32-bit SSE2, natemu | 2427 / 2296 | 2614 / 1905 | 4042 / 4040 | 59 / 59 | 2558 / 2573 | 2862 / 2904 |
+
+What stands out, as findings to follow up, none of them fixed here:
+
+- **Monte Carlo in the 32-bit SSE2 build is 13 times slower than on real x86** (59 against 796). The likely cause, not
+  yet verified by a profile: on i386 a function returns a double on the x87 stack whatever the floating-point
+  instruction set, so SSE2 code does a FLD and a FSTP around every call. FLD of a double is the one x87 instruction
+  here that needs the x87 run (its quieting multiply raises x87 flags), so each call opens a run and the next SSE
+  instruction closes it: four writes of Arm's status and control registers per call. A FLD that tests its operand with
+  integer instructions where no other x87 arithmetic is near would avoid the run altogether.
+- **LU is four to five times slower than real x86 in both SSE builds** (2,295 against 11,639; 2,862 against 10,276), while
+  SOR is faster on the M4 than on the Ryzen. LU is not x87 code; this is a 64-bit finding too.
+- **Monte Carlo and the sparse multiply in the x87 build** are three to four times slower than real x86, where c-ray's
+  x87 code is now at parity.
+
 ### INT 0x80 again: where its time goes
 
 Profiles of `hackbench32` both ways (timing build, the whole boot with two runs; 32 million system calls):
