@@ -1587,32 +1587,36 @@ void Arm64JITCore::FexcEmitStubs() {
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     // A store that crosses a page without a trap: the split stub writes one byte of each page (an atomic add of zero: it
     // always writes, so a page this vCPU's shadow does not hold writable faults here) and goes back to the store.
-    //   64-bit code   staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <the word after the check>
-    //   32-bit code   add x0, xA, #w-1; orr x0, x0, xA; lsr x0, x0, #32; cbnz x0, +20; the four words above; brk #2
+    //   ldrb w0, [x28, #WATCH]; cbnz w0, brk        a breakpoint is armed (DR7; the resident's byte): the `brk`, as before
+    //   add x0, xA, #w-1
+    //   64-bit code  bic x0, xA, x0; lsr x0, x0, #63; cbnz x0, brk     the store wraps at 2^64: the `brk`
+    //   32-bit code  orr x0, x0, xA; lsr x0, x0, #32; cbnz x0, brk     an address above 4 GiB: the `brk`
+    //   staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <the word after the check>
+    //   brk: brk #2
     // A fault at either probe is the resident's split store as at the `brk` (its checks, the walks in order, the store
     // through its own mapping), resumed after the access.
     // LOAD-BEARING: after two probes that passed, the store cannot fault. The shadow tables are this vCPU's own and change
     // only in its synchronous resident entries; between the probes and the store there is none (an interrupt only arms a
     // stop), and every return of the resident into this sequence is to the stub's first word, never to the second probe.
-    // 32-bit code: an address above 4 GiB (FEX's 64-bit address arithmetic; a store that runs across 4 GiB) is not
-    // probed, since the tables may map something there for the task's 64-bit code: the `brk`, as before.
+    // That covers aborts, not watchpoints (a store that crossed a page and then met one might have written part): hence
+    // the first test. 32-bit code: an address above 4 GiB (FEX's 64-bit address arithmetic; a store that runs across
+    // 4 GiB) is not probed, since the tables may map something there for the task's 64-bit code.
     if (const auto It = FexcProbes.find(Index); It != FexcProbes.end()) {
       const auto A = ARMEmitter::XRegister(It->second.Reg);
       ARMEmitter::ForwardLabel Brk;
-      if (fexc_bits32) {
-        add(ARMEmitter::Size::i64Bit, TMP1, A, It->second.Width - 1);
-        orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, A.R());
-        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 32);
-        (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &Brk);
-      }
+      ldrb(TMP1.W(), STATE, FEXC_WATCH_ARMED);
+      (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &Brk);
+      add(ARMEmitter::Size::i64Bit, TMP1, A, It->second.Width - 1);
+      if (fexc_bits32) orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, A.R());
+      else bic(ARMEmitter::Size::i64Bit, TMP1, A.R(), TMP1);
+      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, fexc_bits32 ? 32 : 63);
+      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &Brk);
       stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, A.R());
       add(ARMEmitter::Size::i64Bit, TMP1, A, It->second.Width - 1);
       stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, TMP1);
       (void)b(&It->second.Back);
-      if (fexc_bits32) {
-        (void)Bind(&Brk);
-        brk(FexcBrkSplit);
-      }
+      (void)Bind(&Brk);
+      brk(FexcBrkSplit);
       continue;
     }
     const uint8_t K = fexc_sites[Index].kind;

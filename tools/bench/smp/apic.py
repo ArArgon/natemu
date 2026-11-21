@@ -261,7 +261,7 @@ def regs_program(m):
     return build(f'apic-regs-{m}', m, ['\n'.join(seq)], [])
 
 
-def prio_program(m):
+def prio_program(m, indirect=False):
     """Priority, TPR and EOI order with nested interrupts (11.8.3.1, 11.8.4): self IPIs pending with IF = 0, the TPR
     masking classes, interrupts taken by class after STI and as the TPR drops, a nested delivery inside a handler that
     re-enables interrupts, and the EOI that ends the highest in-service vector. Labels p_* (no code) name the
@@ -276,7 +276,8 @@ def prio_program(m):
     bodies = {0x42: '\n'.join([self_ipi(m, 0x62), self_ipi(m, 0x52), '    sti', '    nop', 'p_c42:', '    cli']),
               0x43: '\n'.join([self_ipi(m, 0x63), '    sti', '    nop', 'p_c43:', '    cli', rd(m, ISR + 2), store(2)]),
               0x63: '\n'.join([rd(m, ISR + 2), store(3), eoi(m), rd(m, ISR + 2), store(4)])}
-    return build(f'apic-prio-{m}', m, [main], [0x41, 0x42, 0x43, 0x51, 0x52, 0x61, 0x62, 0x63, 0x71], bodies, indirect=True)
+    # (`indirect`, apic-prio-jmp: the same with every handler returning to its IRETQ through a computed jump.)
+    return build(f'apic-prio-{"jmp-" if indirect else ""}{m}', m, [main], [0x41, 0x42, 0x43, 0x51, 0x52, 0x61, 0x62, 0x63, 0x71], bodies, indirect=indirect)
 
 
 def cr8_program():

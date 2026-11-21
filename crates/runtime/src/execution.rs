@@ -3299,7 +3299,11 @@ fn post_pending(s: &State, entry: bool) {
     unsafe {
         (FRAME_VA as *mut u8)
             .add(frame::EVENT_PENDING as usize)
-            .write_volatile(pending)
+            .write_volatile(pending);
+        // M2 task 4: with a breakpoint armed, a store that crosses a page takes its stub's `brk` ([`frame::WATCH_ARMED`]).
+        (FRAME_VA as *mut u8)
+            .add(frame::WATCH_ARMED as usize)
+            .write_volatile(u8::from(s.cpu.dr[5] & DR7_ENABLES != 0));
     };
 }
 /// An instruction completed: RF (an IRET's frame may set it) ends (SDM Vol.3 "RF": cleared after every instruction but
@@ -3667,31 +3671,21 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                 .ok()
                 .map(|i| all[i])
         };
-        // A split stub that probes (fexc, FexcEmitStubs): its words after the first are no sites of their own. In 64-bit
-        // code the probes are the stub's words 0 and 2; in 32-bit code, behind the four words that test for an address
-        // above 4 GiB, words 4 and 6, and word 8 is the `brk` that test goes to. `probe`: 1 the first probe, 2 the second.
-        const STADDB_WZR: u32 = 0x383f_001f; // staddb wzr, [xN]: the base in bits 9:5
-        let stub_word = |site: &Site, k: u64| {
-            ((block.unwrap().code_va() + u64::from(site.native_offset) + 4 * k) as *const u32).read()
+        // A split stub that probes (fexc, FexcEmitStubs): its words after the first are no sites of their own. The probes
+        // are its words 6 and 8, behind the tests that send an armed breakpoint and an address above 4 GiB (32-bit code)
+        // or wrapping (64-bit code) to the `brk`, its word 10. `probe`: 1 the first probe, 2 the second.
+        let probing = |site: &Site| {
+            site.kind == object::kind::SPLIT
+                && ((block.unwrap().code_va() + u64::from(site.native_offset)) as *const u32).read() != 0xd420_0040
         };
-        let (found, probe) = [0, 8, 16, 24, 32]
-            .into_iter()
-            .filter(|&d| at >= d)
-            .find_map(|d| {
-                let site = at_site(at - d)?;
-                if d == 0 && (site.kind != object::kind::SPLIT || stub_word(&site, 0) & !0x3e0 != STADDB_WZR) {
-                    return Some((site, 0));
-                }
-                let first = if stub_word(&site, 0) & !0x3e0 == STADDB_WZR { 0 } else { 16 };
-                (site.kind == object::kind::SPLIT).then_some(())?;
-                match d.checked_sub(first)? {
-                    0 => Some((site, 1)),
-                    8 => Some((site, 2)),
-                    16 if first == 16 => Some((site, 0)),
-                    _ => None,
-                }
-            })
-            .map_or((None, 0), |(site, p)| (Some(site), p));
+        let (found, probe) = match at_site(at) {
+            Some(site) => (Some(site), 0),
+            None => [(24, 1), (32, 2), (40, 0)]
+                .into_iter()
+                .filter(|&(d, _)| at >= d)
+                .find_map(|(d, p)| Some((at_site(at - d).filter(probing)?, p)))
+                .map_or((None, 0), |(site, p)| (Some(site), p)),
+        };
         // The syndrome must be the class this site's kind produces, before anything is taken or stepped: BRK from
         // AArch64 with the stub's immediate (1 branch target, 2 split, 3 divide), else a data abort from EL0 inside the
         // site's access (access_aborted checks the rest).

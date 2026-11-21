@@ -150,7 +150,7 @@ def model_problems(prog, mem, labels=None):
 
 def cmd_qemu(a, report):
     failures = []
-    programs = [apic.regs_program('x'), apic.regs_program('x2'), apic.prio_program('x'), apic.prio_program('x2'), apic.cr8_program(),
+    programs = [apic.regs_program('x'), apic.regs_program('x2'), apic.prio_program('x'), apic.prio_program('x2'), apic.prio_program('x2', indirect=True), apic.cr8_program(),
                 apic.faults_program()] + [apic.ipi_program(n) for n in (2, 3, 4)]
     for prog, labels in programs:
         label = prog['name']

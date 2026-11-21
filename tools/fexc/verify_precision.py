@@ -219,19 +219,18 @@ M64 = (1 << 64) - 1
 
 def probing(s, dis, check=None):
     """The words of split stub `s` when it probes instead of trapping (fexc FexcEmitStubs): a set of offsets, else None.
-    64-bit code: `staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <back>`; 32-bit code: `add x0, xA, #w-1;
-    orr x0, x0, xA; lsr x0, x0, #32; cbnz x0, <its brk>` before them and `brk #0x2` after. A the stub's address register,
-    w its store's width, <back> the word after the stub's check (`check`: that branch, when given)."""
+    `ldrb w0, [x28, #0xb4]; cbnz w0, <brk>; add x0, xA, #w-1; bic x0, xA, x0; lsr x0, x0, #63 (32-bit code: orr x0, x0, xA;
+    lsr x0, x0, #32); cbnz x0, <brk>; staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <back>; brk #0x2`. A the
+    stub's address register, w its store's width, <back> the word after the stub's check (`check`: that branch, when given)."""
     at, a, w = s['native_offset'], s['base_reg'], s['width']
     if s['kind'] != 'split': return None
-    add = f'add x0, x{a}, #{w - 1:#x}'
-    first = at + 16 if dis.get(at) == add else at
-    if [dis.get(first + k) for k in (0, 4, 8)] != [f'staddb wzr, [x{a}]', add, 'staddb wzr, [x0]']: return None
-    back = re.fullmatch(r'b 0x([0-9a-f]+)', dis.get(first + 12, ''))
+    add, brk = f'add x0, x{a}, #{w - 1:#x}', f'{at + 40:#x}'
+    want = ['ldrb w0, [x28, #0xb4]', f'cbnz w0, {brk}', add] + ([f'orr x0, x0, x{a}', 'lsr x0, x0, #32'] if BITS else [f'bic x0, x{a}, x0', 'lsr x0, x0, #63']) + \
+           [f'cbnz x0, {brk}', f'staddb wzr, [x{a}]', add, 'staddb wzr, [x0]']
+    if [dis.get(at + 4 * k) for k in range(9)] != want or dis.get(at + 40) != 'brk #0x2': return None
+    back = re.fullmatch(r'b 0x([0-9a-f]+)', dis.get(at + 36, ''))
     if not back or (check is not None and int(back[1], 16) != check + 4): return None
-    if first == at: return {at + k for k in (0, 4, 8, 12)}
-    if [dis.get(at + k) for k in (4, 8, 12, 32)] != ['orr x0, x0, x' + str(a), 'lsr x0, x0, #32', f'cbnz x0, {at + 32:#x}', 'brk #0x2']: return None
-    return {at + k for k in range(0, 36, 4)}
+    return {at + k for k in range(0, 44, 4)}
 
 
 def canonical(a):
@@ -745,7 +744,7 @@ X87_PENDING = 0x412
 # M2 task 4, x87 runs (shim/fexc_hook.h): the SIMD flag byte (FPSR's flags move into it at a run's start: MXCSR is their OR
 # either way), the run byte and the FPCR the run started with. Bookkeeping, not guest state: a store of one before a fault
 # site changes nothing the guest can see.
-X87_RUN_STATE = ((0x411, 1), (0x414, 1), (0xb0, 4))
+X87_RUN_STATE = ((0x411, 1), (0x414, 1), (0xb0, 4), (0xb4, 1))   # (0xb4: frame::WATCH_ARMED, a probing split stub's read)
 # M2 task 4, lazy x87 flags (shim/fexc_hook.h): inside an x87 run the flags of the x87 instructions that completed are in FPSR
 # until these five words or them into the exception word. The guest's status word is the OR of the two either way, so the
 # store changes nothing a fault at a later site of the instruction can show (FNSTSW m16, a run that ends inside an SSE

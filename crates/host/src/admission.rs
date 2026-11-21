@@ -724,28 +724,37 @@ fn admit_records(
             .min()
             .unwrap_or(h.guest_bytes)
             - s.guest_offset;
-        // A split stub is its `brk`, or the probes of the store's first and last byte and a branch back to the store
-        // (fexc, FexcEmitStubs; the resident takes a fault at a probe as the `brk`): exactly these words, the probes on the
-        // stub's address register, the branch to a word at or before the access. In 32-bit code, behind the four words
-        // that send an address above 4 GiB to the `brk` after them.
+        // A split stub is its `brk`, or eleven words that probe the store's first and last byte and go back to the store
+        // (fexc, FexcEmitStubs; the resident takes a fault at a probe as the `brk`): exactly these, the probes on the stub's
+        // address register, the branch to a word at or before the access.
         let probing = || {
             let (at, a, w) = (s.native_offset, u32::from(s.base_reg), u32::from(s.width));
-            let first = if bits32 { 16 } else { 0 };
             let add = 0x9100_0000 | (w.wrapping_sub(1) & 0xfff) << 10 | a << 5; // add x0, xA, #w-1
             const STADDB: u32 = 0x383f_001f; // staddb wzr, [x0]
             let back = |x: u32| {
-                let to = i64::from(at + first + 12) + i64::from((x << 6) as i32 >> 6) * 4;
+                let to = i64::from(at + 36) + i64::from((x << 6) as i32 >> 6) * 4;
                 x >> 26 == 5 && to >= i64::from(ENTRY_OFFSET) && access.is_some_and(|a| to <= i64::from(a.native_offset))
             };
+            // An address above 4 GiB (32-bit code) or a store that wraps (64-bit code) goes to the `brk`.
+            let range = if bits32 { [0xaa00_0000 | a << 16, 0xd360_fc00] } else { [0x8a20_0000 | a << 5, 0xd37f_fc00] };
             s.kind == object::kind::SPLIT
                 && (1..31).contains(&a)
+                && a != 28
                 && (2..=32).contains(&w)
-                && at + first + 16 + if bits32 { 4 } else { 0 } <= region
-                && [STADDB | a << 5, add, STADDB] == [0, 4, 8].map(|k| word(at + first + k))
-                && back(word(at + first + 12))
-                && (!bits32
-                    || [add, 0xaa00_0000 | a << 16, 0xd360_fc00, 0xb500_00a0, stub_word(s.kind)]
-                        == [0, 4, 8, 12, 32].map(|k| word(at + k)))
+                && at + 44 <= region
+                && [
+                    0x3940_0380 | natemu_abi::execution::frame::WATCH_ARMED << 10, // ldrb w0, [x28, #WATCH_ARMED]
+                    0x3500_0120,                            // cbnz w0, +36
+                    add,
+                    range[0],                               // orr x0, x0, xA | bic x0, xA, x0
+                    range[1],                               // lsr x0, x0, #32 | #63
+                    0xb500_00a0,                            // cbnz x0, +20
+                    STADDB | a << 5,
+                    add,
+                    STADDB,
+                ] == [0, 4, 8, 12, 16, 20, 24, 28, 32].map(|k| word(at + k))
+                && back(word(at + 36))
+                && word(at + 40) == stub_word(s.kind)
         };
         if !is_stub(s)
             || !site_fields_valid(s, &h, region)

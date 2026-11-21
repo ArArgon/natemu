@@ -750,6 +750,10 @@ FORMS = arm((X, 3, 8), (Y, 1, 4), (BB, 3, 1), (CROSS, 1, 4)) + f"""    mov rax, 
     mov [{CROSS - 4:#x}], rax ;;E next:8
     mov [{CROSS - 8:#x}], rax
     mov rax, [{CROSS - 4:#x}]
+    add dword [{CROSS - 2:#x}], 1 ;;E next:8
+    pcmpeqd xmm0, xmm0
+    movups [{CROSS - 10:#x}], xmm0 ;;E next:8
+    add qword [{CROSS - 5:#x}], 3 ;;E next:8
     xor eax, eax
     xor ecx, ecx
     xor edx, edx

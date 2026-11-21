@@ -346,6 +346,7 @@ constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
 // zero), so x87 rounding is honoured per run whatever MXCSR says and the rounding control is no part of the code identity;
 // FLDCW is translated when it keeps the exception masks (`FexcFldcwInline`): it ends the run and stores the word.
 constexpr uint32_t FEXC_X87_RUN = 0x3f0 + 36, FEXC_X87_FPCR = 0xb0;
+constexpr uint32_t FEXC_WATCH_ARMED = 0xb4;   // (frame::WATCH_ARMED: DR7 arms a breakpoint; a split stub reads it, fexc_sites.inc)
 // M2 task 4, lazy x87 flags: where x87 ops run in runs, FPSR keeps the flags of the run's x87 instructions and nothing copies
 // them per op or per instruction. They are or-ed into the exception word where it is read or FPSR is taken back: a run's end,
 // FNSTSW (FexcX87Fold), and the resident's bank inside a run. An instruction that may have to drop its own flags saves FPSR's

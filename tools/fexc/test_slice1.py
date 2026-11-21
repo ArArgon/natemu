@@ -1374,7 +1374,8 @@ def check_exits(test, d, tmp, what):
             if t in ('svc #0x5', 'svc #0x6'):   # I6b: right after the movz of its function code or control word
                 test.assertRegex(lines[i - 1][1], r'^mov w0, #0x[0-9a-f]+$', (what, o))
             # no frame or stack access but a guest-state load of the FS/GS base (I7: ldr xN, [x28, #0x3e0|#0x3e8])
-            if not re.fullmatch(r'ldr x\d+, \[x28, #0x3e[08]\]', t):
+            # (and a probing split stub's read of the armed-breakpoint byte, frame::WATCH_ARMED: M2 task 4)
+            if not re.fullmatch(r'ldr x\d+, \[x28, #0x3e[08]\]', t) and t != 'ldrb w0, [x28, #0xb4]':
                 test.assertIsNone(re.search(r'\[(x28|sp)\b', t), (what, o, t))
             test.assertIsNone(re.match(r'ldr\w* \w+, 0x', t), (what, o, t))         # no literal load
             if t.lower() != 'mrs x25, nzcv':
