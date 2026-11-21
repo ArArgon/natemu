@@ -1058,6 +1058,39 @@ BREAK_USER = REGS32 + f"""    int3
     int 0x80
 """
 
+# ---- an x87 run left open, then SSE code (M2 task 4: the second entry) --------------------------------------------------------
+# The x87 rounds down (FLDCW), SSE to nearest. A block of x87 code jumps to a block of SSE code, which jumps to another, three
+# times round, so the links are made and then used. The first SSE block must end the x87's run (its test at the top) every
+# time it is reached from the x87 block; the second is reached from SSE code, behind its test. 1/3, 2/3 and 3/3 by DIVSD and
+# their squares differ in the last bit under the x87's rounding.
+RUNLINK_USER = REGS32 + f"""    fninit
+    mov word [{W:#x}], 0x077f
+    fldcw [{W:#x}]
+    mov ecx, 3
+    mov dword [{W + 4:#x}], 3
+    cvtsi2sd xmm1, dword [{W + 4:#x}]
+.x87:
+    fld1
+    fdiv qword [.seven]
+    fstp qword [{R:#x} + 8*ecx]
+    jmp .sse
+.sse:
+    cvtsi2sd xmm0, ecx
+    divsd xmm0, xmm1
+    movsd [{R + 0x20:#x} + 8*ecx], xmm0
+    jmp .sse2
+.sse2:
+    mulsd xmm0, xmm0
+    movsd [{R + 0x40:#x} + 8*ecx], xmm0
+    dec ecx
+    jnz .x87
+    stmxcsr [{R + 0x60:#x}]
+    fnstsw [{R + 0x64:#x}]
+    fninit
+    int 0x80
+.seven: dq 7.0
+"""
+
 # An instruction breakpoint on the first instruction of a block compiled for an x87 stack top (M2 task 4), met twice, the
 # second time with another top: each time one #DB, then the handler resumes with RF set and the instruction runs (not a
 # second #DB when the block's test for its top fails right at that instruction: the instruction then runs alone).
@@ -1117,6 +1150,7 @@ def positive32():
             program('c32-breakpoints@1', GATES + BREAK_BODY + ENTER() +
                     handlers('    cmp qword [rsp], 0x80\n    jne .go\n    xor eax, eax\n    mov dr7, rax\n    jmp .fin\n.go:\n' + DB + RESUME, **vec),
                     BREAK_USER, log=0x1000),
+            program('c32-x87-sse-link@1', X87_BODY, RUNLINK_USER, [P.zero(R, 0x100)]),
             program('c32-x87-rf@1', GATES + BREAK_BODY + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() +
                     handlers('    cmp qword [rsp], 0x80\n    jne .go\n    xor eax, eax\n    mov dr7, rax\n    jmp .fin\n.go:\n' + DB + RESUME, **vec),
                     RF_USER, log=0x1000),

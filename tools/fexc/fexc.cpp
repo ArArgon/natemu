@@ -705,7 +705,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       fexc_ext_conds = ext; fexc_ext_stop = -1;
       thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
       // (32-bit code under an identity with x87 runs: a run may be open at the unit's entry; shim/fexc_hook.h)
-      fexc_x87_run = fexc_bits32 && fexc_slice1 && !fexc_no_afp && s.x87_unmasked == 0 ? FEXC_RUN_UNKNOWN : FEXC_RUN_CLOSED;
+      fexc_x87_run = fexc_x87_run_entry = fexc_bits32 && fexc_slice1 && !fexc_no_afp && s.x87_unmasked == 0 ? FEXC_RUN_UNKNOWN : FEXC_RUN_CLOSED;
       int blocks = 0, links = 0;
       const bool compiled = Attempt(impl, thread, rip, max, ext > 1, blocks, links);
       if (!fexc_bits32 && fexc_x87_run != FEXC_RUN_CLOSED) std::abort();   // a hard check: an x87 run left open at the unit's end (shim/fexc_hook.h)

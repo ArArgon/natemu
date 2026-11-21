@@ -233,6 +233,33 @@ def probing(s, dis, check=None):
     return {at + k for k in range(0, 44, 4)}
 
 
+RUN_END = ['mrs x0, fpsr', 'and w0, w0, #0xff', 'ldr w1, [x28, #0x4b4]', 'orr w1, w1, w0', 'str w1, [x28, #0x4b4]', 'ldr w0, [x28, #0xb0]', 'msr fpcr, x0',
+           'msr fpsr, xzr', 'strb wzr, [x28, #0x414]']
+
+
+def run_test_end(d, dis):
+    """M2 task 4, the second entry: where the run's end of the block's top test for an open x87 run stands (`ldrb w0, [x28,
+    #0x414]; cbnz w0, E` as the block's first two words), else None."""
+    first = d['code']['layout']['code_region_begin']
+    m = re.fullmatch(r'cbnz w0, 0x([0-9a-f]+)', dis.get(first + 4, ''))
+    return int(m[1], 16) if dis.get(first) == 'ldrb w0, [x28, #0x414]' and m else None
+
+
+def run_test(d, dis, order):
+    """A block with the top test (the resident's linker enters it behind the test from another such block) is 32-bit code, has at
+    E exactly the run's end and the branch back to its third word, and opens no run anywhere (no store to the run byte but
+    of zero): so no run is open behind the test, to every exit."""
+    e, first = run_test_end(d, dis), d['code']['layout']['code_region_begin']
+    if e is None: return []
+    out = []
+    if not BITS: out.append('the x87 run test at the top of 64-bit code')
+    if [str(dis.get(e + 4 * k)).lower() for k in range(9)] != RUN_END or dis.get(e + 36) != f'b {first + 8:#x}':
+        out.append("the x87 run test at the block's top does not lead to the run's end and back")
+    out += [f'+{o} "{dis[o]}" opens an x87 run in a block that begins with the test for one' for o in order
+            if re.fullmatch(r'strb w\d+, \[x28, #0x414\]', dis[o])]
+    return out
+
+
 def canonical(a):
     return (a & M64) >> 47 in (0, 0x1ffff)
 
@@ -296,7 +323,7 @@ def guards(d, dis, order):
           G a guard with no access and base_reg T, and R holds T (mov copies followed); the P1/P2 window of that guard
           (instruction start to the tbnz) proves no state write precedes it. Every literal exit (a guest-RIP move into x0,
           then `svc #1`) has a canonical RIP or the block's fall-through RIP."""
-    out, check_at, ok = [], {}, set()
+    out, check_at, ok = run_test(d, dis, order), {}, set()
     cost = {'guard': 0, 'split': 0, 'branch': 0, 'stub': 0}
     sites = d['sites']
     stubs = {s['native_offset']: s for s in sites if s['kind'] in STUBS}
@@ -780,6 +807,8 @@ def entry_and_branches(d, dis, order):
             dispatch = mn == 'b' and t == off and any(r['kind'] == 'dispatch_branch' and r['offset'] == off for r in d['code']['relocations'])
             # (A probing split stub's branch back to its store, at or before the access: guards() checks it is the word after the check.)
             back = mn == 'b' and t in dis and any(s['kind'] == 'split' and (w := probing(s, dis)) and off == max(o for o in w if dis[o].startswith('b ')) and t <= s['access_native_offset'] for s in d['sites'])
+            # (and the return from the run's end of the block's top x87 run test: run_test() checks its words)
+            back = back or (mn == 'b' and (e := run_test_end(d, dis)) is not None and off == e + 36 and t == d['code']['layout']['code_region_begin'] + 8)
             if (t <= off or t not in dis) and not dispatch and not back:
                 out.append(f'+{off} "{dis[off]}" is not a forward branch to an instruction of the block')
     return out

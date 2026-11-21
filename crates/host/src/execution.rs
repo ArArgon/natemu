@@ -1329,7 +1329,18 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                         !pic(t) && t.rip == p.target
                     }
             };
-            match branch(at, w).and_then(|to| entries.get(&to).copied()) {
+            // M2 task 4, the second entry: between two blocks that begin with the test for an open x87 run the link goes
+            // behind the target's test (its two words; the resident's `link_entry`), and between no others.
+            let run_tested = |t: &cache::Block| {
+                let at = t.entry() - cache::CODE_VA;
+                t.code_size != 0 && word(at) == 0x3940_0380 | exec::frame::X87_RUN << 10 && word(at + 4) & 0xff00_001f == 0x3500_0000
+            };
+            let target = branch(at, w).and_then(|to| {
+                entries.get(&to).copied().filter(|&t| !(run_tested(b) && run_tested(&blocks[t]))).or_else(|| {
+                    entries.get(&to.wrapping_sub(8)).copied().filter(|&t| run_tested(b) && run_tested(&blocks[t]))
+                })
+            });
+            match target {
                 Some(t) if fits(&blocks[t]) => linked.insert((b.number, p.offset), t as u32),
                 _ => return Err(bad()),
             };

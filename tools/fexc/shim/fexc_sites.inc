@@ -518,7 +518,27 @@ static struct {
   bool HasE[2] {}, HasM[2] {}, HasS {};
   uint8_t E[2] {}, M[2] {}, S {};   // indices into GeneralFPRegisters
 } FexcHoist;
+// The test at the top of a unit of fexc_x87_run_top (fexc_hook.h) and the run's end it branches to, behind the body
+// (FexcEmitStubs): the usual way through the test falls through. (Measured: with the end in line and the test's branch over
+// it taken every time, at the block's first words, SciMark's LU lost 16% and the sparse multiply 30%.)
+static ARMEmitter::ForwardLabel FexcRunEndStub;
+static ARMEmitter::BackwardLabel FexcRunEndBack;
+static bool FexcRunEndUsed = false;
+// Whether `Op`, of an instruction that is no x87 instruction, needs the x87 run closed before it (FexcBeforeOp).
+static bool FexcRunSensitive(IR::IROps Op) {
+  const std::string_view Name = IR::GetName(Op);
+  return Op != IR::IROps::OP_FEXCX87SLOT && Op != IR::IROps::OP_FEXCX87MAP &&
+         (FexcPrecision::SimdFPOp(Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
+}
 void Arm64JITCore::FexcHoistPlan() {
+  // (Per JIT attempt: the run state of the unit's entry again, and whether its test stands at the top, fexc_hook.h.)
+  fexc_x87_run = fexc_x87_run_entry;
+  fexc_x87_run_top = false;
+  FexcRunEndStub = {}; FexcRunEndBack = {}; FexcRunEndUsed = false;
+  if (fexc_bits32 && FexcX87Runs() && !fexc_step_unit && fexc_x87.empty() && fexc_x87_run == FEXC_RUN_UNKNOWN) {
+    for (auto [BlockNode, BlockHeader] : IR->GetBlocks())
+      for (auto [Node, IROp] : IR->GetCode(BlockNode)) fexc_x87_run_top |= FexcRunSensitive(IROp->Op);
+  }
   FexcHoist = {};
   if (SpillSlots) return;
   uint32_t Used = 0, Count[2] = {};
@@ -550,6 +570,14 @@ void Arm64JITCore::FexcHoistPlan() {
   for (int s = 0; s < 2; ++s) FexcHoist.HasM[s] = FexcHoist.HasS && FexcHoist.HasE[s] && Take(FexcHoist.M[s]);
 }
 void Arm64JITCore::FexcHoistEmit() {
+  // The unit's first two words (the second entry is the word after them): the test for an open x87 run.
+  if (fexc_x87_run_top && fexc_x87_run == FEXC_RUN_UNKNOWN) {
+    ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
+    (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &FexcRunEndStub);
+    (void)Bind(&FexcRunEndBack);
+    fexc_x87_run = FEXC_RUN_CLOSED;
+    FexcRunEndUsed = true;
+  }
   for (int s = 0; s < 2; ++s) {
     if (!FexcHoist.HasE[s]) continue;
     const auto Sz = s ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
@@ -1396,17 +1424,15 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     FexcX87HoldEnd(*this);   // (an x87 instruction that ends its IR block)
   if (fexc_x87_run != FEXC_RUN_CLOSED || FexcX87Op(IROp)) {   // M2 task 4: where an x87 run ends (fexc_hook.h)
     const bool X87 = fexc_x87.count(Entry + FexcGuest) != 0;
-    const std::string_view Name = IR::GetName(IROp->Op);
     fexc_x87_m32_convert = X87 && IROp->Op == IROps::OP_FLOAT_FTOF && IR::OpSizeToSize(IROp->C<IR::IROp_Float_FToF>()->SrcElementSize) == 4;
     const bool Leaves = IROp->Op == IROps::OP_JUMP || IROp->Op == IROps::OP_CONDJUMP || IROp->Op == IROps::OP_EXITFUNCTION || IROp->Op == IROps::OP_BREAK;
     // (The x87 map's ops emit nothing and stand at the end of any instruction, an integer one too: no end of a run.)
-    const bool Other = !X87 && IROp->Op != IROps::OP_FEXCX87SLOT && IROp->Op != IROps::OP_FEXCX87MAP &&
-                       (FexcPrecision::SimdFPOp(IROp->Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
+    const bool Other = !X87 && FexcRunSensitive(IROp->Op);
     // 64-bit code: a run ends where its IR block does (a block of SSE code is entered with FPSR its own, unchecked).
     // 32-bit code, where x87 is the usual floating point: the run stays open across blocks, and the next IR block asks the byte.
     // (FLDCW: the next x87 op starts a run under the new rounding control.)
     if (Other || IROp->Op == IROps::OP_FEXCFLDCW || (Leaves && !fexc_bits32)) FexcX87RunEnd(*this);
-    if (Leaves && fexc_bits32 && FexcX87Runs()) fexc_x87_run = FEXC_RUN_UNKNOWN;
+    if (Leaves && fexc_bits32 && FexcX87Runs() && !fexc_x87_run_top) fexc_x87_run = FEXC_RUN_UNKNOWN;
   }
   if (fexc_push_run) {   // the aligned registers each jump carries to its target block (JIT.cpp FexcCarried)
     if (IROp->Op == IROps::OP_JUMP) FexcCarryJump(IROp->C<IR::IROp_Jump>()->TargetBlock);
@@ -1581,6 +1607,14 @@ void Arm64JITCore::FexcEmitStubs() {
   if (FexcTargetsDone != fexc_target_check.size()) {
     ERROR_AND_DIE_FMT("fexc slice1: {} of {} indirect branch targets were not checked", fexc_target_check.size() - FexcTargetsDone,
                       fexc_target_check.size());
+  }
+  // The run's end of the unit's top test, before the check stubs (so it is the last of the body's words): nine words and
+  // the branch back to the unit's third word.
+  if (FexcRunEndUsed) {
+    (void)Bind(&FexcRunEndStub);
+    fexc_x87_run = FEXC_RUN_OPEN;
+    FexcX87RunEnd(*this);
+    (void)b(&FexcRunEndBack);
   }
   for (auto& [Index, Label] : FexcStubs) {
     BindOrRestart(&Label);
