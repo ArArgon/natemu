@@ -209,9 +209,10 @@ static void FexcX87HoldEnd(Arm64JITCore& J) {
   fexc_x87_held = false;
 }
 // M2 task 4, lazy x87 flags: a fault point after a floating-point op of its own x87 instruction needs the hold (the resident
-// would take the instruction's flags from FPSR): a hard check of fexc_x87_hold's list.
+// would take the instruction's flags from FPSR): the check of fexc_x87_hold's list. A form the list lacks has the unit compiled
+// again with every x87 instruction held (fexc_x87_hold_all).
 static void FexcX87SiteCheck() {
-  if (fexc_x87_fp_seen && !fexc_x87_held && FexcX87Lazy()) ERROR_AND_DIE_FMT("fexc slice1 (M2 task 4): a fault point after an x87 floating-point op without a hold");
+  if (fexc_x87_fp_seen && !fexc_x87_held && FexcX87Lazy()) fexc_x87_hold_missing = true;
 }
 static void FexcX87RunEnd(Arm64JITCore& J) {
   if (fexc_x87_run == FEXC_RUN_CLOSED) return;
@@ -1110,7 +1111,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     fexc_insns.push_back({FexcGuest, Begin, FexcCf});
     FexcX87HoldEnd(*this);   // M2 task 4: the instruction before is complete
     fexc_x87_fp_seen = false;
-    fexc_x87_hold_wanted = fexc_x87_hold.count(Op->GuestEntryOffset + Entry) != 0 && FexcX87Lazy();   // (the set first: FexcX87Lazy reads a request argument)
+    fexc_x87_hold_wanted = (fexc_x87_hold_all ? fexc_x87.count(Op->GuestEntryOffset + Entry) : fexc_x87_hold.count(Op->GuestEntryOffset + Entry)) != 0 && FexcX87Lazy();   // (the set first: FexcX87Lazy reads a request argument)
     if (fexc_slice1 && fexc_x87_waiting.count(Op->GuestEntryOffset + Entry)) FexcPendingCheck();   // I5c: #MF before it runs
     if (fexc_slice1 && fexc_pre_nzcv.count(Op->GuestEntryOffset)) {
       static_assert(FexcPrecision::PreNzcvReg == 25);
