@@ -194,6 +194,68 @@ program start (static glibc's start-up) against 44 SYSENTER calls, about 30 micr
 `cray32-small` makes 135 in all. A dynamically linked start adds the loader's calls (54 call sites, each used once or
 a few times per library): a few hundred calls, still under a millisecond.
 
+## After the pause: the x87 register stack in host registers
+
+The remaining cost was the translation of the x87 instructions themselves: about 48 Arm instructions each. An independent
+look at our FEX fork found why. FEX's x87 pass keeps the register stack, its top and its tag bits in host registers
+across a block; our fork had switched that off (every operation loaded the top, the tag byte and its operands from the
+guest state and wrote everything back), so that a fault anywhere finds the guest state exact. And every operation
+computed the answer to "is this register empty?" in full, although real programs never read an empty register.
+
+What is built (FEX fork, the x87 pass; both 32- and 64-bit code; every Mac):
+
+- **The stack lives in host registers across the instructions of a block.** What is pending is written to the guest
+  state before every instruction that can fault, stop or call the shim: every instruction but an x87 instruction with
+  register operands only. So at each such point the guest state is complete, as before. Blocks with unmasked x87
+  exceptions and single-stepped instructions keep the old code.
+- **What the block knows needs no test.** A register the block pushed is not empty; one it popped is. Only a register
+  the block inherits is tested, once.
+- **That test is two instructions, and a stack fault leaves the block.** It sits at the start of its instruction. When
+  it fails (a read of an empty register, a push onto a full stack: a program bug) the shim runs that one instruction
+  alone, in the old form, which computes x87's masked response exactly as before. Nothing is approximated; the rare
+  case just takes a trap.
+- **Exception flags stay in Arm's status register** (on Macs with AFP, all x87 exceptions masked) until something reads
+  the x87 status word: FNSTSW, the end of the run, or the shim when it takes over. Before, every operation copied them
+  (four instructions) and every instruction folded them (five more). The two cases where an instruction's own flags must
+  be dropped keep their exact behaviour: a store that converts before it can fault (FIST, FST to a float) saves the
+  flags so far in a byte first, and the shim takes that byte when the store faults; a stack fault in a single-stepped
+  instruction puts the saved flags back.
+- Smaller: a value the block computed is never a signalling NaN, so storing it as a double skips the quieting (nine
+  instructions per FSTP); the condition bit C1 is written once while the block knows it is 0; consecutive MMX
+  instructions set the x87 top and tags once, not after each.
+- The caches use scratch registers, of which 64-bit code has half as many. Past a budget everything is written and the
+  registers are given up, so a block never needs a spill area (which the shim does not allow).
+
+On c-ray's hottest block (85 x87 instructions) the code went from 4,070 Arm instructions to 494: 48 per x87 instruction
+to 5.8. A register-only multiply is one `fmul`.
+
+| | cray32-small, run 1 / run 2 (s) |
+| --- | --- |
+| Checkpoint A (measured again, same day) | 128.2 / 124.4 |
+| Before this change (x87 runs and the cast fix) | 33.75 / 33.67 |
+| With it | **1.95 / 1.83** |
+
+The picture's hash is the same in all three (2cf47b1e...). That is 17 times faster than before the change and 66 times
+faster than checkpoint A.
+
+How it is checked: a new test runs a block natively up to each of its fault points and compares the x87 state in the
+guest-state area with what the instructions before it leave when each runs alone (`fexc-slice1-x87-commit`: 7 programs
+in 32- and 64-bit code, from an empty and a part-filled stack, with underflow and overflow). The existing x87 suites pass unchanged, on the M4 and on the emulated
+Mac without AFP: the x87 reference corpora against QEMU, the stack-fault and mid-run fault cases, the unmasked-exception
+cases, admission and the precision checker on every compile. The i386 campaign passes at 1, 2 and 4 vCPUs (126 passed, 18
+expected failures, as before).
+
+What changes elsewhere:
+
+- **64-bit code** gets the same pass, with the smaller register budget. Its x87 output changes in every block that has
+  an x87 instruction; blocks without one are byte-identical (the replay check's recorded boot has none and passes).
+- **Macs without AFP (M1, M2)** get the stack in registers and the two-instruction test, but keep copying the flags
+  after each operation: their NaN and denormal fix-ups read each operation's own flags. So x87-heavy 32-bit code is
+  faster there too, by less. Not measured (no such Mac here; the emulated one runs the tests, not benchmarks).
+- One guess of the software denormal test for those Macs had to be made exact: it took "the other operand is a
+  constant" to mean "this is FLD's own multiply by one", which a constant pushed by an earlier instruction (FLDZ) now
+  also looks like. It now checks that the constant is 1.0.
+
 ## 64-bit integers through the x87: two prototypes for the owner's choice
 
 Compilers copy a 64-bit integer on i686 with FILD m64 then FISTP m64 (atomic loads and stores); natemu's x87 registers
@@ -259,10 +321,8 @@ estimate from the small scene was 1,970 s). So at least 3.4 times faster, about 
 - **Macs without AFP (M1, M2)** keep the per-operation x87 wrapper and FLDCW in the shim: x87-heavy 32-bit code is as
   slow there as it was here before. Their NaN and denormal fix-ups read each operation's own flags, which a run does
   not separate. A lead, not started.
-- **x87 instructions cost about 48 Arm instructions each** (the register stack, its top and its tag bits live in memory
-  and are updated by every instruction). After the changes above this is all of `cray32`'s time: 525 s against 3.2 s
-  for the 64-bit SSE build. FEX's x87 stack pass can keep the stack in registers across a block; natemu flushes it
-  at every instruction so that a fault finds exact state. The next lead for x87-heavy code.
+- **x87 instructions cost about 48 Arm instructions each:** done after the pause, see "the x87 register stack in host
+  registers" above (now about 6).
 - **PCMPxSTRx through the shim** is 12% of `startup32` (glibc's i386 string functions with SSE4.2; 57 ns a call).
 - **32-bit code is compiled again in every process** (about 850 compiles per start of a small static program, 5% of
   `startup32`): relocation and the persistent cache are still refused for it. For checkpoint B.
