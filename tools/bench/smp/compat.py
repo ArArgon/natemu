@@ -896,16 +896,42 @@ INT64_AGAIN_USER = REGS32 + f"""    fninit
 # (2) The x87 registers saved and restored between the fault and the second run (what a kernel does when the fault sleeps
 # and another task runs, when it delivers a signal, when it uses the FPU itself): FXSAVE, FNINIT, a push, FXRSTOR in the
 # handler. The image holds ST(0) as the 80-bit 2^62 + 1 (copied out to be compared), and the FISTP stores 2^62 + 1.
-INT64_SAVED = _PF + f"""    fxsave [{LOW1:#x}]
+# Three ways to save and restore: FXSAVE/FXRSTOR, XSAVE/XRSTOR, XSAVEOPT/XRSTOR. (FILD of 2^62 + 1 sets PE here: FNCLEX.) Then,
+# in user mode: the same double loaded again after the kept integer was used is saved as the double (FXSAVE); and an image
+# with the 80-bit 2^62 + 1 in ST(0) that the program restores itself, pops and replaces by the double 2^62 is saved as
+# 2^62 (a restore in user mode keeps no integer).
+INT64_SAVED = lambda save, restore: _PF + f"""    mov eax, 7
+    xor edx, edx
+    {save} [{LOW1:#x}]
     fninit
     fldpi
-    fxrstor [{LOW1:#x}]
+    mov eax, 7
+    xor edx, edx
+    {restore} [{LOW1:#x}]
     mov rax, [{LOW1 + 32:#x}]
     mov [{VPAGE + 0x60:#x}], rax
     movzx eax, word [{LOW1 + 40:#x}]
     mov [{VPAGE + 0x68:#x}], rax
     jmp .resume
 .not_pf:
+"""
+INT64_SAVED_USER = REGS32 + f"""    fninit
+    fild qword [.odd]
+    fistp qword [{VPAGE + 0x30:#x}]
+    fnclex
+    fild qword [.other]
+    fxsave [{VPAGE + 0x200:#x}]
+""" + _zero(VPAGE + 0x200 + 6, 18) + f"""    mov dword [{VPAGE + 0x220:#x}], 2
+    mov dword [{VPAGE + 0x224:#x}], 0x80000000
+    mov word [{VPAGE + 0x228:#x}], 0x403d
+    fxrstor [{VPAGE + 0x200:#x}]
+    fstp st0
+    fild qword [.other]
+    fxsave [{VPAGE + 0x400:#x}]
+""" + _zero(VPAGE + 0x400 + 6, 18) + """    fninit
+    int 0x80
+.odd: dq 0x4000000000000001
+.other: dq 0x4000000000000000
 """
 A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
 X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
@@ -1034,8 +1060,10 @@ def positive32():
                     INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             program('c32-x87-int64-again@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_AGAIN + RESUME, **vec),
                     INT64_AGAIN_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
-            program('c32-x87-int64-saved@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_SAVED + RESUME, **vec),
-                    INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
+            *[program(f'c32-x87-int64-saved-{save}@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() +
+                      handlers(END + INT64_SAVED(save, restore) + RESUME, **vec),
+                      INT64_SAVED_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000)
+              for save, restore in (('fxsave', 'fxrstor'), ('xsave', 'xrstor'), ('xsaveopt', 'xrstor'))],   # (XSAVEC: the pinned QEMU's run of it fails)
             program('c32-x87-faults@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
                     X87FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
             program('c32-faults@1', GATES + ENTER() + handlers(END + RESUME, **vec), FAULT_USER32, log=0x1000),

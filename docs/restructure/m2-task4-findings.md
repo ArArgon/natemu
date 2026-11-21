@@ -615,9 +615,14 @@ Still not covered, recorded here as the limits of (b), none of them fixed:
   without a kept integer and converts.
 - A pair split by a block boundary or a jump target between the two is not a pair.
 - FNSAVE/FRSTOR and FSTP m80 do not carry the integer (Linux uses neither to switch tasks on these processors).
-- A program that itself restores an image holding such an integer and does not then return from the kernel to a FISTP
-  m64 leaves an entry for an address it is not at. Like any stale entry it can only ever give an integer that converts
-  to exactly the double in the register, at that one address, in that one address space.
+- Translated code never retires an entry a restore made. Only the kernel's restores make one (a restore a program
+  runs itself in user mode does not: the second review). After such a restore, a program that pops the register and
+  loads the very double the integer rounds to has a register the shim still takes for the integer: a FISTP m64 at the
+  bound address stores the integer, and, new with this change, a save image written then shows the integer too, where
+  hardware shows the double. It needs the kernel to have restored that exact integer and the program to produce the same
+  double again without returning to the FISTP.
+- Not tested: XSAVEC with the compacted XRSTOR (the pinned QEMU fails to run that case; the code path is the same
+  legacy area), a restore whose top is not 0 or whose tag is empty, binding by SYSRET or SYSEXIT instead of IRET.
 - FILD m64 of an integer above 2^53 still sets the precision flag (see above); it shows only with that exception
   unmasked.
 

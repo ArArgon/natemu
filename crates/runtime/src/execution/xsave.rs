@@ -357,7 +357,9 @@ fn load_x87(s: &mut State, img: &[u8]) {
         u64::from_le_bytes(img[32..40].try_into().unwrap()),
         u16::from_le_bytes([img[40], img[41]]),
     );
-    if let Some(i) = st0.filter(|_| img[4] >> (fsw >> 11 & 7) & 1 != 0) {
+    // (Only a restore at CPL 0, the kernel's before it returns to the task: one a program makes itself has no return to
+    // bind the entry to, and an interrupt's would bind it to wherever the program then is.)
+    if let Some(i) = st0.filter(|_| s.cpu.cpl == 0 && img[4] >> (fsw >> 11 & 7) & 1 != 0) {
         x87::restored_integer(i);
     }
 }
