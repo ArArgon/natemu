@@ -555,6 +555,48 @@ Neither changes the flags of the FILD itself: converting a 64-bit integer above 
 precision flag, which hardware (where the load is exact) does not; that is part of the recorded "x87 registers are
 doubles" deviation.
 
+### (b) as merged: the faulting store, and what its review found
+
+The owner chose (b). When the pair's store faults (the first touch of a page, copy on write), the instruction runs again
+alone and would convert the double; the shim keeps the integer, the instruction's address, the register's double and the
+address space at the fault, and a FISTP m64 that starts a block of 32-bit code stores the kept integer when all of them
+match. An independent review found three defects, fixed in one change:
+
+- **A used entry came back at the next load of CR3** (a kernel with page-table isolation loads it at every return): the
+  translated code clears only the field it reads, and the shim recomputed that field from its own copy. Now the shim
+  treats an entry whose field is clear in its own address space as gone, and drops it at the load. Test
+  `c32-x87-int64-again`: after the kept integer is used, the same FISTP is reached again with 2^62 in the register (the
+  double 2^62 + 1 was held as) after another fault and CR3 load; it stores 2^62. It stored 2^62 + 1 before the fix.
+- **A full x87 stack at the FILD with any x87 exception unmasked:** there the FILD's stack check is in line, the push
+  makes the indefinite, and the paired FISTP still stored the integer read. The pair is now made only where a full
+  stack leaves the block (every exception masked), so both instructions then run alone, exactly. Checked by a compiler
+  test (QEMU has no x87 stack faults, so a VM case has nothing to compare with).
+- **The kept integer was lost whenever the kernel saved and restored the x87 registers between the fault and the second
+  run** (the fault sleeps and another task runs, the task moves to another vCPU, a signal is delivered on the way back,
+  the kernel uses the FPU itself), so first-touch and copy-on-write were covered only when none of that happened. Built
+  as the reviewer proposed: while the entry stands and the register still holds its double, FXSAVE and the XSAVE family
+  write that register as the integer itself (the 80-bit format holds every 64-bit integer, so this is what hardware's
+  image holds); FXRSTOR and XRSTOR, finding in ST(0) an integer that no double holds, make the entry again, for the
+  instruction and address space of the next return to user mode, which the kernel makes right after it restores a
+  task's registers. The entry so travels in the save image, also to another vCPU. Test `c32-x87-int64-saved`: the fault
+  handler does FXSAVE, FNINIT, a push and FXRSTOR; the image's ST(0) is the 80-bit 2^62 + 1 and the FISTP stores
+  2^62 + 1 (it stored 2^62 without the change). Not measured under a real kernel with a fault that sleeps; the
+  mechanism is the same instruction sequence.
+
+Still not covered, recorded here as the limits of (b), none of them fixed:
+
+- 64-bit code: the pair is made there too, but a pair whose store faults converts the double on the second run (the
+  kept integer is used by 32-bit code only; 64-bit code has no reason to copy integers through the x87).
+- A fault at a non-x87 instruction between the FILD and the FISTP ends the block there; the FISTP then starts a block
+  without a kept integer and converts.
+- A pair split by a block boundary or a jump target between the two is not a pair.
+- FNSAVE/FRSTOR and FSTP m80 do not carry the integer (Linux uses neither to switch tasks on these processors).
+- A program that itself restores an image holding such an integer and does not then return from the kernel to a FISTP
+  m64 leaves an entry for an address it is not at. Like any stale entry it can only ever give an integer that converts
+  to exactly the double in the register, at that one address, in that one address space.
+- FILD m64 of an integer above 2^53 still sets the precision flag (see above); it shows only with that exception
+  unmasked.
+
 ## Paused (November 20, about 14:50)
 
 The work was paused on the owner's order while checkpoint A, which this branch sits on, investigates a 64-bit slowdown;

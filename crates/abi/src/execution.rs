@@ -1640,8 +1640,9 @@ pub mod frame {
     /// m64 at the same RIP with an equal double. The resident keeps the entry's CR3 and RIP beside it ([`X87_INT_CR3`],
     /// [`X87_INT_KEPT_RIP`]: generated code never reads these two) and holds [`X87_INT_RIP`] at 0 while CR3 is another
     /// ([`x87_int_live`], at every load of CR3); it drops the entry whenever it writes an x87 register or runs an x87
-    /// transaction (FNINIT, FLDENV, FRSTOR, FXRSTOR, XRSTOR: the register file is replaced), so the entry lives through a
-    /// page fault and the IRET back, not through a context switch.
+    /// transaction (FNINIT, FLDENV, FRSTOR, FXRSTOR, XRSTOR: the register file is replaced). It lives through a
+    /// page fault and the IRET back, and through a save and restore of the registers between them (a context switch, a
+    /// signal): the save image holds ST(0) as the integer and the restore makes the entry again ([`X87_INT_UNBOUND`]).
     pub const X87_INT_RIP: u32 = 0x20;
     pub const X87_INT: u32 = 0x28;
     pub const X87_INT_ST0: u32 = 0x30;
@@ -1651,6 +1652,16 @@ pub mod frame {
     pub const fn x87_int_live(kept_rip: u64, kept_cr3: u64, cr3: u64) -> u64 {
         if kept_cr3 == cr3 { kept_rip } else { 0 }
     }
+    /// Whether the resident's entry (`kept_rip`, `kept_cr3`) still is one under `cr3`, [`X87_INT_RIP`] holding `int_rip`:
+    /// generated code clears only `X87_INT_RIP` when a FISTP m64 that starts a unit uses the entry or finds it another's, so
+    /// a 0 there in the entry's own address space is an entry gone (the review of the kept integer: without this rule the
+    /// next load of CR3 made it live again). In another address space the 0 is the resident's ([`x87_int_live`]).
+    pub const fn x87_int_kept(kept_rip: u64, kept_cr3: u64, int_rip: u64, cr3: u64) -> bool {
+        kept_rip != 0 && !(int_rip == 0 && kept_cr3 == cr3)
+    }
+    /// An entry made by a restore of the x87 registers ([`X87_INT_KEPT_RIP`] and [`X87_INT_CR3`] both this): the RIP and
+    /// address space it is for are those of the next return to CPL 3 (no CR3 is all ones).
+    pub const X87_INT_UNBOUND: u64 = u64::MAX;
     /// I5c (unmasked floating-point exceptions), two bytes of FEX's flag array FEX's code never uses (its X87FLAG_DE_LOC and
     /// X87FLAG_ZE_LOC), both in FPSR's flag order: the MXCSR flags SIMD-checked instructions raised since the last resident
     /// entry (generated code folds each checked instruction's FPSR into it; the resident ORs it into MXCSR and clears it at
@@ -4562,6 +4573,13 @@ mod tests {
         assert_eq!(frame::x87_int_live(0x8049d5d, 0x1000, 0x1000), 0x8049d5d);
         assert_eq!(frame::x87_int_live(0x8049d5d, 0x1000, 0x2000), 0);
         assert_eq!(frame::x87_int_live(0, 0x1000, 0x1000), 0);
+        // (the review:) an entry used in its own address space is gone, also after CR3 is loaded again; one that waits in
+        // another address space, or for its return to CPL 3, is kept.
+        assert!(frame::x87_int_kept(0x8049d5d, 0x1000, 0x8049d5d, 0x1000));
+        assert!(!frame::x87_int_kept(0x8049d5d, 0x1000, 0, 0x1000));
+        assert!(frame::x87_int_kept(0x8049d5d, 0x1000, 0, 0x2000));
+        assert!(frame::x87_int_kept(frame::X87_INT_UNBOUND, frame::X87_INT_UNBOUND, 0, 0x1000));
+        assert!(!frame::x87_int_kept(0, 0, 0, 0));
         assert!(
             [frame::SIMD_FLAGS, frame::X87_PENDING]
                 .iter()

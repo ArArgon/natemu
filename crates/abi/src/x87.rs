@@ -23,6 +23,25 @@ pub fn to_f80(d: u64) -> (u64, u16) {
     };
     (mant, sign << 15 | e)
 }
+/// M2 task 4: the nonzero 64-bit integer `i` (an i64's bits) in the 80-bit format, which holds every one exactly.
+pub fn int_f80(i: u64) -> (u64, u16) {
+    let m = (i as i64).unsigned_abs();
+    let lz = m.leading_zeros();
+    (m << lz, ((i >> 63) as u16) << 15 | (16383 + 63 - lz as u16))
+}
+/// M2 task 4: the integer (an i64's bits) an 80-bit value is, when it is one that no double holds: a normal number, whole,
+/// inside i64's range, with more than 53 significant bits. [`from_f80`] rounds such a value.
+pub fn f80_int(mant: u64, se: u16) -> Option<u64> {
+    let e = i64::from(se & 0x7fff) - 16383;
+    if mant >> 63 == 0 || !(53..=62).contains(&e) {
+        return None;
+    }
+    let m = mant >> (63 - e);
+    if m << (63 - e) != mant || e + 1 - i64::from(m.trailing_zeros()) <= 53 {
+        return None;
+    }
+    Some(if se >> 15 != 0 { m.wrapping_neg() } else { m })
+}
 /// An 80-bit value rounded to a double under rounding control `rc` (FCW.RC). Unsupported encodings (pseudo-NaN,
 /// pseudo-infinity, unnormal) become the indefinite; a NaN keeps its sign, its quiet bit and as much payload as fits (an
 /// SNaN whose payload all lies in the dropped bits keeps bit 0, so it stays a NaN).
@@ -521,6 +540,24 @@ mod tests {
             v ^= v << 17;
             check(v);
         }
+    }
+    #[test]
+    fn f80_integers() {
+        // M2 task 4: every i64 widens exactly; only those no double holds are recognized on the way back.
+        for i in [0x4000_0000_0000_0001u64, 0x7fff_ffff_ffff_ffff, (-0x4000_0000_0000_0001i64) as u64, (1 << 53) + 1, u64::MAX - (1 << 54)] {
+            let (mant, se) = int_f80(i);
+            assert_eq!(f80_int(mant, se), Some(i), "{i:#x}");
+            assert_ne!(to_f80(from_f80(mant, se, 0)), (mant, se));
+        }
+        for i in [1u64, 1 << 62, 1 << 63, (1 << 53) - 1, 3 << 61, (-5i64) as u64] {
+            let (mant, se) = int_f80(i);
+            assert_eq!((mant, se), to_f80((i as i64 as f64).to_bits()), "{i:#x}");
+            assert_eq!(f80_int(mant, se), None, "{i:#x}");
+        }
+        // 2^62 + 0.5 (not whole), 2^64 (out of range), an unnormal
+        assert_eq!(f80_int(0x8000_0000_0000_0001, 16383 + 61), None);
+        assert_eq!(f80_int(0x8000_0000_0000_0001, 16383 + 64), None);
+        assert_eq!(f80_int(0x4000_0000_0000_0001, 16383 + 63), None);
     }
     #[test]
     fn f80_conversions() {
