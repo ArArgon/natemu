@@ -766,6 +766,22 @@ Read with these in mind:
 The x86 selftests' and the i386 campaigns at the head, run after the table: 221 cases passed, 18 expected failures, 3
 unsupported (the same expected failures as before; `atomic64` passes).
 
+### The review of the whole change
+
+A fresh reviewer read the whole difference from the starting commit, in natemu and in the FEX fork, against the
+exactness rules, without this page's conclusions. No serious defect. One inexactness, low, left as it is: when a block
+compiled for an x87 stack top is entered with another one and its test is at the block's first instruction, the shim
+leaves the resume flag (RF) alone, on the reading that no instruction has completed since it last looked. That is
+right when the shim itself entered the block and wrong when another block jumped straight into it: RF, if an IRET had
+set it, then stays set for one instruction too long (a code breakpoint on that instruction is skipped once; an
+interrupt's saved flags show RF). The earlier review had found the opposite error (RF cleared with nothing completed)
+and the rule was turned round then; telling the two cases apart needs the translated code to say whether it came from
+a link. Not built. Three things the reviewer could not settle by reading, with no failing case found: every callee of
+INT and IRET on the one-pass path for a host exit or stack depth (the static stack-bound check passes); what the M4
+reports for a probe's fault at every kind of address (anything unexpected stops the vCPU, it does not corrupt); and
+that x87 runs end before floating-point operations chosen by name, which a future operation with another name would
+escape.
+
 ### Macs without AFP (M1, M2): the same round's 32-bit cases with AFP hidden
 
 A separate step, at the owner's request. AFP is the Arm feature (M4 has it; M1 and M2 do not) that lets Arm arithmetic
