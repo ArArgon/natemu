@@ -1313,6 +1313,8 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   // starts from the state at the instruction: they do not count as committed effects.)
   if ((S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
        S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) && IROp->Op != IROps::OP_FEXCREPSTOS) FexcStoreSeen = true;
+  // M2 task 4 (fexc_hook.h): the store of a FISTP m64 that stores its block's FILD m64's integer.
+  if (S.kind == FEXC_SITE_STORE && S.width == 8 && S.data_class == 0 && fexc_x87_int_pair.count(Entry + FexcGuest)) S.guest_offset2 = FEXC_X87_INT64;
   FexcX87SiteCheck();
   fexc_sites.push_back(S);
 }

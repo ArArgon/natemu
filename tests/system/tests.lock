@@ -100,6 +100,28 @@ repro = "55be81b8f107 image_sha256=dd1ff28a28fb83b52d2b2bb0cd31c376cdbeaec7e1e93
 sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
 value = "[null]"
 
+[answers.1e02d84a484fce976a76ddc256ba8c9f300de87bd0d8f780630e72db71e60bd7]
+aux = "{\"ncpu\":1}"
+repro = "1251e4d561b3 image_sha256=f98b3c5e3cc36fbebba144efa19125517f7d79502596c81551d784b16b3e4010"
+sha256 = "a8479b5a90d9bcdda19079c714a3c37264b79cb263315d3278f9f916f9065d39"
+
+[answers."1e02d84a484fce976a76ddc256ba8c9f300de87bd0d8f780630e72db71e60bd7#exit"]
+aux = "{\"rc\":1}"
+repro = "0769aa0dc550 image_sha256=f98b3c5e3cc36fbebba144efa19125517f7d79502596c81551d784b16b3e4010"
+sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
+value = "exit 1"
+
+[answers."1e02d84a484fce976a76ddc256ba8c9f300de87bd0d8f780630e72db71e60bd7/qemu_fault"]
+aux = "{\"ncpu\":1}"
+repro = "72ce5871a40d image_sha256=f98b3c5e3cc36fbebba144efa19125517f7d79502596c81551d784b16b3e4010"
+sha256 = "a8479b5a90d9bcdda19079c714a3c37264b79cb263315d3278f9f916f9065d39"
+
+[answers."1e02d84a484fce976a76ddc256ba8c9f300de87bd0d8f780630e72db71e60bd7/qemu_fault#faults"]
+aux = "{\"value\":[null]}"
+repro = "55be81b8f107 image_sha256=f98b3c5e3cc36fbebba144efa19125517f7d79502596c81551d784b16b3e4010"
+sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
+value = "[null]"
+
 [answers.20eadcd5bbc80cd8a444742cb090abc095c9c4ec947d5f359836fa07e3dfe98a]
 aux = "{\"ncpu\":1}"
 repro = "528a717bb75d image_sha256=a02c24e627b0501eb63d981d8bf1ee0279e286d3f26818fbdea0b3ba8dea61c6"
@@ -126,6 +148,28 @@ sha256 = "86f31d8f1b33e0d85d7895393b4be8f3c2ab7c156e7884900585b56d627cc03f"
 repro = "7c34c3f7813f image_sha256=a02c24e627b0501eb63d981d8bf1ee0279e286d3f26818fbdea0b3ba8dea61c6"
 sha256 = "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
 value = "\"\""
+
+[answers.2a0b825e3d723e52322cc6fd26908b8cfcbbae33b201baeb3b8bc31c86e1c247]
+aux = "{\"ncpu\":1}"
+repro = "1251e4d561b3 image_sha256=077c9d6452a0e3acfb539f62d489f3bfcb0280d4d1165c7462f1915a34a4e5c1"
+sha256 = "79bc614188f037cb9faab9c6bb3653a8e638f68429382dd2f34d58b840c18ac9"
+
+[answers."2a0b825e3d723e52322cc6fd26908b8cfcbbae33b201baeb3b8bc31c86e1c247#exit"]
+aux = "{\"rc\":1}"
+repro = "0769aa0dc550 image_sha256=077c9d6452a0e3acfb539f62d489f3bfcb0280d4d1165c7462f1915a34a4e5c1"
+sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
+value = "exit 1"
+
+[answers."2a0b825e3d723e52322cc6fd26908b8cfcbbae33b201baeb3b8bc31c86e1c247/qemu_fault"]
+aux = "{\"ncpu\":1}"
+repro = "72ce5871a40d image_sha256=077c9d6452a0e3acfb539f62d489f3bfcb0280d4d1165c7462f1915a34a4e5c1"
+sha256 = "79bc614188f037cb9faab9c6bb3653a8e638f68429382dd2f34d58b840c18ac9"
+
+[answers."2a0b825e3d723e52322cc6fd26908b8cfcbbae33b201baeb3b8bc31c86e1c247/qemu_fault#faults"]
+aux = "{\"value\":[null]}"
+repro = "55be81b8f107 image_sha256=077c9d6452a0e3acfb539f62d489f3bfcb0280d4d1165c7462f1915a34a4e5c1"
+sha256 = "1d8fc6ceb1f94c6326d6d5483d258fcb2e179e9869325b245d105c2219bf69fd"
+value = "[null]"
 
 [answers.2a88d91bf7dbcd4462af4a559581d5ecadf2e32989d74e6595adcbf6a91770a8]
 aux = "{\"ncpu\":1}"

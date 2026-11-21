@@ -42,6 +42,7 @@ pub(super) fn mm(r: u64) -> u64 {
     unsafe { (page(frame::X87_MM + 16 * (r as u32 & 7)) as *mut u64).read_volatile() }
 }
 pub(super) fn set_mm(r: u64, v: u64) {
+    forget_integer();
     unsafe { (page(frame::X87_MM + 16 * (r as u32 & 7)) as *mut u64).write_volatile(v) }
 }
 /// The abridged tag byte (bit i: physical register i is not empty; FXSAVE's FTW field) and its write (I5b).
@@ -85,6 +86,7 @@ pub(super) fn fsw(fcw: u64) -> u64 {
 }
 /// Writes FSW's TOP, condition codes and exception flags (bits 6:0; ES and B follow from the masks) into the page.
 pub(super) fn set_fsw(v: u64) {
+    forget_integer();
     set8(frame::X87_TOP, v >> 11 & 7);
     for (at, bit) in [
         (frame::X87_C0, 8),
@@ -121,6 +123,33 @@ pub(super) fn rebuild(map: &natemu_abi::code_object::X87Map, f: &NativeFrame) {
     }
     set8(frame::X87_TOP, u64::from(map.top));
     set_abridged(u64::from(map.tags));
+}
+/// M2 task 4 ([`frame::X87_INT`]): the integer a faulting FISTP m64 at `rip` was storing under the address space `cr3`,
+/// with ST(0)'s bits as they are.
+pub(super) fn keep_integer(rip: u64, integer: u64, cr3: u64) {
+    let st0 = mm(top());
+    for (at, v) in [
+        (frame::X87_INT, integer),
+        (frame::X87_INT_ST0, st0),
+        (frame::X87_INT_CR3, cr3),
+        (frame::X87_INT_KEPT_RIP, rip),
+        (frame::X87_INT_RIP, rip),
+    ] {
+        unsafe { (page(at) as *mut u64).write_volatile(v) }
+    }
+}
+/// The kept integer is dropped: the x87 register file is being written by the resident (a transaction, a restore, a
+/// helper), so ST(0) is no longer the register the faulting FISTP m64 left.
+pub(super) fn forget_integer() {
+    for at in [frame::X87_INT_RIP, frame::X87_INT_KEPT_RIP] {
+        unsafe { (page(at) as *mut u64).write_volatile(0) }
+    }
+}
+/// CR3 was loaded: the kept integer is another address space's unless its CR3 is this one ([`frame::x87_int_live`]).
+pub(super) fn address_space(cr3: u64) {
+    let get = |at: u32| unsafe { (page(at) as *const u64).read_volatile() };
+    let live = frame::x87_int_live(get(frame::X87_INT_KEPT_RIP), get(frame::X87_INT_CR3), cr3);
+    unsafe { (page(frame::X87_INT_RIP) as *mut u64).write_volatile(live) }
 }
 /// The full tag word (SDM Vol.1 8.1.7): 11 empty, else from the double: 01 zero, 10 NaN or infinity, 00 valid (a denormal
 /// double is a normal 80-bit value).
@@ -267,6 +296,7 @@ pub(super) fn exception(fcw: u64, w: u64) {
 /// Executes the x87 transaction `i` (any CPL; LOCK is #UD before this). `Ok`: committed, RIP moves past it.
 pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     gate(&s.cpu)?;
+    forget_integer();
     // I5c: the waiting forms take a pending exception first (the non-waiting FNINIT, FNCLEX, FNSTENV, FNSAVE do not).
     if matches!(
         i.kind,

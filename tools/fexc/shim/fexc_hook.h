@@ -357,6 +357,13 @@ inline bool FexcX87Lazy() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_
 // M2 task 4, `--x87-guess V` (32-bit code; V = 0x1000 | TOP << 8 | the tag byte, as the guest state held them when the unit
 // was requested; 0: none): the x87 stack pass compiles the unit for that pair (FEX's x87StackOptimizationPass, TopAbs).
 inline FexcArg<uint64_t, FEXC_ARG_X87_GUESS> fexc_x87_guess;
+// M2 task 4, 64-bit integers through the x87: guest RIP of each FISTP/FISTTP m64 that stores the integer its block's FILD m64
+// loaded (FEX's X87F64.cpp). Its store site carries FEXC_X87_INT64 in guest_offset2: at a fault there the resident keeps the
+// integer (the store's data register), the RIP and ST(0)'s bits in three guest-state fields (FEX's gregs[0..2], which slice1
+// code never uses: the general registers are static), and the FISTP m64 that starts the next unit at that RIP stores the
+// integer again when ST(0) is still that double (32-bit code).
+inline std::set<uint64_t> fexc_x87_int_pair;
+constexpr uint32_t FEXC_X87_INT64 = 0xC000'0001u, FEXC_X87_INT_RIP = 0x20, FEXC_X87_INT = 0x28, FEXC_X87_INT_ST0 = 0x30;
 inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
 inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
 // A fault point after a floating-point op of its own x87 instruction that fexc_x87_hold does not list (none known): the unit is
