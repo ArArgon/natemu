@@ -88,10 +88,7 @@ fn split_point(
     // M2 task 4: the run's end a block's top test for an open x87 run branches to ([`run_tested`]) stands behind the body's
     // exits and is no site: cold, as the check stubs (it runs when x87 code jumped to SSE code, and then goes on in the
     // block's code below).
-    let entry = u64::from(natemu_abi::execution::ENTRY_OFFSET);
-    let cbnz = word(entry + 4);
-    let run_end = (word(entry) == 0x3940_0380 | natemu_abi::execution::frame::X87_RUN << 10 && cbnz & 0xff80_001f == 0x3500_0000)
-        .then(|| entry + 4 + u64::from(cbnz >> 5 & 0x7_ffff) * 4);
+    let run_end = natemu_abi::execution::run_test_end(&word, u64::from(size));
     let stub = |o: u64| stub(o) || run_end == Some(o);
     let Some(h) = natemu_abi::execution::body_end(word, u64::from(size), |o| exit(o) || stub(o)) else {
         return (0, 0);
@@ -153,6 +150,13 @@ fn split(b: &mut Block) -> bool {
     b.patch = patch;
     let from = u64::from(b.hot) + 4;
     synchronize_code(area::CODE_WRITE_VA + from, area::CODE_VA + from, (body + h + 4 - from) as usize);
+    // M2 task 4: the run's end of a top x87 run test is cold; its return goes to the hot copy's third word, not the cold
+    // code's (whose exits no link patches: each arrival with a run open, x87 code jumping or returning to SSE code,
+    // would leave through the linker). The one word of a block's code the resident changes besides its link points; a
+    // block that begins with the test is never copied ([`copy`]).
+    if let Some(e) = natemu_abi::execution::run_test_end(|o| word(code + o), u64::from(b.code_size)) {
+        rewrite(code + e + 36, branch(code + e + 36, body + u64::from(natemu_abi::execution::ENTRY_OFFSET) + 8));
+    }
     true
 }
 fn link_at(b: &Block, offset: u64) -> u64 {
@@ -1398,6 +1402,10 @@ pub fn copy(
     if b.flags & PIC != 0 {
         return Err(natemu_abi::execution::refusal::PLACE); // a translation is shared, not copied ([`instance`])
     }
+    // (M2 task 4: a block whose code the resident changed, [`split`]: 32-bit code, which is not relocatable today.)
+    if run_tested(b) {
+        return Err(natemu_abi::execution::refusal::PLACE);
+    }
     let (h_at, want) = split_point(|o| word(u64::from(b.code) + o), &b.links, b.dispatch_exit, b.code_size, |o| {
         sites(b).iter().any(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind) && u64::from(s.native_offset) == o)
     });
@@ -1963,11 +1971,9 @@ pub enum Link {
 /// end and that the block opens no run). Such a block opens no run, so behind its test none is open, to its every exit.
 /// (The word after a conditional branch is a word the block reaches anyway: entering there needs no trust in the rest.)
 fn run_tested(code: &Block) -> bool {
-    let at = code.entry() - area::CODE_VA;
     code.code_size != 0
         && code.flags & (SYSTEM | STEP) == 0
-        && word(at) == 0x3940_0380 | natemu_abi::execution::frame::X87_RUN << 10
-        && word(at + 4) & 0xff00_001f == 0x3500_0000
+        && natemu_abi::execution::run_test_end(|o| word(u64::from(code.code) + o), u64::from(code.code_size)).is_some()
 }
 /// Where a plain link from `source`'s code enters `code` (code-area offset): its body entry, or, from a block that leaves
 /// with no x87 run open into a block that begins with the test for one, the word after the test's two ([`run_tested`]:

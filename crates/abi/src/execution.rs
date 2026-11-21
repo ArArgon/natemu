@@ -2009,6 +2009,30 @@ pub fn moved_word(w: u32, from: u64, to: u64, map: impl Fn(u64) -> u64) -> Optio
     }
     Some(w & !(mask << shift) | (d as u32 & mask) << shift)
 }
+/// M2 task 4: the end of an x87 run (fexc `FexcX87RunEnd`): the run's flags from FPSR into the x87 exception word, FPCR back,
+/// FPSR and the run byte cleared.
+pub const RUN_END: [u32; 9] =
+    [0xd53b_4420, 0x1200_1c00, 0xb944_b781, 0x2a00_0021, 0xb904_b781, 0xb940_b380, 0xd51b_4400, 0xd51b_443f, 0x3910_539f];
+const _: () = assert!(RUN_END[8] == 0x3900_039f | frame::X87_RUN << 10);
+/// M2 task 4, the second entry: a block's top test for an open x87 run, whole: its first two words `ldrb w0, [x28,
+/// #X87_RUN]; cbnz w0, E`, at E the run's end's nine words ([`RUN_END`]) and a `b` after them (as admitted, to the block's
+/// third word; the resident may have made it go to the hot copy's). Returns E. `word` reads the block's code by offset
+/// from its header word, `size` is its bytes. The same two first words alone also begin the start of a run in x87 code
+/// (`FexcX87RunStart`): only with the run's end behind them is a block one that opens no run (the code shape proves that
+/// part, where it is on).
+pub fn run_test_end(word: impl Fn(u64) -> u32, size: u64) -> Option<u64> {
+    let entry = u64::from(ENTRY_OFFSET);
+    if size < entry + 12 {
+        return None;
+    }
+    let cbnz = word(entry + 4);
+    if word(entry) != 0x3940_0380 | frame::X87_RUN << 10 || cbnz & 0xff80_001f != 0x3500_0000 {
+        return None;
+    }
+    let e = entry + 4 + u64::from(cbnz >> 5 & 0x7_ffff) * 4;
+    (e > entry + 8 && e + 40 <= size && (0..9).all(|k| word(e + 4 * k) == RUN_END[k as usize]) && word(e + 36) >> 26 == 5)
+        .then_some(e)
+}
 /// Hot/cold layout: the word `w` can be followed by the next (not `b`, `brk` or a zero word: [`body_end`]'s rule).
 pub fn falls_through(w: u32) -> bool {
     !(w & 0xfc00_0000 == 0x1400_0000 || w & 0xffe0_001f == 0xd420_0000 || w >> 16 == 0)

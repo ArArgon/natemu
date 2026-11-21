@@ -417,12 +417,9 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
         // (a one-instruction unit has neither test). So such a test, when it fires at the block's first instruction, never
         // sees an RF that belongs to that very instruction, and may take every instruction before it as completed, which
         // is right for a block reached by a link or the dispatcher with the resident's RF stale ([`x87_guess_miss`]).
-        if s.cpu.rflags & RFLAGS_RF != 0
-            && block.flags & cache::STEP == 0
-            && cache::sites(block)
-                .iter()
-                .any(|x| x.guest_offset == 0 && matches!(x.kind, object::kind::X87GUESS | object::kind::DENORM))
-        {
+        // (Only where the test would fire now: every fault's return is an IRET with RF set, and a one-instruction unit
+        // is a round trip to the host.)
+        if s.cpu.rflags & RFLAGS_RF != 0 && first_test_fires(block) {
             match unsafe { step_here(s) } {
                 Some(block) => return Some(block),
                 None => continue,
@@ -496,6 +493,32 @@ fn trap_due(s: &mut State) -> bool {
         },
     );
     true
+}
+/// M2 task 4: whether `block`, entered now, would leave at its first instruction before anything ran: its test of the
+/// x87 stack top and tags it was compiled for would miss (the pair in the guest-state page against the test's constant,
+/// read from its `orr w0, w1, w0, lsl #8; sub w0, w0, #V`; not found: taken as a miss), or a denormal is pending for
+/// its check. The resident does not enter such a block with RF set ([`find_from`]).
+fn first_test_fires(block: &Block) -> bool {
+    if block.flags & (cache::STEP | cache::SYSTEM) != 0 {
+        return false;
+    }
+    let code = cache::code_of(block);
+    let word = |o: u32| unsafe { ((code.code_va() + u64::from(o)) as *const u32).read() };
+    cache::sites(code).iter().filter(|x| x.guest_offset == 0).any(|x| match x.kind {
+        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
+        object::kind::DENORM => unsafe { (FRAME_VA as *const u8).add(frame::DE_PENDING as usize).read_volatile() != 0 },
+        object::kind::X87GUESS => {
+            let guess = (0..12)
+                .map(|k| x.insn_native_offset + 4 * k)
+                .take_while(|&o| o + 4 < x.native_offset)
+                .find(|&o| word(o) == 0x2a00_2020 && word(o + 4) & 0xffc0_03ff == 0x5100_0000)
+                .map(|o| u64::from(word(o + 4) >> 10 & 0xfff));
+            // (The two bytes as the test reads them.)
+            let byte = |at: u32| unsafe { u64::from((FRAME_VA as *const u8).add(at as usize).read_volatile()) };
+            guess != Some(byte(frame::X87_TOP) << 8 | byte(frame::X87_FTW))
+        }
+        _ => false,
+    })
 }
 /// S4: an armed instruction breakpoint at RIP is a #DB fault before the instruction, unless RF is set or a MOV SS shadow
 /// suppresses it (delivery_model A9), or the boundary is between two iterations of a REP string; its frame holds the
@@ -829,9 +852,8 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     s.l2_hits += 1;
     system(s, i);
     // (SYSRETL into 32-bit code whose segments translated code cannot run, `Cpu::compat_refused`: `find` raises its #GP.)
-    // (An IRET that sets RF: `find` decides how the target is entered, M2 task 4.)
     if s.debug != 0
-        || s.cpu.rflags & (RFLAGS_TF | RFLAGS_RF) != 0
+        || s.cpu.rflags & RFLAGS_TF != 0
         || !events::none(s)
         || (s.cpu.seg[SREG_CS].attributes & ATTR_L == 0 && s.cpu.compat_refused().is_some())
     {
@@ -843,7 +865,11 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     let p = crate::perf::enter(crate::perf::LOOKUP);
     let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
     crate::perf::leave(p);
-    let Some(target) = found.filter(|b| b.flags & cache::SYSTEM == 0) else {
+    // (M2 task 4: an IRET that set RF, into a block whose first instruction's test would fire: `find` runs that
+    // instruction alone, [`first_test_fires`].)
+    let Some(target) = found
+        .filter(|b| b.flags & cache::SYSTEM == 0 && !(s.cpu.rflags & RFLAGS_RF != 0 && first_test_fires(b)))
+    else {
         declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
     };

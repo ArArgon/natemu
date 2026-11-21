@@ -1060,15 +1060,16 @@ BREAK_USER = REGS32 + f"""    int3
 
 # ---- an x87 run left open, then SSE code (M2 task 4: the second entry) --------------------------------------------------------
 # The x87 rounds down (FLDCW), SSE to nearest. A block of x87 code jumps to a block of SSE code, which jumps to another, three
-# times round, so the links are made and then used. The first SSE block must end the x87's run (its test at the top) every
-# time it is reached from the x87 block; the second is reached from SSE code, behind its test. 1/3, 2/3 and 3/3 by DIVSD and
-# their squares differ in the last bit under the x87's rounding.
+# six times round, so each link is used after it is made. The first SSE block must end the x87's run (its test at the top)
+# every time it is reached from the x87 block; the second is reached from SSE code, behind its test. Each block ends in a
+# jump and the x87 instructions at the end stand behind one, so the two SSE blocks hold no x87 instruction (a block that
+# does keeps the test before its first SSE instruction and has no second entry). k/7 by DIVSD in the first SSE block and
+# its square in the second differ in the last bit under the x87's rounding.
 RUNLINK_USER = REGS32 + f"""    fninit
     mov word [{W:#x}], 0x077f
     fldcw [{W:#x}]
-    mov ecx, 3
-    mov dword [{W + 4:#x}], 3
-    cvtsi2sd xmm1, dword [{W + 4:#x}]
+    mov ecx, 6
+    movsd xmm7, [.seven]
 .x87:
     fld1
     fdiv qword [.seven]
@@ -1076,16 +1077,20 @@ RUNLINK_USER = REGS32 + f"""    fninit
     jmp .sse
 .sse:
     cvtsi2sd xmm0, ecx
-    divsd xmm0, xmm1
-    movsd [{R + 0x20:#x} + 8*ecx], xmm0
+    divsd xmm0, xmm7
+    movsd [{R + 0x40:#x} + 8*ecx], xmm0
     jmp .sse2
 .sse2:
     mulsd xmm0, xmm0
-    movsd [{R + 0x40:#x} + 8*ecx], xmm0
+    movsd [{R + 0x80:#x} + 8*ecx], xmm0
+    jmp .next
+.next:
     dec ecx
     jnz .x87
-    stmxcsr [{R + 0x60:#x}]
-    fnstsw [{R + 0x64:#x}]
+    jmp .end
+.end:
+    stmxcsr [{R + 0xc0:#x}]
+    fnstsw [{R + 0xc4:#x}]
     fninit
     int 0x80
 .seven: dq 7.0
