@@ -43,10 +43,13 @@ behaviour. It only replaces one full reset with a subset removal that leaves the
 only shadows a CR3 load can leave in place (`Space::reset_cr3`: the kept half's global ones; its non-global ones are
 removed but treated as kept here, which only over-approximates).
 
-**Insert** (end of `install`, both success paths, only when the installed shadow is writable): probe the window; if a
-live entry for (va, gpa) exists that is kept, or the new shadow is not kept, done (a non-kept entry does not cover a kept
-shadow of the same va: the user space's shadow of an upper-half va dies at a CR3 load, the supervisor space's does not);
-else take the first slot that is not live; if none, set `lossy`.
+**Insert** (end of `install`, both success paths, only when the installed shadow is writable): probe the window up to
+its first slot that is not live and take that slot; before it, a live entry for (va, gpa) that is kept, or any one when
+the new shadow is not kept, means done (a non-kept entry does not cover a kept shadow of the same va: the user space's
+shadow of an upper-half va dies at a CR3 load, the supervisor space's does not); no slot that is not live: set `lossy`.
+An entry past the first free slot is not looked at, so a shadow may be recorded twice (a slot before its entry died
+since): an over-approximation, unmapped twice at its drop. Probing the whole window for that check cost `mem` (stress-ng
+vm/mmap/fork) 4.3% on the M2 Max, against 0.5% (noise) for the first-free-slot insert (4 runs each against main).
 
 **Drop** (`mark`, when `writers & own`): if `lossy == full_epoch + 1`, full reset (as today). Else, for each live
 entry of P in its window: `tables::unmap(va)` (both spaces; TLBI VAE1 per space, `dsb ish`, `isb`) and invalidate the

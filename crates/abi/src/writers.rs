@@ -59,33 +59,29 @@ fn page_of(w: [u64; 2]) -> u64 {
     w[1] & 0xffff_ffff
 }
 
-/// Records a writable shadow of `va` (page-aligned) onto guest page `page` (in the space of `user`). Returns false when
-/// the window was full of live entries: the caller marks the map lossy.
+/// Records a writable shadow of `va` (page-aligned) onto guest page `page` (in the space of `user`) in the first slot of
+/// its probe window that holds no live entry. Live entries before that slot are checked for the same shadow; one after it
+/// (a slot before it died since) is not, so a shadow may be recorded twice: an over-approximation that costs only a
+/// second unmap at its drop. Returns false when the window was full of live entries: the caller marks the map lossy.
 pub fn insert(table: &mut [[u64; 2]], e: &Epochs, user: bool, va: u64, page: u64) -> bool {
     let first = [va & !4095 | if kept(user, va) { KEPT } else { 0 } | VALID, second(page, e)];
     let h = home(page);
-    let mut free = None;
     for i in 0..WINDOW {
         let s = slot(h, i);
         let w = table[s];
-        if live(w, e) {
-            if w[0] & !KEPT == first[0] & !KEPT && page_of(w) == page & 0xffff_ffff {
-                // Same shadow already recorded; a kept entry also covers a non-kept one of the same va.
-                if w[0] & KEPT != 0 || first[0] & KEPT == 0 {
-                    return true;
-                }
-            }
-        } else if free.is_none() {
-            free = Some(s);
-        }
-    }
-    match free {
-        Some(s) => {
+        if !live(w, e) {
             table[s] = first;
-            true
+            return true;
         }
-        None => false,
+        // Same shadow already recorded; a kept entry also covers a non-kept one of the same va.
+        if w[0] & !KEPT == first[0] & !KEPT
+            && page_of(w) == page & 0xffff_ffff
+            && (w[0] & KEPT != 0 || first[0] & KEPT == 0)
+        {
+            return true;
+        }
     }
+    false
 }
 
 /// Calls `unmap(va)` for every live entry of guest page `page` and invalidates it. Returns how many.
@@ -188,6 +184,20 @@ mod tests {
         assert!(insert(&mut t, &e, true, 0x90_0000, extra));
         same.push(extra);
         assert_eq!(dropped(&mut t, &e, extra), vec![0x90_0000]);
+    }
+
+    #[test]
+    fn an_insert_takes_the_first_free_slot_so_a_shadow_after_a_hole_is_recorded_twice() {
+        let mut t = table();
+        let e = Epochs { full: 1, cr3: 1, lossy: 0 };
+        let h = home(5);
+        let q = (6..).find(|&p| home(p) == h).unwrap();
+        assert!(insert(&mut t, &e, true, 0x1000, 5)); // slot 0
+        assert!(insert(&mut t, &e, true, 0x2000, q)); // slot 1
+        assert!(insert(&mut t, &e, true, 0x2000, q)); // already recorded before any free slot: not again
+        assert_eq!(dropped(&mut t, &e, 5), vec![0x1000]); // slot 0 is free now
+        assert!(insert(&mut t, &e, true, 0x2000, q)); // into slot 0: a second entry, unmapped twice at the drop
+        assert_eq!(dropped(&mut t, &e, q), vec![0x2000, 0x2000]);
     }
 
     #[test]
