@@ -795,6 +795,13 @@ pub struct K1 {
     /// Relink plan (docs/restructure/relink-plan.md): absent while every counter is zero.
     #[serde(skip_serializing_if = "K1Relink::is_empty")]
     relink: K1Relink,
+    /// The reverse map of writable shadows (docs/writable-drop.md, `natemu_abi::writers::count`): absent while every
+    /// counter is zero.
+    #[serde(skip_serializing_if = "writers_empty")]
+    writers: [u64; natemu_abi::writers::count::COUNT],
+}
+fn writers_empty(w: &[u64; natemu_abi::writers::count::COUNT]) -> bool {
+    w.iter().all(|&n| n == 0)
 }
 /// The relink plan's counters: linker entries that linked a target found current as it was (`linked_current`, and those entries'
 /// `link` bucket time, `perf` residents only).
@@ -1070,6 +1077,7 @@ impl K1 {
                 relink_dropped: c.relink_dropped,
                 links_susp: c.links_susp,
             },
+            writers: c.writers,
         }
     }
 }
@@ -1510,8 +1518,8 @@ pub enum Stop {
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
     Resident { stop: u64, status: u64, detail: u64 },
     /// The watchdog forced the vCPU out (imprecise: the bank is not current) at native `pc`: in generated code (`el0`: a
-    /// guest loop ran past the budget) or in the resident (EL1: a resident wait, e.g. for a peer's shadow reset, never
-    /// ended); `asked` = the peers whose `SHADOWS` request was still pending then (bit p: vCPU p).
+    /// guest loop ran past the budget) or in the resident (EL1: a resident wait, e.g. for a peer's shadow reset or page
+    /// drop, never ended); `asked` = the peers whose `SHADOWS` or `DROPS` request was still pending then (bit p: vCPU p).
     Watchdog { pc: u64, el0: bool, asked: u64 },
     /// A peer's failure cancelled the run (imprecise when the vCPU was forced out).
     Cancelled,
@@ -3871,7 +3879,7 @@ fn serve(
                 let asked = (0..cache::MAX_VCPUS)
                     .filter(|&p| {
                         p != v
-                            && record_word(area.memory, p, None).load(SeqCst) & cache::SHADOWS != 0
+                            && record_word(area.memory, p, None).load(SeqCst) & (cache::SHADOWS | cache::DROPS) != 0
                     })
                     .fold(0, |m, p| m | 1 << p);
                 return Ok(Stop::Watchdog {

@@ -295,7 +295,10 @@ pub mod cache {
     /// the guest-state alias in that space's own level-2 table, after the alias's 2 MiB when it fits there
     /// ([`dl1_after`]), else before it; a slot reaches table t from x28 by a page count. So user code can read no
     /// supervisor context's entries.
-    pub const DL1: usize = (PCID_STUDY + PCID_STUDY_BYTES).next_multiple_of(BLOCK);
+    /// The vCPU's reverse map of its writable shadows (`crate::writers`, docs/writable-drop.md), after the PCID study's
+    /// part; backed as touched.
+    pub const WRITERS: usize = (PCID_STUDY + PCID_STUDY_BYTES).next_multiple_of(4096);
+    pub const DL1: usize = (WRITERS + crate::writers::BYTES).next_multiple_of(BLOCK);
     pub const DL1_BYTES: usize = L1_TABLES * L1_ENTRIES * 16;
     pub const DL1_EMPTY: u64 = 1 << 62;
     pub const fn dl1_after(guest_state_va: u64) -> bool {
@@ -903,6 +906,10 @@ pub mod cache {
         pub pcid_study: [u64; pcid_study::COUNT],
         /// Hot/cold layout: where the current segment's hot copies and code are filled ([`SegFill`]). Appended.
         pub seg: SegFill,
+        /// The reverse map of writable shadows (`crate::writers`): its epochs (full, cr3, lossy) and counters
+        /// (`crate::writers::count`).
+        pub writer_epochs: [u64; 3],
+        pub writers: [u64; crate::writers::count::COUNT],
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1389,8 +1396,12 @@ pub mod cache {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Record {
-        /// [`PAGES`], [`FLUSH`], [`SHADOWS`].
+        /// [`PAGES`], [`FLUSH`], [`SHADOWS`], [`DROPS`].
         pub pending: u64,
+        /// docs/writable-drop.md: pages whose writable shadows peers ask this vCPU to drop ([`DROPS`]): guest page number
+        /// + 1 (0: free). A peer claims a free slot by compare-and-swap; this vCPU empties a slot (compare-and-swap) once it
+        /// holds no writable shadow of the page (a targeted drop or a full reset).
+        pub drops: [u64; DROP_SLOTS],
         /// Bit i % 64 of word i / 64: `stale` word i may be nonzero.
         pub summary: [u64; super::MAX_GUEST_PAGES / 64 / 64],
         /// Guest-physical pages whose translations are stale (bit p % 64 of word p / 64).
@@ -1400,6 +1411,9 @@ pub mod cache {
     pub const PAGES: u64 = 1;
     pub const FLUSH: u64 = 2;
     pub const SHADOWS: u64 = 4;
+    /// `Record::drops` holds pages to drop writable shadows of.
+    pub const DROPS: u64 = 8;
+    pub const DROP_SLOTS: usize = 8;
     /// One vCPU's pending asynchronous x86 events (X2), shared: producers (peers' local APICs, X3; the host's event
     /// sources) set bits with an atomic OR and then ring the vCPU's doorbell; its resident takes them at precise stops
     /// and resident entries (an atomic AND of the bit it accepts). `vectors` is the local APIC's IRR (X3: delivered by

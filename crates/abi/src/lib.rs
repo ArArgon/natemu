@@ -34,6 +34,7 @@ pub mod resident;
 pub mod shadow;
 pub mod strings;
 pub mod tiny;
+pub mod writers;
 pub mod x87;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;

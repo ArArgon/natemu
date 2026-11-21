@@ -12,6 +12,7 @@
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/Relocations.h"
+#include "Interface/Core/OpcodeDispatcher.h"
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
@@ -193,6 +194,12 @@ struct Capture {
   std::vector<FexcSiteInfo> sites;
   std::vector<FexcInsnInfo> insn_info;
   uint32_t spill_bytes = 0;
+  // Emptied for the next request with every vector's storage kept (a fresh Capture freed and regrew them all each time).
+  void Clear() {
+    fired = false; info = {}; spill_bytes = 0;
+    code.clear(); pcs.clear(); subblocks.clear(); prologues.clear(); relocs.clear(); dispatch_exits.clear(); sra_gpr.clear(); sra_fpr.clear();
+    insts.clear(); blocks.clear(); sites.clear(); insn_info.clear();
+  }
 } Cap;
 
 Capture::X86Mem MemOperand(const X86Tables::DecodedInst& d) {
@@ -368,7 +375,7 @@ static bool ConfigOptionByName(std::string n, Config::ConfigOption& out) {
 
 // Everything the compile reads from process-wide state is reset here, so a request never sees an earlier one's.
 static void ResetGlobals() {
-  Cap = {};
+  Cap.Clear();
   Diagnostics.clear();
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0; fexc_self_exits = 0;
@@ -377,6 +384,7 @@ static void ResetGlobals() {
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
   fexc_args_read = 0; Extent = 0;
+  fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
 
 // One FEX context per configuration (everything fixed at its creation: the Config values set below, the host features, the
@@ -485,6 +493,7 @@ static int CheckWindow(uint64_t rip, uint64_t bitness, size_t size) {
 
 // The process-wide state a compile (and a context's creation) reads from `s`: the shim's gating arguments and hooks, the log
 // handlers. Set for every request (ResetGlobals clears the gating arguments).
+static bool ExtAbandon(IR::IRListView& View);   // (below, with the compile attempt)
 static void Arm(const Setup& s) {
   fexc_sse_gated = s.sse_gated; fexc_avx_gated = s.avx_gated; fexc_alignment_gated = s.alignment_gated; fexc_x87_gated = s.x87_gated;
   fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_bulk = s.bulk; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
@@ -493,6 +502,8 @@ static void Arm(const Setup& s) {
   LogMan::Msg::InstallHandler(MsgHandler);
   fexc_push_run = s.push_run && s.slice1; fexc_narrow_cmp = s.narrow_cmp && s.slice1; fexc_step_unit = s.st.max_insts == 1;
   fexc_compile_hook = Hook;
+  fexc_ext_abandon = ExtAbandon;
+  Utils::PoolBufferKeepClaimed = true;   // (one compile thread compiling all the time: FEX's pools keep their buffers)
   fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
   fexc_dense_pc_table = s.st.dense_pc;
   fexc_slice1 = s.slice1;
@@ -563,6 +574,78 @@ static void Emit(Json& j, Reply* rep, const std::string& out) {
   if (rep) rep->json.swap(j.s); else if (out.empty()) fwrite(j.s.data(), 1, j.s.size(), stdout); else std::ofstream(out) << j.s;
 }
 
+// The link points a unit's code takes, read from its final IR: one `svc #FEXC_SVC_LINK` per ExitFunction to a constant RIP
+// (BranchOps' slice1 form) and per LOCK NEG (FexcLockNeg's lost-race exit), the only two places that emit one.
+static int LiteralExits(IR::IRListView& View) {
+  int n = 0;
+  for (auto [BlockNode, BlockHeader] : View.GetBlocks())
+    for (auto [CodeNode, IROp] : View.GetCode(BlockNode)) {
+      if (IROp->Op == IR::OP_ATOMICFETCHNEG) ++n;
+      if (IROp->Op != IR::OP_EXITFUNCTION) continue;
+      const auto RIP = IROp->C<IR::IROp_ExitFunction>()->NewRIP;
+      if (RIP.IsImmediate()) continue;   // (post-RA an argument may be an immediate: no node, as the JIT's IsInlineConstant)
+      const auto T = View.GetOp<IR::IROp_Header>(RIP)->Op;
+      n += T == IR::OP_INLINECONSTANT || T == IR::OP_INLINEENTRYPOINTOFFSET;
+    }
+  return n;
+}
+
+// Whether the extended-block loop would compile this unit again: a cut or early end inside a non-final decoded block
+// (fexc_ext_stop), or more literal exits than the resident's link points with a decoded block to drop (the loop's `keep` > 0).
+static bool Redo(Core::InternalThreadState* thread, IR::IRListView& View, int& blocks, int& links) {
+  blocks = int(thread->FrontendDecoder->GetDecodedBlockInfo()->Blocks.size());
+  links = LiteralExits(View);
+  return (fexc_ext_stop >= 0 && fexc_ext_stop + 1 < blocks) || (links > 4 && blocks > 1);
+}
+// fexc_ext_abandon (asked by GenerateIR before the passes, while an Attempt arms it): no pass makes or removes an exit, so the
+// count on the dispatcher's IR is the final one; Attempt checks the final IR as well.
+static Core::InternalThreadState* AbandonThread = nullptr;
+static bool AbandonArmed = false;
+static int AbandonBlocks = 0, AbandonLinks = 0;
+static bool ExtAbandon(IR::IRListView& View) { return AbandonArmed && Redo(AbandonThread, View, AbandonBlocks, AbandonLinks); }
+
+// One compile attempt: FEX's ContextImpl::CompileCode as fexc runs it (no source map: GDB symbols are off; no lookup-cache race
+// check: fexc never enters a block into the cache), except that with `retry` set an attempt the extended-block loop would throw
+// away anyway (a cut or early end inside a non-final decoded block, or more literal exits than the resident's link points) stops
+// after GenerateIR, before the backend and the hook: false then, and `blocks`/`links` say why. The IR (decode, dispatch, passes)
+// is what the full attempt builds, so the decision is the full attempt's, and so are the guest bytes it read (Extent: only the
+// frontend reads them); the gating arguments only code generation would have read are not read (args_read: the output does not
+// depend on them, the retry being decided before code generation).
+static bool Attempt(Context::ContextImpl* impl, Core::InternalThreadState* thread, uint64_t rip, uint64_t max, bool retry,
+                    int& blocks, int& links) {
+  AbandonThread = thread; AbandonArmed = retry; fexc_ext_abandoned = false;
+  auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
+    impl->GenerateIR(thread, rip, impl->Config.GDBSymbols() || fexc_dense_pc_table, max);
+  (void)NeedsAddGuestCodeRanges;
+  AbandonArmed = false;
+  if (!IRView) {
+    thread->FrontendDecoder->ValidateDisownedOrFree();
+    thread->OpDispatcher->ValidateDisownedOrFree();
+    if (!fexc_ext_abandoned) return true;
+    fexc_ext_abandoned = false;   // (stopped before the passes: ExtAbandon)
+    blocks = AbandonBlocks; links = AbandonLinks;
+    return false;
+  }
+  if (retry) {
+    if (Redo(thread, *IRView, blocks, links)) {   // (not after ExtAbandon said no: kept as the check on the final IR)
+      thread->OpDispatcher->DelayedDisownBuffer();
+      thread->FrontendDecoder->ValidateDisownedOrFree();
+      thread->OpDispatcher->ValidateDisownedOrFree();
+      return false;
+    }
+  }
+  auto DebugData = fextl::make_unique<Core::DebugData>();
+  const bool TFSet = thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+  auto Code = thread->CPUBackend->CompileCode(rip, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+  if (fexc_compile_hook)
+    fexc_compile_hook(thread, FexcCompileInfo {rip, StartAddr, Length, TotalInstructions, TotalInstructionsLength}, Code.BlockBegin,
+                      Code.Size, *DebugData);
+  thread->OpDispatcher->DelayedDisownBuffer();
+  thread->FrontendDecoder->ValidateDisownedOrFree();
+  thread->OpDispatcher->ValidateDisownedOrFree();
+  return true;
+}
+
 // One compile of `size` guest bytes at `rip` under the configured setup `s` (ResetGlobals has run; ParseArgs, CheckWindow,
 // Prepare and Configure passed). `rep` collects the outputs instead of stdout/--out/--object (set only by --serve).
 static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, size_t size, Reply* rep) {
@@ -599,19 +682,24 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     // Extended blocks: compiled again with fewer conditional branches per unit while a cut or early end fell
     // inside a non-final decoded block (fexc_ext_stop) or the unit has more literal exits than the resident's link points
     // (4, crates/abi MAX_LINK_POINTS). Each attempt has fewer, so this ends; 0 is the plain block. The guest bytes read
-    // (Extent) and gating arguments read accumulate over the attempts.
+    // (Extent) and gating arguments read accumulate over the attempts (a discarded one's up to its IR: Attempt).
+    // An attempt that will be compiled again stops before the backend (Attempt); one that reaches it is still checked on its
+    // code, by its `svc #FEXC_SVC_LINK` words as before (a data word with that value counts too, as it always did).
     for (int ext = st.ext_conds;;) {
       fexc_ext_conds = ext; fexc_ext_stop = -1;
       thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
-      (void)impl->CompileCode(thread, rip, max);
+      int blocks = 0, links = 0;
+      const bool compiled = Attempt(impl, thread, rip, max, ext > 1, blocks, links);
       thread->CPUBackend->ClearRelocations();
       impl->GetLatest()->Reset();
       if (ext <= 1) break;   // (1 keeps one decoded block: the plain block)
-      const int blocks = int(Cap.blocks.size());
-      int links = 0;
-      for (size_t o = 4; o + 4 <= Cap.code.size(); o += 4) {
-        uint32_t w; std::memcpy(&w, Cap.code.data() + o, 4);
-        links += w == (0xd4000001u | uint32_t(FEXC_SVC_LINK) << 5);
+      if (compiled) {
+        blocks = int(Cap.blocks.size());
+        links = 0;
+        for (size_t o = 4; o + 4 <= Cap.code.size(); o += 4) {
+          uint32_t w; std::memcpy(&w, Cap.code.data() + o, 4);
+          links += w == (0xd4000001u | uint32_t(FEXC_SVC_LINK) << 5);
+        }
       }
       // The decoded blocks to keep: through the one that ended early, or one fewer.
       const int keep = fexc_ext_stop >= 0 && fexc_ext_stop + 1 < blocks ? fexc_ext_stop + 1 : links > 4 ? blocks - 1 : 0;

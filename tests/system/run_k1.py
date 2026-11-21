@@ -1348,9 +1348,12 @@ PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1), ('self-in
 # The fast miss path's counts (k1.fast_miss) in a default run: taken at least; declined by reason at least; taken exactly none.
 FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 2, 'miss-ac': 1}
 FAST_DECLINED = {'hold-io': ('io', 1), 'hold-pending': ('pending', 1), 'hold-event': ('event', 1), 'hold-lapic': ('lapic', 1), 'miss-uc': ('uncached', 1), 'miss-event': ('event', 1), 'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
-# Stats a program must show at least (default block size): `page-mark`'s placements from the record mark the frame again (the mark resets this vCPU's
-# writable shadow: 3 resets; without the mark `kept` discards each block placed from the record and steps it: fewer resets, more requests).
-STAT_LEAST = {'page-mark': {'shadow_resets': 3}}
+# Stats a program must show at least (default block size).
+STAT_LEAST = {}
+# `page-mark`'s placements from the record mark the frame again: each mark removes this vCPU's writable shadow of it, by a full
+# reset or by a targeted drop (docs/writable-drop.md, k1.writers[0]): 3 removals; without the mark `kept` discards each block
+# placed from the record and steps it: fewer removals, more requests.
+MARK_REMOVALS_LEAST = {'page-mark': 3}
 # Stats a program must show exactly (default block size; `fa_setup`): a read of a D = 1 page installs it writable (no upgrade abort),
 # of a D = 0 page it does not (one), and a read of a page holding translations takes no code-write path.
 STAT_EXACT = {'fa-read-code-r': {'invalidations': 0, 'steps': 0}, 'fa-rw': {'upgrades': 0}, 'fa-ad0': {'upgrades': 1}, 'fa-ro': {'upgrades': 0}}
@@ -1975,6 +1978,10 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
             if taken < FAST_TAKEN.get(short, 0):
                 problems.append(f'cpu{v} fast miss path took {taken}, want at least {FAST_TAKEN[short]}')
             problems += [f"cpu{v} {f} = {c['stats'].get(f)}, want at least {m}" for f, m in STAT_LEAST.get(short, {}).items() if (c['stats'].get(f) or 0) < m]
+            if short in MARK_REMOVALS_LEAST:
+                removals = (c['stats'].get('shadow_resets') or 0) + (k1.get('writers') or [0])[0]
+                if removals < MARK_REMOVALS_LEAST[short]:
+                    problems.append(f'cpu{v} writable-shadow removals (resets + targeted drops) {removals}, want at least {MARK_REMOVALS_LEAST[short]}')
             if short in UC_STEPS and k1['uncached']['steps'] != UC_STEPS[short]:
                 problems.append(f"cpu{v} UC steps {k1['uncached']['steps']}, want {UC_STEPS[short]}")
             if short in FAST_NONE and taken:
