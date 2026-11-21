@@ -108,7 +108,7 @@ def local_labels(text):
     return '\n'.join(out)
 
 
-def handlers(m, i, vectors, bodies):
+def handlers(m, i, vectors, bodies, indirect=False):
     cur, count = A(i) + 0x1010, A(i) + 0x1018
     out = [f"""ap_log:
     mov rbx, 0x40
@@ -168,11 +168,13 @@ ap_log0:
     pop rdx
     pop rcx
     pop rax
-""" + ('    add rsp, 8\n' if error else '') + '    iretq\n')
+""" + ('    add rsp, 8\n' if error else '') +
+                   # (`indirect`: the IRETQ reached by a computed jump, as Linux reaches its own: the dispatcher's miss path runs it.)
+                   (f'    push rax\n    lea rax, [rel ap_iq{v}]\n    xchg [rsp], rax\n    ret\nap_iq{v}:\n' if indirect else '') + '    iretq\n')
     return '\n'.join(out)
 
 
-def build(name, m, texts, vectors, bodies=None, memory=(), capture_ring=False):
+def build(name, m, texts, vectors, bodies=None, memory=(), capture_ring=False, indirect=False):
     """A natemu-smp-v1 program: CPU i runs head + texts[i] + the handlers; `bodies` {vector: text} per CPU or shared
     (key -v: before the log entry; v: before the EOI; v + 0x100: after it)."""
     n = len(texts)
@@ -184,7 +186,7 @@ def build(name, m, texts, vectors, bodies=None, memory=(), capture_ring=False):
         b = bodies[i] if isinstance(bodies, list) else bodies
         fmt = dict(i=i, data=DATA(i), counts=COUNTS(i), ring=RING(i), shared=SHARED)
         b = {v: t2.format(**fmt) for v, t2 in b.items()}
-        text = head(m, i) + t.format(**fmt) + '\n    jmp ap_end\n' + handlers(m, i, vectors, b) + 'ap_end:\n    cmp r11, r11\n'
+        text = head(m, i) + t.format(**fmt) + '\n    jmp ap_end\n' + handlers(m, i, vectors, b, indirect) + 'ap_end:\n    cmp r11, r11\n'
         code, lab = ref_assemble(local_labels(text))
         assert len(code) <= 0x4000, f'{name}: CPU {i} code {len(code)} bytes'
         gates = b''
@@ -249,6 +251,13 @@ def regs_program(m):
             seq.append(wr(m, reg, value))
         seq.append(rd(m, reg) + ('\n    shl rdx, 32\n    or rax, rdx' if m == 'x2' and reg == ICR else ''))
         seq.append(store(k))
+    if m == 'x':
+        # Reads that are not a plain MOV (the load completes in place and the instruction goes on): ADD r32, m and CMP m, imm;
+        # then a register the APIC does not have (read as 0, the ESR's illegal-register bit set: written, then read).
+        k = len(regs_reads(m))
+        seq += [f'    mov rbx, {APIC + 16 * SVR:#x}', '    mov eax, 1', '    add eax, [rbx]', store(k), '    xor eax, eax',
+                '    cmp dword [rbx], 0x1ff', '    sete al', store(k + 1), f'    mov eax, [qword {APIC + 0x400:#x}]', store(k + 2),
+                wr(m, ESR, 0), rd(m, ESR), store(k + 3)]
     return build(f'apic-regs-{m}', m, ['\n'.join(seq)], [])
 
 
@@ -267,7 +276,7 @@ def prio_program(m):
     bodies = {0x42: '\n'.join([self_ipi(m, 0x62), self_ipi(m, 0x52), '    sti', '    nop', 'p_c42:', '    cli']),
               0x43: '\n'.join([self_ipi(m, 0x63), '    sti', '    nop', 'p_c43:', '    cli', rd(m, ISR + 2), store(2)]),
               0x63: '\n'.join([rd(m, ISR + 2), store(3), eoi(m), rd(m, ISR + 2), store(4)])}
-    return build(f'apic-prio-{m}', m, [main], [0x41, 0x42, 0x43, 0x51, 0x52, 0x61, 0x62, 0x63, 0x71], bodies)
+    return build(f'apic-prio-{m}', m, [main], [0x41, 0x42, 0x43, 0x51, 0x52, 0x61, 0x62, 0x63, 0x71], bodies, indirect=True)
 
 
 def cr8_program():

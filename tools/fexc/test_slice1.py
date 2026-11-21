@@ -2332,7 +2332,8 @@ class Slice1X87Commit(unittest.TestCase):
         marked = lambda *extra: [s['guest_offset2'] for s in run('df2bdf7b08', RIP, *extra)[0]['sites'] if s['kind'] == 'store']
         self.assertEqual(marked(), [0xC0000001])
         self.assertEqual(marked('--x87-unmasked', '0x4'), [None])
-        self.assertEqual([s['guest_offset2'] for s in run('df2b', RIP, '--max-insts', '1')[0]['sites'] if s['kind'] == 'store'], [])   # (a step unit: one instruction)
+        # (a step unit: the FISTP alone, its store not a pair's)
+        self.assertEqual([s['guest_offset2'] for s in run('df7b08', RIP, '--max-insts', '1')[0]['sites'] if s['kind'] == 'store'], [None])
 
     def test_fault_site_allows_pending_flags_but_rejects_early_architectural_flags(self):
         import verify_precision as vp
