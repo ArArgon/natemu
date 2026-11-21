@@ -326,6 +326,20 @@ DEF_OP(FexcX87Guess) {
   sub(ARMEmitter::Size::i32Bit, TMP1, TMP1, V);
   cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_X87GUESS, false));
 }
+// M2 task 4, the x87 map (fexc_hook.h): no code. (A unit with a spill slot is not run: the host compiles a shorter one.)
+DEF_OP(FexcX87Slot) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Slot>();
+  fexc_x87_slots[Op->Register & 7] = uint8_t(GetVReg(Op->Value).Idx());
+}
+DEF_OP(FexcX87Map) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Map>();
+  FexcX87MapInfo M {FexcInsnNative, FexcGuest, Op->Top, Op->Tags, {}};
+  std::memcpy(M.reg, fexc_x87_slots, 8);
+  std::memset(fexc_x87_slots, 0xff, 8);
+  // (An instruction that emits no word shares its native offset with the next one, and the x87 state too: one record.)
+  if (!fexc_x87_maps.empty() && fexc_x87_maps.back().insn_native_offset == M.insn_native_offset) fexc_x87_maps.pop_back();
+  fexc_x87_maps.push_back(M);
+}
 DEF_OP(FexcX87Fold) {
   if (fexc_x87_run == FEXC_RUN_CLOSED) return;   // FPSR is MXCSR's: every x87 flag is in the word
   ARMEmitter::ForwardLabel Closed;
@@ -1379,7 +1393,9 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     const std::string_view Name = IR::GetName(IROp->Op);
     fexc_x87_m32_convert = X87 && IROp->Op == IROps::OP_FLOAT_FTOF && IR::OpSizeToSize(IROp->C<IR::IROp_Float_FToF>()->SrcElementSize) == 4;
     const bool Leaves = IROp->Op == IROps::OP_JUMP || IROp->Op == IROps::OP_CONDJUMP || IROp->Op == IROps::OP_EXITFUNCTION || IROp->Op == IROps::OP_BREAK;
-    const bool Other = !X87 && (FexcPrecision::SimdFPOp(IROp->Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
+    // (The x87 map's ops emit nothing and stand at the end of any instruction, an integer one too: no end of a run.)
+    const bool Other = !X87 && IROp->Op != IROps::OP_FEXCX87SLOT && IROp->Op != IROps::OP_FEXCX87MAP &&
+                       (FexcPrecision::SimdFPOp(IROp->Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
     // 64-bit code: a run ends where its IR block does (a block of SSE code is entered with FPSR its own, unchecked).
     // 32-bit code, where x87 is the usual floating point: the run stays open across blocks, and the next IR block asks the byte.
     // (FLDCW: the next x87 op starts a run under the new rounding control.)

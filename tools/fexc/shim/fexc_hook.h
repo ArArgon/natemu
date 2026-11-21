@@ -69,6 +69,8 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_X87GUESS = 23,                  // slice1 stub (M2 task 4): the unit was compiled for another x87 stack top or tag byte than the
                                             // guest state holds (FexcX87Guess, at an IR block's first x87 instruction): the resident retires
                                             // the unit and goes on at this instruction
+  FEXC_SITE_X87MAP = 24,                    // slice1 (M2 task 4), no access and no stub: the x87 stack state at the fault points of one guest
+                                            // instruction (fexc_x87_maps; in the binary site table at the instruction's native offset + 1)
   FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
                                             // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };
@@ -105,6 +107,13 @@ struct FexcSiteInfo {
 };
 struct FexcInsnInfo { uint32_t guest_offset; uint32_t native_offset; bool cf_inverted; };
 inline std::vector<FexcSiteInfo> fexc_sites;
+// M2 task 4, the x87 map (FEX's x87 stack pass: FexcX87Slot, FexcX87Map): at every fault point of the guest instruction whose
+// translation starts at `insn_native_offset`, the x87 stack state is the guest-state page's with register r (its number) from
+// the low 64 bits of host register v<reg[r]> (0xff: the page's), TOP = `top` and the tag byte `tags`. The compiler wrote
+// nothing of it before the instruction; the resident does when it banks the state at one of those points.
+struct FexcX87MapInfo { uint32_t insn_native_offset; uint32_t guest_offset; uint8_t top; uint8_t tags; uint8_t reg[8]; };
+inline std::vector<FexcX87MapInfo> fexc_x87_maps;
+inline uint8_t fexc_x87_slots[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};   // the FexcX87Slot ops since the last FexcX87Map
 inline std::vector<FexcInsnInfo> fexc_insns;
 inline FexcMapT<uint64_t, bool> fexc_cf_inverted; // guest offset -> CF inversion at that instruction's start (dispatcher state)
 inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue subtracts from sp (ResetStack restores them)

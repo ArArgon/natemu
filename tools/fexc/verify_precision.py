@@ -836,6 +836,20 @@ def verify(d, tmp, insns=None):
             bad = {reg(dis[at].partition(' ')[2].split(',')[1])} & sra
             if bad:
                 out.append(f'{tag}: atomic destination {",".join(sorted(map(name, bad)))} of "{dis[at]}" is a static register')
+    # P14 (M2 task 4, the x87 map): where the code wrote no x87 state before an instruction, the record that names the host
+    # registers holding it must stay true up to the instruction's last fault point: it starts at a PC-table entry of its
+    # instruction, and no word from there to that point writes a register it names. (That the registers hold the right
+    # values at the instruction's start is checked by running the code: test_slice1's Slice1X87Commit. P1 already refuses
+    # any write of the x87 state itself in that window.)
+    for m in d.get('x87_maps', []):
+        start = m['insn_native_offset']
+        named = {('v', r) for r in m['regs'] if r != 255}
+        if (start, m['guest_offset']) not in entries or any(r != 255 and r > 31 for r in m['regs']) or m['top'] > 7:
+            out.append(f'x87 map +{start}: not at a PC-table entry of guest +{m["guest_offset"]}, or a bad register or top')
+        points = [check_at.get(s['native_offset'], s['native_offset']) for s in d['sites'] if s['insn_native_offset'] == start]
+        for off in (o for o in order if start <= o < max(points, default=start)):
+            if effects(dis[off])[1] & named:
+                out.append(f'x87 map +{start}: +{off} "{dis[off]}" writes a register the map names before the instruction\'s last fault point')
     for g, ss in by_insn.items():
         stores = [s for s in ss if s['kind'] in ('store', 'store_pair', 'push', 'push_pair', 'swap', 'atomic')]
         if len(stores) > 1:

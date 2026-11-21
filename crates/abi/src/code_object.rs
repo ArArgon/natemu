@@ -39,7 +39,7 @@ pub const NO_REG: u8 = 0xff;
 pub mod kind {
     /// A check stub's site (its native offset is the stub's first word): the kinds admission takes as stubs.
     pub const fn is_stub_kind(k: u8) -> bool {
-        matches!(k, GUARD | SPLIT | DIVIDE | ALIGN | SIMD | X87 | PENDING | DENORM | STACK)
+        matches!(k, GUARD | SPLIT | DIVIDE | ALIGN | SIMD | X87 | PENDING | DENORM | STACK | FLDCW | X87TAG | X87GUESS)
     }
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -95,6 +95,34 @@ pub mod kind {
     /// (`brk #13`). At the stub (the guest state holds another pair) the state is the state before the instruction: the
     /// resident retires the unit, notes its RIP ([`crate::execution::cache::Control::x87_varied`]) and goes on at the instruction.
     pub const X87GUESS: u8 = 23;
+    /// M2 task 4, no access and no stub: the x87 stack state at the fault points of the guest instruction whose translation
+    /// starts at `insn_native_offset` ([`super::x87_map`]), which generated code did not write to the guest-state page before
+    /// that instruction. Its `native_offset` is that offset + 1 (no word is there: the record is found by this key).
+    pub const X87MAP: u8 = 24;
+}
+/// An [`kind::X87MAP`] record: x87 register r (its number) is the low 64 bits of host register v`reg[r]` (`NO_REG`: as the
+/// guest-state page holds it), TOP is `top` and the abridged tag byte `tags`. Numbers, not changes: applying it again
+/// changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X87Map {
+    pub top: u8,
+    pub tags: u8,
+    pub reg: [u8; 8],
+}
+/// The record's map, when `site` is a well-formed [`kind::X87MAP`] record.
+pub fn x87_map(site: &Site) -> Option<X87Map> {
+    let low = (site.imm as u32).to_le_bytes();
+    let reg = [low[0], low[1], low[2], low[3], site.base_reg, site.index_reg, site.extend, site.shift];
+    (site.kind == kind::X87MAP
+        && site.native_offset == site.insn_native_offset | 1
+        && site.insn_native_offset % 4 == 0
+        && site.guest_offset2 >> 16 == 0
+        && site.guest_offset2 & 0xf8 == 0
+        && reg.iter().all(|&r| r < 32 || r == NO_REG)
+        && (site.width, site.intent, site.rmw, site.segment, site.writeback, site.writeback_delta) == (0, 0, 0, 0, 0, 0)
+        && (site.data_reg, site.data_class, site.nzcv, site.cf_inverted, site.flags_written_before, site.ordering) == ([0, 0], 0, 0, 0, 0, 0)
+        && (site.completed_effects, site.located) == (EFFECTS_NONE, 1))
+    .then_some(X87Map { top: site.guest_offset2 as u8, tags: (site.guest_offset2 >> 8) as u8, reg })
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;
