@@ -217,6 +217,23 @@ STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'al
 M64 = (1 << 64) - 1
 
 
+def probing(s, dis, check=None):
+    """The words of split stub `s` when it probes instead of trapping (fexc FexcEmitStubs): a set of offsets, else None.
+    64-bit code: `staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <back>`; 32-bit code: `add x0, xA, #w-1;
+    orr x0, x0, xA; lsr x0, x0, #32; cbnz x0, <its brk>` before them and `brk #0x2` after. A the stub's address register,
+    w its store's width, <back> the word after the stub's check (`check`: that branch, when given)."""
+    at, a, w = s['native_offset'], s['base_reg'], s['width']
+    if s['kind'] != 'split': return None
+    add = f'add x0, x{a}, #{w - 1:#x}'
+    first = at + 16 if dis.get(at) == add else at
+    if [dis.get(first + k) for k in (0, 4, 8)] != [f'staddb wzr, [x{a}]', add, 'staddb wzr, [x0]']: return None
+    back = re.fullmatch(r'b 0x([0-9a-f]+)', dis.get(first + 12, ''))
+    if not back or (check is not None and int(back[1], 16) != check + 4): return None
+    if first == at: return {at + k for k in (0, 4, 8, 12)}
+    if [dis.get(at + k) for k in (4, 8, 12, 32)] != ['orr x0, x0, x' + str(a), 'lsr x0, x0, #32', f'cbnz x0, {at + 32:#x}', 'brk #0x2']: return None
+    return {at + k for k in range(0, 36, 4)}
+
+
 def canonical(a):
     return (a & M64) >> 47 in (0, 0x1ffff)
 
@@ -288,8 +305,11 @@ def guards(d, dis, order):
     for o in order:
         if (m := BRANCH.match(dis[o])) and int(m[4], 16) in stubs:
             refs.setdefault(int(m[4], 16), []).append(o)
+    probes = {}
     for at, s in stubs.items():
-        if dis.get(at) != STUB_WORD[s['kind']]:
+        if (words := probing(s, dis, refs[at][0] if len(refs.get(at, [])) == 1 else None)) is not None:
+            probes[at] = words
+        elif dis.get(at) != STUB_WORD[s['kind']]:
             out.append(f'stub +{at} ({s["kind"]}) is "{dis.get(at)}"')
         if len(refs.get(at, [])) != 1:
             out.append(f'stub +{at} ({s["kind"]}) reached by {len(refs.get(at, []))} branches')
@@ -315,14 +335,17 @@ def guards(d, dis, order):
             elif s['kind'] == 'x87guess':
                 ok.add(t)
     cost['stub'] = len(stubs)
-    if {o for o in order if dis[o].startswith('brk')} != set(stubs):
+    stub_words = set(stubs) | {o for words in probes.values() for o in words}
+    if {o for o in order if dis[o].startswith('brk')} != (set(stubs) - set(probes)) | {o for words in probes.values() for o in words if dis[o].startswith('brk')}:
         out.append('brk words and stub sites differ')
+    if {o for o in order if dis[o].startswith('staddb')} != {o for words in probes.values() for o in words if dis[o].startswith('staddb')}:
+        out.append('a page probe outside a split stub')
     if stubs:
         first = min(stubs)
         prev = max((o for o in order if o < first), default=None)
         if prev is None or not (dis[prev].split()[0] in ('b', 'udf') or dis[prev] == 'svc #0x1'):   # an exit: dispatch or link
             out.append(f'the body falls into the first stub +{first}')
-        if any(o > first and o not in stubs and not dis[o].startswith('udf') for o in order):
+        if any(o > first and o not in stub_words and not dis[o].startswith('udf') for o in order):
             out.append('code after the stubs')
     linked = {}
     for at, s in stubs.items():
@@ -579,7 +602,7 @@ def divides(d, dis, order, stubs, check_at):
     gi = {i['offset']: i for i in d['guest']['instructions'] if i['translated']}
     names = {g: i['name'] for g, i in gi.items()}
     starts = sorted((e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries'])
-    body_end = min([o for o in order if dis[o].startswith('brk')] + [d['code']['layout']['code_region_end']])
+    body_end = min(list(stubs) + [d['code']['layout']['code_region_end']])
 
     def insn_at(o):
         """(guest offset, native start, native end) of the instruction whose range holds native offset o."""
@@ -756,7 +779,9 @@ def entry_and_branches(d, dis, order):
         if mn in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or mn.startswith('b.'):
             t = int(re.findall(r'0x([0-9a-f]+)$', dis[off])[0], 16)
             dispatch = mn == 'b' and t == off and any(r['kind'] == 'dispatch_branch' and r['offset'] == off for r in d['code']['relocations'])
-            if (t <= off or t not in dis) and not dispatch:
+            # (A probing split stub's branch back to its store, at or before the access: guards() checks it is the word after the check.)
+            back = mn == 'b' and t in dis and any(s['kind'] == 'split' and (w := probing(s, dis)) and off == max(o for o in w if dis[o].startswith('b ')) and t <= s['access_native_offset'] for s in d['sites'])
+            if (t <= off or t not in dis) and not dispatch and not back:
                 out.append(f'+{off} "{dis[off]}" is not a forward branch to an instruction of the block')
     return out
 

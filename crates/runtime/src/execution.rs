@@ -729,8 +729,10 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
 /// probe right before the commit would find.
 ///
 /// In place: `s` is the record itself. Nothing called here may copy the record out and back around it (`ask`'s
-/// `write_record(record(), s); ..; *s = load()`, a host exit): none does (no request, no delivery, no device access; a
-/// halt copies `s` once and never returns). The only other accesses to the record while `s` lives are volatile reads
+/// `write_record(record(), s); ..; *s = load()`, a host exit): none does (no request, no device access; a halt copies
+/// `s` once and never returns). SYSCALL, SYSRET and SYSENTER never fault here and deliver nothing. INT n and IRET (M2
+/// task 4) walk and write guest memory and deliver their own faults, on `s` like the rest: a delivery is the resident's
+/// own work on the state it is handed, with no host exit. The only other accesses to the record while `s` lives are volatile reads
 /// of `State::vcpu` ([`cache`]'s `vcpu`, which nothing writes after the start).
 #[inline(never)] // its frame stays out of `returned` (the nested-entry stack bound); it holds no state copy
 unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
@@ -3387,8 +3389,16 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     }
     // M2 task 4: the store of a FISTP m64 that was storing its block's FILD m64's integer: kept for the instruction's rerun
     // ([`frame::X87_INT`]; 32-bit code, where the FISTP that starts a unit looks for it).
-    if site.guest_offset2 == object::X87_INT64 && site.kind == object::kind::STORE && s.cpu.code_mode() == Some(CodeMode::Compat32) {
-        x87::keep_integer(s.cpu.rip, f.x[site.data_reg[0] as usize & 31], s.cpu.cr3 & !(1 << 63));
+    // (At the split stub of such a store, one that crosses a page, the mark is its access's.)
+    let store = if site.kind == object::kind::SPLIT {
+        sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset).ok().map(|i| sites[i])
+    } else {
+        Some(*site)
+    };
+    if let Some(a) = store.filter(|a| a.guest_offset2 == object::X87_INT64 && a.kind == object::kind::STORE)
+        && s.cpu.code_mode() == Some(CodeMode::Compat32)
+    {
+        x87::keep_integer(s.cpu.rip, f.x[a.data_reg[0] as usize & 31], s.cpu.cr3 & !(1 << 63));
     }
 }
 
@@ -3652,10 +3662,36 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         // `native` for every outcome: ESR, FAR, and ELR as an offset in its block when it is in one, else absolute.
         let at = block.map_or(elr, |b| cache::native_offset(b, elr));
         s.native = [esr, far, at];
-        let found = all
-            .binary_search_by_key(&at, |site| site.native_offset as u64)
-            .ok()
-            .map(|i| all[i]);
+        let at_site = |at: u64| {
+            all.binary_search_by_key(&at, |site| site.native_offset as u64)
+                .ok()
+                .map(|i| all[i])
+        };
+        // A split stub that probes (fexc, FexcEmitStubs): its words after the first are no sites of their own. In 64-bit
+        // code the probes are the stub's words 0 and 2; in 32-bit code, behind the four words that test for an address
+        // above 4 GiB, words 4 and 6, and word 8 is the `brk` that test goes to. `probe`: 1 the first probe, 2 the second.
+        const STADDB_WZR: u32 = 0x383f_001f; // staddb wzr, [xN]: the base in bits 9:5
+        let stub_word = |site: &Site, k: u64| {
+            ((block.unwrap().code_va() + u64::from(site.native_offset) + 4 * k) as *const u32).read()
+        };
+        let (found, probe) = [0, 8, 16, 24, 32]
+            .into_iter()
+            .filter(|&d| at >= d)
+            .find_map(|d| {
+                let site = at_site(at - d)?;
+                if d == 0 && (site.kind != object::kind::SPLIT || stub_word(&site, 0) & !0x3e0 != STADDB_WZR) {
+                    return Some((site, 0));
+                }
+                let first = if stub_word(&site, 0) & !0x3e0 == STADDB_WZR { 0 } else { 16 };
+                (site.kind == object::kind::SPLIT).then_some(())?;
+                match d.checked_sub(first)? {
+                    0 => Some((site, 1)),
+                    8 => Some((site, 2)),
+                    16 if first == 16 => Some((site, 0)),
+                    _ => None,
+                }
+            })
+            .map_or((None, 0), |(site, p)| (Some(site), p));
         // The syndrome must be the class this site's kind produces, before anything is taken or stepped: BRK from
         // AArch64 with the stub's immediate (1 branch target, 2 split, 3 divide), else a data abort from EL0 inside the
         // site's access (access_aborted checks the rest).
@@ -3664,7 +3700,18 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             from_el0(spsr)
                 && match site.kind {
                     object::kind::GUARD => brk(1),
-                    object::kind::SPLIT => brk(2),
+                    // The `brk` (a step unit's stub, at the site; 32-bit code's, behind the probes), or a probe's data abort:
+                    // a translation or permission fault on the byte it writes, the store's first or last, reported as a
+                    // write or as a read (the M4 reports an atomic's translation fault as a read); or its watchpoint.
+                    // Any other syndrome there is no site's.
+                    object::kind::SPLIT => {
+                        let byte = site_address(site, f)
+                            .wrapping_add(if probe == 2 { u64::from(site.width) - 1 } else { 0 });
+                        brk(2) && probe == 0
+                            || probe != 0
+                                && (esr >> 26 == 0x34
+                                    || esr >> 26 == 0x24 && matches!(esr & 63, 4..=7 | 12..=15) && far == byte)
+                    }
                     object::kind::DIVIDE => brk(3),
                     object::kind::ALIGN => brk(4),
                     object::kind::SIMD => brk(5),
@@ -3712,7 +3759,8 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         {
             step_from(s, f, b, &site)
         }
-        if esr >> 26 == 0x34 {
+        // (A probe that met a watchpoint is the split store's business: it tests the debug registers itself.)
+        if esr >> 26 == 0x34 && site.kind != object::kind::SPLIT {
             watch::hit(s, f, b, &site, elr, spsr)
         }
         match site.kind {
@@ -3727,7 +3775,12 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             }
             object::kind::DENORM => denormal_exit(s, f, b, &site),
             object::kind::X87GUESS => x87_guess_miss(s, f, b, &site),
-            object::kind::SPLIT => split(s, f, b, all, &site, spsr),
+            // (Resumed, when a walk was contended, at the `brk` that came here or at the stub's first word, never at the
+            // second probe: the first page's shadow may be gone by then, and the store after two probes must not fault.)
+            object::kind::SPLIT => {
+                let again = if esr >> 26 == 0x3c { elr } else { b.code_va() + u64::from(site.native_offset) };
+                split(s, f, b, all, &site, again, spsr)
+            }
             // An 8-byte push found its stack pointer misaligned (fexc --push-run): the push runs alone, in a step block
             // whose split check completes or faults it exactly; the block after it starts at the next instruction.
             // (Each firing counts: from [`natemu_abi::execution::STACK_TRAP_LIMIT`] on this vCPU's code context asks for code without the run check.)
@@ -4111,6 +4164,7 @@ unsafe fn split(
     b: &Block,
     all: &[Site],
     stub: &Site,
+    again: u64,
     spsr: u64,
 ) -> ! {
     let Ok(i) = all.binary_search_by_key(&stub.guest_offset2, |site| site.native_offset) else {
@@ -4164,12 +4218,7 @@ unsafe fn split(
     let [Some((gpa0, uc0)), Some((gpa1, uc1))] = gpa else {
         unsafe {
             write_record(record(), &s);
-            resume(
-                &s,
-                &raw const (*shared()).captured,
-                b.code_va() + stub.native_offset as u64,
-                spsr,
-            )
+            resume(&s, &raw const (*shared()).captured, again, spsr)
         }
     };
     // M3: a page-crossing store with a device page on either side is refused (both pages walked first).

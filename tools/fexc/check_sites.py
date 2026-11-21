@@ -282,7 +282,8 @@ def code_vs_sites(sites, dis):
     native = {}
     for off, text in dis.items():
         a = native_access(text)
-        if a and a[2] not in ('x28', 'sp') and not x87_slot(dis, off):
+        # (`staddb wzr, [xN]`: a split stub's probe of a page, no access of its own: verify_precision.py checks where they are.)
+        if a and a[2] not in ('x28', 'sp') and not x87_slot(dis, off) and not text.startswith('staddb wzr,'):
             native[off] = a
     for off in sorted(set(native) | set(by_off)):
         a, s = native.get(off), by_off.get(off)

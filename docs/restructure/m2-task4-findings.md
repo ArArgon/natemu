@@ -483,6 +483,62 @@ reads. FFT's result also varies from run to run under natemu (1,692 to 3,182 acr
 transform's arrays' alignment against pages is the first suspect, given the crossing checks). No fix made: none of it
 is the Monte Carlo fix.
 
+### Built: page-crossing stores without the trap
+
+Approved by the owner after the LU finding; the design is the one an independent design review chose (two page probes
+in the store's out-of-line stub), not the "second page first, then roll back" idea. Every store wider than a byte
+already tests whether it crosses a 4K page and, if so, branched to a stub that trapped into the shim, which made the
+store itself (about 650 ns). The stub now writes one byte of each page with an atomic add of zero and branches back to
+the store:
+
+    staddb wzr, [A]         the store's first byte
+    add    x0, A, #width-1
+    staddb wzr, [x0]        its last byte
+    b      <the store>
+
+An add of zero always writes, so a page that this vCPU's shadow tables do not hold writable (not present, read-only,
+not yet dirty, a page of translated code, uncached or device memory) faults at the probe; the shim then does exactly
+what it did at the trap (its checks in x86's order, both walks, the store through its own mapping) and resumes after
+the store. If both probes pass, the store cannot fault, because the shadow tables are this vCPU's own and change only
+when it enters the shim, which it does not between the probes and the store (an interrupt there only arms a stop). That
+sentence is what the design rests on; it is written at the code. Details that follow from it or guard it:
+
+- Any return from the shim into the stub goes to the stub's first word, never to the second probe.
+- One-instruction blocks keep the trap, so single-stepping, data breakpoints and uncached-memory ordering are untouched.
+- 32-bit code: the stub first tests for an address above 4 GiB (FEX computes addresses in 64 bits; a store running
+  across 4 GiB) and takes the trap for it, since the page tables may map something up there for the same task's 64-bit
+  code and the probe would pass.
+- With x86 alignment checking on, the probes (bytes) pass and the misaligned store itself takes Arm's alignment fault,
+  which was already delivered as #AC.
+- A probe that hits a hardware watchpoint goes to the same handler, which tests the debug registers as before.
+- The three checkers (the host's object validation and code-shape check, `verify_precision.py`, `check_sites.py`)
+  accept exactly this stub, and its branch back as the one backward branch besides the REP STOS loop: only to a word
+  at or before the store, from a stub that nothing after that word can reach.
+
+| SciMark LU (Mflops), one boot each, two runs | before | after | real x86 |
+| --- | --- | --- | --- |
+| 64-bit | 2,106 / 2,137 | 3,608 / 3,621 | 11,639 |
+| 32-bit SSE2 | 2,645 / 2,638 | 4,215 / 4,213 | 10,276 |
+| 32-bit x87 (8-byte stores, never crossed) | 1,938 / 1,938 | 1,933 / 1,933 | 4,571 |
+
+1.6 to 1.7 times on LU in both SSE builds, as estimated (1.8 to 2 was the estimate; the profile to confirm that the
+phase is now all translated code was not rerun). The other kernels did not move outside their run-to-run spread. The
+rest of LU's gap to real x86 is translated-code quality (the four-instruction check in front of each 16-byte access
+among them).
+
+`fexc-replay` fails with this change, by its design: it shows that a compiler change left the code of a recorded
+64-bit boot alone, and this change alters every block with a store wider than a byte (the stubs behind the block; the
+block's own words are the same). Judged by the other suites, as its description says.
+
+Tests: no new family. The existing cases of crossing stores now run through the probes in ordinary blocks and through
+the trap in their one-instruction variants, and all pass: the fault families (page not present, read-only, supervisor,
+reserved bits on either side; 2 to 32 bytes; PUSH and a CALL's push; read-modify-write forms; the canonical-gap
+straddles; first-page-first order), uncached memory on either side (`m2`), a device page on either side (`m3`), three
+vCPUs with crossing vector stores and split locks (`vector-split-smp`), #AC (`vector-ac`), the 32-bit wrap cases
+(`compat32`), and a crossing FILD/FISTP pair (`c32-x87-int64-cross`, new, which also found that the kept integer was
+not kept when the fault was taken at a stub: fixed). Not written: a data breakpoint on each byte of a crossing store
+in an ordinary block, and a multi-vCPU run with mprotect or munmap racing a crossing read-modify-write.
+
 ### INT 0x80 again: where its time goes
 
 Profiles of `hackbench32` both ways (timing build, the whole boot with two runs; 32 million system calls):
@@ -537,7 +593,12 @@ Built after the owner's decision ("cheaper APIC, more efficient IRET"; merged, w
 13% faster. 64-bit `hackbench`, four variants in three alternating rounds (the head; with the one-pass path; with the
 APIC read only; with all): 10.99, 10.95, 10.89 and 10.98 s on average, the rounds themselves differing by 0.3 to 0.8 s,
 so no change that can be told from a boot's noise. (A first comparison of two pairs had suggested 1 to 2% slower; the
-rounds did not confirm it.) The system, SMP and fault families pass with it (77,181 cases). Still there per call: the
+rounds did not confirm it.) The system, SMP and fault families pass with it (77,181 cases). Added after its review: the
+APIC register program also reads with ADD and CMP (forms the old path refused; the load in place serves any 4-byte
+load) and reads a register that does not exist (0, and the error register's illegal-register bit through the old
+path); the priority program's handlers return through a computed jump to their IRETQ, with interrupts pending; three
+faulting IRETQs are reached by a computed jump. Not written: an IRET in an NMI handler with a second NMI pending, the
+APIC page read at CPL 3, with a data breakpoint armed, and in x2APIC or disabled mode through this path. Still there per call: the
 delivery itself (the IDT entry, the stack switch, five pushes) and the APIC read's trap and page walk.
 
 ## 64-bit integers through the x87: two prototypes for the owner's choice

@@ -724,9 +724,32 @@ fn admit_records(
             .min()
             .unwrap_or(h.guest_bytes)
             - s.guest_offset;
+        // A split stub is its `brk`, or the probes of the store's first and last byte and a branch back to the store
+        // (fexc, FexcEmitStubs; the resident takes a fault at a probe as the `brk`): exactly these words, the probes on the
+        // stub's address register, the branch to a word at or before the access. In 32-bit code, behind the four words
+        // that send an address above 4 GiB to the `brk` after them.
+        let probing = || {
+            let (at, a, w) = (s.native_offset, u32::from(s.base_reg), u32::from(s.width));
+            let first = if bits32 { 16 } else { 0 };
+            let add = 0x9100_0000 | (w.wrapping_sub(1) & 0xfff) << 10 | a << 5; // add x0, xA, #w-1
+            const STADDB: u32 = 0x383f_001f; // staddb wzr, [x0]
+            let back = |x: u32| {
+                let to = i64::from(at + first + 12) + i64::from((x << 6) as i32 >> 6) * 4;
+                x >> 26 == 5 && to >= i64::from(ENTRY_OFFSET) && access.is_some_and(|a| to <= i64::from(a.native_offset))
+            };
+            s.kind == object::kind::SPLIT
+                && (1..31).contains(&a)
+                && (2..=32).contains(&w)
+                && at + first + 16 + if bits32 { 4 } else { 0 } <= region
+                && [STADDB | a << 5, add, STADDB] == [0, 4, 8].map(|k| word(at + first + k))
+                && back(word(at + first + 12))
+                && (!bits32
+                    || [add, 0xaa00_0000 | a << 16, 0xd360_fc00, 0xb500_00a0, stub_word(s.kind)]
+                        == [0, 4, 8, 12, 32].map(|k| word(at + k)))
+        };
         if !is_stub(s)
             || !site_fields_valid(s, &h, region)
-            || word(s.native_offset) != stub_word(s.kind)
+            || (word(s.native_offset) != stub_word(s.kind) && !probing())
             || !stub_matches(s, access)
             || (s.kind == object::kind::X87 && u32::from(s.width) != length)
         {
