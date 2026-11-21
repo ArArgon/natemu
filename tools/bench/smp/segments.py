@@ -403,6 +403,12 @@ def cases():
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
     c.append(('iret-dpl3-ss',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x18]))
     c.append(('iret-ss-not-present',) + iret([0x110000, 0x08, 2, P.STACK(0), 0xc8]))
+    # The same IRETQs reached by a computed jump (Linux's return path; M2 task 4: the dispatcher's miss path runs a kept
+    # IRET itself): the faults are the instruction's all the same.
+    jumped = lambda words: (pushes(words) + '    jmp [rel .ij]\n.ij: dq .iq\n.iq:\n', '    iretq\n', lambda s: sm.iret(_stack(s, words)), {})
+    c.append(('iret-jmp-null-ss-rpl',) + jumped([0x110000, 0x08, 2, P.STACK(0), 0x1]))
+    c.append(('iret-jmp-ss-not-present',) + jumped([0x110000, 0x08, 2, P.STACK(0), 0xc8]))
+    c.append(('iret-jmp-compat-rip',) + jumped([1 << 32 | 0x110000, 0xdb, 2, d + USTACK, 0x1b]))
     # CPL 3 (entered by LRETQ): privilege and null-SS faults.
     for name, insn, call in (('ds-dpl0', '    mov eax, 0x10\n    mov ds, eax\n', lambda s: sm.load(s, 'ds', 0x10)),
                              ('ss-null', '    mov eax, 0x3\n    mov ss, eax\n', lambda s: sm.load(s, 'ss', 3)),

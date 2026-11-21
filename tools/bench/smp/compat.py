@@ -868,10 +868,32 @@ _PF = f"""    cmp qword [rsp], 14
     shr rax, 12
     or qword [{PTE(0):#x} + rax*8], 3
 """
-INT64_AGAIN = _PF + """    mov rax, cr3
+# (Every other fault maps nothing: the instruction faults a second time, also the FISTP's second run, which must still
+# find the kept integer at its third.)
+INT64_AGAIN = f"""    cmp qword [rsp], 14
+    jne .not_pf
+    and qword [rsp+32], ~0x10000
+    inc dword [{LOW1:#x}]
+    test dword [{LOW1:#x}], 1
+    jnz .resume
+    mov rax, cr2
+    invlpg [rax]
+    shr rax, 12
+    or qword [{PTE(0):#x} + rax*8], 3
+    mov rax, cr3
     mov cr3, rax
     jmp .resume
 .not_pf:
+"""
+# A pair whose store crosses into a page not present: the fault is taken at the store's split stub, and the integer is
+# kept all the same.
+INT64_CROSS_USER = REGS32 + f"""    fninit
+    fild qword [.odd]
+    fistp qword [{XPAGE - 4:#x}]
+    fild qword [.odd]
+    fistp qword [{XPAGE + 0xffc:#x}]
+    int 0x80
+.odd: dq 0x4000000000000001
 """
 INT64_AGAIN_USER = REGS32 + f"""    fninit
     fild qword [.odd]
@@ -1060,6 +1082,8 @@ def positive32():
                     INT64_SPACE_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             program('c32-x87-int64-again@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + INT64_AGAIN + RESUME, **vec),
                     INT64_AGAIN_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
+            program('c32-x87-int64-cross@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() + handlers(END + MAP + RESUME, **vec),
+                    INT64_CROSS_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000),
             *[program(f'c32-x87-int64-saved-{save}@1', GATES + UNMAP + X87_BODY[:X87_BODY.index(ENTER())] + ENTER() +
                       handlers(END + INT64_SAVED(save, restore) + RESUME, **vec),
                       INT64_SAVED_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], params={'whole_blocks': True}, log=0x1000)
