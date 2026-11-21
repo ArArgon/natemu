@@ -504,8 +504,6 @@ matrix = { "machine.vcpus" = [1, 2, 4] }
 needs = { cores = 4, perf = true }
 
 [suite.expected]
-"atomic64.dyn" = "natemu's x87 registers are doubles: gcc's 64-bit atomic load and store on i686 (FILD m64, FISTP m64) loses the low bits of a value above 2^53; the special handling is the owner's open decision (M2 design, Accuracy, To investigate; docs/restructure/m2-checkpoint-a-findings.md)"
-"atomic64.static" = "natemu's x87 registers are doubles: gcc's 64-bit atomic load and store on i686 (FILD m64, FISTP m64) loses the low bits of a value above 2^53; the special handling is the owner's open decision (M2 design, Accuracy, To investigate; docs/restructure/m2-checkpoint-a-findings.md)"
 "py-test_cmath-values" = "natemu's x87 registers are doubles: glibc's i386 hypot squares in the x87's extended exponent range, so cmath.acos(-1e299) is -inf (acos0046) in test_specific_values, run alone here; py-test_cmath runs the other cases and must pass (docs/restructure/m2-checkpoint-a-findings.md)"
 "py-test_math-files" = "natemu's x87 registers are doubles: glibc's i386 exp, expm1, sinh, cosh and tgamma lose 17 to 324 ulps for large arguments, and expm1(1.79e308) reports a domain error for an overflow, in test_mtestfile and test_testfile, run alone here; py-test_math runs the other 84 cases and must pass (docs/restructure/m2-checkpoint-a-findings.md)"
 "x87ext.dyn" = "natemu's x87 registers are doubles (M2 design, Accuracy; docs/floating-point.md): no 64-bit significand, no long double range"
