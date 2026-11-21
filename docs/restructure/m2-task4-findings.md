@@ -379,7 +379,7 @@ What is left in the hot block (228 instructions for 85 x87 instructions): arithm
 29; the page-crossing checks of its 8-byte stores 30; FLD's quieting multiply 18; flags and the run 17; condition bits 13;
 state writes 12; the rest 55.
 
-### INT 0x80 again: where its time goes (parked, not built)
+### INT 0x80 again: where its time goes
 
 Profiles of `hackbench32` both ways (timing build, the whole boot with two runs; 32 million system calls):
 
@@ -399,7 +399,18 @@ call takes one dispatcher miss that the SYSENTER path does not take (not yet exp
 IRET would save the double pass of each, perhaps 0.2 to 0.3 of the 1.25 microseconds a call spends in the shim (an
 estimate); the delivery, the IRET and the APIC read stay. Unlike SYSCALL and SYSENTER, INT writes guest memory (the
 kernel stack) and can fault while it does, which the existing fast path is built never to do, so it is not a small
-change. Parked here for the x87 work the owner put first; the profile case `guest-hackbench32-int80-profile` is added.
+change. The profile case `guest-hackbench32-int80-profile` is added.
+
+Tried after the x87 work, and parked on the branch `m2-speed-int80` until the owner decides (it is not on the head):
+INT n and IRET take the one-pass path when a block exits straight into them. That turned out to need no new machinery: everything the path does after the instruction is what the shim does
+after any system instruction, so a fault inside the INT or IRET is simply delivered by the instruction itself and the
+path goes on from wherever that leaves the processor. Measured: `hackbench32-int80` 27.90 / 27.64 s, against 28.4 to
+29.8 in earlier boots; in the profile the exit handling per call fell from 97 to 64 ns and one copy of the state record
+per call went away. About 3%, which is inside the difference between two boots, so it is not a result one can see in the
+benchmark. The larger costs are untouched: the delivery itself, the kernel's APIC read, and the kernel's IRET, which
+this kernel reaches through an indirect jump, so it arrives by a dispatcher miss and not by a block exit. The same
+change would serve every IRET that a block exits into directly, in 64-bit kernels too. With it the system and SMP
+families pass (35,323 cases).
 
 ## 64-bit integers through the x87: two prototypes for the owner's choice
 
@@ -419,6 +430,22 @@ built as prototypes, each on its own branch off this one (and its own branch of 
 | Cost in translated code | None outside the pair; the pair itself gets shorter (the FISTP is a plain 8-byte store). | Three Arm instructions for every write of an x87 register (a zero, an address, a store), plus one more store per FILD m64 and about 12 instructions per FISTP m64. On c-ray's main block (85 x87 instructions): 17,680 bytes of code against 16,496, 7% more. |
 | Other code changed | The FEX fork only (about 25 lines in the x87 dispatcher). | The FEX fork (about 40 lines in the dispatcher and the x87 stack pass), admission and the site checker (the slot's upper half may be accessed), the shim (its register writes clear the upper half). |
 | 64-bit code | The same change applies (the pair is an 8-byte copy there too, rare). | The extra store on every x87 register write applies there too. |
+
+Measured (one boot each, two runs per boot, 1 vCPU, seconds), both rebased onto the head with the x87 stack in host
+registers, the guess and the records:
+
+| | cray32 | cray32-small | sqlite32 | startup32 | i386 campaign |
+| --- | --- | --- | --- | --- | --- |
+| No prototype | 9.01 / 8.93 | 0.62 / 0.57 | 8.02 / 7.76 | 7.16 / 6.94 | 126 passed, 18 expected failures |
+| (b) | 9.05 / 8.98 | 0.62 / 0.57 | 8.04 / 7.78 | 7.21 / 6.99 | 132 passed, 12 expected failures |
+| (c) | 11.21 / 11.11 | 0.76 / 0.71 | 8.03 / 7.76 | 7.24 / 6.99 | 132 passed, 12 expected failures |
+
+Under both, the `atomic64` test passes, static and dynamic, at 1, 2 and 4 vCPUs (the six expected failures that went away).
+(b) costs nothing that can be measured. (c) costs 24% on c-ray: every write of an x87 register to the guest state now also
+writes the integer (or 0) beside it, and a register that still has its integer beside it is written before the next
+instruction that can fault, because the record for the shim names only the double's host register. The second part could
+be removed by a record that names the integer's register too; the first part is what (c) is. The "7% more code" in the
+table above was measured before the stack moved into host registers and no longer describes (c).
 
 Neither changes the flags of the FILD itself: converting a 64-bit integer above 2^53 to a double sets the x87
 precision flag, which hardware (where the load is exact) does not; that is part of the recorded "x87 registers are
