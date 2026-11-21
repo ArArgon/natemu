@@ -144,6 +144,11 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench3
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--compile-cache", "off", "--perf-log"]
 
+[suite.cases.guest-hackbench32-int80-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32-int80-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log", "--append", "vdso32=0"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]

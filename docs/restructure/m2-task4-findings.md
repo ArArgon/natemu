@@ -315,6 +315,28 @@ general registers). That would remove most of the 98 write instructions and of t
 them: about 200 of 477 instructions, 40%. It touches the site records, the shim, admission and the checkers; a guess
 of 15 to 25 agent hours. Keeping the x87 registers in fixed host registers across blocks would add to either.
 
+### INT 0x80 again: where its time goes (parked, not built)
+
+Profiles of `hackbench32` both ways (timing build, the whole boot with two runs; 32 million system calls):
+
+| Per system call, in the shim (ns) | SYSENTER | INT 0x80 |
+| --- | --- | --- |
+| The system instructions themselves (in and out) | 68 | 262 (INT and IRET) |
+| Delivering the interrupt (the IDT entry, the kernel stack, five pushes) | | 227 |
+| A read of the local APIC by the kernel, once per call | | 267 |
+| Leaving and entering blocks (link, lookup, enter, a dispatcher miss) | 290 | about 490 |
+| Translated code | 290 | 440 |
+| Run time | 10.3 to 10.4 s | 27.1 to 27.4 s |
+
+Two things were not known before. The kernel reads the local APIC on every INT 0x80 system call: since Linux 6.7 its
+handler checks the in-service register to tell a real `int 0x80` from an external interrupt on that vector, and with
+the APIC in memory-mapped mode that read is a device access the shim serves (a quarter of a microsecond). And every
+call takes one dispatcher miss that the SYSENTER path does not take (not yet explained). A one-pass path for INT and
+IRET would save the double pass of each, perhaps 0.2 to 0.3 of the 1.25 microseconds a call spends in the shim (an
+estimate); the delivery, the IRET and the APIC read stay. Unlike SYSCALL and SYSENTER, INT writes guest memory (the
+kernel stack) and can fault while it does, which the existing fast path is built never to do, so it is not a small
+change. Parked here for the x87 work the owner put first; the profile case `guest-hackbench32-int80-profile` is added.
+
 ## 64-bit integers through the x87: two prototypes for the owner's choice
 
 Compilers copy a 64-bit integer on i686 with FILD m64 then FISTP m64 (atomic loads and stores); natemu's x87 registers
