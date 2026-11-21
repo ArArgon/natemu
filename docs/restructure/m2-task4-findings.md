@@ -342,6 +342,43 @@ tag byte current there about 104; condition bits, flags and the rest about 77. S
 before instructions that can fault, the shim rebuilding it at a fault) would now remove about 150 of 361 instructions,
 around 40%, as an **estimate**.
 
+### Built: no x87 state written before instructions that can fault
+
+Also on the owner's order. Until here the pending x87 registers, the top and the tag byte were written to the guest
+state before every instruction with a memory operand, so that a fault there finds them. Now, in a block compiled for a
+known stack top, they are not. Instead the compiler leaves a small record per such instruction: which host register
+holds which x87 register, and the top and tag byte as plain numbers. When an instruction faults (or one of its checks
+fails), the shim applies that record to the guest state before it does anything else. Applying it twice changes
+nothing, so it does not matter whether the block is resumed or left. The state is still written by the code itself
+before the last instruction of each block piece, before an instruction that reads the x87 state directly (FXAM, FNSTSW,
+MMX, the shim's helpers), and at the exit.
+
+| | c-ray's hottest block | cray32-small (s) | cray32 (s) |
+| --- | --- | --- | --- |
+| With the guess | 372 instructions | 1.22 / 1.16 | 18.9 / 18.7 |
+| And no writes before faultable instructions | 238 | 0.62 / 0.57 | 9.01 / 8.93 |
+| Real x86 (Ryzen 7 8845HS), the same binary | | 0.58 | 9.19 |
+
+Pictures unchanged. The x87 build now runs as fast under natemu on the M4 as on the real x86 machine; from checkpoint A's
+more than 1,800 s that is a factor of 200. (The estimate was 40% fewer instructions; measured 36%, and half the time.)
+
+How it is checked, since the guest state is no longer complete in memory at a fault:
+
+- The native test (`fexc-slice1-x87-commit`) runs each block up to every fault point, applies the instruction's record
+  exactly as the shim does, and compares with what the instructions before it leave when each runs alone; 32- and 64-bit
+  code, with and without the guess, also the code for Macs without AFP. It also shows that without the record the memory
+  state is wrong at more than half of those points, so the comparison does depend on the record.
+- The precision checker has a new rule: from the start of an instruction to its last fault point, no word writes a host
+  register that the instruction's record names (and, as before, none writes x87 state in memory there).
+- Admission checks each record's shape. A wrong record could only give the guest a wrong x87 state of its own.
+- A new 32-bit VM case against QEMU (`c32-x87-depth` in `system/compat32`) calls one x87 function at two stack depths and
+  joins paths with different tops: the guessed translations are thrown away and made again without a guess.
+- The i386 campaign (126 passed, 18 expected failures) and the narrow suites (4,881 passed) at this head.
+
+What is left in the hot block (228 instructions for 85 x87 instructions): arithmetic 54; the program's loads and stores
+29; the page-crossing checks of its 8-byte stores 30; FLD's quieting multiply 18; flags and the run 17; condition bits 13;
+state writes 12; the rest 55.
+
 ### INT 0x80 again: where its time goes (parked, not built)
 
 Profiles of `hackbench32` both ways (timing build, the whole boot with two runs; 32 million system calls):
