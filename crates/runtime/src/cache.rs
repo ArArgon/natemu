@@ -20,7 +20,7 @@ pub use natemu_abi::execution::cache::{
     ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
     INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
-    PIC_TEST_STR, PIC_TEST_SVC, PIC_USER, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP,
+    PIC_TEST_STR, PIC_TEST_SVC, PIC_USER, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
     STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
@@ -3199,6 +3199,63 @@ pub fn shadowed_writable(gpa: u64) {
         set_own(area::WRITABLE_PAGES, page);
     }
 }
+/// The reverse map of this vCPU's writable shadows (docs/writable-drop.md).
+fn writers_table() -> &'static mut [[u64; 2]] {
+    unsafe { core::slice::from_raw_parts_mut(lookup_area(area::WRITERS), natemu_abi::writers::ENTRIES) }
+}
+fn writer_epochs() -> natemu_abi::writers::Epochs {
+    let [full, cr3, lossy] = control().writer_epochs;
+    natemu_abi::writers::Epochs { full, cr3, lossy }
+}
+/// Records that this vCPU installed a writable shadow of `va` (in the space of `user`) onto `gpa`'s page; a full probe
+/// window makes the map lossy until the next full reset.
+pub fn writable_installed(user: bool, va: u64, gpa: u64) {
+    use natemu_abi::writers::{count, insert};
+    let e = writer_epochs();
+    let c = control();
+    c.writers[count::INSERTS] += 1;
+    if !insert(writers_table(), &e, user, va & !4095, gpa >> 12) {
+        c.writers[count::OVERFLOWS] += 1;
+        c.writer_epochs[2] = e.full.wrapping_add(1);
+    }
+}
+/// Every shadow of this vCPU went (a full reset): every entry of the map dies.
+pub fn writers_reset() {
+    control().writer_epochs[0] += 1;
+}
+/// A CR3 load removed every shadow but the kept half's: the other entries die.
+pub fn writers_cr3() {
+    control().writer_epochs[1] += 1;
+}
+/// Removes this vCPU's writable shadows of `gpa`'s page (both spaces, with their TLB entries) and then its writable bit
+/// of the page; `false` (nothing done) when the map is lossy: the caller resets every shadow instead.
+pub fn drop_writable(gpa: u64) -> Result<bool, natemu_abi::shadow::Error> {
+    use natemu_abi::writers::{count, drop_page};
+    let e = writer_epochs();
+    let c = control();
+    if e.lossy() {
+        c.writers[count::LOSSY_RESETS] += 1;
+        return Ok(false);
+    }
+    let mut failed = None;
+    let n = drop_page(writers_table(), &e, gpa >> 12, |va| {
+        if let Err(err) = crate::tables::unmap(va) {
+            failed = Some(err);
+        }
+    });
+    if let Some(err) = failed {
+        return Err(err);
+    }
+    c.writers[count::DROPS] += 1;
+    c.writers[count::UNMAPPED] += n as u64;
+    // The unmaps' TLB invalidations completed (`dsb ish`) before the bit goes.
+    let page = (gpa >> 12) as usize;
+    if page < pages() {
+        let (m, shift) = mask(area::WRITABLE_PAGES, page);
+        m.fetch_and(!(u64::from(own()) << shift), SeqCst);
+    }
+    Ok(true)
+}
 /// This vCPU's shadows were all removed (and the TLB invalidated): clears its writable bits, then counts the reset
 /// (a peer waiting for this vCPU to drop its writable shadows waits for the counter to change).
 pub fn shadows_reset() {
@@ -3260,11 +3317,49 @@ pub fn split_end() {
     split_word(2).store(0, SeqCst);
     split_word(0).store(0, SeqCst);
 }
-/// While waiting on a split lock: serves only a peer's request to drop all shadows ([`SHADOWS`]; whether to reset them now),
-/// leaving the rest of the record (code invalidations, a flush) to the next resident entry, as a block of this vCPU may be
-/// live here (its abort handler resumes it).
-pub fn take_shadows() -> bool {
-    record_word(vcpu(), None).fetch_and(!SHADOWS, SeqCst) & SHADOWS != 0
+/// While waiting on a split lock: takes only peers' shadow requests (the bits of [`SHADOWS`], drop all shadows, and [`DROPS`],
+/// drop pages' writable shadows from the drop slots; the caller serves them), leaving the rest of the record (code
+/// invalidations, a flush) to the next resident entry, as a block of this vCPU may be live here (its abort handler resumes it).
+pub fn take_shadows() -> u64 {
+    use natemu_abi::execution::cache::DROPS;
+    let word = record_word(vcpu(), None);
+    if word.load(SeqCst) & (SHADOWS | DROPS) == 0 {
+        return 0;
+    }
+    word.fetch_and(!(SHADOWS | DROPS), SeqCst) & (SHADOWS | DROPS)
+}
+/// vCPU `v`'s drop slot `i` (`Record::drops`).
+fn drop_word(v: usize, i: usize) -> &'static AtomicU64 {
+    let r = global::<Record>(area::RECORDS).wrapping_add(v);
+    unsafe { AtomicU64::from_ptr((&raw mut (*r).drops).cast::<u64>().wrapping_add(i)) }
+}
+/// Asks vCPU `v` to drop its writable shadows of `gpa`'s page ([`DROPS`], then a kick): the slot claimed and its value,
+/// which `v` replaces by 0 once it holds none; `None` when every slot is taken (the caller asks for a full reset).
+pub fn ask_drop(v: usize, gpa: u64) -> Option<(usize, u64)> {
+    use natemu_abi::execution::cache::{DROPS, DROP_SLOTS};
+    let value = (gpa >> 12) + 1;
+    let i = (0..DROP_SLOTS).find(|&i| drop_word(v, i).compare_exchange(0, value, SeqCst, SeqCst).is_ok());
+    let Some(i) = i else {
+        control().writers[natemu_abi::writers::count::SLOTS_FULL] += 1;
+        return None;
+    };
+    record_word(v, None).fetch_or(DROPS, SeqCst);
+    kick(v);
+    Some((i, value))
+}
+/// Whether vCPU `v`'s slot `i` still holds `value` (the request is not served yet).
+pub fn drop_waiting(v: usize, (i, value): (usize, u64)) -> bool {
+    drop_word(v, i).load(SeqCst) == value
+}
+/// This vCPU's drop slot `i`: the page asked for (`gpa`), if any.
+pub fn drop_asked(i: usize) -> Option<(u64, u64)> {
+    let value = drop_word(vcpu(), i).load(SeqCst);
+    (value != 0).then(|| (value, (value - 1) << 12))
+}
+/// Slot `i`'s request (`value`) is served: this vCPU holds no writable shadow of its page.
+pub fn drop_served(i: usize, value: u64) {
+    let _ = drop_word(vcpu(), i).compare_exchange(value, 0, SeqCst, SeqCst);
+    control().writers[natemu_abi::writers::count::SERVED] += 1;
 }
 /// Another vCPU holds the split lock over `gpa`'s page.
 pub fn split_held(gpa: u64) -> bool {

@@ -21,7 +21,7 @@
 //!
 //! HLT parks the vCPU in `wfi` in the VM ([`park`]): with the in-kernel GIC, HVF holds it without a host exit; a
 //! doorbell wakes it, the resident acknowledges every pending IRQ, takes its invalidations (a peer may be waiting for its
-//! shadow reset) and wakes only for an event it can take (an enabled interrupt or an unblocked NMI, model A10). While
+//! shadow reset or page drop) and wakes only for an event it can take (an enabled interrupt or an unblocked NMI, model A10). While
 //! parked its record says so (`Events::halted`): the host's watchdog treats it as idle, and the host may end its run
 //! ([`Events::end`], [`stop::HALTED`]) when no source could wake it.
 use super::lapic;
@@ -363,8 +363,9 @@ pub(super) fn wait_mailbox(s: &mut State) {
         );
         let ending = end.load(SeqCst) != 0;
         // The re-mark's cost (the review's item): it may spin until a writer that holds a writable shadow of the page
-        // resets its shadows (a writer in the host answers only when it next enters the VM), and each such writer
-        // drops all its shadows (`State::shootdowns` counts the writers asked).
+        // drops it (a writer in the host answers only when it next enters the VM); each such writer drops the page's
+        // writable shadows, or all its shadows when its reverse map or drop slots fall short (docs/writable-drop.md;
+        // `State::shootdowns` counts the writers asked).
         let t0 = ticks();
         super::mark(s, gpa);
         s.mailbox_mark_ticks += ticks() - t0;
