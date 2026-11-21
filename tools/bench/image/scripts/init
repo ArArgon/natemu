@@ -1,6 +1,6 @@
 #!/bin/sh
 # Benchmark initramfs /init (busybox sh). Kernel command line:
-# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|hackbench32|cray32|cray32-small|sqlite32|startup32|shell [jobs=N]
+# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|hackbench32|cray32|cray32-small|sqlite32|startup32|cray32-strict|cray32-strict-small|cray32-sse2|cray32-sse2-small|scimark|scimark32|scimark32-sse2|shell [jobs=N]
 # (jobs defaults to the online CPU count). The benchmark runs twice in the one boot: run 1 (cold) and run 2 (warm; same
 # command, outputs removed or overwritten). Each run prints NATEMU-BENCH-START (run 2: START2), the benchmark's own output and
 # timing (busybox time per phase; a NATEMU-BENCH-PHASE / PHASE2 line after each named phase), NATEMU-BENCH-END (END2) with the
@@ -77,6 +77,16 @@ cray32)    run() { phase - "$B/c-ray-mt32 -t $jobs -s 1280x960 -r 1 < $B/sphfrac
 cray32-small) run() { phase - "$B/c-ray-mt32 -t $jobs -s 320x240 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
 startup32) run() { phase - "i=0; while [ \$i -lt 40 ]; do speedtest1-32 --memdb --size 5 :memory: > /tmp/st.out || exit 1; i=\$((i+1)); done"; } ;;
 sqlite32)  run() { phase - "speedtest1-32 --memdb --verify --size 160 :memory: > /tmp/st.out"; } ;;
+# More 32-bit floating point: c-ray as x87 code without -ffast-math and as SSE2 code (each also at 320x240), and SciMark 2.0
+# (64-bit, 32-bit x87, 32-bit SSE2). SciMark's kernels each run for at least 2 s of the guest's clock and report Mflops: its
+# result is the rates it prints (higher is better), not the run's time.
+cray32-strict) run() { phase - "$B/c-ray-mt32-strict -t $jobs -s 1280x960 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+cray32-strict-small) run() { phase - "$B/c-ray-mt32-strict -t $jobs -s 320x240 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+cray32-sse2) run() { phase - "$B/c-ray-mt32-sse2 -t $jobs -s 1280x960 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+cray32-sse2-small) run() { phase - "$B/c-ray-mt32-sse2 -t $jobs -s 320x240 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+scimark)   run() { phase - "scimark2 > /tmp/sm.out"; } ;;
+scimark32) run() { phase - "scimark2-32 > /tmp/sm.out"; } ;;
+scimark32-sse2) run() { phase - "scimark2-32sse2 > /tmp/sm.out"; } ;;
 shell)     exec setsid cttyhack sh ;;
 *)         echo "NATEMU-BENCH-ERROR unknown bench=$bench"; poweroff -f ;;
 esac
@@ -110,6 +120,10 @@ verify() {
            grep -E 'cpu capabilities' /tmp/x264.log ;;
     cray32-small) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx cray32-small md5=$(md5sum /tmp/cray.ppm | cut -d' ' -f1)" ;;
     cray32) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx cray32 md5=$(md5sum /tmp/cray.ppm | cut -d' ' -f1)" ;;
+    cray32-strict|cray32-strict-small|cray32-sse2|cray32-sse2-small)
+           got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx $bench md5=$(md5sum /tmp/cray.ppm | cut -d' ' -f1)" ;;
+    scimark|scimark32|scimark32-sse2)
+           got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx $bench $(sed -n 's/^Composite Score: */composite=/p; s/^FFT *Mflops: *\([0-9.]*\).*/fft=\1/p; s/^SOR *Mflops: *\([0-9.]*\).*/sor=\1/p; s/^MonteCarlo: *Mflops: *\([0-9.]*\).*/montecarlo=\1/p; s/^Sparse matmult *Mflops: *\([0-9.]*\).*/sparse=\1/p; s/^LU *Mflops: *\([0-9.]*\).*/lu=\1/p' /tmp/sm.out | tr '\n' ' ')" ;;
     sqlite32) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx sqlite32 hash=$(sed -n 's/^Verification Hash: //p' /tmp/st.out | tr -d ' ')" ;;
     *)     got=$rc; want=0 ;;
     esac
