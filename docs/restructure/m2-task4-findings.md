@@ -709,6 +709,96 @@ Still not covered, recorded here as the limits of (b), none of them fixed:
 - FILD m64 of an integer above 2^53 still sets the precision flag (see above); it shows only with that exception
   unmasked.
 
+## The final round (November 21)
+
+One round at the head of the branch, alone on the machine, with the starting point (`4d7ea93e`, checkpoint A) measured
+in the same hour through the same build route. 1 vCPU, one boot per case, two runs per boot, seconds unless Mflops.
+
+| | start | head | |
+| --- | --- | --- | --- |
+| `hackbench` (64-bit) | 10.59 / 10.51 | 10.61 / 10.63 | unchanged |
+| `hackbench32` | 13.46 / 13.42 | 10.43 / 10.39 | 1.29 times |
+| `hackbench32-int80` | 28.52 / 28.30 | 25.53 / 25.35 | 1.12 times |
+| `sqlite` (64-bit) | 6.16 / 5.95 | 6.22 / 6.01 | unchanged |
+| `sqlite32` | 8.54 / 8.25 | 8.20 / 7.87 | 1.04 times |
+| `startup32` | 7.76 / 7.57 | 7.42 / 7.22 | 1.05 times |
+| `cray` (64-bit) | 3.02 / 3.00 | 3.06 / 2.98 | unchanged |
+| `cray-strict` (64-bit) | 3.22 / 3.19 | 3.32 / 3.25 | within the hour's spread (see below) |
+| `cray32-small` | 122.8 / 122.7 | 0.65 / 0.58 | about 200 times |
+| `cray32-strict-small` | 69.1 / 69.1 | 0.63 / 0.58 | about 115 times |
+| `cray32-sse2-small` | 0.53 / 0.48 | 0.29 / 0.28 | 1.8 times |
+| `cray32-sse2` | 7.13 / 7.03 | 3.98 / 3.92 | 1.8 times (real x86: 3.91) |
+| `cray32` | (does not finish in 1,800 s) | 9.20 / 9.13 | real x86: 9.19 |
+| `cray32-strict` | (not run) | 8.76 / 8.65 | real x86: 9.63 |
+
+c-ray at 4 vCPUs at the head (real x86 with 4 threads in brackets): `cray` 1.02 / 0.91, `cray-strict` 1.03 / 0.99
+(1.05), `cray32` 2.83 / 2.84 (2.61), `cray32-strict` 2.89 / 2.84 (2.71), `cray32-sse2` 1.43 / 1.32 (1.12).
+
+| SciMark 2.0 (Mflops, run 1 / run 2) | composite | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64-bit, start | 2732 / 2473 | 3105 / 1814 | 4254 / 4259 | 852 / 852 | 3225 / 3218 | 2224 / 2222 |
+| 64-bit, head | 2869 / 2674 | 2474 / 1488 | 4205 / 4217 | 850 / 844 | 3201 / 3212 | 3616 / 3611 |
+| 32-bit SSE2, start | 2269 / 2290 | 709 / 814 | 4065 / 4080 | 62 / 62 | 3650 / 3651 | 2861 / 2844 |
+| 32-bit SSE2, head | 2699 / 2479 | 2595 / 1478 | 3945 / 3950 | 256 / 257 | **2539 / 2542** | 4159 / 4168 |
+| 32-bit x87, start | 32 / 32 | 17 / 17 | 45 / 45 | 23 / 23 | 39 / 39 | 36 / 36 |
+| 32-bit x87, head | 1285 / 1239 | 1302 / 1041 | 1702 / 1732 | 293 / 293 | 1190 / 1186 | 1940 / 1941 |
+
+Read with these in mind:
+
+- **The machine was about 2 to 4% slower this night than when the earlier tables were made** (`cray32` read 9.01 /
+  8.93 the day before and 9.17 / 9.11 now at the very commit it was first measured at, rerun to check; 64-bit Monte
+  Carlo read 962 then and 852 now at the starting commit too). No thermal warning was recorded and nothing else was
+  running. So compare columns of this table with each other, not with earlier sections.
+- **One regression, found by this round: the sparse multiply in the 32-bit SSE2 build is 30% slower than at the start
+  (3,650 to 2,540).** The cause is the x87 runs of this task: in 32-bit code a run may stay open from one block to the
+  next, so every block tests "is an x87 run open?" before its first SSE floating-point instruction (a load of a byte and
+  a branch). The sparse loop is one block of seven instructions entered again for every element, and those two
+  instructions are a sixth of it; the starting commit's translation of the loop is the same code without them. SOR in
+  that build shows the same, smaller (3%). 64-bit code does not have the test (its runs end with their block). It is a
+  cost of a design choice, on tight 32-bit SSE loops only. Ways out, none built: give each block a second entry behind
+  the test for predecessors that know no run is open (the linker would choose; a day's work with the checkers), or end
+  runs at the block's end in 32-bit code too wherever the block's exit does not lead to x87 code (which gives back part
+  of c-ray's gain where it guesses wrong). Not decided.
+- FFT in the two SSE builds varies between two runs of one boot by up to 40% (and did so at the start); still not
+  explained.
+- LU's gain is the page-crossing stores; Monte Carlo's in the SSE2 build is the integer FLD.
+
+The x86 selftests' and the i386 campaigns at the head, run after the table: 221 cases passed, 18 expected failures, 3
+unsupported (the same expected failures as before; `atomic64` passes).
+
+### Macs without AFP (M1, M2): the same round's 32-bit cases with AFP hidden
+
+A separate step, at the owner's request. AFP is the Arm feature (M4 has it; M1 and M2 do not) that lets Arm arithmetic
+produce x86's NaN and denormal results directly. Hidden here with the test switch `NATEMU_FEXC_FEATURE_OFF=afp` on the
+M4, so the code is the code an M2 would run, on a faster core.
+
+Correctness: `compat32` (every 32-bit system case, the kept-integer cases among them) and the i386 campaign pass with
+AFP hidden (175 passed, 12 expected failures, the same twelve); the floating-point family, whose cases run with and
+without AFP in both modes, passes (5,096). The fault families' no-AFP variants (x87 faults among them) ran with every
+fault-family run of this task.
+
+Speed, 1 vCPU, seconds (run 1 / run 2) or Mflops:
+
+| | with AFP (the round above) | AFP hidden |
+| --- | --- | --- |
+| `cray32-small` | 0.65 / 0.58 | 104.9 / 104.7 |
+| `cray32-strict-small` | 0.63 / 0.58 | 61.9 / 61.7 |
+| `cray32` | 9.20 / 9.13 | not finished in 17 minutes when stopped; 16 times the small scene is about 1,680 s |
+| `cray32-sse2` | 3.98 / 3.92 | 6.86 / 6.74 |
+| `cray` (64-bit) | 3.06 / 2.98 | 4.21 / 4.18 |
+| `cray-strict` (64-bit) | 3.32 / 3.25 | 4.95 / 4.85 |
+| SciMark 32-bit x87, composite | 1285 | 35 |
+| SciMark 32-bit SSE2: composite, FFT, SOR, Monte Carlo, sparse, LU | 2699, 2595, 3945, 256, 2539, 4159 | 2106, 746, 1758, 61, 3567, 4399 |
+
+So nothing of this task's x87 work reaches a Mac without AFP: x87 code there is where it was at the start (the stack in
+host registers, the lazy flags, the runs and the integer FLD are all built on AFP's results, and without it every x87
+operation still goes through the per-operation wrapper with its fix-ups). 32-bit x87 programs are about 150 times
+slower on such a Mac than on an M4-class core, beyond the cores' own difference. The page-crossing stores and the
+system-call work do not depend on AFP (LU: 4,399). The sparse multiply does not have the regression there (no runs,
+so no test). What it would take: the same caches with the NaN and denormal fix-ups done per operation inside a run; a
+design of its own, not estimated here.
+
+
 ## Paused (November 20, about 14:50)
 
 The work was paused on the owner's order while checkpoint A, which this branch sits on, investigates a 64-bit slowdown;
