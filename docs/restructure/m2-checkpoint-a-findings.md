@@ -197,6 +197,77 @@ short to be more than an order of magnitude):
 Integer 32-bit code runs at about 1.4 times its 64-bit build's time. x87 code is about a hundred times slower than
 the SSE build: every cast traps twice and every x87 operation pays its wrapper, the plan's first two items for task 4.
 
+## 64-bit regression
+
+November 20, branch `m2-regress` off `m2-32bit` at 631b26a3. The cost was per system call, not per block: hackbench
+runs about 32 million SYSCALL and 32 million SYSRET per boot through the resident's fast path, locks fewer; the
+compile-heavy benchmarks and CPython's configure and make never showed it.
+
+**Where.** All numbers here are warm medians of six interleaved rounds at 1 vCPU (each build in turn, per round), in
+seconds, hackbench / locks. Within the integration of tasks D and 1, the step is all in the first branch, the task 1
+plumbing (ef0c1206 and 7fdda4dd): `main` (f0feda92) 10.60 / 3.28; the plumbing 10.97 / 3.34; with the iced-x86 decoder
+(226ca66d) 11.07 / 3.32; with the diagnostics (89f76ede) 11.01 / 3.34; integrated (766e37af) 10.99 / 3.41. The decoder
+(compile time only) and the diagnostics (two stores per exit as before, a 100 ms watchdog wake-up) add nothing
+measurable.
+
+**Not the state layout.** The plumbing made the CPU state 16 bytes smaller (FS.base and GS.base moved into the
+segments), so every field from `cr2` on moved. Restoring every offset with 16 bytes of padding changed nothing: 7fdda4dd
+10.96 / 3.33 without, 10.96 / 3.34 with; 631b26a3 11.12 / 3.41 without, 11.13 / 3.40 with (`main` 10.66 / 3.28 in the same
+rounds).
+
+**What.** The resident's own time accounting (its `perf` feature, three rounds, whole boot) put the difference in the
+system-call fast path: the system-instruction bucket 48.7 ns per instruction on `main`, 53.1 on the plumbing; the fast
+path's own part (`sys_fast`) 54.9 against 59.5 ns; each block lookup 8.3 against 9.3 ns. The disassembly shows why. The
+resident is built for size (`opt-level = "s"`), and the plumbing replaced `Cpu::control` with `controls`, an out-of-line
+function returning the walk controls: it calls `Cpu::paging` into a temporary and copies the 40-byte result to its
+caller through a call to `memcpy`, and `set_cpl` and `commit`, which discard the result, call it on every SYSCALL and
+SYSRET. `main`'s `set_cpl` called `Cpu::control` and tested its tag, with no copy. Second, `Cpu::code_mode`'s `match`
+became a chain of three branches in `Cpu::code_context` (the resident has no jump tables), which every lookup computes,
+two per system call; before the plumbing that field was a constant.
+
+**The fix.** `controls` is `#[inline(always)]` (no copy where the result is discarded, none in the callers that use it),
+and `Cpu::code_mode` reads a four-entry table indexed by CS.L and CS.D instead of matching (the same values; its unit
+test covers all four). Behaviour is identical. With the resident's accounting, the fix's system-call buckets are back to
+`main`'s (system 51.0 ns against `main`'s 49.8 and 631b26a3's 55.8; `sys_fast` 56.7 against 55.6 and 60.8; the vCPU's
+time in the guest 23.41 s against 23.51 and 24.26). Without it, six rounds of each candidate against `main` and
+631b26a3 in the same rounds: `main` 10.66 / 3.29; 631b26a3 10.91 / 3.34; the inlining alone 11.07 / 3.36; both 10.72 /
+3.29. The inlining alone measured 10.90 against 631b26a3's 11.05 in an earlier set; wall time between sets of rounds
+moves by 1-2%, more than the inlining's share, so its effect rests on the accounting above. Both are kept.
+
+**The fix against `main`** (6a498f33), the standing 11 benchmarks, warm runs, two interleaved rounds per vCPU count,
+same image, kernel and settings, no run contended. Seconds: median (lowest to highest).
+
+| Benchmark | `main`, 1 vCPU | fix, 1 vCPU | fix/`main` | `main`, 4 vCPUs | fix, 4 vCPUs | fix/`main` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `build` | 5.98 (5.91-6.06) | 5.97 (5.92-6.02) | 1.00 | 2.29 (2.25-2.33) | 2.28 (2.25-2.30) | 0.99 |
+| `zstd` | 2.49 (2.42-2.55) | 2.49 (2.45-2.54) | 1.00 | 1.13 (1.12-1.13) | 1.17 (1.15-1.19) | 1.04 |
+| `hackbench` | 10.72 (10.60-10.84) | 10.51 (10.46-10.56) | 0.98 | 3.44 (3.44-3.45) | 3.37 (3.22-3.51) | 0.98 |
+| `locks` | 3.31 (3.27-3.35) | 3.32 (3.30-3.34) | 1.00 | 5.90 (5.74-6.07) | 5.78 (5.74-5.83) | 0.98 |
+| `luajit` | 3.03 (2.99-3.08) | 3.09 (3.09-3.10) | 1.02 | 1.11 (1.08-1.14) | 1.10 (1.07-1.14) | 1.00 |
+| `luajit-interp` | 3.33 (3.32-3.34) | 3.33 (3.31-3.35) | 1.00 | 0.91 (0.89-0.93) | 0.91 (0.90-0.92) | 1.00 |
+| `mem` | 6.81 (6.77-6.84) | 6.81 (6.79-6.83) | 1.00 | 2.13 (2.10-2.16) | 2.14 (2.14-2.15) | 1.01 |
+| `cray` | 2.99 (2.98-2.99) | 2.99 (2.97-3.02) | 1.00 | 0.99 (0.97-1.01) | 1.01 (1.00-1.01) | 1.02 |
+| `7zip` | 3.27 (3.23-3.30) | 3.25 (3.25-3.26) | 1.00 | 1.38 (1.36-1.41) | 1.39 (1.37-1.41) | 1.01 |
+| `sqlite` | 6.04 (5.95-6.13) | 6.03 (6.02-6.04) | 1.00 | 6.14 (6.13-6.16) | 6.14 (6.14-6.15) | 1.00 |
+| `avx` | 8.01 (7.92-8.09) | 8.01 (7.98-8.04) | 1.00 | 3.03 (2.99-3.06) | 3.05 (3.04-3.06) | 1.01 |
+| geometric mean | | | 1.000 | | | 1.002 |
+
+`zstd` at 4 vCPUs (4%) is the one ratio outside the spread of two rounds; it is no system-call workload, and checkpoint
+A's three rounds had it equal (1.17 both). `luajit` at 1 vCPU, 2%, the same.
+
+**CPython** (`io5-solo`, new in the bench family: the Debian cloud-image workload, then `./configure` and `make -j4` of
+CPython 3.13 again alone, 4 vCPUs, `mitigations=off`; seconds of the solo steps): `main` 55.8 and 88.2 (one run);
+631b26a3 55.9 and 88.5 (one run); the fix 55.3 and 88.0, 55.8 and 86.9 (two runs). CPython never showed the regression:
+it makes far fewer system calls per second of guest time than hackbench. (The owner's recorded `main` figures, 58.4 s
+and 95.1 / 93.8 s, came from the older pool script; this setup is about 5% faster on both builds, so `main` was run here.)
+
+**Tests** on the fix: `tests/unit` (1,344 passed), `tests/static` stack and barriers, `tests/diag`, `tests/system -k
+compat32`, `tests/smp -k system`, `tests/correctness -k i386` (126 passed, 18 expected failures, the x87 ones).
+
+**What remains.** Nothing measurable: hackbench and locks are at `main` at both vCPU counts. A lead for later, not
+measured: the fast path still computes `code_context` twice per system call, longer since task 3a (in 64-bit code one
+more branch skips the null-segment bits); a context kept per CPL change would remove both.
+
 ## Not done
 
 - **Speed** (task 4): nothing was measured or tuned.
