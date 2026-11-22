@@ -1,11 +1,10 @@
 # The boot-time interpreter's per-instruction cases: format and references
 
-Status: November 22, 2026. The reference side runs and is locked (`tests/interp`, case `references`). natemu's program
-driver sets a case's state directly (its machine descriptions, below) and natemu's runner is written
-(`run_interp_natemu.py`), but natemu does not run the corpus yet: the resident runs no 16- or 32-bit state until the
-interpreter is integrated (its `start()` halts on one), so the corpus case is not registered; case `natemu-machine` runs
-the driver's machine descriptions in 64-bit mode. This page is the contract between the generator, the reference rig and
-the natemu side (M2 Part 2, plan section 8, "Per-instruction cases in each mode").
+Status: November 22, 2026. The reference side runs and is locked (`tests/interp`, case `references`). natemu runs the
+corpus in its interpreter (case `natemu`, below): 1,574 of the 1,716 cases match their answers, and the other 142 stop
+at a resident operation not built yet (protected-mode far JMP 25, far RET 11, segment loads 38, MOV to CR 68), each
+listed in `tests/interp/natemu-pending.txt` (M2 Max, run 20261122-052809-a4eb). This page is the contract between the
+generator, the reference rig and the natemu side (M2 Part 2, plan section 8, "Per-instruction cases in each mode").
 
 ## What there is
 
@@ -16,7 +15,8 @@ the natemu side (M2 Part 2, plan section 8, "Per-instruction cases in each mode"
 | `tests/interp/interp_rig.py` | The capture blobs, the image (stub + case table), the two references, parsing, each case's answer. |
 | `tests/interp/run_interp_ref.py` | The `references` case: the checks below, from the lock (or, seeding, from the references). |
 | `tests/interp/tests.lock` | Every case's two answers, inline (`[answers]`, `tools/reference/answers.py`). |
-| `tests/interp/run_interp_natemu.py` | natemu's side: each case as a machine description through the program driver, judged against the lock; `--selftest`, case `natemu-machine`. |
+| `tests/interp/run_interp_natemu.py` | natemu's side: each case as a machine description through the program driver, judged against the lock (case `natemu`); `--selftest`, case `natemu-machine`: descriptions with the fields they must leave, in 64-bit and interpreted modes. |
+| `tests/interp/natemu-pending.txt` | The cases that stop at a resident operation the interpreter has not built yet. |
 
 The corpus covers exactly section 1's first-version list in R, P32 and C32, the P16 stretch, and the transitions R → P16,
 R → P32, P16 → R, P32 → C32, P32 → 64-bit, C32 → P32 and C32 → 64-bit: 1,716 cases (case `references`, the generator at
@@ -117,11 +117,13 @@ CR3, CR4 (low 32 bits), EFER, `gdtr` and `idtr` as [limit, low 32 bits of the ba
 `interp_rig.fields()`. The runner projects them with the case's masks (`interp_rig.project`) and compares per answer
 field: `by` absent → the locked QEMU answer (equal to KVM's), `qemu` or `kvm` → that one, `profile` → not here.
 
-What the integration has to switch on: the driver answers a stop at a translation request for its address
-(`execution::Hook::at`, with blocks ending before it), which is RIP in 64-bit code; the interpreter must ask the same hook
-with CS.base + EIP before it decodes an instruction there (a `REQUEST_DECODE` at a stop is answered with the stop, as a
-translation request at one is, and is never cached), and then register the corpus as case `natemu` (argv in the
-runner's docstring).
+The driver answers a stop at a translation request for its address (`execution::Hook::at`, with blocks ending before
+it), which is RIP in 64-bit code; in the interpreted modes the host asks the same hook at CS.base + EIP at every
+`REQUEST_DECODE` before it decodes (a stop parks the vCPU), and ends the decode's run before the hook's next address, so
+the interpreter caches no record at a stop and asks again there. Case `natemu` runs every case (four at a time); a case
+listed in `natemu-pending.txt` must end in the typed stop `interp_unsupported` naming a resident operation not built yet
+(reported as unsupported, the harness's declared limit), and one that matches instead is an unexpected pass (remove it
+from the list); every other case must match.
 
 ## The references and the rig
 
@@ -158,8 +160,8 @@ and mixed, in every mode: a reference that changed them would fail there.
 
 ## The checks (case `references`) and seeding
 
-`tools/natemu-test run tests/interp -k references`: no VM starts (`natemu-machine`, the family's other case, runs
-natemu's program driver). The corpus is generated; per case both locked answers must exist,
+`tools/natemu-test run tests/interp -k references`: no VM starts (`natemu` and `natemu-machine`, the family's other
+cases, run natemu's program driver). The corpus is generated; per case both locked answers must exist,
 agree on every field both answer, stop at `expect_stop`, and an empty case's must be its starting state. A changed case
 has a new hash and no answer: the case reports it as not seeded.
 

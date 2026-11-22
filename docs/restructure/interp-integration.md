@@ -1,112 +1,114 @@
-# The boot-time interpreter in the resident: integration design
+# The boot-time interpreter in the resident
 
-Status: November 22, 2026, design (M2 Part 2, after B1 (b); plan sections 3-5 are the spec). Scope: everything
-`natemu_abi::interp::exec::step` executes plus CPUID, RDMSR/WRMSR, LGDT/LIDT, WBINVD (CLI, CLD are the core's) and MOV
-from CR0/CR2/CR3/CR4 (trivial). Typed stops for now, the next task's: protected-mode far JMP/RET and MOV Sreg, MOV to CR,
-HLT, the hand-off to 64-bit code. INIT and SIPI are the parallel task's.
+Status: November 22, 2026, built (M2 Part 2, after B1 (b); plan sections 3-5 are the spec). Scope: everything
+`natemu_abi::interp::exec::step` executes, plus CPUID, RDMSR, WRMSR, WBINVD, LGDT, LIDT and MOV from CR0/CR2/CR3/CR4
+(CLI and CLD are the core's). Typed stops for now, the next step's: protected-mode far JMP/RET and MOV Sreg, MOV to
+CR, HLT, the hand-off to 64-bit code. INIT and SIPI are the parallel CPU start-up work's. Code:
+`crates/runtime/src/execution/interpret.rs`.
 
 ## The loop (`interpret::run`)
 
-One instruction per pass, until `Cpu::interpreted_mode()` is `None` (then it returns to `find_from`'s loop, which
-`boundary` already continues; `start` calls `run`, then `dispatch`):
+One instruction per pass, until `Cpu::interpreted_mode()` is `None`; it then returns to `find_from`'s loop (through
+`boundary`), or `start` dispatches.
 
-1. `rip &= 0xffff_ffff`; `io_checkpoint`, `take_invalidations`, `lapic::poll` (find's order).
-2. Debug: a pending trap (`State::debug & TRAP` but `INTERPRET`), TF, or any DR7 enable: typed stop `interp_debug`.
-3. Events: `interpret::events`, the one place (the INIT/SIPI task extends it): `events::interpreted(s)` is `next()`
-   without the shadow test and without taking anything; any event (NMI, maskable interrupt with IF = 1, ExtINT) is a
-   typed stop `interp_event` naming kind and vector, left pending.
-4. Mode support: protected mode at CPL ≠ 0, or CR0.PG without EFER.LMA (legacy/PAE paging), or `Cpu::paging()` `None`
-   with PG set: typed stop `interp_mode`.
-5. The record at linear = CS.base + EIP (wrapping at 32 bits): a cached one whose bytes still match (below), else a
-   decode; then `exec::step` on a copy of `s.cpu` (the memory layer borrows `s`), written back on `Done`; a resident
-   operation (below); an `Exit` is a typed stop.
+1. `rip &= 0xffff_ffff`; `io_checkpoint`, `take_invalidations`, `lapic::poll`: `find`'s order.
+2. Both shadows cleared (the interpreter sets and honours none). A pending trap (`State::debug & TRAP` but
+   `INTERPRET`), RFLAGS.TF or any DR7 enable: typed stop `interp_debug`.
+3. Events: `interpret::events` is the one place they are read. It calls `events::undelivered` (`find`'s `next`, nothing
+   taken) and turns any event into the typed stop `interp_event` (`event_stop`: kind and vector), left pending. The
+   CPU start-up work's `events::interpreted` (which takes INIT itself) replaces that one call.
+4. Mode: protected mode at CPL > 0, paging without EFER.LMA, or paging controls `Cpu::paging` refuses: `interp_mode`.
+5. The record at linear = CS.base + EIP (32-bit wrap): a cached one whose bytes still match, else a decode; then
+   `exec::step` on a copy of the bank (the memory layer borrows the record), written back on `Done` (RF cleared).
 
-Resident operations: CPUID, RDMSR, WRMSR, WBINVD through the existing `transaction` with a `System { kind, length }`
-(no delivery: `Err` is a fault stop; its `commit` sets `debug::INTERPRET` through `ends_in_mode`, which the loop clears,
-and advances RIP with the 32-bit wrap `exec::complete` has); LGDT/LIDT set GDTR/IDTR from the core's operands;
-MOV from CR writes the register (CR other than 0, 2, 3, 4: #UD). The rest: `interp_unsupported`.
+Resident operations: CPUID, RDMSR, WRMSR, WBINVD through the existing `transaction` (`#[inline(always)]` now: out of
+line it put a call on the fast system-call path, `system`; with it `system` is unchanged), its `Err` a fault stop with
+nothing committed, its `commit`'s `debug::INTERPRET` cleared; LGDT/LIDT set GDTR/IDTR from the core's operands; MOV from
+CR writes the register (other CR numbers #UD). The rest: `interp_unsupported` with the operation's detail.
 
 ## Fetch
 
-Each byte at EIP + k must lie within the CS limit (#GP(0) past it); no execute-right check. Paging off: the identity
-(`fetch_unpaged`, guest RAM only). Compatibility mode: a fetch walk with `s.cpu.paging()` (CPL 0; `fetch_walk` keeps
-its `controls` halt). A decode fetches to the end of the page, into the next page only when fewer than 15 bytes remain
-(at most 15 in all then), at most 240, straight into the staging `Decode`; it stops at the first byte it cannot fetch
-and remembers why (#GP(0), #PF with its error code and CR2, or not RAM: a typed stop `interp_memory`). Validation
-fetches the record's `length` bytes the same way. The request goes out even with 0 bytes, so the host's stop answer
-comes before a fetch fault there.
+Each byte at EIP + k inside the CS limit (#GP(0) past it; no execute-right check), through the current translation
+(paging off: the identity; compatibility mode: a fetch walk with `cpu.paging()`, CPL 0; `fetch_walk` keeps its halt),
+from guest RAM only (else `interp_memory`, detail fetch). A page's walk is made only when a byte of it is wanted. A
+decode fetches to the end of RIP's page (at most 240 bytes), stopping short at the first byte it cannot fetch and keeping
+that byte's stop; only when the first instruction is truncated does it fetch the next page, up to 15 bytes in all, and
+ask again; a fault there, or past the CS limit, is raised only for an instruction that reaches it. The request goes out
+even with no byte fetched, so the host's stop answer comes before a fetch fault there. Validation fetches the record's
+`length` bytes the same way.
 
 ## Records
 
-Placed with the cache's `file` as `SYSTEM | INTERPRETED`, the `Insn` (56 bytes) as the tail, keyed by the linear
-address and `interpreted_key(cpu)` = `interpreted_context(mode, cpl)` | CS.D << 5 (real mode's decode depends on CS.D,
-which the mode does not hold), `source_gpa` unused (on no page chain: no code-write mark). Found with a new
-`cache::interpreted_at(linear, key)`, an L2 probe that ignores currency, and validated by comparing `bytes[..length]`
-with a fresh fetch at every execution: equivalent to fetching every time, through the current translation, with the CS
-limit (so `revalidated_unpaged` goes: deviation from section 5's "through `lookup` and `revalidated`"). A mismatch, or a
-fetch failure, decodes again; a fresh decode's first record executes from the reply without validation (no livelock),
-and each record of the run replaces the tail of the record at its key in place, or is filed. Stop records (UD, TOO_LONG,
-OTHER) are not cached. Full arena: `flush` and file again, as `find` does. The reply is checked as the contract says
-(well formed, its bytes those sent at its position, lengths within `available`), else `bad_reply`.
+Filed with the cache's `file` as `SYSTEM | INTERPRETED`, the `Insn` (56 bytes) as the tail
+(`cache::place_interpreted`), keyed by the linear address and `interpreted_key(cpu)` = `interpreted_context(mode, cpl)` |
+CS.D << 5 (the decode depends on CS.D, which real mode's classification does not hold), no source page (no page chain,
+no code-write mark). Found by `cache::interpreted_at`, its own L2 probe that ignores currency (the translated blocks'
+`lookup` and `cached_at` are not called, so their code is unchanged), and validated by comparing `bytes[..length]` with a
+fresh fetch at every execution: as fetching every time, through the current translation and the CS limit. This replaces
+section 5's "through `lookup` and `revalidated`" (`revalidated_unpaged` is gone). A mismatch or a failed fetch decodes
+again; the fresh decode's first record executes from the reply unvalidated (no livelock), and each record of the run
+replaces the tail of the record under its key or is filed. Stop records (UD, TOO_LONG, OTHER) are not cached. A full
+arena: `flush` and file again, as `find` does. Each reply record is checked (well formed, its bytes those sent at its
+position and zero after them, lengths within `available`), else `bad_reply`.
 
-Exclusion: the key has `INTERPRETED_CONTEXT` (bit 63), which no `code_context()` has, so `kept_system`, `sys_fast`'s
-lookup, `miss_fast`'s and `find_from`'s never find one; `cut`/`cut_one` see no INBOUND, out slots or L1 entry; `link`,
-`template`, `first_test_fires` and the host's block passes exclude SYSTEM. No hot path changes.
+Exclusion from translated code's paths: the key has `INTERPRETED_CONTEXT` (bit 63), which no `code_context()` has, so
+`kept_system`, `sys_fast`, `miss_fast` and `find_from` never find one; `cut`/`cut_one` find no INBOUND, out slot or L1
+entry; `link`, `template`, `first_test_fires` and the host's block passes exclude SYSTEM. Disassembly against the parent
+commit (release residents, literal and anonymous-symbol offsets aside): `find_from`, both `lookup` instances, `mapped`
+(with `revalidated` inlined), `revalidated_from_record`, `sys_fast`, `miss_fast`, `system`, `commit`, `set_cpl`,
+`translate`, `fetch_walk`, `segments::pages`, `enter`, `linker`, `step_here`, `cut_one`, `invalidate`, `current_at`,
+`kept_system` and `trap_due` identical; `cache::file` (placement) swaps two registers; `split_lock` inlines its
+`split_begin`, `mmio::ones` calls `mmio::page` out of line. Resident 240,164 -> 260,784 bytes.
 
-Stops (`Hook::at`): the host's `REQUEST_DECODE` handler asks `stop_at` and `hook.at` at the request's linear address
-first (a stop parks the vCPU, `REPLY_PARK`, as a translation does; a test hook's `At::System` there is an error) and
-ends the run before `hook.boundary(linear)` or `stop_at`, so no record is ever placed at a stop.
+Stops (`Hook::at`): the host's `REQUEST_DECODE` handler asks `stop_at` and `hook.at` at CS.base + EIP first (a stop parks
+the vCPU, `REPLY_PARK`; a test hook's `At::System` there is an error) and ends the run before `hook.boundary` or
+`stop_at` (`interp::run_to`), so no record is made for a stop's address.
 
 ## Memory layer (`interpret::Mem`, layers 2-5)
 
-`check(linear, size, write)`: each page touched (the first walked at `linear`, so CR2 is exact): paging off
-`unpaged_pages`, compatibility mode a walk like `segments::pages` with `s.cpu.paging()` (#PF with the walker's error
-code, A/D set by CAS, the memory-type barrier); then the class: RAM (`mmio::ram`); a device (the LAPIC page, a claimed
-page, or the host's `REQUEST_PAGE` answer `claimed`): `Exit::Stop`, the guest-physical page kept for the report;
-unassigned (the legacy hole among them): reads all-ones, writes ignored; `split_wait`. Up to four pages are kept per
-instruction for `read`/`write`/`compare_exchange`, which find their page there (a miss is an interpreter bug: a halt).
-Nothing commits before every check of the instruction (the core's order). Accesses: 1 byte; 2 or 4 bytes inside 16 bytes
-as one Arm access (aligned or not: `ldrh/ldr/strh/str` by inline asm; FEAT_LSE2); crossing 16 bytes byte by byte (the
-existing tearing deviation); across pages in two parts. Stores: `code_write` first when `cache::translated(gpa)`, then
-`dsb ish`, then `cache::rechecked` (as `copy`). LOCK: `casal{b,h}` on the alias inside 16 bytes; crossing 16 bytes under
-`cache::split_begin`/`split_end` (read, compare, write), as `split_lock`.
+`check(linear, size, write)`: every page touched is translated first (the first walked at `linear`, so CR2 is exact;
+paging off the identity, wrapping at 4 GiB; compatibility mode the walk, A/D by CAS, #PF with the walker's error code),
+then classified: RAM (`mmio::ram`, with the memory type's barrier as `segments::pages`); a device's page
+(`mmio::unassigned`: the LAPIC page, a remembered claim or the host's `REQUEST_PAGE` answer): `interp_memory` with the
+page; unassigned (the legacy hole among them): reads all-ones, writes ignored; then `split_wait`. Up to four pages per
+instruction are kept for `read`/`write`/`compare_exchange` (a miss is an interpreter bug: a halt). 1, 2 or 4 bytes inside
+16 are one Arm access (inline `ldr`/`str`, aligned or not: FEAT_LSE2), byte by byte across 16 (the existing tearing
+deviation); stores follow `segments::copy`'s code-write protocol (`code_write` when translated, `dsb ish`,
+`rechecked`). LOCK: `casal{b,h}` inside 16 bytes, else (or on unassigned bytes) read-compare-write under
+`cache::split_begin`/`split_end`, as `split_lock`.
 
 ## Typed stops
 
-New codes, numbered apart: `interp_fault` (80), `interp_unsupported` (81), `interp_memory` (82), `interp_event` (83),
-`interp_debug` (84), `interp_mode` (85). The record, nothing committed (RIP at the instruction): `State::native[0]` =
-the interpreted mode | op << 8 | bytes << 16 | detail << 24 (event kind, memory kind), `native[1..3]` the instruction's
-bytes (the record's, or those fetched); `State::fault` = [vector, CR2, error code, RIP] for a fault, [vector, linear,
-guest-physical page, RIP] for memory, vector and kind for an event. The host's report (`diag::report`) adds a line with
-these: mode, bytes, op, the exception or what stopped it.
+`interp_fault` (80), `interp_unsupported` (81), `interp_memory` (82), `interp_event` (83), `interp_debug` (84),
+`interp_mode` (85), the record in `exec::stop::INTERP_FAULT`'s documentation: `State::native[0]` = mode | op << 8 | bytes
+<< 16 | detail << 24, `native[1..3]` the bytes; `State::fault` = [vector, CR2, error code, RIP] for a fault, [0, linear,
+page, RIP] for memory, [vector, ...] for an event or the DR6/DR7 bits. Nothing is committed (RIP at the instruction). The
+program driver reports `fault` for these stops; the host's report (`diag::report`) adds a line naming the mode, bytes,
+operation and record.
 
-`debug::INTERPRET` (DR6 bit 12) stays out of the guest: DR6 is written from `State::debug` only in `debug_exception`
-(`trap_due`'s path, after its INTERPRET test returns, and `code_break` with no bits), MOV DR6 masks bit 12 (reserved),
-and the interpreter delivers no #DB and runs no MOV DR (typed stops). Belt and braces: `debug_exception` masks it.
+`debug::INTERPRET` (DR6 bit 12) stays out of the guest: DR6 is written from `State::debug` only in `debug_exception`,
+reached through `trap_due` after its INTERPRET test returns and through `code_break` with no bits; MOV to DR6 masks the
+reserved bit 12; the interpreter delivers no #DB and runs no MOV DR (typed stops). `debug_exception` also masks the bit.
 
 ## Stack
 
-The interpreter's body starts at 12,864 bytes under the deepest gate path. `EXCEPTION_STACK_TOP` moves to 0x70000 and
-its reservation grows from 32 KiB to 80 KiB (0x5C000-0x70000, the free 0x64000-0x70000 taken; the host's span and the
-static check read both from the sources): its bound with the nested entry may then be 61,440 bytes, against about
-28,000 expected. Its own commit, with the replay and stack checks; the numbers come from case `stack`.
+The exception stack is 80 KiB (0x5c000-0x70000, its own commit). Static case `stack` (M2 Max, run
+20261122-053137-98b3): the deepest gate path now runs through the interpreter with a transaction under it (`run`'s frame
+2,960 bytes, the transaction inlined into it), 20,960 bytes, 25,296 with the nested entry, of 61,440 allowed (36,144
+headroom beyond the 25% reserve); boot 11,072 of 24,576.
 
-## Files
+## Cases
 
-abi: `lib.rs` (stack top), `execution.rs` (stop codes, names, `interpreted_key`, the stop record), `interp.rs` (doc).
-resident: `execution/interpret.rs` (loop, fetch, decode request, records, `Mem`, resident operations, stops),
-`cache.rs` (`place_interpreted`, `interpreted_at`, `interpreted_of`, in-place replacement), `execution/events.rs`
-(`interpreted`), `execution/mmio.rs` (a non-RAM page's class), `execution.rs` (`debug_exception`'s mask). host:
-`execution.rs` (stack span; the decode handler's stop and boundary), `interp.rs` (the run's byte limit),
-`execution/diag.rs` (the stop's report). tests: `tests/interp/family.toml` and `run_interp_natemu.py` (the natemu cases,
-with the list of those that stop for now; typed-stop self-tests), `docs/restructure/interp-cases.md`.
+Case `natemu` (M2 Max, run 20261122-052809-a4eb): 1,574 of the 1,716 corpus cases match their answers; the other 142
+stop at a resident operation not built yet (far JMP 25, far RET 11, segment loads 38, MOV to CR 68), listed in
+`tests/interp/natemu-pending.txt`. Case `natemu-machine` adds 12 interpreted-mode self-tests: an unaligned LOCK XADD and
+LOCK BTS inside 16 bytes (FEAT_LSE2 at EL1: no alignment fault) and a LOCK XADD across 16 bytes; an instruction ending
+at a page end before an unmapped page, one crossing into it (#PF, CR2 the page, error 0); an instruction ending at the CS
+limit, the byte after it and one crossing it (#GP(0)); unassigned and device pages; self-modifying code; three typed
+stops.
 
 ## Risks
 
-- Stack: the interpreter calls `transaction` (6,880 bytes deep) under the deepest gate path; the bigger reservation
-  is the remedy; checked by case `stack`.
-- LSE2: an unaligned `casal` inside 16 bytes not faulting is inferred from translated code's contract (`split_lock`
-  handles only accesses crossing 16 bytes); if wrong, the resident halts loudly (an EL1 alignment fault).
 - Unassigned pages cost a host exit per access (`REQUEST_PAGE`, no cache); MTRRs off (power-on) make every access UC,
   a barrier each. Boot code rarely touches either.
 - A decode exit per new instruction (runs of up to 16 cut that); a stub page shared with translated code pays the
@@ -115,4 +117,3 @@ with the list of those that stop for now; typed-stop self-tests), `docs/restruct
   watchdog is a forced stop.
 - Hook stops must be static (the program driver's are): a record cached before a hook appears at its address would
   pass it.
-- The INIT/SIPI task edits `events.rs` beside `interpreted` and `interpret::events`: a merge, not a conflict of design.

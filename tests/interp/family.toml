@@ -1,8 +1,7 @@
 # The boot-time interpreter's per-instruction cases (docs/restructure/interp-cases.md): the generated corpus, its two
 # references (the pinned QEMU's TCG and the x86 machine under KVM) and their checks. The `references` case compares the
-# locked answers only: nothing starts a VM. natemu does not run the corpus yet (the resident runs no 16- or 32-bit state
-# until the interpreter is integrated); its runner is run_interp_natemu.py, which the integration registers as case
-# `natemu` (that script's docstring). `natemu-machine` runs the program driver's machine descriptions in 64-bit mode today.
+# locked answers only: nothing starts a VM. `natemu` runs the corpus in natemu's interpreter (run_interp_natemu.py) and
+# `natemu-machine` the program driver's machine descriptions with their expected fields, in 64-bit and interpreted modes.
 [family]
 name = "interp"
 covers = ["tests/interp/**", "tests/lib/testenv.py", "tools/reference/answers.py", "tools/correctness/recipes/common.sh",
@@ -21,9 +20,18 @@ params = { timeout = 1800 }
 argv = ["tests/interp/run_interp_ref.py", "--out", "{out}"]
 smoke = true
 
-# The program driver's machine descriptions (the corpus's form: state set directly, physical memory, stops, readback) in
-# 64-bit mode, which the resident runs today: a landing stop, the first-instruction stop, the `machine` fields.
+# The program driver's machine descriptions (the corpus's form: state set directly, physical memory, stops, readback)
+# with the fields each must leave: in 64-bit mode (translated code: a landing stop, the first-instruction stop, the
+# `machine` fields) and in the interpreted modes (the interpreter's memory, fetch and typed stops; run_interp_natemu.py).
 [suite.cases."natemu-machine"]
-argv = ["tests/interp/run_interp_natemu.py", "--selftest", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}",
-        "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/interp/run_interp_natemu.py", "--selftest", "--jobs", "4", "--host", "{natemu_host}", "--runtime",
+        "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4 }
 smoke = true
+
+# The corpus in natemu's interpreter against the locked answers; the cases listed in natemu-pending.txt stop at a
+# resident operation not built yet (each must stop there, the typed stop naming it).
+[suite.cases."natemu"]
+argv = ["tests/interp/run_interp_natemu.py", "--pending", "tests/interp/natemu-pending.txt", "--jobs", "4", "--host",
+        "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4 }
