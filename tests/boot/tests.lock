@@ -1,61 +1,61 @@
 # Written by `natemu-test lock`; do not edit (docs/testing.md).
-[answers.2be9aff9ab4d938fd2c63a32639de586eab745c081535bb57fb614fbb47ea98d]
-repro = "746e2e954c00 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+[answers.189fe124cbff3dc55e8128370a158c71ef7a6cc0684d008cdfa1b0066174f1db]
+repro = "b0296114bc05 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
+sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
+
+[answers.3b8fb709200ef037afa3431a86bd98df660a4f8f3ebdbc4ba0a43b3ca2cc48a9]
+repro = "f06f765e9c1a image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
+sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.4c13096beceb27ad54bfd753cd7fff585b09ecae0a7be9672b7b5d36292f5208]
+repro = "ce917e519f55 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
+sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.57f2616205f05ae6b4ac5da979fb7607c7dbb45238417c883f4077b6486d402e]
+repro = "b6fe72ac23d5 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
+sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
+
+[answers.7303aaef6a0bc404d2c4ed346bf9d2264aed2e8b36b4e811d3a9be71459ba4a1]
+repro = "09373697de79 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
+sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.7a8ecac916eb9a75edb36979eb21923681bd8114e7dc7a56aecd97fea9745d2f]
+repro = "3bee7048be91 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
+sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2,3 status=0\\n\"}"
+
+[answers.7b9d30caceec5e89495319740af137381ac546145d1eb3639d6a3e6e0a9efebe]
+repro = "746e2e954c00 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
 
-[answers.3779e9439408918c93a5efaad9ee11699c8693d6caa4e918e110c652f54b0cc4]
-repro = "ce917e519f55 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+[answers.a92e5356c6638130e86daf6f9c72e8d8cdd1a1f4c2cd75bf4fa5e8c855adf3b1]
+repro = "204ec1584718 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
-[answers.3cb204c432674f4309bd9a863beb0282cd9a4789bedf9d0001ffd3bbcc566574]
-repro = "3ab23c1da9ce image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
-sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
-value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
-
-[answers.5c4cd194c3e951ec9b3ed12c2379e65de52a966edcd2bad07f5e1c8a7f905b14]
-repro = "204ec1584718 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
-sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
-value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
-
-[answers.6e5de763a40887bf79a7cecb79139c8d12f074d10e441aed966e18eb063142eb]
-repro = "55ea89e4415a image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+[answers.b5890ee3983aaa6d8532ce864badc8cccbe68ec1ddcb0a1049084efac675aac5]
+repro = "55ea89e4415a image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
-[answers.79d33673908be2d5e1cef619135b386967aefd86f15fe0ed61d0c4dbb6855efa]
-repro = "f06f765e9c1a image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
-sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
-value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
-
-[answers.7ca6e8f0e9df501b816ca5377cc3b3216433423dfbcc8a85a87b46be385aa84b]
-repro = "3bee7048be91 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
-sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
-value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2,3 status=0\\n\"}"
-
-[answers.9dd954a68a621f0ec1015b92749d32229f65fdbad2fdae9d5fcb01ce3a8e0059]
-repro = "09373697de79 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+[answers.b6f104f756f872e017cc9008ac7e8a7bfaaf614c0776003e6bee2e1b27c9158b]
+repro = "3ab23c1da9ce image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
-[answers.a9a0d6ac3e159d1209420d518e777a61c7b2b46965865d700d3550de5f2072fd]
-repro = "e0719a150e0e image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+[answers.c8a0cd5d56338c98ae7b8c6eabaecbec07a1754d9d18936e889b69f059920596]
+repro = "e0719a150e0e image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2,3 status=0\\n\"}"
 
-[answers.bad8696759d85fe1a5a18570fa41c09cffde5125ab5783f4fd62364e9cda6502]
-repro = "b0296114bc05 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
-sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
-value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
-
-[answers.ea423cbcbe823098f3307c92b9979c660fac596b19540581a366307fa0c34740]
-repro = "b6fe72ac23d5 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
-sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
-value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
-
-[answers.fdcbaf1bbefce8b7606fae6d9a3e3d7a67021108cf102780bc7ade7b5d7b3fdf]
-repro = "1dd1f68546bd image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+[answers.cd617ce2b5a0b707c4c60da4729a3901932f3d6eeefffc2f5b5a50cea32d8089]
+repro = "1dd1f68546bd image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
 

@@ -28,6 +28,7 @@ sys.path[:0] = [str(ROOT / 'tools' / 'bench' / 'smp'), str(ROOT / 'tools' / 'ref
 import smp, answers  # noqa: E402
 
 CPUS = (1, 2, 4)
+AP_BASE = 0x8000                                # exit_ap.inc's stub page (SIPI vector 08H)
 FW_SIZE = 0x10000                               # at 4 GiB - FW_SIZE
 BODY = smp.LOW                                  # the program's body (110000H), its start RIP 1000H further
 START = BODY + 0x1000
@@ -98,9 +99,11 @@ def expected_registers(n):
     return g, 0x44
 
 
-def judge(variant, n, ans):
-    """Differences between an answer and what N CPUs must give (empty: pass)."""
-    d = [] if ans.get('exit') == 1 else [f"QEMU exit {ans.get('exit')} (want 1: the debug exit)"]
+def judge(variant, n, ans, want_exit=1):
+    """Differences between an answer and what N CPUs must give (empty: pass). `want_exit`: how the run must end, QEMU's
+    exit status 1 (the debug exit) on the references; a natemu case passes its own (the `poweroff` stop for the
+    firmware, the end reached for the program)."""
+    d = [] if ans.get('exit') == want_exit else [f"exit {ans.get('exit')} (want {want_exit})"]
     if variant == 'firmware':
         if ans.get('serial') != expected_serial(n): d.append(f"COM1 {ans.get('serial')!r} != {expected_serial(n)!r}")
         return d

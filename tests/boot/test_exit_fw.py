@@ -8,17 +8,21 @@ import pytest
 
 import run_exit_fw as fw
 
-# Plan section 1's first version, by ndisasm's mnemonics: every other instruction stops the interpreter.
-ALLOWED = {
+# Plan section 1's first version, by ndisasm's mnemonics: every other instruction stops the interpreter. The sixteen
+# conditions as ndisasm names them (70H-7FH, 0F 80H-8FH).
+JCC = {'jo', 'jno', 'jc', 'jnc', 'jz', 'jnz', 'jna', 'ja', 'js', 'jns', 'jpe', 'jpo', 'jl', 'jnl', 'jng', 'jg'}
+ALLOWED = JCC | {
     'mov', 'movzx', 'lea',
     'add', 'or', 'adc', 'sbb', 'and', 'sub', 'xor', 'cmp', 'test', 'inc', 'dec', 'shl', 'shr', 'sar',
     'bt', 'bts', 'btr', 'btc', 'xadd',
-    'ja', 'jae', 'jb', 'jbe', 'jc', 'jnc', 'jz', 'jnz', 'jo', 'jno', 'js', 'jns', 'jpe', 'jpo', 'jl', 'jnl', 'jg', 'jng',
     'jmp', 'loop', 'call', 'ret', 'retf', 'retfd',
     'push', 'pop', 'pushf', 'pushfw', 'pushfd', 'popf', 'popfw', 'popfd',
     'lgdt', 'lidt', 'rdmsr', 'wrmsr', 'cpuid',
     'cli', 'cld', 'hlt', 'pause', 'wbinvd', 'nop',
 }
+HEX = r'0x[0-9a-f]+'
+# JMP short and near (relative), far JMP ptr16:16 and ptr16:32, far JMP m16:32; CALL near (relative) only.
+JMP = re.compile(rf'jmp {HEX}|jmp word {HEX}:(word|dword) {HEX}|jmp dword far \[[^]]*\]')
 PREFIXES = {'o16', 'o32', 'a16', 'a32', 'lock'}
 SREGS = {'cs', 'ds', 'es', 'ss', 'fs', 'gs'}
 
@@ -49,7 +53,10 @@ def refused(text, bits):
     if op == 'mov' and any(re.fullmatch(r'cr\d+', w) and w not in ('cr0', 'cr3', 'cr4') for w in rest): return 'only CR0, CR3, CR4'
     if op == 'mov' and any(re.fullmatch(r'[dt]r\d+', w) for w in rest): return 'debug and test registers'
     if op == 'xadd' and 'lock' not in prefixes: return 'XADD only with LOCK'
-    if op == 'call' and (':' in text or 'far' in rest): return 'far CALL'
+    body = ' '.join([op, *rest])
+    if op == 'jmp' and not JMP.fullmatch(body): return 'only relative, ptr16:16, ptr16:32 and m16:32 JMPs'
+    if op in JCC | {'loop', 'call'} and not re.fullmatch(rf'{op} {HEX}', body): return f'{op}: relative forms only'
+    if op in ('ret', 'retf', 'retfd') and rest: return 'RET with an immediate'
     if op == 'retf' and bits == 16: return 'far RET only with a 32-bit operand size'   # ndisasm: 16-bit retf; o32: retfd
     if op in ('push', 'pop') and (set(rest) & SREGS or any('[' in w for w in rest)): return 'PUSH/POP of a register or immediate only'
     return None
@@ -89,12 +96,30 @@ def test_16_and_32_bit_code_uses_only_first_version_instructions(images, variant
     assert all(counts.values()), counts
 
 
+def test_an_ap_counts_only_from_64_bit_mode(images, tmp_path):
+    """The AP's arrival byte and counter updates are RIP-relative: the same bytes run as 32-bit code (an AP left in
+    compatibility mode or 32-bit mode after its far jump) address neither, so such an AP never arrives."""
+    for im in images.values():
+        s = im['symbols']
+        code, at = fw.region(im, 'ap64', 'ap_gdt')
+        to_page = lambda a: a - s['ap_src'] + fw.AP_BASE
+        as64 = [t for _, _, t in disassemble(code, to_page(at), 64, tmp_path)]
+        assert f"lea rax,[rel {to_page(s['ap_arrivals']):#x}]" in as64, as64
+        assert f"lock inc dword [rel {to_page(s['ap_count']):#x}]" in as64, as64
+        as32 = ' '.join(t for _, _, t in disassemble(code, to_page(at), 32, tmp_path))
+        for name in ('ap_arrivals', 'ap_count'):
+            assert f'{to_page(s[name]):#x}' not in as32, (name, as32)
+
+
 def test_the_instruction_check_refuses_what_the_first_version_lacks(tmp_path):
     """Negative control: forms outside section 1's list, as nasm assembles them, are refused."""
     src = tmp_path / 'bad.asm'
     cases = {16: ['in al, dx', 'out dx, al', 'rep movsb', 'mov eax, cr2', 'mov eax, dr7', 'iret', 'sti', 'push ds',
-                  'call 0x10:0x20', 'retf', 'xadd [bx], ax', 'mul ecx', 'int 0x10', 'lmsw ax', 'pusha', 'xchg ax, bx'],
-             32: ['in al, dx', 'movsd', 'o16 retf', 'pop dword [eax]', 'ltr ax', 'rol eax, 1', 'div ecx', 'leave']}
+                  'call 0x10:0x20', 'retf', 'xadd [bx], ax', 'mul ecx', 'int 0x10', 'lmsw ax', 'pusha', 'xchg ax, bx',
+                  'call ax', 'call [bx]', 'call far [bx]', 'jmp ax', 'jmp [bx]', 'jmp far [bx]', 'ret 4', 'retf 4',
+                  'jcxz $', 'loope $'],
+             32: ['in al, dx', 'movsd', 'o16 retf', 'pop dword [eax]', 'ltr ax', 'rol eax, 1', 'div ecx', 'leave',
+                  'jmp eax', 'jmp [eax]', 'jmp word far [eax]', 'call eax', 'retf 4', 'ret 8', 'jecxz $']}
     for bits, lines in cases.items():
         for line in lines:
             src.write_text(f'bits {bits}\n{line}\n')
@@ -102,7 +127,12 @@ def test_the_instruction_check_refuses_what_the_first_version_lacks(tmp_path):
             subprocess.run(['nasm', '-f', 'bin', '-o', str(out), str(src)], check=True)
             (_, _, text), = disassemble(out.read_bytes(), 0, bits, tmp_path)
             assert refused(text, bits), f'{bits}-bit {line!r} ({text}) passed the check'
-    for bits, line in ((16, 'o32 retf'), (32, 'retf'), (32, 'lock xadd [eax], ecx'), (16, 'jmp dword 0x10:0x8032')):
+    jcc = ['jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js', 'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg']
+    good = [(16, 'o32 retf'), (32, 'retf'), (32, 'lock xadd [eax], ecx'), (16, 'jmp dword 0x10:0x8032'),
+            (16, 'jmp 0x10:0x20'), (16, 'jmp dword far [bx]'), (32, 'jmp far [eax]'), (32, 'jmp 0x8:0x806d'),
+            (16, 'jmp short $'), (32, 'jmp near $'), (16, 'call $'), (32, 'loop $'), (16, 'ret'),
+            *((b, f'{j} {w} $') for b in (16, 32) for j in jcc for w in ('short', 'near'))]
+    for bits, line in good:
         src.write_text(f'bits {bits}\n{line}\n')
         subprocess.run(['nasm', '-f', 'bin', '-o', str(tmp_path / 'ok.bin'), str(src)], check=True)
         (_, _, text), = disassemble((tmp_path / 'ok.bin').read_bytes(), 0, bits, tmp_path)
@@ -113,6 +143,7 @@ def test_the_instruction_check_refuses_what_the_first_version_lacks(tmp_path):
 def test_the_judges_pass_the_expected_answers_and_refuse_wrong_ones(n):
     good = {'exit': 1, 'serial': fw.expected_serial(n)}
     assert fw.judge('firmware', n, good) == []
+    assert fw.judge('firmware', n, {**good, 'exit': 'poweroff'}, want_exit='poweroff') == []
     for bad in ({**good, 'exit': 3}, {**good, 'serial': good['serial'].replace('status=0', 'status=1')},
                 {**good, 'serial': good['serial'].replace(f'aps={n - 1}', f'aps={n}')},
                 {**good, 'serial': good['serial'].splitlines(True)[1]}, {'exit': 1, 'serial': ''}):
