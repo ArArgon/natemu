@@ -388,9 +388,23 @@ def cases():
     c.append(('lret-cs-not-present',) + ret([0x110000, 0xc0]))
     c.append(('lret-noncanonical',) + ret([1 << 47, 0x08]))
     iret = lambda words: (pushes(words), '    iretq\n', lambda s: sm.iret(_stack(s, words)), {})
-    c.append(('jmp-far-compat',) + far(0x38) + (lambda s: sm.far(_ptr(s, 0x110000, 0x38), 'jmp', d + PTR + 0x90), {}))
+    # M2 Part 2: 64-bit kernel code to CPL-0 compatibility-mode code (0x38, 32-bit) completes and the boot-time interpreter
+    # runs it (refuse_compatibility's CPL-0 arm): there it sets EAX and comes back to 64-bit code, by a far JMP ptr16:32
+    # or by a 32-bit far RET (the interpreter's hand-off), and the program ends as QEMU's does (the body is position
+    # independent: both targets are stored at run time). An IRETQ there is refused.
+    back = '    lea rax, [rel {back}]\n    mov [{{p:#x}}+0xa0], eax\n    mov word [{{p:#x}}+0xa4], 0x08\n'
+    c.append(('jmp-far-compat', back.format(back='seg_b64') + '    lea rax, [rel seg_c32]\n    mov [{p:#x}+0x90], rax\n'
+              '    mov word [{p:#x}+0x98], 0x38\n',
+              '    jmp far [{p:#x}+0x90]\nbits 32\nseg_c32:\n    mov eax, 0x13572468\n    jmp far dword [{p:#x}+0xa0]\n'
+              'bits 64\nseg_b64:\n',
+              lambda s: sm.far(_ptr(s, 0x110000, 0x38), 'jmp', d + PTR + 0x90), {}))
     c.append(('jmp-far-call-gate',) + far(0xb0) + (lambda s: sm.far(_ptr(s, 0x110000, 0xb0), 'jmp', d + PTR + 0x90), {}))
-    c.append(('lret-compat',) + ret([0x110000, 0x38]))
+    c.append(('lret-compat', back.format(back='seg_b64r') + '    push 0x38\n    lea rax, [rel seg_c32r]\n    push rax\n',
+              '    o64 retf\nbits 32\nseg_c32r:\n    mov eax, 0x2468ace0\n    mov ecx, [{p:#x}+0xa0]\n    push 0x08\n'
+              '    push ecx\n    retf\nbits 64\nseg_b64r:\n',
+              lambda s: sm.ret(_stack(s, [0x110000, 0x38])), {}))
+    c.append(('iret-compat-cpl0', pushes([0x110000, 0x38, 2, P.STACK(0), 0x10]), '    iretq\n',
+              lambda s: sm.iret(_stack(s, [0x110000, 0x38, 2, P.STACK(0), 0x10])), {}))
     # Compatibility-mode code at CPL 3 that natemu does not run is its recorded deviation, judged by segment_model alone
     # (x86 runs the code). From CPL 0: IRETQ to the 16-bit DPL 3 code segment (0xd3) completes and takes #GP(0xd0) at its
     # target (M2 task 3a; IRETQ to the 32-bit one runs the code: compat.py); an outer RET to the 32-bit one (0xdb) is

@@ -16,9 +16,10 @@ limit of the flat segment natemu runs (#GP(0)), RSP is loaded zero-extended from
 only with flat segments (`refused_shape`): where the state after such an IRET (or after a segment load in 32-bit code,
 `load`) is one it does not run, its recorded deviation is #GP(the offending selector) before the next instruction (a
 `Deviation` at that RIP with the completed state; x86 would run the code, so no x86 reference applies). The other
-transfers to compatibility mode are not built (task 5): a far JMP, CALL or RET whose target CS is not a 64-bit code segment
-(L = 0), and any transfer to L = D = 1, is `refused`, after the descriptor checks the SDM makes before the mode matters; so
-is a 64-bit call gate (not built). Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
+transfers to compatibility mode at CPL 3 are not built (task 5). M2 Part 2: a far JMP, CALL or RET whose target is
+compatibility-mode code (L = 0) at CPL 0 completes (the boot-time interpreter runs that code); an IRET to it, and any
+transfer to L = D = 1, is `refused`, after the descriptor checks the SDM makes before the mode matters; so is a 64-bit
+call gate (not built). Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
 3, RET far to RPL 3; a call gate at CPL 3) it is instead the deviation #GP(selector) with nothing changed (a `Deviation`
 fault: the result's `deviation` is True). `null_access` and `flat_access` are the two faults of a 32-bit access that
 translated code must still raise (a null FS, GS, DS or ES; the 4 GiB limit). An IRET loading TF is
@@ -153,8 +154,9 @@ def _compat(s):
 
 
 def _refuse_shape(s, rip):
-    """The deviation at `rip` when `s`, a completed state, is compatibility-mode code at CPL 3 natemu does not run."""
-    if _compat(s) and refused_shape(s) is not None:
+    """The deviation at `rip` when `s`, a completed state, is compatibility-mode code at CPL 3 natemu does not run (at CPL
+    0 the boot-time interpreter runs any shape)."""
+    if s['cpl'] == 3 and _compat(s) and refused_shape(s) is not None:
         raise Deviation(GP, refused_shape(s) & 0xFFFC, rip=rip, state=copy.deepcopy(s))
 
 
@@ -382,13 +384,16 @@ def flat_access(state, addr, n, stack=False):
 
 
 def _refuse_compatibility(raw, sel, cpl, iret=False):
-    """`cpl`: the CPL the target code would run at. `iret`: IRET, which loads a compatibility-mode CS with RPL 3."""
+    """`cpl`: the CPL the target code would run at. `iret`: IRET, which loads a compatibility-mode CS with RPL 3 (and
+    whose return to CPL-0 compatibility-mode code natemu refuses)."""
     _, _, _, _, l, d = fields(raw)
     if iret and cpl == 3 and not l:
         return
     if not l or d:
         if cpl == 3:
             raise Deviation(GP, sel & 0xFFFC)
+        if cpl == 0 and not l and not iret:
+            return                                                 # M2 Part 2: the boot-time interpreter's
         raise Refused('compatibility-mode code segment')
 
 

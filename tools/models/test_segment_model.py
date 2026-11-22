@@ -131,7 +131,9 @@ class Transfers(unittest.TestCase):
         r = m.far(s, 'call', PTR)
         self.assertEqual((r['state']['rip'], r['state']['rsp']), (0x40_1000, STACK + 0x7F0))
         self.assertEqual(r['diff'], {STACK + 0x7F0: (0x40_0003).to_bytes(8, 'little') + (0x08).to_bytes(8, 'little')})
-        self.assertEqual(m.far(self.pointer(machine(), 0x1000, 0x38), 'jmp', PTR)['outcome'], 'refused')
+        # M2 Part 2: CPL-0 compatibility-mode code (0x38: L = 0, D = 1) is the boot-time interpreter's: the JMP completes.
+        r = m.far(self.pointer(machine(), 0x1000, 0x38), 'jmp', PTR)
+        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['cs']), ('done', 0x1000, 0x38))
         self.assertEqual(m.far(self.pointer(machine(), 0x1000, CALL_GATE), 'jmp', PTR)['outcome'], 'refused')
         for sel, want in ((0x10, (dm.GP, 0x10)), (0x20, (dm.GP, 0x20)), (0x60, (dm.NP, 0x60)), (0x0B, (dm.GP, 0x08)),
                           (0x70, (dm.GP, 0x70)), (0, (dm.GP, 0))):
@@ -151,7 +153,9 @@ class Transfers(unittest.TestCase):
         self.assertEqual(m.ret(push(machine(), 0x40_2000, 0x23, 0x7000, 0x03))['fault'][:2], (dm.GP, 0))  # null SS at CPL 3
         self.assertEqual(m.ret(push(machine(), 0x40_2000, 0x23, 0x7000, 0x13))['fault'][:2], (dm.GP, 0x10))
         self.assertEqual(m.ret(push(machine(cpl=3), 0x40_2000, 0x08))['fault'][:2], (dm.GP, 0x08))  # RPL < CPL
-        self.assertEqual(m.ret(push(machine(), 0x40_2000, 0x38))['outcome'], 'refused')
+        r = m.ret(push(machine(), 0x40_2000, 0x38))                                         # to CPL-0 32-bit code
+        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['cs']), ('done', 0x40_2000, 0x38))
+        self.assertEqual(m.iret(push(machine(), 0x40_2000, 0x38, 2, STACK, 0x10))['outcome'], 'refused')   # IRET: refused
         # The compatibility-mode deviation: a return to RPL 3 compatibility-mode code is #GP(selector), at CPL 0 too.
         s = machine()
         dm.place(s['memory'], GDT + 0x48, m.code(3, l=0, d=1).to_bytes(8, 'little'))
