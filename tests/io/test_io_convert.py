@@ -36,5 +36,28 @@ class Console(unittest.TestCase):
         self.assertEqual(len(got), 3, got)
         (t / 'serial-use.log').write_text('[3.0] fine\n'); self.assertEqual(run_io5.console_checks(t, 'use'), [])
 
+    def test_i386_check_is_judged(self):
+        """--i386's first boot passes with the reference's check hash, package list and x87 lines; a wrong hash, a wrong
+        package list, an x87 value too far from the reference's or a missing x87 line each fail it."""
+        t = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, t, True)
+        (t / 'stderr-use.log').write_text('')
+        x87 = run_io5.I386_X87.strip().splitlines()
+
+        def problems(check=run_io5.I386_CHECK, packages=run_io5.I386_PACKAGES, lines=x87):
+            steps = ''.join(f'IO5 step {s} ok 1.0 start=0.0\r\n' for s in run_io5.REQUIRED_I386)
+            (t / 'serial-use.log').write_text(f'IO5 system running boot=1s\r\n{steps}IO5 i386-packages {packages}\r\n'
+                'IO5 i386-userland i686 i386 i686-linux-gnu\r\n' + ''.join(f'IO5chk {l}\r\n' for l in lines) +
+                f'IO5 i386-check {check}\r\nreboot: Power down\r\n')
+            return run_io5.judge(t, 'use', 0, False, True)['problems']
+        self.assertEqual(problems(), [])
+        self.assertEqual(len(problems(check='0' * 16)), 1)
+        self.assertEqual(len(problems(packages='0' * 16)), 1)
+        near = [l.replace('1.4142135623730951', '1.414213562373095') for l in x87]; self.assertNotEqual(near, x87)
+        self.assertEqual(problems(lines=near), [])                    # one unit in the last place: natemu's doubles
+        far = [l.replace('1.4142135623730951', '1.41421356237') for l in x87]
+        self.assertEqual(len(problems(lines=far)), 1)
+        self.assertEqual(len(problems(lines=x87[1:])), 1)
+        self.assertEqual(len(problems(lines=[x87[0].replace('log', 'exp')] + x87[1:])), 1)
+
 
 if __name__ == '__main__': unittest.main()

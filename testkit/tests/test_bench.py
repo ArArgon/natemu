@@ -256,3 +256,11 @@ def test_only_a_remote_case_is_not_exclusive():
     shared = {c for s in suites.values() for c in s.extra['cases'] if not HARNESS.case_needs(fam, s, c).exclusive}
     assert shared == {'io5-solo32-reference'}
     assert HARNESS.case_needs(fam, suites['io5'], 'io5-solo32-reference').cores == 1
+
+
+def test_a_case_may_set_its_own_timeout():
+    """io5-solo32-qemu runs longer than the io5 suite's 7200 s: the run loop asks the harness for the case's own timeout."""
+    from testkit.harness.bench import HARNESS
+    fam, suites = _bench_family()
+    assert HARNESS.case_timeout(fam, suites['io5'], 'io5-solo32-qemu') == 9000
+    assert HARNESS.case_timeout(fam, suites['io5'], 'io5-solo') is None
