@@ -170,7 +170,8 @@ mapped while the VM exists. `Boot::run()` is both. The compile cache is off unle
 **Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` (positional
 as before, the runners' form; parsed by clap since November 5, `natemu-host RUNTIME boot-linux --help`; a repeated
 option's last value wins; numbers decimal or 0x hex) with the stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
-`--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`, `--check-reuse` (perf chunk 4,
+`--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`, (M2 Part 2) `--no-mailbox`,
+`--debug-exit` and `--firmware` (BZIMAGE is then a firmware image; [firmware-mode.md](firmware-mode.md)), `--check-reuse` (perf chunk 4,
 debug: every translation reused at another RIP is also compiled there and must be byte-equal, else a host error; the
 program driver's `--code-shape` turns the same check on), `--code-shape` (debug, off by default: admission's code-shape
 check on every object, as the suites run it; here without `--check-reuse`, which it can be combined with; the library's
