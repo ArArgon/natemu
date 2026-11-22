@@ -1,0 +1,5 @@
+# Known natemu bugs these tests catch (testkit/known_bugs.py): reported as `known-bug`, never a gate failure.
+
+[bug.ovmf-reset-cr4-mce]
+note = "ovmf-natemu reset: OVMF's 32-bit reset path writes CR4 = 640H (MCE, OSFXSR, OSXMMEXCPT: docs/restructure/real-code-suites.md) at FFFFFE94H in 32-bit protected mode with paging off, CPL 0; natemu's CPU presents no MCE (CPUID.1:EDX.MCE = 0, so CR4.MCE is outside cpu_profile::CR4_VALID) and the interpreter's MOV CR4 raises #GP(0) there (interp_fault 13). Waits for a decision: present MCE, or accept CR4.MCE without it (docs/restructure/firmware-mode.md section 5). main32 does not set CR4.MCE and passes."
+cases = ["ovmf/ovmf-natemu::reset-natemu"]

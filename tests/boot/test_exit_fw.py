@@ -104,3 +104,15 @@ def test_the_judges_pass_the_expected_answers_and_refuse_wrong_ones(n):
     for bad in ({**good, 'rflags': 0}, {**good, 'fault': [13, 0, 0x8000, 0]}, {**good, 'exit': 'timeout'},
                 {'exit': 1, 'dump': 'unreadable'}):
         assert fw.judge('program', n, bad)
+
+
+
+def test_natemu_firmware_judge_and_bounds():
+    """The firmware variant under natemu: a run to the power-off with the report passes `judge` and the bounds; the
+    bounds refuse too many decode exits or shootdowns on any vCPU."""
+    for n in (1, 2, 4):
+        done = {'exit': 'poweroff', 'serial': fw.expected_serial(n), 'vcpus': [{'decodes': 19, 'shootdowns': 1}] * n}
+        assert fw.judge('firmware', n, done, want_exit='poweroff') + fw.judge_bounds(done) == []
+        assert fw.judge('firmware', n, {**done, 'exit': 'resident'}, want_exit='poweroff')
+    assert fw.judge_bounds({'vcpus': [{'decodes': 0, 'shootdowns': 0}, {'decodes': fw.DECODES_MAX + 1, 'shootdowns': 0}]})
+    assert fw.judge_bounds({'vcpus': [{'decodes': 0, 'shootdowns': fw.SHOOTDOWNS_MAX + 1}]})

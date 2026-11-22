@@ -2,13 +2,19 @@
 """The M2 exit test's firmware and its AP part as a 64-bit program, on the references (docs/restructure/m2-exit-firmware.md).
 
     tests/boot/run_exit_fw.py --variant firmware|program --backend qemu|kvm [--cpus 1 2 4] --out DIR
-    tests/boot/run_exit_fw.py --variant program --backend natemu --fexc FEXC [--cpus 1 2 4] --out DIR
+    tests/boot/run_exit_fw.py --variant firmware|program --backend natemu --fexc FEXC [--cpus 1 2 4] --out DIR
 
-natemu (M2 Part 2, the program variant only): the program driver runs exit_prog.asm's body with CPU 0 at its start and
+natemu, the program variant (M2 Part 2): the program driver runs exit_prog.asm's body with CPU 0 at its start and
 every other vCPU waiting for a SIPI (`wait-for-sipi`): the description of docs/restructure/m2-exit-firmware.md. Each AP
 runs the stub from its SIPI in the boot-time interpreter (real mode, the far JMP to 32-bit code, compatibility mode)
 until its far JMP to the 64-bit CS hands it to the translator, which counts it on the stub page. Pass: CPU 0 reaches the
 body's end with `expected_registers(N)` (every AP arrived exactly once, from 64-bit code).
+natemu, the firmware variant (the firmware boot mode, docs/restructure/firmware-mode.md): the test driver's `boot-linux
+--firmware` boots the image at N vCPUs with 64 MiB, as the references do: the BSP from the reset vector through the
+boot-time interpreter (real mode, the far JMP to 32-bit code, compatibility mode) to the image's 64-bit code, which the
+translator runs from the ROM and which starts the APs. Pass: `judge('firmware', N, answer, want_exit='poweroff')` on
+COM1 and the run's stop, and per vCPU at most DECODES_MAX decode exits (the boot-time interpreter's requests to the
+host) and SHOOTDOWNS_MAX shootdowns asked (`judge_bounds`: plan section 8, with N APs in and past the 16-bit part).
 
 Both images are assembled here with nasm from tests/boot (exit_fw.asm, exit_prog.asm and the shared exit_ap.inc).
 - firmware: the 64 KiB image QEMU maps below 4 GiB with `-bios` (machine pc, 64 MiB, isa-debug-exit at F4H, COM1 into a
@@ -40,6 +46,12 @@ FW_SIZE = 0x10000                               # at 4 GiB - FW_SIZE
 BODY = smp.LOW                                  # the program's body (110000H), its start RIP 1000H further
 START = BODY + 0x1000
 RSP = 0x3E1800                                  # CPU 0's stack in the smp stub's map (never used: no stack)
+FW_RAM = 64 << 20                               # natemu's firmware runs: the references' -m 64
+# Per vCPU (plan section 8): decode exits, the BSP's 49 16- and 32-bit instructions and an AP's 30 in runs of up to 16
+# (19 and 16 at 1, 2 and 4 CPUs, exit-fw-natemu, M2 Max, November 22); shootdowns asked, the APs' counter stores on their
+# stub page while it holds the 64-bit code's translations (plan section 5; at most 2 there).
+DECODES_MAX = 32
+SHOOTDOWNS_MAX = 8
 TCG_CPU = smp.SYSTEM_CPU
 KVM_CPU = 'host'
 KVM_IMAGE = 'docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f'   # = testkit/artifacts.py BENCH_BUILDER
@@ -256,6 +268,40 @@ def run_natemu(n, images, work, fexc):
             'fault': None if bsp['stop'] == 'reached' else f"{bsp['stop']} {bsp.get('reason')}", 'aps': aps}
 
 
+def run_natemu_firmware(n, images, work, fexc):
+    """One run of the firmware in natemu's firmware boot mode (`natemu-host RUNTIME boot-linux FEXC IMAGE --firmware`): the
+    answer `judge` reads (`exit` natemu's stop, `poweroff` for the image's PM1a write; `serial` COM1's text) with each
+    vCPU's stop, where it waited, decode exits and shootdowns, and the BSP's final state and stop detail."""
+    import run_slice1_vm as vm                  # tests/lib
+    host, runtime = vm.build()
+    work.mkdir(parents=True, exist_ok=True)
+    image, serial = work / 'exit_fw.bin', work / f'com1-{n}.txt'
+    image.write_bytes(images['firmware']['bytes'])
+    serial.unlink(missing_ok=True)
+    try:
+        r = subprocess.run([host, runtime, 'boot-linux', fexc, image, '--firmware', '--vcpus', str(n), '--ram', hex(FW_RAM),
+                            '--serial', serial, '--watchdog-ms', '30000', *vm.CODE_SHAPE],
+                           capture_output=True, text=True, timeout=QEMU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {'exit': 'timeout'}
+    (work / f'stderr-{n}.txt').write_text(r.stderr)
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {'exit': f'driver exit {r.returncode}: {r.stderr.strip()[-400:]}'}
+    (work / f'out-{n}.json').write_text(json.dumps(out, indent=1) + '\n')
+    text = serial.read_bytes().decode(errors='replace').replace('\r', '') if serial.exists() else ''
+    vcpus = [{'stop': v['stop'], 'waiting': v.get('waiting'), 'decodes': v.get('decodes', 0), 'shootdowns': v['shootdowns'],
+              'native': [int(x, 16) for x in v['native']]} for v in out['vcpus']]
+    return {'exit': out['stop'], 'reason': out['reason'], 'serial': text, 'state': out['state'], 'vcpus': vcpus}
+
+
+def judge_bounds(ans):
+    """Differences from the bounds on decode exits and shootdowns per vCPU (plan section 8)."""
+    return [f"CPU {i}: {k} {v[k]} > {m}" for i, v in enumerate(ans.get('vcpus', []))
+            for k, m in (('decodes', DECODES_MAX), ('shootdowns', SHOOTDOWNS_MAX)) if v[k] > m]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--variant', choices=('firmware', 'program'), required=True)
@@ -266,8 +312,26 @@ def main():
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     images = build(a.out / 'build')
+    if a.backend == 'natemu' and a.variant == 'firmware':
+        if not a.fexc: raise SystemExit('--backend natemu needs --fexc')
+        results = []
+        for n in a.cpus:
+            ans = run_natemu_firmware(n, images, a.out / 'natemu', a.fexc)
+            diffs = judge('firmware', n, ans, want_exit='poweroff') + judge_bounds(ans)
+            if diffs and ans.get('exit') == 'resident':
+                st = ans['state']
+                diffs.append(f"BSP stop {ans['reason'][:120]} at CS {st['seg'][1]}:{st['rip']}, CR0 {st['cr0']}, EFER {st['efer']}")
+            results.append({'name': f'firmware-natemu N={n}', 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+            print(f"firmware natemu N={n}: {'pass' if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
+            for line in ans.get('serial', '').splitlines(): print(f'  COM1: {line}', flush=True)
+            print(f"  stop {ans.get('exit')} {ans.get('reason', '')}"[:300], flush=True)
+            for i, v in enumerate(ans.get('vcpus', [])):
+                print(f"  CPU {i}: {v['stop'][:80]}, waiting {v['waiting']}, decodes {v['decodes']}, shootdowns {v['shootdowns']}",
+                      flush=True)
+        (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
+        return 1 if any(r['diffs'] for r in results) else 0
     if a.backend == 'natemu':
-        if a.variant != 'program' or not a.fexc:
+        if not a.fexc:
             raise SystemExit('--backend natemu runs the program variant, with --fexc')
         results = []
         for n in a.cpus:

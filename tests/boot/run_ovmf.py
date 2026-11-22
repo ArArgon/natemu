@@ -3,6 +3,7 @@
 instruction in 64-bit mode, on the references (docs/restructure/real-code-suites.md).
 
     tests/boot/run_ovmf.py --backend qemu|kvm [--entries reset main32] --out DIR
+    tests/boot/run_ovmf.py --backend natemu --fexc FEXC [--entries reset main32] --out DIR
 
 The image comes from the framework's build (NATEMU_INPUT_OVMF, tests/boot/built_inputs.py: OVMF.fd, SECFV.Fv.map and
 provenance.json). SEC's entry is the SecMain line of SECFV.Fv.map (the address the reset vector itself finds in the
@@ -24,7 +25,15 @@ the image's upstream (provenance.json), never the built image's hash. Judged by 
 source gives (expected_registers). Answers (tools/reference/answers.py): seed runs the backend and records; locked
 never runs it: the lock's answer must pass the judge for the image as built now (its SEC entry, its boot firmware
 volume); live runs it. Writes DIR/results.json (one result per entry), DIR/ovmf.json (the image's addresses, the
-answers, the reference machine); exit 1 on a failure."""
+answers, the reference machine); exit 1 on a failure.
+natemu (the firmware boot mode, docs/restructure/firmware-mode.md): the test driver's `boot-linux --firmware` boots
+OVMF.fd with 256 MiB (`main32`: `--firmware-start flat32`, the state the rig gives QEMU) until the boot processor is about
+to run SEC's entry (`--stop-at`); the answer is natemu's: the stop (`breakpoint` there), its registers, its record of
+port and unassigned-page accesses before the stop (`devices`), no debug port lines (natemu stops at SEC's entry, before
+SEC's first line; the registers name the boot firmware volume in RBP). Pass: `judge` without its debug-port line, and the
+registers equal to the locked KVM answer's (`key(entry, 'kvm', provenance)`; QEMU's and KVM's agree) when the lock holds
+its value. A run that ends elsewhere names its stop, RIP, CS and mode in the differences.
+"""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, datetime, json, os, pathlib, re, shlex, shutil, struct, subprocess, sys, tempfile
 
@@ -41,6 +50,7 @@ FOUR_GIB = 1 << 32
 FFS_GUIDS = (bytes.fromhex('78e58c8c3d8a1c4f9935896185c32dd3'),        # EFI_FIRMWARE_FILE_SYSTEM2_GUID
              bytes.fromhex('7ac07354cb3dca4d961e6fbd9a34e789'))        # EFI_FIRMWARE_FILE_SYSTEM3_GUID
 FLAGS_MASK = 0x3F7FD7 & ~0x10010            # EFLAGS' defined bits less AF and RF
+NATEMU_TIMEOUT = 300
 FIRST_LINE = 'SecCoreStartupWithStack('
 PAGE_TABLES = 0x800000                       # PcdOvmfSecPageTablesBase (OvmfPkg/Include/Fdf/MemFd.fdf.inc)
 # QEMU's log trace backend with -msg timestamp=on (system/trace-events): "<time> memory_region_ops_read cpu N mr 0x...
@@ -124,10 +134,11 @@ def answer(got: dict, debugcon: bytes, trace: str | None) -> dict:
     return {'stop': stop, 'regs': regs, 'devices': dev, 'debugcon': [l for l in lines if l]}
 
 
-def judge(entry: str, ans: dict, sec: int, bfv: int) -> list:
+def judge(entry: str, ans: dict, sec: int, bfv: int, debugcon: bool = True) -> list:
     """Differences between an answer and the pass (empty: pass): the stop at SEC's entry, the registers there
     (expected_registers; IF clear), no device access before it (the boot-time interpreter's first version stops at any
-    port I/O or device page in 16- and 32-bit code), SEC's first debug line naming the boot firmware volume."""
+    port I/O or device page in 16- and 32-bit code), SEC's first debug line naming the boot firmware volume (not with
+    `debugcon` false: natemu's runs stop at SEC's entry, before SEC writes it)."""
     d = [] if ans.get('stop') == 'breakpoint' else [f"stop {ans.get('stop')!r}: the CPU did not reach SEC's entry {sec:#x}"]
     regs = ans.get('regs') or {}
     for k, v in expected_registers(entry, sec, bfv).items():
@@ -137,8 +148,46 @@ def judge(entry: str, ans: dict, sec: int, bfv: int) -> list:
     elif ans['devices']: d.append(f"device accesses before SEC's entry: {ans['devices']}")
     last = (ans.get('debugcon') or ['(none)'])[-1]
     want = f'{FIRST_LINE}0x{bfv:X}, '
-    if not last.upper().startswith(want.upper()): d.append(f'debug port: {last!r} (want {want}...)')
+    if debugcon and not last.upper().startswith(want.upper()): d.append(f'debug port: {last!r} (want {want}...)')
     return d
+
+
+def natemu_answer(out: dict, sec: int) -> dict:
+    """natemu's answer from the test driver's report `out`, in `answer`'s form: the stop (`breakpoint` when the run ended
+    at `--stop-at`, RIP SEC's entry), the boot processor's registers (EFLAGS masked as there), the accesses natemu counted
+    to ports and unassigned pages before the stop (each with its reads and writes), no debug port lines."""
+    st = out['state']
+    g = [int(x, 16) for x in st['gpr']]
+    regs = dict(zip(('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi'), g))
+    regs.update({f'r{k}': g[k] for k in range(8, 16)})
+    regs['rip'], regs['eflags'] = int(st['rip'], 16), int(st['rflags'], 16) & FLAGS_MASK
+    regs.update(zip(('es', 'cs', 'ss', 'ds', 'fs', 'gs'), (int(x, 16) for x in st['seg'])))
+    regs.update({k: int(st[k], 16) for k in ('fs_base', 'gs_base', 'cr0', 'cr3', 'cr4', 'efer')})
+    stop = 'breakpoint' if out['stop'] == 'reached' and regs['rip'] == sec else f"{out['stop']} {out['reason']}".strip()
+    dev = [{'op': 'port', 'addr': x['port'], 'reads': x['reads'], 'writes': x['writes']} for x in out.get('ports', [])]
+    dev += [{'op': 'page', 'addr': x['page'], 'reads': x['reads'], 'writes': x['writes']} for x in out.get('unassigned_pages', [])]
+    return {'stop': stop, 'regs': {k: regs[k] for k in gdbrsp.REGS}, 'devices': dev, 'debugcon': [],
+            'natemu': {'stop': out['stop'], 'reason': out['reason'], 'native': out['vcpus'][0]['native']}}
+
+
+def run_natemu(entry: str, img: pathlib.Path, sec: int, work: pathlib.Path, fexc: str) -> dict:
+    """One entry in natemu's firmware boot mode, to SEC's entry (see the module doc)."""
+    import run_slice1_vm as vm                  # tests/lib
+    host, runtime = vm.build()
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        r = subprocess.run([host, runtime, 'boot-linux', fexc, img, '--firmware', *(['--firmware-start', 'flat32'] if entry == 'main32' else []),
+                            '--ram', hex(MEM_MB << 20), '--stop-at', hex(sec), '--watchdog-ms', '60000', *vm.CODE_SHAPE],
+                           capture_output=True, text=True, timeout=NATEMU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {'stop': 'timeout'}
+    (work / f'{entry}.stderr').write_text(r.stderr)
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {'stop': f'driver exit {r.returncode}: {r.stderr.strip()[-400:]}'}
+    (work / f'{entry}.json').write_text(json.dumps(out, indent=1) + '\n')
+    return natemu_answer(out, sec)
 
 
 def qemu_args(backend: str) -> list:
@@ -222,16 +271,20 @@ def run_kvm(entries, img: pathlib.Path, sec: int, work: pathlib.Path) -> tuple:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--backend', choices=('qemu', 'kvm'), required=True)
+    ap.add_argument('--backend', choices=('qemu', 'kvm', 'natemu'), required=True)
     ap.add_argument('--entries', nargs='+', choices=ENTRIES, default=list(ENTRIES))
+    ap.add_argument('--fexc', help='natemu: the compiler')
     ap.add_argument('--out', type=pathlib.Path, required=True)
     a = ap.parse_args()
+    if a.backend == 'natemu' and not a.fexc: raise SystemExit('--backend natemu needs --fexc')
     a.out.mkdir(parents=True, exist_ok=True)
     d, prov = inputs()
     img = (d / 'OVMF.fd').read_bytes()
     sec, bfv = sec_entry((d / 'SECFV.Fv.map').read_text(errors='replace')), boot_fv(img)
     image = {'size': len(img), 'base': FOUR_GIB - len(img), 'sec_entry': sec, 'boot_fv': bfv, **reset_vector(img)}
     print('image: ' + ', '.join(f'{k} {v:#x}' for k, v in image.items()), flush=True)
+    if a.backend == 'natemu':
+        return main_natemu(a, d, prov, img, sec, bfv)
     keys = {e: key(e, a.backend, prov) for e in a.entries}
     mode, got, ref = answers.mode(), {}, {}
     if mode == 'locked':
@@ -263,6 +316,34 @@ def main():
     (a.out / 'ovmf.json').write_text(json.dumps({
         'mode': mode, 'backend': a.backend, 'provenance': prov, 'image': {k: hex(v) for k, v in image.items()},
         'reference': ref, 'answers': got}, indent=1, default=str) + '\n')
+    return 1 if any(r['diffs'] for r in results) else 0
+
+
+def main_natemu(a, d: pathlib.Path, prov: dict, img: bytes, sec: int, bfv: int) -> int:
+    """`--backend natemu`: each entry in natemu's firmware boot mode, judged as the module doc says."""
+    results, got = [], {}
+    for e in a.entries:
+        ans = got[e] = run_natemu(e, d / 'OVMF.fd', sec, a.out / 'natemu', a.fexc)
+        diffs = judge(e, ans, sec, bfv, debugcon=False)
+        try:
+            ref = answers.lookup(key(e, 'kvm', prov))
+            want = json.loads(ref.value)['regs'] if ref is not None and ref.value is not None else None
+        except (answers.Missing, answers.Unconfigured):
+            want = None
+        if want is None: print(f'{e}: the lock holds no value of the KVM answer: the registers judged alone', flush=True)
+        diffs += [f"{k} {ans['regs'].get(k)} != KVM's {v:#x}" for k, v in (want or {}).items() if ans['regs'].get(k) != v]
+        if diffs and ans.get('regs'):
+            r = ans['regs']
+            diffs.append(f"natemu stopped: {(ans.get('natemu') or {}).get('reason', '')[:120]} at CS {r['cs']:#x}:{r['rip']:#x}, "
+                         f"CR0 {r['cr0']:#x}, EFER {r['efer']:#x}")
+        results.append({'name': f'{e}-natemu', 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+        print(f"{e} natemu: {'pass' if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
+        regs = ans.get('regs') or {}
+        if regs: print('  ' + ' '.join(f'{k}={v:#x}' for k, v in regs.items()), flush=True)
+        print(f"  stop {(ans.get('natemu') or {}).get('reason') or ans.get('stop')}"[:300], flush=True)
+    (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
+    (a.out / 'ovmf.json').write_text(json.dumps({'backend': 'natemu', 'provenance': prov, 'answers': got}, indent=1,
+                                                default=str) + '\n')
     return 1 if any(r['diffs'] for r in results) else 0
 
 
