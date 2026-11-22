@@ -2091,11 +2091,12 @@ impl Answer {
 pub(crate) const GATING: usize = 15;
 /// M2 reuse: the kept answers' RIP of 32-bit code, tagged in its upper half, which a 32-bit address leaves free, with
 /// everything of the request that 64-bit code has not: bit 62 (32-bit code; with bit 63 clear, so no canonical address:
-/// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35) and the x87
-/// guess (from bit 36; 13 bits): the request's for an answer whose compile read it, [`GUESS_FREE`] for one that did
-/// not (a unit without x87 instructions: one entry, and one publication, under every guess). The answers table alone sees it ([`Answers::find`], [`Answers::insert`], an entry's
-/// fingerprint): an answer of another tag is under another key, never a hit; every address use (relocation's distance,
-/// admission, fexc's request, the persistent cache's key, the pool) has the plain RIP.
+/// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35) and the
+/// x87 guess (from bit 36; 13 bits): the request's for an answer whose compile read it, [`GUESS_FREE`] for one that did
+/// not (a unit without x87 instructions: one entry, and one publication, under every guess). The answers table alone
+/// sees it ([`Answers::find`], [`Answers::insert`], an entry's fingerprint): an answer of another tag is under another
+/// key, never a hit; every address use (relocation's distance, admission, fexc's request, the persistent cache's key,
+/// the pool) has the plain RIP.
 const TAG32: u64 = 1 << 62;
 /// The guess field of a 32-bit answer that did not read the guess: no guess's value (a guess is 0 or has bit 12 set and
 /// bit 11 clear: 0x1000 | TOP << 8 | tags).
@@ -5136,9 +5137,7 @@ mod tests {
         assert_eq!(a.report(), old, "byte for byte");
     }
 
-    /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
-    /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
-    /// answer kept for the requested RIP comes first.
+    /// M2 reuse: an answer is found only under its own code mode, null segments and x87 guess.
     #[test]
     fn answers_of_another_tag_are_never_found() {
         // M2 reuse: the same bytes at the same address (and at another of its page offset) under 64-bit code, 32-bit code,
@@ -5161,6 +5160,9 @@ mod tests {
         assert!(!tagged(0x7fff_ffff_f000) && !tagged(0xffff_8000_0000_0000) && tag32([false; 4], 0x2000).is_err());
     }
 
+    /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
+    /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
+    /// answer kept for the requested RIP comes first.
     #[test]
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);

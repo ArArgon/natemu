@@ -527,7 +527,7 @@ class Campaign:
         mode = {'afp': bool(have.get('afp')), 'fp': fp}
         env = {'NATEMU_FP': fp} if variant.get('engine.fp') else {}
         if ex.get('check_reuse'): env['NATEMU_CHECK_REUSE'] = '1'
-        fp_env = {'env': env} if env else {}
+        boot_env = {'env': env} if env else {}
         for f, d in without.items():
             if f in have and not have[f]:
                 expected.update({t: why for t, why in d.items() if not (f == 'afp' and accurate) or kept_in_accurate(why)})
@@ -557,7 +557,7 @@ class Campaign:
         if seed and not x86: return CaseResult('failed', 'seeding needs NATEMU_X86_HOST=user@host')
 
         def once(w: pathlib.Path) -> BootResult:
-            if not seed: return boot(cpio, ct, booted, vcpus, w, cap, **how, **fp_env)
+            if not seed: return boot(cpio, ct, booted, vcpus, w, cap, **how, **boot_env)
             if ex.get('reference_boot') == 'kvm': return native_vm(cpio, ct, booted, vcpus, x86, cap, w, **how)
             return native(cpio, ct, booted, x86, cap, w)
 

@@ -13,7 +13,8 @@ same bytes at the same address.
 persistent cache, and inside the guest a vCPU's own templates and the shared pool. The one thing it does not use is
 position-independent sharing (below).
 
-**Result** (bench case `io5-solo32`, M4, 4 vCPUs, seconds; one run each):
+**Result** (bench case `io5-solo32`, M4, 4 vCPUs, seconds; one run each; "all of it" is this branch at eedae4a2,
+November 22):
 
 | Step | Checkpoint B | host side only | all of it | QEMU |
 | --- | ---: | ---: | ---: | ---: |
@@ -151,7 +152,20 @@ rewrite needs address moves of two or three words and adds in 64 bits; 32-bit mo
   mismatch stops the run. The `torture32` and `libm32` campaigns now always boot under it (`check_reuse = true`,
   `tests/correctness/family.toml`).
 
-  Runs under the check: CAMPAIGNS
+  Runs under the check, all on the M3 at eedae4a2 (the branch's code; this commit changes only comments, a test's
+  position and a variable's name), November 22:
+
+  | Run | Result | Wall time (cap 3600 s) |
+  | --- | --- | ---: |
+  | unit tests (`tests/unit`) | 630 passed, 13 skipped | 169 s |
+  | `tests/correctness -k i386`, `NATEMU_CHECK_REUSE=1` | 132 passed, 12 expected-fail | 363 s |
+  | `torture32` and `libm32` (no AFP, fast and accurate), three units, run one after another | 5,317 passed, 982 expected-fail | 1,759 s for the three; the longest, `torture32`, 756 s; the two `libm32` runs 481 s and 521 s |
+  | `tests/static -k fexc` | 276 passed | 1,137 s |
+  | `tests/correctness -k i386`, without the check | 132 passed, 12 expected-fail | 260 s |
+
+  The expected failures are the ones the suites already carry in their expectation files; none is new. Each of the three campaign units stayed under a
+  quarter of its 3600 s cap. The unit run's one note is a known bug that now looks fixed
+  (`block-abandoned-worker-retire-timeout`), unrelated to this branch.
 
 The runtime has no unit tests of its own, so the copy of a split block with the run test, and the refusal on the last
 page as the runtime calls it, are covered by the campaigns under the check and by the unit tests of the rules they
@@ -171,6 +185,19 @@ instruction; the timed run is of the final code.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | i386 configure | 69% | 34% | **4%** | 25% | 19% | 15% |
 | i386 make | 49% | 12% | **3%** | 67% | 5% | 7% |
+
+Busy vCPU time in the i386 configure, in seconds (the profile's buckets; 112.4 s in all, summed over the 4 vCPUs),
+beside the 64-bit configure (60.4 s in all):
+
+| Bucket | i386 configure | 64-bit configure |
+| --- | ---: | ---: |
+| in translated code | 27.8 | 23.2 |
+| copying (templates, pool: "reuse") | 14.9 | 1.4 |
+| delivery | 14.2 | 3.0 |
+| linking | 12.6 | 4.1 |
+| pool lookups | 6.9 | 2.2 |
+| patching | 4.4 | 0.8 |
+| requests to the host | 991,778 | 1,077,758 |
 
 Requests to the host and compiles in the i386 configure:
 
@@ -213,8 +240,8 @@ i386 configure were of bytes compiled before, for all causes together (5.8%, 0.1
 no guess, compiles bytes again at the same rate (5.7%). So the guess never cost much here; keeping such answers once
 is for the pool, which would otherwise have published the same template once per guess.
 
-**`startup32`** (bench case `guest-startup32`: one static program started 40 times on one vCPU): 7.16 s in its second
-pass (7.59 s in the first), against 7.18 s at Checkpoint B. No change, as expected: the program loads at the same
+**`startup32`** (bench case `guest-startup32`: one static program started 40 times on one vCPU; M4, this branch at
+eedae4a2, November 22, one run): 7.16 s in its second pass (7.59 s in the first), against 7.18 s at Checkpoint B. No change, as expected: the program loads at the same
 address every time, and a vCPU's blocks are found again by address and physical page without any request.
 
 ## The alternative: one block for every address
@@ -231,3 +258,17 @@ The numbers say what copies cost 32-bit code now that the host is out of the pat
 largest part after translated code itself, and the reason it takes 1.9 times the 64-bit configure. Extending sharing
 to 32-bit code is the next step if that matters: fexc would emit address moves of a fixed width in 32-bit code (a
 change of its 32-bit output), and the shared form would need the 4 GiB wrap.
+
+## What is left
+
+- **32-bit code is excluded from position-independent sharing**, because fexc builds 32-bit addresses in one or two
+  words and the shared form needs a fixed width and the 4 GiB wrap. It costs copying, linking and patching: in the i386
+  configure 31.9 s of vCPU time (14.9 + 12.6 + 4.4) against 6.3 s for the 64-bit configure (1.4 + 4.1 + 0.8). The planned fix is three-word 32-bit address moves with a 32-bit add.
+- **"Delivery" is likely the INT 0x80 system calls of the 32-bit programs, but this is unconfirmed.** The bucket counts
+  all time spent delivering guest events (exceptions, interrupts and software interrupts through the IDT) and does not
+  split them by vector, so the profile cannot show it. 14.2 s against 3.0 s in the 64-bit configure fits a
+  system-call-heavy 32-bit shell, nothing more. A per-vector count would settle it.
+- **x87 units are not pooled**: a unit whose compile read the x87 guess is copied by no vCPU and published to no pool;
+  each process asks the host, which serves it from its kept answers. Whether to key such units without the guess is open.
+- **A 32-bit request at a RIP at or above 4 GiB is now a host error, so the run stops.** A guest IRET or far return to
+  compatibility mode with a high RIP should raise #GP first. The segment and far-transfer task (task 5) should check this.
