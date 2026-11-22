@@ -9,13 +9,13 @@ interpreter asks at CS.base + EIP before each decode, and the host never makes a
 
     tools/natemu-test run tests/interp -k natemu      # the corpus (case `natemu`) and the self-tests (`natemu-machine`)
 
-The corpus case runs every case, `--jobs` at a time. The cases the interpreter does not run yet are listed in
-`--pending` (natemu-pending.txt): each must end in the typed stop of a resident operation not built yet
-(`interp_unsupported`: a protected-mode far transfer or segment load, MOV to CR, HLT), not in any other result; one that
-matches its answers is an unexpected pass (remove it from the list). `--selftest` runs machine descriptions with the fields
-each must leave: in 64-bit mode (translated code), and in the interpreted modes (the interpreter's own rules: an unaligned
-LOCK inside and across 16 bytes, an instruction ending at a page end or at the CS limit and one running past it,
-unassigned and device pages, self-modifying code, the typed stops' records).
+The corpus case runs every case, `--jobs` at a time; every one must match its answers. `--selftest` runs machine
+descriptions with the fields each must leave: in 64-bit mode (translated code), and in the interpreted modes (the
+interpreter's own rules: an unaligned LOCK inside and across 16 bytes, an instruction ending at a page end or at the CS
+limit and one running past it, unassigned and device pages, self-modifying code, the typed stops' records, HLT, and the
+order of an INIT before TF). `--faults` runs the fault and transition cases against the models (interp_faults.py: the
+typed stop and record the model gives with nothing committed, or the state it reaches; modes_model's programs to where
+the model ends them).
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402,E702
 import argparse
@@ -49,6 +49,7 @@ def description(case: dict, common: list) -> str:
         lines.append(f"seg {s} {num(g['sel']):#x} {num(g['base']):#x} {num(g['limit']):#x} {num(g['attr']):#x}")
     lines += [f"{t} {num(st[t]['base']):#x} {num(st[t]['limit']):#x}" for t in ('gdtr', 'idtr')]
     lines += [f"stop {num(s['linear']):#x}" for s in sorted(case['stops'], key=lambda s: s['id'])]
+    lines += case.get('items', [])                      # (self-tests: the driver's event sources)
     lines += [f"window {num(w['addr']):#x} {w['len']:#x}" for w in case['compare']['windows']]
     return '\n'.join(lines) + '\n'
 
@@ -119,14 +120,14 @@ def selftests() -> list:
 # --- the interpreted modes' self-tests: the interpreter's own rules, each with the fields it must leave ---
 
 PT = G.PML4 + 0x3000   # the common tables' page table of 0-2 MiB (4 KiB pages)
-# exec::stop::interp: the details of `interp_unsupported` for a resident operation not built yet.
-PENDING_DETAILS = {1: 'far_jump', 2: 'far_return', 3: 'load_segment', 4: 'mov_to_cr', 5: 'hlt'}
 
 
-def interp_case(name, mode, asm, *, regs=None, eflags=0x2, segs=None, mem=(), at=G.CODE, stops=None, windows=()):
+def interp_case(name, mode, asm, *, regs=None, eflags=0x2, segs=None, mem=(), at=G.CODE, stops=None, windows=(), events=()):
     """A case in `mode` (G.MODES' state, the corpus's starting segments with `segs` over them), `asm` (nasm lines) at
     linear `at`; GPRs 0 but ESP and `regs`; `mem`: (address, bytes) blocks after the common ones; `stops`: linear
-    addresses (default: the code's end, stop 0); `windows`: (address, length) read back."""
+    addresses (default: the code's end, stop 0); `windows`: (address, length) read back; `events`: (kind, offset) the
+    driver's event sources (`nmi`, `init`) at the instruction `offset` bytes into the code (posted at its decode, after
+    that boundary's look at events)."""
     m, seg = G.MODES[mode], G.start_segments(mode)
     seg.update(segs or {})
     gpr = {r: 0 for r in G.GPRS}
@@ -138,6 +139,7 @@ def interp_case(name, mode, asm, *, regs=None, eflags=0x2, segs=None, mem=(), at
              'gdtr': {'base': G.h(G.GDT), 'limit': G.h(G.GDT_LIMIT)},
              'idtr': {'base': G.h(m['idtr'][0]), 'limit': G.h(m['idtr'][1])}}
     return {'name': name, 'mode': mode, 'asm': asm, 'at': at, 'state': state, 'stops': stops,
+            'items': [f'{kind} {at + k:#x}' for kind, k in events],
             'memory': [{'addr': G.h(a), 'data': bytes(d).hex()} for a, d in mem],
             'compare': {'windows': [{'addr': G.h(a), 'len': n} for a, n in windows]}}
 
@@ -181,6 +183,18 @@ def interp_selftests() -> list:
         (interp_case('r-unsupported', 'R', ['out 0x80, al']), {'resident': 'interp_unsupported', 'stop': None}),
         (interp_case('r-trap-flag', 'R', ['nop'], eflags=0x102), {'resident': 'interp_debug', 'stop': None}),
         (interp_case('p32-ud2', 'P32', ['ud2']), {'resident': 'interp_fault', 'fault': [6, 0, 0], 'stop': None}),
+        # An INIT pending where TF is set is taken first (SDM Table 7-2: class 3 before the trap and breakpoint classes):
+        # the INIT posted at the POPFD that sets TF; the BSP's INIT state then fetches at the reset vector, which is not
+        # RAM here (a fetch stop at FFFFFFF0H), where interp_debug would say the order is wrong.
+        (interp_case('p32-init-before-tf', 'P32', ['pushfd', 'or dword [esp], 0x100', 'popfd', 'nop'], events=[('init', 8)]),
+         {'resident': 'interp_memory', 'fault': [0, 0xfffffff0, 0xfffff000], 'stop': None}),
+        # HLT: it completes and waits; an NMI wakes it for the typed stop (vector 2), an INIT wakes it and is taken (the
+        # reset vector's fetch stop again); alone, with nothing to wake it, the run ends with the vCPU halted.
+        (interp_case('p32-hlt-nmi', 'P32', ['nop', 'hlt', 'mov eax, 1'], events=[('nmi', 1)]),
+         {'resident': 'interp_event', 'fault': [2, 0, 0], 'eax': 0, 'stop': None}),
+        (interp_case('r-hlt-init', 'R', ['nop', 'hlt', 'mov eax, 1'], events=[('init', 1)]),
+         {'resident': 'interp_memory', 'fault': [0, 0xfffffff0, 0xfffff000], 'stop': None}),
+        (interp_case('r-hlt-halted', 'R', ['cli', 'hlt', 'mov eax, 1']), {'resident': 'halted', 'eax': 0, 'stop': None}),
     ]
     out = []
     for bits in (16, 32):
@@ -206,16 +220,39 @@ def typed_stop(out: dict, want: dict) -> list:
     return []
 
 
-def pending_detail(out: dict) -> str:
-    """The resident operation not built yet whose typed stop ended the run, or ''."""
-    if out.get('stop') != 'resident' or not str(out.get('reason', '')).startswith('interp_unsupported '):
-        return ''
-    return PENDING_DETAILS.get(int(out.get('native', ['0x0'])[0], 16) >> 24 & 0xff, '')
-
-
-def read_pending(path: pathlib.Path) -> set:
-    """The case names of a pending list: one per line, `#` comments."""
-    return {line.split('#')[0].strip() for line in path.read_text().splitlines()} - {''}
+def judge_fault(case: dict, out: dict, want: dict) -> list:
+    """The differences of a fault case's run (interp_faults.py) from the model's result."""
+    got, reason = out.get('machine'), str(out.get('reason', ''))
+    if 'ending' in want:                                  # a modes_model program: where it ends
+        if want['ending'] is None:
+            return [] if out.get('stop') == 'reached' and got and got.get('stop') == 0 else [f'stop {out.get("stop")}: {reason}, want the end']
+        index, vector, error, paging = want['ending']
+        name = 'interp_mode' if paging else 'interp_fault'
+        if out.get('stop') != 'resident' or not reason.startswith(name + ' '):
+            return [f'stop {out.get("stop")}: {reason}, want {name} at instruction {index}']
+        up = out.get('startup') or {}
+        at = (num(up.get('cs_base', 0)) + num(up.get('rip', 0))) & 0xffffffff     # (the driver's numbers: ints)
+        where = at - num(case['code']['addr'])
+        d = [] if where == want['offsets'][index] else [f'stopped at offset {where:#x}, want instruction {index} at {want["offsets"][index]:#x}']
+        fault = [int(x, 16) for x in out.get('fault', [])[:3]]
+        if paging:
+            detail = int(out.get('native', ['0x0'])[0], 16) >> 24 & 0xff
+            return d + ([] if detail == 1 else [f'detail {detail}, want PAGING (1)'])
+        return d + ([] if (fault[0], fault[2]) == (vector, error) else [f'fault {fault}, want vector {vector} error {error:#x}'])
+    fields = {k: v for k, v in want.items() if k not in ('resident', 'permitted', 'detail', 'may_complete')}
+    if 'resident' in want:
+        if out.get('stop') != 'resident' or not reason.startswith(want['resident'] + ' '):
+            return [f'stop {out.get("stop")}: {reason}, want {want["resident"]}']
+        fault = tuple(int(x, 16) for x in out.get('fault', [])[:3])
+        if 'permitted' in want and list(fault) not in [list(f) for f in want['permitted']]:
+            return [f'fault {[hex(x) for x in fault]}, the model permits {[[hex(x) for x in f] for f in want["permitted"]]}']
+        if 'detail' in want and int(out.get('native', ['0x0'])[0], 16) >> 24 & 0xff != want['detail']:
+            return [f'detail {int(out.get("native", ["0x0"])[0], 16) >> 24 & 0xff}, want {want["detail"]}']
+    elif out.get('stop') != 'reached':
+        return [f'stop {out.get("stop")}: {reason}, want the model\'s completion']
+    if got is None:
+        return [f'no machine output: {reason}']
+    return [f'{k}: natemu {R._show(got.get(k))}, want {R._show(v)}' for k, v in fields.items() if got.get(k) != v]
 
 
 def main(argv=None):
@@ -225,8 +262,8 @@ def main(argv=None):
     ap.add_argument('--fexc', required=True)
     ap.add_argument('--out', required=True, type=pathlib.Path)
     ap.add_argument('--selftest', action='store_true', help='the machine descriptions with their expected fields only')
+    ap.add_argument('--faults', action='store_true', help='the fault and transition cases against the models')
     ap.add_argument('--cases', default='*', help='a glob over case names (the corpus)')
-    ap.add_argument('--pending', type=pathlib.Path, help='the corpus cases that stop at a form not built yet')
     ap.add_argument('--jobs', type=int, default=1, help='runs at once')
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
@@ -235,7 +272,13 @@ def main(argv=None):
     results = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.jobs))
     go = lambda name, case: run(a.host, a.runtime, a.fexc, description(case, common), a.out / 'work' / name)
-    if a.selftest:
+    if a.faults:
+        import interp_faults
+        tests = interp_faults.all_cases(sys.modules[__name__])
+        for (name, case, want), out in zip(tests, pool.map(lambda t: go(t[0], t[1]), tests)):
+            diffs = judge_fault(case, out, want)
+            results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+    elif a.selftest:
         tests = selftests() + interp_selftests()
         for (name, case, want), out in zip(tests, pool.map(lambda t: go(t[0], t[1]), tests)):
             got = out.get('machine')
@@ -247,29 +290,16 @@ def main(argv=None):
     else:
         import run_interp_ref
         locked = run_interp_ref.locked(doc)
-        pending = read_pending(a.pending) if a.pending else set()
-        if unknown := pending - {c['name'] for c in doc['cases']}:
-            results.append({'name': 'pending-list', 'outcome': 'fail', 'diffs': [f'not a case: {n}' for n in sorted(unknown)]})
         chosen = [(i, c) for i, c in enumerate(doc['cases']) if fnmatch.fnmatch(c['name'], a.cases)]
         for (i, c), out in zip(chosen, pool.map(lambda ic: go(ic[1]['name'], ic[1]), chosen)):
             diffs = judge(c, out.get('machine'), {r: locked[r].get(i) for r in locked})
             if out.get('machine') is None or out['machine'].get('stop') is None:
                 diffs.insert(0, f'driver stop {out.get("stop")}: {out.get("reason")}')
-            outcome = 'fail' if diffs else 'match'
-            if c['name'] in pending:
-                detail = pending_detail(out)
-                outcome = 'unsupported' if detail else 'fail'   # (the harness's declared limit: not a pass, not a failure)
-                diffs = [f'stops at {detail}, not built yet'] if detail else \
-                    diffs or ['unexpected pass: remove it from the pending list']
-            results.append({'name': c['name'], 'outcome': outcome, 'diffs': diffs})
+            results.append({'name': c['name'], 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
     (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
     failed = [r for r in results if r['outcome'] == 'fail']
-    waiting = [r for r in results if r['outcome'] == 'unsupported']
     for r in failed: print(f'FAIL {r["name"]}: {"; ".join(r["diffs"])[:600]}', flush=True)
-    counts = {d: sum(r['diffs'][0].startswith(f'stops at {d},') for r in waiting) for d in PENDING_DETAILS.values()}
-    print(f'{len(results) - len(failed) - len(waiting)} of {len(results)} pass; {len(waiting)} pending'
-          f'{" (" + ", ".join(f"{d} {n}" for d, n in counts.items() if n) + ")" if waiting else ""}; {len(failed)} fail',
-          flush=True)
+    print(f'{len(results) - len(failed)} of {len(results)} pass; {len(failed)} fail', flush=True)
     sys.exit(1 if failed or not results else 0)
 
 

@@ -1645,6 +1645,10 @@ const _: () = assert!(size_of::<Block>() % align_of::<System>() == 0);
 /// the metadata arena or the block index is full.
 pub fn place_interpreted(linear: u64, key: u64, i: &Insn) -> Option<()> {
     if let Some(b) = interpreted_at(linear, key) {
+        // Only the tail changes: the first filing's `guest_bytes`, its linear chains and its regions stay as that record's
+        // length set them. Harmless: what those steer (an INVLPG or a write making records not current, a cut) ends at
+        // most in this record's currency, which nothing reads for an interpreter record, and every execution checks
+        // the new record's own bytes ([`interpreted_at`]'s caller validates `bytes[..length]` against memory).
         // SAFETY: the record's tail is its `Insn` (filed below); the arena is this vCPU's and writable.
         unsafe { block_ptr(b.number as usize).add(1).cast::<Insn>().write(*i) };
         return Some(());

@@ -43,6 +43,7 @@
 use crate::execution::Cpu;
 
 pub mod exec;
+pub mod system;
 
 /// Operation numbers of [`Insn::op`]: our own, not iced's `Code`, so the resident needs no decoder tables. Grouped so
 /// that a range test classifies: data operations below [`op::JCC`], control transfers from it, resident operations from

@@ -3628,8 +3628,10 @@ pub mod stop {
     /// An exception the instruction raises (fetch faults included): `fault` = [vector, CR2 (#PF; else 0), error code, RIP].
     /// Interpreted modes deliver nothing (plan section 6).
     pub const INTERP_FAULT: u64 = 80;
-    /// An instruction decoded but not in the first version (`op` `OTHER`), or a first-version form whose resident
-    /// operation is not built yet (detail: [`interp::FAR_JUMP`] ..).
+    /// An instruction decoded but not in the first version (`op` `OTHER`, detail 0), or a first-version form at what the
+    /// first version does not do (detail [`interp::GATE`]: a far JMP through a call gate, a task gate or a TSS;
+    /// [`interp::OUTER`]: a far RET to an outer privilege level; [`interp::TABLE`]: a descriptor-table entry above 4 GiB in
+    /// compatibility mode).
     pub const INTERP_UNSUPPORTED: u64 = 81;
     /// A device page (detail [`interp::DEVICE`]: the local APIC's, or one the host's registry claims), an unassigned page
     /// under the strict switch ([`interp::UNASSIGNED`]), or a fetch from a page that is not guest RAM
@@ -3642,15 +3644,18 @@ pub mod stop {
     /// bits).
     pub const INTERP_DEBUG: u64 = 84;
     /// A state the interpreter does not run: protected mode at CPL > 0, paging without IA-32e mode, or paging controls
-    /// the walker has none for (`super::Cpu::paging`).
+    /// the walker has none for (`super::Cpu::paging`), found at a boundary (detail 0); or the MOV to CR0 that would
+    /// enable paging without IA-32e mode, legacy or PAE paging (detail [`interp::PAGING`], at that instruction).
     pub const INTERP_MODE: u64 = 85;
+    /// (Not a typed stop: no record.) The interpreter found its own invariant broken (an access its checks did not cover,
+    /// a record it cannot key): a bug of natemu's, never the guest's.
+    pub const INTERP_BUG: u64 = 86;
     /// The details of the interpreter's stops (`State::native[0]` bits 31:24).
     pub mod interp {
-        pub const FAR_JUMP: u64 = 1;
-        pub const FAR_RETURN: u64 = 2;
-        pub const LOAD_SEGMENT: u64 = 3;
-        pub const MOV_TO_CR: u64 = 4;
-        pub const HLT: u64 = 5;
+        pub const GATE: u64 = 6;
+        pub const OUTER: u64 = 7;
+        pub const TABLE: u64 = 8;
+        pub const PAGING: u64 = 1;
         pub const DEVICE: u64 = 1;
         pub const UNASSIGNED: u64 = 2;
         pub const FETCH: u64 = 3;
@@ -3699,6 +3704,7 @@ pub mod stop {
             INTERP_EVENT => "interp_event",
             INTERP_DEBUG => "interp_debug",
             INTERP_MODE => "interp_mode",
+            INTERP_BUG => "interp_bug",
             _ => "none",
         }
     }

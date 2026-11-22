@@ -13,8 +13,9 @@
 //! other transfers to one are not built (task 5): JMP/CALL far at CPL 3 and RET far whose new CS has RPL 3, and any
 //! transfer to L = D = 1, raise #GP(that selector) at the instruction before any change (owner decision, November 6: a
 //! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program); one that would run
-//! CPL 0 code stops `unsupported_code_mode` with that CS in the record and RIP at the instruction, nothing else
-//! changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
+//! CPL 0 compatibility-mode code completes and is the boot-time interpreter's (M2 Part 2, [`refuse_compatibility`]); L = D
+//! = 1, CPL 1 or 2, or an IRET there stops `unsupported_code_mode` with that CS in the record and RIP at the instruction,
+//! nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
 //! CPL-3 transfer stops the machine). M2 task 3b, executed in 32-bit code: operands at 32-bit addresses in their segment
 //! ([`address`]), the stack at 32 bits (ESP wraps, 4-byte slots), JMP/CALL/RET far within 32-bit code (to 64-bit code:
 //! #GP(selector), task 5), IRET's three pops at the same level, the 32-bit-only far-pointer loads. `tools/models/segment_model.py`
@@ -596,20 +597,22 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     Ok((va, raw))
 }
 /// Loads CS with `selector` (RPL as given) from `raw` (a segment that runs: [`refuse_compatibility`], and the commit's
-/// and [`set_cpl`]'s mode check).
-fn load_cs(s: &mut State, selector: u16, raw: u64) {
+/// and [`set_cpl`]'s mode check). M2 Part 2: the boot-time interpreter's far transfers load their CS with it too.
+pub(super) fn load_cs(s: &mut State, selector: u16, raw: u64) {
     s.cpu.seg[SREG_CS] = Segment::loaded(selector, raw | 1 << 40);
 }
 /// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
-/// at CPL 3 (`cpl`, the new CPL), else halts `unsupported_code_mode` (module doc).
+/// at CPL 3 (`cpl`, the new CPL); else (M2 Part 2) compatibility-mode code at CPL 0 is the boot-time interpreter's and
+/// the transfer goes on, and any other halts `unsupported_code_mode` (module doc; out of line,
+/// [`super::interpret::kernel_compatibility`]). Out of line, as the compiler left it before that arm became a call: so
+/// `far_transfer` and `far_return` stay the same code.
+#[inline(never)]
 fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
     if raw >> 53 & 3 != 1 {
         if cpl == 3 {
             return Err(gp(selector));
         }
-        let mut refused = *s;
-        refused.cpu.seg[SREG_CS] = Segment::loaded(selector, raw);
-        halt(&refused, stop::UNSUPPORTED_CODE_MODE)
+        super::interpret::kernel_compatibility(s, selector, raw, cpl);
     }
     Ok(())
 }

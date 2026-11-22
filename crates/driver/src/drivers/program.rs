@@ -102,9 +102,11 @@
 //!     `wait_for_sipi`)
 //!   | svr VALUE (X3: the local APIC's spurious-interrupt vector register at the start, default its reset value 0xff,
 //!     software disabled; e.g. 0x1ff lets `post` items reach the core without guest APIC set-up)
-//!   | post ADDR VECTOR | nmi ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`, makes the host
-//!     post the external interrupt VECTOR (16..255) or an NMI into the vCPU's event record and ring its doorbell; the
-//!     vCPU takes it when eligible. Blocks end before it.)
+//!   | post ADDR VECTOR | nmi ADDR | init ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`,
+//!     makes the host post the external interrupt VECTOR (16..255), an NMI or (M2 Part 2) an INIT into the vCPU's event
+//!     record and ring its doorbell; the vCPU takes it when eligible. Blocks end before it. In interpreted code the
+//!     instruction at ADDR is decoded and runs as itself, the event posted when the interpreter asks for its decode,
+//!     after its boundary's own look at events: so the boundary after that instruction is the first to see it.)
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
 //! with system instructions (the resident's transactions).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
@@ -133,7 +135,7 @@
 //! fixture of the driver's (no page tables, logging IDT, GDT or TSS, nothing derived): each section starts in the SDM's
 //! power-on state (`natemu_abi::power_on::power_on`: CS F000H base FFFF0000H, EIP FFF0H, CR0 60000010H, EDX the
 //! signature), which these items change: `rip EIP` (CS-relative), `rflags VALUE` (as given; bit 1 set), `gpr V0 .. V15`,
-//! `cpl 0|3`, `xmm`, `mxcsr`, `svr` as above; `cr0 V`, `cr3 V`, `cr4 V`, `efer V` (as given, LMA included); `seg
+//! `cpl 0|3`, `xmm`, `mxcsr`, `svr`, `post`, `nmi`, `init` as above; `cr0 V`, `cr3 V`, `cr4 V`, `efer V` (as given, LMA included); `seg
 //! es|cs|ss|ds|fs|gs SEL BASE LIMIT ATTR` (the register with its hidden part: `exec::Segment`'s attributes, descriptor
 //! bits 47:40 in 7:0 and 55:52 in 15:12; the byte-granular limit); `gdtr BASE LIMIT`, `idtr BASE LIMIT`; `stop LINEAR`
 //! (repeatable: the run ends when the vCPU is about to execute that linear address, stop ids 0.. in order, the first
@@ -228,7 +230,7 @@ struct Section {
     space: usize,
     /// `switch` items: (RIP, CPL).
     switches: Vec<(u64, u64)>,
-    /// `post`/`nmi` items (X2 event sources): (RIP, vector or `execution::NMI`).
+    /// `post`/`nmi`/`init` items (X2 event sources): (RIP, vector, `execution::NMI` or `execution::INIT`).
     posts: Vec<(u64, u64)>,
     /// RFLAGS.IF at the start (`if 0|1`, default 1).
     interrupts: bool,
@@ -469,6 +471,9 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("nmi", [a]) => state(&mut cpu, line)?
                 .posts
                 .push((number(a)?, execution::NMI)),
+            ("init", [a]) => state(&mut cpu, line)?
+                .posts
+                .push((number(a)?, execution::INIT)),
             ("if", [v @ ("0" | "1")]) => state(&mut cpu, line)?.interrupts = *v == "1",
             ("svr", [v]) if number(v)? & !natemu_abi::lapic::SVR_WRITABLE == 0 => {
                 state(&mut cpu, line)?.svr = number(v)?
@@ -545,7 +550,7 @@ fn machine_items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section
         };
         match (words[0], &words[1..]) {
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
-            ("rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr", _) => {
+            ("rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
                 items(&[*line], space, cpu.as_deref_mut())?
             }
             ("cr0" | "cr3" | "cr4" | "efer", [v]) => {

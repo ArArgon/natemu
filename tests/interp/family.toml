@@ -29,9 +29,16 @@ argv = ["tests/interp/run_interp_natemu.py", "--selftest", "--jobs", "4", "--hos
 needs = { cores = 4 }
 smoke = true
 
-# The corpus in natemu's interpreter against the locked answers; the cases listed in natemu-pending.txt stop at a
-# resident operation not built yet (each must stop there, the typed stop naming it).
+# The interpreter's fault and transition cases against the models (interp_faults.py): segment_model's far JMP, far RET
+# and MOV Sreg in R, P16, P32 and C32 (the typed stop and record it gives with nothing committed, or the state it
+# reaches), and modes_model's programs (where the model ends them: a fault, the paging-without-long-mode stop, the end).
+[suite.cases."natemu-faults"]
+argv = ["tests/interp/run_interp_natemu.py", "--faults", "--jobs", "4", "--host", "{natemu_host}", "--runtime",
+        "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4 }
+
+# The corpus in natemu's interpreter: every case against its locked answers.
 [suite.cases."natemu"]
-argv = ["tests/interp/run_interp_natemu.py", "--pending", "tests/interp/natemu-pending.txt", "--jobs", "4", "--host",
-        "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/interp/run_interp_natemu.py", "--jobs", "4", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}",
+        "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4 }
