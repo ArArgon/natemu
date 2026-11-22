@@ -280,7 +280,8 @@ def only_moves(old, new):
         if x[4:] != y[4:]: return 'a relocation differs'
         if x[4] != GUEST_RIP_MOVE: continue
         o, n, reg, value = u32(x, 0), u32(y, 0), x[5], struct.unpack_from('<Q', x, 8)[0]
-        m = move_value(ca, o, reg)
+        # (OLD's move: FEX's LoadConstant form, or already the one form, as in a self-check of NEW against itself.)
+        m = (12, value) if move32(ca, o, reg) == value else move_value(ca, o, reg)
         if m is None or m[1] != value or n != o + shift or move32(cb, n, reg) != value:
             return f'the move at +{o:#x} (NEW +{n:#x}) is not the same value in the one form'
         edits.append((o, m[0], n)); shift += 12 - m[0]
