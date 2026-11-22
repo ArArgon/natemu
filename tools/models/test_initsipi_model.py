@@ -95,6 +95,12 @@ class Rules(unittest.TestCase):
         # W1: the CPU ends waiting, whatever its trampoline had run.
         self.assertEqual({c[0] for _, c in per_cpu('init-sipi-init', 1)}, {'wait-for-sipi'})
 
+    def test_second_sipi_and_one_cpu(self):
+        # W3: a SIPI that finds one latched (or the CPU running) is discarded: the AP starts at the first vector only.
+        self.assertEqual({c[1] for _, c in per_cpu('sipi-sipi', 1)}, {((('sipi', V), 4),)})
+        # A shorthand that selects no CPU: nothing happens.
+        self.assertEqual(ends('one-cpu'), {('end', (('halted', (('boot', 2),), 0, 0),))})
+
     def test_end_rule(self):
         # The run ends with the BSP halted and the others waiting for a SIPI, reported as such (not finished).
         self.assertEqual(ends('never-started'), {('end', (('halted', (('boot', 1),), 0, 0),
