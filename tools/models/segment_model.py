@@ -635,7 +635,7 @@ def jmp_far_interp(state, target=None, pointer=None, osize=32):
         st, t, dpl, p, l, d = fields(raw)
         lma, cpl = s['efer'] & EFER_LMA, s['cpl']
         if not st:
-            if t == 0xC or not lma and t in (1, 3, 4, 5, 9, 0xB):
+            if t == 0xC or not lma and t in (1, 4, 5, 9):           # a busy TSS (3, BH): "not available", #GP(sel)
                 raise Refused('call gate' if t in (4, 0xC) else 'task gate or TSS: a task switch')
             raise _gp(sel)
         if not t & 8 or lma and l and d:

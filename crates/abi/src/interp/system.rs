@@ -21,8 +21,8 @@ const CR0_CD: u64 = 1 << 30;
 pub enum Check {
     /// An exception: its vector and error code (#GP, #NP, #SS with a selector's index, TI and EXT bits clear; or 0).
     Fault { vector: u8, error: u16 },
-    /// A far JMP through a call gate, or (EFER.LMA = 0) a task gate or a TSS: a task switch. The first version runs
-    /// neither (a typed stop).
+    /// A far JMP through a call gate, or (EFER.LMA = 0) a task gate or an available TSS: a task switch. The first
+    /// version runs neither (a typed stop).
     Gate,
     /// A far RET to an outer privilege level (the first version has no privilege changes: a typed stop).
     Outer,
@@ -87,7 +87,8 @@ const fn loaded(selector: u16, raw: u64) -> Segment {
 
 /// The new CS of a far JMP to non-null `selector`, descriptor `raw`, at `offset` (already cut to the operand size), at the
 /// bank's CPL (SDM Vol.2 JMP, protected mode; `segment_model.jmp_far_interp`): a system descriptor is a call gate or
-/// (LMA = 0) a task gate or TSS ([`Check::Gate`]), else #GP(selector); a data segment, or with LMA = 1 L = D = 1,
+/// (LMA = 0) a task gate or an available TSS ([`Check::Gate`]), else #GP(selector) (a busy TSS: "TSS descriptor
+/// indicates TSS not available"); a data segment, or with LMA = 1 L = D = 1,
 /// #GP(selector); conforming code with DPL > CPL, nonconforming with RPL > CPL or DPL != CPL, #GP(selector); not
 /// present #NP(selector); an offset past the new limit #GP(0), except into 64-bit code (LMA and L: no limit). CS gets
 /// RPL = CPL.
@@ -95,7 +96,7 @@ pub fn jump(cpu: &Cpu, selector: u16, raw: u64, offset: u32) -> Result<Segment, 
     let (code_or_data, kind, dpl, present, l, d) = fields(raw);
     let (lma, cpl) = (cpu.efer & EFER_LMA != 0, cpu.cpl);
     if !code_or_data {
-        let gate = kind == 0xc || (!lma && matches!(kind, 1 | 3 | 4 | 5 | 9 | 0xb));
+        let gate = kind == 0xc || (!lma && matches!(kind, 1 | 4 | 5 | 9));
         return Err(if gate { Check::Gate } else { gp(selector) });
     }
     let rpl = u64::from(selector & 3);
@@ -287,9 +288,11 @@ mod tests {
         assert!(jump(&c, 0x28, small, 0x1_0000).is_ok());
         assert_eq!(jump(&p, 0x20, CODE16, 0x10000), Err(GP0));
         assert!(jump(&p, 0x20, CODE16, 0xffff).is_ok());
-        // System descriptors: gates and TSSs are a task switch or a gate (refused); an LDT is #GP.
+        // System descriptors: gates and available TSSs are a task switch or a gate (refused); a busy TSS and an LDT are
+        // #GP(selector).
         for (kind, legacy, long) in [(0xc, Check::Gate, Check::Gate), (4, Check::Gate, gp(0x30)), (5, Check::Gate, gp(0x30)),
-                                     (9, Check::Gate, gp(0x30)), (0xb, Check::Gate, gp(0x30)), (2, gp(0x30), gp(0x30))] {
+                                     (1, Check::Gate, gp(0x30)), (9, Check::Gate, gp(0x30)), (3, gp(0x30), gp(0x30)),
+                                     (0xb, gp(0x30), gp(0x30)), (2, gp(0x30), gp(0x30))] {
             let raw = with(CODE32, 0x80 | kind);
             assert_eq!((jump(&p, 0x30, raw, 0), jump(&c, 0x30, raw, 0)), (Err(legacy), Err(long)), "type {kind:#x}");
         }

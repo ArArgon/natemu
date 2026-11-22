@@ -1,5 +1,6 @@
 """Hand-derived cases for the 64-bit segment model (SDM references in segment_model's docstring), and its IRETQ against
 delivery_model's."""
+import copy
 import pathlib
 import sys
 import unittest
@@ -432,6 +433,10 @@ class Interpreted(unittest.TestCase):
         self.assertEqual(m.mode_of(m.jmp_far_interp(s, (0x28, 0))['state']), 'P16')  # L = 1, D = 0: 16-bit
         for sel in (0x50, 0x58, 0x88):
             self.assertEqual(m.jmp_far_interp(s, (sel, 0))['outcome'], 'refused', hex(sel))
+        for access in (0x8B, 0x83, 0x0B):                                       # a busy TSS (32-, 16-bit; not present)
+            b = copy.deepcopy(s)
+            dm.place(b['memory'], IGDT + 0x50, m.segment(0x1000, 0x67, access).to_bytes(8, 'little'))
+            self.assertEqual(self.f(m.jmp_far_interp(b, (0x50, 0))), ('fault', (dm.GP, 0x50)), hex(access))
         r = m.jmp_far_interp(s, (0x48, 0))
         self.assertEqual(r['diff'], {IGDT + 0x48 + 5: bytes([0x9B])})          # the accessed bit
         self.assertEqual(self.f(m.jmp_far_interp(interp('P32', cpl=3), (0x93, 0)))[0], 'refused')
