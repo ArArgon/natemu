@@ -45,6 +45,8 @@ ENDINGS = {
     45: [(10, 9, 13, 0, None)],                   # PE cleared with PG = 1: #GP(0)
     46: [(2, 1, 0, 0, 'paging without long mode')],   # legacy paging: architecturally legal, natemu's typed stop
     47: [(16, 15, 0, 0, None)],                   # CR4.PAE and EFER.LME set in real mode, then activation from P32
+    48: [(11, 10, 0, 0, None)],                   # LIDT and near RET in compatibility mode
+    49: [(9, 8, 14, 0, None)],                    # LIDT's operand on a page not present: #PF (read, supervisor)
 }
 
 
@@ -110,6 +112,13 @@ class Programs(unittest.TestCase):
         self.assertEqual([x['after'][2] for x in r[3:6]], [m.LINUX_CR4, m.LINUX_CR4, 0x600])   # PAE cleared, LME = 1
         self.assertEqual(m.LINUX_CR4 & ~m.CR4_VALID, 0)
         self.assertNotEqual((1 << 12) & m.CR4_VALID, 1 << 12)    # LA57 is not offered
+
+    def test_lidt_and_near_ret_in_compatibility_mode(self):
+        r = records(48)
+        self.assertEqual([x['imode'] for x in r[8:]], ['C32', 'C32', 'C32'])
+        self.assertEqual(r[8]['idtr_after'], [0x12345678, 0xFFF])               # m16&32: 16-bit limit, 32-bit base
+        self.assertEqual((r[9]['next_rip'], r[9]['esp_after']), (r[10]['rip'], m.STACK + 4))
+        self.assertEqual((records(49)[-1]['linear'], records(49)[-1]['vector']), (m.DATA + 0x1000, 14))
 
     def test_paging_without_long_mode_is_natemu_stop(self):
         self.assertEqual([(x['index'], x.get('stop')) for x in records(23)][3], (3, 'paging without long mode'))
