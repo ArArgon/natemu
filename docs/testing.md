@@ -138,6 +138,9 @@ tests/correctness/family.toml -k stress` is the original full-size stress-ng cam
 `TESTKIT_PART_ARGS='stress:scale=1,timeout=240;litmus:'` runs both at full size. A value without `SUITE:` applies to
 every suite of the run that no entry names.
 
+Each part boots its own VM and claims as many cores as that VM has vCPUs, at most the suite's `needs.cores`: public's
+1-vCPU parts claim one core each, so they run side by side.
+
 A Mac with every feature (an M4) runs everything alone. On a Mac without one, a gate in which everything that ran passed ends
 not passed, under a red line such as `ALL TESTS PASSED, BUT 8 TESTS DID NOT RUN ON THIS MACHINE`, the list of them and three
 ways to close it, each a later command. Nothing is asked while the run goes (a prompt would block a run nobody watches); an

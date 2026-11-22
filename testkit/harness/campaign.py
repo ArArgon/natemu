@@ -24,7 +24,7 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
                                 timing-sensitive cases, as CPython's TimerfdTests): the part is rerun once, as for a
                                 `flaky` entry; the rerun's verdict counts if it passes, a second `flaky` stays flaky and
                                 any other failure fails
-    matrix = { "machine.vcpus" = [4] }
+    matrix = { "machine.vcpus" = [4] }   a part claims as many cores as its variant's vCPUs, at most needs.cores
     reference_boot = "kvm"      seeding a `reference = "x86"` suite boots each part on the x86 machine under KVM, with
                                 the kernel and command line of a natemu boot (native_vm()), instead of a chroot on the
                                 machine's own kernel: for a suite whose results depend on the kernel (ltp32). Seeding
@@ -495,9 +495,15 @@ class Campaign:
         boots = 2 if suite.extra.get('flaky') or suite.extra.get('verdict_flaky') else 1
         return boots * (float(suite.extra.get('cap', 3600)) + AFTER_END + 30) + 120
 
-    def case_needs(self, fam, suite, case):
-        """The suite's needs, with `perf` (performance cores only) for a part named in `perf_parts`."""
-        return dataclasses.replace(suite.needs, perf=True) if case in suite.extra.get('perf_parts', ()) else suite.needs
+    def case_needs(self, fam, suite, case, variant=None):
+        """The suite's needs, with `perf` (performance cores only) for a part named in `perf_parts`, and as many cores as
+        the variant has vCPUs, at most the suite's (a 1-vCPU part of public claims one): the VM's other threads (timer,
+        console, disk) mostly sleep, and a part's claim is what lets the others run beside it."""
+        n = suite.needs
+        if case in suite.extra.get('perf_parts', ()): n = dataclasses.replace(n, perf=True)
+        vcpus = variant.get('machine.vcpus') if variant else None
+        if vcpus and isinstance(n.cores, int): n = dataclasses.replace(n, cores=min(n.cores, int(vcpus)))
+        return n
 
     def requirements(self, fam, suite, variant):
         return [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'),

@@ -395,6 +395,22 @@ def test_perf_parts_take_performance_cores_only(tmp_path):
     assert [c for c in campaign.HARNESS.cases(fam, pub) if campaign.HARNESS.case_needs(fam, pub, c).perf] == ['part-1', 'part-2', 'part-10', 'part-11']
 
 
+def test_a_part_claims_one_core_per_vcpu_up_to_the_suites():
+    """A part claims its variant's vCPUs in cores, at most the suite's `needs.cores` (public: 1 or 4), and keeps
+    `perf_parts`; the run loop asks with the item's variant."""
+    import types
+    from testkit import runloop
+    from testkit.family import Variant
+    pub = next(s for s in family.load(paths.repo_root() / 'tests/correctness/family.toml').suites if s.name == 'public')
+    fam = types.SimpleNamespace(name='correctness')
+    need = lambda case, n: runloop.it_needs(types.SimpleNamespace(harness=campaign.HARNESS, fam=fam, suite=pub, case=case,
+                                                                  variant=Variant(params=(('machine.vcpus', n),))))
+    assert pub.needs.cores == 4
+    assert (need('part-0', 1).cores, need('part-0', 4).cores, need('part-0', 8).cores) == (1, 4, 4)
+    assert need('part-1', 1).cores == 1 and need('part-1', 1).perf and not need('part-0', 1).perf
+    assert campaign.HARNESS.case_needs(fam, pub, 'part-0').cores == 4             # no variant: the suite's claim
+
+
 def test_boot_runs_natemu_with_boot_py_command_line(tmp_path, monkeypatch):
     """boot() itself: the stub's argv as tools/correctness/boot.py builds it, a private serial file, stopped after CT-END."""
     import types

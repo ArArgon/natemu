@@ -119,7 +119,7 @@ class Bench:
         """The case's own `timeout` (seconds), else None: the suite's `params.timeout` applies (as the runner harness)."""
         return self._spec(suite, case)[2].get('timeout')
 
-    def case_needs(self, fam, suite, case):
+    def case_needs(self, fam, suite, case, variant=None):
         if self._spec(suite, case)[2].get('remote'):       # `remote = true`: the case's VM runs on another machine and times
             return Needs(cores=1)                          # nothing here (io5-solo32-reference); it only waits, on one core
         return Needs(exclusive=True, why='measures wall-clock time: nothing else may run')

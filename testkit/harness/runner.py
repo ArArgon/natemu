@@ -172,7 +172,7 @@ class Runner:
         """The case's own `timeout` (seconds), else None: the suite's `params.timeout` applies."""
         return self._spec(suite, case).get('timeout')
 
-    def case_needs(self, fam, suite, case):
+    def case_needs(self, fam, suite, case, variant=None):
         n = dict(self._spec(suite, case).get('needs', {}))
         return Needs(**n) if n else suite.needs
 

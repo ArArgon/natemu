@@ -129,9 +129,9 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
 
 
 def it_needs(item):
-    """A suite's claims, or per case where the harness knows them (benchmarks)."""
+    """A suite's claims, or per case (and variant) where the harness knows them (benchmarks, campaign parts)."""
     h = item.harness
-    return h.case_needs(item.fam, item.suite, item.case) if hasattr(h, 'case_needs') else item.suite.needs
+    return h.case_needs(item.fam, item.suite, item.case, item.variant) if hasattr(h, 'case_needs') else item.suite.needs
 
 
 def report_without_running(item, category, reason):
