@@ -399,10 +399,9 @@ pub struct Boot {
     /// start-up IPI, as firmware leaves the processors it did not boot: Linux then starts them with INIT and SIPI. A
     /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). Each such AP is published
     /// as waiting for a SIPI before any vCPU runs ([`execution::wait_for_sipi`]), and waits in the resident for one;
-    /// the SIPI's state is the boot-time interpreter's, which is not built yet: the AP stops there (`unsupported_mode`
-    /// at the SIPI's state), and one vCPU's end ends the whole run ([`Prepared::run`]). So until then a boot with this
-    /// off ends when the kernel starts its first AP, and every Multiboot boot (its BSP starts in 32-bit protected mode)
-    /// ends at once.
+    /// the SIPI starts it in the boot-time interpreter, which runs its real-mode start (Linux's trampoline) up to its
+    /// hand-off to 64-bit code (`tests/boot` case `boot-startup`: Debian's kernel at 2 and 4 vCPUs, CPUs offline and
+    /// online again, the shutdown).
     pub mailbox: bool,
     /// Test only (kvm-unit-tests' exit, plan section 7): QEMU's isa-debug-exit device at ports F4H-F7H
     /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
