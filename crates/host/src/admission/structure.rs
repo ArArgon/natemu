@@ -2442,7 +2442,8 @@ impl Verifier<'_> {
             let mut k = at + 4;
             while k < self.c.code.len() as u32 {
                 let Some(i) = self.insn(k) else { break };
-                if !matches!(i, Insn::Data(_) | Insn::Mem(_) | Insn::Other) {
+                // (A 32-bit guest-RIP move's `nop` writes nothing: the scan goes on past it as past the move's words.)
+                if !matches!(i, Insn::Data(_) | Insn::Mem(_) | Insn::Other | Insn::MovePad) {
                     break;
                 }
                 let x = self.word(k);

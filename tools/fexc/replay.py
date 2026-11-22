@@ -305,8 +305,9 @@ def only_moves(old, new):
     while x < end[0]:
         if x in moves: x += moves[x]; continue
         y, wa, wb = at(x), u32(ca, x), u32(cb, at(x))
-        if wa != wb:
-            pa_, pb_ = pcrel(wa), pcrel(wb)
+        pa_, pb_ = pcrel(wa), pcrel(wb)
+        # (A PC-relative word is checked by its target whether or not its words differ: one that spans a move must change.)
+        if wa != wb or pa_ is not None:
             if pa_ is None or pb_ is None or pa_[1] != pb_[1] or at(x + pa_[0]) != y + pb_[0]:
                 far = pa_ is not None and pb_ is not None and wa >> 24 in (0x34, 0x35, 0x36, 0x37, 0xb4, 0xb5, 0xb6, 0xb7) and pb_[0] == 8
                 return (f'a far form at +{x:#x} (NEW +{y:#x}): FEX restarted with it' if far else
@@ -353,6 +354,14 @@ def mutations(reply):
         return w + 1 if w & 0x7c000000 == 0x14000000 else w + (1 << 29) if w & 0x9f000000 == 0x10000000 else w + (1 << 5)
     rel = [o for o in words if pcrel(u32(code, o)) and pcrel(u32(code, o))[0]]
     if rel: out.append(poke(base + rel[0], retarget))
+    # A PC-relative word over a move, its target 4 bytes short (OLD's own word where OLD's move was one word shorter).
+    span = [o for o in rel if any(min(o, o + pcrel(u32(code, o))[0]) < m < max(o, o + pcrel(u32(code, o))[0]) for m in moves)]
+    if span:
+        o = span[0]
+        def shorter(w, back=pcrel(u32(code, o))[0] < 0):
+            unit = 1 if w & 0x7c000000 == 0x14000000 else 1 << 5   # 4 bytes: b's field at bit 0, adr's high bits and the others' at 5
+            return (w + unit if back else w - unit) & 0xffffffff
+        out.append(poke(base + o, shorter))
     if sites: out.append(poke(20 + len(json) + u32(h, 64), lambda w: w + 4))
     return out
 
@@ -412,7 +421,7 @@ def main():
     same = os.path.realpath(a.old) == os.path.realpath(a.fexc)
     print(f'replay: {n} requests ({stream.stat().st_size >> 20} MiB), {differ} differences' +
           (f'; {probes} more replies differ only by split stubs that probe (M2 task 4: only_probes)' if probes else '') + (' (OLD is NEW: the self-check only)' if same else '') +
-          (f'; {n32} of them for 32-bit code, answered by NEW only' if a.program32 and not old32 else ''))
+          (f'; {n32} of them for 32-bit code, answered by NEW only (none compared: --old32 compares them)' if n32 and not old32 else ''))
     if old32:
         growth = 100 * (size32[1] - size32[0]) / max(size32[0], 1)
         print(f'32-bit: {n32} requests: {same32} replies the same, {moves32} differ only by moves (only_moves), {differ32} otherwise; '

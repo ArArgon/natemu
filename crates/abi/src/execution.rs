@@ -1145,7 +1145,7 @@ pub mod cache {
     pub const PIC_USER64: u64 = 3;
     /// PIC study stage 3: whether templates of `context` are shared under [`Control::pic`] `pic`: user code, or every
     /// privilege level; 32-bit code too (fexc's one move form there, [`super::guest_rip_move32`], is rewritten to the
-    /// 32-bit form of [`crate::pic::form`], whose adds wrap at 4 GiB as fexc's values do) but under [`PIC_USER64`].
+    /// 32-bit form of [`crate::pic::form`], whose adds wrap at 4 GiB as fexc's values do), except under [`PIC_USER64`].
     pub fn shares(pic: u64, context: u64) -> bool {
         match pic {
             PIC_USER => context & 3 == 3,

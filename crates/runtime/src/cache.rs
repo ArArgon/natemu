@@ -1360,7 +1360,9 @@ pub fn running_rip(b: &Block) -> u64 {
             .byte_add(natemu_abi::execution::frame::PAGE_BASE as usize)
             .read_volatile()
     };
-    slot & !0xfff | b.rip & 0xfff
+    // (32-bit code's adds build its addresses modulo 2^32, whatever the slot's high half: a forged slot's too.)
+    let rip = slot & !0xfff | b.rip & 0xfff;
+    if bits32(b.context) { rip & 0xffff_ffff } else { rip }
 }
 /// PIC study stage 2, under the check ([`REUSE_CHECK`]): a position-independent block's literal slots (the tail's RIP,
 /// left as the template's in its copies) hold a non-canonical value, so code that read one would be caught by the
