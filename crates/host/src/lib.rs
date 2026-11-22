@@ -16,6 +16,7 @@ pub mod compile_cache;
 pub mod devices;
 mod disk;
 pub mod execution;
+mod interp;
 mod ioapic;
 pub mod irq;
 pub mod linux;

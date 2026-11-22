@@ -87,7 +87,9 @@ pub const IRQ: usize = 8;
 pub const ENTROPY: usize = 9;
 /// Writing the request's line (the log's own cost).
 pub const LOG_LINE: usize = 10;
-const HOST: [&str; 11] = [
+/// M2 Part 2: the interpreter's decode requests.
+pub const INTERPRET: usize = 11;
+const HOST: [&str; 12] = [
     "signal",
     "run",
     "exit",
@@ -99,6 +101,7 @@ const HOST: [&str; 11] = [
     "irq",
     "entropy",
     "log",
+    "interpret",
 ];
 /// Parts of a translation request: the guest bytes' copy, the in-memory cache's lookup, the persistent cache's get (the
 /// request body and its SHA-256 key included), fexc's round trip (its server's start included), the persistent put (a
