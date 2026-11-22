@@ -5,6 +5,7 @@
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
+//!       [--no-mailbox] [--debug-exit] [--firmware [--firmware-start reset|flat32]]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
