@@ -12,10 +12,10 @@ interpreter asks at CS.base + EIP before each decode, and the host never makes a
 The corpus case runs every case, `--jobs` at a time; every one must match its answers. `--selftest` runs machine
 descriptions with the fields each must leave: in 64-bit mode (translated code), and in the interpreted modes (the
 interpreter's own rules: an unaligned LOCK inside and across 16 bytes, an instruction ending at a page end or at the CS
-limit and one running past it, unassigned and device pages, self-modifying code, the typed stops' records, HLT, and the
-order of an INIT before TF). `--faults` runs the fault and transition cases against the models (interp_faults.py: the
-typed stop and record the model gives with nothing committed, or the state it reaches; modes_model's programs to where
-the model ends them).
+limit and one running past it, unassigned and device pages, self-modifying code, the typed stops' records, HLT, the
+order of an INIT before TF, and on two CPUs a SIPI that leaves an interpreted HLT as it is where an INIT ends it).
+`--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop and record the model
+gives with nothing committed, or the state it reaches; modes_model's programs to where the model ends them).
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402,E702
 import argparse
@@ -206,6 +206,54 @@ def interp_selftests() -> list:
     return out
 
 
+# Two CPUs (plan section 6, tools/models/initsipi_model.py `hlt-init-not-sipi`): CPU 1 in real mode signals at FLAGS and
+# halts with IF = 0 in interpreted code; the BSP (P32) sends it a SIPI, which must not end that HLT (A3, A6: a SIPI to a
+# CPU not waiting for one is discarded), then an INIT, which does (taken at the boundary after the HLT: the instruction
+# after it never runs), then a SIPI, which starts it at vector 0AH (real mode, CS 0A00H), where it counts its start and
+# halts. Each of the BSP's waits is bounded (LOOP) and records that it saw what it waited for (the windows are read when
+# the run has ended, so CPU 1 may count a late start after the BSP gave up), and a delay between its IPIs gives CPU 1
+# time to show a wrong wake.
+FLAGS = 0x20100          # +0 CPU 1 reached its HLT; +1 the instruction after that HLT ran; +2 starts at vector 0AH;
+                         # +3, +4 the BSP saw +0, then +2, within its wait
+SIPI_VECTOR, AP_CODE = 0x0A, 0x12000
+WAIT, DELAY = 0x400000, 0x4000
+
+
+def two_cpu_selftests() -> list:
+    """(name, description, [the BSP's fields, CPU 1's fields]); a CPU's `resident` names its typed stop or end."""
+    icr = lambda low: ['mov ecx, 0x830', 'mov edx, 1', f'mov eax, {low:#x}', 'wrmsr']
+    delay = lambda k: [f'mov ecx, {DELAY:#x}', f'd{k}: loop d{k}']
+    bsp = ['mov ecx, 0x1b', 'rdmsr', 'or eax, 0xc00', 'wrmsr',                     # x2APIC on, the APIC software-enabled
+           'mov ecx, 0x80f', 'mov eax, 0x1ff', 'xor edx, edx', 'wrmsr',
+           f'mov ecx, {WAIT:#x}', f'w1: cmp byte [{FLAGS:#x}], 1', 'je w1e', 'pause', 'loop w1', 'jmp w1x',
+           f'w1e: mov byte [{FLAGS + 3:#x}], 1', 'w1x:',
+           *delay(1),                                                                # CPU 1 parks in its HLT
+           *icr(0x4600 | SIPI_VECTOR), *delay(2),                                    # SIPI: discarded
+           *icr(0x4500), *delay(3),                                                  # INIT: ends the HLT
+           *icr(0x4600 | SIPI_VECTOR),                                               # SIPI: starts CPU 1
+           f'mov ecx, {WAIT:#x}', f'w2: cmp byte [{FLAGS + 2:#x}], 0', 'jne w2e', 'pause', 'loop w2', 'jmp w2x',
+           f'w2e: mov byte [{FLAGS + 4:#x}], 1', 'w2x:']
+    ap = ['mov byte [0x100], 1', 'hlt', 'mov byte [0x101], 1', 'h1: hlt', 'jmp h1']    # DS 2000H: FLAGS
+    start = ['mov ax, 0x2000', 'mov ds, ax', 'add byte [0x102], 1', 'h2: hlt', 'jmp h2']
+    (bsp_code,), (ap_code, start_code) = G.assemble([bsp], 32), G.assemble([ap, start], 16)
+    common = [f"memory {a:#x} {d.hex()}" for _, a, d in G.common_blocks()]
+    def cpu(mode, segs, at):
+        m = G.MODES[mode]
+        lines = ['cpu', f"rip {at - segs['cs']['base']:#x}", 'rflags 0x2', 'cpl 0',
+                 *[f"{k} {m[k]:#x}" for k in ('cr0', 'cr3', 'cr4', 'efer')],
+                 *[f"seg {s} {g['sel']:#x} {g['base']:#x} {g['limit']:#x} {g['attr']:#x}" for s, g in ((s, segs[s]) for s in G.SREGS)],
+                 f"gdtr {G.GDT:#x} {G.GDT_LIMIT:#x}", f"idtr {m['idtr'][0]:#x} {m['idtr'][1]:#x}"]
+        return lines
+    real = {s: G.real(0) for s in G.SREGS} | {'cs': G.real(AP_CODE >> 4, True), 'ds': G.real(0x2000)}
+    text = ['machine', *common, f'memory {FLAGS:#x} {bytes(16).hex()}', f'memory {G.CODE:#x} {bsp_code.hex()}',
+            f'memory {AP_CODE:#x} {ap_code.hex()}', f'memory {SIPI_VECTOR << 12:#x} {start_code.hex()}',
+            *cpu('P32', G.start_segments('P32'), G.CODE), f'stop {G.CODE + len(bsp_code):#x}', f'window {FLAGS:#x} 0x10',
+            *cpu('R', real, AP_CODE)]
+    # CPU 1 ends halted at vector 0AH's HLT loop (its CS 0A00H), its HLT before the SIPIs never completed (+1 stays 0).
+    want = [{'stop': 0, 'window0': '0100010101' + '00' * 11}, {'resident': 'halted', 'stop': None, 'cs': SIPI_VECTOR << 8}]
+    return [('smp-hlt-sipi-init', '\n'.join(text) + '\n', want)]
+
+
 def typed_stop(out: dict, want: dict) -> list:
     """The differences of how a run ended from `want`: a typed stop (`resident`, its name; `fault`, the record's first
     three words) or none."""
@@ -286,6 +334,16 @@ def main(argv=None):
             diffs = typed_stop(out, want) + ([f'no machine output: {out.get("reason")}'] if got is None else
                                              [f'{k}: natemu {R._show(got.get(k))}, want {R._show(v)}'
                                               for k, v in fields.items() if got.get(k) != v])
+            results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+        for name, text, want in two_cpu_selftests():
+            out = run(a.host, a.runtime, a.fexc, text, a.out / 'work' / name)
+            cpus = out.get('cpus') or [out]
+            diffs = [] if len(cpus) == len(want) else [f'{len(cpus)} CPUs reported: {out.get("stop")}: {out.get("reason")}']
+            for k, (o, w) in enumerate(zip(cpus, want)):
+                got = o.get('machine') or {}
+                diffs += [f'cpu{k} {d}' for d in typed_stop(o, w)]
+                diffs += [f'cpu{k} {f}: natemu {R._show(got.get(f))}, want {R._show(v)}' for f, v in w.items()
+                          if f not in ('resident', 'fault') and got.get(f) != v]
             results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
     else:
         import run_interp_ref
