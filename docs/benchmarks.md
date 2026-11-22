@@ -140,18 +140,40 @@ Experiment (an earlier version of the case: 8 GiB and Java's default heap, one b
 
 `hackbench` (above) makes its system calls by SYSCALL. `hackbench32` is the same program built as 32-bit code (i686),
 which makes them through the kernel's 32-bit vDSO (SYSENTER); `hackbench32-int80` boots with `vdso32=0`, so every system
-call is an INT 0x80. All at 1 vCPU. Measured before `boot-interp` was rebased onto main (November 22), on its pre-rebase
-commits (tag `boot-interp-prerebase` and its ancestors), so the ids below are theirs; [the commit
-map](restructure/commit-map-boot-interp-2026-11-22.txt) gives each one's id after the rebase. The commits: 78f60965, the
-old base (`m2-32bit`, before the rebase), before the boot-time interpreter; be626aa8, after its plumbing (d7bc0885 moved
-the resident's code into its own 2 MiB block, 0624b341 and be626aa8 added the interpreter's classification and entry);
-e21b0209, after CPU start-up (INIT and SIPI) and the interpreter itself; 9fd9f346, the branch's final tip (the mode
-transitions, the firmware boot mode, the real-code suites).
+call is an INT 0x80. All at 1 vCPU.
 
 Bench cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (`TESTKIT_BENCH_AT=<commit>
 tools/natemu-test run --tier bench -k "guest-hackbench and not profile and not qemu"`); Apple M2 Max; November 22,
 2026. Seconds, the mean of 3 boots of two runs each (`wall_s`, `wall2_s`), the two commits of a table booted
 alternately; the spread is the largest minus the smallest of the 3 boots' means, as a share of the mean.
+
+### After the rebase onto main
+
+`boot-interp` rebased onto main a6d03605 (November 22): its tip, 5113ba57, against main a6d03605, before the boot-time
+interpreter:
+
+| Case | a6d03605 | spread | 5113ba57 | spread | change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `hackbench` | 13.67 | 4.6% | 13.08 | 3.7% | −4.3% |
+| `hackbench32` | 13.38 | 2.3% | 12.77 | 3.1% | −4.6% |
+| `hackbench32-int80` | 31.42 | 2.0% | 30.11 | 2.0% | −4.2% |
+
+All three gains are larger than the noise: no boot of one commit comes near the other's (`hackbench` 13.36 to 14.00 s
+against 12.81 to 13.29 s; `hackbench32` 13.27 to 13.57 s against 12.60 to 12.99 s; `hackbench32-int80` 31.08 to 31.72 s
+against 29.90 to 30.51 s). `hackbench32`'s and `hackbench32-int80`'s match their gains before the rebase (below);
+`hackbench`'s is beyond the noise here for the first time (before the rebase, −0.8% to −3.3%, within it). They look
+like the same gains, which arrived with the plumbing commits (now 31564a06 to a2449f26), probably through the code's
+move to its own 2 MiB block (below); this set does not separate the commits either.
+
+### Before the rebase
+
+Measured before `boot-interp` was rebased onto main (November 22), on its pre-rebase commits (tag
+`boot-interp-prerebase` and its ancestors), so the ids below are theirs; [the commit
+map](restructure/commit-map-boot-interp-2026-11-22.txt) gives each one's id after the rebase. The commits: 78f60965, the
+old base (`m2-32bit`, before the rebase), before the boot-time interpreter; be626aa8, after its plumbing (d7bc0885 moved
+the resident's code into its own 2 MiB block, 0624b341 and be626aa8 added the interpreter's classification and entry);
+e21b0209, after CPU start-up (INIT and SIPI) and the interpreter itself; 9fd9f346, the branch's final tip (the mode
+transitions, the firmware boot mode, the real-code suites).
 
 The final tip, 9fd9f346, against 78f60965:
 

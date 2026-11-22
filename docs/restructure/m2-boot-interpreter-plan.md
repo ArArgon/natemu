@@ -4,9 +4,11 @@ Status: built, November 22, 2026, on branch `boot-interp` (from `m2-32bit` at 78
 a6d03605 the same day, section 12). It develops Part 2 of [the M2 design notes](m2-32bit-design.md) and takes the 32-bit
 survey of [the S3g plan](s3g-plan.md) as input. Two independent reviews, three rechecks and an independent replication
 of the upstream census were folded in before the build (section 12); the results of the build are folded into each
-section ("Built"), and the decisions taken are in section 11. B0-B5 are built; B5's full gate on the final tip passed
-but for three failures identical at the parent, its AFP cases pending, and its benchmark round: see section 12. B6 stays
-deferred.
+section ("Built"), and the decisions taken are in section 11. B0-B5 are built. On the rebased branch (section 12): the
+full gate at bc38dfba passed but for 15 failures, two as before the rebase (an AFP-dependent x87 status byte) and 13
+from a stale test build, which 5113ba57 (test-only) fixes, after which those cases passed; the gate's AFP part passed
+on the M3; the system-call bench cases are 4.2-4.6% faster than main; the campaign tier has not run on it (before the
+rebase: 0 failed, and 290 build failures from a network outage). B6 stays deferred.
 Results, all framework cases on the M2 Max:
 
 - the interpreter matches QEMU 11.1.2 and KVM on all 1,716 per-instruction cases in R, P16, P32 and C32 (`tests/interp`
@@ -21,10 +23,11 @@ Results, all framework cases on the M2 Max:
   Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
   [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
   `segments::copy` and the page walker inlining its table read ([firmware-mode.md](firmware-mode.md) section 6), both
-  before the rebase onto main (against main after it: section 12); and the system-call bench cases are no slower,
-  measured before the rebase (pre-rebase ids): at the final tip against 78f60965, `guest-hackbench32` −4.5% and
-  `guest-hackbench32-int80` −5.1%, beyond the noise and from the plumbing commits (d7bc0885 to be626aa8),
-  `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
+  before the rebase onto main (against main after it: section 12); and the system-call bench cases are no slower: on
+  the rebased branch, its tip 5113ba57 against main a6d03605, `guest-hackbench` −4.3%, `guest-hackbench32` −4.6% and
+  `guest-hackbench32-int80` −4.2%, each beyond the noise; before the rebase (pre-rebase ids), at the final tip against
+  78f60965, `guest-hackbench32` −4.5% and `guest-hackbench32-int80` −5.1%, beyond the noise and from the plumbing
+  commits (d7bc0885 to be626aa8), `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
 
 Design notes of the build: [interp-integration.md](interp-integration.md), [initsipi-resident.md](initsipi-resident.md),
 [interp-transitions.md](interp-transitions.md), [firmware-mode.md](firmware-mode.md); test contracts:
@@ -643,12 +646,15 @@ INIT/SIPI and interpreter together (ready; the INIT-before-TF order fixed), and 
 stop; TLB-flush tests added). The test pieces (reference rig, exit-test firmware, real-code suites) and INIT/SIPI were
 also reviewed by reviewers their authors briefed.
 
-**Final checks (B5, on the final tip 9fd9f346, M2 Max, November 22):** the full gate (`tools/natemu-test run --gate`,
-30 min 18 s): 87,622 passed, 3 failed, 2,329 not-runnable (they need AFP), 12 expected-fail, 2 known-bug, 3
-known-bug-passed. The three failures are identical at the parent 78f60965: `static` `fexc-replay` (it compares against
-`main`'s compiler) and `system` `i5b-images::fxsave-full-stack` with its case row (an AFP-dependent x87 status byte,
-failing on `m2-32bit` too). The AFP cases, on the M3 at the pushed commit: pending. The benchmark round: the system-call
-bench cases against 78f60965, as in the status above ([benchmarks](../benchmarks.md)).
+**Final checks before the rebase (B5, on the pre-rebase final tip 9fd9f346, M2 Max, November 22):** the full gate
+(`tools/natemu-test run --gate`, 30 min 18 s): 87,622 passed, 3 failed, 2,329 not-runnable (they need AFP), 12
+expected-fail, 2 known-bug, 3 known-bug-passed. The three failures are identical at the parent 78f60965: `static`
+`fexc-replay` (it compares against `main`'s compiler) and `system` `i5b-images::fxsave-full-stack` with its case row (an
+AFP-dependent x87 status byte, failing on `m2-32bit` too). The AFP cases were not run before the rebase (after it:
+below). The benchmark round: the system-call bench cases against 78f60965, as in the status above
+([benchmarks](../benchmarks.md)). The campaign tier (`tools/natemu-test run --tier campaign`, M2 Max) at the pre-rebase
+tip 8f42fd6a: 5,414 passed, 0 failed; its 290 build failures were a transient network outage to the x86 builder, and
+its rerun was stopped at the owner's request before the rebase.
 
 **The rebase onto main (November 22).** The branch's 87 commits moved from 78f60965 (the old base: `m2-32bit` before its
 own rebase; main holds the same tree as 6388d04e, not 78f60965 itself) onto main a6d03605. The commits before the rebase
@@ -680,12 +686,34 @@ whole): 85,107 passed, 3 failed: `system` `i5b-images::fxsave-full-stack` with i
 `static` `fexc-replay`, which cannot build its old compiler in this checkout (the merge base with the local `main` is
 b1c84a0d, whose FEX pin the checkout's submodule does not hold; the branch changes neither `tools/fexc` nor
 `third_party/FEX`). Case `stack`: the gate bound 21,920 of 81,920 bytes (26,256 with one nested entry), boot 11,920 of
-32,768. Not run on the rebased tip: the full gate, the AFP cases and the benchmark round.
+32,768. The full gate, its AFP part and the benchmark round ran on the rebased branch later (below).
 
-**Commit ids.** Ids in this plan and the design notes that name a measurement (a gate, a bench case, a disassembly, a
-stack bound) are the pre-rebase commits it ran on, kept as they were; ids that say where something was built are the
-rebased ones. Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
-`boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as (agent's, before the rebase, after it):
-cb7cd541 → d4bf265d → 4bc62f52; 8b022e58 → 0624b341 → 974d4b8a; f29042cf → ce8cea18 → 93bff2bc; bdb5dc09 → 40a888db →
-b52c6e43; 315860f3 → d7bc0885 → 31564a06; 75cfdd22 → be626aa8 → a2449f26. A number measured at one of the agents' ids
-was measured on the agent's tree, not on `boot-interp`'s.
+**Final checks on the rebased branch (November 22).** The full gate (`tools/natemu-test run --gate`) at bc38dfba, M2
+Max: 86,012 passed, 15 failed, 2,329 not-runnable (they need AFP), 12 expected-fail, 3 known-bug-passed, 2 known-bug.
+`static` `fexc-replay` now passes against main's compiler. Two failures are `system` `i5b-images::fxsave-full-stack`
+with its case row, failing as before the rebase and at the base, main a6d03605 (the AFP-dependent x87 status byte). The
+other 13 are `system` `k1-c1` (its four hold cases and their parent) and `pic-and`, `pic-str`, `pic-body` and `pic-svc`
+(each with its parent), from a stale test build, not from natemu's code: `tests/system/run_k1.py`'s `hooks_build`
+reused an `io-test-hooks` build in `target/hooks` made before main's shared probes, so that build's admission refused
+the probing split stub the current code emits ("check stub at native offset 0x2c"). The fix is 5113ba57 (test-only):
+the build is reused only if a key file matches the current sources and build commands, and the runners that need it
+build it one at a time under a lock, which also fixes a signing race seen on main. It belongs on main too (it fixes
+`hooks_build` as 6089ca68 made it). After it, `k1-c1`, `pic-and`, `pic-str`, `pic-body`, `pic-svc` and every other
+`hooks_build` user passed (330 cases, M2 Max). The owner decided not to run the full gate again after this test-only
+fix. The gate's AFP part (the cases the M2 Max cannot run, on a second Mac that has AFP) at bc38dfba, M3
+(`tools/natemu-test submit --gate tests/fp "tests/unit/family.toml::rust-afp/all[afp=True]" -k "not False"`): 2,975
+passed, 0 failed. The benchmark round, the rebased tip 5113ba57 against main a6d03605 (bench cases `guest-hackbench`,
+`guest-hackbench32` and `guest-hackbench32-int80`, M2 Max, three boots of each commit, alternating): 13.67 → 13.08 s
+(−4.3%), 13.38 → 12.77 s (−4.6%) and 31.42 → 30.11 s (−4.2%), no boot of one commit overlapping the other's. The 32-bit
+cases gain as much as before the rebase (`guest-hackbench`'s gain, within the noise there, is beyond it here); those
+gains arrived with the plumbing commits (now 31564a06 to a2449f26), likely through the code's move to its own 2 MiB
+block ([benchmarks](../benchmarks.md)). The campaign tier has not run on the rebased branch (before the rebase: above).
+
+**Commit ids.** Ids in this plan and the design notes that name a measurement made before the rebase (a gate, a bench
+case, a disassembly, a stack bound) are the pre-rebase commits it ran on, kept as they were; the ids of the checks on
+the rebased branch (above) and ids that say where something was built are the rebased ones. Some commit messages on
+`boot-interp` cite the commit an agent made on its own branch, which is not on `boot-interp`. Each is the same change
+(equal `git patch-id`), cherry-picked as (agent's, before the rebase, after it): cb7cd541 → d4bf265d → 4bc62f52;
+8b022e58 → 0624b341 → 974d4b8a; f29042cf → ce8cea18 → 93bff2bc; bdb5dc09 → 40a888db → b52c6e43; 315860f3 → d7bc0885 →
+31564a06; 75cfdd22 → be626aa8 → a2449f26. A number measured at one of the agents' ids was measured on the agent's tree,
+not on `boot-interp`'s.
