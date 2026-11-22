@@ -29,7 +29,7 @@ def reply(words, move_at, tail_at):
     RIP entry (host +4, guest +1), one guest-RIP move of w5 at `move_at`, one PC entry at 4."""
     code = [tail_at] + words[1:]
     code += [0] * (tail_at // 4 - len(code))
-    body = b''.join(struct.pack('<I', w) for w in code)
+    body = bytearray(b''.join(struct.pack('<I', w) for w in code))
     tail = struct.pack('<QQQIIIB', 0, VALUE - 6, 6, 1, 40, 0, 0).ljust(40, b'\0') + b'\x00'
     body += tail.ljust(48, b'\0')
     struct.pack_into('<Q', body, tail_at, len(body))
@@ -41,9 +41,8 @@ def reply(words, move_at, tail_at):
     for o, v in ((40, 128), (44, len(body)), (48, 4), (52, NONE32), (56, end), (64, 128 + len(body)), (68, 0),
                  (72, 128 + len(body)), (76, 1), (80, 128 + len(body) + 12), (84, 1)):
         struct.pack_into('<I', h, o, v)
-    obj = bytes(h) + body + pcs + relocs
-    struct.pack_into('<I', h, 16, len(obj))
-    obj = bytes(h) + body + pcs + relocs
+    struct.pack_into('<I', h, 16, 128 + len(body) + len(pcs) + len(relocs))
+    obj = bytes(h) + bytes(body) + pcs + relocs
     json = b'{"status":"ok"}'
     return struct.pack('<iIIII', 0, len(json), len(obj), 6, 0) + json + obj
 

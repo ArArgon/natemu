@@ -4804,6 +4804,10 @@ mod tests {
         // and no block exists here.
         assert_eq!(now.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         now.as_object_mut().unwrap().remove("segments");
+        // (So are the page-fault scan's counters, `perf` builds only.)
+        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale"] {
+            assert_eq!(now.as_object_mut().unwrap().remove(k), Some(serde_json::json!(0)), "{k}");
+        }
         assert_eq!(empty, now);
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
