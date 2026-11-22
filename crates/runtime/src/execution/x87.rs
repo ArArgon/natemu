@@ -224,7 +224,10 @@ pub(super) fn ftw() -> u64 {
 
 /// I6b: the helper instruction D9 `function` (`svc #X87`, [`natemu_abi::x87::helper`]) on the page's stack under FCW `fcw`:
 /// reads ST(0), ST(1) and whether TOP - 1 is empty, writes the values, tags, TOP, the condition codes the instruction defines
-/// and ORs its flags into the exception word. False (nothing written) for a function that is no helper.
+/// and ORs its flags into the exception word. False (nothing written) for a function that is no helper. Inlined into its
+/// one caller (`helpers::x87`, `svc #X87`): the code-generation units' partitioning left it out of line once the
+/// interpreter's transitions were added (one more call per helper instruction, and other functions' frames moved).
+#[inline]
 pub(super) fn helper(function: u64, fcw: u64) -> bool {
     let t = top();
     let reg = |i: u64| valid(t + i).then(|| mm(t + i));
