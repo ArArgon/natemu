@@ -425,13 +425,13 @@ inline uint32_t X87MemBits(const FEXCore::IR::IRListView& View, FEXCore::IR::Ord
   }
   return 0;
 }
-// The memory operands row 8 tests, among the x87 instruction's floating-point ops `Ops[0..Count)`: the op that examines the operand,
-// the operand's bits (the load), the other operand (ST0; null for FLD) and which argument of the op the memory operand is.
-struct X87DeHit { FEXCore::IR::Ref Node, Bits, Other; uint32_t Elem; bool Div; uint8_t Arg; };
-inline std::vector<X87DeHit> X87DeHits(const FEXCore::IR::IRListView& View, const std::vector<std::pair<FEXCore::IR::Ref, FEXCore::IR::IROps>>& Ops, size_t Count) {
+// The test of the x87 instruction's floating-point ops among `Ops` (all before its check): a GPR, 0 or nonzero, or null.
+template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, const std::vector<std::pair<FEXCore::IR::Ref, FEXCore::IR::IROps>>& Ops, size_t Count) {
   using namespace FEXCore::IR;
   using Ref = FEXCore::IR::Ref;
-  std::vector<X87DeHit> Hits;
+  auto View = IREmit->ViewIR();
+  struct Hit { Ref Node, Bits, Other; uint32_t Elem; bool Div; };
+  std::vector<Hit> Hits;
   bool Arith = false;   // an arithmetic or compare op with a memory operand: the converting FLOAT_FTOF of an m32 is its operand, not an FLD
   for (size_t i = 0; i < Count; ++i) {
     const auto Op = View.template GetOp<IROp_Header>(Ops[i].first);
@@ -450,7 +450,7 @@ inline std::vector<X87DeHit> X87DeHits(const FEXCore::IR::IRListView& View, cons
         const auto Other = View.template GetOp<IROp_Header>(Op->Args[1 - m]);
         const bool Const = Op->Op == OP_VFMUL && Other->Op == OP_VCASTFROMGPR && View.template GetOp<IROp_Header>(Other->Args[0])->Op == OP_CONSTANT &&
                            View.template GetOp<IROp_Header>(Other->Args[0])->template C<IROp_Constant>()->Constant == 0x3ff0'0000'0000'0000ULL;
-        Hits.push_back({Ops[i].first, Bits, Const ? nullptr : View.GetNode(Op->Args[1 - m]), Elem, Op->Op == OP_VFDIV && m == 0, uint8_t(m)});
+        Hits.push_back({Ops[i].first, Bits, Const ? nullptr : View.GetNode(Op->Args[1 - m]), Elem, Op->Op == OP_VFDIV && m == 0});
         Arith |= !Const;
         break;
       }
@@ -463,16 +463,8 @@ inline std::vector<X87DeHit> X87DeHits(const FEXCore::IR::IRListView& View, cons
     const auto Op = View.template GetOp<IROp_Header>(Ops[i].first);
     Ref Bits = nullptr;
     if (!Arith && Op->Op == OP_FLOAT_FTOF && X87MemBits(View, Op->Args[0], Bits) == 4 && Hits.empty())
-      Hits.push_back({Ops[i].first, Bits, nullptr, 4, false, 0});
+      Hits.push_back({Ops[i].first, Bits, nullptr, 4, false});
   }
-  return Hits;
-}
-// The test of the x87 instruction's floating-point ops among `Ops` (all before its check): a GPR, 0 or nonzero, or null.
-template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, const std::vector<std::pair<FEXCore::IR::Ref, FEXCore::IR::IROps>>& Ops, size_t Count) {
-  using namespace FEXCore::IR;
-  using Ref = FEXCore::IR::Ref;
-  auto View = IREmit->ViewIR();
-  const std::vector<X87DeHit> Hits = X87DeHits(View, Ops, Count);
   Ref Flag = nullptr;
   for (const auto& H : Hits) {
     IREmit->SetWriteCursorBefore(H.Node);
@@ -583,7 +575,6 @@ inline bool NzcvWriterOp(FEXCore::IR::IROps Op) {
 // Places the checks (run at the start of flag elimination, after the x87 stack pass, before register allocation). An
 // instruction whose floating-point op follows its first commit has no exact check point: the compile fails (a producer bug).
 template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a template: IREmitter is complete only in its caller)
-  fexc_x87_de.clear();   // (this IR's: node addresses are reused from one compile to the next)
   using namespace FEXCore::IR;
   auto IR = IREmit->ViewIR();
   if (!AnyFpWork(IR)) return;   // (every instruction's Finish would return at once: no floating-point op, no x87 instruction)
@@ -631,7 +622,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
         Mask = SimdCheckMask();
       }
       // AFP fallback (the owner's default mode): without AFP an x87 m32/m64 memory operand's DE is set by software even masked (below).
-      const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1);
+      const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1) && !FexcX87Lazy();   // (fast mode with x87 runs: not set, the `masked-x87-de` deviation)
       // AFP accurate plan, chunk 2 (B): accurate mode without AFP and with DE masked (and no DAZ: x86 sets no DE then) sets the flag of each
       // SSE/AVX op by software, into FPSR.IDC (FexcSimdDe, before the op: no commit or fault point lies between it and the op).
       const bool SimdDe = !X87 && fexc_no_afp && fexc_accurate && !(uint64_t(fexc_simd_unmasked) >> 1 & 1) && !fexc_daz;
@@ -703,9 +694,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           // DE masked: FSW.DE is set, nothing is raised. The flag is or-ed into the pending byte (the instruction's end commits it,
           // after a stack fault dropped the operation's flags: FEX's FexcEndInstruction) where BuildX87De left the cursor, which
           // is before the last of the ops that examine the operand: no commit, no fault point between.
-          if (FexcX87Lazy()) {   // fast mode's x87 runs: the JIT's integer test
-            for (const auto& H : X87DeHits(IR, Insn, Insn.size())) fexc_x87_de[H.Node] = {H.Arg, H.Other != nullptr, H.Div, uint8_t(H.Elem)};
-          } else if (Ref De = BuildX87De(IREmit, Insn, Insn.size())) {
+          if (Ref De = BuildX87De(IREmit, Insn, Insn.size())) {
             Ref P = IREmit->_LoadContextGPR(OpSize::i8Bit, FEXC_X87_PENDING);
             IREmit->_StoreContextGPR(OpSize::i8Bit, IREmit->_Or(OpSize::i32Bit, P, IREmit->_And(OpSize::i32Bit, De, IREmit->_Constant(0x80))), FEXC_X87_PENDING);
           }
