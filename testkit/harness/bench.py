@@ -3,7 +3,7 @@ reports where its numbers are. Numbers are kept per machine (<run>/bench/<machin
 machines. Baseline caching and the drift canary (R3.7) are not part of this wrapper yet.
 
     [[suite]] kind = "bench"  harness = "bench"  tier = "bench"  params = { timeout = SECONDS }
-    [suite.cases.<name>]  argv = [...]  needs = ["{raw}/..."]  env = { NAME = "..." }  baseline = "REV"
+    [suite.cases.<name>]  argv = [...]  needs = ["{raw}/..."]  env = { NAME = "..." }  baseline = "REV"  remote = true
 Placeholders (in argv, env and needs): {out} {fexc} {natemu} {runtime} {host} {kernel} {raw}, and these, each built only
 when a case of the suite uses it (and then prepared before the run starts):
     {bench_image}       the benchmark initramfs (artifacts.bench_image)
@@ -114,6 +114,8 @@ class Bench:
         return base, spec, dict(spec, argv=[*spec['argv'], '--limit', '1'])
 
     def case_needs(self, fam, suite, case):
+        if self._spec(suite, case)[2].get('remote'):       # `remote = true`: the case's VM runs on another machine and times
+            return Needs(cores=1)                          # nothing here (io5-solo32-reference); it only waits, on one core
         return Needs(exclusive=True, why='measures wall-clock time: nothing else may run')
 
     def requirements(self, fam, suite, variant):

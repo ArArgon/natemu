@@ -246,3 +246,13 @@ def test_a_failing_piece_count_is_loud(monkeypatch, tmp_path):
     monkeypatch.setattr(bench.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=1, stdout='', stderr='boom'))
     with pytest.raises(RuntimeError, match='no piece count'):
         bench._piece_count({'argv': ['python3', 'tests/bench/run_m1_perf.py', 'full']})
+
+
+def test_only_a_remote_case_is_not_exclusive():
+    """Every benchmark takes the machine alone, except a case marked `remote` (its VM runs on another machine and nothing
+    is timed here): io5-solo32-reference, and only it."""
+    from testkit.harness.bench import HARNESS
+    fam, suites = _bench_family()
+    shared = {c for s in suites.values() for c in s.extra['cases'] if not HARNESS.case_needs(fam, s, c).exclusive}
+    assert shared == {'io5-solo32-reference'}
+    assert HARNESS.case_needs(fam, suites['io5'], 'io5-solo32-reference').cores == 1
