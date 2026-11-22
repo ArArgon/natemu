@@ -28,7 +28,8 @@ private_start:
     tlbi vmalle1
     dsb ish
     isb
-    adr x9, vectors
+    // A literal: the text block is beyond `adr`'s 1 MiB from the boot page.
+    ldr x9, =vectors
     msr vbar_el1, x9
     ldr x9, ={shared_address}
     msr tpidr_el1, x9

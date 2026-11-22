@@ -280,11 +280,11 @@ fn prepare_at_alias(
     let ram_offset = pool_offset + pool_bytes;
     let ram_span = exec::ram_end(ram_bytes as u64) as usize;
     let memory = Memory::with_size(ram_offset + ram_span)?;
-    load_resident(&memory, resident)?;
+    let image_end = load_resident(&memory, resident)?;
     for v in 0..n {
         let base = v * stride;
         if v > 0 {
-            memory.replicate_resident_text(base);
+            memory.replicate_resident_text(base, image_end);
         }
         let mut spans = resident_text(base);
         let own = |offset, bytes| Span::data(offset, bytes, base + offset);
@@ -357,7 +357,10 @@ fn prepare_at_alias(
         let mut shared: Shared = unsafe { std::mem::zeroed() };
         shared.mode = exec::MODE;
         memory.write_record(base + SHARED_OFFSET, shared);
-        memory.flush_instruction_cache(base, RAM_SIZE);
+        memory.flush_instruction_cache(base, resident::BOOT_END);
+        if image_end > resident::TEXT_OFFSET {
+            memory.flush_instruction_cache(base + resident::TEXT_OFFSET, image_end - resident::TEXT_OFFSET);
+        }
     }
     // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
