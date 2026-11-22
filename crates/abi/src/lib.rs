@@ -25,6 +25,7 @@ pub mod execution;
 pub mod fptrap;
 pub mod guest_memory;
 pub mod half;
+pub mod interp;
 pub mod lapic;
 pub mod page_study;
 pub mod paging;
