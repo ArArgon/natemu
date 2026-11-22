@@ -129,6 +129,7 @@ def main():
             others |= foreign(p.pid); last = now
         read_serial()
     capped = p.poll() is None      # the cap is on the whole boot (both runs), not on one run
+    capped_at = time.monotonic()
     if capped:
         p.send_signal(signal.SIGINT)
         try: p.wait(10)
@@ -171,11 +172,13 @@ def main():
     if capped:
         k = 'START2 ' if M['START2 '] is not None else 'START '
         rec['capped_in'] = None if M[k] is None else 'run 2' if k == 'START2 ' else 'run 1'
-        rec['at_least_s'] = None if M[k] is None else round(t0 + total - M[k], 1)
+        rec['at_least_s'] = None if M[k] is None else round(capped_at - M[k], 1)
     rec['outputs'] = re.findall(r'NATEMU-BENCH-OUTPUT\S* (.*)', text)    # what a benchmark without a pinned hash printed
     with open(f'{out}/bench.jsonl', 'a') as f: f.write(json.dumps(rec) + '\n')
     print(json.dumps({k: rec.get(k) for k in ('name', 'verified', 'capped', 'capped_in', 'at_least_s', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
-    if capped and emu != 'natemu':   # a QEMU baseline too slow for its cap is a result (recorded above), not a failure
+    # A QEMU baseline too slow for its cap is a result (recorded above), not a failure: if its benchmark had started and no
+    # run that ended failed its verification. A boot that never reached START, or a failed run 1, is a failure as ever.
+    if capped and emu != 'natemu' and M['START '] is not None and (not r1['reached'] or r1['verified']):
         sys.exit(3 if others else 0)
     sys.exit(1 if not verified else 3 if others else 0)
 
