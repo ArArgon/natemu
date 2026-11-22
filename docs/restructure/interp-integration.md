@@ -60,13 +60,15 @@ position and zero after them, lengths within `available`), else `bad_reply`.
 
 Exclusion from translated code's paths: the key has `INTERPRETED_CONTEXT` (bit 63), which no `code_context()` has, so
 `kept_system`, `sys_fast`, `miss_fast` and `find_from` never find one; `cut`/`cut_one` find no INBOUND, out slot or L1
-entry; `link`, `template`, `first_test_fires` and the host's block passes exclude SYSTEM. Disassembly against the parent
-commit (release residents, literal and anonymous-symbol offsets aside): `find_from`, both `lookup` instances, `mapped`
-(with `revalidated` inlined), `revalidated_from_record`, `sys_fast`, `miss_fast`, `system`, `commit`, `set_cpl`,
-`translate`, `fetch_walk`, `segments::pages`, `enter`, `linker`, `step_here`, `cut_one`, `invalidate`, `current_at`,
-`kept_system` and `trap_due` identical; `cache::file` (placement) swaps two registers; `split_lock` inlines its
-`split_begin`, `mmio::ones` calls `mmio::page` out of line. Resident 242,624 -> 261,516 bytes (against 5d5594c0, where the
-same functions are again identical).
+entry; `link`, `template`, `first_test_fires` and the host's block passes exclude SYSTEM.
+
+Experiment (not a framework case; M2 Max): disassembly against the parent commit (release residents, literal and
+anonymous-symbol offsets aside): `find_from`, both `lookup` instances, `mapped` (with `revalidated` inlined),
+`revalidated_from_record`, `sys_fast`, `miss_fast`, `system`, `commit`, `set_cpl`, `translate`, `fetch_walk`,
+`segments::pages`, `enter`, `linker`, `step_here`, `cut_one`, `invalidate`, `current_at`, `kept_system` and `trap_due`
+identical; `cache::file` (placement) swaps two registers; `split_lock` inlines its `split_begin`, `mmio::ones` calls
+`mmio::page` out of line. Resident 242,624 -> 261,516 bytes (against 5d5594c0, where the same functions are again
+identical).
 
 Stops (`Hook::at`): the host's `REQUEST_DECODE` handler asks `stop_at` and `hook.at` at CS.base + EIP first (a stop parks
 the vCPU, `REPLY_PARK`; a test hook's `At::System` there is an error) and ends the run before `hook.boundary` or
