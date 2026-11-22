@@ -62,15 +62,18 @@ pub(super) fn boundary(s: &mut State) -> bool {
 /// for the next boundary ([`record`], through `ends_in_mode`). Anything else halts `unsupported_code_mode` as the arm did
 /// (the record naming the CS it would have loaded): L = D = 1 (reserved in IA-32e mode), a return to CPL 1 or 2, and any
 /// IRET (an IRET into compatibility mode may load a null SS, which x86 refuses with #GP(0) and the 64-bit IRET does not
-/// check: no known code makes one). Out of line and cold, so the 64-bit far transfers keep only a call in that arm.
+/// check: no known code makes one). Out of line and cold, so the 64-bit far transfers keep only a branch in that arm: it
+/// returns `refuse_compatibility`'s result (always `Ok`), so the call there is a tail call and that function's common
+/// path needs no frame.
 #[cold]
 #[inline(never)]
-pub(super) fn kernel_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) {
+pub(super) fn kernel_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), segments::Exception> {
     let mut t = *s;
     if cpl != 0 || raw >> 53 & 1 != 0 || iret_at(&mut t) {
         t.cpu.seg[SREG_CS] = Segment::loaded(selector, raw);
         halt(&t, stop::UNSUPPORTED_CODE_MODE)
     }
+    Ok(())
 }
 /// Whether the instruction at RIP (64-bit code at CPL 0, the transaction's: its fetch has succeeded) is an IRET: CFH after
 /// its prefixes (legacy and REX). A byte that cannot be read is taken as one (the halt).
