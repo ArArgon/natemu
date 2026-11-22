@@ -8,6 +8,16 @@ pub fn canonical(address: u64) -> bool {
     address >> 47 == 0 || address >> 47 == 0x1ffff
 }
 
+/// M2 Part 2: the pages a linear access of `n` bytes (1 to 4096) at `va` touches with paging off (CR0.PG = 0, outside
+/// IA-32e mode: the physical address is the linear one): the address of its first byte, and the base of the next page
+/// when the access crosses into it, else `None`. Linear addresses outside IA-32e mode are 32 bits wide, so both wrap at
+/// 4 GiB (an access at FFFF_FFFEH crosses into page 0). No A20 masking: real mode reaches up to 10_FFEFH.
+pub const fn unpaged(va: u64, n: u64) -> (u64, Option<u64>) {
+    let first = va & 0xffff_ffff;
+    let last = first.wrapping_add(n - 1) & 0xffff_ffff;
+    (first, if (last ^ first) >> 12 != 0 { Some(last & !4095) } else { None })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Control {
@@ -282,6 +292,19 @@ fn walk_once<T: Tables, const B: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpaged_is_the_identity_wrapping_at_4_gib() {
+        assert_eq!(unpaged(0x7c00, 2), (0x7c00, None));
+        assert_eq!(unpaged(0x10_ffef, 1), (0x10_ffef, None)); // real mode's last byte (FFFFH:FFFFH): no A20 masking
+        assert_eq!(unpaged(0xfff, 2), (0xfff, Some(0x1000)));
+        assert_eq!(unpaged(0x1ffc, 4), (0x1ffc, None));
+        assert_eq!(unpaged(0xffff_fff0, 16), (0xffff_fff0, None));
+        assert_eq!(unpaged(0xffff_fffe, 4), (0xffff_fffe, Some(0))); // across 4 GiB: wraps to page 0
+        assert_eq!(unpaged(0x1_0000_0010, 4), (0x10, None)); // a linear address above 32 bits wraps
+        assert_eq!(unpaged(0x1000, 4096), (0x1000, None));
+        assert_eq!(unpaged(0x1001, 4096), (0x1001, Some(0x2000)));
+    }
 
     /// PCID plan P1 (review B1, item 5): the non-leaf mask keeps the frame only for a present entry with the reserved
     /// (51:40) and PS (bit 7) bits clear, else yields 0. The host fallback is the same select as the resident's asm.

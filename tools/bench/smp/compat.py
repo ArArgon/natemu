@@ -1242,8 +1242,11 @@ def cases():
         ('fxsave-limit', '    mov ebx, 0xffffff00\n', 'fxsave [ebx]', lambda s: sm.flat_access(s, 0xFFFF_FF00, 512), TOP_ONLY),
         ('popfd-limit', '    mov esp, 0xfffffffe\n', 'popfd', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
         ('pop-ds-limit', '    mov esp, 0xfffffffe\n', 'pop ds', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
-        # natemu's deviation until task 5: a far jump and a far return from 32-bit to 64-bit code: #GP(20H) at it.
+        # natemu's deviation until task 5: a far jump, a far call and a far return from 32-bit to 64-bit code: #GP(20H) at
+        # it, before the call's pushes (M2 Part 2 keeps these: the interpreter runs none of it, plan section 8).
         ('jmp-far-64', f'    mov ebx, {XPAGE:#x}\n', 'jmp far [ebx]', lambda s: sm.far(_at(s, XPAGE, FAR64), 'jmp', XPAGE, width=4),
+         [{'addr': f'0x{XPAGE:x}', 'data': FAR64.hex()}]),
+        ('call-far-64', f'    mov ebx, {XPAGE:#x}\n', 'call far [ebx]', lambda s: sm.far(_at(s, XPAGE, FAR64), 'call', XPAGE, width=4),
          [{'addr': f'0x{XPAGE:x}', 'data': FAR64.hex()}]),
         ('retf-64', '    push 0x23\n    push 0x1000\n', 'retf',
          lambda s: sm.ret(_at(dict(s, rsp=US - 8), US - 8, FAR64[:4] + bytes([0x23, 0, 0, 0])), width=4), []),

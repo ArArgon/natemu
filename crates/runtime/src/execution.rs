@@ -28,6 +28,7 @@ mod fp;
 mod gather;
 mod half;
 mod helpers;
+mod interpret;
 mod lapic;
 mod maskmov;
 mod mmio;
@@ -126,6 +127,19 @@ fn controls(s: &State) -> paging::Control {
         _ => halt(s, stop::UNSUPPORTED_CODE_MODE),
     }
 }
+/// [`controls`]' check at the end of a system transaction ([`commit`], and [`set_cpl`] inside one), where the controls are
+/// not needed: its two returning arms, unchanged; where it halts, M2 Part 2: a state the boot-time interpreter runs is
+/// recorded for [`system`]'s exit to enter once the transaction has completed, any other halts as there
+/// ([`interpret::record`], out of line). Inlined, as [`controls`] is (SYSCALL and SYSRET pass through both callers).
+#[inline(always)]
+fn ends_in_mode(s: &State) {
+    match (s.cpu.paging(), s.cpu.code_mode()) {
+        (Some(_), Some(CodeMode::Bits64)) => {}
+        (Some(c), Some(_)) if c.cpl == 3 => {}
+        (None, _) => interpret::record(s, stop::UNSUPPORTED_MODE),
+        _ => interpret::record(s, stop::UNSUPPORTED_CODE_MODE),
+    }
+}
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
@@ -136,12 +150,14 @@ pub unsafe fn start() -> ! {
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     fp::reset();
     let mut s = unsafe { load() };
-    let unusable = !guest_state_alias_valid(cache::control().guest_state_va)
-        || s.cpu.paging().is_none()
+    let broken = !guest_state_alias_valid(cache::control().guest_state_va)
         || s.request != NONE
         || s.vcpu >= s.vcpus
         || s.vcpus as usize > cache::MAX_VCPUS;
-    if unusable || s.cpu.code_mode() != Some(CodeMode::Bits64) {
+    // M2 Part 2: a vCPU that starts in a state the boot-time interpreter runs enters it directly once it is set up (below).
+    let interpreted = !broken && s.cpu.interpreted_mode().is_some();
+    let unusable = broken || s.cpu.paging().is_none();
+    if !interpreted && (unusable || s.cpu.code_mode() != Some(CodeMode::Bits64)) {
         // Before anything is shadowed or marked (and before the vCPU number is known to be valid). The code segment is
         // named only when all else is usable (as [`controls`]).
         s.stop = if unusable {
@@ -175,6 +191,9 @@ pub unsafe fn start() -> ! {
     // X4: an AP waits for the ACPI mailbox before it first runs.
     if s.mailbox != 0 {
         events::wait_mailbox(&mut s);
+    }
+    if s.cpu.interpreted_mode().is_some() {
+        interpret::run(&mut s)
     }
     unsafe { dispatch(&mut s) }
 }
@@ -274,6 +293,11 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
             Some(b) if b.flags & cache::SYSTEM != 0 => {
                 s.l2_hits += 1;
+                // M2 Part 2: the boot-time interpreter's records are SYSTEM records too ([`cache::INTERPRETED`]), parted
+                // from the decodes here; none is placed yet.
+                if b.flags & cache::INTERPRETED != 0 {
+                    halt(s, stop::BAD_REPLY)
+                }
                 #[cfg(feature = "perf")]
                 {
                     cache::control().system_chained += chained as u64;
@@ -2699,6 +2723,11 @@ fn system(s: &mut State, i: System) {
         c.system_from[(p & 31) as usize] += 1;
     }
     crate::perf::leave(p);
+    // M2 Part 2: the one test on this exit. A transaction that left a state only the boot-time interpreter runs
+    // ([`ends_in_mode`]) enters it now that it has completed.
+    if cache::control().interpret != 0 {
+        interpret::enter(s)
+    }
 }
 /// CNTVCT without a barrier (accounting only).
 #[cfg(feature = "perf")]
@@ -3242,9 +3271,11 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     Ok(commit(s, i, changed))
 }
 /// Ends a system transaction: RIP past the instruction (it completed: RF ends, except the RF an IRET just loaded); with
-/// `flush_all`, a global TLB flush ([`tlb`]: shadows go, translations stay).
+/// `flush_all`, a global TLB flush ([`tlb`]: shadows go, translations stay). M2 Part 2: a state the boot-time interpreter
+/// runs ([`ends_in_mode`]) completes the same way, then [`system`] enters it: none of this needs walk controls (the flush
+/// drops shadows, which the interpreter never uses; the interpreter applies its own IP width to RIP).
 fn commit(s: &mut State, i: System, flush_all: bool) {
-    controls(s);
+    ends_in_mode(s);
     if i.kind != system::IRET {
         completed(s);
     } else {
@@ -3294,10 +3325,11 @@ fn tsc() -> u64 {
 /// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows. A CPL the bank cannot
 /// run at ([`Cpu::paging`]: 1, 2 or above 3) stops `unsupported_mode` here, a CS it cannot run ([`Cpu::code_mode`]:
 /// e.g. a compatibility-mode one) `unsupported_code_mode` ([`controls`]), with the new CPL in the stop record and RIP
-/// still at the instruction.
+/// still at the instruction; M2 Part 2: unless the boot-time interpreter runs the state ([`ends_in_mode`]: recorded,
+/// and entered when the transaction has completed).
 pub fn set_cpl(s: &mut State, cpl: u64) {
     s.cpu.cpl = cpl;
-    controls(s);
+    ends_in_mode(s);
 }
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
