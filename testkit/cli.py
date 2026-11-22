@@ -22,9 +22,15 @@ def cmd_run(args):
     return runs.run(with_default_tier(args), rid)
 
 
+RECORDING = ('TESTKIT_SEED_ANSWERS', 'TESTKIT_SEED_FAILURES')     # runs that record answers instead of judging
+
+
 def with_default_tier(args):
-    """`run` without --tier, --gate or a path selects the affected tier (spec R6.1)."""
+    """`run` without --tier, --gate or a path selects the affected tier (spec R6.1). A gate that would record answers
+    (RECORDING set) is refused: such a run reports what it records as unverified and could bless a regression."""
     import os
+    if '--gate' in args and (rec := [v for v in RECORDING if os.environ.get(v)]):
+        raise SystemExit(f'natemu-test: {" and ".join(rec)} set: a recording run is never a gate (docs/testing.md)')
     if any(a.startswith('--tier') or a == '--gate' for a in args): return args
     if any(not a.startswith('-') and os.path.exists(a.split('::')[0]) for a in args): return args
     return ['--tier', 'affected', *args]

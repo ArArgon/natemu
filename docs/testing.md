@@ -372,11 +372,13 @@ tests built for i686: x87 code; also with AFP hidden, and in accurate mode then)
 by its own exit status, as `ltp` and `libm` do, against the reference machine's: a failure with the reference's own
 status passes (it fails the same way there, as in `torture32`), and a test unsupported under natemu that passed there
 fails. A `libm32` program that fails (all of them x87 long double or extended-precision deviations, listed in
-`expected`) must also fail exactly as recorded for its floating-point mode, by the count and hash of its failing cases
+`expected`) must also fail exactly as recorded for its floating-point mode, by the hash of its whole output and exit status
 (`tests/correctness/libm32-fails-MODE.txt`); otherwise it is `changed`, a failure, so an expected program hides no new
-failure. Record those after a change that alters them, on natemu, with `TESTKIT_SEED_FAILURES=1`: delete the files
-first and record twice (a program whose failure differs between the two is recorded `fp=*` and judged by failing
-alone). Its `expected_without.afp` entries name their deviation (`tests/lib/fp_deviations.py`); in accurate mode only
+failure and no case that fails by more. Record those after a change that alters them, on natemu, with
+`TESTKIT_SEED_FAILURES=1`: delete the files first and record twice (a program whose failure differs between the two is
+recorded `fp=*` and judged by failing alone; the family's test lists the only ones allowed). A recording run reports
+what it records as unverified, and `--gate` refuses to start with `TESTKIT_SEED_FAILURES` or `TESTKIT_SEED_ANSWERS`
+set. Its `expected_without.afp` entries name their deviation (`tests/lib/fp_deviations.py`); in accurate mode only
 those whose deviation that mode keeps (`x87-band-ue-flag`) still apply. Their recipes share `tools/correctness/i386.sh` (gcc's
 32-bit multilib in the sysroot, Debian's i386 packages through a third private apt), which the `x86st` recipe also uses
 for the kernel selftests' `*_32` programs. The answers are files in the repo: each `i386` test's whole output in

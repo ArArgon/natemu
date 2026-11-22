@@ -3,9 +3,11 @@
 # native `make check subdirs=math` ran, against the build tree's ld.so and libm; entries K, K+N, ...), each with glibc's
 # own timeout scaled by TIMEOUTFACTOR and a kill timeout. glibc's verdicts: exit 0 PASS, 77 UNSUPPORTED, other FAIL.
 #   CT-RESULT libm NAME rc=EXIT     (rc=skip: listed in DIR/libm-skip.txt, if present)
-#   ... rc=EXIT fails=N fp=HASH     where rc is neither 0 nor 77: how it failed, the number and md5 prefix of its distinct
-#                                   `Failure:` and `Maximal error of` lines (which name a case, not its values), or of its
-#                                   whole output where it has none
+#   ... rc=EXIT fails=N fp=HASH     where rc is neither 0 nor 77: how it failed, the number of its `Failure:` lines and
+#                                   the md5 prefix of its whole output (stdout and stderr) followed by `rc=EXIT`, so a
+#                                   case that fails by more, or fails another way, changes it. test-nan-payload's long
+#                                   double and _Float64x lines are left out: they memcmp the 80-bit format's two padding
+#                                   bytes, which natemu leaves as stack garbage (tests/correctness/verdicts.py, libm32)
 #   CT-OUT NAME | ...   the first 60 output lines of a test whose rc is neither 0 nor 77
 D=$1; k=${2%/*}; n=${2#*/}; [ -n "$2" ] || { k=0; n=1; }
 export TIMEOUTFACTOR=${TIMEOUTFACTOR:-10}; i=0; o=${TMPDIR:-/tmp}/libm-out.$$
@@ -17,8 +19,11 @@ while IFS="$tab" read -r name cwd cmd; do
     (cd "$cwd" && exec timeout -s KILL 1200 sh -c "exec $cmd") > "$o" 2>&1 < /dev/null; rc=$?
     case $rc in
         0|77) echo "CT-RESULT libm $name rc=$rc";;
-        *) grep -E '^(Failure|Maximal error of)' "$o" | sort -u > "$o.f"; [ -s "$o.f" ] || cp "$o" "$o.f"
-           echo "CT-RESULT libm $name rc=$rc fails=$(grep -c '' "$o.f") fp=$(md5sum < "$o.f" | cut -c1-12)"
+        *) case $name in      # grep -a and stdin: a NUL byte makes no `binary file <name> matches` line, with a pid
+               math/test-nan-payload) grep -av -E '^(PASS|FAIL): (long double|_Float64x) ' < "$o";;
+               *) cat "$o";;
+           esac > "$o.f"; echo "rc=$rc" >> "$o.f"
+           echo "CT-RESULT libm $name rc=$rc fails=$(grep -ac '^Failure' < "$o") fp=$(md5sum < "$o.f" | cut -c1-12)"
            head -n 60 "$o" | sed "s|^|CT-OUT $name \| |";;
     esac
 done < "$D/libm-cmds.txt"
