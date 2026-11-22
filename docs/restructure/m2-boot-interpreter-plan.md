@@ -15,11 +15,13 @@ Results, all framework cases on the M2 Max:
   (`exit-ap-natemu`);
 - the M2 exit test, our firmware from the reset vector at 1, 2 and 4 CPUs (`exit-fw-natemu`), and OVMF's reset vector
   to SEC from both entries (`ovmf-natemu`);
-- no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case;
-  M2 Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
-  [interp-transitions.md](interp-transitions.md)); and the system-call bench cases are no slower: at the final tip
-  against 78f60965, `guest-hackbench32` −4.5% and `guest-hackbench32-int80` −5.1%, beyond the noise and from the
-  plumbing commits (d7bc0885 to be626aa8), `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
+- no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case; M2
+  Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
+  [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
+  `segments::copy` and the page walker inlining its table read ([firmware-mode.md](firmware-mode.md) section 6); and the
+  system-call bench cases are no slower: at the final tip against 78f60965, `guest-hackbench32` −4.5% and
+  `guest-hackbench32-int80` −5.1%, beyond the noise and from the plumbing commits (d7bc0885 to be626aa8),
+  `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
 
 Design notes of the build: [interp-integration.md](interp-integration.md), [initsipi-resident.md](initsipi-resident.md),
 [interp-transitions.md](interp-transitions.md), [firmware-mode.md](firmware-mode.md); test contracts:
@@ -430,7 +432,8 @@ the repository; every number from a framework case (or labelled an experiment).
   CPU natemu presents are masked per case or answered by QEMU. QEMU's TCG does not set a code descriptor's accessed bit
   on far transfers, so KVM answers those windows. B0 showed that the AMD machine runs real-mode and P16 code natively
   under KVM (experiment, not a framework case, B0's spike on the x86 reference machine: 0 instruction emulations over
-  470M instructions; the machine is itself a KVM guest, so this is nested SVM). Built: the `interp` family, its format in [interp-cases.md](interp-cases.md).
+  470M instructions; the machine is itself a KVM guest, so this is nested SVM). Built: the `interp` family, its format
+  in [interp-cases.md](interp-cases.md).
 - **Fault cases** against the SDM models: the typed stop names the exception and error code the model gives, with
   nothing committed (`segment_model.py` extended to far JMP and far RET in real and 16/32-bit protected mode at CPL 0,
   `modes_model.py`'s parked 32-bit programs). Built: `tests/interp` `natemu-faults` (`interp_faults.py`: 306 segment
