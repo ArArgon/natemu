@@ -24,6 +24,28 @@ class Starts(unittest.TestCase):
         self.assertEqual(run_paper.markers(t, 'bench-2'), [])
 
 
+class Options(unittest.TestCase):
+    def args(self, perf_log):
+        import types
+        return types.SimpleNamespace(natemu='natemu', runtime='rt', fexc='fexc', inputs=pathlib.Path('in'), ram=2, vcpus=4,
+                                     speculation_barriers=True, perf_log=perf_log, out=pathlib.Path('out'))
+
+    def test_the_timing_log_only_when_asked(self):
+        self.assertEqual(run_paper.phase_command(self.args(True), 'disk', 'bench-1')[-2:], ['--perf-log', pathlib.Path('out/perf-bench-1.log')])
+        self.assertNotIn('--perf-log', run_paper.phase_command(self.args(False), 'disk', 'bench-1'))
+
+    def test_a_hidden_afp_must_show_in_the_startup_line(self):
+        t = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, t, True)
+        (t / 'stderr-bench-1.log').write_text('natemu: cpu: x86-64-v3\nnatemu: fp: fast mode\n')
+        (t / 'stderr-bench-2.log').write_text('natemu: fp: fast mode, degraded (host lacks FEAT_AFP)\n')
+        hidden = {'NATEMU_FEXC_FEATURE_OFF': 'flagm2,afp'}
+        self.assertEqual(run_paper.fp_line(t, 'bench-1'), 'natemu: fp: fast mode')
+        self.assertFalse(run_paper.afp_as_asked(run_paper.fp_line(t, 'bench-1'), hidden))
+        self.assertTrue(run_paper.afp_as_asked(run_paper.fp_line(t, 'bench-2'), hidden))
+        self.assertFalse(run_paper.afp_as_asked(run_paper.fp_line(t, 'setup'), hidden))   # (no stderr: no line)
+        self.assertTrue(run_paper.afp_as_asked(run_paper.fp_line(t, 'bench-1'), {}))
+
+
 class Guest(unittest.TestCase):
     def test_every_placeholder_is_substituted(self):
         filled = run_paper.guest_script(2)

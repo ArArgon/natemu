@@ -134,6 +134,20 @@ def phase_command(args, disk, phase):
     return natemu_command(args, disk) + (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else [])
 
 
+def fp_line(work, phase):
+    """natemu's floating-point startup line of a boot (`natemu: fp: ...`, from stderr-PHASE.log), or None."""
+    f = work / f'stderr-{phase}.log'
+    lines = f.read_text(errors='replace').splitlines() if f.exists() else []
+    return next((l.strip() for l in lines if l.startswith('natemu: fp:')), None)
+
+
+def afp_as_asked(line, env):
+    """Whether natemu ran as the case asked: with AFP hidden (NATEMU_FEXC_FEATURE_OFF names afp, the guest-paper-noafp cases)
+    its startup line says the host lacks FEAT_AFP; otherwise anything goes."""
+    if 'afp' not in env.get('NATEMU_FEXC_FEATURE_OFF', '').split(','): return True
+    return line is not None and 'lacks FEAT_AFP' in line
+
+
 def markers(work, phase):
     """[(host seconds, marker words)] from launch's markers-PHASE.tsv."""
     f = work / f'markers-{phase}.tsv'
@@ -192,7 +206,9 @@ def run(args):
             r = {'exit': code, 'timed_out': timed_out, 'seconds': seconds, 'starts': starts(rows),
                  'steps': {w[1]: w[2] for w in words if w[:1] == ['step'] and len(w) > 2},
                  'facts': {w[0]: w[1:] for w in words if w[:1] in (['packages'], ['seed'], ['seed-used'], ['net'], ['begin'])},
+                 'fp': fp_line(args.out, phase),
                  'ok': [f'{phase.split("-")[0]}-ok'] in words and code == 0 and not timed_out}
+            r['ok'] = r['ok'] and afp_as_asked(r['fp'], os.environ)
             if phase != 'setup': r['contended'] = before + others(); contended += r['contended']
             result['phases'][phase] = r
             print(f'{phase}: exit {code} in {seconds}s, ok {r["ok"]}, starts {r["starts"]}', flush=True)
