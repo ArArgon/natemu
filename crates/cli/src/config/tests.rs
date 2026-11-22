@@ -723,6 +723,9 @@ fn firmware_boot() {
     let e = err(load_file(&format!("{eng}[boot.firmware]\nimage = \"a\"\nstart = \"main32\"\n"), &[]).1);
     assert!(e.contains("reset or flat32"), "{e}");
     assert!(err(load_file(&format!("{eng}[boot.firmware]\nimage = \"a\"\nentry = 1\n"), &[]).1).contains("unknown field"));
+    let e = err(load_args(&["--fexc", "f", "--kernel", "k", "--set", "boot.firmware.start=flat32"]));
+    assert!(e.contains("two boot methods") || e.contains("without a firmware image"), "{e}");
+    assert!(err(load_old(&["--set", "boot.firmware.start=flat32"])).contains("without a firmware image"));
 }
 
 #[test]

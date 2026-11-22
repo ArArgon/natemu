@@ -46,8 +46,8 @@
 //! M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `--firmware` boots IMAGE as a firmware image
 //! instead of a kernel (`Boot::firmware`): at guest-physical [4 GiB - its size, 4 GiB), vCPU 0 at the reset vector in the
 //! power-on state (`--firmware-start flat32`: in flat 32-bit protected mode at FFFFFFF0H), the others waiting for a SIPI,
-//! the MTRRs at their power-on values; no tables, no mailbox (`--initrd`, `--cmdline`, `--rsdp`, `--no-mailbox`, `--rng`
-//! and `--load-only` are refused). The placement's `kernel` and `window` are the image's range.
+//! the MTRRs at their power-on values; no tables, no mailbox (`--initrd`, `--cmdline`, `--rsdp`, `--no-mailbox`, `--rng`,
+//! `--load-only` and `--dump` are refused). The placement's `kernel` and `window` are the image's range.
 //!
 //! Performance phase (perf plan §2): `--perf-log FILE` (or `NATEMU_PERF_LOG=FILE`) turns on the library's timing log (`natemu::perf`): process
 //! phases and one line per vCPU in FILE, one line per translation request in FILE.vN. The resident's buckets need a
@@ -209,8 +209,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         firmware,
         firmware_start,
     } = args;
-    if firmware && (initrd.is_some() || !cmdline.is_empty() || rsdp.is_some() || no_mailbox || rng || load_only) {
-        return Err("--firmware: no --initrd, --cmdline, --rsdp, --no-mailbox, --rng or --load-only".into());
+    if firmware
+        && (initrd.is_some() || !cmdline.is_empty() || rsdp.is_some() || no_mailbox || rng || load_only || dump.is_some())
+    {
+        return Err("--firmware: no --initrd, --cmdline, --rsdp, --no-mailbox, --rng, --load-only or --dump".into());
     }
     if let Some(path) = perf_log {
         natemu::perf::enable(path)?;

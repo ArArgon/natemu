@@ -793,6 +793,9 @@ pub fn validate(cfg: &Config) -> Res<()> {
             "{who}: no boot method: --kernel FILE, or [boot.kernel] in a --config file (or a firmware image: --firmware FILE)"
         ));
     }
+    if cfg.firmware.is_none() && cfg.firmware_start != natemu::boot::firmware::Start::Reset {
+        return Err(format!("{who}: boot.firmware.start without a firmware image (--firmware FILE or [boot.firmware] image)"));
+    }
     // M2 Part 2: a firmware boot loads no initrd or command line, and its board has no virtio device yet.
     if cfg.firmware.is_some() && (cfg.initrd.is_some() || !cfg.cmdline.is_empty()) {
         return Err(format!("{who}: a firmware boot takes no initrd or kernel command line"));
