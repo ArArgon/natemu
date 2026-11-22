@@ -1536,14 +1536,14 @@ impl<'a> Verifier<'a> {
             return false;
         };
         let s = &self.c.stubs[i];
-        let last = at;
-        let stub = s.native_offset..=last;
-        t <= s.guest_offset2
+        // (Every branch into the stub goes to its `adr`: one to its `b` would send the probe's `br x0` wherever x0 points.)
+        t % 4 == 0
+            && t <= s.guest_offset2
             && self.insn(t).is_some()
             && self.insn(s.native_offset - 4).is_none_or(|x| !x.falls_through())
             && self
-                .branches_into(s.native_offset - 4, last)
-                .all(|(src, _)| src < t || stub.contains(&src))
+                .branches_into(s.native_offset - 4, at)
+                .all(|(src, to)| src < t && to == s.native_offset)
     }
     /// For a probing split stub's return branch at `src`: the first word that branches into its stub (every one of them
     /// lies before the return's target, [`Self::probe_return`]).
@@ -2795,6 +2795,8 @@ mod tests {
         // Back to the check itself (its `tbnz` at 0x10, or before it): a loop through the stub, refused with the code shape off.
         validated(block, 0x24, adr(0x14), adr(0x10), Some("probing split stub 0 at 0x24: its way back"));
         validated(block, 0x24, adr(0x14), adr(0x8), Some("probing split stub 0 at 0x24: its way back"));
+        // The check's branch to the stub's `b` instead of its `adr` (the probe would return wherever x0 points).
+        validated(block, 0x10, 0x3760_00a0, 0x3760_00c0, Some("probing split stub 0 at 0x24: its way back"));
         // A probe in generated code; a second way into the stub, from after the word it returns to.
         validated(block, 0x4, 0x9100_20c1, 0x383f_003f, Some("page probe outside a split stub"));
         assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24

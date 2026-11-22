@@ -128,8 +128,12 @@ def only_probes(old, new):
         if site[20] == SPLIT and word & 0x9f00001f == 0x10000000:
             imm = ((word >> 5 & 0x7ffff) << 2 | word >> 29 & 3)
             back = n + (imm - (1 << 21) if imm >> 20 else imm)
-            want = [probe_index(b, site[25], site[21]) for b in (False, True)]
-            if u32(co, o) != BRK2 or u32(cn, n + 4) != PLACEHOLDER or not 4 <= back <= u32(site, 8) or probes.get(n + 4) not in want:
+            # (64-bit code's probe; back: the word after the split check, a `tbnz` to this stub)
+            check = u32(cn, back - 4) if back >= 8 else 0
+            imm = check >> 5 & 0x3fff
+            to = back - 4 + 4 * (imm - (1 << 14) if imm >> 13 else imm)
+            if u32(co, o) != BRK2 or u32(cn, n + 4) != PLACEHOLDER or not 4 <= back <= u32(site, 8) or check & 0x7f000000 != 0x37000000 or \
+                    to != n or probes.get(n + 4) != probe_index(False, site[25], site[21]):
                 return 'a probing stub of another form'
             seen.add(n + 4)
             size = 8

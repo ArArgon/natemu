@@ -740,7 +740,7 @@ fn admit_records(
                 && (s.imm, s.index_reg) == (0, object::NO_REG)
                 && at + 8 <= region
                 && back.is_some_and(|t| {
-                    t >= u64::from(ENTRY_OFFSET) && access.is_some_and(|a| t <= u64::from(a.native_offset))
+                    t % 4 == 0 && t >= u64::from(ENTRY_OFFSET) && access.is_some_and(|a| t <= u64::from(a.native_offset))
                 })
                 && word(at + 4) == natemu_abi::execution::DISPATCH_PLACEHOLDER
                 && index.is_some_and(|i| {

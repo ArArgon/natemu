@@ -1616,6 +1616,8 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                 (0..u64::from(cache::placed_size(&h)) / 4).all(|k| {
                     (t.dispatch_exit != 0 && 4 * k == u64::from(t.dispatch_exit))
                         || code(k) == staged(k)
+                        // (a probing split stub's branch, pointed at its shared probe: admitted as the placeholder)
+                        || (staged(k) == DISPATCH_PLACEHOLDER && cache::probe_branch(u64::from(t.code) + 4 * k))
                         || run.is_some_and(|(o, admitted, split)| 4 * k == o && staged(k) == admitted && Some(code(k)) == split)
                 })
             };

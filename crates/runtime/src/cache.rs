@@ -1159,11 +1159,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
     }
     // (The probing split stubs' branches to their shared probes, as admitted: the placeholder, pointed again below.)
     // (Only they branch into the probes: every other branch of a block goes inside it, to a block or to the dispatcher.)
-    let probe_branch = |o: u64| {
-        let w = word(from + o);
-        w & 0xfc00_0000 == 0x1400_0000
-            && (area::PROBES as u64..area::HEAD_BYTES as u64).contains(&branch_to(from + o))
-    };
+    let probe_branch = |o: u64| probe_branch(from + o);
     let original = |o: usize| {
         if probe_branch(o as u64) {
             return natemu_abi::execution::DISPATCH_PLACEHOLDER;
@@ -1322,7 +1318,16 @@ pub fn unlinked_word(t: &Block, o: usize) -> u32 {
             return pic::SVC_LINK;
         }
     }
+    // (A probing split stub's branch, which the resident points at its shared probe: the placeholder it was admitted as.)
+    if probe_branch(u64::from(t.code) + o) {
+        return natemu_abi::execution::DISPATCH_PLACEHOLDER;
+    }
     word(u64::from(t.code) + o)
+}
+/// The word at code-area offset `at` is a `b` into the shared probes: a probing split stub's second word as the resident
+/// points it ([`point_probes`]; every other branch of a block goes inside it, to a block or to the dispatcher).
+pub fn probe_branch(at: u64) -> bool {
+    word(at) & 0xfc00_0000 == 0x1400_0000 && (area::PROBES as u64..area::HEAD_BYTES as u64).contains(&branch_to(at))
 }
 /// The block whose code `b` runs: an [`INSTANCE`]'s translation, else `b`.
 pub fn code_of(b: &Block) -> &'static Block {
@@ -1810,6 +1815,8 @@ pub fn place_step(
             h.code_size as usize,
         );
         relocate(SLOT as u64, dispatch_exit, DISPATCH_MISS as u64);
+        // (A step unit's split stubs are `brk`s, fexc_step_unit; pointed all the same, should one probe.)
+        point_probes(SLOT as u64, self::sites(&*at).iter().copied(), context);
         synchronize_code(SLOT_WRITE_VA, SLOT_VA, h.code_size as usize);
         Some(&*at)
     }
