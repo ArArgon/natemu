@@ -407,7 +407,9 @@ failure and no case that fails by more. Record those after a change that alters 
 recorded `fp=*` and judged by failing alone; the family's test lists the only ones allowed). A recording run reports
 what it records as unverified, and `--gate` refuses to start with `TESTKIT_SEED_FAILURES` or `TESTKIT_SEED_ANSWERS`
 set. Its `expected_without.afp` entries name their deviation (`tests/lib/fp_deviations.py`); in accurate mode only
-those whose deviation that mode keeps (`x87-band-ue-flag`) still apply. Their recipes share `tools/correctness/i386.sh` (gcc's
+those whose deviation that mode keeps (`x87-band-ue-flag`) still apply. `torture32` and `libm32` boot with natemu's
+reuse check on (`check_reuse = true` on the suite: `NATEMU_CHECK_REUSE=1`), so a translated block reused wrongly stops
+the boot and its tests go missing. Their recipes share `tools/correctness/i386.sh` (gcc's
 32-bit multilib in the sysroot, Debian's i386 packages through a third private apt), which the `x86st` recipe also uses
 for the kernel selftests' `*_32` programs. The answers are files in the repo: each `i386` test's whole output in
 `tests/correctness/i386/`, each `torture32` program's exit status and output hash in `tests/correctness/torture32.txt`,

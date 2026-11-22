@@ -5,6 +5,9 @@ November 21 and 22, 2026. Checkpoint B of [the M2 plan](m2-32bit-design.md), on 
 stock i386 userland runs under the Debian guest, including a 32-bit toolchain build, and performance is recorded against
 QEMU. There is no speed bar (the owner's decision); costs are named and labelled instead.
 
+(The flaw this page names, 32-bit code compiled again in every process, is fixed since: the i386 configure takes
+106.7 s and the make 114.7 s; [32-bit code reuse](m2-reuse32-findings.md). The numbers below are this checkpoint's.)
+
 **Summary.**
 
 - A complete Debian 13 i386 userland, installed in the guest by Debian's own `debootstrap`, configures and builds CPython

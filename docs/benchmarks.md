@@ -15,7 +15,9 @@ were measured before the bench cases existed (with `tools/bench/run.py` directly
 through them; numbers from experiments elsewhere in `docs/` are labelled as such and are not this page's numbers.
 
 32-bit programs against QEMU, and a CPython build by a Debian i386 userland, are in
-[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md) (November 22).
+[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md) (November 22). The i386 build's times since
+32-bit code is reused (bench case `io5-solo32`, M4, November 22: configure 106.7 s, `make -j4` 114.7 s, from 374.2 and
+223.2) are in [the 32-bit reuse findings](restructure/m2-reuse32-findings.md).
 
 ## Setup
 

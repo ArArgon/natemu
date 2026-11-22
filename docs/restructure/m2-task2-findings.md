@@ -21,7 +21,7 @@ code. Nothing runs it yet: the resident still stops before it asks for a block o
   the 32-bit rules and is always compiled: its answer is not kept in memory (so never moved to another address), not
   read from or written to the persistent cache, and never offered as a template for reuse. The field follows the code
   segment's mode (`Cpu::code_mode`). (Since [32-bit code reuse](m2-reuse32-findings.md) its answers are kept, moved and
-  cached like 64-bit code's; reuse inside the guest is designed there.)
+  cached like 64-bit code's; reused inside the guest too.)
 - **Offline admission tool.** `natemu-host unused admit-corpus DIR` admits every `NAME.obj` in a folder (compiled from
   `NAME.src`), with the code-shape check, and prints the time per block. The old ignored `corpus` test calls the same
   function.
