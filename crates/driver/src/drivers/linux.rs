@@ -260,8 +260,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             compile_cache.as_deref().map(|p| p.as_os_str()),
             compile_cache_mb,
         )?,
-        // (Or NATEMU_CHECK_REUSE in the environment: a test run's boots take no options of their own, docs/testing.md.)
-        check_reuse: check_reuse || std::env::var_os("NATEMU_CHECK_REUSE").is_some(),
+        check_reuse,
         code_shape,
         page_currency,
         speculation_barriers,
