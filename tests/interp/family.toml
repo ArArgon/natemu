@@ -1,10 +1,12 @@
 # The boot-time interpreter's per-instruction cases (docs/restructure/interp-cases.md): the generated corpus, its two
-# references (the pinned QEMU's TCG and the x86 machine under KVM) and their checks. Ordinary runs compare the locked
-# answers only: nothing starts a VM. natemu is not run here yet (its program driver starts only in 64-bit long mode);
-# the cases that run natemu come with the driver's start states in these modes.
+# references (the pinned QEMU's TCG and the x86 machine under KVM) and their checks. The `references` case compares the
+# locked answers only: nothing starts a VM. natemu does not run the corpus yet (the resident runs no 16- or 32-bit state
+# until the interpreter is integrated); its runner is run_interp_natemu.py, which the integration registers as case
+# `natemu` (that script's docstring). `natemu-machine` runs the program driver's machine descriptions in 64-bit mode today.
 [family]
 name = "interp"
-covers = ["tests/interp/**", "tests/lib/testenv.py", "tools/reference/answers.py", "tools/correctness/recipes/common.sh"]
+covers = ["tests/interp/**", "tests/lib/testenv.py", "tools/reference/answers.py", "tools/correctness/recipes/common.sh",
+          "crates/**", "third_party/FEX"]
 
 [[suite]]
 name = "interp"
@@ -17,4 +19,11 @@ params = { timeout = 1800 }
 # then `natemu-test lock tests/interp --from-run RUN1 RUN2`.
 [suite.cases."references"]
 argv = ["tests/interp/run_interp_ref.py", "--out", "{out}"]
+smoke = true
+
+# The program driver's machine descriptions (the corpus's form: state set directly, physical memory, stops, readback) in
+# 64-bit mode, which the resident runs today: a landing stop, the first-instruction stop, the `machine` fields.
+[suite.cases."natemu-machine"]
+argv = ["tests/interp/run_interp_natemu.py", "--selftest", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}",
+        "--fexc", "{fexc}", "--out", "{out}"]
 smoke = true

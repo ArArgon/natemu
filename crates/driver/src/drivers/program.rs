@@ -111,6 +111,27 @@
 //! reserved (no 1 GiB pages); the A bit of a non-leaf entry is set but never compared. PWT, PCD and PAT bits (entry bits
 //! 3, 4; bit 7 of a PTE; bit 12 of a 2 MiB leaf) select the page's memory type (M2); UC RAM's accesses run their instruction alone
 //! (strong ordering), and the output's `memory_types` counts data shadows by type, `uncached` the UC accesses.
+//!
+//! Machine descriptions (M2 Part 2, the boot-time interpreter's per-instruction cases, docs/restructure/interp-cases.md):
+//! a line `machine` makes the whole description set each vCPU's architectural state directly, in any mode, with no
+//! fixture of the driver's (no page tables, logging IDT, GDT or TSS, nothing derived): each section starts in the SDM's
+//! power-on state (`natemu_abi::power_on::power_on`: CS F000H base FFFF0000H, EIP FFF0H, CR0 60000010H, EDX the
+//! signature), which these items change: `rip EIP` (CS-relative), `rflags VALUE` (as given; bit 1 set), `gpr V0 .. V15`,
+//! `cpl 0|3`, `xmm`, `mxcsr`, `svr` as above; `cr0 V`, `cr3 V`, `cr4 V`, `efer V` (as given, LMA included); `seg
+//! es|cs|ss|ds|fs|gs SEL BASE LIMIT ATTR` (the register with its hidden part: `exec::Segment`'s attributes, descriptor
+//! bits 47:40 in 7:0 and 55:52 in 15:12; the byte-granular limit); `gdtr BASE LIMIT`, `idtr BASE LIMIT`; `stop LINEAR`
+//! (repeatable: the run ends when the vCPU is about to execute that linear address, stop ids 0.. in order, the first
+//! instruction included); `window GPA LEN` (repeatable; LEN in hex, as every number here: bytes read back at the end).
+//! The only address-space item is `memory GPA HEX`, bytes written at that guest-physical address (inside guest RAM);
+//! code is memory too. LDTR and TR are the reset values, DR0-DR7 too; the x87 state is FNINIT's (as every
+//! driver-started vCPU's). The vCPU's output gains `machine`: the fields `tests/interp/interp_rig.py`'s `fields()`
+//! reads from its capture record, `stop` (the id of the stop reached, null when the run ended otherwise:
+//! then `stop` and `reason` say why), `eax`..`edi` (the low 32 bits), `eflags`, `es`..`gs` (selectors), `cr0`, `cr3`,
+//! `cr4` (low 32 bits), `efer`, `gdtr` and `idtr` ([limit, low 32 bits of the base]) and `window0`.. (hex). A stop is
+//! answered at a translation request for its address (`execution::Hook::at`; blocks end before it): in 64-bit code the
+//! address is RIP; interpreted code (16-bit and 32-bit modes, which the resident does not run yet: today `start()` halts
+//! on such a state) must ask the hook the same way with CS.base + EIP before it decodes there.
+//!
 //! Without `cpu` lines the description is one program on one vCPU (output: one state object). Each `cpu` line starts
 //! the next vCPU's section (vCPUs 0.., output `{"cpus": [...]}`); address-space items before the first `cpu` line
 //! form the shared address space, which a section uses unless it has address-space items of its own (then it gets
@@ -197,7 +218,81 @@ struct Section {
     svr: u64,
     /// X4: the guest-physical ACPI mailbox the vCPU waits on before it runs (`mailbox GPA`), else 0.
     mailbox: u64,
+    /// A `machine` description's state: set as given, no driver fixture (module doc).
+    machine: Option<MachineState>,
 }
+/// M2 Part 2: a `machine` section's control registers, segments, tables, stops and windows (module doc).
+#[derive(Debug, PartialEq, Clone)]
+struct MachineState {
+    cr0: u64,
+    cr3: u64,
+    cr4: u64,
+    efer: u64,
+    seg: [exec::Segment; 6],
+    gdtr: exec::Table,
+    idtr: exec::Table,
+    /// Linear addresses where the run ends (`stop` items; the id is the index).
+    stops: Vec<u64>,
+    /// Guest-physical (address, length) read back at the end (`window` items).
+    windows: Vec<(u64, u64)>,
+}
+impl MachineState {
+    /// The power-on state's (`natemu_abi::power_on`), and that state.
+    fn power_on() -> (Self, Cpu) {
+        let mut c = Cpu {
+            gpr: [0; 16],
+            rip: 0,
+            rflags: 2,
+            cr0: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+            cpl: 0,
+            cr2: 0,
+            cr8: 0,
+            dr: exec::DR_RESET,
+            seg: [exec::Segment::NULL; 6],
+            ldtr: exec::LDTR_RESET,
+            tr: exec::TR_RESET,
+            gdtr: exec::TABLE_RESET,
+            idtr: exec::TABLE_RESET,
+            mov_ss: 0,
+            xmm: [[0; 2]; 16],
+            mxcsr: exec::MXCSR_RESET,
+            fcw: exec::FCW_INIT,
+            xcr0: natemu_abi::cpu_profile::XCR0_RESET,
+            no_afp: 0,
+            accurate_fp: 0,
+            stack_traps: 0,
+        };
+        natemu_abi::power_on::power_on(&mut c);
+        let m = MachineState {
+            cr0: c.cr0,
+            cr3: c.cr3,
+            cr4: c.cr4,
+            efer: c.efer,
+            seg: c.seg,
+            gdtr: c.gdtr,
+            idtr: c.idtr,
+            stops: vec![],
+            windows: vec![],
+        };
+        (m, c)
+    }
+    /// The vCPU's state: the power-on state with the section's and this machine state's items.
+    fn cpu(&self, c: &Section) -> Cpu {
+        let (_, mut cpu) = MachineState::power_on();
+        (cpu.gpr, cpu.rip, cpu.rflags, cpu.cpl) = (c.gpr, c.rip, c.rflags | 2, c.cpl);
+        (cpu.xmm, cpu.mxcsr) = (c.xmm, c.mxcsr);
+        // The x87 state as after FNINIT, as every driver-started vCPU's (the guest-state page holds FNINIT's), not RESET's.
+        cpu.fcw = exec::FCW_INIT;
+        (cpu.cr0, cpu.cr3, cpu.cr4, cpu.efer) = (self.cr0, self.cr3, self.cr4, self.efer);
+        (cpu.seg, cpu.gdtr, cpu.idtr) = (self.seg, self.gdtr, self.idtr);
+        cpu
+    }
+}
+/// [`Stop::Hooked`]'s code for a machine description's stop `id`: this | id.
+const STOPPED: u32 = 1 << 31;
 #[derive(Debug, PartialEq)]
 struct Description {
     /// Space 0 is the shared one.
@@ -205,6 +300,8 @@ struct Description {
     cpus: Vec<Section>,
     /// Written with `cpu` lines.
     sections: bool,
+    /// A `machine` description (module doc).
+    machine: bool,
 }
 
 fn number(text: &str) -> Result<u64> {
@@ -221,18 +318,24 @@ fn hex(text: &str) -> Result<Vec<u8>> {
         .collect()
 }
 fn parse(text: &str) -> Result<Description> {
+    let machine = text.lines().any(|l| l.trim() == "machine");
+    let read = if machine { machine_items } else { items };
     let mut chunks = vec![vec![]];
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    for line in text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.trim() != "machine")
+    {
         match line.split_whitespace().collect::<Vec<_>>()[..] {
             ["cpu"] => chunks.push(vec![]),
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
+    let (reset, on) = MachineState::power_on();
     let new = |space| Section {
-        rip: 0,
-        rflags: 0,
-        gpr: [0; 16],
-        cpl: 3,
+        rip: if machine { on.rip } else { 0 },
+        rflags: if machine { on.rflags } else { 0 },
+        gpr: if machine { on.gpr } else { [0; 16] },
+        cpl: if machine { 0 } else { 3 },
         wp: true,
         smep: false,
         nxe: true,
@@ -250,20 +353,22 @@ fn parse(text: &str) -> Result<Description> {
         interrupts: true,
         svr: natemu_abi::lapic::SVR_RESET,
         mailbox: 0,
+        machine: machine.then(|| reset.clone()),
     };
     let mut d = Description {
         spaces: vec![Space::default()],
         cpus: vec![],
         sections: chunks.len() > 1,
+        machine,
     };
     if d.sections {
-        items(&chunks[0], &mut d.spaces[0], None)?;
+        read(&chunks[0], &mut d.spaces[0], None)?;
         if d.spaces[0].bodies.iter().any(|(at, _)| at.is_none()) {
             return Err("code in the shared space: write it as body ADDR HEX".into());
         }
         for chunk in &chunks[1..] {
             let (mut own, mut cpu) = (Space::default(), new(0));
-            items(chunk, &mut own, Some(&mut cpu))?;
+            read(chunk, &mut own, Some(&mut cpu))?;
             if own != Space::default() {
                 cpu.space = d.spaces.len();
                 d.spaces.push(own);
@@ -272,10 +377,10 @@ fn parse(text: &str) -> Result<Description> {
         }
     } else {
         let mut cpu = new(0);
-        items(&chunks[0], &mut d.spaces[0], Some(&mut cpu))?;
+        read(&chunks[0], &mut d.spaces[0], Some(&mut cpu))?;
         d.cpus.push(cpu);
     }
-    for c in &d.cpus {
+    for c in d.cpus.iter().filter(|_| !machine) {
         if bodies(&d.spaces[c.space], c.rip).all(|(_, code)| code.is_empty()) {
             return Err("no code".into());
         }
@@ -392,6 +497,63 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
     }
     Ok(())
 }
+/// A machine section's state ([`state`] for its machine items).
+fn machine<'a>(cpu: &'a mut Option<&mut Section>, line: &str) -> Result<&'a mut MachineState> {
+    Ok(state(cpu, line)?.machine.as_mut().unwrap())
+}
+/// A `machine` description's items (module doc): its own, and the state items of [`items`] it shares; `memory` is the
+/// only address-space item.
+fn machine_items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Result<()> {
+    for line in lines {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let table = |base: &str, limit: &str| -> Result<exec::Table> {
+            Ok(exec::Table {
+                base: number(base)?,
+                limit: number(limit)?,
+            })
+        };
+        match (words[0], &words[1..]) {
+            ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
+            ("rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr", _) => {
+                items(&[*line], space, cpu.as_deref_mut())?
+            }
+            ("cr0" | "cr3" | "cr4" | "efer", [v]) => {
+                let (m, v) = (machine(&mut cpu, line)?, number(v)?);
+                *match words[0] {
+                    "cr0" => &mut m.cr0,
+                    "cr3" => &mut m.cr3,
+                    "cr4" => &mut m.cr4,
+                    _ => &mut m.efer,
+                } = v;
+            }
+            ("seg", [r, sel, base, limit, attr]) => {
+                let i = ["es", "cs", "ss", "ds", "fs", "gs"]
+                    .iter()
+                    .position(|n| n == r)
+                    .ok_or(format!("bad segment register: {line}"))?;
+                let wide = |v: u64, bits: u32| {
+                    (v >> bits == 0)
+                        .then_some(v)
+                        .ok_or(format!("value too wide: {line}"))
+                };
+                machine(&mut cpu, line)?.seg[i] = exec::Segment {
+                    selector: wide(number(sel)?, 16)? as u16,
+                    base: number(base)?,
+                    limit: wide(number(limit)?, 32)? as u32,
+                    attributes: wide(number(attr)?, 16)? as u16,
+                };
+            }
+            ("gdtr", [b, l]) => machine(&mut cpu, line)?.gdtr = table(b, l)?,
+            ("idtr", [b, l]) => machine(&mut cpu, line)?.idtr = table(b, l)?,
+            ("stop", [a]) => machine(&mut cpu, line)?.stops.push(number(a)?),
+            ("window", [a, n]) if number(n)? > 0 => {
+                machine(&mut cpu, line)?.windows.push((number(a)?, number(n)?))
+            }
+            _ => return Err(format!("not a machine description line: {line}")),
+        }
+    }
+    Ok(())
+}
 /// The bodies of `space` with their addresses, for a vCPU starting at `rip`.
 fn bodies(space: &Space, rip: u64) -> impl Iterator<Item = (u64, &[u8])> {
     space
@@ -464,6 +626,8 @@ struct Tables {
     devices: BTreeMap<u64, Arc<Mutex<TestDevice>>>,
     /// Linear page -> (physical page, leaf entry address).
     pages: BTreeMap<u64, (u64, u64)>,
+    /// A `machine` description's space: no tables, every address its own guest-physical one (`pages` empty).
+    physical: bool,
 }
 impl Tables {
     fn new(b: &mut Builder) -> Result<Self> {
@@ -472,7 +636,38 @@ impl Tables {
             cr3: b.page()?,
             pages: BTreeMap::new(),
             devices: BTreeMap::new(),
+            physical: false,
         })
+    }
+    /// A `machine` description's space: its memory written at its guest-physical addresses, each inside guest RAM
+    /// (`ram_bytes` of it), as every window is.
+    fn physical(
+        b: &Builder,
+        ram_bytes: u64,
+        space: &Space,
+        windows: impl Iterator<Item = (u64, u64)>,
+        devices: &BTreeMap<u64, Arc<Mutex<TestDevice>>>,
+    ) -> Result<Self> {
+        let t = Self {
+            ram: b.ram,
+            cr3: 0,
+            pages: BTreeMap::new(),
+            devices: devices.clone(),
+            physical: true,
+        };
+        let ranges = space.memory.iter().map(|(a, d)| (*a, d.len() as u64));
+        for (a, n) in ranges.chain(windows) {
+            let end = a.checked_add(n).ok_or(format!("{a:#x}+{n:#x}: wraps"))?;
+            if !(a..end).step_by(4096).chain([end - 1]).all(|g| exec::ram_contains(ram_bytes, g)) {
+                return Err(format!(
+                    "machine memory or window {a:#x}+{n:#x} outside guest RAM (or in a hole)"
+                ));
+            }
+        }
+        for (address, data) in &space.memory {
+            t.copy_in(*address, data);
+        }
+        Ok(t)
     }
     /// The address of the entry at `level` of `va`'s walk, creating missing tables above it with a builder (without
     /// one, a non-present entry above it is an error: mutations never create tables).
@@ -531,13 +726,16 @@ impl Tables {
         }
         Ok(())
     }
-    /// Physical address of mapped linear `va`.
-    fn physical(&self, va: u64) -> u64 {
+    /// Physical address of mapped linear `va` (in a `machine` space, `va` itself).
+    fn gpa(&self, va: u64) -> u64 {
+        if self.physical {
+            return va;
+        }
         self.pages[&(va & !4095)].0 | (va & 4095)
     }
     fn copy_in(&self, va: u64, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate() {
-            let gpa = self.physical(va + i as u64);
+            let gpa = self.gpa(va + i as u64);
             match self.devices.get(&(gpa & !4095)) {
                 Some(d) => d.lock().unwrap().bytes[(gpa & 4095) as usize] = b,
                 None => assert!(self.ram.write(gpa, b)),
@@ -550,7 +748,7 @@ impl Tables {
             None => self.ram.read::<u8>(gpa).unwrap(),
         };
         (0..length as u64)
-            .map(|i| byte(self.physical(va + i)))
+            .map(|i| byte(self.gpa(va + i)))
             .collect()
     }
 }
@@ -954,6 +1152,9 @@ struct ProgramHook {
     posts: BTreeMap<u64, u64>,
     /// The logging IDT's handler range: reaching it ends the run ([`LOGGED`]) before anything there is fetched.
     handlers: std::ops::Range<u64>,
+    /// A machine section's `stop` items: reaching one ends the run ([`STOPPED`] | its index) before anything there is
+    /// fetched.
+    stops: Vec<u64>,
     doorbell: Doorbell,
     /// `--forge-exit`: rewrites each admitted object before it is staged ([`forge_exit`]).
     forge_exit: bool,
@@ -973,6 +1174,9 @@ impl execution::Hook for ProgramHook {
     fn at(&mut self, area: Area, rip: u64) -> Result<Option<execution::At>> {
         if self.handlers.contains(&rip) {
             return Ok(Some(execution::At::Stop(LOGGED)));
+        }
+        if let Some(id) = self.stops.iter().position(|&s| s == rip) {
+            return Ok(Some(execution::At::Stop(STOPPED | id as u32)));
         }
         if let Some(&cpl) = self.switches.get(&rip) {
             return Ok(Some(execution::At::System(exec::System {
@@ -1000,9 +1204,11 @@ impl execution::Hook for ProgramHook {
         use std::ops::Bound::{Excluded, Unbounded};
         let after =
             |m: &BTreeMap<u64, u64>| m.range((Excluded(rip), Unbounded)).next().map(|(&r, _)| r);
+        let stop = self.stops.iter().copied().filter(|&s| s > rip).min();
         after(&self.switches)
             .into_iter()
             .chain(after(&self.posts))
+            .chain(stop)
             .min()
     }
     fn fences(&self) -> Vec<std::ops::Range<u64>> {
@@ -1010,8 +1216,10 @@ impl execution::Hook for ProgramHook {
             .switches
             .keys()
             .chain(self.posts.keys())
+            .chain(&self.stops)
             .map(|&r| r..r + 1);
         std::iter::once(self.handlers.clone())
+            .filter(|h| !h.is_empty())
             .chain(points)
             .collect()
     }
@@ -1077,10 +1285,10 @@ struct Ran {
 }
 /// L4b: a power stop's name (`pm::POWEROFF`, `pm::RESET`).
 pub(crate) fn power_name(p: u8) -> &'static str {
-    if p == crate::pm::RESET {
-        "reset"
-    } else {
-        "poweroff"
+    match p {
+        crate::pm::RESET => "reset",
+        crate::pm::DEBUG_EXIT => "debug_exit",
+        _ => "poweroff",
     }
 }
 /// A vCPU's own end (it parks; peers run on). Any other stop cancels the peers.
@@ -1780,22 +1988,37 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let mut ends = Vec::new();
     for c in &d.cpus {
         if spaces[c.space].is_none() {
-            spaces[c.space] = Some(build(
-                &mut builder,
-                &d.spaces[c.space],
-                c.rip,
-                c.nxe,
-                &test_devices,
-            )?);
+            spaces[c.space] = Some(match &c.machine {
+                Some(m) => Tables::physical(
+                    &builder,
+                    ram_bytes,
+                    &d.spaces[c.space],
+                    m.windows.iter().copied(),
+                    &test_devices,
+                )?,
+                None => build(
+                    &mut builder,
+                    &d.spaces[c.space],
+                    c.rip,
+                    c.nxe,
+                    &test_devices,
+                )?,
+            });
         }
-        ends.push(stop_at(&d.spaces[c.space], c.rip)?);
+        // A machine section's ends are its `stop` items, answered by its hook.
+        ends.push(match c.machine {
+            Some(_) => None,
+            None => Some(stop_at(&d.spaces[c.space], c.rip)?),
+        });
     }
     let stop_at = ends;
     // The logging IDT's pages, after every space (the spaces' own pages keep their places): one set for the driver-built
     // spaces, the identity set for identity spaces.
     let mut log_gpa: Option<Vec<u64>> = None;
     for (k, t) in spaces.iter_mut().enumerate() {
-        let Some(t) = t else { continue };
+        let Some(t) = t.as_mut().filter(|t| !t.physical) else {
+            continue;
+        };
         let identity = d.spaces[k].identity;
         let base = log_base(identity);
         let pages = log_pages(n);
@@ -1825,11 +2048,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     }
     execution::guest_ram_written(backing.memory());
     for (v, c) in d.cpus.iter().enumerate() {
-        // 4-level paging; user mode, NX and WP on unless the section says otherwise.
+        // 4-level paging; user mode, NX and WP on unless the section says otherwise. A machine section: as it says.
         let bit = |on: bool, value: u64| if on { value } else { 0 };
-        execution::set_cpu(
-            backing.vcpu(v),
-            Cpu {
+        let driver_cpu = || Cpu {
                 gpr: c.gpr,
                 rip: c.rip,
                 rflags: c.rflags | 2 | if c.interrupts { 0x200 } else { 0 },
@@ -1881,7 +2102,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     limit: 0xfff,
                 },
                 mov_ss: 0,
-            },
+            };
+        execution::set_cpu(
+            backing.vcpu(v),
+            c.machine.as_ref().map_or_else(driver_cpu, |m| m.cpu(c)),
             false, // the program driver's slice tests never run the speculation barriers
         )?;
         execution::set_lapic(
@@ -1929,7 +2153,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             compiler.attach_pool(&backing);
             compiler.share(&answers);
         }
-        let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
+        // A machine section has no logging IDT: an empty handler range.
+        let handlers = match d.cpus[v].machine {
+            Some(_) => 0,
+            None => log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS,
+        };
         let mut requests = execution::Requests {
             devices: Some(registry.clone()),
             rips: Some(Default::default()),
@@ -1938,7 +2166,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let mut hook = ProgramHook {
             switches: d.cpus[v].switches.iter().copied().collect(),
             posts: d.cpus[v].posts.iter().copied().collect(),
-            handlers: handlers..handlers + 0x1000,
+            handlers: handlers..handlers + if handlers == 0 { 0 } else { 0x1000 },
+            stops: d.cpus[v]
+                .machine
+                .as_ref()
+                .map_or(vec![], |m| m.stops.clone()),
             doorbell: machine.doorbell(),
             forge_exit: false,
             signal_at: None,
@@ -1976,7 +2208,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             cpu,
             backing.vcpu(v),
             &mut compiler,
-            Some(stop_at[v]),
+            stop_at[v],
             watchdog,
             &mut requests,
             &stops,
@@ -2430,6 +2662,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             tampering,
             tamper_after.filter(|_| v == target),
         )?;
+        if let Some(m) = &d.cpus[v].machine {
+            result.machine = Some(machine_result(backing.vcpu(v), m, tables, &result));
+        }
         let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
         result.kicks = Some(kick_report(backing.vcpu(v), &stops));
         // With test devices, or once the vCPU made a device access (X3: its xAPIC page) or had one refused.
@@ -2658,6 +2893,9 @@ fn report(
     // A guest exception (resident: at an access site or stub; host: instruction fetch) with its record.
     let (kind, reason, fault) = match &ran.stop {
         Stop::Reached => ("reached", String::new(), [0; 4]),
+        Stop::Hooked(code) if code & STOPPED != 0 => {
+            ("reached", format!("stop {}", code & !STOPPED), [0; 4])
+        }
         Stop::FetchFault(Fault::Page { address, error }) => (
             "guest_fault",
             "fetch".into(),
@@ -2875,7 +3113,42 @@ fn report(
         delivered,
         kicks: None,
         mmio: None,
+        machine: None,
     })
+}
+/// A machine section's `machine` output (module doc): `interp_rig.fields()`'s names and widths.
+fn machine_result(area: Area, m: &MachineState, space: &Tables, result: &CpuResult) -> Value {
+    let s: State = area.read_record(exec::STATE_OFFSET);
+    let c = s.cpu;
+    let low = |v: u64| v & 0xffff_ffff;
+    let stop = result
+        .reason
+        .strip_prefix("stop ")
+        .filter(|_| result.stop == "reached")
+        .and_then(|id| id.parse::<u64>().ok());
+    let mut out = serde_json::Map::new();
+    out.insert("stop".into(), json!(stop));
+    for (i, r) in ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"].iter().enumerate() {
+        out.insert((*r).into(), json!(low(c.gpr[i])));
+    }
+    out.insert("eflags".into(), json!(low(c.rflags)));
+    for (i, r) in ["es", "cs", "ss", "ds", "fs", "gs"].iter().enumerate() {
+        out.insert((*r).into(), json!(c.seg[i].selector));
+    }
+    for (k, v) in [("cr0", c.cr0), ("cr3", c.cr3), ("cr4", c.cr4)] {
+        out.insert(k.into(), json!(low(v)));
+    }
+    out.insert("efer".into(), json!(c.efer));
+    out.insert("gdtr".into(), json!([c.gdtr.limit, low(c.gdtr.base)]));
+    out.insert("idtr".into(), json!([c.idtr.limit, low(c.idtr.base)]));
+    for (i, &(a, n)) in m.windows.iter().enumerate() {
+        let bytes = space.copy_out(a, n as usize);
+        out.insert(
+            format!("window{i}"),
+            json!(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        );
+    }
+    Value::Object(out)
 }
 
 /// One vCPU's result line (or `cpus` entry): its final state, its space's memory and A/D bits, and its counters; the
@@ -2922,6 +3195,9 @@ struct CpuResult {
     kicks: Option<Kicks>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mmio: Option<MmioState>,
+    /// A machine section's final state in `interp_rig.fields()`'s form (module doc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<Value>,
 }
 /// Guest bytes at `addr`, as lowercase hex.
 #[derive(Serialize)]
@@ -3319,6 +3595,67 @@ mod tests {
         (s.reply, s.fetch[1]) = (exec::REPLY_ADMITTED, 0x6000);
         assert!(tamper_next_page(area, &mut s) && s.reply == exec::REPLY_NEXT_PAGE); // second, after the walk
     }
+    /// A machine description (one of the interp cases' shape, R mode): the state as given over the power-on state, the
+    /// memory physical, the stops and windows; items of the driver's fixture refused.
+    #[test]
+    fn machine_descriptions_set_the_state_directly() {
+        let text = "machine\nmemory 0x10100 b8341200\nmemory 0x1000 0000000000000000\nrip 0x100\nrflags 0x46\n\
+                    gpr 1 2 3 4 0xfe0 6 7 8 0 0 0 0 0 0 0 0\ncr0 0x10\ncr4 0\nefer 0\n\
+                    seg es 0x3000 0x30000 0xffff 0x93\nseg cs 0x1000 0x10000 0xffff 0x9b\n\
+                    seg ss 0x6000 0x60000 0xffff 0x93\nseg ds 0x2000 0x20000 0xffff 0x93\n\
+                    seg fs 0x4000 0x40000 0xffff 0x93\nseg gs 0x5000 0x50000 0xffff 0x93\n\
+                    gdtr 0x1000 0x67\nidtr 0 0x3ff\nstop 0x10104\nstop 0x11000\nwindow 0x20100 0x40\n";
+        let d = parse(text).unwrap();
+        assert!(d.machine && !d.sections);
+        let (c, m) = (&d.cpus[0], d.cpus[0].machine.as_ref().unwrap());
+        assert_eq!(
+            d.spaces[0].memory,
+            [(0x10100, vec![0xb8, 0x34, 0x12, 0]), (0x1000, vec![0; 8])]
+        );
+        assert_eq!((m.stops.clone(), m.windows.clone()), (vec![0x10104, 0x11000], vec![(0x20100, 0x40)]));
+        let cpu = m.cpu(c);
+        assert_eq!((cpu.rip, cpu.rflags, cpu.cpl, cpu.gpr[4]), (0x100, 0x46, 0, 0xfe0));
+        assert_eq!((cpu.cr0, cpu.cr3, cpu.cr4, cpu.efer), (0x10, 0, 0, 0));
+        assert_eq!(
+            cpu.seg[exec::SREG_CS],
+            exec::Segment {
+                selector: 0x1000,
+                attributes: 0x9b,
+                limit: 0xffff,
+                base: 0x10000
+            }
+        );
+        assert_eq!(cpu.seg[exec::SREG_GS].base, 0x50000);
+        assert_eq!((cpu.gdtr.base, cpu.gdtr.limit, cpu.idtr.limit), (0x1000, 0x67, 0x3ff));
+        assert_eq!((cpu.ldtr, cpu.tr, cpu.dr), (exec::LDTR_RESET, exec::TR_RESET, exec::DR_RESET));
+        // An empty machine section is the power-on state (FCW but FNINIT's): the reset vector, EDX the signature.
+        let d = parse("machine\n").unwrap();
+        let cpu = d.cpus[0].machine.as_ref().unwrap().cpu(&d.cpus[0]);
+        let mut want = cpu;
+        natemu_abi::power_on::power_on(&mut want);
+        want.fcw = exec::FCW_INIT;
+        assert_eq!(cpu, want);
+        assert_eq!((cpu.rip, cpu.seg[exec::SREG_CS].base, cpu.gpr[2]), (0xfff0, 0xffff_0000, 0x306c3));
+        // Sections, each with its own state; the memory shared.
+        let d = parse("machine\nmemory 0x10000 90\ncpu\nrip 1\ncpu\nrip 2\ncr0 0x11\n").unwrap();
+        assert_eq!(d.cpus.iter().map(|c| (c.rip, c.space)).collect::<Vec<_>>(), [(1, 0), (2, 0)]);
+        assert_eq!(d.cpus[1].machine.as_ref().unwrap().cr0, 0x11);
+        for bad in [
+            "machine\ncode 90",
+            "machine\nbody 0x1000 90",
+            "machine\nregion 0x1000 0x1000",
+            "machine\nidentity",
+            "machine\nif 0",
+            "machine\nwp 0",
+            "machine\nseg xs 0 0 0 0",
+            "machine\nseg cs 0x10000 0 0 0",
+            "machine\nseg cs 0 0 0x100000000 0",
+            "machine\nwindow 0x1000 0",
+            "machine\ncr0 0x11\ncpu\nrip 0",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
     #[test]
     fn cpu_sections_share_the_preamble_space_or_own_one() {
         let d = parse("body 0x1000 90c3\nmemory 0x5000 01\ncpu\nrip 0x1001\ncpu\nrip 0x2000\ncode 90\ncpu\nrip 0x1000\n").unwrap();
@@ -3523,6 +3860,7 @@ mod json_tests {
                 status: "device",
                 address: address.map(Hex),
             }),
+            machine: None,
         }
     }
     /// The former `report` + `kick_report` + mmio line for `r`.
