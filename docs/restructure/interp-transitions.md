@@ -30,7 +30,7 @@ the interpreter from 64-bit kernel code (`refuse_compatibility`'s CPL-0 arm).
 | far RET 16/32, imm16, protected mode (the core has checked and read both slots) | null #GP(0); table limit; not code, or LMA and L = D = 1 #GP(sel); RPL < CPL, DPL #GP(sel); P #NP(sel); RPL > CPL: `interp_unsupported` OUTER; offset past the limit #GP(0); the accessed bit | ESP (or SP, by SS.B) released, CS, EIP |
 | MOV Sreg, protected mode | null: SS #GP(0), else the unusable segment (FS/GS base 0); table limit; `load_data`'s type, DPL/RPL and P rules (#GP/#SS/#NP(sel)); the accessed bit | the segment, EIP; no MOV SS shadow |
 | MOV CR0 | value & CR0_VALID \| ET; PG without PE, NW without CD #GP(0); PG 0 -> 1: without EFER.LME `interp_mode` PAGING (legacy or PAE paging); without CR4.PAE, with CS.L = 1 or a 16-bit TSS in TR #GP(0), else LMA := 1; PG 1 -> 0: LMA := 0 (64-bit mode never interprets) | CR0, EFER |
-| MOV CR4 | a bit the CPU profile does not support (`CR4_VALID`: MCE, LA57, PCIDE, SMAP among them) #GP(0); PAE changed while LMA = 1 #GP(0) | CR4 |
+| MOV CR4 | a bit the CPU profile does not support (`CR4_VALID`: LA57, PCIDE, SMAP among them; MCE is valid without CPUID's MCE, a recorded deviation) #GP(0); PAE changed while LMA = 1 #GP(0) | CR4 |
 | MOV CR3, CR2 | (none for a 32-bit value) | CR3 with `stack_traps` 0 and `x87::address_space`; CR2 |
 | HLT | (CPL 0 only) | EIP past it, then `events::park`: an INIT wakes it (the next boundary takes it), an NMI or an enabled interrupt wakes it for `interp_event`, a SIPI changes nothing |
 
@@ -87,10 +87,11 @@ the INIT-before-TF order and the HLT wakes deterministically; machine descriptio
 
 - abi unit tests (`natemu_abi::interp::system::tests`): table entries, far JMP and far RET targets, segment loads, MOV
   CR0/CR4, against the models' outcomes.
-- `tests/interp` case `natemu`: all 1,716 corpus cases match their locked answers (`natemu-pending.txt` removed). Two
-  cases were changed: `R-mov_cr4,_r32-02` and `P32-mov_cr4,_r32-02` wrote CR4 = 750H, whose MCE bit natemu's CPU
-  profile does not advertise (#GP(0) where QEMU's and KVM's CPU models load it); they write 710H, and their answers were
-  seeded again on QEMU and on the x86 reference machine's KVM and locked.
+- `tests/interp` case `natemu`: all 1,716 corpus cases match their locked answers (`natemu-pending.txt` removed).
+  `R-mov_cr4,_r32-02` and `P32-mov_cr4,_r32-02` write CR4 = 750H, whose MCE bit natemu's CPU profile does not advertise:
+  for a while they wrote 710H (#GP(0) in natemu, where QEMU's and KVM's CPU models load it); since CR4.MCE is accepted
+  (a recorded deviation, `cpu_profile.json` `control.cr4.bits.MCE`) they write 750H again, judged by their original
+  answers. In 64-bit kernel code, `tests/smp` `sys-cr4-mce` (MCE set and cleared, read back, against QEMU).
 - `tests/interp` case `natemu-faults` (`interp_faults.py`): 306 segment cases, `segment_model`'s far JMP (ptr16:16,
   ptr16:32, m16:32), far RET (16, 32, imm16) and MOV Sreg in R, P16, P32 and C32 over a GDT covering every check (busy
   32- and 16-bit TSSs among them; with not-present operand, stack and descriptor pages and a read-only GDT page under

@@ -3,8 +3,8 @@
 Status (November 22, 2026, branch `boot-interp`): the inputs are built by the framework from pinned upstream sources,
 both run on the references (the pinned QEMU 11.1.2 under TCG, and real hardware through KVM on the x86 reference
 machine) and their answers are locked. kvm-unit-tests runs in natemu (case `kut-natemu`); OVMF runs in the firmware boot mode ([firmware-mode.md](firmware-mode.md),
-case `ovmf-natemu`): `main32` to SEC's entry with KVM's registers, `reset` to its MOV CR4 640H, refused because natemu's CPU
-presents no MCE (the known bug `ovmf-reset-cr4-mce`), of the [boot-time interpreter plan](m2-boot-interpreter-plan.md). This page is the contract those
+case `ovmf-natemu`): `main32` and `reset` to SEC's entry with KVM's registers (`reset` through its MOV CR4 640H: natemu
+accepts CR4.MCE without presenting MCE, a recorded deviation), of the [boot-time interpreter plan](m2-boot-interpreter-plan.md). This page is the contract those
 cases build to.
 
 ## The pieces
