@@ -2086,32 +2086,41 @@ impl Answer {
         }
     }
 }
-/// The number of fexc's gating arguments (`FEXC_ARG_*`: the bits of its `args_read`), the x87 guess last.
-const FEXC_ARGS: usize = 16;
-/// The values kept answers are matched by ([`Compiler::gating`]): fexc's gating arguments, each compared where the compile
-/// read it, then [`MODE`].
-pub(crate) const GATING: usize = FEXC_ARGS + 1;
-/// The index (and `Entry::read` bit) of the request's code mode among the gating values: what fexc reads of a request
-/// without reporting it in `args_read`, so always compared ([`mode_read`]).
-const MODE: usize = FEXC_ARGS;
-/// fexc's `args_read` as a kept answer's `read`: with [`MODE`]. An argument beyond the ones answers are matched by is an
-/// error: an answer that read it would be served to a request with another value of it (M2 task 4's review: the x87
-/// guess, then outside the key).
-fn mode_read(args_read: u32) -> Result<u32> {
-    if args_read >> FEXC_ARGS != 0 {
-        return Err(format!("fexc read an argument beyond the ones kept answers are matched by ({args_read:#x})").into());
+/// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]): the low bits of its `args_read`. The next
+/// bit is the x87 guess's, which is not one of them: 32-bit code's answers carry it in their tagged RIP ([`tag32`]).
+pub(crate) const GATING: usize = 15;
+/// M2 reuse: the kept answers' RIP of 32-bit code, tagged in its upper half, which a 32-bit address leaves free, with
+/// everything of the request that 64-bit code has not: bit 62 (32-bit code; with bit 63 clear, so no canonical address:
+/// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35) and the x87
+/// guess (from bit 36; 13 bits). The answers table alone sees it ([`Answers::find`], [`Answers::insert`], an entry's
+/// fingerprint): an answer of another tag is under another key, never a hit; every address use (relocation's distance,
+/// admission, fexc's request, the persistent cache's key, the pool) has the plain RIP.
+const TAG32: u64 = 1 << 62;
+fn tag32(null_segments: [bool; 4], x87_guess: u64) -> Result<u64> {
+    if x87_guess >> 13 != 0 {
+        return Err(format!("x87 guess {x87_guess:#x}: more than 13 bits").into());
     }
-    Ok(args_read | 1 << MODE)
+    let null = null_segments.iter().enumerate().fold(0, |m, (i, &null)| m | u64::from(null) << i);
+    Ok(TAG32 | x87_guess << 36 | null << 32)
+}
+/// A tagged RIP ([`tag32`]): no canonical address has bit 62 set and bit 63 clear.
+fn tagged(at: u64) -> bool {
+    at >> 62 == 1
+}
+/// The address of a kept answer's RIP, tagged or not.
+fn untagged(at: u64) -> u64 {
+    if tagged(at) { at & 0xffff_ffff } else { at }
 }
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
-/// ([`Universal`]); no limit is `1 << 32`.
+/// ([`Universal`]); no limit is `1 << 32`. `at`: the RIP as the table holds it, 32-bit code's tagged ([`tag32`]): the tag
+/// is part of the key with the page offset.
 type Key = (u64, u64, u64);
 const LEAD: usize = 4;
-fn key(limit: Option<u32>, rip: u64, lead: &[u8]) -> Key {
+fn key(limit: Option<u32>, at: u64, lead: &[u8]) -> Key {
     (
         limit.map_or(1 << 32, u64::from),
-        rip & (1 << 63 | 0xfff),
+        at & if tagged(at) { !0xffff_f000 } else { 1 << 63 | 0xfff },
         lead.iter()
             .fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)),
     )
@@ -2177,6 +2186,8 @@ const SHARDS: usize = 16;
 /// from the map between a lookup and its use, which keeps its own reference.
 struct Entry {
     rip: u64,
+    /// The tag of `rip` in the answers table ([`tag32`]; 0: 64-bit code).
+    tag: u64,
     owner: u8,
     read: u32,
     gating: [u64; GATING],
@@ -2238,7 +2249,7 @@ impl Entry {
     /// PIC study: what makes it the same answer (its key with `limit`, gating values read, bytes read), hashed: a later
     /// compile with this fingerprint is one of an answer the map dropped.
     fn fingerprint(&self, limit: Option<u32>) -> u64 {
-        let k = key(limit, self.rip, &self.prefix[..LEAD.min(self.prefix.len())]);
+        let k = key(limit, self.rip | self.tag, &self.prefix[..LEAD.min(self.prefix.len())]);
         let read: Vec<u64> = (0..GATING)
             .filter(|&i| self.read & 1 << i != 0)
             .map(|i| self.gating[i])
@@ -2280,19 +2291,21 @@ struct Shard {
     cached_bytes: usize,
 }
 impl Shard {
-    /// The kept answer matching `bytes` at `rip` (generation, key, index), from either generation: one kept for `rip`
+    /// The kept answer matching `bytes` at `at` (generation, key, index), from either generation: one kept for that RIP
     /// itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
-    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once.
+    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once. (`at`: tagged for 32-bit code; a bucket's
+    /// entries have its key's tag.)
     fn find(
         &self,
         bytes: &[u8],
-        rip: u64,
+        at: u64,
         limit: Option<u32>,
         gating: &[u64; GATING],
     ) -> Option<(bool, Key, usize)> {
         let mut other = None;
+        let rip = untagged(at);
         for n in (0..=LEAD.min(bytes.len())).rev() {
-            let key = key(limit, rip, &bytes[..n]);
+            let key = key(limit, at, &bytes[..n]);
             for newer in [true, false] {
                 let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else {
                     continue;
@@ -2349,7 +2362,7 @@ impl Shard {
         }
         let key = key(
             limit,
-            entry.rip,
+            entry.rip | entry.tag,
             &entry.prefix[..LEAD.min(entry.prefix.len())],
         );
         self.cached_bytes += entry.size();
@@ -2399,7 +2412,8 @@ impl Answers {
             }
         }
     }
-    /// The kept answer matching `bytes` at `rip` ([`Shard::find`]; an older one moves to the newer generation).
+    /// The kept answer matching `bytes` at `rip` ([`Shard::find`]; an older one moves to the newer generation). `rip`, here
+    /// and in [`Answers::insert`]: as [`Compiler::at`] gives it (32-bit code's tagged).
     fn find(
         &self,
         bytes: &[u8],
@@ -2851,10 +2865,9 @@ impl Compiler {
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
     /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, (perf chunk 26) bulk REP STOS, and
-    /// (AFP fallback chunk 3a) DAZ and effective FTZ, (AFP accurate plan chunk 1) accurate mode, `--push-run`, and (M2 task
-    /// 4) the x87 guess as [`Compiler::body_with`] sends it; then [`MODE`]: 32-bit code and its null FS, GS, DS and ES
-    /// (`--bitness 32`, `--fs-null` .. `--es-null`). With the block limit, the RIP's half and page offset, the bytes read
-    /// (the key) and the features (one map per feature set) that is every part of a request ([`Compiler::body_with`]).
+    /// (AFP fallback chunk 3a) DAZ and effective FTZ, (AFP accurate plan chunk 1) accurate mode, and `--push-run`. With the
+    /// block limit, the RIP's half and page offset, the bytes read (the key), the features (one map per feature set) and
+    /// 32-bit code's tag ([`Compiler::at`]) that is every part of a request ([`Compiler::body_with`]).
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -2882,13 +2895,33 @@ impl Compiler {
             flag("--ftz"),
             flag("--accurate"),
             self.push_run.into(),
-            if self.bits32 { self.x87_guess } else { 0 },
-            if self.bits32 {
-                self.null_segments.iter().enumerate().fold(1, |m, (i, &null)| m | u64::from(null) << (i + 1))
-            } else {
-                0
-            },
         ]
+    }
+    /// `rip` as the answers table holds it: 32-bit code's with the request's null segments and x87 guess, as
+    /// [`Compiler::body_with`] sends them ([`tag32`]).
+    fn at(&self, rip: u64) -> Result<u64> {
+        if !self.bits32 {
+            // (No such RIP is compiled: fexc refuses a non-canonical one.)
+            return if tagged(rip) { Err(format!("RIP {rip:#x} is not canonical").into()) } else { Ok(rip) };
+        }
+        if rip >> 32 != 0 {
+            return Err(format!("32-bit code at {rip:#x}").into());
+        }
+        Ok(rip | tag32(self.null_segments, self.x87_guess)?)
+    }
+    /// fexc's `args_read` as a kept answer's `read`: its gating arguments. The x87 guess's bit is dropped for 32-bit code,
+    /// whose tag holds the guess whether read or not. Any other argument is an error, and the guess for 64-bit code,
+    /// which is sent none: an answer that read it would be served to a request with another value of it (M2 task 4's
+    /// review: the guess, then outside the key).
+    fn keyed_read(&self, args_read: u32) -> Result<u32> {
+        if args_read >> (GATING + usize::from(self.bits32)) != 0 {
+            return Err(format!(
+                "fexc read an argument kept answers are not matched by ({args_read:#x}, {}-bit code)",
+                if self.bits32 { 32 } else { 64 }
+            )
+            .into());
+        }
+        Ok(args_read & ((1 << GATING) - 1))
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
@@ -2901,12 +2934,13 @@ impl Compiler {
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
-        let (found, waited) = self.answers.find(bytes, rip, limit, &gating);
+        let at = self.at(rip)?;
+        let (found, waited) = self.answers.find(bytes, at, limit, &gating);
         self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
             if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
-                if self.pool.is_some() && !self.bits32 {
+                if self.pool.is_some() {
                     self.last = Some(e.clone());
                 }
                 self.hits += 1;
@@ -2924,26 +2958,27 @@ impl Compiler {
         let mut disk = found.is_none();
         loop {
             let (compiles, disk_hits) = (self.compiles, self.disk_hits);
-            let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
+            let (reply, from) = self.ask(bytes, rip, limit, disk, hook)?;
             let disk_hit = self.disk_hits > disk_hits;
             let t = self.stamp();
             let (whole, end) = (
                 reply.extent as usize >= bytes.len(),
                 bytes.len().min(reply.extent as usize),
             );
-            let (read, prefix) = (mode_read(reply.read)?, bytes[..end].to_vec());
+            let (read, prefix) = (self.keyed_read(reply.read)?, bytes[..end].to_vec());
             let entry = Arc::new(Entry {
-                rip: at,
+                rip: from,
+                tag: at ^ rip,
                 owner: self.vcpu,
                 read,
                 gating,
                 prefix,
                 whole,
-                answer: Answer::new(reply, at)?,
+                answer: Answer::new(reply, from)?,
                 kept: Default::default(),
                 published: AtomicU64::new(0),
             });
-            let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
+            let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, at);
             self.waited(waited);
             // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
             if disk && self.compiles > compiles && held.is_some_and(|o| o != self.vcpu) {
@@ -3139,7 +3174,7 @@ impl Compiler {
         }
         self.reuse_checks += 1;
         let fresh = (
-            mode_read(reply.read)?,
+            self.keyed_read(reply.read)?,
             reply.extent as usize >= bytes.len(),
             bytes.len().min(reply.extent as usize),
         );
@@ -4341,9 +4376,7 @@ fn translation(
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
         compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
-        // (The pool holds 64-bit code only, [`Compiler::publish`]'s `template`: 32-bit code's requests of one context differ
-        // in the x87 guess.)
-        if !step && !compiler.bits32 {
+        if !step {
             compiler.note_gating(state.cpu.code_context())?;
         }
         let code = compiler.compile(&bytes, rip, step, hook)?;
@@ -4847,6 +4880,7 @@ mod tests {
         fn kept_entry(prefix: usize) -> Entry {
             Entry {
                 rip: A.1,
+                tag: 0,
                 owner: 0,
                 read: 0,
                 gating: [0; GATING],
@@ -4969,6 +5003,7 @@ mod tests {
             let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
             let f = Entry {
                 rip: honest.rip,
+                tag: 0,
                 owner: 0,
                 read: honest.read,
                 gating: honest.gating,
@@ -5040,6 +5075,7 @@ mod tests {
     fn entry(rip: u64, owner: u8, prefix: &[u8], read: u32, gating: [u64; GATING]) -> Arc<Entry> {
         Arc::new(Entry {
             rip,
+            tag: 0,
             owner,
             read,
             gating,
@@ -5078,6 +5114,28 @@ mod tests {
     /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
     /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
     /// answer kept for the requested RIP comes first.
+    #[test]
+    fn answers_of_another_tag_are_never_found() {
+        // M2 reuse: the same bytes at the same address (and at another of its page offset) under 64-bit code, 32-bit code,
+        // a null segment and an x87 guess are four entries; each is found only under its own tag, at any of its RIPs.
+        let a = Answers::new(u64::MAX);
+        let g = [0; GATING];
+        let tags = [0, tag32([false; 4], 0).unwrap(), tag32([false, false, true, false], 0).unwrap(), tag32([false; 4], 0x1000).unwrap()];
+        for (owner, &tag) in tags.iter().enumerate() {
+            assert_eq!(a.find(&[1, 2, 3], 0x40_1100 | tag, None, &g).0.map(|e| e.owner), None);
+            let e = Entry { tag, ..Arc::into_inner(entry(0x40_1100, owner as u8, &[1, 2, 3], 0, g)).unwrap() };
+            a.insert(None, Arc::new(e), &[1, 2, 3], 0x40_1100 | tag);
+        }
+        for (owner, &tag) in tags.iter().enumerate() {
+            for rip in [0x40_1100, 0x5655_5100] {
+                let found = a.find(&[1, 2, 3], rip | tag, None, &g).0.unwrap();
+                assert_eq!((found.owner, found.rip, found.tag), (owner as u8, 0x40_1100, tag));
+            }
+        }
+        assert!(tags[1..].iter().all(|&t| tagged(t | 0xffff_ffff) && !exec::canonical(t) && untagged(t | 0x1234) == 0x1234));
+        assert!(!tagged(0x7fff_ffff_f000) && !tagged(0xffff_8000_0000_0000) && tag32([false; 4], 0x2000).is_err());
+    }
+
     #[test]
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
@@ -5428,8 +5486,7 @@ mod tests {
         insns(&mut c, &fwd, 0x5655_5340);
         insns(&mut c, &fwd, 0xffff_f340); // the target wraps past 4 GiB
         assert_eq!(c.relocation_refused, refused + 3);
-        // The null segments and the x87 guess are the answer's: another value is another answer where fexc read it (the
-        // guess: in x87 code only).
+        // The null segments and the x87 guess are the answer's: another value is another answer.
         let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret
         let same = |c: &mut super::Compiler, code: &[u8], rip| {
             let n = c.compiles;
@@ -5438,7 +5495,7 @@ mod tests {
         };
         c.x87_guess = 0x1000;
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
-        assert!(same(&mut c, &code, 0x4000), "no x87: the guess is not read");
+        assert!(!same(&mut c, &code, 0x4000) && same(&mut c, &code, 0x5000), "the guess is the answer's tag, read or not");
         c.x87_guess = 0x1701;
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
         c.x87_guess = 0;
@@ -5448,8 +5505,23 @@ mod tests {
         c.null_segments = [true, false, false, false];
         assert!(!same(&mut c, &fld, 0x5655_5800) && !same(&mut c, &code, 0x4000));
         c.null_segments = [false; 4];
-        c.x87_guess = 0;
         assert!(same(&mut c, &code, 0x4000));
+        c.x87_guess = 0;
+        // The tag is the table's alone: an entry's RIP is its address, and no tagged RIP is a canonical one.
+        let at = c.at(0x5655_5340).unwrap();
+        assert!(super::tagged(at) && !exec::canonical(at) && super::untagged(at) == 0x5655_5340);
+        assert_eq!(at, 0x4000_0000_5655_5340);
+        c.null_segments = [true, false, false, true];
+        c.x87_guess = 0x17ff;
+        assert_eq!(c.at(0xffff_ffff).unwrap(), 0x4001_7ff9_ffff_ffff);
+        assert!(c.at(1 << 32).is_err());
+        (c.null_segments, c.x87_guess, c.bits32) = ([false; 4], 0, false);
+        assert_eq!(c.at(0x40_0000).unwrap(), 0x40_0000);
+        assert!(c.at(at).is_err() && c.at(0xffff_8000_0000_0000).is_ok());
+        // An argument beyond the key: the guess is 32-bit code's (in its tag), nothing above it is anyone's.
+        assert_eq!((c.keyed_read(0x7fff), c.keyed_read(0x8000).is_err(), c.keyed_read(0x1_0000).is_err()), (Ok(0x7fff), true, true));
+        c.bits32 = true;
+        assert_eq!((c.keyed_read(0x8081), c.keyed_read(0x1_0000).is_err()), (Ok(0x81), true));
         c.check_reuse = false;
         // M2 task 3a: system cuts are decoded in 32-bit mode (40 is INC EAX before the INT, not a REX prefix), and an
         // access through a null FS or GS is the #GP cut; the other segment's, and 64-bit code's, are translated.
