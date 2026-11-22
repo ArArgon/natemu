@@ -536,6 +536,9 @@ fn event_word(memory: &Memory, v: usize, field: usize) -> &AtomicU64 {
 }
 /// `post` value of an NMI (else an interrupt vector, 0..=255).
 pub const NMI: u64 = 256;
+/// `post` value of an INIT (M2 Part 2; test drivers' event sources): sent as a peer's APIC sends it
+/// (`natemu_abi::lapic::startup::init_sent`).
+pub const INIT: u64 = 257;
 /// Posts `event` (a vector, or [`NMI`]) into vCPU `v`'s event record (X2); the caller then rings its doorbell, which makes
 /// it stop precisely and take the event when it is eligible. L4a: `level`, a level-triggered interrupt: its TMR bit is
 /// set (else cleared) before the IRR bit, as the LAPIC accepts it (SDM Vol.3 11.8.4), so its EOI is broadcast. Returns
@@ -544,7 +547,7 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
     // X3: as from a peer's APIC: an NMI needs the target's APIC hardware enabled, an interrupt also software enabled
     // (SDM Vol.3 11.4.7.2); otherwise the message is not accepted.
     let apic = event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst);
-    let needs = if event == NMI {
+    let needs = if event == NMI || event == INIT {
         natemu_abi::lapic::HW_ENABLED
     } else {
         natemu_abi::lapic::SW_ENABLED
@@ -557,6 +560,13 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
         NMI => {
             event_word(memory, v, std::mem::offset_of!(cache::Events, pending))
                 .fetch_or(cache::pending::NMI, SeqCst);
+        }
+        INIT => {
+            let _ = event_word(memory, v, std::mem::offset_of!(cache::Events, pending)).fetch_update(
+                SeqCst,
+                SeqCst,
+                |w| Some(natemu_abi::lapic::startup::init_sent(w)),
+            );
         }
         _ => {
             let w = 8 * (event as usize / 64 % 4);
@@ -4383,6 +4393,9 @@ fn serve(
                 } else {
                     match hook.at(area, linear)? {
                         Some(At::Stop(code)) => Some(Stop::Hooked(code)),
+                        // (A test driver's event source posted its event: the instruction there runs as itself.)
+                        #[cfg(feature = "testing")]
+                        Some(At::System(i)) if i.kind == exec::system::EVENT_HOOK => None,
                         #[cfg(feature = "testing")]
                         Some(At::System(_)) => {
                             return Err(format!("a test hook's system answer at {linear:#x}, in interpreted code").into());

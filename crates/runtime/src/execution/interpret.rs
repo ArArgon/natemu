@@ -11,10 +11,13 @@
 //! [`run`] executes one instruction per pass, after `find`'s boundary prologue: the record at CS.base + EIP (the host's
 //! decode, `natemu_abi::interp`, cached by linear address and [`interpreted_key`] and validated by its bytes at every
 //! execution, [`cache::place_interpreted`]) through the abi's executor core (`natemu_abi::interp::exec`) over [`Mem`], the
-//! memory layers; CPUID, RDMSR, WRMSR and WBINVD through the system transactions, LGDT, LIDT and MOV from CR here. What it
-//! does not run is a typed stop (`stop::INTERP_FAULT` ..), precise, with nothing committed: exceptions (interpreted modes
-//! deliver none), events, TF and breakpoints, device pages, the forms outside the first version and the resident
-//! operations not built yet (protected-mode far transfers and segment loads, MOV to CR, HLT).
+//! memory layers; CPUID, RDMSR, WRMSR and WBINVD through the system transactions, LGDT, LIDT and MOV from CR here, and
+//! the protected-mode far transfers and segment loads, MOV to CR0/CR3/CR4 with the mode transitions and HLT in
+//! [`transitions`] (docs/restructure/interp-transitions.md). A far transfer that loads a 64-bit CS with IA-32e mode active
+//! leaves interpreted state: [`run`] then returns to the translator. What it does not run is a typed stop
+//! (`stop::INTERP_FAULT` ..), precise, with nothing committed: exceptions (interpreted modes deliver none), events, TF and
+//! breakpoints, device pages, the forms outside the first version, gates, task switches and privilege changes, legacy and
+//! PAE paging.
 use super::*;
 use core::ptr::{addr_of, addr_of_mut};
 use natemu_abi::execution::stop::interp as detail;
@@ -24,6 +27,8 @@ use natemu_abi::interp::{
     exec::{self, Exit, Memory, Outcome, Resident},
     op,
 };
+
+mod transitions;
 
 /// [`ends_in_mode`]'s arms where [`controls`] halts with `reason`: a state the interpreter runs is recorded for the next
 /// boundary; any other halts as [`controls`] does (`unsupported_mode` for the paging mode or CPL, `unsupported_code_mode`
@@ -47,6 +52,39 @@ pub(super) fn boundary(s: &mut State) -> bool {
     s.debug &= !debug::INTERPRET;
     if s.cpu.interpreted_mode().is_some() {
         run(s);
+    }
+    true
+}
+
+/// `segments::refuse_compatibility`'s CPL-0 arm (plan section 5, B4): a far JMP, CALL or RET of 64-bit kernel code whose
+/// target is not 64-bit code, checked before any effect. A compatibility-mode code segment (L = 0) at CPL 0 is the
+/// interpreter's: this returns, the transfer completes in `far_transfer`/`far_return`, and its commit records the state
+/// for the next boundary ([`record`], through `ends_in_mode`). Anything else halts `unsupported_code_mode` as the arm did
+/// (the record naming the CS it would have loaded): L = D = 1 (reserved in IA-32e mode), a return to CPL 1 or 2, and any
+/// IRET (an IRET into compatibility mode may load a null SS, which x86 refuses with #GP(0) and the 64-bit IRET does not
+/// check: no known code makes one). Out of line and cold, so the 64-bit far transfers keep only a call in that arm.
+#[cold]
+#[inline(never)]
+pub(super) fn kernel_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) {
+    let mut t = *s;
+    if cpl != 0 || raw >> 53 & 1 != 0 || iret_at(&mut t) {
+        t.cpu.seg[SREG_CS] = Segment::loaded(selector, raw);
+        halt(&t, stop::UNSUPPORTED_CODE_MODE)
+    }
+}
+/// Whether the instruction at RIP (64-bit code at CPL 0, the transaction's: its fetch has succeeded) is an IRET: CFH after
+/// its prefixes (legacy and REX). A byte that cannot be read is taken as one (the halt).
+fn iret_at(t: &mut State) -> bool {
+    for k in 0..15 {
+        let va = t.cpu.rip.wrapping_add(k);
+        let Some(p) = fetch_walk(t, va).ok().and_then(|(page, _)| guest_ram().range(page | va & 4095, 1)) else {
+            return true;
+        };
+        // SAFETY: a guest RAM byte in the resident's alias.
+        match unsafe { p.read_volatile() } {
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3 | 0x40..=0x4f => {}
+            opcode => return opcode == 0xcf,
+        }
     }
     true
 }
@@ -123,7 +161,7 @@ fn pass(s: &mut State, at: &mut At) -> Result<(), Stop> {
     events(s)?;
     let paging = walks(s)?;
     let Some(key) = interpreted_key(&s.cpu) else {
-        halt(s, stop::BAD_REPLY)
+        halt(s, stop::INTERP_BUG)
     };
     let linear = (s.cpu.seg[SREG_CS].base as u32).wrapping_add(s.cpu.rip as u32);
     let i = match cache::interpreted_at(u64::from(linear), key).map(|b| cache::interpreted_of(b)) {
@@ -139,8 +177,13 @@ fn pass(s: &mut State, at: &mut At) -> Result<(), Stop> {
 }
 
 /// A pending trap-class #DB, RFLAGS.TF or an armed breakpoint (DR7): the interpreter delivers no #DB and checks no
-/// breakpoint, so each is a typed stop (plan section 5). (Not [`debug::INTERPRET`], which [`boundary`] cleared.)
+/// breakpoint, so each is a typed stop (plan section 5). (Not [`debug::INTERPRET`], which [`boundary`] cleared.) A pending
+/// INIT comes first (SDM Vol.3 Table 7-2: class 3, before traps and breakpoints, as `find`'s `trap_due` leaves it):
+/// [`events`] takes it, and its state has neither TF nor a breakpoint.
 fn debugging(s: &State) -> Result<(), Stop> {
+    if startup::init_pending(s) {
+        return Ok(());
+    }
     let trap = s.debug & debug::TRAP & !debug::INTERPRET;
     let (d, value) = if trap != 0 {
         (detail::TRAP, trap)
@@ -257,7 +300,7 @@ fn fetch(
             .min((limit - offset + 1).min(4096) as usize);
         let page = fetch_page(s, paging, u64::from(linear)).map_err(|why| (done, why))?;
         let Some(p) = guest_ram().range(page | u64::from(linear & 4095), n as u64) else {
-            halt(s, stop::BAD_REPLY)
+            halt(s, stop::INTERP_BUG)
         };
         // SAFETY: `p` is `n` bytes of guest RAM in the resident's alias; `out` holds them.
         unsafe { guest_memory::copy_volatile(out[done..].as_mut_ptr(), p, n) };
@@ -419,27 +462,29 @@ fn execute(s: &mut State, paging: Option<paging::Control>, i: &Insn) -> Result<(
             s.cpu.rflags &= !RFLAGS_RF; // the instruction completed
             Ok(())
         }
-        Ok(Outcome::Resident(r)) => resident(s, i, r),
-        Err(Exit::Fault {
+        Ok(Outcome::Resident(r)) => resident(s, paging, i, r),
+        Err(e) => Err(exited(e, stopped)),
+    }
+}
+/// The typed stop of a core or memory exit; `stopped` is the memory layer's [`Mem::stopped`] (a memory stop's address).
+fn exited(e: Exit, stopped: [u64; 2]) -> Stop {
+    match e {
+        Exit::Fault {
             vector,
             error,
             address,
-        }) => Err(Stop::exception(
-            u64::from(vector),
-            u64::from(error),
-            u64::from(address),
-        )),
-        Err(Exit::Unsupported) => Err(Stop::unsupported(0)),
-        Err(Exit::Stop(d)) => Err(Stop::memory(u64::from(d), stopped[0], stopped[1])),
+        } => Stop::exception(u64::from(vector), u64::from(error), u64::from(address)),
+        Exit::Unsupported => Stop::unsupported(0),
+        Exit::Stop(d) => Stop::memory(u64::from(d), stopped[0], stopped[1]),
     }
 }
 
 /// A resident operation the core returned with its operands read and checked (CPL 0: [`walks`]). CPUID, RDMSR, WRMSR and
 /// WBINVD through the system transaction (its commit moves EIP past the instruction, wrapping at 32 bits as the core
 /// does, and records the interpreted state, [`ends_in_mode`], which goes: this is the interpreter); an exception it raises
-/// is a typed stop, nothing committed. The rest are not built yet (the next step's: far transfers and segment loads in
-/// protected mode, MOV to CR and the transitions, HLT).
-fn resident(s: &mut State, i: &Insn, r: Resident) -> Result<(), Stop> {
+/// is a typed stop, nothing committed. Far transfers and segment loads in protected mode, MOV to CR and HLT: the
+/// interpreter's own ([`transitions`]).
+fn resident(s: &mut State, paging: Option<paging::Control>, i: &Insn, r: Resident) -> Result<(), Stop> {
     let kind = match r {
         Resident::LoadTable { idt, base, limit } => {
             let table = Table {
@@ -465,11 +510,19 @@ fn resident(s: &mut State, i: &Insn, r: Resident) -> Result<(), Stop> {
         Resident::Rdmsr => system::RDMSR,
         Resident::Wrmsr => system::WRMSR,
         Resident::Wbinvd => system::WBINVD,
-        Resident::FarJump { .. } => return Err(Stop::unsupported(detail::FAR_JUMP)),
-        Resident::FarReturn { .. } => return Err(Stop::unsupported(detail::FAR_RETURN)),
-        Resident::LoadSegment { .. } => return Err(Stop::unsupported(detail::LOAD_SEGMENT)),
-        Resident::MovToCr { .. } => return Err(Stop::unsupported(detail::MOV_TO_CR)),
-        Resident::Hlt => return Err(Stop::unsupported(detail::HLT)),
+        Resident::FarJump { selector, offset } => {
+            return transitions::far_jump(s, paging, selector, offset);
+        }
+        Resident::FarReturn {
+            selector,
+            offset,
+            release,
+        } => return transitions::far_return(s, paging, selector, offset, release),
+        Resident::LoadSegment { sreg, selector } => {
+            return transitions::load_segment(s, paging, i, sreg, selector);
+        }
+        Resident::MovToCr { cr, value } => return transitions::mov_to_cr(s, i, cr, value),
+        Resident::Hlt => return Ok(transitions::hlt(s, i)),
     };
     let done = transaction(
         s,
@@ -525,14 +578,14 @@ impl Mem<'_> {
         let p = u64::from(linear & !4095);
         match self.pages[..self.count].iter().find(|e| e[0] == p) {
             Some(e) => (e[1] & !1, e[1] & 1 != 0),
-            None => halt(self.s, stop::BAD_REPLY), // an access no check covered: an interpreter bug
+            None => halt(self.s, stop::INTERP_BUG), // an access no check covered
         }
     }
     /// The resident's pointer to `n` bytes of guest RAM at `gpa`.
     fn pointer(&self, gpa: u64, n: u8) -> *mut u8 {
         match guest_ram().range(gpa, u64::from(n)) {
             Some(p) => p,
-            None => halt(self.s, stop::BAD_REPLY),
+            None => halt(self.s, stop::INTERP_BUG), // a RAM page whose bytes are not: a classification bug
         }
     }
     /// One Arm access suffices: `size` bytes at `linear` lie inside one 16-byte block (so inside a page).
@@ -605,7 +658,7 @@ impl Memory for Mem<'_> {
             }
             gpa[k] = page;
             if self.count == self.pages.len() {
-                halt(self.s, stop::BAD_REPLY)
+                halt(self.s, stop::INTERP_BUG)
             }
             self.pages[self.count] = [va & !4095, page | u64::from(ram)];
             self.count += 1;

@@ -162,11 +162,9 @@ fn interpreted(s: &State) -> Option<String> {
     let what = match s.stop {
         stop::INTERP_FAULT => format!("exception {a} error code {c:#x} cr2 {b:#x}, nothing committed"),
         stop::INTERP_UNSUPPORTED => match detail {
-            interp::FAR_JUMP => "a protected-mode far JMP (not built yet)".into(),
-            interp::FAR_RETURN => "a protected-mode far RET (not built yet)".into(),
-            interp::LOAD_SEGMENT => "a protected-mode segment load (not built yet)".into(),
-            interp::MOV_TO_CR => "MOV to a control register (not built yet)".into(),
-            interp::HLT => "HLT (not built yet)".into(),
+            interp::GATE => "a far JMP through a call gate, a task gate or a TSS (not in the first version)".into(),
+            interp::OUTER => "a far RET to an outer privilege level (not in the first version)".into(),
+            interp::TABLE => "a descriptor-table entry above 4 GiB in compatibility mode".into(),
             _ => "an instruction outside the first version".into(),
         },
         stop::INTERP_MEMORY => format!(
@@ -191,6 +189,9 @@ fn interpreted(s: &State) -> Option<String> {
             interp::TF => "RFLAGS.TF set".into(),
             _ => format!("a breakpoint armed (DR7 {a:#x})"),
         },
+        _ if detail == interp::PAGING => {
+            "MOV to CR0 enabling paging without IA-32e mode (legacy or PAE paging: not in the first version)".into()
+        }
         _ => "a state the interpreter does not run (CPL > 0, or paging other than IA-32e's)".into(),
     };
     Some(format!("interpreted, {mode}: instruction {} ({op}): {what}", bytes.join(" ")))
@@ -369,8 +370,11 @@ mod tests {
         assert!(line.contains("compatibility mode, 32-bit") && line.contains("instruction b8 78 56 (none decoded)"), "{line}");
         assert!(line.contains("exception 14 error code 0x0 cr2 0x11000"), "{line}");
         s.stop = exec::stop::INTERP_UNSUPPORTED;
-        s.native[0] = exec::stop::interp::word(3, 37, 1, exec::stop::interp::FAR_JUMP);
-        assert!(interpreted(&s).unwrap().contains("operation 37): a protected-mode far JMP"));
+        s.native[0] = exec::stop::interp::word(3, 37, 1, exec::stop::interp::GATE);
+        assert!(interpreted(&s).unwrap().contains("operation 37): a far JMP through a call gate"));
+        s.stop = exec::stop::INTERP_MODE;
+        s.native[0] = exec::stop::interp::word(3, 43, 3, exec::stop::interp::PAGING);
+        assert!(interpreted(&s).unwrap().contains("operation 43): MOV to CR0 enabling paging without IA-32e mode"));
         s.stop = exec::stop::INTERP_MEMORY;
         (s.native[0], s.fault) = (exec::stop::interp::word(1, 19, 0, exec::stop::interp::DEVICE), [0, 0xfee0_00b0, 0xfee0_0000, 0]);
         assert!(interpreted(&s).unwrap().contains("a device page at linear 0xfee000b0, guest-physical page 0xfee00000"));

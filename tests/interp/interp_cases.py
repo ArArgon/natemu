@@ -614,7 +614,8 @@ def gen_control(mode, rng, out):
     if mode in ('R', 'P16', 'P32'):
         for v in (0x12345000, 0x9a000 | 0x18, PML4):
             out.append(Case(mode, 'Control registers, MSRs', 'mov cr3, r32', ['mov cr3, edx'], rng, regs={'edx': v}, undefined=und))
-        for v in (CR4_PAE, CR4_PAE | CR4_PGE, 0x10 | 0x40 | 0x100 | 0x200 | 0x400, 0x8):
+        # (PSE PCE OSFXSR OSXMMEXCPT: features natemu's CPU profile has; MCE, which it does not advertise, is #GP there.)
+        for v in (CR4_PAE, CR4_PAE | CR4_PGE, 0x10 | 0x100 | 0x200 | 0x400, 0x8):
             out.append(Case(mode, 'Control registers, MSRs', 'mov cr4, r32', ['mov cr4, ecx'], rng, regs={'ecx': v}, undefined=und))
     else:      # C32: the alternate tables, PGE on and off; PAE stays
         out.append(Case(mode, 'Control registers, MSRs', 'mov cr3, r32', ['mov cr3, edx', f'mov [{h(DATA)}], ebx'], rng,
