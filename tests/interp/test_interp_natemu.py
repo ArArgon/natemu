@@ -105,5 +105,41 @@ class Judge(unittest.TestCase):
         self.assertEqual(N.judge(prof, {**f, reg: f[reg] ^ 1}, locked), [], 'profile fields are not compared here')
 
 
+class TypedStops(unittest.TestCase):
+    """The judging of how a run ended: a typed stop with its record, a stop reached, a pending case's stop."""
+
+    def out(self, name, native0=0, fault=(0, 0, 0)):
+        return {'stop': 'resident', 'reason': f'{name} status=1 detail=0', 'native': [hex(native0), '0x0', '0x0'],
+                'fault': [hex(x) for x in (*fault, 0x10100)]}
+
+    def test_a_typed_stop_with_its_record(self):
+        want = {'resident': 'interp_fault', 'fault': [14, 0x11000, 0]}
+        self.assertEqual(N.typed_stop(self.out('interp_fault', fault=(14, 0x11000, 0)), want), [])
+        self.assertTrue(N.typed_stop(self.out('interp_fault', fault=(13, 0, 0)), want))
+        self.assertTrue(N.typed_stop(self.out('interp_fault_x', fault=(14, 0x11000, 0)), want), 'a name, not a prefix')
+        self.assertTrue(N.typed_stop({'stop': 'reached', 'reason': 'stop 0'}, want))
+        self.assertEqual(N.typed_stop({'stop': 'reached', 'reason': 'stop 0'}, {'stop': 0}), [])
+        self.assertTrue(N.typed_stop(self.out('interp_fault'), {'stop': 0}), 'a stop where none is wanted')
+
+    def test_pending_is_a_resident_operation_not_built(self):
+        for detail, name in N.PENDING_DETAILS.items():
+            self.assertEqual(N.pending_detail(self.out('interp_unsupported', detail << 24 | 0x3e03)), name)
+        self.assertEqual(N.pending_detail(self.out('interp_unsupported', 0x3e03)), '', 'a form outside the first version')
+        self.assertEqual(N.pending_detail(self.out('interp_fault', 1 << 24)), '')
+        self.assertEqual(N.pending_detail({'stop': 'reached', 'reason': 'stop 0'}), '')
+
+    def test_the_pending_list_names_corpus_cases(self):
+        names = N.read_pending(pathlib.Path(N.__file__).with_name('natemu-pending.txt'))
+        self.assertLessEqual(names, {c['name'] for c in corpus()['cases']})
+
+    def test_interpreted_selftests_are_machine_descriptions(self):
+        for name, case, want in N.interp_selftests():
+            text = N.description(case, corpus()['common'])
+            self.assertTrue(text.startswith('machine\n'), name)
+            self.assertIn(f"rip {num(case['state']['eip']):#x}", text)
+            self.assertTrue(case['stops'] and case['code']['data'], name)
+            self.assertTrue(set(want) <= {'stop', 'resident', 'fault', *G.GPRS, 'eflags', 'window0'}, name)
+
+
 if __name__ == '__main__':
     unittest.main()
