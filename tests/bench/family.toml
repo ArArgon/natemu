@@ -205,6 +205,52 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
 
+# M2 checkpoint B: the QEMU side (TCG, one vCPU) of the 32-bit cases, and of the two 64-bit cases the November 14 QEMU round did
+# not have (cray-strict, scimark). QEMU runs x87 in software, so c-ray is the small scene (320x240) only. Each boot is capped at 15 minutes. Once per QEMU version.
+[suite.cases.guest-hackbench32-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-hackbench32-int80-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32-int80", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900", "--append", "vdso32=0"]
+
+[suite.cases.guest-sqlite32-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "sqlite32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-startup32-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "startup32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-cray32-strict-small-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-strict-small", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "cray32-strict-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-cray32-sse2-small-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-sse2-small", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "cray32-sse2-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-cray32-small-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "cray32-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-scimark32-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-scimark32-sse2-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark32-sse2",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-cray-strict-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-strict", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "cray-strict",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
+[suite.cases.guest-scimark-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+
 # The Debian cloud-image workload (tests/io/run_io5.py, docs/benchmarks.md "Context-switch-heavy Debian workload") with its
 # build timed alone (--solo-build: configure and make -j4 again after the run, without the download and disk loops):
 # result.json's steps solo-configure and solo-make. Always 4 vCPUs, mitigations=off, as m1-perf's IO5 runs. About 15 minutes
@@ -221,6 +267,32 @@ params = { timeout = 7200 }
 argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
         "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
         "--solo-build", "--lock", "{out}/vm.lock"]
+
+# The 32-bit toolchain build (M2 checkpoint B; run_io5.py --i386): in one boot, CPython's configure and make -j4 by the 64-bit
+# userland (steps configure, make; nothing else running) and by a Debian i386 userland debootstrapped into /i386 (steps
+# i386-configure, i386-make), whose python must then give the x86 reference machine's answers. -qemu: the same under QEMU TCG
+# (about an hour; once per version). -profile: natemu's timing log (perf-use.log; a profile, not a timing). -reference: the
+# same boots on the x86 machine NATEMU_X86_HOST under KVM; prints the check's hash to pin as run_io5.py I386_CHECK, and its
+# step times are real x86's (`remote`: it uses none of this Mac's cores and takes no exclusive window).
+[suite.cases.io5-solo32]
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
+        "--i386", "--lock", "{out}/vm.lock"]
+
+[suite.cases.io5-solo32-profile]
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--natemu", "{natemu}", "--runtime", "{runtime_perf}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
+        "--i386", "--perf-log", "--lock", "{out}/vm.lock"]
+
+[suite.cases.io5-solo32-qemu]
+timeout = 9000
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "qemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--vcpus", "4", "--ram", "8", "--mitigations-off", "--i386", "--limit", "7800", "--lock", "{out}/vm.lock"]
+
+[suite.cases.io5-solo32-reference]
+remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "kvm", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--vcpus", "4", "--ram", "8", "--mitigations-off", "--i386", "--lock", "{out}/vm.lock"]
 
 # The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tests/bench/run_m1_perf.py): natemu at
 # the baseline commit against this checkout's build, in fio matrix runs on raw, qcow2 and overlay disks plus IO5, judged
