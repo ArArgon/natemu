@@ -2605,7 +2605,7 @@ pub struct Compiler {
     /// set and grants the write; on by default; `--writable-on-read on|off`, [`parse_writable_on_read`]; `NATEMU_WRITABLE_ON_READ` overrides it).
     pub writable_on_read: bool,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
-    /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
+    /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|user64|all` overrides it (`user64`: 32-bit code not shared, copied).
     pub pic: u64,
     /// PIC study: [`cache::Control::pic_check_local`] (the program driver's code-shape runs: local links under the check).
     pub pic_check_local: bool,
@@ -3928,7 +3928,8 @@ pub fn run(
         Ok("off") => cache::PIC_OFF,
         Ok("user") => cache::PIC_USER,
         Ok("all") => cache::PIC_ALL,
-        Ok(other) => return Err(format!("NATEMU_PIC={other}: off, user or all")),
+        Ok("user64") => cache::PIC_USER64,
+        Ok(other) => return Err(format!("NATEMU_PIC={other}: off, user, user64 or all")),
         Err(_) => compiler.pic,
     };
     area.write_record(control + std::mem::offset_of!(cache::Control, pic), pic);
@@ -5616,11 +5617,12 @@ mod tests {
         assert_eq!(kind(&mut c, &load), None);
         assert!(!String::from_utf8_lossy(&c.body(&load, 0x1000, None)).contains("--fs-null"));
     }
-    /// M2 reuse, with `FEXC` set: the move forms an i386 program's addresses seldom give, each moved answer compared with
-    /// fexc's compile at the new EIP by the reuse check: the one-word `movn` (0xffffxxxx), `orr #bitmask` and `movz` forms
-    /// moved into each other; a change of word count, a target of 0 and a block ending at 4 GiB refused.
+    /// M2 reuse, with `FEXC` set: 32-bit code's one move form (`movz w; movk w, lsl #16; nop`) moves between any two EIPs
+    /// below 4 GiB, each moved answer compared with fexc's compile at the new EIP by the reuse check: values that once took
+    /// FEX's one-word `movn`, `orr #bitmask` and lone `movz` forms and other word counts (zero halves, a target of 0) all
+    /// move; a block ending at 4 GiB is refused.
     #[test]
-    fn rare_move_forms_of_32_bit_code_move_as_fexc_compiles_them() {
+    fn the_one_move_form_of_32_bit_code_moves_as_fexc_compiles_it() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
@@ -5632,24 +5634,85 @@ mod tests {
         // (code, EIP, relocated, refused): in order; an answer is moved from the first kept one of its bytes.
         let steps: [(&[u8], u64, u64, u64); 12] = [
             (&jcc, 0xffff_1340, 0, 0),
-            (&jcc, 0xffff_8340, 1, 0), // movn to movn
-            (&jcc, 0x5655_5340, 0, 1), // movn to movz + movk
-            (&pic, 0x0ffe_fffa, 0, 0), // 0x0ffff000: orr #bitmask
-            (&pic, 0x00fe_fffa, 1, 0), // 0x00fff000: to another bitmask
-            (&pic, 0x0f0f_fffa, 1, 0), // 0x0f100000: to one movz
-            (&pic, 0x5655_5ffa, 0, 1), // 0x56556000: two words
+            (&jcc, 0xffff_8340, 1, 0), // once movn to movn
+            (&jcc, 0x5655_5340, 1, 0), // once movn to movz + movk
+            (&pic, 0x0ffe_fffa, 0, 0), // 0x0ffff000: once orr #bitmask
+            (&pic, 0x00fe_fffa, 1, 0), // 0x00fff000: once another bitmask
+            (&pic, 0x0f0f_fffa, 1, 0), // 0x0f100000: once one movz
+            (&pic, 0x5655_5ffa, 1, 0), // 0x56556000
             (&pic, 0xffff_fffa, 0, 1), // ends at 4 GiB: the return address is 0
             (&pic, 0xffff_fffa, 0, 0), // (its own answer, found again and checked)
-            (&zero, 0x0000_1340, 0, 0), // the target is 0: one movz
-            (&zero, 0x5655_5340, 0, 1), // 0x56554000: two words
+            (&zero, 0x0000_1340, 0, 0), // the target is 0
+            (&zero, 0x5655_5340, 1, 0), // 0x56554000
             (&zero, 0x0000_1340, 0, 0),
         ];
         for (i, (code, rip, relocated, refused)) in steps.into_iter().enumerate() {
             let before = (c.relocated, c.relocation_refused);
-            assert!(matches!(c.compile(code, rip, false, &mut ()).unwrap(), Code::Block(_)), "step {i}");
+            let Code::Block(b) = c.compile(code, rip, false, &mut ()).unwrap() else {
+                panic!("step {i}: no block");
+            };
             assert_eq!((c.relocated - before.0, c.relocation_refused - before.1), (relocated, refused), "step {i} at {rip:#x}");
+            // Every move is the one form, the `nop` after it.
+            let h: natemu_abi::code_object::Header = crate::relocation::read(&b.object, 0).unwrap();
+            let word = |at: u32| u32::from_le_bytes(b.object[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+            for k in 0..h.relocs_count as usize {
+                let r: natemu_abi::code_object::Reloc = crate::relocation::read(&b.object, h.relocs_offset as usize + 16 * k).unwrap();
+                if r.kind == natemu_abi::code_object::RELOC_GUEST_RIP_MOVE {
+                    let [z, m] = exec::guest_rip_move32(r.value, r.register.into());
+                    assert_eq!([word(r.offset), word(r.offset + 4), word(r.offset + 8)], [z, m, exec::NOP], "step {i}");
+                }
+            }
         }
-        assert_eq!((c.compiles, c.reuse_checks), (7, 5));
+        assert_eq!((c.compiles, c.reuse_checks), (4, 8));
+    }
+    /// The exactness of 32-bit sharing, with `FEXC` set: a block compiled at A on the last page below 4 GiB, whose call
+    /// target wraps to page 1, rewritten position-independent, is at B's page base word for word fexc's compile at B (the
+    /// static proof against B's admitted code, its link targets moved modulo 2^32); not with targets moved by a 64-bit add,
+    /// and not against A's code.
+    #[test]
+    fn a_shared_32_bit_template_is_fexcs_compile_at_another_base() {
+        use natemu_abi::execution::{LinkPoint, MAX_LINK_POINTS, pack_reloc};
+        use natemu_abi::pic;
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let code = [0x40, 0xe8, 0xfa, 0x1f, 0x00, 0x00]; // inc eax; call $+0x2000 (and the pushed return address)
+        let admitted = |rip: u64| {
+            let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.bits32 = true;
+            let Code::Block(b) = c.compile(&code, rip, false, &mut ()).unwrap() else {
+                panic!("no block at {rip:#x}");
+            };
+            let h: natemu_abi::code_object::Header = crate::relocation::read(&b.object, 0).unwrap();
+            let bytes = b.object[h.code_offset as usize..][..h.code_size as usize].to_vec();
+            let mut relocs: Vec<u32> = (0..h.relocs_count as usize)
+                .flat_map(|i| pack_reloc(&crate::relocation::read(&b.object, h.relocs_offset as usize + 16 * i).unwrap(), h.code_size).unwrap())
+                .collect();
+            relocs.sort();
+            let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+            links[..b.links.len()].copy_from_slice(&b.links);
+            (bytes, relocs, links)
+        };
+        let (a, b) = (0xffff_f340u64, 0x5655_5340u64);
+        let (original, relocs, mut links) = admitted(a);
+        assert!(links.iter().any(|p| p.offset != 0 && p.target == 0x1340), "the call's target wraps: {links:x?}");
+        assert!(relocs.iter().filter(|&&r| r & exec::RELOC_MOVE != 0).count() >= 2, "{relocs:x?}");
+        let mut shared = original.clone();
+        assert_eq!(pic::rewrite(&mut shared, &relocs, &mut links, a, true), Ok(()));
+        let w = |c: &[u8]| {
+            let c = c.to_vec();
+            move |o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap())
+        };
+        assert!(pic::proved(w(&original), w(&shared), shared.len(), &relocs, &links, a, 0, true));
+        let (there, relocs_b, _) = admitted(b);
+        assert_eq!(relocs_b, relocs);
+        let (mut at_b, mut unmasked) = (links, links);
+        for (m, u) in at_b.iter_mut().zip(&mut unmasked).filter(|(m, _)| m.offset != 0) {
+            (m.target, u.target) = (pic::moved(m.target, a, b, true), pic::moved(u.target, a, b, false));
+        }
+        assert!(pic::proved(w(&there), w(&shared), shared.len(), &relocs, &at_b, b, 0, true));
+        assert!(!pic::proved(w(&there), w(&shared), shared.len(), &relocs, &unmasked, b, 0, true));
+        assert!(!pic::proved(w(&original), w(&shared), shared.len(), &relocs, &at_b, b, 0, true));
     }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
@@ -7462,6 +7525,114 @@ mod tests {
                 names[m], r[5], r[refusal::PLACE], r[refusal::LITERAL], r[refusal::MOVE], r[refusal::LINK]
             );
         }
+    }
+
+    /// Diagnostic (not a gate): of the blocks of a real i386 program compiled as 32-bit user code where a library runs,
+    /// how many templates the resident would share position-independent ([`natemu_abi::pic::eligible`] of 32-bit code;
+    /// its refusals by kind; `share`'s other refusal, the x87 run test), and fexc's code bytes. Needs `FEXC` and
+    /// `SURVEY_ELF` (an i386 ELF, e.g. the i386 campaign image's libc.so.6); `SURVEY_BLOCKS` blocks (default 20000) from
+    /// `SURVEY_BASE` (default 0xf7c00000) on; with `NATEMU_FEXC_RECORD` set its requests are a replay stream
+    /// (tools/fexc/replay.py --stream, --old32):
+    /// `FEXC=... SURVEY_ELF=... cargo test -p natemu --release pic32_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn pic32_survey() {
+        use natemu_abi::execution::{LinkPoint, MAX_LINK_POINTS, pack_reloc, run_test_end};
+        use natemu_abi::pic::{self, refusal};
+        let (Some(fexc), Some(elf)) = (std::env::var_os("FEXC"), std::env::var_os("SURVEY_ELF")) else {
+            return;
+        };
+        let data = std::fs::read(elf).unwrap();
+        let u = |at: usize, n: usize| u64::from_le_bytes({
+            let mut b = [0; 8];
+            b[..n].copy_from_slice(&data[at..at + n]);
+            b
+        });
+        assert_eq!((&data[..4], data[4], u(18, 2)), (&b"\x7fELF"[..], 1, 3), "an i386 ELF");
+        // The largest executable PT_LOAD (ELF32 program headers: 32 bytes each).
+        let (phoff, phnum) = (u(28, 4) as usize, u(44, 2) as usize);
+        let (mut text, mut vaddr) = (&data[..0], 0u64);
+        for i in 0..phnum {
+            let h = phoff + 32 * i;
+            if u(h, 4) == 1 && u(h + 24, 4) & 1 != 0 && u(h + 16, 4) as usize > text.len() {
+                let (off, va, sz) = (u(h + 4, 4) as usize, u(h + 8, 4), u(h + 16, 4) as usize);
+                (text, vaddr) = (&data[off..off + sz], va);
+            }
+        }
+        let blocks: u64 = std::env::var("SURVEY_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+        let base = std::env::var("SURVEY_BASE").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0xf7c0_0000);
+        let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.cpl3, c.bits32) = (true, true);
+        let (start, end) = (base + vaddr, base + vaddr + text.len() as u64);
+        assert!(end >> 32 == 0, "the text ends at {end:#x}");
+        let (mut rip, mut seen, mut refused_blocks, mut templates, mut packed, mut run_tested) = (start, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut code_bytes, mut moves, mut eligible) = (0u64, 0u64, [0u64; 8]);
+        while seen < blocks && rip + 16 < end {
+            let at = (rip - start) as usize;
+            let bytes = &text[at..text.len().min(at + 8192)];
+            let code = match c.compile(bytes, rip, false, &mut ()) {
+                Ok(Code::Block(b)) => b,
+                Ok(Code::System(s)) => {
+                    rip += u64::from(s.length.max(1));
+                    continue;
+                }
+                Err(e) => {
+                    refused_blocks += 1;
+                    if refused_blocks <= 5 {
+                        eprintln!("{rip:#x}: {e}");
+                    }
+                    rip += 1;
+                    continue;
+                }
+                _ => {
+                    rip += 1;
+                    continue;
+                }
+            };
+            seen += 1;
+            let h: natemu_abi::code_object::Header = crate::relocation::read(&code.object, 0).unwrap();
+            let body = &code.object[h.code_offset as usize..][..h.code_size as usize];
+            code_bytes += u64::from(h.code_size);
+            let next = rip + u64::from(code.guest_bytes);
+            let last = rip.wrapping_add(u64::from(code.guest_bytes).max(1) - 1) >> 12;
+            let template = !c.halved
+                && !c.guess_read
+                && code.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+                && c.read < bytes.len()
+                && rip.wrapping_add(c.read.max(1) as u64 - 1) >> 12 <= last;
+            let mut relocs = vec![];
+            let mut packable = h.relocs_count <= cache::MAX_RELOCS && code.links.len() <= MAX_LINK_POINTS;
+            for i in 0..h.relocs_count as usize {
+                let r: natemu_abi::code_object::Reloc = crate::relocation::read(&code.object, h.relocs_offset as usize + 16 * i).unwrap();
+                moves += u64::from(r.kind == natemu_abi::code_object::RELOC_GUEST_RIP_MOVE);
+                match pack_reloc(&r, h.code_size) {
+                    Some(p) => relocs.extend(p),
+                    None => packable = false,
+                }
+            }
+            relocs.sort();
+            if template {
+                templates += 1;
+            }
+            if template && packable {
+                packed += 1;
+                let word = |o: u64| u32::from_le_bytes(body[o as usize..o as usize + 4].try_into().unwrap());
+                let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+                links[..code.links.len()].copy_from_slice(&code.links);
+                if run_test_end(word, u64::from(h.code_size)).is_some() {
+                    run_tested += 1;
+                } else {
+                    let k = pic::eligible(body, &relocs, &links, rip, true).err().unwrap_or(0);
+                    eligible[k] += 1;
+                }
+            }
+            rip = next.max(rip + 1);
+        }
+        eprintln!(
+            "{seen} blocks ({refused_blocks} refused), {code_bytes} code bytes, {moves} guest-RIP moves; {templates} templates, {packed} with \
+             their relocations packed: {} shareable, {run_tested} with the x87 run test, refused {} for a move ({} out of reach, {} one word)",
+            eligible[0], eligible[refusal::MOVE], eligible[refusal::REACH], eligible[refusal::ONE_WORD]
+        );
     }
 
     /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next

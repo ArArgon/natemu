@@ -1116,7 +1116,7 @@ fn placed_pic(b: &Block, admitted: &[u8]) {
     let k = if b.flags & GLOBAL != 0 {
         count::GLOBAL
     } else {
-        pic::eligible(admitted, relocs(b), &b.links, b.rip)
+        pic::eligible(admitted, relocs(b), &b.links, b.rip, bits32(b.context))
             .err()
             .unwrap_or(count::ELIGIBLE)
     };
@@ -1125,6 +1125,10 @@ fn placed_pic(b: &Block, admitted: &[u8]) {
 /// PIC study stage 3: whether templates of `context` are shared ([`Control::pic`]: user code, or every privilege level).
 pub fn shares(context: u64) -> bool {
     natemu_abi::execution::cache::shares(control().pic, context)
+}
+/// The code of `context` is 32-bit code ([`natemu_abi::execution::context_bits32`]).
+pub fn bits32(context: u64) -> bool {
+    natemu_abi::execution::context_bits32(context)
 }
 /// PIC study stage 3, the lazy rewrite: the shared translation of the template `t` (absolute, live, not [`UNSHAREABLE`]),
 /// made when a second address first needs its code (a template with no position-independent form, or a global mapping, is
@@ -1136,8 +1140,8 @@ pub fn shares(context: u64) -> bool {
 /// `None` (nothing filed): the code area or the arena is full, or the rewrite or its proof refused (counted
 /// [`count::UNPROVED`], a resident fault the check halts on).
 pub fn share(t: &Block) -> Option<&'static Block> {
-    // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return. 32-bit code, which is never
-    // shared ([`shares`]), so not reached.)
+    // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return: 32-bit code with the x87 run
+    // test, left unshared.)
     if run_tested(t) {
         unsafe { (*block_ptr(t.number as usize)).flags |= UNSHAREABLE };
         return None;
@@ -1184,11 +1188,12 @@ pub fn share(t: &Block) -> Option<&'static Block> {
             at[o as usize..o as usize + 4].copy_from_slice(&natemu_abi::execution::DISPATCH_PLACEHOLDER.to_le_bytes());
         }
         // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
-        if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip).is_err() {
+        let bits32 = bits32(t.context);
+        if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip, bits32).is_err() {
             (*block_ptr(t.number as usize)).flags |= UNSHAREABLE;
             return None;
         }
-        if pic::rewrite(at, relocs(t), &mut links, t.rip).is_err() {
+        if pic::rewrite(at, relocs(t), &mut links, t.rip, bits32).is_err() {
             counted(count::UNPROVED);
             return None;
         }
@@ -1209,6 +1214,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
             &links,
             t.rip,
             t.dispatch_exit,
+            bits32,
         ) {
             counted(count::UNPROVED);
             return None;
@@ -1249,7 +1255,9 @@ pub fn share(t: &Block) -> Option<&'static Block> {
 /// `t`'s, checked by the caller; `walked` as for [`place`]): `t`'s link-point targets moved to `rip`, no code. `Ok(None)`
 /// when full (as [`place`]); `Err`: perf chunk 10's `PLACE` refusal (counted [`count::INSTANCE_REFUSED`]): another half or
 /// page offset, a page within the rewrite's reach of a canonical edge ([`pic::reaches`]), a block end not canonical, a
-/// global mapping (shared code is for non-global mappings only: a CR3 load ends every instance's currency).
+/// global mapping (shared code is for non-global mappings only: a CR3 load ends every instance's currency). 32-bit code:
+/// the block below 4 GiB, as a copy's ([`natemu_abi::execution::in_32_bits`]: its 32-bit form wraps there exactly), its
+/// targets moved modulo 2^32 ([`pic::moved`]).
 pub fn instance(
     t: &Block,
     rip: u64,
@@ -1257,19 +1265,22 @@ pub fn instance(
     walked: u32,
 ) -> Result<Option<&'static Block>, usize> {
     let c = control();
-    if (t.rip ^ rip) & (1 << 63 | 0xfff) != 0
-        || !pic::reaches(rip & !0xfff)
-        || !rip
-            .checked_add(t.guest_bytes.into())
-            .is_some_and(natemu_abi::execution::canonical)
-        || walked & GLOBAL != 0
-    {
+    let bits32 = bits32(t.context);
+    let place = if bits32 {
+        natemu_abi::execution::in_32_bits(rip, t.guest_bytes)
+    } else {
+        pic::reaches(rip & !0xfff)
+            && rip
+                .checked_add(t.guest_bytes.into())
+                .is_some_and(natemu_abi::execution::canonical)
+    };
+    if (t.rip ^ rip) & (1 << 63 | 0xfff) != 0 || !place || walked & GLOBAL != 0 {
         counted(count::INSTANCE_REFUSED);
         return Err(natemu_abi::execution::refusal::PLACE);
     }
     let mut links = t.links;
     for p in links.iter_mut().filter(|p| p.offset != 0) {
-        p.target = p.target.wrapping_add(rip.wrapping_sub(t.rip));
+        p.target = pic::moved(p.target, t.rip, rip, bits32);
     }
     // `code` at the fill point keeps the records in address order ([`block_at`]); a size of 0 holds no PC.
     let record = Block {
@@ -2071,7 +2082,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     let c = control();
     // (A shared source's link points name its translation's targets; `at` is the address it runs for.)
     let named = |p: &LinkPoint| {
-        p.offset != 0 && p.target.wrapping_sub(source.rip) == target.rip.wrapping_sub(at)
+        p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == target.rip
     };
     let points = || source.links.iter().filter(move |p| named(p));
     if source.context != target.context || points().next().is_none() {

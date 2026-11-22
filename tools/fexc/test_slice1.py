@@ -1364,6 +1364,8 @@ def check_exits(test, d, tmp, what):
         if t == 'svc #0x1':
             exits += 1
             k = i - 1
+            if lines[k][1] == 'nop' and lines[k - 1][1].startswith('movk w0'):   # 32-bit code's one move form: movz w; movk w; nop
+                k -= 1
             while re.fullmatch(r'movk [wx]0, #0x[0-9a-f]+, lsl #\d+', lines[k][1]):
                 k -= 1
             test.assertIn(lines[k][0], moves, (what, o))

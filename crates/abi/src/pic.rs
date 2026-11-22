@@ -5,7 +5,12 @@
 //! base ± 4 KiB or a page multiple below 16 MiB, three or four words ± 16 MiB, one word nothing. The block's entry records
 //! the page base ([`AND_PAGE`], [`STORE_BASE`]); every other word stays FEX's (its literal slots too: the tail's RIP, which
 //! no generated code reads). [`proved`] is the static check of one rewritten block against the object it came from.
-use crate::execution::{LinkPoint, MAX_LINK_POINTS, RELOC_MOVE, canonical, frame, move_value, svc};
+//!
+//! 32-bit code (`bits32`): fexc's one move form, `movz w; movk w, lsl #16; nop` ([`crate::execution::guest_rip_move32`]),
+//! becomes `ldr xR, [x28, #PAGE_BASE]` and two 32-bit `add`/`sub wR, wR, #imm`, always three words, for k = the move's value
+//! less the page base modulo 2^32, as a signed offset: the adds wrap at 4 GiB as fexc's masked value does, so the form is
+//! exact at every page base of the instance's 32-bit range ([`moved`] moves its link targets the same way).
+use crate::execution::{LinkPoint, MAX_LINK_POINTS, RELOC_MOVE, canonical, frame, move_value, move32_value, svc};
 
 /// `ldr xR, [x28, #PAGE_BASE]`.
 pub const fn load_base(reg: u32) -> u32 {
@@ -20,6 +25,8 @@ const NOP: u32 = 0xd503_201f;
 pub const SVC_LINK: u32 = 0xd400_0001 | (svc::LINK as u32) << 5;
 const ADD: u32 = 0x9100_0000;
 const SUB: u32 = 0xd100_0000;
+const ADD32: u32 = 0x1100_0000;
+const SUB32: u32 = 0x5100_0000;
 /// The reach of three words (`add #hi, lsl #12; add #lo`): |k| below 16 MiB.
 pub const REACH: u64 = 1 << 24;
 
@@ -107,13 +114,26 @@ pub fn class(source_pic: bool, source_rip: u64, target_pic: bool, target_rip: u6
     }
 }
 
-/// The `n`-word form of a move building `base + k` in `reg` (module comment); `None` when `n` words cannot reach `k`.
-pub fn form(n: usize, reg: u32, k: i64) -> Option<[u32; 4]> {
-    let (op, m) = (if k < 0 { SUB } else { ADD }, k.unsigned_abs());
+/// The address a form of k builds at page `base`: base + k, in 32-bit code modulo 2^32 ([`form`]'s 32-bit adds).
+pub fn built(base: u64, k: i64, bits32: bool) -> u64 {
+    let v = base.wrapping_add(k as u64);
+    if bits32 { v & 0xffff_ffff } else { v }
+}
+/// Link target `target` of code at `from` as code at `to` exits to it ([`built`]: in 32-bit code modulo 2^32). The one
+/// rule for a shared translation's targets at the address it runs for: an instance's, a link's, the linker's and a stop's.
+pub fn moved(target: u64, from: u64, to: u64, bits32: bool) -> u64 {
+    built(to, target.wrapping_sub(from) as i64, bits32)
+}
+/// The `n`-word form of a move building `base + k` in `reg` (module comment); `None` when `n` words cannot reach `k`. In
+/// 32-bit code (`bits32`) only three words, the adds 32-bit.
+pub fn form(n: usize, reg: u32, k: i64, bits32: bool) -> Option<[u32; 4]> {
+    let (add, sub) = if bits32 { (ADD32, SUB32) } else { (ADD, SUB) };
+    let (op, m) = (if k < 0 { sub } else { add }, k.unsigned_abs());
     let add =
         |shift: u64, imm: u64| op | (shift as u32) << 22 | (imm as u32) << 10 | reg << 5 | reg;
     let ldr = load_base(reg);
     match n {
+        _ if bits32 => (n == 3 && m < REACH).then(|| [ldr, add(1, m >> 12), add(0, m & 0xfff), 0]),
         2 if m < 4096 => Some([ldr, add(0, m), 0, 0]),
         2 if m % 4096 == 0 && m < REACH => Some([ldr, add(1, m >> 12), 0, 0]),
         3 | 4 if m < REACH => Some([
@@ -126,21 +146,23 @@ pub fn form(n: usize, reg: u32, k: i64) -> Option<[u32; 4]> {
     }
 }
 /// The k a form of exactly `words.len()` words builds in `reg` (the decode [`proved`] checks with, written apart from
-/// [`form`]): `ldr reg, [x28, #PAGE_BASE]`, then 64-bit `add`/`sub reg, reg, #imm{, lsl #12}` or `nop`.
-pub fn value(words: &[u32], reg: u32) -> Option<i64> {
+/// [`form`]): `ldr reg, [x28, #PAGE_BASE]`, then 64-bit `add`/`sub reg, reg, #imm{, lsl #12}` or `nop`; in 32-bit code
+/// exactly two 32-bit `add`/`sub` (what they build: [`built`]).
+pub fn value(words: &[u32], reg: u32, bits32: bool) -> Option<i64> {
     let (&first, rest) = words.split_first()?;
-    if first != load_base(reg) || rest.len() > 3 {
+    if first != load_base(reg) || rest.len() > 3 || (bits32 && rest.len() != 2) {
         return None;
     }
+    let (add, sub) = if bits32 { (ADD32, SUB32) } else { (ADD, SUB) };
     rest.iter().try_fold(0i64, |k, &w| {
-        if w == NOP {
+        if w == NOP && !bits32 {
             return Some(k);
         }
         let imm = i64::from(w >> 10 & 0xfff) << (12 * (w >> 22 & 1));
         match w & 0xff80_0000 {
             _ if w & 31 != reg || w >> 5 & 31 != reg => None,
-            0x9100_0000 => Some(k + imm),
-            0xd100_0000 => Some(k - imm),
+            op if op == add => Some(k + imm),
+            op if op == sub => Some(k - imm),
             _ => None,
         }
     })
@@ -156,8 +178,8 @@ fn word(code: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(code[at..at + 4].try_into().unwrap())
 }
 /// The move of `reg` at `at` in `code` (as admitted, at page `base`): its word count and its [`form`]. `Err`: the
-/// [`refusal`].
-fn one(code: &[u8], at: usize, reg: u32, base: u64) -> Result<(usize, [u32; 4]), usize> {
+/// [`refusal`]. 32-bit code: fexc's one form alone, k its value less `base` modulo 2^32 (signed).
+fn one(code: &[u8], at: usize, reg: u32, base: u64, bits32: bool) -> Result<(usize, [u32; 4]), usize> {
     if at + 4 > code.len() || reg == 28 {
         return Err(refusal::MOVE);
     }
@@ -166,22 +188,27 @@ fn one(code: &[u8], at: usize, reg: u32, base: u64) -> Result<(usize, [u32; 4]),
     for (k, w) in words[..n].iter_mut().enumerate() {
         *w = word(code, at + 4 * k);
     }
-    // A 32-bit form (a value below 4 GiB) is refused, as perf chunk 10's rule refuses it: FEX would wrap such a value at 4
-    // GiB, the form at another base would not.
+    if bits32 {
+        let v = move32_value(&words[..n], reg).ok_or(refusal::MOVE)?;
+        let k = i64::from(v.wrapping_sub(base) as u32 as i32);
+        return form(3, reg, k, true).map(|f| (3, f)).ok_or(refusal::REACH);
+    }
+    // In 64-bit code a 32-bit form (a value below 4 GiB) is refused, as perf chunk 10's rule refuses it: FEX would wrap such
+    // a value at 4 GiB, the 64-bit form at another base would not.
     let Some((n, v)) = move_value(&words[..n], reg).filter(|_| words[0] >> 31 == 1) else {
         return Err(refusal::MOVE);
     };
     if n == 1 {
         return Err(refusal::ONE_WORD);
     }
-    form(n, reg, v.wrapping_sub(base) as i64)
+    form(n, reg, v.wrapping_sub(base) as i64, false)
         .map(|f| (n, f))
         .ok_or(refusal::REACH)
 }
 /// Whether the template `code` (admitted for `rip`; `relocs` packed, [`RELOC_MOVE`]; its link points `links`) has a
 /// rewrite: each relocation in order, none starting inside the one before (as perf chunk 10's re-check), each move with a
-/// [`form`], every link point at a move of x0. `Err`: the [`refusal`]; nothing is written.
-pub fn eligible(code: &[u8], relocs: &[u32], links: &[LinkPoint], rip: u64) -> Result<(), usize> {
+/// [`form`], every link point at a move of x0. `Err`: the [`refusal`]; nothing is written. `bits32`: 32-bit code's.
+pub fn eligible(code: &[u8], relocs: &[u32], links: &[LinkPoint], rip: u64, bits32: bool) -> Result<(), usize> {
     let mut free = 0;
     for &r in relocs {
         let at = (r >> 6) as usize * 4;
@@ -197,7 +224,7 @@ pub fn eligible(code: &[u8], relocs: &[u32], links: &[LinkPoint], rip: u64) -> R
             }
             2
         } else {
-            one(code, at, r & 31, rip & !0xfff)?.0
+            one(code, at, r & 31, rip & !0xfff, bits32)?.0
         };
         free = at + 4 * n;
     }
@@ -220,11 +247,12 @@ pub fn rewrite(
     relocs: &[u32],
     links: &mut [LinkPoint; MAX_LINK_POINTS],
     rip: u64,
+    bits32: bool,
 ) -> Result<(), usize> {
-    eligible(code, relocs, links, rip)?;
+    eligible(code, relocs, links, rip, bits32)?;
     for &r in relocs.iter().filter(|&&r| r & RELOC_MOVE != 0) {
         let at = (r >> 6) as usize * 4;
-        let (n, f) = one(code, at, r & 31, rip & !0xfff)?;
+        let (n, f) = one(code, at, r & 31, rip & !0xfff, bits32)?;
         for (j, w) in f[..n].iter().enumerate() {
             code[at + 4 * j..at + 4 * j + 4].copy_from_slice(&w.to_le_bytes());
         }
@@ -237,12 +265,13 @@ pub fn rewrite(
 }
 /// The offset of the word after link point `p`'s move (its `svc #LINK`, or the `b` an `svc`-word link put there): past the
 /// point's first word (whatever it holds now: linked, armed), the rest of the move, the `add`/`sub x0`/`nop` words of a
-/// position-independent form or the `movk x0` words of an absolute one.
+/// position-independent form (32-bit code: `add`/`sub w0`) or the `movk x0` words of an absolute one (32-bit code: `movk
+/// w0` and its `nop`).
 pub fn svc_slot(word: impl Fn(u64) -> u32, p: &LinkPoint) -> u64 {
     let at = u64::from(p.offset);
     let plain = |w: u32| {
         w == NOP
-            || (matches!(w & 0xff80_0000, ADD | SUB) && w & 0x3ff == 0)
+            || (matches!(w & 0xff80_0000, ADD | SUB | ADD32 | SUB32) && w & 0x3ff == 0)
             || w & 0x7f80_001f == 0x7280_0000
     };
     (1..4)
@@ -250,9 +279,9 @@ pub fn svc_slot(word: impl Fn(u64) -> u32, p: &LinkPoint) -> u64 {
         .map_or(at + 16, |k| at + 4 * k)
 }
 /// `p` names an exit of position-independent `code` (`code_size` bytes, at page `base`) as [`rewrite`] leaves it: its word
-/// is in the code and is `p.word` = `ldr x0, [x28, #PAGE_BASE]`, the form after it builds `p.target` from `base`, and
-/// `svc #LINK` follows.
-pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint, base: u64) -> bool {
+/// is in the code and is `p.word` = `ldr x0, [x28, #PAGE_BASE]`, the form after it builds `p.target` from `base` ([`built`]),
+/// and `svc #LINK` follows.
+pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint, base: u64, bits32: bool) -> bool {
     let at = u64::from(p.offset);
     if at % 4 != 0 || at < 4 || at + 8 > u64::from(code_size) || p.word != load_base(0) {
         return false;
@@ -266,13 +295,15 @@ pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint, base
     for (k, w) in words[..n].iter_mut().enumerate() {
         *w = word(at + 4 * k as u64);
     }
-    value(&words[..n], 0).is_some_and(|k| base.wrapping_add(k as u64) == p.target)
+    value(&words[..n], 0, bits32).is_some_and(|k| built(base, k, bits32) == p.target)
 }
 /// The static proof of one rewritten block: `code` (its word at each offset from its header word, `len` bytes, its link
 /// points as admitted) is `original` (the word at each offset of the admitted object's code for `rip`) but for the header word, now [`STORE_BASE`] (the only store [`rewrite`] adds); each move of `relocs` (in order,
 /// none inside the one before; its words decoded from `original`), now `value` k in as many words with base + k its old
 /// value; the word at `skip` (a computed exit's `b`, 0 for none) and literal slots (the tail's RIP, which no generated code
-/// reads), not compared; and every link point a [`link_point`] of `code`. Every other word is the same.
+/// reads), not compared; and every link point a [`link_point`] of `code`. Every other word is the same. 32-bit code
+/// (`bits32`): each move fexc's one form, its rewrite three words building its value modulo 2^32.
+#[allow(clippy::too_many_arguments)]
 pub fn proved(
     original: impl Fn(usize) -> u32,
     code: impl Fn(usize) -> u32,
@@ -281,6 +312,7 @@ pub fn proved(
     links: &[LinkPoint; MAX_LINK_POINTS],
     rip: u64,
     skip: u32,
+    bits32: bool,
 ) -> bool {
     let base = rip & !0xfff;
     if len % 4 != 0 || len < 4 || code(0) != STORE_BASE {
@@ -307,14 +339,19 @@ pub fn proved(
             for (k, w) in words[..avail].iter_mut().enumerate() {
                 *w = original(at + 4 * k);
             }
-            let Some((n, v)) = move_value(&words[..avail], reg).filter(|&(n, _)| n <= 4) else {
+            let decoded = if bits32 {
+                move32_value(&words[..avail], reg).map(|v| (3, v))
+            } else {
+                move_value(&words[..avail], reg).filter(|&(n, _)| n <= 4)
+            };
+            let Some((n, v)) = decoded else {
                 return false;
             };
             let mut new = [0; 4];
             for (k, w) in new[..n].iter_mut().enumerate() {
                 *w = code(at + 4 * k);
             }
-            if reg == 28 || value(&new[..n], reg).map(|k| base.wrapping_add(k as u64)) != Some(v) {
+            if reg == 28 || value(&new[..n], reg, bits32).map(|k| built(base, k, bits32)) != Some(v) {
                 return false;
             }
             n
@@ -337,6 +374,7 @@ pub fn proved(
                 len as u32,
                 p,
                 base,
+                bits32,
             )
         })
 }
@@ -344,6 +382,7 @@ pub fn proved(
 /// compared word for word, [`proved`]): the guest-RIP relocations agree in order, kind and register, and each of the
 /// host's absolute moves (`host`, `host_len` bytes, packed `host_relocs`, admitted for `rip`) builds the value the
 /// translation's rewritten move (`code`, `len`, `relocs`) builds at `rip`'s page (its [`form`] re-encoded exactly).
+#[allow(clippy::too_many_arguments)]
 pub fn moves_agree(
     host: impl Fn(usize) -> u32,
     host_len: usize,
@@ -352,6 +391,7 @@ pub fn moves_agree(
     len: usize,
     relocs: &[u32],
     rip: u64,
+    bits32: bool,
 ) -> bool {
     let base = rip & !0xfff;
     let mut mine = relocs.iter();
@@ -371,7 +411,12 @@ pub fn moves_agree(
         for (k, w) in words[..avail].iter_mut().enumerate() {
             *w = host(ha + 4 * k);
         }
-        let Some((_, v)) = move_value(&words[..avail], reg) else {
+        let decoded = if bits32 {
+            move32_value(&words[..avail], reg)
+        } else {
+            move_value(&words[..avail], reg).map(|(_, v)| v)
+        };
+        let Some(v) = decoded else {
             return false;
         };
         let mut new = [0; 4];
@@ -380,9 +425,9 @@ pub fn moves_agree(
             *w = code(at + 4 * k);
         }
         let k = (2..=avail).rev().find_map(|n| {
-            value(&new[..n], reg).filter(|&k| form(n, reg, k).is_some_and(|f| f[..n] == new[..n]))
+            value(&new[..n], reg, bits32).filter(|&k| form(n, reg, k, bits32).is_some_and(|f| f[..n] == new[..n]))
         });
-        if k.map(|k| base.wrapping_add(k as u64)) != Some(v) {
+        if k.map(|k| built(base, k, bits32)) != Some(v) {
             return false;
         }
     }
@@ -425,19 +470,19 @@ mod tests {
             (1, 0, false),
             (5, 0, false),
         ] {
-            let f = form(n, 7, k);
+            let f = form(n, 7, k, false);
             assert_eq!(f.is_some(), some, "{n} {k:#x}");
             if let Some(f) = f {
-                assert_eq!(value(&f[..n], 7), Some(k), "{n} {k:#x}");
-                assert_eq!(value(&f[..n], 8), None);
+                assert_eq!(value(&f[..n], 7, false), Some(k), "{n} {k:#x}");
+                assert_eq!(value(&f[..n], 8, false), None);
             }
         }
         // Another base register, a 32-bit add, an add of another register: not a form.
-        let f = form(3, 7, 0x1234).unwrap();
-        assert_eq!(value(&[f[0] ^ 1 << 5, f[1], f[2]], 7), None);
-        assert_eq!(value(&[f[0], f[1] & !(1 << 31), f[2]], 7), None);
-        assert_eq!(value(&[f[0], f[1], f[2] ^ 1 << 5], 7), None);
-        assert_eq!(value(&[f[0], f[1], f[2], NOP, NOP], 7), None);
+        let f = form(3, 7, 0x1234, false).unwrap();
+        assert_eq!(value(&[f[0] ^ 1 << 5, f[1], f[2]], 7, false), None);
+        assert_eq!(value(&[f[0], f[1] & !(1 << 31), f[2]], 7, false), None);
+        assert_eq!(value(&[f[0], f[1], f[2] ^ 1 << 5], 7, false), None);
+        assert_eq!(value(&[f[0], f[1], f[2], NOP, NOP], 7, false), None);
     }
 
     /// A template at a user address: a three-word move rewritten, a link point's exit too; the proof holds, and each
@@ -471,12 +516,12 @@ mod tests {
             word: m0[0],
             target: rip + 0x2000,
         };
-        assert_eq!(eligible(&original, &relocs, &links, rip), Ok(()));
+        assert_eq!(eligible(&original, &relocs, &links, rip, false), Ok(()));
         // A guest-RIP literal anywhere but the tail (here: the `svc` word and the slot's first half) is refused.
         let mid = [relocs[0], relocs[1], (literal_at / 4 - 1) << 6];
-        assert_eq!(eligible(&original, &mid, &links, rip), Err(refusal::MOVE));
+        assert_eq!(eligible(&original, &mid, &links, rip, false), Err(refusal::MOVE));
         let mut code = original.clone();
-        assert_eq!(rewrite(&mut code, &relocs, &mut links, rip), Ok(()));
+        assert_eq!(rewrite(&mut code, &relocs, &mut links, rip, false), Ok(()));
         assert_eq!(links[0].word, load_base(0));
         assert!(proved(
             |at| word(&original, at),
@@ -485,10 +530,11 @@ mod tests {
             &relocs,
             &links,
             rip,
-            0
+            0,
+            false
         ));
         assert_eq!(
-            value(&[word(&code, 4), word(&code, 8), word(&code, 12)], 5),
+            value(&[word(&code, 4), word(&code, 8), word(&code, 12)], 5, false),
             Some(rip as i64 + 0x40 - base as i64)
         );
         // The check's comparison by move values: the host's absolute code at this RIP agrees; at another page (the
@@ -502,6 +548,7 @@ mod tests {
                 code.len(),
                 &relocs,
                 at,
+                false,
             )
         };
         assert!(agree(&original, &relocs, rip));
@@ -529,6 +576,7 @@ mod tests {
                 &links,
                 rip,
                 0,
+                false,
             )
         };
         assert!(red(16, 0xd503_201e));
@@ -545,7 +593,8 @@ mod tests {
             &relocs,
             &l,
             rip,
-            0
+            0,
+            false
         ));
         assert!(!proved(
             |at| word(&original, at),
@@ -554,7 +603,8 @@ mod tests {
             &[relocs[0], relocs[1], literal_at / 4 << 6 | RELOC_MOVE],
             &links,
             rip,
-            0
+            0,
+            false
         ));
         assert!(!proved(
             |at| word(&original, at),
@@ -563,7 +613,8 @@ mod tests {
             &relocs[1..],
             &links,
             rip,
-            0
+            0,
+            false
         ));
         // The literal slot is not compared (the tail's RIP is left as the template's, or poisoned in the check mode).
         let mut c = code.clone();
@@ -575,7 +626,8 @@ mod tests {
             &relocs,
             &links,
             rip,
-            0
+            0,
+            false
         ));
         // At another address (an instance's) the same code proves only with its link targets moved there and against the
         // code admitted there: here the template's original is not it.
@@ -589,7 +641,8 @@ mod tests {
             &relocs,
             &l,
             to,
-            0
+            0,
+            false
         ));
         // Refusals of the rewrite: a one-word move, a move out of reach, a link point at no move.
         let one: Vec<u8> = [0u32, 0x9280_0005, NOP]
@@ -597,7 +650,7 @@ mod tests {
             .flat_map(|w| w.to_le_bytes())
             .collect();
         assert_eq!(
-            eligible(&one, &[1 << 6 | RELOC_MOVE | 5], &[], rip),
+            eligible(&one, &[1 << 6 | RELOC_MOVE | 5], &[], rip, false),
             Err(refusal::ONE_WORD)
         );
         let (far, nf) = load_constant(rip + REACH, 5);
@@ -607,7 +660,7 @@ mod tests {
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         assert_eq!(
-            eligible(&far, &[1 << 6 | RELOC_MOVE | 5], &[], rip),
+            eligible(&far, &[1 << 6 | RELOC_MOVE | 5], &[], rip, false),
             Err(refusal::REACH)
         );
         // A 32-bit form (a value below 4 GiB, near a 4 GiB base), as perf chunk 10 refuses it.
@@ -619,13 +672,13 @@ mod tests {
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         assert_eq!(
-            eligible(&low, &[1 << 6 | RELOC_MOVE | 5], &[], 0x1234_0100),
+            eligible(&low, &[1 << 6 | RELOC_MOVE | 5], &[], 0x1234_0100, false),
             Err(refusal::MOVE)
         );
         let mut l = links;
         l[0].offset = 16;
         assert_eq!(
-            rewrite(&mut original.clone(), &relocs, &mut l, rip),
+            rewrite(&mut original.clone(), &relocs, &mut l, rip, false),
             Err(refusal::MOVE)
         );
     }
@@ -640,5 +693,111 @@ mod tests {
         assert_eq!(class(true, 0x1000, false, 0x1000), Class::SharedToAbsolute);
         assert_eq!(class(false, 0x1000, true, 0x1000), Class::AbsoluteToShared);
         assert_eq!(class(false, 0, false, 0), Class::Absolute);
+    }
+
+    /// 32-bit code's form: three words at both reach edges, decoded only as itself (not with a `nop`, a 64-bit add, one
+    /// add short or another register), and exact across the wrap at 4 GiB both ways, where the 64-bit sum is 2^32 off.
+    #[test]
+    fn the_32_bit_form_reaches_and_wraps() {
+        use crate::execution::{NOP as N, guest_rip_move32};
+        let edge = REACH as i64;
+        for k in [0, 1, -1, 0xfff, -0x1000, 0x12_3456, edge - 1, -(edge - 1)] {
+            let f = form(3, 7, k, true).unwrap();
+            assert_eq!((value(&f[..3], 7, true), value(&f[..3], 7, false)), (Some(k), None), "{k:#x}");
+            assert_eq!(f[1] >> 31 | f[2] >> 31, 0);
+        }
+        assert_eq!([form(3, 7, edge, true), form(3, 7, -edge, true), form(2, 7, 0, true), form(4, 7, 0, true)], [None; 4]);
+        let f = form(3, 7, 0x1234, true).unwrap();
+        for bad in [&[f[0], f[1]][..], &[f[0], f[1], N], &[f[0], f[1] | 1 << 31, f[2]], &[f[0], f[1], f[2] ^ 1 << 5], &[f[0], f[1], f[2], N]] {
+            assert_eq!(value(bad, 7, true), None, "{bad:x?}");
+        }
+        // A move at offset 4 of a block whose page base is `base`, building `v` across the wrap.
+        for (base, v, k) in [(0xffff_f000u64, 0x0000_0234u64, 0x1234i64), (0x1000, 0xffff_ff00, -0x1100)] {
+            let [z, m] = guest_rip_move32(v, 5);
+            let code: Vec<u8> = [0, z, m, N].iter().flat_map(|w| w.to_le_bytes()).collect();
+            let (n, f) = one(&code, 4, 5, base, true).unwrap();
+            assert_eq!((n, value(&f[..3], 5, true)), (3, Some(k)));
+            assert_eq!((built(base, k, true), built(base, k, false) ^ v), (v, 1 << 32));
+            // Not fexc's form (no `nop`, a 64-bit move, another register): refused.
+            for w in [[0, z, m, 0], [0, z | 1 << 31, m | 1 << 31, N], [0, z ^ 1, m ^ 1, N]] {
+                let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+                assert_eq!(one(&code, 4, 5, base, true), Err(refusal::MOVE));
+            }
+        }
+        assert_eq!(moved(0x1100, 0xffff_f100, 0x5655_5100, true), 0x5655_7100);
+        assert_eq!(moved(0x5655_7100, 0x5655_5100, 0xffff_f100, true), 0x1100);
+        assert_eq!(moved(0x1100, 0xffff_f100, 0x5655_5100, false), 0xffff_ffff_5655_7100);
+        // Out of reach (17 MiB away): refused as such.
+        let [z, m] = guest_rip_move32(0x5655_5000 + (17 << 20), 5);
+        let code: Vec<u8> = [0, z, m, N].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(one(&code, 4, 5, 0x5655_5000, true), Err(refusal::REACH));
+    }
+
+    /// A 32-bit template on the last page below 4 GiB whose link target wraps to page 1: rewritten and proved; its
+    /// instance's link point (target moved modulo 2^32) is a link point of the same code at another base; the host's absolute
+    /// code there agrees by values; each mutation is red (a 64-bit add, the original without its `nop`, one add short, the
+    /// wrong register, an unmasked target).
+    #[test]
+    fn a_32_bit_rewrite_is_proved_across_the_wrap() {
+        use crate::execution::{NOP as N, guest_rip_move32};
+        let words_at = |rip: u64| {
+            let [z5, m5] = guest_rip_move32(rip + 0x40, 5);
+            let [z0, m0] = guest_rip_move32(rip + 0x2000, 0);
+            // header; mov w5, #rip + 0x40; nop; nop; mov w0, #rip + 0x2000 (wrapped); nop; svc #LINK; literal slot.
+            let mut w = std::vec![0, z5, m5, N, N, z0, m0, N, SVC_LINK, 0, 0];
+            w[0] = 4 * 9 - 8;
+            w
+        };
+        let bytes = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let rip = 0xffff_f100u64;
+        let original = bytes(&words_at(rip));
+        let relocs = [1 << 6 | RELOC_MOVE | 5, 5 << 6 | RELOC_MOVE, 9 << 6];
+        let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+        links[0] = LinkPoint { offset: 20, word: words_at(rip)[5], target: (rip + 0x2000) & 0xffff_ffff };
+        assert_eq!(links[0].target, 0x1100);
+        assert_eq!(eligible(&original, &relocs, &links, rip, false), Err(refusal::MOVE));
+        assert_eq!(eligible(&original, &relocs, &links, rip, true), Ok(()));
+        let mut code = original.clone();
+        assert_eq!(rewrite(&mut code, &relocs, &mut links, rip, true), Ok(()));
+        let w = |c: &[u8], at: usize| word(c, at);
+        let prove = |orig: &[u8], c: &[u8], l: &[LinkPoint; MAX_LINK_POINTS], at: u64| {
+            proved(|o| w(orig, o), |o| w(c, o), c.len(), &relocs, l, at, 0, true)
+        };
+        assert!(prove(&original, &code, &links, rip));
+        assert!(!proved(|o| w(&original, o), |o| w(&code, o), code.len(), &relocs, &links, rip, 0, false));
+        assert_eq!(svc_slot(|o| w(&code, o as usize), &links[0]), 32);
+        // At another base: the code is the same, its link point's target moved there modulo 2^32; the host's code admitted
+        // there is fexc's at that RIP, which the rewritten code proves against and agrees with by values.
+        let to = 0x5655_5100u64;
+        let there = bytes(&words_at(to));
+        let mut l = links;
+        l[0].target = moved(links[0].target, rip, to, true);
+        assert_eq!(l[0].target, 0x5655_7100);
+        assert!(prove(&there, &code, &l, to));
+        assert!(link_point(|o| w(&code, o as usize), code.len() as u32, &l[0], to & !0xfff, true));
+        assert!(!prove(&there, &code, &links, to), "the template's target");
+        let mut unmasked = l;
+        unmasked[0].target = moved(links[0].target, rip, to, false);
+        assert!(!prove(&there, &code, &unmasked, to), "a target 2^32 off");
+        let agree = |c: &[u8], at: u64| {
+            moves_agree(|o| w(&there, o), there.len(), relocs.iter().copied(), |o| w(c, o), c.len(), &relocs, at, true)
+        };
+        assert!(agree(&code, to) && !agree(&code, to + 0x1000));
+        // Mutations of the rewritten code: a 64-bit add, the lo add dropped (a `nop`), the wrong register.
+        let red = |at: usize, word: u32| {
+            let mut c = code.clone();
+            c[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            !prove(&original, &c, &links, rip) && !agree(&c, to)
+        };
+        assert!(red(8, w(&code, 8) | 1 << 31));
+        assert!(red(12, N));
+        assert!(red(12, w(&code, 12) ^ (1 | 1 << 5)));
+        assert!(red(4, load_base(6)));
+        // The original without its `nop` (an unpadded move): not a template, and not what the proof accepts.
+        let mut unpadded = words_at(rip);
+        unpadded[3] = 0xd503_201e;
+        let unpadded = bytes(&unpadded);
+        assert_eq!(eligible(&unpadded, &relocs, &links, rip, true), Err(refusal::MOVE));
+        assert!(!prove(&unpadded, &code, &links, rip));
     }
 }

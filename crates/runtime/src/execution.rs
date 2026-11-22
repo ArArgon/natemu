@@ -660,7 +660,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         // PIC study stage 3: shared code runs for the address its page-base slot names ([`cache::running_rip`]); its link
         // points' targets are its translation's, moved there (x0, built from the same slot, is the same).
         let here = ran.map_or(0, |b| cache::running_rip(b));
-        let moved = |b: &Block, p: &LinkPoint| p.target.wrapping_sub(b.rip).wrapping_add(here);
+        let moved = |b: &Block, p: &LinkPoint| natemu_abi::pic::moved(p.target, b.rip, here, cache::bits32(b.context));
         if let Some(b) = ran.filter(|b| b.flags & cache::PIC != 0) {
             let at = link_point_of(b, elr.wrapping_sub(4));
             if let Some(p) = b.links.iter().find(|p| at == Some(u64::from(p.offset))) {
@@ -798,7 +798,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let here = cache::running_rip(ran);
     let Some(point) = link_point_of(ran, svc)
         .and_then(|at| ran.links.iter().find(|p| u64::from(p.offset) == at))
-        .filter(|p| p.target.wrapping_sub(ran.rip).wrapping_add(here) == rip)
+        .filter(|p| natemu_abi::pic::moved(p.target, ran.rip, here, cache::bits32(ran.context)) == rip)
     else {
         return declined(s, rip, SysFastDecline::Other);
     };
@@ -1588,6 +1588,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                     t.code_size as usize,
                     relocs,
                     copy.rip,
+                    cache::bits32(t.context),
                 )
             {
                 cache::control().pic_counts[natemu_abi::pic::count::CHECK_SHAPE] += 1;
@@ -1608,6 +1609,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                         &copy.links,
                         copy.rip,
                         t.dispatch_exit,
+                        cache::bits32(t.context),
                     )
             } else {
                 // (M2 reuse: a split block's run end returns to its hot copy, [`cache::run_return`]: the one word the
@@ -2596,11 +2598,12 @@ unsafe fn stopped(
                 cache::control().pic_counts[natemu_abi::pic::count::SVC_STOPS] += 1;
             }
             match first {
-                Some(p) => Some(
-                    p.target
-                        .wrapping_sub(b.rip)
-                        .wrapping_add(cache::running_rip(b)),
-                ),
+                Some(p) => Some(natemu_abi::pic::moved(
+                    p.target,
+                    b.rip,
+                    cache::running_rip(b),
+                    cache::bits32(b.context),
+                )),
                 None if svc => Some(frame.x[0]),
                 None => (b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit))
                     .then_some(frame.x[0]),

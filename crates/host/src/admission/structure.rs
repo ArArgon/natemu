@@ -841,7 +841,7 @@ impl<'a> Verifier<'a> {
             .filter(|r| r.kind == object::RELOC_GUEST_RIP_MOVE)
         {
             let (words, value) = v
-                .move_sequence(r.offset, r.register)
+                .rip_move(r.offset, r.register)
                 .ok_or(format!("guest-RIP move at {:#x}", r.offset))?;
             // A literal exit's move (into x0, right before `svc #LINK`) holds its target, which `exits` checks.
             let exit = r.register == 0
@@ -1041,7 +1041,7 @@ impl<'a> Verifier<'a> {
         let r = self.c.relocs.iter().find(|r| {
             r.kind == object::RELOC_GUEST_RIP_MOVE && r.offset == at && r.register == 0
         })?;
-        let (words, value) = self.move_sequence(at, 0)?;
+        let (words, value) = self.rip_move(at, 0)?;
         (value == r.value && self.word(words.end) == SVC_LINK && self.sealed(at, at, words.end))
             .then_some((value, words.end))
     }
@@ -1050,6 +1050,20 @@ impl<'a> Verifier<'a> {
         matches!(self.insn(at), Some(Insn::Svc(svc::DIV_U | svc::DIV_S)))
     }
 
+    /// The guest-RIP move at `at` building `reg`: its words and value. 64-bit code: a [`Self::move_sequence`]; 32-bit code:
+    /// fexc's one form alone, its `nop` included (`movz w; movk w, lsl #16; nop`, [`natemu_abi::execution::move32_value`]:
+    /// the three words the resident's position-independent rewrite needs).
+    fn rip_move(&self, at: u32, reg: u8) -> Option<(Range<u32>, u64)> {
+        if !self.c.bits32 {
+            return self.move_sequence(at, reg);
+        }
+        let mut words = [0; 3];
+        for (k, w) in words.iter_mut().enumerate() {
+            let o = at + 4 * k as u32;
+            *w = self.insn(o).and(Some(self.word(o)))?;
+        }
+        natemu_abi::execution::move32_value(&words, reg.into()).map(|v| (at..at + 12, v))
+    }
     /// The movz/movn/`orr #bitmask, wzr` (+ movk) sequence at `at` building `reg`: its words and value.
     fn move_sequence(&self, at: u32, reg: u8) -> Option<(Range<u32>, u64)> {
         let w = self.insn(at).and(Some(self.word(at)))?;
@@ -2901,6 +2915,28 @@ mod tests {
         assert!(e.contains("profile or settings"), "{e}");
         // The link points of the wrapping exits carry the wrapped RIPs (0, not 4 GiB).
         assert_eq!(admit(&compile("7402ebfe", "0xfffffffc", "32"), true), Ok(2));
+        // fexc's one form of a 32-bit guest-RIP move, `movz w; movk w, lsl #16; nop` (zero halves too: a call at 0 pushes 5,
+        // a jmp to 0x10000 has a zero low half): the `nop` belongs to it, so a move without it is refused, with the code
+        // shape check and without.
+        for (hex, rip) in [("e800000000", "0x8048000"), ("e800000000", "0x0"), ("e9fbffffff", "0x10000")] {
+            let (o, source) = compile(hex, rip, "32");
+            let h: Header = super::super::record(&o, 0);
+            let word = |o: &[u8], at: u32| u32::from_le_bytes(o[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+            let moves: Vec<Reloc> = (0..h.relocs_count as usize)
+                .map(|i| super::super::record::<Reloc>(&o, h.relocs_offset as usize + 16 * i))
+                .filter(|r| r.kind == object::RELOC_GUEST_RIP_MOVE)
+                .collect();
+            assert!(!moves.is_empty(), "{hex} at {rip}");
+            for r in moves {
+                let [z, k] = natemu_abi::execution::guest_rip_move32(r.value, r.register.into());
+                assert_eq!([word(&o, r.offset), word(&o, r.offset + 4), word(&o, r.offset + 8)], [z, k, 0xd503_201f], "{hex} at {rip}");
+                for shape in [true, false] {
+                    let p = patched((&o, &source), r.offset + 8, 0xd503_201f, NOP);
+                    let e = super::super::admit_mode(&p, h.guest_rip, &source, u64::MAX, shape, false, true).expect_err("an unpadded move");
+                    assert!(e.contains("guest-RIP move at"), "{hex} at {rip}: {e}");
+                }
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

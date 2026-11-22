@@ -421,8 +421,8 @@ mod tests {
                 let at = p.offset as usize;
                 code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
             }
-            assert_eq!(pic::eligible(&code, &relocs, &links, from.1), Ok(()));
-            assert_eq!(pic::rewrite(&mut code, &relocs, &mut links, from.1), Ok(()));
+            assert_eq!(pic::eligible(&code, &relocs, &links, from.1, false), Ok(()));
+            assert_eq!(pic::rewrite(&mut code, &relocs, &mut links, from.1, false), Ok(()));
             assert!(pic::proved(
                 w(&original),
                 w(&code),
@@ -430,7 +430,8 @@ mod tests {
                 &relocs,
                 &links,
                 from.1,
-                0
+                0,
+                false
             ));
             assert!(
                 links
@@ -456,10 +457,11 @@ mod tests {
                 &relocs,
                 &moved,
                 to.1,
-                0
+                0,
+                false
             ));
             assert!(
-                !pic::proved(w(&there), w(&code), code.len(), &relocs, &links, to.1, 0),
+                !pic::proved(w(&there), w(&code), code.len(), &relocs, &links, to.1, 0, false),
                 "the template's link targets"
             );
             assert!(!pic::proved(
@@ -469,7 +471,8 @@ mod tests {
                 &relocs,
                 &moved,
                 to.1,
-                0
+                0,
+                false
             ));
         }
     }
@@ -573,37 +576,67 @@ mod tests {
         assert_eq!(relocate_move(&w[..n], 6, 0x1000), None);
     }
 
-    /// M2 reuse, the move rule for 32-bit code: the 32-bit form alone, re-encoded in as many words; refused when the value
-    /// wraps at 4 GiB either way, the word count differs, or the words are the 64-bit form.
+    /// M2 reuse, the move rule for 32-bit code: fexc's one form alone (`movz w; movk w, lsl #16; nop`), re-encoded in its
+    /// three words for every value below 4 GiB (zero halves too, which other forms once took); refused when the value wraps
+    /// at 4 GiB either way, without the `nop`, in another form (a one-word or 64-bit move), or for another register.
     #[test]
     fn the_move_rule_of_32_bit_code() {
-        use natemu_abi::execution::{in_32_bits, relocate_code_mode, relocate_move_mode as mv};
-        let low = |c: u64| {
-            let (w, n) = load_constant(c, 0);
-            assert!(w[0] >> 31 == 0);
-            (w, n)
+        use natemu_abi::execution::{NOP, guest_rip_move32, in_32_bits, relocate_code_mode, relocate_move_mode as mv};
+        let form = |c: u64, reg: u32| {
+            let [z, k] = guest_rip_move32(c, reg);
+            [z, k, NOP, 0]
         };
         for (old, new) in [
-            (0x5655_5346u64, 0xf7c5_6346u64), // movz + movk
+            (0x5655_5346u64, 0xf7c5_6346u64),
             (0xf7c5_6346, 0x5655_5346),
-            (0xffff_1346, 0xffff_8346), // movn
-            (0x00ff_f000, 0x0ff0_0000), // a bitmask, both
+            (0xffff_1346, 0xffff_8346), // once a one-word movn
+            (0x00ff_f000, 0x0ff0_0000), // once bitmasks
+            (0x5655_5346, 0x5655_0000), // a zero low half
+            (0x5655_5346, 0x0000_2346), // a zero high half
+            (0x5655_5346, 0),
         ] {
-            let (w, n) = low(old);
-            assert_eq!(mv(&w[..n], 0, new.wrapping_sub(old), true), Some((low(new).0, n, old)), "{old:#x} to {new:#x}");
+            let w = form(old, 0);
+            assert_eq!(mv(&w[..3], 0, new.wrapping_sub(old), true), Some((form(new, 0), 3, old)), "{old:#x} to {new:#x}");
             // 64-bit code refuses the form, as before.
-            assert_eq!(mv(&w[..n], 0, new.wrapping_sub(old), false), None);
-            assert_eq!(relocate_move(&w[..n], 0, new.wrapping_sub(old)), None);
+            assert_eq!(mv(&w[..3], 0, new.wrapping_sub(old), false), None);
+            assert_eq!(relocate_move(&w[..3], 0, new.wrapping_sub(old)), None);
         }
-        let (w, n) = low(0x5655_5346);
-        // Past 4 GiB and below 0 (FEX would wrap; never relocated), and other word counts (a zero half, a bitmask, movn).
-        for to in [0x1_0000_0346u64, 0xffff_ffff_ffff_f346, 0x5655_0000, 0x2346, 0x00ff_f000, 0xffff_1346] {
-            assert_eq!(mv(&w[..n], 0, to.wrapping_sub(0x5655_5346), true), None, "to {to:#x}");
+        let w = form(0x5655_5346, 7);
+        // Past 4 GiB and below 0 (FEX wraps; not relocated, though the rule would be exact: rare, fexc's to compile).
+        for to in [0x1_0000_0346u64, 0xffff_ffff_ffff_f346] {
+            assert_eq!(mv(&w[..3], 7, to.wrapping_sub(0x5655_5346), true), None, "to {to:#x}");
         }
-        // The 64-bit form in 32-bit code (an unmasked site's value at or above 4 GiB).
-        let (w, n) = load_constant(0x1_5655_5346, 0);
-        assert_eq!(mv(&w[..n], 0, 0x1000, true), None);
-        assert_eq!(mv(&w[..n], 0, 0u64.wrapping_sub(0x1_0000_0000), true), None);
+        // Not the form: no `nop` (an unpadded move, or the end of the code), FEX's other forms, another register.
+        let (low, n) = load_constant(0x5655_5346, 7);
+        let (one, _) = load_constant(0xffff_1346, 7);
+        let (wide, m) = load_constant(0x1_5655_5346, 7);
+        for bad in [&w[..2], &[w[0], w[1], 0xd503_201e][..], &low[..n], &[low[0], low[1], 0], &[one[0], NOP, 0], &wide[..m]] {
+            assert_eq!(mv(bad, 7, 0x1000, true), None, "{bad:x?}");
+        }
+        assert_eq!(mv(&w[..3], 6, 0x1000, true), None);
+        assert_eq!(mv(&form(0x5655_5346, 31)[..3], 31, 0x1000, true), None);
+        // A link point of the form (`svc #LINK` after its `nop`) moved by the copy rule; the old two-word form refused.
+        let svc = natemu_abi::pic::SVC_LINK;
+        let block = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let at = |rip: u64| {
+            let f = form(rip + 0x1f00, 0);
+            block(&[0, f[0], f[1], NOP, svc])
+        };
+        let point = |rip: u64, w: &[u8]| {
+            let mut l = [LinkPoint::NONE; MAX_LINK_POINTS];
+            l[0] = LinkPoint { offset: 4, word: u32::from_le_bytes(w[4..8].try_into().unwrap()), target: rip + 0x1f00 };
+            l
+        };
+        let (from, to) = (0x5655_5100u64, 0xf7c5_6100u64);
+        let mut code = at(from);
+        let mut l = point(from, &code);
+        assert_eq!(relocate_code_mode(&mut code, &[1 << 6 | RELOC_MOVE], &mut l, from, to, 8, true), Ok(()));
+        assert_eq!((code, l), (at(to), point(to, &at(to))));
+        let (old, n) = load_constant(from + 0x1f00, 0);
+        let mut code = block(&[0, old[0], old[1], svc]);
+        assert_eq!(n, 2);
+        let mut l = point(from, &code);
+        assert_eq!(relocate_code_mode(&mut code, &[1 << 6 | RELOC_MOVE], &mut l, from, to, 8, true), Err(refusal::MOVE));
         // The block's place: both ends below 4 GiB at both RIPs.
         assert!(in_32_bits(0xffff_f000, 0xfff) && !in_32_bits(0xffff_f000, 0x1000) && !in_32_bits(1 << 32, 0));
         let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
@@ -619,22 +652,24 @@ mod tests {
         }
     }
 
-    /// M2 reuse inside the resident: 32-bit code's templates are copied by the 32-bit rule and never shared as
-    /// position-independent translations, whatever the block (here: one ending in `ret`, which has no address move at
-    /// all, so nothing else would refuse it); a block on the last page below 4 GiB that runs to 4 GiB is refused by the
-    /// rule both copy routines call; and a copy of a block with the x87 run test restores its run end's return.
+    /// M2 reuse inside the resident: 32-bit code's user templates are shared as position-independent translations (but
+    /// under `PIC_USER64`, the switch that copies them as before), as 64-bit code's are; a block on the last page below 4
+    /// GiB that runs to 4 GiB is refused by the rule both copy routines call; and a copy of a block with the x87 run test
+    /// restores its run end's return.
     #[test]
-    fn templates_of_32_bit_code_are_copied_never_shared() {
-        use natemu_abi::execution::cache::{PIC_ALL, PIC_OFF, PIC_USER, shares};
+    fn templates_of_32_bit_code_are_shared_or_copied() {
+        use natemu_abi::execution::cache::{PIC_ALL, PIC_OFF, PIC_USER, PIC_USER64, shares};
         use natemu_abi::execution::{CodeMode, ENTRY_OFFSET, RUN_END, context_bits32, frame, relocate_code_mode, run_return_word, run_test_end};
         // The code context's mode field (bits 4:2) and CPL (bits 1:0).
         let context = |mode: CodeMode, cpl: u64| (mode as u64) << 2 | cpl | 1 << 11;
         let (user64, kernel64, user32) = (context(CodeMode::Bits64, 3), context(CodeMode::Bits64, 0), context(CodeMode::Compat32, 3));
         assert!(!context_bits32(user64) && !context_bits32(kernel64) && context_bits32(user32));
         assert!(!context_bits32(context(CodeMode::Compat16, 3)));
-        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, user64)), [false, true, true]);
-        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, kernel64)), [false, false, true]);
-        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, user32)), [false; 3]);
+        let modes = [PIC_OFF, PIC_USER, PIC_ALL, PIC_USER64];
+        assert_eq!(modes.map(|p| shares(p, user64)), [false, true, true, true]);
+        assert_eq!(modes.map(|p| shares(p, kernel64)), [false, false, true, false]);
+        assert_eq!(modes.map(|p| shares(p, user32)), [false, true, true, false]);
+        assert_eq!(modes.map(|p| shares(p, context(CodeMode::Compat32, 0))), [false, false, true, false]);
         // A block with no relocation (inc eax; ret) on the last page: moved below it, refused where it would end at 4 GiB
         // or come from there, in 32-bit code only.
         let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];

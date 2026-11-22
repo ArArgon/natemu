@@ -831,7 +831,8 @@ pub mod cache {
         pub pic_counts: [u64; crate::pic::count::COUNTS],
         /// PIC study stage 2, set by the host before the vCPU runs: which templates are placed position-independent
         /// ([`PIC_OFF`], [`PIC_USER`]: CPL-3 code only, the design's rule; [`PIC_ALL`]: every privilege level, a test mode
-        /// that runs the suites' CPL-0 programs through the rewritten code too). Appended.
+        /// that runs the suites' CPL-0 programs through the rewritten code too; [`PIC_USER64`]: as [`PIC_USER`] but 64-bit
+        /// code only, 32-bit code copied as before it was shared, the A/B and off switch of 32-bit sharing). Appended.
         pub pic: u64,
         /// PIC study stage 2 tests (the host's `NATEMU_PIC_TEST`), on every second entry of a position-independent block
         /// from the resident: [`PIC_TEST_AND`], [`PIC_TEST_STR`], [`PIC_TEST_BODY`] enter it at that word with the vCPU's
@@ -1141,17 +1142,17 @@ pub mod cache {
     pub const PIC_OFF: u64 = 0;
     pub const PIC_USER: u64 = 1;
     pub const PIC_ALL: u64 = 2;
+    pub const PIC_USER64: u64 = 3;
     /// PIC study stage 3: whether templates of `context` are shared under [`Control::pic`] `pic`: user code, or every
-    /// privilege level; never 32-bit code (M2 reuse: its address moves are one or two words where the rewrite needs more,
-    /// its addresses wrap at 4 GiB where an instance's are built by a 64-bit add, and no rule of an instance checks
-    /// that: it is copied, [`super::relocate_code_mode`]).
+    /// privilege level; 32-bit code too (fexc's one move form there, [`super::guest_rip_move32`], is rewritten to the
+    /// 32-bit form of [`crate::pic::form`], whose adds wrap at 4 GiB as fexc's values do) but under [`PIC_USER64`].
     pub fn shares(pic: u64, context: u64) -> bool {
-        !super::context_bits32(context)
-            && match pic {
-                PIC_USER => context & 3 == 3,
-                PIC_ALL => true,
-                _ => false,
-            }
+        match pic {
+            PIC_USER => context & 3 == 3,
+            PIC_USER64 => context & 3 == 3 && !super::context_bits32(context),
+            PIC_ALL => true,
+            _ => false,
+        }
     }
     pub const CLAIMED_PAGES: usize = 8;
     impl Control {
@@ -1936,6 +1937,22 @@ pub fn load_constant(c: u64, reg: u8) -> ([u32; 4], usize) {
     }
     (words, n)
 }
+/// 32-bit code's one guest-RIP move (fexc: FEX's `InsertGuestRIPMove` under `fexc_bits32`): `movz wR, #lo; movk wR, #hi,
+/// lsl #16` for the value's low 32 bits, then a `nop` (the third word the position-independent rewrite needs, [`crate::pic`]).
+pub const fn guest_rip_move32(v: u64, reg: u32) -> [u32; 2] {
+    [0x5280_0000 | (v as u32 & 0xffff) << 5 | reg, 0x72a0_0000 | (v as u32 >> 16) << 5 | reg]
+}
+/// `nop`.
+pub const NOP: u32 = 0xd503_201f;
+/// The value of the move of 32-bit code into `reg` (at most x30) at the start of `words`: exactly its three words,
+/// [`guest_rip_move32`]'s then `nop` (decoded apart from the encoder).
+pub fn move32_value(words: &[u32], reg: u32) -> Option<u64> {
+    let &[z, k, n, ..] = words else {
+        return None;
+    };
+    (reg <= 30 && z & 0xffe0_001f == 0x5280_0000 | reg && k & 0xffe0_001f == 0x72a0_0000 | reg && n == NOP)
+        .then_some(u64::from(z >> 5 & 0xffff | (k >> 5 & 0xffff) << 16))
+}
 /// Reuse across load addresses (perf chunks 4 and 10), the one rule the host's relocator and the resident's copies share
 /// for a guest-RIP move: the 64-bit move into `reg` at the start of `words` (its first word, then the word after it, which
 /// must not join it) re-encoded by FEX's rules for its value plus `d`. Returns the new words (as many as before), their
@@ -1946,10 +1963,16 @@ pub fn relocate_move(words: &[u32], reg: u32, d: u64) -> Option<([u32; 4], usize
     relocate_move_mode(words, reg, d, false)
 }
 /// [`relocate_move`] for the code mode of the block. 32-bit code (`bits32`; M2 reuse): fexc masks every guest-EIP constant
-/// to 32 bits and loads it in the 32-bit form, so there that form alone is accepted, before and after, and the new value
-/// is the old plus `d` only where neither wraps at 4 GiB (a value that would wrap is fexc's to compile: refused, whether
-/// or not its site masks).
+/// to 32 bits and loads it in its one form ([`guest_rip_move32`] and `nop`: three words, the `nop` returned unchanged), so
+/// that form alone is accepted, and the new value is the old plus `d` only where it does not wrap at 4 GiB (exact, but
+/// rare: fexc's to compile).
 pub fn relocate_move_mode(words: &[u32], reg: u32, d: u64, bits32: bool) -> Option<([u32; 4], usize, u64)> {
+    if bits32 {
+        let old = move32_value(words, reg)?;
+        let value = old.wrapping_add(d);
+        let [z, k] = guest_rip_move32(value, reg);
+        return (value >> 32 == 0).then_some(([z, k, NOP, 0], 3, old));
+    }
     let (n, old) = move_value(words, reg)?;
     let value = old.wrapping_add(d);
     // (A 32-bit form's old value is below 4 GiB by its decode.)
@@ -1974,7 +1997,8 @@ pub fn relocate_move_mode(words: &[u32], reg: u32, d: u64, bits32: bool) -> Opti
 }
 /// `p` names an exit of the code whose words `word` reads (`code_size` bytes) as admission returns it: its word is in the
 /// code and is `p.word`, the first of a move (`movz|movn|orr` from the zero register, then `movk`s; at most four words)
-/// building `p.target` in x0, and an `svc #LINK` follows the move (inside the code).
+/// building `p.target` in x0, and an `svc #LINK` follows the move (inside the code; after a 32-bit move's `nop`, 32-bit
+/// code's form, [`guest_rip_move32`]).
 pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> bool {
     let at = u64::from(p.offset);
     let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
@@ -1990,7 +2014,9 @@ pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> b
     for (k, w) in words[..n].iter_mut().enumerate() {
         *w = word(at + 4 * k as u64);
     }
-    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
+    let svc = |k: usize| words.get(k) == Some(&svc_link)
+        || (words[0] >> 31 == 0 && words.get(k) == Some(&NOP) && words.get(k + 1) == Some(&svc_link));
+    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && svc(k) && value == p.target)
 }
 
 /// Perf chunk 10, reuse inside the resident: a placed block keeps its admitted object's guest-RIP relocations after its
