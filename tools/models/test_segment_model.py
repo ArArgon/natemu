@@ -288,5 +288,205 @@ class Transfers(unittest.TestCase):
         self.assertEqual(r['fault'][:2], (dm.GP, 0x10))
 
 
+# ---- the interpreter's modes (R, P16, P32, C32 at CPL 0): far JMP, far RET, MOV Sreg ---------------------------------
+
+IGDT, ISTACK, IPTR = 0x7000, 0x9000, 0xA000
+IDESC = {0x08: m.segment(0, 0xFFFFFFFF, 0x9B, 4),            # flat 32-bit code
+         0x10: m.segment(0, 0xFFFFFFFF, 0x93, 4),            # flat data
+         0x18: m.segment(0x10000, 0xFFFF, 0x9B),             # 16-bit code, base 10000H, 64 KiB
+         0x20: m.segment(0, 0xFFFFFFFF, 0x9B, 6),            # L = D = 1: 32-bit code while LMA = 0
+         0x28: m.segment(0, 0xFFFF, 0x9B, 2),                # L = 1, D = 0: 16-bit code while LMA = 0
+         0x30: m.segment(0, 0xFFFF, 0x1B),                   # not present
+         0x38: m.segment(0, 0xFFFF, 0xFB),                   # DPL 3, nonconforming
+         0x40: m.segment(0, 0xFFFF, 0x9F),                   # conforming, DPL 0
+         0x48: m.segment(0, 0xFFFFFFFF, 0x9A, 4),            # code, accessed bit clear
+         0x50: m.segment(0x1000, 0x67, 0x89),                # 32-bit TSS
+         0x58: m.segment(0, 0, 0x8C),                        # call gate (32-bit, or 64-bit under LMA)
+         0x60: m.segment(0x2000, 0x17, 0x82),                # LDT
+         0x68: m.segment(0, 0, 0x86),                        # 16-bit interrupt gate
+         0x70: m.segment(0, 0xFFFFFFFF, 0x9B, 2),            # 64-bit code (L = 1, D = 0)
+         0x78: m.segment(0, 0x0FFF, 0x93),                   # data, limit FFFH
+         0x80: m.segment(0, 0xFFFFFFFF, 0x91, 4),            # read-only data
+         0x88: m.segment(0, 0xFFFFFFFF, 0x85),               # task gate
+         0x90: m.segment(0, 0xFFFFFFFF, 0xFB, 4)}            # DPL 3 32-bit code
+
+
+def interp(mode, cpl=0):
+    """An interpreted state: 'R' (after a SIPI with vector 9), 'P16' (PE just set under that CS), 'P32' (flat), 'C32'
+    (compatibility mode under the delivery bus's paging: every page present and writable)."""
+    memory = {p: dm.page() for p in range(16)}
+    for sel, raw in IDESC.items():
+        dm.place(memory, IGDT + sel, raw.to_bytes(8, 'little'))
+    s = m.reset_state(memory, sipi=9)
+    s.update(gdtr=(IGDT, 0x97), rsp=ISTACK)
+    if mode != 'R':
+        s['cr0'] |= 1
+    if mode in ('P32', 'C32'):
+        flat = {r: (0x10, 0xC093) for r in m.SREGS}
+        flat['cs'] = (0x08 | cpl, 0xC09B if cpl == 0 else 0xC0FB)
+        s.update(seg=flat, shape={r: (0, 0xFFFFFFFF) for r in m.SREGS}, cs=flat['cs'][0], ss=0x10, cpl=cpl,
+                 rip=0x1000)
+    if mode == 'C32':
+        s.update(cr0=s['cr0'] | 1 << 31, cr4=0x20, efer=0x500)
+    return s
+
+
+def frame(s, *words, width=4):
+    """Place `words` (first = lowest) at SS:ESP, a 16-bit stack's offsets wrapping at 64 KiB."""
+    big = s['seg']['ss'][1] >> 14 & 1
+    for k, w in enumerate(words):
+        off = s['rsp'] + k * width
+        dm.place(s['memory'], s['shape']['ss'][0] + (off if big else off & 0xFFFF), w.to_bytes(width, 'little'))
+    return s
+
+
+class Interpreted(unittest.TestCase):
+    def f(self, r): return r['outcome'], r['fault'] and r['fault'][:2]
+
+    def test_modes(self):
+        self.assertEqual([m.mode_of(interp(x)) for x in ('R', 'P16', 'P32', 'C32')], ['R', 'P16', 'P32', 'C32'])
+        self.assertIsNone(m.interpreted_mode(0x80000011, 0x500, 0xA09B, 0))   # 64-bit code
+        self.assertIsNone(m.interpreted_mode(0x80000011, 0x500, 0xC0FB, 3))   # compatibility mode at CPL 3: translated
+        self.assertEqual(m.interpreted_mode(0x11, 0, 0xE09B, 0), 'P32')        # L ignored while LMA = 0
+        self.assertEqual(m.interpreted_mode(0x11, 0, 0x209B, 0), 'P16')
+
+    def test_reset_and_sipi_state(self):
+        r = m.reset_state()
+        self.assertEqual((r['cr0'], r['rflags'], r['rip'], r['seg']['cs'], r['shape']['cs']),
+                         (0x60000010, 2, 0xFFF0, (0xF000, 0x9B), (0xFFFF0000, 0xFFFF)))
+        self.assertEqual(m.reset_state(cd_nw=0)['cr0'], 0x10)                   # INIT keeps CD and NW
+        s = m.reset_state(sipi=0x9A)
+        self.assertEqual((s['seg']['cs'][0], s['shape']['cs'], s['rip']), (0x9A00, (0x9A000, 0xFFFF), 0))
+
+    def test_real_mode_far_jump(self):
+        s = interp('R')
+        r = m.jmp_far_interp(s, (0x1000, 0x10), osize=16)
+        self.assertEqual((r['outcome'], r['state']['seg']['cs'], r['state']['shape']['cs'], r['state']['rip']),
+                         ('done', (0x1000, 0x9B), (0x10000, 0xFFFF), 0x10))   # B11: limit and attributes kept
+        self.assertEqual(r['diff'], {})                                          # no descriptor, no accessed bit
+        self.assertEqual(self.f(m.jmp_far_interp(s, (0x1000, 0x12345))), ('fault', (dm.GP, 0)))   # beyond CS limit
+        u = interp('R')
+        u['shape']['cs'] = (0x9000, 0xFFFFFFFF)                                  # a stale 4 GiB CS limit
+        self.assertEqual(m.jmp_far_interp(u, (0x1000, 0x12345))['state']['rip'], 0x12345)
+        dm.place(s['memory'], 0x200, (0x4321).to_bytes(4, 'little') + (0x2000).to_bytes(2, 'little'))
+        r = m.jmp_far_interp(s, pointer=('ds', 0x200))                           # m16:32 through DS base 0
+        self.assertEqual((r['state']['cs'], r['state']['shape']['cs'][0], r['state']['rip']), (0x2000, 0x20000, 0x4321))
+        self.assertEqual(self.f(m.jmp_far_interp(s, pointer=('ds', 0xFFFC))), ('fault', (dm.GP, 0)))  # crosses DS limit
+        self.assertEqual(self.f(m.jmp_far_interp(s, pointer=('ss', 0xFFFC))), ('fault', (dm.SS, 0)))
+
+    def test_real_mode_far_return_and_loads(self):
+        s = frame(interp('R'), 0x1234, 0x5000)
+        r = m.ret_far_interp(s, release=8)
+        self.assertEqual((r['state']['cs'], r['state']['shape']['cs'][0], r['state']['rip'], r['state']['rsp']),
+                         (0x5000, 0x50000, 0x1234, ISTACK + 16))
+        r = m.ret_far_interp(frame(interp('R'), 0x10000, 0x5000))
+        self.assertEqual(self.f(r), ('fault', (dm.GP, 0)))                       # B12: EIP beyond the CS limit
+        self.assertIn(('done', None), r['permitted'])
+        u = frame(interp('R'), 0x2000, 0x5000, width=2)
+        u['shape']['cs'] = (0x9000, 0xFFF)                                       # (a stale 4 KiB CS limit)
+        r = m.ret_far_interp(u, osize=16)
+        self.assertEqual((self.f(r), r['permitted']), (('fault', (dm.GP, 0)), {('fault', (dm.GP, 0, 0))}))
+        w = interp('R')
+        w['rsp'] = 0xFFFE                                                        # B13: the second slot wraps to 0
+        dm.place(w['memory'], 0xFFFE, (0x40).to_bytes(2, 'little'))
+        dm.place(w['memory'], 0, (0x7000).to_bytes(2, 'little'))
+        r = m.ret_far_interp(w, osize=16)
+        self.assertEqual((r['state']['cs'], r['state']['rip'], r['state']['rsp']), (0x7000, 0x40, 2))
+        w['rsp'] = 0xFFFF
+        self.assertEqual(self.f(m.ret_far_interp(w)), ('fault', (dm.SS, 0)))     # a 4-byte slot across 64 KiB
+        r = m.load_interp(interp('R'), 'ds', 0x1234)
+        self.assertEqual((r['state']['seg']['ds'], r['state']['shape']['ds']), ((0x1234, 0x93), (0x12340, 0xFFFF)))
+        u = interp('R')
+        u['shape']['ds'] = (0, 0xFFFFFFFF)                                       # big real mode survives a load
+        self.assertEqual(m.load_interp(u, 'ds', 0x10)['state']['shape']['ds'], (0x100, 0xFFFFFFFF))
+        self.assertEqual(m.load_interp(interp('R'), 'ss', 0)['outcome'], 'done')  # no null rule in real mode
+
+    def test_protected_far_jump_checks(self):
+        s = interp('P16')
+        r = m.jmp_far_interp(s, (0x08, 0x1234))                                  # 66 EA ptr16:32: into P32
+        self.assertEqual((r['outcome'], r['state']['seg']['cs'], r['state']['shape']['cs'], m.mode_of(r['state'])),
+                         ('done', (0x08, 0xC09B), (0, 0xFFFFFFFF), 'P32'))
+        r = m.jmp_far_interp(s, (0x18, 0x10), osize=16)                          # EA ptr16:16: a 16-bit segment
+        self.assertEqual((r['state']['shape']['cs'], m.mode_of(r['state'])), ((0x10000, 0xFFFF), 'P16'))
+        for sel, want in ((0, (dm.GP, 0)), (3, (dm.GP, 0)), (0x98, (dm.GP, 0x98)), (0x0C, (dm.GP, 0x0C)),
+                          (0x10, (dm.GP, 0x10)), (0x30, (dm.NP, 0x30)), (0x38, (dm.GP, 0x38)), (0x0B, (dm.GP, 0x08)),
+                          (0x60, (dm.GP, 0x60)), (0x68, (dm.GP, 0x68))):
+            self.assertEqual(self.f(m.jmp_far_interp(s, (sel, 0))), ('fault', want), hex(sel))
+        r = m.jmp_far_interp(s, (0x43, 0x10))                                    # conforming: RPL ignored, RPL := CPL
+        self.assertEqual(r['state']['cs'], 0x40)
+        self.assertEqual(self.f(m.jmp_far_interp(s, (0x18, 0x10000))), ('fault', (dm.GP, 0)))   # the new CS's limit
+        self.assertEqual(self.f(m.jmp_far_interp(s, (0x18, 0x10000), osize=16))[0], 'done')    # offset & FFFFH
+        self.assertEqual(m.mode_of(m.jmp_far_interp(s, (0x20, 0))['state']), 'P32')  # L = D = 1, LMA = 0: 32-bit
+        self.assertEqual(m.mode_of(m.jmp_far_interp(s, (0x28, 0))['state']), 'P16')  # L = 1, D = 0: 16-bit
+        for sel in (0x50, 0x58, 0x88):
+            self.assertEqual(m.jmp_far_interp(s, (sel, 0))['outcome'], 'refused', hex(sel))
+        r = m.jmp_far_interp(s, (0x48, 0))
+        self.assertEqual(r['diff'], {IGDT + 0x48 + 5: bytes([0x9B])})          # the accessed bit
+        self.assertEqual(self.f(m.jmp_far_interp(interp('P32', cpl=3), (0x93, 0)))[0], 'refused')
+
+    def test_protected_far_jump_through_memory(self):
+        s = interp('P32')
+        dm.place(s['memory'], IPTR, (0x2222).to_bytes(4, 'little') + (0x18).to_bytes(2, 'little'))
+        r = m.jmp_far_interp(s, pointer=('ds', IPTR))
+        self.assertEqual((r['state']['cs'], r['state']['rip'], m.mode_of(r['state'])), (0x18, 0x2222, 'P16'))
+        r = m.jmp_far_interp(s, pointer=('ds', IPTR), osize=16)                  # m16:16: the selector is bytes 2-3
+        self.assertEqual(self.f(r), ('fault', (dm.GP, 0)))                       # (0: the offset's high half)
+        s['seg']['ds'], s['shape']['ds'] = (0x78, 0x9093), (0, 0xFFF)
+        self.assertEqual(self.f(m.jmp_far_interp(s, pointer=('ds', 0xFFC))), ('fault', (dm.GP, 0)))
+        s['seg']['ds'] = (0, 0)                                                  # a null DS used
+        self.assertEqual(self.f(m.jmp_far_interp(s, pointer=('ds', IPTR))), ('fault', (dm.GP, 0)))
+        s['seg']['es'] = (0x08, 0xC098)                                          # execute-only code: no read
+        self.assertEqual(self.f(m.jmp_far_interp(s, pointer=('es', IPTR))), ('fault', (dm.GP, 0)))
+        u = interp('P32')
+        u['memory'].pop(IPTR >> 12)                                              # paging off: unassigned, all-ones
+        self.assertEqual(self.f(m.jmp_far_interp(u, pointer=('ds', IPTR))), ('fault', (dm.GP, 0xFFFC)))
+
+    def test_protected_far_return(self):
+        r = m.ret_far_interp(frame(interp('P32'), 0x3000, 0x18), release=4)
+        self.assertEqual((r['state']['cs'], r['state']['rip'], r['state']['rsp'], m.mode_of(r['state'])),
+                         (0x18, 0x3000, ISTACK + 12, 'P16'))
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('P32'), 0x10000, 0x18))), ('fault', (dm.GP, 0)))
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('P32'), 0, 0))), ('fault', (dm.GP, 0)))
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('P32'), 0, 0x38))), ('fault', (dm.GP, 0x38)))  # DPL != RPL
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('P32'), 0, 0x30))), ('fault', (dm.NP, 0x30)))
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('P32'), 0, 0x10))), ('fault', (dm.GP, 0x10)))
+        self.assertEqual(m.ret_far_interp(frame(interp('P32'), 0, 0x93))['outcome'], 'refused')   # to CPL 3
+        self.assertEqual(m.mode_of(m.ret_far_interp(frame(interp('P32'), 0, 0x20))['state']), 'P32')  # L ignored
+        s = frame(interp('P32'), 0x3000, 0x08)
+        s['seg']['ss'], s['shape']['ss'] = (0x78, 0xC093), (0, ISTACK + 4)       # the CS slot beyond the SS limit
+        self.assertEqual(self.f(m.ret_far_interp(s)), ('fault', (dm.SS, 0)))
+        r = m.ret_far_interp(frame(interp('P16'), 0x44, 0x18, width=2), osize=16)  # 16-bit RET on the SIPI stack
+        self.assertEqual((r['state']['cs'], r['state']['rip'], r['state']['rsp']), (0x18, 0x44, ISTACK + 4))
+
+    def test_protected_loads(self):
+        s = interp('P32')
+        self.assertEqual(self.f(m.load_interp(s, 'ss', 0)), ('fault', (dm.GP, 0)))   # null SS: #GP(0) outside 64-bit
+        self.assertEqual(m.load(machine(), 'ss', 0)['outcome'], 'done')                # (64-bit mode, CPL 0: allowed)
+        r = m.load_interp(s, 'ds', 0)
+        self.assertEqual((r['outcome'], r['state']['seg']['ds']), ('done', (0, 0)))
+        self.assertEqual(self.f(m.load_interp(s, 'ds', 0x30)), ('fault', (dm.NP, 0x30)))
+        self.assertEqual(self.f(m.load_interp(s, 'ss', 0x80)), ('fault', (dm.GP, 0x80)))  # read-only data as SS
+        r = m.load_interp(s, 'ss', 0x78)
+        self.assertEqual((r['state']['ss'], r['state']['shape']['ss']), (0x78, (0, 0xFFF)))
+        p = interp('P16')                                                        # the stale real-mode DS is usable
+        self.assertEqual(m.load_interp(p, 'es', 0x10)['state']['shape']['es'], (0, 0xFFFFFFFF))
+
+    def test_compatibility_mode(self):
+        s = interp('C32')
+        r = m.jmp_far_interp(s, (0x70, 0x8000_1000))                             # to 64-bit code: the hand-off
+        self.assertEqual((r['outcome'], r['handoff'], r['state']['rip']), ('done', True, 0x8000_1000))
+        self.assertEqual(self.f(m.jmp_far_interp(s, (0x20, 0))), ('fault', (dm.GP, 0x20)))  # L = D = 1 with LMA = 1
+        self.assertFalse(m.jmp_far_interp(s, (0x08, 0x10))['handoff'])
+        self.assertEqual(self.f(m.jmp_far_interp(s, (0x50, 0))), ('fault', (dm.GP, 0x50)))  # a TSS is no target
+        self.assertEqual(m.jmp_far_interp(s, (0x58, 0))['outcome'], 'refused')   # (type CH: a 64-bit call gate)
+        r = m.ret_far_interp(frame(interp('C32'), 0x4000, 0x70))
+        self.assertEqual((r['handoff'], r['state']['rip'], r['state']['rsp']), (True, 0x4000, ISTACK + 8))
+        self.assertEqual(self.f(m.ret_far_interp(frame(interp('C32'), 0, 0x20))), ('fault', (dm.GP, 0x20)))
+        u = interp('C32')
+        u['memory'].pop(IPTR >> 12)                                              # paging on: the pointer's #PF
+        r = m.jmp_far_interp(u, pointer=('ds', IPTR))
+        self.assertEqual(r['fault'], (dm.PF, 0, IPTR))
+
+
 if __name__ == '__main__':
     unittest.main()
