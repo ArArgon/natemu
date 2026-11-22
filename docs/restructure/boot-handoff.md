@@ -294,10 +294,17 @@ syscall_arg_fault_64 and sysret_ss_attrs_64 ([correctness-nostop.md](correctness
 locks run atomically in the resident under a VM-wide split lock, [correctness-nostop.md](correctness-nostop.md) §3);
 `unsupported_mode` for CPL 1/2, compatibility-mode code at CPL 0 (JMP/CALL far at CPL 0 or RET far/IRET to RPL 0 into a
 32- or 16-bit code segment; at CPL 3 it is the deviation above), 32-bit and paging-off modes (owner decision 3), page tables
-outside guest RAM; `unsupported_system` for call gates at CPL 0, an ICR INIT/start-up IPI or
+outside guest RAM (in the firmware image too); `unsupported_system` for call gates at CPL 0, an ICR INIT/start-up IPI or
 any delivery mode but fixed, lowest priority and NMI (the mailbox is the AP start; `execution/lapic.rs`), a LAPIC base moved onto RAM, DR7 R/W = 10 without
 CR4.DE, more data breakpoints than the host offers; `unsupported_mmio` for RMW, atomic, pair, page-crossing, string and
-vector forms on a device page; `unsupported_ferr` for a pending x87 exception with CR0.NE = 0; `unsupported_port` for
+vector forms on a device page, and (M2 Part 2, the firmware boot mode, [firmware-mode.md](firmware-mode.md)) for the
+same forms stored to the firmware image from translated code (a store pair, a push, a store crossing a page, a
+read-modify-write such as `add [rom], eax`, a LOCKed form or XCHG) and for an operand in the image of the resident's own
+instructions other than through `linear` (far pointers and frames, RCL/RCR and VCVTPS2PH memory forms, XSAVE's area,
+INS's destination), where x86 reads the ROM and drops the store: a translated store to the image takes the device path,
+which completes only the MOV forms of fexc's completion records, and the image is kept out of RAM's paths so that a
+running OS's shadow-miss and resident-access paths stay as they were (the other stores to the image, the interpreter's
+included, are dropped exactly); `unsupported_ferr` for a pending x87 exception with CR0.NE = 0; `unsupported_port` for
 an SLP_TYP other than S5; `fetch_not_ram` for code on a non-RAM page. **No longer stops** (no-stop change, November 6;
 [correctness-nostop.md](correctness-nostop.md) §2): a form fexc refuses at a block's first instruction (once `unsupported_form`),
 a system instruction the host does not decode, a decoder or dispatcher failure and a compiler limit at one instruction (once

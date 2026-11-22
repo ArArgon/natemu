@@ -3,8 +3,9 @@
 Status (November 22, 2026, branch `boot-interp-exit-fw`): built by the framework from the repository and proven on the
 pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs the program variant at one
 CPU, and at 2 and 4 up to the SIPI landing (case `exit-ap-natemu`: the CPU start-up slice, B2 of the boot-time interpreter
-plan, without the interpreter yet); the firmware image needs the firmware boot mode (B5). This page is the contract
-those slices build to.
+plan, without the interpreter yet); the firmware image runs whole in natemu's firmware boot mode at 1, 2 and 4 CPUs
+([firmware-mode.md](firmware-mode.md), case `exit-fw-natemu`).
+This page is the contract those slices build to.
 
 ## The pieces
 

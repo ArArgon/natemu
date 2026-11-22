@@ -79,7 +79,8 @@ record is made for a stop's address.
 paging off the identity, wrapping at 4 GiB; compatibility mode the walk, A/D by CAS, #PF with the walker's error code),
 then classified: RAM (`mmio::ram`, with the memory type's barrier as `segments::pages`); a device's page
 (`mmio::unassigned`: the LAPIC page, a remembered claim or the host's `REQUEST_PAGE` answer): `interp_memory` with the
-page; unassigned (the legacy hole among them): reads all-ones, writes ignored; then `split_wait`. Up to four pages per
+page; the firmware image (`mmio::rom`, [firmware-mode.md](firmware-mode.md)): read as RAM, its stores and LOCK's write
+dropped; unassigned (the legacy hole among them): reads all-ones, writes ignored; then `split_wait`. Up to four pages per
 instruction are kept for `read`/`write`/`compare_exchange` (a miss is an interpreter bug: a halt). 1, 2 or 4 bytes inside
 16 are one Arm access (inline `ldr`/`str`, aligned or not: FEAT_LSE2), byte by byte across 16 (the existing tearing
 deviation); stores follow `segments::copy`'s code-write protocol (`code_write` when translated, `dsb ish`,
