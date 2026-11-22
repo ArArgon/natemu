@@ -2,7 +2,7 @@
 """guest-paper: a Paper (Minecraft server) start under natemu, from inputs the framework fetches (docs/benchmarks.md).
 
     tests/bench/run_paper.py run --inputs IO5_INPUTS --paper-inputs PAPER_INPUTS --out DIR --fexc FEXC --natemu NATEMU --runtime RUNTIME
-                             [--vcpus 4] [--ram 2] [--starts 2] [--boots 3] [--speculation-barriers]
+                             [--vcpus 4] [--ram 2] [--starts 2] [--boots 3] [--speculation-barriers] [--perf-log]
 
 The guest is the stock Debian 13 cloud image IO5 boots (tests/io/run_io5.py: its prepared disk.raw, kernel and initramfs,
 input io5-inputs), cloned per run and grown to 16 GiB, booted 1 + BOOTS times through the serial console:
@@ -129,6 +129,11 @@ def natemu_command(args, disk):
            (['--speculation-barriers'] if args.speculation_barriers else [])
 
 
+def phase_command(args, disk, phase):
+    """natemu_command, with the timing log of this phase (OUT/perf-PHASE.log) under --perf-log."""
+    return natemu_command(args, disk) + (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else [])
+
+
 def markers(work, phase):
     """[(host seconds, marker words)] from launch's markers-PHASE.tsv."""
     f = work / f'markers-{phase}.tsv'
@@ -171,7 +176,7 @@ def run(args):
         clone(p / name, serve / name)
     server, host = serve_files(serve)
     result = {'name': 'paper', 'emu': 'natemu', 'vcpus': args.vcpus, 'ram_gib': args.ram, 'jar': JAR, 'jdk': JDK_VERSION,
-              'speculation_barriers': args.speculation_barriers, 'seed': SEED, 'heap': HEAP, 'debs': listed,
+              'speculation_barriers': args.speculation_barriers, 'perf_log': args.perf_log, 'seed': SEED, 'heap': HEAP, 'debs': listed,
               'inputs': recorded, 'natemu': digest(args.natemu),
               'command': [str(c) for c in natemu_command(args, disk)], 'phases': {}}
     contended = []
@@ -180,7 +185,7 @@ def run(args):
         for phase in phases:
             print(f'{phase}: launching', flush=True)
             before = others()
-            code, timed_out, seconds = launch(natemu_command(args, disk), args.out, phase, host,
+            code, timed_out, seconds = launch(phase_command(args, disk, phase), args.out, phase, host,
                                               LIMITS[phase.split('-')[0]], script='paper')
             rows = markers(args.out, phase)
             words = [w for _, w in rows]
@@ -222,6 +227,7 @@ def main():
     r.add_argument('--boots', type=lambda v: max(1, int(v)), default=3, help='timed boots (the median per start position is reported)')
     r.add_argument('--speculation-barriers', action='store_true',
                    help="natemu's page-walk barriers: the CPU reports RDCL_NO, so Linux runs without PTI (README)")
+    r.add_argument('--perf-log', action='store_true', help="natemu's timing log of each boot, OUT/perf-PHASE.log (a profile, not a timing)")
     args = a.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     return run(args)
