@@ -2959,6 +2959,10 @@ impl Compiler {
         loop {
             let (compiles, disk_hits) = (self.compiles, self.disk_hits);
             let (reply, from) = self.ask(bytes, rip, limit, disk, hook)?;
+            // (Only a damaged persistent entry: the tag takes the upper half of a 32-bit answer's RIP.)
+            if self.bits32 && from >> 32 != 0 {
+                return Err(format!("an answer for 32-bit code at {rip:#x} was compiled at {from:#x}").into());
+            }
             let disk_hit = self.disk_hits > disk_hits;
             let t = self.stamp();
             let (whole, end) = (
