@@ -1,10 +1,10 @@
 # The boot-time interpreter's per-instruction cases: format and references
 
 Status: November 22, 2026. The reference side runs and is locked (`tests/interp`, case `references`). natemu runs the
-corpus in its interpreter (case `natemu`, below): 1,574 of the 1,716 cases match their answers, and the other 142 stop
-at a resident operation not built yet (protected-mode far JMP 25, far RET 11, segment loads 38, MOV to CR 68), each
-listed in `tests/interp/natemu-pending.txt` (M2 Max, run 20261122-052809-a4eb). This page is the contract between the
-generator, the reference rig and the natemu side (M2 Part 2, plan section 8, "Per-instruction cases in each mode").
+corpus in its interpreter (case `natemu`, below): all 1,716 cases match their answers (M2 Max). The fault and
+transition cases against the models are case `natemu-faults` ([the interpreter's transitions](interp-transitions.md)).
+This page is the contract between the generator, the reference rig and the natemu side (M2 Part 2, plan section 8,
+"Per-instruction cases in each mode").
 
 ## What there is
 
@@ -16,7 +16,7 @@ generator, the reference rig and the natemu side (M2 Part 2, plan section 8, "Pe
 | `tests/interp/run_interp_ref.py` | The `references` case: the checks below, from the lock (or, seeding, from the references). |
 | `tests/interp/tests.lock` | Every case's two answers, inline (`[answers]`, `tools/reference/answers.py`). |
 | `tests/interp/run_interp_natemu.py` | natemu's side: each case as a machine description through the program driver, judged against the lock (case `natemu`); `--selftest`, case `natemu-machine`: descriptions with the fields they must leave, in 64-bit and interpreted modes. |
-| `tests/interp/natemu-pending.txt` | The cases that stop at a resident operation the interpreter has not built yet. |
+| `tests/interp/interp_faults.py` | The fault and transition cases against `segment_model` and `modes_model` (case `natemu-faults`). |
 
 The corpus covers exactly section 1's first-version list in R, P32 and C32, the P16 stretch, and the transitions R → P16,
 R → P32, P16 → R, P32 → C32, P32 → 64-bit, C32 → P32 and C32 → 64-bit: 1,716 cases (case `references`, the generator at
@@ -120,10 +120,8 @@ field: `by` absent → the locked QEMU answer (equal to KVM's), `qemu` or `kvm` 
 The driver answers a stop at a translation request for its address (`execution::Hook::at`, with blocks ending before
 it), which is RIP in 64-bit code; in the interpreted modes the host asks the same hook at CS.base + EIP at every
 `REQUEST_DECODE` before it decodes (a stop parks the vCPU), and ends the decode's run before the hook's next address, so
-the interpreter caches no record at a stop and asks again there. Case `natemu` runs every case (four at a time); a case
-listed in `natemu-pending.txt` must end in the typed stop `interp_unsupported` naming a resident operation not built yet
-(reported as unsupported, the harness's declared limit), and one that matches instead is an unexpected pass (remove it
-from the list); every other case must match.
+the interpreter caches no record at a stop and asks again there. Case `natemu` runs every case (four at a time); every
+case must match.
 
 ## The references and the rig
 
