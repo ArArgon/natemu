@@ -156,6 +156,7 @@ def init_state(cd_nw=0x60000000, sipi=None):
 
 I, W, S, N = 'I', 'W', 'S', 'N'
 V = 0x9A                               # Linux's trampoline vector (start_eip >> 12 at 9A000H); any vector works
+V2 = 0x9B                              # a second vector (`sipi-sipi`)
 LOOPS = ('hlt', 'wfs', 'mbox')
 LABEL = {'hlt': 'halted', 'wfs': 'wait-for-sipi', 'mbox': 'mailbox', 'done': 'done', 'run': 'running',
          'host': 'running', 'init2': 'running'}
@@ -631,6 +632,12 @@ SCENARIOS = {
     # A fixed IPI to a CPU waiting for its SIPI: not accepted (the APIC is software-disabled), so never delivered.
     'fixed-in-wfs': dict(cpus=[dict(tr=True, boot=[('icr', 'fixed', 1, 0x40), ('icr', 'sipi', 1, V), ('halt',)]),
                                dict(ctx='wfs', start=[('op',), ('t',), ('enable',), ('sti',), ('halt',)])]),
+    # Two SIPIs with different vectors to a waiting AP: the first starts it, the second is discarded (W3, A3).
+    'sipi-sipi': dict(cpus=[dict(tr=True, boot=[('icr', 'init', 1), ('icr', 'sipi', 1, V), ('icr', 'sipi', 1, V2),
+                                                ('halt',)]),
+                            dict(ctx='wfs', start=STUB)]),
+    # One CPU: INIT and SIPI to all excluding self select no CPU and do nothing.
+    'one-cpu': dict(cpus=[dict(tr=True, boot=[('icr', 'init', 'others'), ('icr', 'sipi', 'others', V), ('halt',)])]),
     # A fixed IPI racing an INIT and the started AP's APIC enable (its arrival is never earlier than the read of
     # SW_ENABLED nor later than the IRR store: either is a delivery latency the SDM allows).
     'fixed-around-init': dict(cpus=[dict(tr=True, boot=[('icr', 'init', 1), ('icr', 'sipi', 1, V), ('halt',)]),

@@ -2,7 +2,7 @@
 # the framework's input root and its QEMU answers locked in tests.lock (docs/testing.md, tests/README.md).
 [family]
 name = "system"
-covers = ["crates/**", "third_party/FEX", "tools/**", "tests/system/**", "tests/smp/**", "tests/faults/**", "tests/lib/**"]
+covers = ["crates/**", "third_party/FEX", "tools/**", "tests/system/**", "tests/smp/**", "tests/faults/**", "tests/lib/**", "tests/boot/exit_ap.inc"]
 
 [[suite]]
 name = "system"
@@ -176,6 +176,17 @@ smoke = true
 argv = ["tests/system/run_x4.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 smoke = true
+
+# M2 Part 2: INIT and SIPI, each scenario of tools/models/initsipi_model.py judged against its reference
+# (docs/restructure/initsipi-resident.md); the entry regime until the boot-time interpreter runs the AP stub.
+[suite.cases."initsipi"]
+argv = ["tests/system/run_initsipi.py", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+smoke = true
+
+[suite.cases."initsipi-1"]
+argv = ["tests/system/run_initsipi.py", "--max-block", "1", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
 
 [suite.cases."k1-c1"]
 argv = ["tests/system/run_k1.py", "--cpus", "1", "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
