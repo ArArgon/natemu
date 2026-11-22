@@ -96,10 +96,12 @@ class Cpuid(unittest.TestCase):
 class ControlBits(unittest.TestCase):
     def test_masks(self):
         self.assertEqual(P.cr0_valid_mask(), bitset(0, 1, 2, 3, 4, 5, 16, 18, 29, 30, 31))
-        # plan section 1 CR4 row: DE TSD PSE PAE PGE PCE OSFXSR OSXMMEXCPT FSGSBASE OSXSAVE SMEP; UMIP (November 3)
-        self.assertEqual(P.cr4_valid_mask(), bitset(2, 3, 4, 5, 7, 8, 9, 10, 11, 16, 18, 20))
+        # plan section 1 CR4 row: DE TSD PSE PAE PGE PCE OSFXSR OSXMMEXCPT FSGSBASE OSXSAVE SMEP; UMIP (November 3); MCE
+        # without CPUID.1:EDX.MCE (the recorded deviation, November 22)
+        self.assertEqual(P.cr4_valid_mask(), bitset(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16, 18, 20))
         self.assertEqual(P.efer_valid_mask(), bitset(0, 8, 10, 11))
-        for name in ('VME', 'PVI', 'MCE', 'LA57', 'VMXE', 'SMXE', 'PCIDE', 'SMAP', 'PKE', 'CET', 'PKS', 'UINTR', 'KL'):
+        self.assertFalse(P.feature('1.edx.MCE'))
+        for name in ('VME', 'PVI', 'LA57', 'VMXE', 'SMXE', 'PCIDE', 'SMAP', 'PKE', 'CET', 'PKS', 'UINTR', 'KL'):
             self.assertFalse(RAW['control']['cr4']['bits'][name]['valid'], name)
 
     def test_xcr0(self):

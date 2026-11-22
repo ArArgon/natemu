@@ -45,7 +45,7 @@ pub const CPUID: [(u32, u32, [u32; 4]); 27] = [
 ];
 pub const CR0_VALID: u64 = 0xe005003f;
 /// CR4 bits whose CPUID feature is advertised (SDM Vol.3 2.5); every other bit is reserved (#GP).
-pub const CR4_VALID: u64 = 0x150fbc;
+pub const CR4_VALID: u64 = 0x150ffc;
 pub const EFER_VALID: u64 = 0xd01;
 pub const XCR0_RESET: u64 = 0x1;
 pub const XCR0_VALID: [u64; 3] = [0x1, 0x3, 0x7];

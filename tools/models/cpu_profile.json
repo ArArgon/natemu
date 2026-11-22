@@ -824,10 +824,7 @@
      "7": {
       "name": "MCE",
       "state": "clear",
-      "cr4": [
-       "MCE"
-      ],
-      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
+      "source": "not advertised: natemu raises no machine check; CR4.MCE is valid nonetheless (control.cr4.bits.MCE, a recorded deviation)"
      },
      "8": {
       "name": "CX8",
@@ -2390,8 +2387,9 @@
     },
     "MCE": {
      "bit": 6,
-     "gate": "1.edx.MCE",
-     "valid": false
+     "gate": "arch",
+     "valid": true,
+     "note": "A recorded deviation (M2 Part 2, orchestrator decision of November 22): MOV CR4 accepts MCE although CPUID.1:EDX.MCE is clear, where SDM Vol.3 2.5 makes the bit reserved (#GP(0)). Every x86-64 CPU has MCE, natemu never raises a machine check (the bit enables nothing), and firmware sets it unconditionally: OVMF's reset vector loads CR4 = 640H. QEMU's TCG accepts it the same way."
     },
     "PGE": {
      "bit": 7,
