@@ -1,7 +1,7 @@
 # natemu's firmware boot mode (boot-time interpreter plan, section 7)
 
-Status: November 22, 2026, built (branch `worktree-agent-a5639dd274d60b095`, on `boot-interp` 73aa5b52, with the
-interpreter's resident operations). Spec: [the plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts
+Status: November 22, 2026, built (`boot-interp` commits 0e41c122 to d8049820, on 73aa5b52, with the interpreter's
+resident operations). Spec: [the plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts
 [m2-exit-firmware.md](m2-exit-firmware.md) (the exit test's firmware), [real-code-suites.md](real-code-suites.md) (OVMF)
 and [interp-integration.md](interp-integration.md) (the interpreter's memory layer). The exit test's firmware runs whole
 at 1, 2 and 4 CPUs and OVMF's `main32` and `reset` entries reach SEC with KVM's registers (`reset` through its MOV CR4

@@ -1,10 +1,10 @@
 # M2 exit test: the firmware and its AP part
 
-Status (November 22, 2026, branch `boot-interp-exit-fw`): built by the framework from the repository and proven on the
-pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs the program variant at one
-CPU, and at 2 and 4 up to the SIPI landing (case `exit-ap-natemu`: the CPU start-up slice, B2 of the boot-time interpreter
-plan, without the interpreter yet); the firmware image runs whole in natemu's firmware boot mode at 1, 2 and 4 CPUs
-([firmware-mode.md](firmware-mode.md), case `exit-fw-natemu`).
+Status (November 22, 2026, `boot-interp` commits a120f189 to aaa65e74): built by the framework from the repository and
+proven on the pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs the program
+variant whole at 1, 2 and 4 CPUs, each AP's stub in the boot-time interpreter (case `exit-ap-natemu`: the CPU start-up
+slice, B2 of the boot-time interpreter plan); the firmware image runs whole in natemu's firmware boot mode at 1, 2 and
+4 CPUs ([firmware-mode.md](firmware-mode.md), case `exit-fw-natemu`).
 This page is the contract those slices build to.
 
 ## The pieces
@@ -96,10 +96,10 @@ state (the power-on state, no other state items). The description is then:
     wait-for-sipi
 
 The driver's tables (placed from `--place`, 1000H by default) are below 4 GiB, as the stub's 32-bit `mov cr3` needs.
-The pass is vCPU 0 reaching its end with the registers above; each AP ends halted in its park loop. Until the
-boot-time interpreter runs the stub, `exit-ap-natemu` (`run_exit_fw.py --backend natemu`) passes at 2 and 4 CPUs up to
-the SIPI landing: every AP that stopped did so at the interpreter's entry with the SIPI's state for vector 08H (CS 0800H,
-base 8000H, IP 0), and its stop cancelled the others; at one CPU, where the IPIs select no CPU, it passes whole.
+The pass is vCPU 0 reaching its end with the registers above; each AP ends halted in its park loop. `exit-ap-natemu`
+(`run_exit_fw.py --backend natemu`) passes at 1, 2 and 4 CPUs: each AP climbs from its SIPI in the boot-time
+interpreter (16 -> 32 -> compatibility mode) to 64-bit code and arrives once, counted from there; at one CPU the IPIs
+select no CPU.
 
 ## What natemu's firmware boot mode must provide
 
