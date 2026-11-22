@@ -258,8 +258,10 @@ a real x86-64 Linux machine instead, where the same image runs natively under Do
 builder = "ssh:ubuntu@x86-box"
 ```
 
-Entries record and are keyed by where they were built, so a Mac-built entry and an x86-built one never stand in for
-each other. Only upstream inputs (sources, packages, the builder image) are pinned; what a build produces is
+Entries are keyed by the build environment: this Mac's Rosetta, or an x86 machine's CPU model, CPU flags and kernel
+release (read from it once per run), never by its address. So a Mac-built entry and an x86-built one never stand in
+for each other, while two equivalent x86 machines share their entries. Campaign images and stress-ng record which
+machine built them. Only upstream inputs (sources, packages, the builder image) are pinned; what a build produces is
 recorded (its hash, in the entry's provenance), never required to match an earlier build.
 
 The x86 machine runs at most two builds at once (`BUILD_SLOTS` in `testkit/inputs.py`), shared by every Mac that uses
