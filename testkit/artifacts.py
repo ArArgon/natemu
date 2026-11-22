@@ -335,70 +335,53 @@ def container_builder() -> str:
 
 
 def build_env_described() -> str:
+    """Which machine built an entry, for its provenance: the facts, never the key (build_env). On an x86 machine, its
+    address, /etc/machine-id (when it has one), kernel release and CPU model, read from it once per process."""
     b = container_builder()
-    return f'local: {BENCH_BUILDER} (amd64 through Rosetta)' if b == 'local' else f'{BENCH_BUILDER} under Docker on {b[4:]} (native)'
+    if b == 'local': return f'local: {BENCH_BUILDER} (amd64 through Rosetta)'
+    f = _builder_facts(b[4:])
+    facts = ([f"machine-id {f['machine-id']}"] if f['machine-id'] else []) + [f"kernel {f['kernel']}", f"CPU {f['cpu']}"]
+    return f"{BENCH_BUILDER} under Docker on {b[4:]} (native): {', '.join(facts)}"
 
 
 def build_env() -> str:
-    """What a container-built input is keyed by: an equivalent build environment, not identical bytes (builds are not
-    byte-reproducible even on one machine: timestamps, temporary paths). Its parts:
+    """The platform part of a container-built input's key, beside its recipe and sources: what the build runs on, by
+    its inputs only, as hermetic build systems key it. Its parts:
     - the pinned image, BENCH_BUILDER: the whole userland the recipes build with;
-    - this Mac's builds (the amd64 image through Rosetta) are only that, and every other key says 'native', so an entry
-      built on an x86 machine is never taken for one built here, nor the other way round: Rosetta's CPU is not the
-      x86 machine's, and recipes can detect CPU features at build time or record outputs of programs run there;
-    - on an x86 machine, its CPU vendor and model name, and a digest of its CPU flags (the whole `flags` line, sorted:
-      what configure scripts and test programs can see), for the same reason;
-    - and its kernel release: the container runs on that kernel, which build-time checks and recorded outputs can see.
-    Not its address, nor its CPU count (only how fast it builds): two equivalent machines share their entries, and
-    which one built an entry is recorded in its provenance (build_env_described). Read from the machine once per run."""
-    b = container_builder()
-    if b == 'local': return BENCH_BUILDER
-    if in_run := bool(os.environ.get('TESTKIT_RUN_DIR')):
-        if p := _pinned(f'build-env:{b}'): return p
-    env = f'{BENCH_BUILDER} {_native_env(b[4:])}'
-    if in_run: pin_for_run(f'build-env:{b}', env)
-    return env
+    - the platform: this Mac's builds (the amd64 image through Rosetta) are the bare image, and an x86 machine's are
+      the image and 'native', so the two never stand in for each other: Rosetta presents a different CPU from any
+      x86 machine's.
+    Never the build machine's identity (address, CPU, kernel): an x86 builder can move by editing its ssh address and
+    the cache stays valid. That holds because recipes are hermetic: they pin their target flags (no -march=native, no
+    configure probe of the build machine's CPU), and the results of programs they run at build time (glibc's and
+    CPython's own checks) are logged, not used. A recipe found to depend on the build machine is a recipe bug, to fix
+    in the recipe. Which machine built an entry is recorded in its provenance (build_env_described)."""
+    return BENCH_BUILDER if container_builder() == 'local' else f'{BENCH_BUILDER} native'
 
 
-_native_envs: dict[str, str] = {}
+_builder_facts_read: dict[str, dict] = {}
 
 
-def _native_env(host: str) -> str:
-    """build_env()'s description of the x86 machine `host`, read over ssh once per process. The last one read is kept
-    in the state folder and used when the machine cannot be reached, so what is already built is still found."""
-    if host in _native_envs:
-        if isinstance(e := _native_envs[host], BuildFailure): raise e      # unreachable: tried once, not per input
-        return e
-    saved = paths.state_dir() / 'builder-env' / host
-    try:
+def _builder_facts(host: str) -> dict:
+    """The x86 machine `host`'s kernel release, machine-id ('' if it has none) and CPU ('vendor model'), read over ssh
+    once per process. Only for provenance: an entry is built there, so the machine is reachable."""
+    if host not in _builder_facts_read:
         out = _run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host,
-                    "uname -r && grep -m3 -E '^(vendor_id|model name|flags)[[:space:]]*:' /proc/cpuinfo"], timeout=60).stdout
-    except BuildFailure as e:
-        # ponytail: if the machine comes back (say, rebooted into a new kernel) before this run builds on it, that build
-        # is stored under the last description; re-describe in _in_docker_over_ssh if that ever matters
-        last = saved.read_text().strip() if saved.is_file() else ''
-        _native_envs[host] = last if last.startswith('native: ') else e
-        return _native_env(host)
-    env = _describe_native(out)                 # not a description: a failure, never the saved one
-    saved.parent.mkdir(parents=True, exist_ok=True)
-    tmp = saved.with_name(f'.{host}.{os.getpid()}'); tmp.write_text(env + '\n'); os.replace(tmp, saved)
-    _native_envs[host] = env
-    return env
-
-
-def _describe_native(out: str) -> str:
-    """`uname -r` and /proc/cpuinfo's vendor_id, model name and flags lines -> build_env()'s native part."""
-    lines = out.strip().splitlines()
-    info = {k.strip(): v.strip() for k, _, v in (l.partition(':') for l in lines[1:])}
-    if not lines or any(k not in info for k in ('vendor_id', 'model name', 'flags')):
-        raise BuildFailure('container-builder', f'cannot describe the builder from {out[-500:]!r}')
-    flags = hashlib.sha256(' '.join(sorted(set(info['flags'].split()))).encode()).hexdigest()[:16]
-    return f"native: {info['vendor_id']} {info['model name']}, flags {flags}, kernel {lines[0].strip()}"
+                    'echo "kernel: $(uname -r)"; echo "machine-id: $(cat /etc/machine-id 2>/dev/null)"; '
+                    "grep -m2 -E '^(vendor_id|model name)[[:space:]]*:' /proc/cpuinfo"], timeout=60).stdout
+        info = {k.strip(): v.strip() for k, _, v in (l.partition(':') for l in out.strip().splitlines())}
+        if not info.get('kernel') or any(k not in info for k in ('vendor_id', 'model name')):
+            raise BuildFailure('container-builder', f'cannot describe the builder from {out[-500:]!r}')
+        _builder_facts_read[host] = {'kernel': info['kernel'], 'machine-id': info.get('machine-id', ''),
+                                     'cpu': f"{info['vendor_id']} {info['model name']}"}
+    return _builder_facts_read[host]
 
 
 def bench_builder() -> str:
     """Where the benchmark programs are built: 'local' (this Mac, an amd64 container through Rosetta) or
-    'ssh:user@host' (a real x86-64 Linux machine). NATEMU_BENCH_BUILDER, else [bench] builder in .natemu/config.toml."""
+    'ssh:user@host' (a real x86-64 Linux machine). NATEMU_BENCH_BUILDER, else [bench] builder in .natemu/config.toml.
+    Unlike the container builds (build_env), what it builds is keyed by the machine's address: it is not hermetic by
+    design, building on that machine's own userland, which is not pinned."""
     b = os.environ.get('NATEMU_BENCH_BUILDER') or local_config().get('bench', {}).get('builder', 'local')
     if b != 'local' and not b.startswith('ssh:'):
         raise BuildFailure('bench-image', f'unknown builder {b!r}: local or ssh:user@host')
