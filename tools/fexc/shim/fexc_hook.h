@@ -354,7 +354,11 @@ constexpr uint32_t FEXC_WATCH_ARMED = 0xb4;   // (frame::WATCH_ARMED: DR7 arms a
 // one whose floating-point op comes before a fault site of its own (the narrowing stores: fexc_x87_hold, checked when a site
 // is recorded), and one with a stack check (FexcX87Hold, FexcX87Release: after a stack fault FPSR's flags are the saved ones
 // again). At a bank inside a run the resident takes the saved byte when bit 5 is set, else FPSR.
-inline bool FexcX87Lazy() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+// Fast x87 without AFP: a host without AFP keeps the per-op wrapper (its NaN fix-up and software DE read each op's flags) in
+// accurate mode only; fast mode there runs x87 as a host with AFP does, with the deviations of docs/floating-point.md.
+// (`fexc_accurate` is read only without AFP, so no answer of a host with AFP depends on it.)
+inline bool FexcX87Exact() { return fexc_no_afp && fexc_accurate; }
+inline bool FexcX87Lazy() { return fexc_slice1 && !FexcX87Exact() && uint64_t(fexc_x87_unmasked) == 0; }
 // M2 task 4, `--x87-guess V` (32-bit code; V = 0x1000 | TOP << 8 | the tag byte, as the guest state held them when the unit
 // was requested; 0: none): the x87 stack pass compiles the unit for that pair (FEX's x87StackOptimizationPass, TopAbs).
 inline FexcArg<uint64_t, FEXC_ARG_X87_GUESS> fexc_x87_guess;
@@ -374,7 +378,7 @@ inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_see
 // A fault point after a floating-point op of its own x87 instruction that fexc_x87_hold does not list (none known): the unit is
 // compiled again with every x87 instruction held (fexc.cpp), which is exact for any form.
 inline bool fexc_x87_hold_missing = false, fexc_x87_hold_all = false;
-inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !FexcX87Exact() && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
 // fexc_x87_run_entry: what it is at the unit's entry (a JIT attempt that starts over starts from it again).
 // fexc_x87_run_top (M2 task 4, the second entry): the unit is 32-bit code with no x87 instruction and an SSE instruction that

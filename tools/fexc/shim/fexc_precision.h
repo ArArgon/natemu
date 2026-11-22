@@ -622,7 +622,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
         Mask = SimdCheckMask();
       }
       // AFP fallback (the owner's default mode): without AFP an x87 m32/m64 memory operand's DE is set by software even masked (below).
-      const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1);
+      const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1) && !FexcX87Lazy();   // (fast mode with x87 runs: not set, the `masked-x87-de` deviation)
       // AFP accurate plan, chunk 2 (B): accurate mode without AFP and with DE masked (and no DAZ: x86 sets no DE then) sets the flag of each
       // SSE/AVX op by software, into FPSR.IDC (FexcSimdDe, before the op: no commit or fault point lies between it and the op).
       const bool SimdDe = !X87 && fexc_no_afp && fexc_accurate && !(uint64_t(fexc_simd_unmasked) >> 1 & 1) && !fexc_daz;
