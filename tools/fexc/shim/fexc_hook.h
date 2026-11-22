@@ -378,14 +378,6 @@ inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_see
 // A fault point after a floating-point op of its own x87 instruction that fexc_x87_hold does not list (none known): the unit is
 // compiled again with every x87 instruction held (fexc.cpp), which is exact for any form.
 inline bool fexc_x87_hold_missing = false, fexc_x87_hold_all = false;
-// Fast x87 without AFP (x87 runs, lazy flags): FSW.DE of an m32/m64 operand, which Arm without AFP does not flag, is tested
-// by the JIT with integer words right before the op, inside the run (fexc_sites.inc, FexcBeforeOp). The op's IR node ->
-// {which argument the memory operand is, whether the other operand is looked at (a NaN in ST0: no DE), a memory dividend (a
-// zero divisor: ZE, no DE), the operand's bytes}. Filled by FexcPrecision::PlaceFPChecks, which runs right before register
-// allocation, and read by the JIT of the same compile. (Here and not in fexc_precision.h: fexc_sites.inc is compiled inside
-// namespace FEXCore::CPU, where that header's inline variables are other objects than the passes'.)
-struct FexcX87DeOp { uint8_t Arg; bool Other, Div; uint8_t Elem; };
-inline std::map<const void*, FexcX87DeOp> fexc_x87_de;
 inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !FexcX87Exact() && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
 // fexc_x87_run_entry: what it is at the unit's entry (a JIT attempt that starts over starts from it again).
