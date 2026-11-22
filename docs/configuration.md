@@ -7,8 +7,8 @@ the flags cannot express. Flags still work alone, exactly as before.
 Settings are layered, lowest first: built-in defaults, the file, the deprecated environment
 variables, the flags, then `--set KEY=VALUE`. A later layer overrides an earlier one. Paths in the
 file are relative to the file's folder; paths in flags and `--set` are relative to the working
-directory. `--kernel` and `--fexc` are only required when the file does not give
-`[boot.kernel] image` and `[engine] fexc`.
+directory. `--fexc` is only required when the file does not give `[engine] fexc`, and `--kernel` only when
+the file gives no `[boot.kernel] image` and no firmware image is booted (`--firmware` or `[boot.firmware]`).
 
 ## An annotated example
 
@@ -121,7 +121,9 @@ for now.
 
 `[boot.firmware]` (or `--firmware FILE`) boots a firmware image instead of a Linux kernel, the way a PC
 starts: the image sits at the top of the first 4 GiB of the guest's address space (a 4 MiB image at
-FFC00000H to FFFFFFFFH), read-only as a PC's flash ROM is (the guest's writes to it are ignored), and the
+FFC00000H to FFFFFFFFH), read-only as a PC's flash ROM is (the guest's writes to it are ignored, except that a
+few kinds of store in 64-bit code stop the run with `unsupported_mmio` instead: store pairs, pushes, stores
+that cross a page, read-modify-write instructions such as `add [rom], eax`, and LOCK or XCHG), and the
 first processor starts at its reset vector, the last 16 bytes, in the state a processor has right after
 power-on: 16-bit real mode. `start = "flat32"` starts it at the same address in 32-bit protected mode with
 flat segments, the start some firmware (OVMF's `Main32`) also takes. The other processors wait until the
