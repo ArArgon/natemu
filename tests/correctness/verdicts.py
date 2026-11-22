@@ -114,6 +114,45 @@ def torture32(name, f, extra):
     return 'failed', f'rc and output {mine}, the x86 reference machine\'s {known[name]}'
 
 
+LTP32 = pathlib.Path(__file__).parent / 'ltp32.txt'
+LIBM32 = pathlib.Path(__file__).parent / 'libm32.txt'
+
+
+def _x86_rc(name, f, extra, file, own):
+    """`own`, the suite's own verdict from the test's exit status, beside the x86 reference machine's status for the
+    same test of the same image (`file`: `NAME RC` lines, `*` where two seeding runs differed). A test natemu reports
+    unsupported that passed there fails: natemu lacks something the real machine has. A failure's message gives the
+    reference's status. Under TESTKIT_SEED_ANSWERS=1 the status is the reference machine's: it is recorded (under a
+    lock: parts may seed at once), and the result is unverified."""
+    import fcntl, os
+    rc = f.get('rc', '')
+    if os.environ.get('TESTKIT_SEED_ANSWERS'):
+        with open(file, 'a+') as h:
+            fcntl.flock(h, fcntl.LOCK_EX); h.seek(0)
+            known = dict(ln.split(None, 1) for ln in h.read().splitlines())
+            known[name] = rc if known.get(name, rc) == rc else '*'
+            h.seek(0); h.truncate(); h.write(''.join(f'{k} {v}\n' for k, v in sorted(known.items())))
+        return 'unverified', 'recorded'
+    known = dict(ln.split(None, 1) for ln in file.read_text().splitlines()) if file.is_file() else {}
+    if name not in known: return 'failed', f'no answer in {file.name} (seed it: docs/testing.md)'
+    v, msg = own(name, f, extra)
+    if v == 'unsupported' and known[name] == '0':
+        return 'failed', f'{msg}: unsupported here, passed on the x86 reference machine'
+    return v, f'{msg} (the x86 reference machine: rc={known[name]})' if v == 'failed' else msg
+
+
+def ltp32(name, f, extra):
+    """run-ltp.sh on the i686 build of LTP: judged as ltp, beside the x86 reference machine's status (tests/correctness/
+    ltp32.txt; the same image and kernel booted there under KVM, testkit/harness/campaign.py native_vm)."""
+    return _x86_rc(name, f, extra, LTP32, ltp)
+
+
+def libm32(name, f, extra):
+    """run-libm.sh on the i686 build of glibc's math tests: judged as libm, beside the x86 reference machine's status
+    (tests/correctness/libm32.txt; the image run there in a chroot, testkit/harness/campaign.py native)."""
+    return _x86_rc(name, f, extra, LIBM32, _glibc)
+
+
 I386 = pathlib.Path(__file__).parent / 'i386'
 I386_SEEDED = set()         # the programs this seeding process has recorded: their other builds must print the same
 
