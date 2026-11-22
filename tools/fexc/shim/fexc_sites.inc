@@ -1477,6 +1477,50 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     if (Dies && Recp && Scalar) FexcFlushWords(Src, Src, 4, true, true, false);   // VTMP1 only: VTMP2 holds H
   }
   if (FexcX87Op(IROp)) FexcX87Begin();
+  // Fast x87 without AFP: FSW.DE of the instruction's m32/m64 operand (fexc_x87_de, fexc_hook.h), which Arm without AFP does not
+  // flag. Inside the run and behind the instruction's hold, so the flag goes into FPSR.IDC like a hardware flag (a stack fault
+  // drops it with the others). The usual operand costs the first three or four words:
+  //   m64:  fmov x0, dM; ubfx x1, x0, #52, #11; cbnz x1, done; lsl x0, x0, #1; cbz x0, done
+  //   m32, converted (a nonzero double below 2^-126):  fmov x0, dM; ubfx x1, x0, #52, #11; sub w1, w1, #897; tbz w1, #31, done; lsl; cbz
+  //   FLD m32 (the convert itself):  fmov w0, sM; ubfx w1, w0, #23, #8; cbnz w1, done; lsl w0, w0, #1; cbz w0, done
+  //   [ST0 a NaN: no DE]  fmov x0, dO; ubfx x1, x0, #0, #63; movz x0, #0x7ff0, lsl #48; sub x0, x0, x1; tbnz x0, #63, done
+  //   [a memory dividend over a zero ST0 is ZE]  cbz x1, done
+  //   mrs x0, fpsr; orr x0, x0, #0x80; msr fpsr, x0; done:
+  if (const auto De = fexc_x87_de.find(Node); De != fexc_x87_de.end() && FexcX87Op(IROp) && fexc_x87_run == FEXC_RUN_OPEN) {
+    const auto [Arg, Other, Div, Elem] = De->second;
+    const auto M = GetVReg(IROp->Args[Arg]);
+    ARMEmitter::ForwardLabel Done;
+    if (IROp->Op == IROps::OP_FLOAT_FTOF) {
+      fmov(ARMEmitter::Size::i32Bit, TMP1, M.S());
+      ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 23, 8);
+      (void)cbnz(ARMEmitter::Size::i32Bit, TMP2, &Done);
+      lsl(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1);
+      (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &Done);
+    } else {
+      fmov(ARMEmitter::Size::i64Bit, TMP1, M.D());
+      ubfx(ARMEmitter::Size::i64Bit, TMP2, TMP1, 52, 11);
+      if (Elem == 4) {
+        sub(ARMEmitter::Size::i32Bit, TMP2, TMP2, 1023 - 126);
+        (void)tbz(TMP2, 31, &Done);
+      } else {
+        (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &Done);
+      }
+      lsl(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Done);
+    }
+    if (Other) {
+      fmov(ARMEmitter::Size::i64Bit, TMP1, GetVReg(IROp->Args[1 - Arg]).D());
+      ubfx(ARMEmitter::Size::i64Bit, TMP2, TMP1, 0, 63);
+      movz(ARMEmitter::Size::i64Bit, TMP1, 0x7ff0, 48);
+      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
+      (void)tbnz(TMP1, 63, &Done);
+      if (Div) (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &Done);
+    }
+    mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+    orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x80);
+    msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+    (void)Bind(&Done);
+  }
   if (FexcX87NanOp(IROp)) {   // the sources the op overwrites, for the NaN fix-up (FexcAfterOp)
     const auto Dst = GetVReg(Node), A = GetVReg(IROp->Args[0]), B = GetVReg(IROp->Args[IROp->Op == IROps::OP_VFSQRT ? 0 : 1]);
     if (Dst == A) mov(VTMP1.Q(), A.Q());
