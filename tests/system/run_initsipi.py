@@ -17,6 +17,10 @@ woken), the others translated 64-bit code. The model's vectors map to natemu's: 
 entry regime only, since the identity space cannot hold code on page 0: 08H in the interpreter regime), the scenario's
 second vector to 09H (a real-mode park there, never to be started), any other to 08H.
 
+A start program other than the stub's shape: `fixed-in-wfs`'s (the climb, then the APIC software-enabled, STI and an idle
+HLT, never signalling), the stub with its 64-bit part replaced (the BSP patches a jump at the stub's `ap64` to it: x2APIC
+on, SVR 1FFH, `sti`, a HLT loop; an interrupt delivered there ends the run at the driver's logging IDT).
+
 `--regime entry` (the default, until the boot-time interpreter runs the stub's MOV CR0 and far JMPs): the driver runs with
 `--entry-ends` and `NATEMU_INTERPRETER=off` (the resident stops at the interpreter's entry, as before it ran), and a CPU
 that stopped at the interpreter's entry is observed as done with the start its state shows
@@ -49,6 +53,13 @@ SCENARIOS = ('linux', 'sipi-sipi', 'kvm-unit-tests', 'edk2', 'edk2-back-to-back'
              'nmi-held', 'nmi-init-in-wfs', 'park-with-init', 'never-started', 'bsp-init', 'fixed-in-wfs', 'one-cpu')
 XAPIC = {'kvm-unit-tests'}                     # their ICR writes through the xAPIC page, as kvm-unit-tests' smp.c
 FIRMWARE = {'bsp-init'}                        # the BSP restarts at the reset vector: entry regime only
+IDLE = [('op',), ('t',), ('enable',), ('sti',), ('halt',)]   # fixed-in-wfs's start: the climb, then an idle with IF = 1
+# The idle's 64-bit code (any address: the BSP patches a jump to it at the stub's ap64) and that jump's bytes.
+IDLE_CODE = ('        bits 64\nidle64: mov ecx, 0x1B\n        rdmsr\n        or eax, 0xC00\n        wrmsr\n'
+             '        mov ecx, 0x80F\n        mov eax, 0x1FF\n        xor edx, edx\n        wrmsr\n        sti\n'
+             '.idle:  hlt\n        jmp .idle\nidle_jump: mov rax, idle64\n        jmp rax\nidle_jump_end:\n')
+IDLE_PATCH = ('        lea rsi, [rel idle_jump]\n        mov edi, AP(ap64)\n        mov ecx, idle_jump_end - idle_jump\n'
+              '        rep movsb\n')
 
 
 def vectors(sc, regime):
@@ -103,11 +114,19 @@ def source(name, regime):
     else:
         apic_on = ('        mov ecx, 0x1B\n        rdmsr\n        or eax, 0xC00\n        wrmsr\n'
                    '        mov ecx, 0x80F\n        mov eax, 0x1FF\n        xor edx, edx\n        wrmsr\n')
+    starts = [c['start'] for c in sc['cpus'][1:] if 'start' in c]
+    idle = IDLE in starts
+    if idle and any(s != IDLE for s in starts):
+        raise ValueError(f'{name}: the idle start and another on one stub page')
+    if any(s not in (m.STUB, m.TRAMPOLINE, IDLE) for s in starts):
+        raise ValueError(f'{name}: a start program the runner does not build')
     bsp = ('bits 64\nstart:  cld\n        lea rsi, [rel ap_src]\n        mov edi, AP_BASE\n        mov ecx, ap_end - ap_src\n'
-           '        rep movsb\n        mov rax, cr3\n        mov [abs AP_CR3], eax\n        mov ecx, 0xC0000080\n        rdmsr\n'
+           '        rep movsb\n' + (IDLE_PATCH if idle else '') + '        mov rax, cr3\n        mov [abs AP_CR3], eax\n        mov ecx, 0xC0000080\n        rdmsr\n'
            '        and eax, ~0x400\n        mov [abs AP_EFER], eax\n' + apic_on)
     text = ['[map symbols MAPFILE]\n        org BODY\n        default rel\n%include "exit_ap.inc"\n        AP_STUB\n'
             '        times 0x1000 - ($ - $$) db 0\n', bsp, program('bsp', sc['cpus'][0].get('boot', []), vec, xapic)]
+    if idle:
+        text.append(IDLE_CODE)
     for i, c in enumerate(sc['cpus'][1:], 1):
         ctx = c.get('ctx', 'run')
         if ctx == 'wfs':
