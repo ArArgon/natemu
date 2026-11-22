@@ -1051,7 +1051,8 @@ impl<'a> Verifier<'a> {
         Some((at..end, value))
     }
     /// A guest-RIP move's value is its instruction's end (a pushed return address) or the end plus a 32-bit
-    /// displacement whose bytes are in the instruction.
+    /// displacement whose bytes are in the instruction; or, in the first instruction of 32-bit code, the block's own RIP
+    /// (M2 reuse: a FISTP m64 that starts its unit compares its RIP with the kept integer's, `X87_INT_RIP`).
     fn displacement_ok(&self, at: u32, value: u64) -> bool {
         let Some((g, _)) = self.instruction(at) else {
             return false;
@@ -1060,6 +1061,7 @@ impl<'a> Verifier<'a> {
         let disp = value.wrapping_sub(self.c.address(g as u64 + insn.len() as u64)) as i64;
         disp == 0
             || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
+            || (self.c.bits32 && g == 0 && value == self.c.address(0))
     }
 
     /// The per-word rules of the linear pass, then the site words.

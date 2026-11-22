@@ -5523,6 +5523,10 @@ mod tests {
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
         assert!(c.guess_read);
         assert!(same(&mut c, &code, 0x4000) && !c.guess_read, "no x87: one answer under every guess");
+        // A FISTP m64 that starts its unit compares its own RIP with the kept integer's: a relocation, moved with the block
+        // (a plain constant before, which the libm32 campaign's reuse check found).
+        let fistp = [0xdf, 0x7c, 0x24, 0x20, 0xc3]; // fistp qword [esp + 0x20]; ret
+        assert!(!same(&mut c, &fistp, 0x5655_5800) && same(&mut c, &fistp, 0xf7c5_6800));
         c.x87_guess = 0x1701;
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
         c.x87_guess = 0;
