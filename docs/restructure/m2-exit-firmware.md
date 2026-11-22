@@ -36,13 +36,17 @@ The BSP, from the reset vector (CS F000H, base FFFF0000H, IP FFF0H; `jmp near` t
 `START_APS` (also the program's body): copies the AP stub (464 bytes) to 8000H, writes the BSP's CR3 (must be below
 4 GiB) and its EFER without LMA into the stub's fields, reads the CPU count, enables the x2APIC (IA32_APIC_BASE EN|EXTD,
 SVR 1FFH), writes the ICR (MSR 830H) with INIT (assert), waits 10,000,000 TSC cycles, SIPI vector 08H, waits 200,000,
-SIPI again, waits 200,000, all with the all-excluding-self shorthand. It then waits until the counter reaches the CPU
+SIPI again, waits 200,000, all with the all-excluding-self shorthand and each after `mfence; lfence` (a WRMSR to an
+x2APIC register is not serializing, SDM Vol.3A 11.12.3: the stub and its fields are visible before the IPI). It then waits until the counter reaches the CPU
 count - 1 (timeout 2^34 TSC cycles), waits 20,000,000 cycles more (an AP started twice counts twice), and tallies.
 
 Each AP, from the SIPI (CS 0800H, base 8000H, IP 0): `cli`; the same MTRR write; `mov ax, cs; mov ds, ax`; `o32 lgdt`
 of the stub's own GDT; PE (CD, NW cleared); far JMP ptr16:32 (13 instructions in R and P16); flat segments, CR4.PAE,
 CR3 and EFER from the stub's fields, PG, far JMP to the 64-bit CS (17 instructions in P32 and C32); in 64-bit mode
 `lock inc` of its arrival byte (indexed by its initial APIC ID) and of the shared counter, then `cli; hlt` in a loop.
+Both updates are RIP-relative: the same bytes run as 32-bit code address low memory instead, so an AP that is not
+really in 64-bit mode after its last far jump (an interpreter that carries on in compatibility mode, say) never
+arrives and the BSP reports a timeout (`test_exit_fw.py` checks the encoding).
 The stub page holds 16-, 32- and 64-bit code, the GDT, the BSP-written fields, the counter and 256 arrival bytes: code
 and data on one page, on purpose (plan section 5).
 
@@ -105,9 +109,9 @@ The pass is vCPU 0 reaching its end with the registers above; each AP ends halte
   mailbox (the image reads no ACPI table; no MADT is needed).
 - **RAM:** from 0, at least 1 MiB: the image uses 8000H-8FFFH (the AP stub page; SIPI vector 08H), 10000H-15FFFH
   (page tables) and 70000H-7FFFFH (the BSP's stack). The legacy hole is not touched.
-- **Paging:** 2 MiB identity pages over all of 4 GiB, so the BSP's 64-bit code runs from the ROM at FFFFxxxxH under a
-  2 MiB leaf that also covers the local APIC's page (never accessed: the x2APIC is used) and addresses with nothing
-  behind them.
+- **Paging:** 2 MiB identity pages over all of 4 GiB, so the BSP's 64-bit code runs from the ROM at FFFFxxxxH under
+  the leaf FFE00000H-FFFFFFFFH, which holds addresses with nothing behind them besides the image; other leaves cover
+  the local APIC's page (never accessed: the x2APIC is used) and the rest of the space above RAM.
 - **The CPU count:** CPUID.1:EBX[23:16] = N with EDX.HTT = (N > 1), as `natemu_abi::cpu::cpuid` presents it today
   (QEMU and KVM give the same for powers of two). APIC IDs are the vCPU numbers; the report's bitmap holds IDs below 64.
 - **x2APIC:** MSRs 80FH (SVR) and 830H (ICR) with INIT (level assert) and start-up, shorthand all excluding self, from
@@ -144,7 +148,9 @@ answer for the image as built and checks it is the pass. An image changed since 
 | 4 | `EXITFW cpus=4 aps=3 ids=1,2,3 status=0` | RAX 4, RBX 3, RCX 0, RDX 0EH |
 
 Shown to fail when they should: a run with the image changed after seeding fails every case with `ANSWER-MISSING`;
-`test_exit_fw.py` refuses wrong reports and registers and checks its instruction check against forms outside the list.
+`test_exit_fw.py` refuses wrong reports and registers, checks its instruction check against forms outside the list
+(and that it accepts the list's own forms), and checks that the AP's counting instructions, decoded as 32-bit code,
+address neither the counter nor the arrival bytes.
 Experiment (not a case; the x86 reference machine, KVM, the dev container's Debian QEMU 10.0.13, by hand): a firmware
 whose AP never adds to the counter reports `cpus=4 aps=0 ids=1,2,3 status=1` (timeout) at 4 CPUs; one whose AP stops
 at a real-mode `hlt` (IF = 0) before its far jump reports `aps=2 ids=1,3 status=1`: KVM woke two of the three halted
@@ -155,9 +161,10 @@ HLT) does not either. The exit test's APs park in 64-bit code in a `cli; hlt` lo
 
 - Today `lapic.rs` stops `unsupported_system` at any INIT or start-up IPI, before looking at the targets: at 1 vCPU,
   the all-excluding-self INIT has no target and must become a no-op, not a stop.
-- The CPU start-up slice's case: the program at 1, 2 and 4 vCPUs, judged by `run_exit_fw.judge('program', N, ...)` on
-  the driver's final registers (the same judge as the references). The firmware boot mode's case: the image at 1, 2, 4
-  and more vCPUs, judged by `judge('firmware', ...)` on natemu's serial output and the `poweroff` stop; the plan's
+- The CPU start-up slice's case: the program at 1, 2 and 4 vCPUs, judged by `run_exit_fw.judge('program', N, answer,
+  want_exit=...)` on the driver's final registers, with the answer's `exit` set from vCPU 0's stop (its end reached)
+  in place of QEMU's exit status. The firmware boot mode's case: the image at 1, 2, 4 and more vCPUs, judged by
+  `judge('firmware', N, answer, want_exit='poweroff')` on natemu's serial output and its `poweroff` stop; the plan's
   bounds on decode exits and shootdowns (section 8) are asserted there.
 - The stub page holds the APs' 64-bit code and the counter: once one AP has translated its 64-bit code there, the
   other APs' counter stores go through `code_write` while later APs may still be interpreting their 16-bit code on

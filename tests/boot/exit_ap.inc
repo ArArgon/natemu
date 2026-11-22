@@ -19,7 +19,8 @@
 ; Each AP, from the SIPI (real mode, CS 0800H): enables the MTRRs first (IA32_MTRR_DEF_TYPE E = 1, FE = 0, default type
 ; write-back: until then all memory is UC), loads its GDT, sets PE (clearing CD and NW), far-jumps to flat 32-bit code
 ; (paging off), sets PAE, loads the BSP's CR3 and EFER (LME, and NXE as the BSP has it), sets PG (compatibility mode),
-; far-jumps to 64-bit code, adds one to its arrival byte and to the counter (LOCK INC), and parks (cli; hlt loop).
+; far-jumps to 64-bit code, adds one to its arrival byte and to the counter (LOCK INC, RIP-relative: only 64-bit
+; execution reaches them), and parks (cli; hlt loop).
 ; The 16- and 32-bit parts use only the boot-time interpreter's first-version instructions (plan section 1);
 ; tests/boot/test_exit_fw.py checks each instruction there. No port I/O outside 64-bit code.
 
@@ -74,8 +75,9 @@ ap32_end:
 ap64:   mov eax, 1
         cpuid
         shr ebx, 24                             ; the initial APIC ID
-        lock inc byte [rbx + AP(ap_arrivals)]
-        lock inc dword [abs AP(ap_count)]
+        lea rax, [rel ap_arrivals]              ; RIP-relative (position-independent): run as 32-bit code these bytes
+        lock inc byte [rax + rbx]               ; address low memory instead, so an AP that is not in 64-bit mode
+        lock inc dword [rel ap_count]           ; never counts and the BSP times out
 .park:  cli
         hlt
         jmp .park
@@ -119,8 +121,11 @@ AP_ARRIVALS     equ AP(ap_arrivals)
         jb %%wait
 %endmacro
 
-; an x2APIC ICR write: %1 the low word (destination ignored: shorthand)
+; an x2APIC ICR write: %1 the low word (destination ignored: shorthand). A WRMSR to an x2APIC register is not
+; serializing (SDM Vol.3A 11.12.3): the fences make the stub and its fields visible before the IPI.
 %macro ICR 1
+        mfence
+        lfence
         mov ecx, 0x830
         xor edx, edx
         mov eax, %1
