@@ -244,10 +244,14 @@ a real x86-64 Linux machine instead, where the same image runs natively under Do
 builder = "ssh:ubuntu@x86-box"
 ```
 
-Entries are keyed by the build environment: this Mac's Rosetta, or an x86 machine's CPU model, CPU flags and kernel
-release (read from it once per run), never by its address. So a Mac-built entry and an x86-built one never stand in
-for each other, while two equivalent x86 machines share their entries. Campaign images and stress-ng record which
-machine built them. Only upstream inputs (sources, packages, the builder image) are pinned; what a build produces is
+Entries are keyed by what they are built from (the recipe, its sources, the pinned image) and the platform: this
+Mac's Rosetta or a native x86 machine, which never stand in for each other because Rosetta presents a different CPU.
+Which x86 machine builds them (its address, CPU, kernel) is not in the key, so moving the builder means editing the
+address and the cache stays valid. That relies on the recipes being hermetic: they pin their target flags (no
+`-march=native`, no configure probe of the build machine's CPU), and a recipe found to depend on the machine it
+builds on is a recipe bug. Campaign images and stress-ng record which machine built them: its address,
+`/etc/machine-id`, kernel release and CPU model. The benchmark image (`[bench] builder`) is the exception: it builds
+on the machine's own unpinned userland, so it stays keyed by that machine's address. Only upstream inputs (sources, packages, the builder image) are pinned; what a build produces is
 recorded (its hash, in the entry's provenance), never required to match an earlier build.
 
 The x86 machine runs at most two builds at once (`BUILD_SLOTS` in `testkit/inputs.py`), shared by every Mac that uses

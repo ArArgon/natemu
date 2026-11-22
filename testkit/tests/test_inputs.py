@@ -248,57 +248,51 @@ def test_builder_comes_from_the_machine_config_and_keys_the_entry(monkeypatch, t
     local = inputs.artifacts.build_env()
     (tmp_path / 'cache' / 'config.toml').write_text('[build]\nbuilder = "ssh:u@x86"\n')
     assert inputs.artifacts.container_builder() == 'ssh:u@x86'
-    monkeypatch.setattr(inputs.artifacts, '_native_env', lambda host: f'native: {host}')
-    assert inputs.artifacts.build_env() != local and 'native: u@x86' in inputs.artifacts.build_env()
+    assert inputs.artifacts.build_env() != local and inputs.artifacts.build_env() == inputs.artifacts.BENCH_BUILDER + ' native'
     (tmp_path / 'wt' / '.natemu').mkdir(parents=True)
     (tmp_path / 'wt' / '.natemu' / 'config.toml').write_text('[build]\nbuilder = "local"\n')   # the worktree wins
     assert inputs.artifacts.container_builder() == 'local'
 
 
 
-def _cpuinfo(kernel='7.0.0-43-generic', model='AMD Ryzen 7 8845HS w/ Radeon 780M Graphics', flags='fpu sse avx2'):
-    return (f'{kernel}\nvendor_id\t: AuthenticAMD\nmodel name\t: {model}\nflags\t\t: {flags}\n')
 
 
-def test_native_builders_are_keyed_by_cpu_and_kernel_not_address(monkeypatch, tmp_path):
-    """Two x86 machines with the same CPU, flags and kernel share their container-built entries; another kernel, CPU
-    model or flag set, or this Mac (Rosetta), does not. The machine is read once per process; when it cannot be
-    reached, the description last read is used, so what is built is still found."""
+def _facts(kernel='7.0.0-43-generic', model='AMD Ryzen 7 8845HS w/ Radeon 780M Graphics', machine_id='0123abcd', vendor='AuthenticAMD'):
+    return f'kernel: {kernel}\nmachine-id: {machine_id}\nvendor_id\t: {vendor}\nmodel name\t: {model}\n'
+
+
+def test_native_builders_are_keyed_by_platform_not_host_and_provenance_records_the_host(monkeypatch, tmp_path):
+    """A container-built input is keyed by its inputs: the image and the platform. Two x86 machines with another
+    address, CPU and kernel give the same key, so moving the builder keeps the cache; this Mac (Rosetta) gives another.
+    Provenance records the facts: address, machine-id (when there is one), kernel and CPU, read once per process."""
     from types import SimpleNamespace
     a = inputs.artifacts
-    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
-    monkeypatch.delenv('TESTKIT_RUN_DIR', raising=False); monkeypatch.delenv('TESTKIT_ARTIFACTS', raising=False)
-    monkeypatch.setattr(a, '_native_envs', {})
-    hosts = {'u@a': _cpuinfo(), 'u@b': _cpuinfo(flags='avx2 sse fpu'), 'u@kernel': _cpuinfo(kernel='7.0.0-44-generic'),
-             'u@model': _cpuinfo(model='AMD Ryzen 7 7840HS'), 'u@flags': _cpuinfo(flags='fpu sse')}
+    monkeypatch.setattr(a, '_builder_facts_read', {})
+    hosts = {'u@a': _facts(), 'u@b': _facts(kernel='7.0.0-44-generic', model='Intel(R) Xeon(R) w5-2455X', machine_id='4567',
+                       vendor='GenuineIntel'),
+             'u@noid': _facts(machine_id='')}
     calls = []
     def run(cmd, **kw):
         calls.append(cmd[-2])
-        if hosts.get(cmd[-2]) is None: raise a.BuildFailure('ssh', 'unreachable')
         return SimpleNamespace(stdout=hosts[cmd[-2]])
     monkeypatch.setattr(a, '_run', run)
     def key(b):
         monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', b)
         return a.build_env()
     k = key('ssh:u@a')
-    assert k == key('ssh:u@b') and 'u@' not in k
-    assert k.startswith(a.BENCH_BUILDER + ' native: AuthenticAMD AMD Ryzen 7 8845HS') and k.endswith('kernel 7.0.0-43-generic')
-    assert len({k, key('ssh:u@kernel'), key('ssh:u@model'), key('ssh:u@flags'), key('local')}) == 5
-    assert key('local') == a.BENCH_BUILDER
-    key('ssh:u@a'); assert calls.count('u@a') == 1                          # once per process
-    a._native_envs.clear(); hosts['u@a'] = None
-    assert key('ssh:u@a') == k                                              # unreachable: the last description
-    for _ in range(2):
-        with pytest.raises(a.BuildFailure): key('ssh:u@never')             # never read: no key, and asked once
-    assert calls.count('u@never') == 1
-    monkeypatch.setattr(a, '_run', lambda cmd, **kw: SimpleNamespace(stdout='7.0\n'))
-    with pytest.raises(a.BuildFailure): a._native_env('u@odd')             # not a description: no key
-    hosts['u@a'] = _cpuinfo(kernel='7.0.0-44-generic'); a._native_envs.clear()
-    monkeypatch.setattr(a, '_run', run)
-    monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'run')); monkeypatch.setenv('TESTKIT_ARTIFACTS', '{}')
-    assert key('ssh:u@a') != k and calls.count('u@a') == 3
-    hosts['u@a'] = _cpuinfo(); a._native_envs.clear()
-    assert key('ssh:u@a') != k and calls.count('u@a') == 3                  # in a run: what it first read, pinned
+    assert k == key('ssh:u@b') == a.BENCH_BUILDER + ' native' and not calls        # the key never reads the host
+    assert key('local') == a.BENCH_BUILDER != k
+    def described(b):
+        monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', b)
+        return a.build_env_described()
+    assert described('ssh:u@b') == (a.BENCH_BUILDER + ' under Docker on u@b (native): machine-id 4567, '
+                                    'kernel 7.0.0-44-generic, CPU GenuineIntel Intel(R) Xeon(R) w5-2455X')
+    assert described('ssh:u@noid').endswith('(native): kernel 7.0.0-43-generic, CPU AuthenticAMD AMD Ryzen 7 8845HS w/ Radeon 780M Graphics')
+    described('ssh:u@b'); assert calls.count('u@b') == 1                           # once per process
+    assert described('local').startswith('local: ')
+    monkeypatch.setattr(a, '_run', lambda cmd, **kw: SimpleNamespace(stdout='kernel: 7.0\n'))
+    with pytest.raises(a.BuildFailure): a._builder_facts('u@odd')                  # not facts: refused
+
 
 def test_a_run_uses_the_inputs_it_prepared_even_if_the_builder_changes(monkeypatch, tmp_path):
     """The torture part of the first campaign run rebuilt its image at run time: the machine's [build] builder changed
