@@ -17,7 +17,7 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
                                 host with it they are judged as any other test and must pass; `afp` entries also
                                 not under NATEMU_FP=accurate, which makes those deviations exact (docs/floating-point.md),
                                 except an entry whose reason starts with a deviation accurate mode keeps
-                                (`x87-band-ue-flag: ...`, tests/lib/fp_deviations.py X87_OTHER, "both modes").
+                                (`x87-band-ue-flag: ...`: tests/lib/fp_deviations.py MODES has accurate for it).
                                 A FEAT the host does not report at all fails part-0 (a misspelt name), unapplied
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     verdict_flaky = true        the verdict may itself return `flaky` (a test whose only failures are known
@@ -75,6 +75,7 @@ import shlex
 import signal
 import subprocess
 import time
+import uuid
 
 from testkit import artifacts, family, host, resources
 from testkit.harness import CaseResult, Requirement, SubResult
@@ -212,7 +213,7 @@ def native_vm(image: pathlib.Path, suite: str, part: str, vcpus: int, host: str,
     pack = work / 'boot.tar'
     with tarfile.open(pack, 'w') as t:
         t.add(kernel or resources.fetch('debian-netboot-linux'), 'kernel'); t.add(image, 'initrd')
-    name = f'natemu-ref-{suite}-{os.getpid()}-{re.sub(r"[^A-Za-z0-9]", "-", part)}'
+    name = f'natemu-ref-{suite}-{uuid.uuid4().hex[:12]}-{re.sub(r"[^A-Za-z0-9]", "-", part)}'     # two Macs never clash
     apt = f'http://snapshot.debian.org/archive/debian/{_snap()}/'
     guest = (f"rm -f /etc/apt/sources.list.d/*; echo 'deb [check-valid-until=no] {apt} trixie main' > /etc/apt/sources.list; "
              f'timeout {APT_TIMEOUT} apt-get -o Acquire::Retries=5 update -qq >&2 && '
@@ -472,14 +473,12 @@ def part_args(suite: str, declared: str, env: str | None) -> str:
 
 
 def kept_in_accurate(why: str) -> bool:
-    """Whether an expected_without.afp reason names a deviation that accurate mode keeps (fp_deviations.X87_OTHER's
-    "both modes" items, x87-band-ue-flag): its leading `name:`."""
+    """Whether an expected_without.afp reason names a deviation that accurate mode keeps: its leading `name:` is one
+    whose mode list (tests/lib/fp_deviations.py MODES) has accurate."""
     from testkit import paths
     paths.use_test_scripts()
     import fp_deviations
-    other = getattr(fp_deviations, 'X87_OTHER', {})
-    name = why.split(':', 1)[0].strip()
-    return name in other and 'both modes' in other[name][0]
+    return 'accurate' in fp_deviations.MODES.get(why.split(':', 1)[0].strip(), ())
 
 
 class Campaign:
