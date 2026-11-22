@@ -8,7 +8,7 @@ against the model's architectural reference (`outcomes`).
 Each scenario becomes one description (identity space, `nxe 0`, every vCPU at CPL 0 with IF as the scenario's): one
 body at 110000H assembled with nasm (with tests/boot/exit_ap.inc): the exit test's AP stub (its image, copied by the
 BSP to 8000H, SIPI vector 08H: real mode, the climb to 64-bit mode, an arrival on the stub page's counter, a `cli; hlt`
-park: the model's STUB), then the BSP's 64-bit program from the scenario's (the stub copied and its CR3 and EFER fields
+park: the model's STUB; the page a `memory` item, so its arrival bytes are reported), then the BSP's 64-bit program from the scenario's (the stub copied and its CR3 and EFER fields
 filled, the local APIC enabled; each ICR write after `mfence; lfence`, through the x2APIC MSR 830H or, for
 `kvm-unit-tests` as that suite does, the xAPIC page's ICR at FEE00300H/310H; `op` a NOP; `await N` a wait for the
 counter bounded by the TSC; `halt` a HLT loop; `host` an IN from an unassigned port, a host request), and each other
@@ -140,7 +140,7 @@ def description(name, regime, work):
     """The scenario's description, the vector map and the stub's symbols."""
     sc = m.SCENARIOS[name]
     syms, body, vec = assemble(name, regime, work)
-    lines = ['identity', f'body {BODY:#x} {body.hex()}', f'region {AP_BASE:#x} 0x1000', f'memory {PARK:#x} faf4ebfd']
+    lines = ['identity', f'body {BODY:#x} {body.hex()}', f'memory {AP_BASE:#x} {bytes(0x1000).hex()}', f'memory {PARK:#x} faf4ebfd']
     if any(c.get('ctx') == 'mbox' for c in sc['cpus']):
         lines.append(f'memory {MAILBOX:#x} {bytes(16).hex()}')
     if name in XAPIC:

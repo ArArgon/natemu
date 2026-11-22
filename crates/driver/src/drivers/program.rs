@@ -3953,6 +3953,7 @@ mod json_tests {
                 address: address.map(Hex),
             }),
             machine: None,
+            startup: None,
         }
     }
     /// The former `report` + `kick_report` + mmio line for `r`.
