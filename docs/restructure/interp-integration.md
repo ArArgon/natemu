@@ -25,8 +25,8 @@ One instruction per pass, until `Cpu::interpreted_mode()` is `None`; it then ret
 
 Tests only: `NATEMU_INTERPRETER=off` (`Control::interpreter_off`) makes `run` stop at its entry as the resident did
 before the interpreter ran (`unsupported_mode`, `unsupported_code_mode`); the CPU start-up tests that observe each start
-state there (`tests/system` `initsipi` and `initsipi-1`, `tests/boot` `exit-ap-natemu`) set it until the interpreter runs
-their AP stub (its MOV CR0 and far JMPs, the next step).
+state there (`tests/system` `initsipi` and `initsipi-1`, the entry regime) set it on purpose. The others run with the
+interpreter, `tests/system` `initsipi-interpreter` and `tests/boot` `exit-ap-natemu` among them.
 
 Resident operations: CPUID, RDMSR, WRMSR, WBINVD through the existing `transaction` (`#[inline(always)]` now: out of
 line it put a call on the fast system-call path, `system`; with it `system` is unchanged), its `Err` a fault stop with

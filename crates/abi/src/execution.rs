@@ -981,7 +981,7 @@ pub mod cache {
         /// M2 Part 2, set by the host from `NATEMU_INTERPRETER=off` (tests only; zero, the default, is on): the boot-time
         /// interpreter is not run, and a vCPU reaching it stops as it did before there was one (`stop::UNSUPPORTED_MODE`,
         /// `stop::UNSUPPORTED_CODE_MODE`, at its entry): for the CPU start-up tests that observe each start state there
-        /// until the interpreter runs their AP stub. Appended.
+        /// (`tests/system` `initsipi` and `initsipi-1`, the entry regime). Appended.
         pub interpreter_off: u64,
         /// M2 Part 2, the firmware boot mode: the firmware image's size (`super::FIRMWARE_END` - size .. 4 GiB), set by the
         /// host at prepare; 0, the default, is none. Read only where a page is found outside guest RAM. Appended.
@@ -3781,9 +3781,9 @@ pub mod stop {
     /// The bank does not describe a supported paging mode or CPL ([`super::Cpu::paging`] is `None`). When a
     /// transaction's change caused it, the record holds the new control registers or CPL and the old RIP (the
     /// instruction that made the change). M2 Part 2: a state the boot-time interpreter runs
-    /// ([`super::Cpu::interpreted_mode`]) stops so at the interpreter's entry instead, which stands for the interpreter
-    /// until it is built: after the transaction that made it completed (RIP past the instruction, or the far transfer's
-    /// target), or at the vCPU's start.
+    /// ([`super::Cpu::interpreted_mode`]) is not this stop; with the interpreter off (`cache::Control::interpreter_off`,
+    /// tests only) it stops so at the interpreter's entry instead: after the transaction that made it completed (RIP past
+    /// the instruction, or the far transfer's target), or at the vCPU's start.
     pub const UNSUPPORTED_MODE: u64 = 1;
     /// The host reply or staged object is unusable.
     pub const BAD_REPLY: u64 = 2;

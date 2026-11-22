@@ -101,8 +101,8 @@ smoke = true
 # in the amd64 builder container from pinned sources (tests/boot/built_inputs.py, tools/boot/*), on the references:
 # -qemu the pinned QEMU 11.1.2 under TCG, -kvm the x86 reference machine under KVM. A run checks that the lock's answer
 # for the input's upstream (its sources, recipe and builder image) is the pass, without QEMU or the x86 machine; seeding
-# (TESTKIT_SEED_ANSWERS=1, and NATEMU_X86_HOST=user@host for -kvm) runs them. The natemu cases come with the slices that
-# make them pass (the CPU start-up slice with the Multiboot loader; the firmware boot mode).
+# (TESTKIT_SEED_ANSWERS=1, and NATEMU_X86_HOST=user@host for -kvm) runs them. The natemu cases, kut-natemu (the Multiboot
+# loader and CPU start-up) and ovmf-natemu (the firmware boot mode), run them in natemu.
 #
 # kvm-unit-tests a2891d95: smptest and dummy (the Multiboot entry, the climb to 64-bit mode, INIT and SIPI to every
 # other CPU through the 16-bit trampoline), each at 1 to 4 CPUs, judged by the test's own verdict.

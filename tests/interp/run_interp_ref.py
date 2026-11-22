@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The interp family's `references` case: the boot-time interpreter's per-instruction cases against their two references
-(docs/restructure/interp-cases.md). natemu does not run here yet: these are the answers its cases will be judged by.
+(docs/restructure/interp-cases.md). natemu does not run here: these are the answers its cases (`natemu`,
+run_interp_natemu.py) are judged by.
 
 Locked (every ordinary run): nothing runs. The corpus is generated (tests/interp/interp_cases.py); each case's answer
 from QEMU and from KVM comes from tests/interp/tests.lock; a case passes when both are there and agree on every field

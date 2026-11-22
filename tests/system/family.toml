@@ -178,7 +178,8 @@ needs = { perf = true }
 smoke = true
 
 # M2 Part 2: INIT and SIPI, each scenario of tools/models/initsipi_model.py judged against its reference
-# (docs/restructure/initsipi-resident.md); the entry regime until the boot-time interpreter runs the AP stub.
+# (docs/restructure/initsipi-resident.md). The entry regime (NATEMU_INTERPRETER=off): each start state observed at the
+# boot-time interpreter's entry.
 [suite.cases."initsipi"]
 argv = ["tests/system/run_initsipi.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }

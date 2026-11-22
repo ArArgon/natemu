@@ -5,13 +5,13 @@ Both sides are projected onto what a run shows (`project`, `observe`): how the r
 at one CPU), and per CPU how it ended (`halted`, `wait-for-sipi`, `mailbox`, `done`) and the starts it made (each SIPI
 with its vector, a BSP's reset), in order. Two regimes:
 
-- **entry** (while the boot-time interpreter is the stop at its entry, the stub): a started CPU stops at its start's first
-  boundary, and the runner's `--entry-ends` makes that stop the CPU's own end. The reference is the model's outcomes of
-  `entry_scenario`: every interpreted program (a CPU's `start` and `reset`) is one instruction after which the CPU is
-  done, and the awaits are dropped (no AP signals). An entry stop with an NMI pending is the model's `nmi` stop there
-  (the interpreter's first boundary takes it before anything); one with an INIT pending is open (the interpreter's first
-  boundary would take that INIT, which the stub cannot show): any outcome of that CPU matches.
-- **interpreter** (once the interpreter runs the start programs): the model's own outcomes; a start counts when it reached
+- **entry** (`NATEMU_INTERPRETER=off`: the boot-time interpreter stops at its entry, the stub): a started CPU stops at
+  its start's first boundary, and the runner's `--entry-ends` makes that stop the CPU's own end. The reference is the
+  model's outcomes of `entry_scenario`: every interpreted program (a CPU's `start` and `reset`) is one instruction after
+  which the CPU is done, and the awaits are dropped (no AP signals). An entry stop with an NMI pending is the model's
+  `nmi` stop there (the interpreter's first boundary takes it before anything); one with an INIT pending is open (the
+  interpreter's first boundary would take that INIT, which the stub cannot show): any outcome of that CPU matches.
+- **interpreter** (the interpreter runs the start programs): the model's own outcomes; a start counts when it reached
   the program's `signal` (the stub's arrival on the shared counter), the only part of a start a run shows.
 
 A CPU the run cancelled (another CPU's stop ended it) matches any outcome of that CPU."""

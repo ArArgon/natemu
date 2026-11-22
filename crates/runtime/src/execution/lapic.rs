@@ -2,8 +2,9 @@
 //!
 //! **State.** Each vCPU's APIC is its own record ([`Lapic`], private to its resident), the bank's `Cpu::cr8` (the TPR,
 //! bits 7:0; CR8 reads and writes TPR[7:4], 11.8.6) and its shared [`Events`]: `vectors` is the IRR (senders set bits
-//! with an atomic OR, then ring the target's doorbell), `nmi` the NMI pending bit, `apic` the word senders match
-//! destinations against ([`apic::published`], written only here). IA32_APIC_BASE is the MSR record's slot.
+//! with an atomic OR, then ring the target's doorbell), `pending` the NMI bit and the CPU start-up bits, `apic` the word
+//! senders match destinations against ([`apic::published`], written only here). IA32_APIC_BASE is the MSR record's
+//! slot.
 //!
 //! **Delivery** (11.8): the highest IRR vector whose class is above the PPR's (`max(TPR, ISRV)` by class) is taken at the
 //! next boundary where RFLAGS.IF and no shadow allow it ([`super::events`]): its IRR bit moves to the ISR and the
