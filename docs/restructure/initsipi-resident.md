@@ -135,8 +135,8 @@ others run on.
   interpreter and arrives once, counted from 64-bit code).
 - `boot-startup` (tests/boot, `run_boot_smoke.py --only startup`, B2's Debian slice): Debian's 6.12.107 kernel and
   installer initrd through `boot-linux` at 2 and 4 vCPUs, with the mailbox and with `--no-mailbox`, a busybox script on
-  serial. Every CPU is online at boot. Without the mailbox each AP goes offline (`hlt_play_dead`: translated HLT with
-  IF = 0) and online again (an INIT that ends that HLT, the SIPIs, the trampoline in the interpreter); with it Linux
+  serial. Every CPU is online at boot. Without the mailbox each AP goes offline (`play_dead`: a translated HLT with
+  IF = 0, natemu's profile having no MWAIT) and online again (an INIT that ends that HLT, the SIPIs, the trampoline in the interpreter); with it Linux
   refuses offlining (a version-0 mailbox cannot start a CPU twice). Each AP start takes Linux's warm-reset path, with
   the mailbox too: CMOS 0FH := 0AH and the vector at 467H, restored once the AP is up (counted by the pr_debug `Setting
   warm reset code and vector.`, turned on with `dyndbg`; port 71H's writes: 4 with the mailbox at 2 and 4 vCPUs, 6 and
