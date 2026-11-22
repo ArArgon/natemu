@@ -41,6 +41,15 @@ smoke = true
 builds = true
 rerun = true
 
+# M2 Part 2's CPU start-up slice on Debian's kernel (run_boot_smoke.py `startup`): at 2 and 4 vCPUs, with the ACPI
+# wakeup mailbox and without it (the APs started by INIT and SIPI through Linux's real-mode trampoline, which the
+# boot-time interpreter runs): every CPU online, each AP offline and online again where Linux allows it, the warm-reset
+# path, and the shutdown.
+[suite.cases."boot-startup"]
+argv = ["tests/boot/run_boot_smoke.py", "--only", "startup", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}",
+        "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
 # The M2 exit test's firmware (tests/boot/exit_fw.asm) and its AP part as a 64-bit program (exit_prog.asm), both built
 # here with nasm, on the references at 1, 2 and 4 CPUs (tests/boot/run_exit_fw.py; docs/restructure/m2-exit-firmware.md):
 # -qemu the pinned QEMU 11.1.2 under TCG, -kvm real hardware (the x86 reference machine under KVM). Their answers are
