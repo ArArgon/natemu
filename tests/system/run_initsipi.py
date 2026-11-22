@@ -21,11 +21,11 @@ A start program other than the stub's shape: `fixed-in-wfs`'s (the climb, then t
 HLT, never signalling), the stub with its 64-bit part replaced (the BSP patches a jump at the stub's `ap64` to it: x2APIC
 on, SVR 1FFH, `sti`, a HLT loop; an interrupt delivered there ends the run at the driver's logging IDT).
 
-`--regime entry` (the default, until the boot-time interpreter runs the stub's MOV CR0 and far JMPs): the driver runs with
+`--regime entry` (the default: each start state observed at the boot-time interpreter's entry): the driver runs with
 `--entry-ends` and `NATEMU_INTERPRETER=off` (the resident stops at the interpreter's entry, as before it ran), and a CPU
 that stopped at the interpreter's entry is observed as done with the start its state shows
 (the SIPI's CS VV00H, base VV000H, IP 0, or the BSP's reset state), each such state also checked field by field (CR0
-CD/NW as before | ET, EFER 0, EDX the signature, RFLAGS 2). `--regime interpreter` (once the interpreter runs the stub):
+CD/NW as before | ET, EFER 0, EDX the signature, RFLAGS 2). `--regime interpreter` (the interpreter runs the stub):
 a start counts when its CPU arrived on the counter (the stub's per-APIC-ID arrival byte), and scenarios that need
 firmware at the reset vector (`bsp-init`) are left out.
 
@@ -250,7 +250,7 @@ def run(a, name):
     text, vec, syms = description(name, a.regime, work)
     extra = (['--entry-ends'] if a.regime == 'entry' else []) + ([a.max_block] if a.max_block else [])
     # The entry regime observes each start state at the interpreter's entry: NATEMU_INTERPRETER=off keeps the stop there,
-    # as before the interpreter ran (it cannot run the AP stub's MOV CR0 and far JMPs yet).
+    # as before the interpreter ran, so the stop shows the state the start made.
     env = {**os.environ, 'NATEMU_INTERPRETER': 'off'} if a.regime == 'entry' else None
     rc, out, err = driver(a.host, a.runtime, a.fexc, text, work, extra, timeout=300, env=env)
     if rc:
