@@ -157,6 +157,15 @@ enum FexcSvc : uint16_t { FEXC_SVC_LINK = 1, FEXC_SVC_MISS = 2, FEXC_SVC_DIV_U =
 // Profile slice1: native offsets of the computed exits' `b` to the resident dispatcher (placeholder `b .`, relocated by
 // the resident when it places the block), per compile attempt.
 inline std::vector<uint32_t> fexc_dispatch_exits;
+// The probing split stubs' `b` placeholders (FexcEmitStubs): (native offset, shared probe index), exported as `probe_branch`
+// relocations. The index (natemu_abi::execution::probe::index): 160 for 32-bit code, + 32 * the width's position in 2, 4, 8,
+// 16, 32, + the address register; -1: none (x0, x28, sp/xzr, another width), and the store keeps its `brk` stub.
+inline std::vector<std::pair<uint32_t, uint32_t>> fexc_probe_branches;
+inline int FexcProbeThunk(bool bits32, uint32_t reg, uint32_t width) {
+  const int w = width == 2 ? 0 : width == 4 ? 1 : width == 8 ? 2 : width == 16 ? 3 : width == 32 ? 4 : -1;
+  if (w < 0 || reg == 0 || reg == 28 || reg >= 31) return -1;
+  return (bits32 ? 160 : 0) + 32 * w + int(reg);
+}
 // Profile slice1: guest offsets of the instructions whose incoming NZCV the JIT saves in FexcPrecision::PreNzcvReg at
 // their start (an NZCV write precedes one of their fault points), chosen by the flag-elimination pass.
 inline std::set<uint64_t> fexc_pre_nzcv;

@@ -160,6 +160,7 @@ pub unsafe fn start() -> ! {
     if !cache::fill_head(dispatcher()) {
         halt(&s, stop::UNSUPPORTED_MODE)
     }
+    cache::fill_probes();
     cache::reset();
     #[cfg(feature = "io-test-hooks")]
     crate::io_test::ready(s.vcpu as usize);
@@ -2468,7 +2469,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         taken(&mut s);
         s
     };
-    if (cache::DISPATCH_VA..cache::CODE_VA + cache::HEAD_BYTES as u64).contains(&elr) {
+    if (cache::DISPATCH_VA..cache::DISPATCH_VA + cache::DISPATCH_BYTES as u64).contains(&elr) {
         let mut s = at_once(s, frame.x[0]);
         completed(&mut s); // a block exited into the dispatcher
         s.stops_dispatch += 1;
@@ -2483,7 +2484,14 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         s.stops_entry += 1;
         unsafe { dispatch(&mut s) }
     }
-    let Some(b) = cache::block_at(elr).filter(|b| b.flags & cache::DEAD == 0) else {
+    // In a page-crossing store's shared probe (`natemu_abi::execution::probe`): the block it returns to (the word after
+    // the stub's split check: in x0 at the probe's first word, in d0 after it) runs on to an exit, as from inside a block.
+    let pc = match natemu_abi::execution::probe::at(elr) {
+        Some((_, 0)) => frame.x[0],
+        Some(_) => u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8])),
+        None => elr,
+    };
+    let Some(b) = cache::block_at(pc).filter(|b| b.flags & cache::DEAD == 0) else {
         bad(s)
     };
     s.irqs_step += u64::from(b.flags & cache::STEP != 0);
@@ -3712,30 +3720,42 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         asm!("mrs {0}, esr_el1", "mrs {1}, far_el1", "mrs {2}, elr_el1", "mrs {3}, spsr_el1",
              out(reg) esr, out(reg) far, out(reg) elr, out(reg) spsr);
         let mut s = load();
-        let block = cache::block_at(elr);
+        // A shared probe of a page-crossing store (`natemu_abi::execution::probe`): its stub's block and the stub are found
+        // from d0, which holds the word after the stub's split check (the stub's `adr`), at every word that can trap: the
+        // probes (`probe` 1 the first, 2 the second) and the `brk` (0). The probe must be the stub's store's.
+        let thunk = natemu_abi::execution::probe::at(elr);
+        let ret = u64::from_le_bytes(f.q[0][..8].try_into().unwrap_or([0; 8]));
+        let block = cache::block_at(if thunk.is_some() { ret } else { elr });
         let all = block.map_or(&[][..], cache::sites);
         // `native` for every outcome: ESR, FAR, and ELR as an offset in its block when it is in one, else absolute.
-        let at = block.map_or(elr, |b| cache::native_offset(b, elr));
+        let at = match (block, thunk) {
+            (Some(b), None) => cache::native_offset(b, elr),
+            _ => elr,
+        };
         s.native = [esr, far, at];
         let at_site = |at: u64| {
             all.binary_search_by_key(&at, |site| site.native_offset as u64)
                 .ok()
                 .map(|i| all[i])
         };
-        // A split stub that probes (fexc, FexcEmitStubs): its words after the first are no sites of their own. The probes
-        // are its words 6 and 8, behind the tests that send an armed breakpoint and an address above 4 GiB (32-bit code)
-        // or wrapping (64-bit code) to the `brk`, its word 10. `probe`: 1 the first probe, 2 the second.
-        let probing = |site: &Site| {
-            site.kind == object::kind::SPLIT
-                && ((block.unwrap().code_va() + u64::from(site.native_offset)) as *const u32).read() != 0xd420_0040
-        };
-        let (found, probe) = match at_site(at) {
-            Some(site) => (Some(site), 0),
-            None => [(24, 1), (32, 2), (40, 0)]
-                .into_iter()
-                .filter(|&(d, _)| at >= d)
-                .find_map(|(d, p)| Some((at_site(at - d).filter(probing)?, p)))
-                .map_or((None, 0), |(site, p)| (Some(site), p)),
+        let (found, probe) = match (block, thunk) {
+            (_, None) => (at_site(at), 0),
+            (None, Some(_)) => (None, 0),
+            (Some(b), Some((index, o))) => {
+                let code = b.code_va();
+                let word = |o: u64| ((code + o) as *const u32).read();
+                let site = natemu_abi::execution::probe::stub_of(all, word, ret.wrapping_sub(code)).map(|i| all[i]).filter(|site| {
+                    natemu_abi::execution::probe::index(natemu_abi::execution::context_bits32(b.context), site.base_reg, u32::from(site.width))
+                        == Some(index)
+                });
+                use natemu_abi::execution::probe::{BRK, FIRST, SECOND};
+                match o {
+                    FIRST => (site, 1),
+                    SECOND => (site, 2),
+                    BRK => (site, 0),
+                    _ => (None, 0),
+                }
+            }
         };
         // The syndrome must be the class this site's kind produces, before anything is taken or stepped: BRK from
         // AArch64 with the stub's immediate (1 branch target, 2 split, 3 divide), else a data abort from EL0 inside the
@@ -3823,7 +3843,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             // (Resumed, when a walk was contended, at the `brk` that came here or at the stub's first word, never at the
             // second probe: the first page's shadow may be gone by then, and the store after two probes must not fault.)
             object::kind::SPLIT => {
-                let again = if esr >> 26 == 0x3c { elr } else { b.code_va() + u64::from(site.native_offset) };
+                let again = if esr >> 26 == 0x3c && thunk.is_none() { elr } else { b.code_va() + u64::from(site.native_offset) };
                 split(s, f, b, all, &site, again, spsr)
             }
             // An 8-byte push found its stack pointer misaligned (fexc --push-run): the push runs alone, in a step block

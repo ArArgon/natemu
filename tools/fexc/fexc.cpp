@@ -183,6 +183,7 @@ struct Capture {
   std::vector<std::pair<uint64_t, uint64_t>> pcs, subblocks, prologues;
   std::vector<CPU::Relocation> relocs;
   std::vector<uint32_t> dispatch_exits;   // slice1: computed exits' `b` to the resident dispatcher (relocated at placement)
+  std::vector<std::pair<uint32_t, uint32_t>> probe_branches;   // slice1: probing split stubs' `b` to a shared probe (offset, index)
   std::vector<uint8_t> sra_gpr, sra_fpr;
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
@@ -198,7 +199,7 @@ struct Capture {
   // Emptied for the next request with every vector's storage kept (a fresh Capture freed and regrew them all each time).
   void Clear() {
     fired = false; info = {}; spill_bytes = 0;
-    code.clear(); pcs.clear(); subblocks.clear(); prologues.clear(); relocs.clear(); dispatch_exits.clear(); sra_gpr.clear(); sra_fpr.clear();
+    code.clear(); pcs.clear(); subblocks.clear(); prologues.clear(); relocs.clear(); dispatch_exits.clear(); probe_branches.clear(); sra_gpr.clear(); sra_fpr.clear();
     insts.clear(); blocks.clear(); sites.clear(); x87_maps.clear(); insn_info.clear();
   }
 } Cap;
@@ -295,6 +296,7 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
   Cap.prologues = {dd.FexcEntryPrologues.begin(), dd.FexcEntryPrologues.end()};
   if (dd.Relocations) Cap.relocs.assign(dd.Relocations->begin(), dd.Relocations->end());
   Cap.dispatch_exits = fexc_dispatch_exits;
+  Cap.probe_branches = fexc_probe_branches;
   Cap.sra_gpr.assign(dd.FexcSRAGPR, dd.FexcSRAGPR + dd.FexcSRAGPRCount);
   Cap.sra_fpr.assign(dd.FexcSRAFPR, dd.FexcSRAFPR + dd.FexcSRAFPRCount);
   Cap.sites = fexc_sites;
@@ -389,7 +391,7 @@ static void ResetGlobals() {
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_guess = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_int_pair.clear(); fexc_x87_fp.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = fexc_x87_hold_missing = fexc_x87_hold_all = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
-  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED;
+  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED; fexc_probe_branches.clear();
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
 
@@ -893,6 +895,9 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     for (auto o : Cap.dispatch_exits)
       j.elem_obj().kv("offset", uint64_t(o)).kv("kind", "dispatch_branch").null("size")
        .kv("meaning", "placeholder `b .`: the resident relocates it to its dispatcher when it places the block").end_obj();
+    for (auto [o, k] : Cap.probe_branches)
+      j.elem_obj().kv("offset", uint64_t(o)).kv("kind", "probe_branch").kv("probe", uint64_t(k)).null("size")
+       .kv("meaning", "placeholder `b .`: the resident points it at its shared probe when it places the block").end_obj();
     j.end_arr();
     // (relocations written inside "code" object after we know zeroed bytes; hex goes last)
     j.kv("size", code.size());
@@ -1112,7 +1117,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       push(p.second, 4); push(p.first, 4); push(cf < 0 ? 2 : cf, 1); push(0, 3);
     }
     pad(8);
-    put(80, f.size(), 4); put(84, Cap.relocs.size() + Cap.dispatch_exits.size(), 4);
+    put(80, f.size(), 4); put(84, Cap.relocs.size() + Cap.dispatch_exits.size() + Cap.probe_branches.size(), 4);
     for (auto& r : Cap.relocs) {
       using T = CPU::RelocationTypes;
       uint8_t kind = 255, reg = 0, size = 0; uint64_t value = 0;
@@ -1125,6 +1130,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       push(r.Header.Offset, 4); push(kind, 1); push(reg, 1); push(size, 1); push(0, 1); push(value, 8);
     }
     for (auto o : Cap.dispatch_exits) { push(o, 4); push(4, 1); push(0, 1); push(0, 1); push(0, 1); push(0, 8); }   // dispatch_branch
+    for (auto [o, k] : Cap.probe_branches) { push(o, 4); push(5, 1); push(0, 1); push(0, 1); push(0, 1); push(k, 8); }   // probe_branch
     for (size_t i = 0; i < Cap.sra_gpr.size() && i < 20; ++i) f[88 + i] = Cap.sra_gpr[i];
     f[108] = uint8_t(Cap.sra_gpr.size());
     // Profile, end reason, settings and the feature profile (same values as the JSON `settings`, `guest.end` and `features`).

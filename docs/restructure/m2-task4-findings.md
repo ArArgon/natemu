@@ -555,6 +555,22 @@ trap word, a probe outside a stub, a second way into a stub). Not written: a sto
 to the guest-state page's alias, a return into a literal slot (the rule is one line; no block here has a literal to
 aim at), and a multi-vCPU run with mprotect or munmap racing a crossing read-modify-write.
 
+#### Since then: the two-word stub and shared probes
+
+The eleven-word stub made every block with a wide store a third bigger (on 20,000 blocks of the JDK's libjvm.so, code
+bytes +32.5% against `main`), which filled the code area and the shared pool sooner and cost the Paper start (bench case
+`guest-paper-noafp-profile`, M4: about 0.9 s of vCPU time per boot in pool copies, admission, placement and flushes).
+Now the stub is two words, `adr x0, <the word after the check>; b <shared probe>`, and the probe sequence lives once per
+vCPU in its code area's head (`natemu_abi::execution::probe`: one per bitness, address register and width 2, 4, 8, 16
+or 32; a store of another width keeps the trap). fexc emits the `b` as a placeholder with a `probe_branch` relocation
+naming the probe; the resident points it at the probe wherever it places, copies, shares or takes the block from the
+pool. The probe keeps the return in d0 (FEX's VTMP1, dead between ops) while it uses x0, so at a fault on a probe, its
+trap word, or an interrupt in it the resident finds the stub from d0 (or x0 at the probe's first word). The probes'
+words and their tests are the eleven-word stub's, so what the stub does is unchanged: the same tests, the same probes,
+the same trap, the same handling. Code bytes on the same 20,000 blocks: +3.2% against `main`. Admission checks the two
+words (the `adr` to a word at or before the access, the placeholder at a relocation naming exactly the store's probe),
+and the host's audit of a vCPU's cache checks the head's probes and every placed stub's branch.
+
 For whoever runs the gate: the hold cases of `k1` and the `pic-*` cases use a second host built with test hooks in
 `target/hooks`, and reuse it when it exists (`NATEMU_PREBUILT=1`). After a change to the host's admission that binary
 is stale and refuses new code ("object refused: check stub ..."); delete `target/hooks/release/natemu-host` and the

@@ -67,18 +67,24 @@ def answer(p, record):
 
 
 MAGIC, STUB_KINDS, SPLIT = b'NFXOBJ\0\x01', {6, 7, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23}, 7
-STADDB = 0x383f001f   # staddb wzr, [xN]: the base in bits 9:5
-PROBING = 0x3942d380  # ldrb w0, [x28, #0xb4]: a probing split stub's first word
+BRK2, PLACEHOLDER, PROBE_BRANCH = 0xd4200040, 0x14000000, 5
+
+
+def probe_index(bits32, reg, width):
+    """The shared probe of a store of `width` bytes at x`reg` (natemu_abi::execution::probe::index), or None."""
+    if width not in (2, 4, 8, 16, 32) or reg in (0, 28) or reg >= 31: return None
+    return (160 if bits32 else 0) + 32 * (2, 4, 8, 16, 32).index(width) + reg
 
 
 def only_probes(old, new):
     """M2 task 4, page-crossing stores without the trap: an intended change of 64-bit output, bounded here. None when the
-    two replies differ only as that change allows, else what else differs. Allowed: split stubs that are the probes
-    (eleven words: fexc_sites.inc FexcEmitStubs) where OLD has `brk #2`, hence later stubs and the
-    words after them at other offsets, and the header's sizes and table offsets. Everything else must be byte-identical:
-    the bytes around the object, the header's other fields, the code before the first stub (every block's main line),
-    each stub that is no split stub, the words after the stubs, every site record but a stub's native offset, the PC
-    table and the relocations."""
+    two replies differ only as that change allows, else what else differs. Allowed: split stubs that probe through their
+    shared probe (two words, `adr x0, <the word after the check>; b .`, the `b` at a probe_branch relocation naming the
+    store's probe: fexc_sites.inc FexcEmitStubs) where OLD has `brk #2`, hence later stubs and the words after them at
+    other offsets, one probe_branch relocation per such stub after OLD's, and the header's sizes and table offsets.
+    Everything else must be byte-identical: the bytes around the object, the header's other fields, the code before the
+    first stub (every block's main line), each stub that is no split stub, the words after the stubs, every site record but
+    a stub's native offset, the PC table and the other relocations."""
     u32 = lambda b, o: struct.unpack_from('<I', b, o)[0]
     # A reply's payload: code, json_len, object_len, extent, args_read, json, object (fexc.cpp, --serve).
     if len(old) < 20 or len(new) < 20 or old[:8] != new[:8] or old[12:20] != new[12:20] or u32(old, 0) != 0: return 'the status, report, extent or args_read differ'
@@ -86,9 +92,9 @@ def only_probes(old, new):
     if old[20:at] != new[20:at] or old[at:at + 8] != MAGIC or new[at:at + 8] != MAGIC: return 'the report differs, or no object'
     ho, hn = old[at:at + 128], new[at:at + 128]
     # (The header's sizes and offsets that lie behind the stubs move: total_size, code_size, end_marker_offset,
-    # code_region_end and the three tables' offsets; what they locate is compared below.)
+    # code_region_end and the three tables' offsets, and the relocation count grows; what they locate is compared below.)
     for o in range(0, 128, 4):
-        if o not in (16, 44, 52, 56, 64, 72, 80) and u32(hn, o) != u32(ho, o): return f'header word +{o}'
+        if o not in (16, 44, 52, 56, 64, 72, 80, 84) and u32(hn, o) != u32(ho, o): return f'header word +{o}'
     if len(old) != at + u32(old, 8) or len(new) != at + u32(new, 8) or u32(old, 8) != u32(ho, 16) or u32(new, 8) != u32(hn, 16): return 'the object lengths'
     oo, on = old[at:], new[at:]
     table = lambda b, h, o, size: [b[u32(h, o) + size * k:u32(h, o) + size * (k + 1)] for k in range(u32(h, o + 4))]
@@ -96,7 +102,7 @@ def only_probes(old, new):
     if table(oo, ho, 72, 12) != table(on, hn, 72, 12): return 'the PC table differs'
     if len(so) != len(sn): return 'the number of sites differs'
     co, cn = oo[u32(ho, 40):][:u32(ho, 44)], on[u32(hn, 40):][:u32(hn, 44)]
-    stubs = [(u32(x, 0), u32(y, 0), x[20]) for x, y in zip(so, sn) if x[20] in STUB_KINDS]
+    stubs = [(u32(x, 0), u32(y, 0), y) for x, y in zip(so, sn) if x[20] in STUB_KINDS]
     for x, y in zip(so, sn):
         if x[4:] != y[4:] or (x[20] not in STUB_KINDS and x[:4] != y[:4]): return 'a site record differs'
     if not stubs: return 'the code differs in a block with no stub'
@@ -114,30 +120,37 @@ def only_probes(old, new):
                 if moved.get(to(x)) == to(y): break
         else:
             return f'the main line differs at +{at:#x}: {x:08x} | {y:08x}'
-    for k, (o, n, kind) in enumerate(stubs):
+    rn_all = table(on, hn, 80, 16)
+    probes = {u32(r, 0): struct.unpack_from('<Q', r, 8)[0] for r in rn_all if r[4] == PROBE_BRANCH}
+    seen = set()
+    for k, (o, n, site) in enumerate(stubs):
         word = u32(cn, n)
-        if kind == SPLIT and word == PROBING:
-            a = u32(cn, n + 24) >> 5 & 31
-            if (u32(cn, n + 24) & ~0x3e0 != STADDB or u32(cn, n + 28) & 0xffc003ff != 0x91000000 | a << 5 or u32(cn, n + 32) != STADDB or
-                    u32(cn, n + 36) >> 26 != 5 or u32(cn, n + 40) != 0xd4200040 or u32(co, o) != 0xd4200040):
+        if site[20] == SPLIT and word & 0x9f00001f == 0x10000000:
+            imm = ((word >> 5 & 0x7ffff) << 2 | word >> 29 & 3)
+            back = n + (imm - (1 << 21) if imm >> 20 else imm)
+            want = [probe_index(b, site[25], site[21]) for b in (False, True)]
+            if u32(co, o) != BRK2 or u32(cn, n + 4) != PLACEHOLDER or not 4 <= back <= u32(site, 8) or probes.get(n + 4) not in want:
                 return 'a probing stub of another form'
-            size = 44
+            seen.add(n + 4)
+            size = 8
         else:
             if u32(co, o) != word: return 'a stub that is no probing split stub differs'
             size = 4
         if (stubs[k + 1][1] if k + 1 < len(stubs) else n + size) != n + size or (stubs[k + 1][0] if k + 1 < len(stubs) else o + 4) != o + 4:
             return 'the stubs are not one after the other'
+    if seen != set(probes): return 'a probe branch at no probing stub'
     # Behind the stubs: zero words up to an alignment, then FEX's tail (a literal, with its relocation): the same bytes at
-    # another offset. Relocations: the same, that one moved as far as the tail did.
-    tail = [stubs[-1][0] + 4, stubs[-1][1] + (44 if u32(cn, stubs[-1][1]) == PROBING and stubs[-1][2] == SPLIT else 4)]
+    # another offset. Relocations: OLD's, that one moved as far as the tail did, then the probe branches.
+    tail = [stubs[-1][0] + 4, stubs[-1][1] + (8 if stubs[-1][1] + 4 in probes else 4)]
     for k, c in enumerate((co, cn)):
         while tail[k] + 4 <= len(c) and u32(c, tail[k]) == 0: tail[k] += 4
     # (FEX's JITCodeTail starts with the code's size, which grows with the stubs; the rest is the same.)
     # (and zero bytes pad the code to its alignment)
     if co[tail[0] + 4:].rstrip(b'\0') != cn[tail[1] + 4:].rstrip(b'\0') or u32(cn, tail[1]) < u32(co, tail[0]):
         return 'the words after the stubs differ: ' + ' '.join(f'{u32(co, o):x}' for o in range(tail[0], len(co) - 3, 4)) + ' | ' + ' '.join(f'{u32(cn, o):x}' for o in range(tail[1], len(cn) - 3, 4))
-    ro, rn = table(oo, ho, 80, 16), table(on, hn, 80, 16)
-    if len(ro) != len(rn) or any(x[4:] != y[4:] or u32(y, 0) - u32(x, 0) != (tail[1] - tail[0] if u32(x, 0) >= stubs[0][0] else 0) for x, y in zip(ro, rn)):
+    ro, rn = table(oo, ho, 80, 16), [r for r in rn_all if r[4] != PROBE_BRANCH]
+    if len(ro) != len(rn) or rn_all[:len(rn)] != rn or u32(hn, 84) != u32(ho, 84) + len(probes) or \
+            any(x[4:] != y[4:] or u32(y, 0) - u32(x, 0) != (tail[1] - tail[0] if u32(x, 0) >= stubs[0][0] else 0) for x, y in zip(ro, rn)):
         return 'the relocations differ'
     return None
 

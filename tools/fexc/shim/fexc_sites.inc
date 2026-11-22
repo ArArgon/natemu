@@ -995,7 +995,9 @@ void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_
 //             first: orr x1, x1, #(1 << 51); put: fmov Dd, x1; done:
 bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
   using IR::IROps;
-  if (!fexc_no_afp || FexcX87Lazy() || !FexcX87Op(IROp)) return false;   // (fast mode: no fix-up, the `x87-nan-results` deviation)
+  // (fast mode: no fix-up, the `x87-nan-results` deviation; FexcX87Op first: FexcX87Lazy reads request arguments, which an op of
+  // no x87 instruction must not, so a block without x87 code depends on neither --x87-unmasked nor --accurate)
+  if (!fexc_no_afp || !FexcX87Op(IROp) || FexcX87Lazy()) return false;
   if (IROp->Op != IROps::OP_VFADD && IROp->Op != IROps::OP_VFSUB && IROp->Op != IROps::OP_VFMUL && IROp->Op != IROps::OP_VFDIV &&
       IROp->Op != IROps::OP_VFSQRT) return false;
   if (IROp->Size != IR::OpSize::i64Bit || IROp->ElementSize != IR::OpSize::i64Bit) return false;
@@ -1592,8 +1594,9 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, A);
   auto* L = Stub(A, 0);
   tbnz_OrRestart(TMP1, 12, L);
-  // The stub probes both pages and comes back here (FexcEmitStubs); a step unit keeps the `brk`.
-  if (!fexc_step_unit) {
+  // The stub probes both pages through its shared probe and comes back here (FexcEmitStubs); a step unit keeps the `brk`,
+  // and so does a store with no shared probe (a width but 2, 4, 8, 16 or 32 bytes).
+  if (!fexc_step_unit && FexcProbeThunk(fexc_bits32, A.Idx(), uint32_t(W)) >= 0) {
     auto& P = FexcProbes[fexc_sites.size() - 1];
     P.Reg = uint8_t(A.Idx());
     P.Width = uint32_t(W);
@@ -1604,6 +1607,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
 // The stubs, after the block body (reached only by their checks; the body before them ends in an exit: `svc #1` or the
 // dispatch `b`).
 void Arm64JITCore::FexcEmitStubs() {
+  fexc_probe_branches.clear();   // (per attempt: a restarted compile emits its stubs again)
   if (FexcTargetsDone != fexc_target_check.size()) {
     ERROR_AND_DIE_FMT("fexc slice1: {} of {} indirect branch targets were not checked", fexc_target_check.size() - FexcTargetsDone,
                       fexc_target_check.size());
@@ -1619,16 +1623,20 @@ void Arm64JITCore::FexcEmitStubs() {
   for (auto& [Index, Label] : FexcStubs) {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
-    // A store that crosses a page without a trap: the split stub writes one byte of each page (an atomic add of zero: it
-    // always writes, so a page this vCPU's shadow does not hold writable faults here) and goes back to the store.
-    //   ldrb w0, [x28, #WATCH]; cbnz w0, brk        a breakpoint is armed (DR7; the resident's byte): the `brk`, as before
+    // A store that crosses a page without a trap: the split stub is two words, `adr x0, <the word after the check>; b <its
+    // shared probe>`. The shared probes are the resident's, one per (bitness, address register, width) in its code area's head
+    // (natemu_abi::execution::probe): each writes one byte of each page (an atomic add of zero: it always writes, so a page
+    // this vCPU's shadow does not hold writable faults there) and returns through x0, which it keeps in d0 (FEX's VTMP1, dead
+    // between ops like x0 and x1) while it uses x0:
+    //   fmov d0, x0; ldrb w0, [x28, #WATCH]; cbnz w0, brk          a breakpoint is armed (DR7; the resident's byte): the `brk`
     //   add x0, xA, #w-1
     //   64-bit code  bic x0, xA, x0; lsr x0, x0, #63; cbnz x0, brk     the store wraps at 2^64: the `brk`
     //   32-bit code  orr x0, x0, xA; lsr x0, x0, #32; cbnz x0, brk     an address above 4 GiB: the `brk`
-    //   staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <the word after the check>
+    //   staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; fmov x0, d0; br x0
     //   brk: brk #2
-    // A fault at either probe is the resident's split store as at the `brk` (its checks, the walks in order, the store
-    // through its own mapping), resumed after the access.
+    // The `b` is a placeholder `b .` exported as a `probe_branch` relocation (its value the probe's index), which the
+    // resident points at the probe wherever it places the block. A fault at either probe, or the `brk`, is the resident's
+    // split store as at a `brk` stub (the site found from d0, the word after the check), resumed after the access.
     // LOAD-BEARING: after two probes that passed, the store cannot fault. The shadow tables are this vCPU's own and change
     // only in its synchronous resident entries; between the probes and the store there is none (an interrupt only arms a
     // stop), and every return of the resident into this sequence is to the stub's first word, never to the second probe.
@@ -1636,21 +1644,10 @@ void Arm64JITCore::FexcEmitStubs() {
     // the first test. 32-bit code: an address above 4 GiB (FEX's 64-bit address arithmetic; a store that runs across
     // 4 GiB) is not probed, since the tables may map something there for the task's 64-bit code.
     if (const auto It = FexcProbes.find(Index); It != FexcProbes.end()) {
-      const auto A = ARMEmitter::XRegister(It->second.Reg);
-      ARMEmitter::ForwardLabel Brk;
-      ldrb(TMP1.W(), STATE, FEXC_WATCH_ARMED);
-      (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &Brk);
-      add(ARMEmitter::Size::i64Bit, TMP1, A, It->second.Width - 1);
-      if (fexc_bits32) orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, A.R());
-      else bic(ARMEmitter::Size::i64Bit, TMP1, A.R(), TMP1);
-      lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, fexc_bits32 ? 32 : 63);
-      (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &Brk);
-      stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, A.R());
-      add(ARMEmitter::Size::i64Bit, TMP1, A, It->second.Width - 1);
-      stadd(ARMEmitter::SubRegSize::i8Bit, ARMEmitter::Reg::zr, TMP1);
-      (void)b(&It->second.Back);
-      (void)Bind(&Brk);
-      brk(FexcBrkSplit);
+      (void)adr(TMP1, &It->second.Back);
+      fexc_probe_branches.push_back({uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin),
+                                     uint32_t(FexcProbeThunk(fexc_bits32, It->second.Reg, It->second.Width))});
+      dc32(0x14000000);
       continue;
     }
     const uint8_t K = fexc_sites[Index].kind;

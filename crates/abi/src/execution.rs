@@ -269,8 +269,14 @@ pub mod cache {
     }
     /// [`Control::l1_contexts`]: a table that holds no context's entries (it is cleared before it takes one).
     pub const NO_CONTEXT: u64 = u64::MAX;
+    /// The shared probes of page-crossing stores ([`super::probe`]): [`super::probe::THUNKS`] of
+    /// [`super::probe::THUNK_BYTES`] each, written once by the resident ([`super::probe::words`]); a probing split stub's `b`
+    /// goes to its store's. Inside every block's `b` reach, as the dispatcher is.
+    pub const PROBES: usize = DISPATCH + DISPATCH_BYTES;
+    pub const PROBES_BYTES: usize = super::probe::THUNKS * super::probe::THUNK_BYTES as usize;
+    pub const PROBES_VA: u64 = CODE_VA + PROBES as u64;
     /// Blocks are placed from here.
-    pub const HEAD_BYTES: usize = DISPATCH + DISPATCH_BYTES;
+    pub const HEAD_BYTES: usize = PROBES + PROBES_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
     /// Pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block (M1), so the arena
@@ -2003,7 +2009,7 @@ pub fn pack_reloc(r: &crate::code_object::Reloc, code_size: u32) -> Option<Optio
         o::RELOC_GUEST_RIP_MOVE if fits(4) && r.register < 31 => {
             Some(Some(r.offset / 4 << 6 | RELOC_MOVE | u32::from(r.register)))
         }
-        o::RELOC_NAMED_SYMBOL_LITERAL | o::RELOC_DISPATCH_BRANCH => Some(None),
+        o::RELOC_NAMED_SYMBOL_LITERAL | o::RELOC_DISPATCH_BRANCH | o::RELOC_PROBE_BRANCH => Some(None),
         _ => None,
     }
 }
@@ -2297,6 +2303,117 @@ pub fn relocate_code_mode(
 /// The placeholder fexc emits for the resident to relocate when it places a block: a computed exit's branch (`b .`,
 /// becomes `b` to [`cache::DISPATCH`]).
 pub const DISPATCH_PLACEHOLDER: u32 = 0x1400_0000;
+
+/// Page-crossing stores through shared probes (the two-word split stub). A store wider than a byte that crosses a 4 KiB
+/// page branches from its split check to its stub, `adr x0, R; b P`: R the word after the check, P the shared probe of
+/// (bitness, the store's address register A, its width w) in the code area's head ([`cache::PROBES`]). fexc emits the `b` as
+/// a placeholder `b .` with a `probe_branch` relocation whose value is P's [`index`]; the resident points it at P wherever
+/// it places the block ([`branch_word`]). P ([`words`]): `fmov d0, x0; ldrb w0, [x28, #WATCH_ARMED]; cbnz w0, brk; add x0,
+/// xA, #w-1; bic x0, xA, x0 (32-bit code: orr x0, x0, xA); lsr x0, x0, #63 (#32); cbnz x0, brk; staddb wzr, [xA]; add x0,
+/// xA, #w-1; staddb wzr, [x0]; fmov x0, d0; br x0; brk: brk #2`: an armed breakpoint, a store that wraps at 2^64 or (32-bit
+/// code) one above 4 GiB takes the `brk`; else one byte of each page is written (an atomic add of zero), and the store runs.
+/// R travels in x0, then in d0 (FEX's VTMP1, dead between ops as x0 and x1 are), so at a probe's fault or the `brk` the
+/// resident finds the stub from d0 ([`stub_of`]). A is never x0 (the check's scratch register).
+pub mod probe {
+    /// The widths with a shared probe; a store of another width keeps its `brk` stub.
+    pub const WIDTHS: [u32; 5] = [2, 4, 8, 16, 32];
+    pub const THUNK_BYTES: u64 = 64;
+    /// 32 register slots per (bitness, width); slots of x0, x28 and 31 hold no probe (zero words).
+    pub const THUNKS: usize = 2 * WIDTHS.len() * 32;
+    /// Offsets in a probe: the probes, the `brk`.
+    pub const FIRST: u64 = 28;
+    pub const SECOND: u64 = 36;
+    pub const BRK: u64 = 48;
+    /// `brk #2`, the split stub's.
+    pub const BRK2: u32 = 0xd420_0040;
+    /// The probe of a store of `width` bytes at `reg` in 32-bit (`bits32`) or 64-bit code, if there is one.
+    pub const fn index(bits32: bool, reg: u8, width: u32) -> Option<u32> {
+        let w = match width {
+            2 => 0,
+            4 => 1,
+            8 => 2,
+            16 => 3,
+            32 => 4,
+            _ => return None,
+        };
+        if reg == 0 || reg == 28 || reg >= 31 {
+            return None;
+        }
+        Some(if bits32 { 160 } else { 0 } + 32 * w + reg as u32)
+    }
+    /// (bitness, register, width) of probe `index`, if it is one.
+    pub const fn decode(index: u32) -> Option<(bool, u8, u32)> {
+        if index as usize >= THUNKS {
+            return None;
+        }
+        let (bits32, reg, width) = (index >= 160, (index % 32) as u8, WIDTHS[(index % 160 / 32) as usize]);
+        match self::index(bits32, reg, width) {
+            Some(_) => Some((bits32, reg, width)),
+            None => None,
+        }
+    }
+    /// Probe `index`'s words (all zero for a slot that holds none).
+    pub const fn words(index: u32) -> [u32; THUNK_BYTES as usize / 4] {
+        let mut w = [0; THUNK_BYTES as usize / 4];
+        let Some((bits32, reg, width)) = decode(index) else {
+            return w;
+        };
+        let (a, add) = (reg as u32, 0x9100_0000 | (width - 1) << 10 | (reg as u32) << 5);
+        w[0] = 0x9e67_0000; // fmov d0, x0
+        w[1] = 0x3940_0380 | super::frame::WATCH_ARMED << 10; // ldrb w0, [x28, #WATCH_ARMED]
+        w[2] = 0x3500_0000 | (((BRK - 8) / 4) as u32) << 5; // cbnz w0, brk
+        w[3] = add;
+        w[4] = if bits32 { 0xaa00_0000 | a << 16 } else { 0x8a20_0000 | a << 5 }; // orr x0, x0, xA | bic x0, xA, x0
+        w[5] = if bits32 { 0xd360_fc00 } else { 0xd37f_fc00 }; // lsr x0, x0, #32 | #63
+        w[6] = 0xb500_0000 | (((BRK - 24) / 4) as u32) << 5; // cbnz x0, brk
+        w[7] = 0x383f_001f | a << 5; // staddb wzr, [xA]
+        w[8] = add;
+        w[9] = 0x383f_001f; // staddb wzr, [x0]
+        w[10] = 0x9e66_0000; // fmov x0, d0
+        w[11] = 0xd61f_0000; // br x0
+        w[12] = BRK2;
+        w
+    }
+    /// The code-area offset of probe `index`.
+    pub const fn offset(index: u32) -> u64 {
+        super::cache::PROBES as u64 + THUNK_BYTES * index as u64
+    }
+    /// The probe at native address `pc` (in the code area's executable alias) and `pc`'s offset in it.
+    pub fn at(pc: u64) -> Option<(u32, u64)> {
+        let o = pc.checked_sub(super::cache::PROBES_VA)?;
+        let index = (o / THUNK_BYTES) as u32;
+        decode(index).map(|_| (index, o % THUNK_BYTES))
+    }
+    /// The stub's first word: `adr x0, to` at `at`, if `to` is within reach.
+    pub const fn adr_x0(at: u64, to: u64) -> Option<u32> {
+        let d = to.wrapping_sub(at) as i64;
+        if d < -(1 << 20) || d >= 1 << 20 {
+            return None;
+        }
+        let d = d as u32;
+        Some(0x1000_0000 | (d & 3) << 29 | (d >> 2 & 0x7_ffff) << 5)
+    }
+    /// The target of `w` at `at` if it is `adr x0, target`.
+    pub const fn adr_x0_target(w: u32, at: u64) -> Option<u64> {
+        if w & 0x9f00_001f != 0x1000_0000 {
+            return None;
+        }
+        let imm = ((w >> 5 & 0x7_ffff) << 2 | w >> 29 & 3) as i32;
+        Some(at.wrapping_add(((imm << 11) >> 11) as i64 as u64))
+    }
+    /// The stub's second word placed at code-area offset `at`: `b` to probe `index`.
+    pub const fn branch_word(at: u64, index: u32) -> u32 {
+        0x1400_0000 | (offset(index).wrapping_sub(at) >> 2) as u32 & 0x3ff_ffff
+    }
+    /// The probing split stub among `sites` (the block's, whose code `word` reads by offset) that a probe left for with `r`
+    /// in x0 (the stub's `adr`): its index. `r`'s offset in the block's code is `ret`.
+    pub fn stub_of(sites: &[crate::code_object::Site], word: impl Fn(u64) -> u32, ret: u64) -> Option<usize> {
+        sites.iter().position(|s| {
+            s.kind == crate::code_object::kind::SPLIT
+                && adr_x0_target(word(u64::from(s.native_offset)), u64::from(s.native_offset)) == Some(ret)
+        })
+    }
+}
 /// Link points per block: a slice-1 block ends at one branch (a jcc has two literal exits); admission refuses more.
 pub const MAX_LINK_POINTS: usize = 4;
 /// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
@@ -4106,6 +4223,79 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// Every shared probe of a page-crossing store ([`super::probe`]), decoded field by field: for each (bitness, address
+    /// register, width) the probe saves the return in d0, sends an armed breakpoint and (64-bit) a wrapping store or (32-bit)
+    /// one above 4 GiB to its `brk`, probes exactly the store's first and last byte through its register, and returns through
+    /// x0 restored from d0; slots without a probe are zero; the index, the stub's `adr` and its `b` round-trip.
+    #[test]
+    fn every_shared_probe_is_its_store_s() {
+        use super::probe::*;
+        let field = |w: u32, at: u32, bits: u32| w >> at & ((1 << bits) - 1);
+        let cond_target = |w: u32, pos: u64| pos.wrapping_add(((field(w, 5, 19) << 13) as i32 >> 11) as i64 as u64);
+        let mut seen = 0;
+        for bits32 in [false, true] {
+            for &width in &WIDTHS {
+                for reg in 0..32u8 {
+                    let Some(i) = index(bits32, reg, width) else {
+                        assert!(reg == 0 || reg == 28 || reg == 31, "{reg}");
+                        continue;
+                    };
+                    seen += 1;
+                    assert_eq!(decode(i), Some((bits32, reg, width)));
+                    assert_eq!(at(super::cache::PROBES_VA + offset(i) - super::cache::PROBES as u64 + SECOND), Some((i, SECOND)));
+                    let w = words(i);
+                    let a = u32::from(reg);
+                    // fmov d0, x0 (FMOV general to double: sf=1, type=01, rmode=00, opcode=111).
+                    assert_eq!((w[0] >> 10, field(w[0], 5, 5), field(w[0], 0, 5)), (0x9e670000 >> 10, 0, 0));
+                    // ldrb w0, [x28, #WATCH_ARMED]; cbnz w0, brk
+                    assert_eq!((w[1] >> 22, field(w[1], 10, 12), field(w[1], 5, 5), field(w[1], 0, 5)), (0xe5, super::frame::WATCH_ARMED, 28, 0));
+                    assert_eq!((w[2] >> 24, field(w[2], 0, 5), cond_target(w[2], 8)), (0x35, 0, BRK));
+                    // add x0, xA, #w-1 (twice); the range test; cbnz x0, brk
+                    for k in [3, 8] {
+                        assert_eq!((w[k] >> 22, field(w[k], 10, 12), field(w[k], 5, 5), field(w[k], 0, 5)), (0x244, width - 1, a, 0));
+                    }
+                    if bits32 {
+                        // orr x0, x0, xA; lsr x0, x0, #32 (ubfm x0, x0, #32, #63)
+                        assert_eq!((w[4] >> 21, field(w[4], 16, 5), field(w[4], 10, 6), field(w[4], 5, 5), field(w[4], 0, 5)), (0x550, a, 0, 0, 0));
+                        assert_eq!((w[5] >> 22, field(w[5], 16, 6), field(w[5], 10, 6)), (0x34d, 32, 63));
+                    } else {
+                        // bic x0, xA, x0 (and x0, xA, ~x0); lsr x0, x0, #63
+                        assert_eq!((w[4] >> 21, field(w[4], 16, 5), field(w[4], 10, 6), field(w[4], 5, 5), field(w[4], 0, 5)), (0x451, 0, 0, a, 0));
+                        assert_eq!((w[5] >> 22, field(w[5], 16, 6), field(w[5], 10, 6)), (0x34d, 63, 63));
+                    }
+                    assert_eq!((w[6] >> 24, field(w[6], 0, 5), cond_target(w[6], 24)), (0xb5, 0, BRK));
+                    // staddb wzr, [xA] at FIRST; staddb wzr, [x0] at SECOND
+                    assert_eq!((w[FIRST as usize / 4] & !0x3e0, field(w[FIRST as usize / 4], 5, 5)), (0x383f_001f, a));
+                    assert_eq!(w[SECOND as usize / 4], 0x383f_001f);
+                    // fmov x0, d0; br x0; brk #2; then nothing
+                    assert_eq!((w[10], w[11], w[BRK as usize / 4]), (0x9e66_0000, 0xd61f_0000, BRK2));
+                    assert!(w[13..].iter().all(|&x| x == 0));
+                    // The stub's words placed at code-area offset `at`.
+                    for stub in [super::cache::HEAD_BYTES as u64, 0x7ff_fff8] {
+                        let b = branch_word(stub + 4, i);
+                        assert_eq!(b >> 26, 5);
+                        assert_eq!((stub + 4).wrapping_add(((b << 6) as i32 >> 4) as i64 as u64), offset(i));
+                        let back = stub - 0x40;
+                        assert_eq!(adr_x0_target(adr_x0(stub, back).unwrap(), stub), Some(back));
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 2 * WIDTHS.len() * 29);
+        assert!((0..THUNKS as u32).filter(|&i| decode(i).is_none()).all(|i| words(i) == [0; 16]));
+        assert_eq!((index(false, 1, 10), index(false, 0, 8), index(true, 28, 4), decode(THUNKS as u32)), (None, None, None, None));
+        assert_eq!(adr_x0(0, 1 << 20), None);
+        assert_eq!(adr_x0_target(adr_x0(0, 4).unwrap() | 1, 0), None); // adr x1
+        // `stub_of`: the probing split stub whose `adr` names the return, of the block's sites.
+        let site = |kind, native_offset| crate::code_object::Site { kind, native_offset, ..unsafe { core::mem::zeroed() } };
+        let sites = [site(crate::code_object::kind::STORE, 0x14), site(crate::code_object::kind::SPLIT, 0x24), site(crate::code_object::kind::SPLIT, 0x2c)];
+        let code = |o: u64| match o {
+            0x24 => adr_x0(0x24, 0x14).unwrap(),
+            0x2c => BRK2,
+            _ => 0,
+        };
+        assert_eq!((stub_of(&sites, code, 0x14), stub_of(&sites, code, 0x18)), (Some(1), None));
+    }
     /// Segments of the hot/cold layout leave little unused whatever the hot:code mix ([`cache::SegFill`]): blocks of varying
     /// sizes (hot copy bytes : code bytes of 1:2, 2:1, and a third of the blocks placed whole) fill an area; the bytes the
     /// code side passed that no hot copy or code holds stay under 3% of what was placed.

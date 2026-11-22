@@ -1356,6 +1356,34 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             }
         }
     }
+    // The shared probes of page-crossing stores (`natemu_abi::execution::probe`): the head holds exactly every probe's words,
+    // and every probing split stub of a block with code of its own (`adr x0` its first word) branches to its store's probe.
+    for i in 0..exec::probe::THUNKS as u32 {
+        let at = exec::probe::offset(i);
+        if let Some(k) = exec::probe::words(i).iter().enumerate().position(|(k, &w)| word(at + 4 * k as u64) != w) {
+            return Err(format!("shared probe {i}: word {k} is {:#010x}", word(at + 4 * k as u64)));
+        }
+    }
+    for n in 0..control.blocks as usize {
+        let meta = u32::from_le_bytes(area.read::<4>(cache::LOOKUP_OFFSET + cache::INDEX + 4 * n)) as usize;
+        let b: cache::Block = area.read_record(cache::META_OFFSET + meta);
+        if b.flags & (cache::INSTANCE | cache::SYSTEM) != 0 || b.code_size == 0 {
+            continue;
+        }
+        let bits32 = exec::context_bits32(b.context);
+        for k in 0..b.sites_count as usize {
+            let site: natemu_abi::code_object::Site =
+                area.read_record(cache::META_OFFSET + meta + size_of::<cache::Block>() + k * size_of::<natemu_abi::code_object::Site>());
+            let at = u64::from(b.code) + u64::from(site.native_offset);
+            if site.kind != natemu_abi::code_object::kind::SPLIT || exec::probe::adr_x0_target(word(at), at).is_none() {
+                continue;
+            }
+            let want = exec::probe::index(bits32, site.base_reg, u32::from(site.width)).map(|i| exec::probe::branch_word(at + 4, i));
+            if want != Some(word(at + 4)) {
+                return Err(format!("probing split stub at {:#x} of the block at {:#x}: word {:#010x}", site.native_offset, b.rip, word(at + 4)));
+            }
+        }
+    }
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)
         .map(|i| link_record(area, i))
         .collect();

@@ -204,6 +204,9 @@ pub const RELOC_NAMED_SYMBOL_LITERAL: u8 = 2;
 pub const RELOC_GUEST_RIP_MOVE: u8 = 3;
 /// A computed exit's placeholder `b .` the resident relocates to its dispatcher (`execution::DISPATCH_PLACEHOLDER`).
 pub const RELOC_DISPATCH_BRANCH: u8 = 4;
+/// A probing split stub's placeholder `b .` the resident points at its shared probe; the value is the probe's index
+/// (`execution::probe`).
+pub const RELOC_PROBE_BRANCH: u8 = 5;
 pub const RELOC_OTHER: u8 = 255;
 
 #[repr(C)]

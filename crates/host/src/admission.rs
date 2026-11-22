@@ -726,37 +726,26 @@ fn admit_records(
             .min()
             .unwrap_or(h.guest_bytes)
             - s.guest_offset;
-        // A split stub is its `brk`, or eleven words that probe the store's first and last byte and go back to the store
-        // (fexc, FexcEmitStubs; the resident takes a fault at a probe as the `brk`): exactly these, the probes on the stub's
-        // address register, the branch to a word at or before the access.
+        // A split stub is its `brk`, or two words that go to the shared probe of its store and say where to come back
+        // (`natemu_abi::execution::probe`; the resident takes a fault at a probe, and its `brk`, as the stub's `brk`):
+        // `adr x0, R` with R a word at or before the access, then the placeholder `b .` at a `probe_branch` relocation whose
+        // value is the probe of exactly this store (bitness, the site's address register and width; no index or offset:
+        // the probe writes [xA]).
         let probing = || {
-            let (at, a, w) = (s.native_offset, u32::from(s.base_reg), u32::from(s.width));
-            let add = 0x9100_0000 | (w.wrapping_sub(1) & 0xfff) << 10 | a << 5; // add x0, xA, #w-1
-            const STADDB: u32 = 0x383f_001f; // staddb wzr, [x0]
-            let back = |x: u32| {
-                let to = i64::from(at + 36) + i64::from((x << 6) as i32 >> 6) * 4;
-                x >> 26 == 5 && to >= i64::from(ENTRY_OFFSET) && access.is_some_and(|a| to <= i64::from(a.native_offset))
-            };
-            // An address above 4 GiB (32-bit code) or a store that wraps (64-bit code) goes to the `brk`.
-            let range = if bits32 { [0xaa00_0000 | a << 16, 0xd360_fc00] } else { [0x8a20_0000 | a << 5, 0xd37f_fc00] };
+            use natemu_abi::execution::probe;
+            let at = s.native_offset;
+            let back = probe::adr_x0_target(word(at), u64::from(at));
+            let index = probe::index(bits32, s.base_reg, u32::from(s.width));
             s.kind == object::kind::SPLIT
-                && (1..31).contains(&a)
-                && a != 28
-                && (2..=32).contains(&w)
-                && at + 44 <= region
-                && [
-                    0x3940_0380 | natemu_abi::execution::frame::WATCH_ARMED << 10, // ldrb w0, [x28, #WATCH_ARMED]
-                    0x3500_0120,                            // cbnz w0, +36
-                    add,
-                    range[0],                               // orr x0, x0, xA | bic x0, xA, x0
-                    range[1],                               // lsr x0, x0, #32 | #63
-                    0xb500_00a0,                            // cbnz x0, +20
-                    STADDB | a << 5,
-                    add,
-                    STADDB,
-                ] == [0, 4, 8, 12, 16, 20, 24, 28, 32].map(|k| word(at + k))
-                && back(word(at + 36))
-                && word(at + 40) == stub_word(s.kind)
+                && (s.imm, s.index_reg) == (0, object::NO_REG)
+                && at + 8 <= region
+                && back.is_some_and(|t| {
+                    t >= u64::from(ENTRY_OFFSET) && access.is_some_and(|a| t <= u64::from(a.native_offset))
+                })
+                && word(at + 4) == natemu_abi::execution::DISPATCH_PLACEHOLDER
+                && index.is_some_and(|i| {
+                    relocs.iter().any(|r| r.kind == object::RELOC_PROBE_BRANCH && r.offset == at + 4 && r.value == u64::from(i))
+                })
         };
         if !is_stub(s)
             || !site_fields_valid(s, &h, region)
@@ -807,6 +796,12 @@ fn admit_records(
                 if r.size == 0 && at % 4 == 0 && at < region as usize && r.register < 31 => {}
             object::RELOC_DISPATCH_BRANCH if r.size == 0 && at % 4 == 0 && at < region as usize => {
             }
+            // A probing split stub's branch to its shared probe (its stub checks the word and the value).
+            object::RELOC_PROBE_BRANCH
+                if r.size == 0
+                    && at % 4 == 0
+                    && at < region as usize
+                    && u32::try_from(r.value).is_ok_and(|i| natemu_abi::execution::probe::decode(i).is_some()) => {}
             _ => return fail(&format!("relocation at {at:#x}")),
         }
     }

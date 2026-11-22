@@ -141,6 +141,9 @@ enum Insn {
     Svc(u16),
     /// A computed exit's placeholder `b .` at a dispatch relocation (never returns).
     Dispatch,
+    /// A probing split stub's placeholder `b .` at a probe relocation: to the store's shared probe, which returns to the
+    /// stub's `adr` target ([`Verifier::probe_return`]).
+    ProbeBranch,
     Brk,
     Udf,
     /// Perf chunk 15: a read of the virtual count (`mrs xT, cntvct_el0 | cntvctss_el0`: fexc emits `isb; mrs cntvct_el0`, or the
@@ -195,7 +198,7 @@ impl Insn {
     fn falls_through(&self) -> bool {
         !matches!(
             self,
-            Insn::B(_) | Insn::Dispatch | Insn::Svc(svc::LINK) | Insn::Brk | Insn::Udf
+            Insn::B(_) | Insn::Dispatch | Insn::ProbeBranch | Insn::Svc(svc::LINK) | Insn::Brk | Insn::Udf
         )
     }
 }
@@ -758,6 +761,17 @@ impl<'a> Verifier<'a> {
             insns[at / 4] = Some(Insn::Dispatch);
             dispatch = Some(r.offset);
         }
+        // Probing split stubs' branches to their shared probes (object validation checked each stub's value).
+        for r in c.relocs.iter().filter(|r| r.kind == object::RELOC_PROBE_BRANCH) {
+            let at = r.offset as usize;
+            if at % 4 != 0
+                || c.code.get(at..at + 4) != Some(&DISPATCH_PLACEHOLDER.to_le_bytes()[..])
+                || !matches!(insns.get(at / 4), Some(Some(Insn::B(_))))
+            {
+                return Err(format!("probe branch at {at:#x}: not a placeholder `b .` in the code"));
+            }
+            insns[at / 4] = Some(Insn::ProbeBranch);
+        }
         let all: Vec<(u32, i64)> = (insns.iter().enumerate())
             .filter_map(|(i, x)| match x {
                 Some(Insn::B(t) | Insn::Cond(t)) => Some((i as u32 * 4, *t)),
@@ -795,8 +809,18 @@ impl<'a> Verifier<'a> {
         };
         // A probing split stub's branch back to its store, and the branch back from the run's end of a top x87 run test:
         // branches like the others for every rule on targets.
-        let (returns, back): (Vec<_>, Vec<_>) =
-            back.into_iter().partition(|&(at, t)| v.probe_return(at, t) || v.run_end_return(at, t));
+        let (mut returns, back): (Vec<_>, Vec<_>) = back.into_iter().partition(|&(at, t)| v.run_end_return(at, t));
+        // A probing split stub's way back from its shared probe: from the stub's `b` to its `adr`'s target.
+        for (i, st) in c.stubs.iter().enumerate() {
+            let at = st.native_offset + 4;
+            if matches!(v.insn(at), Some(Insn::ProbeBranch)) {
+                let t = natemu_abi::execution::probe::adr_x0_target(v.word(st.native_offset), u64::from(st.native_offset))
+                    .and_then(|t| u32::try_from(t).ok())
+                    .filter(|&t| v.probe_return(at, t))
+                    .ok_or(format!("probing split stub {i} at {:#x}: its way back", st.native_offset))?;
+                returns.push((at, t));
+            }
+        }
         // (No other backward branch into the run's end: its return is reached from the test alone.)
         if let Some(e) = v.run_test()
             && returns.iter().chain(&back).any(|&(at, t)| at != e + 36 && t >= e && t <= e + 36)
@@ -1131,9 +1155,10 @@ impl<'a> Verifier<'a> {
                 }
                 Insn::Atomic { rn: 28, .. } => return fail(at, "frame access by an atomic"),
                 Insn::Probe(28) => return fail(at, "frame access by a probe"),
-                // A probe is a split stub's seventh or ninth word.
-                Insn::Probe(_) if !self.probing(at).is_some_and(|(_, k)| k == 0 || k == 8) => {
-                    return fail(at, "page probe outside a split stub");
+                // (The probes are the resident's: generated code has none.)
+                Insn::Probe(_) => return fail(at, "page probe outside a split stub"),
+                Insn::ProbeBranch if self.probing(at).is_none_or(|(_, k)| k != 4) => {
+                    return fail(at, "probe branch outside a split stub");
                 }
                 // A fetch-and-op or CAS whose result is XZR is not an acquire (as for SWPAL); FEX never emits one.
                 Insn::Atomic {
@@ -1170,7 +1195,6 @@ impl<'a> Verifier<'a> {
                 Insn::Svc(_) => return fail(at, "svc"),
                 Insn::Brk
                     if shape
-                        && self.probing(at).is_none_or(|(_, k)| k != 16)
                         && self
                             .c
                             .stubs
@@ -1478,13 +1502,12 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    /// The probing split stub the word at `at` belongs to (its index), and the word's offset from the stub's first probe
-    /// (its seventh word): 0 and 8 the probes, 12 the branch back to the store, 16 the `brk`; negative in the six test
-    /// words. Object validation checked the stub's words.
+    /// The probing split stub the word at `at` belongs to (its index), and the word's offset in it: 0 its `adr`, 4 its
+    /// branch to its shared probe. Object validation checked the stub's words.
     fn probing(&self, at: u32) -> Option<(usize, i64)> {
         self.c.stubs.iter().enumerate().find_map(|(i, s)| {
-            let k = i64::from(at) - i64::from(s.native_offset) - 24;
-            (s.kind == object::kind::SPLIT && (-24..=16).contains(&k) && matches!(self.insn(s.native_offset + 24), Some(Insn::Probe(_))))
+            let k = i64::from(at) - i64::from(s.native_offset);
+            (s.kind == object::kind::SPLIT && (0..=4).contains(&k) && matches!(self.insn(s.native_offset + 4), Some(Insn::ProbeBranch)))
                 .then_some((i, k))
         })
     }
@@ -1505,15 +1528,15 @@ impl<'a> Verifier<'a> {
                 && self.branches_into(e - 4, at).all(|(src, to)| src == ENTRY_OFFSET + 4 && to == e)
         })
     }
-    /// The backward branch at `at` to `t` is a probing split stub's return to its store, and makes no loop: it goes to a
-    /// word at or before the stub's access, the stub is not fallen into, and every branch into the stub comes from before
-    /// `t` (or from the stub itself: 32-bit code's test), so nothing after `t` reaches the stub again.
+    /// The way back at `at` (a probing split stub's branch to its shared probe) to `t` (where the probe returns) makes no
+    /// loop: `t` is a word at or before the stub's access, the stub is not fallen into, and every branch into the stub comes
+    /// from before `t`, so nothing after `t` reaches the stub again.
     fn probe_return(&self, at: u32, t: u32) -> bool {
-        let Some((i, 12)) = self.probing(at) else {
+        let Some((i, 4)) = self.probing(at) else {
             return false;
         };
         let s = &self.c.stubs[i];
-        let last = at + 4; // (the `brk` after the branch too)
+        let last = at;
         let stub = s.native_offset..=last;
         t <= s.guest_offset2
             && self.insn(t).is_some()
@@ -1525,7 +1548,7 @@ impl<'a> Verifier<'a> {
     /// For a probing split stub's return branch at `src`: the first word that branches into its stub (every one of them
     /// lies before the return's target, [`Self::probe_return`]).
     fn probe_entry(&self, src: u32) -> Option<u32> {
-        let (i, 12) = self.probing(src)? else {
+        let (i, 4) = self.probing(src)? else {
             return None;
         };
         let at = self.c.stubs[i].native_offset;
@@ -1802,10 +1825,10 @@ impl<'a> Verifier<'a> {
                             "no split check `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12` on exactly its address, then only x0/x1 written",
                         );
                     }
-                    // A stub that probes goes back to the word after its check.
-                    let first = st.native_offset + 24;
-                    if matches!(self.insn(first), Some(Insn::Probe(_)))
-                        && !matches!(self.insn(first + 12), Some(Insn::B(t)) if t == i64::from(c.end) + 4)
+                    // A stub that probes comes back to the word after its check.
+                    if matches!(self.insn(st.native_offset + 4), Some(Insn::ProbeBranch))
+                        && natemu_abi::execution::probe::adr_x0_target(self.word(st.native_offset), u64::from(st.native_offset))
+                            != Some(u64::from(c.end) + 4)
                     {
                         return fail("its split stub's probes do not come back to the word after the check");
                     }
@@ -2725,10 +2748,12 @@ mod tests {
     /// M2, with `FEXC` set: 32-bit code (`--bitness 32`) is admitted under its mode only, with FEX's compact register map,
     /// branch targets and return addresses that wrap at 4 GiB, and the ES/CS/SS/DS base loads; a 64-bit object is refused
     /// under the 32-bit mode, and a base load patched into 64-bit code stays refused (`frame_fields`).
-    /// M2 task 4, with `FEXC` set: a split stub that probes. `mov [rbx+8], rax`: the check at 0x4..0x10, the store at 0x14,
-    /// the stub at 0x24 (its tests, the probes at 0x3c and 0x44, the branch back at 0x48, the `brk` at 0x4c).
+    /// M2 task 4, with `FEXC` set: a split stub that probes through its shared probe. `mov [rbx+8], rax`: the check at
+    /// 0x4..0x10 (on x1 = rbx + 8), the store at 0x14, the stub at 0x24: `adr x0, 0x14; b .`, the `b` at a probe_branch
+    /// relocation naming the probe of a 64-bit, x1, 8-byte store (`natemu_abi::execution::probe::index`).
     #[test]
     fn probing_split_stubs_are_verified() {
+        use natemu_abi::execution::probe;
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
@@ -2744,18 +2769,33 @@ mod tests {
         let block = (&block.0[..], &block.1[..]);
         admit(block).unwrap();
         admit_with(block, false).unwrap();
+        let adr = |to: u64| probe::adr_x0(0x24, to).unwrap();
         // Object validation (so also with the code shape off): the stub's words exactly.
         for (at, old, new) in [
-            (0x48, 0x17ff_fff3, 0x17ff_fff4), // b 0x18: back to a word after the access
-            (0x48, 0x17ff_fff3, 0x17ff_ffee), // b 0x0: before the code
-            (0x3c, 0x383f_003f, 0x383f_005f), // staddb wzr, [x2]: not the store's address register
-            (0x30, 0x8a20_0020, NOP),         // without the test for a store that wraps
-            (0x24, 0x3942_d380, NOP),         // without the read of the armed-breakpoint byte
-            (0x4c, 0xd420_0040, NOP),         // without its `brk`
+            (0x24, adr(0x14), adr(0x18)),     // back to a word after the access
+            (0x24, adr(0x14), adr(0x0)),      // back to before the code
+            (0x24, adr(0x14), adr(0x14) | 1), // adr x1: the probe returns through x0
+            (0x28, DISPATCH_PLACEHOLDER, 0x1400_0001), // not the placeholder
         ] {
             validated(block, at, old, new, Some("check stub at native offset 0x24"));
         }
-        // A probe anywhere else; a second way into the stub, from after the word it returns to.
+        // The relocation names another store's probe (x2), or another width's, or none.
+        let h: Header = super::super::record(block.0, 0);
+        let reloc = (0..h.relocs_count as usize)
+            .map(|i| h.relocs_offset as usize + 16 * i)
+            .find(|&at| block.0[at + 4] == object::RELOC_PROBE_BRANCH)
+            .unwrap();
+        assert_eq!(block.0[reloc + 8..reloc + 16], u64::from(probe::index(false, 1, 8).unwrap()).to_le_bytes());
+        for value in [probe::index(false, 2, 8), probe::index(false, 1, 4), probe::index(true, 1, 8), Some(probe::THUNKS as u32)] {
+            let mut o = block.0.to_vec();
+            o[reloc + 8..reloc + 16].copy_from_slice(&u64::from(value.unwrap()).to_le_bytes());
+            let e = admit_with((&o, block.1), false).unwrap_err();
+            assert!(e.contains("check stub at native offset 0x24") || e.contains("relocation at 0x28"), "{value:?}: {e}");
+        }
+        // Back to the check itself (its `tbnz` at 0x10, or before it): a loop through the stub, refused with the code shape off.
+        validated(block, 0x24, adr(0x14), adr(0x10), Some("probing split stub 0 at 0x24: its way back"));
+        validated(block, 0x24, adr(0x14), adr(0x8), Some("probing split stub 0 at 0x24: its way back"));
+        // A probe in generated code; a second way into the stub, from after the word it returns to.
         validated(block, 0x4, 0x9100_20c1, 0x383f_003f, Some("page probe outside a split stub"));
         assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24
     }

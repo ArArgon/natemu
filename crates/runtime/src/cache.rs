@@ -17,7 +17,7 @@ use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
-    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
+    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_BYTES, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL,
     INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
     PIC_TEST_STR, PIC_TEST_SVC, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
@@ -1052,6 +1052,7 @@ pub fn place(
             size as usize,
         );
         relocate(code, dispatch_exit, dispatcher_for(context));
+        point_probes(code, staged_sites.iter().copied(), context);
         if hot != u64::MAX {
             (record.hot, record.hot_size) = (hot as u32, h_at);
             if !split(&mut record) {
@@ -1156,7 +1157,17 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         admitted[2 * k] = (u64::from(p.offset), p.word);
         admitted[2 * k + 1] = (svc_slot(t, p), pic::SVC_LINK);
     }
+    // (The probing split stubs' branches to their shared probes, as admitted: the placeholder, pointed again below.)
+    // (Only they branch into the probes: every other branch of a block goes inside it, to a block or to the dispatcher.)
+    let probe_branch = |o: u64| {
+        let w = word(from + o);
+        w & 0xfc00_0000 == 0x1400_0000
+            && (area::PROBES as u64..area::HEAD_BYTES as u64).contains(&branch_to(from + o))
+    };
     let original = |o: usize| {
+        if probe_branch(o as u64) {
+            return natemu_abi::execution::DISPATCH_PLACEHOLDER;
+        }
         admitted
             .iter()
             .find(|&&(at, _)| at == o as u64)
@@ -1172,6 +1183,9 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         );
         for &(o, w) in admitted.iter().filter(|(o, _)| *o != u64::MAX) {
             at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for o in sites(t).iter().map(|s| u64::from(s.native_offset) + 4).filter(|&o| o + 4 <= size as u64 && probe_branch(o)) {
+            at[o as usize..o as usize + 4].copy_from_slice(&natemu_abi::execution::DISPATCH_PLACEHOLDER.to_le_bytes());
         }
         // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
         if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip).is_err() {
@@ -1203,6 +1217,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
             counted(count::UNPROVED);
             return None;
         }
+        point_probes(code, sites(t).iter().copied(), t.context);
     }
     let record = Block {
         checked: 0,
@@ -1458,6 +1473,7 @@ pub fn copy(
         let bits32 = natemu_abi::execution::context_bits32(b.context);
         natemu_abi::execution::relocate_code_mode(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes, bits32)?;
         relocate(code, u64::from(b.dispatch_exit), dispatcher_for(b.context));
+        point_probes(code, sites(b).iter().copied(), b.context);
         synchronize_code(
             area::CODE_WRITE_VA + code,
             area::CODE_VA + code,
@@ -1568,6 +1584,7 @@ pub fn copy_pooled(
         let bits32 = natemu_abi::execution::context_bits32(context);
         natemu_abi::execution::relocate_code_mode(at, &relocs[..count], &mut links, e.rip, rip, e.guest_bytes, bits32)?;
         relocate(code, u64::from(e.dispatch_exit), dispatcher_for(context));
+        point_probes(code, (0..e.sites_count()).map(|i| e.site(i)), context);
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, len);
     }
     let mut record = Block {
@@ -1885,6 +1902,34 @@ fn relocate(code: u64, dispatch_exit: u64, to: u64) {
     }
 }
 
+/// The shared probes of page-crossing stores ([`natemu_abi::execution::probe`]), once, before any block runs: every
+/// probe's words in the code area's head.
+pub fn fill_probes() {
+    use natemu_abi::execution::probe;
+    for i in 0..probe::THUNKS as u32 {
+        let w = probe::words(i);
+        unsafe { copy_record((area::CODE_WRITE_VA + probe::offset(i)) as *mut u8, w.as_ptr().cast(), size_of_val(&w)) };
+    }
+    synchronize_code(area::CODE_WRITE_VA + area::PROBES as u64, area::PROBES_VA, area::PROBES_BYTES);
+}
+/// Points the probing split stubs of the block just copied to code-area offset `code` (before its code is synchronized),
+/// whose sites are `sites` and code context `context`, at their shared probes: each such stub's second word (the
+/// admitted placeholder, or a branch from where the block was before) becomes `b` to its store's probe, which the site
+/// names ([`natemu_abi::execution::probe::index`]; admission checked there is one). A split stub that is a `brk` stays.
+fn point_probes(code: u64, sites: impl Iterator<Item = Site>, context: u64) {
+    use natemu_abi::execution::probe;
+    let bits32 = natemu_abi::execution::context_bits32(context);
+    for s in sites.filter(|s| s.kind == natemu_abi::code_object::kind::SPLIT) {
+        let at = code + u64::from(s.native_offset);
+        if probe::adr_x0_target(word(at), at).is_none() {
+            continue;
+        }
+        let Some(i) = probe::index(bits32, s.base_reg, u32::from(s.width)) else {
+            crate::execution::halt_native([at, u64::from(s.base_reg), u64::from(s.width)], natemu_abi::execution::stop::SITE_MISMATCH)
+        };
+        unsafe { ((area::CODE_WRITE_VA + at + 4) as *mut u32).write_volatile(probe::branch_word(at + 4, i)) };
+    }
+}
 /// Arms a precise stop in `b` (the block the doorbell interrupted; live, or the step block): every exit's word (each
 /// link point's first word, linked or not, and the computed exit's `b`) becomes [`STOP_WORD`], recorded with its word
 /// for [`disarm`]. Every path out of a block passes one of them or enters the resident (`svc`, a stub, an abort):

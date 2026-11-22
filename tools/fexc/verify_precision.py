@@ -217,20 +217,25 @@ STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'al
 M64 = (1 << 64) - 1
 
 
-def probing(s, dis, check=None):
+def probe_index(bits32, reg, width):
+    """The shared probe of a store of `width` bytes at x`reg` (natemu_abi::execution::probe::index), or None."""
+    if width not in (2, 4, 8, 16, 32) or reg in (0, 28) or reg >= 31: return None
+    return (160 if bits32 else 0) + 32 * (2, 4, 8, 16, 32).index(width) + reg
+
+
+def probing(s, dis, d, check=None):
     """The words of split stub `s` when it probes instead of trapping (fexc FexcEmitStubs): a set of offsets, else None.
-    `ldrb w0, [x28, #0xb4]; cbnz w0, <brk>; add x0, xA, #w-1; bic x0, xA, x0; lsr x0, x0, #63 (32-bit code: orr x0, x0, xA;
-    lsr x0, x0, #32); cbnz x0, <brk>; staddb wzr, [xA]; add x0, xA, #w-1; staddb wzr, [x0]; b <back>; brk #0x2`. A the
-    stub's address register, w its store's width, <back> the word after the stub's check (`check`: that branch, when given)."""
-    at, a, w = s['native_offset'], s['base_reg'], s['width']
-    if s['kind'] != 'split': return None
-    add, brk = f'add x0, x{a}, #{w - 1:#x}', f'{at + 40:#x}'
-    want = ['ldrb w0, [x28, #0xb4]', f'cbnz w0, {brk}', add] + ([f'orr x0, x0, x{a}', 'lsr x0, x0, #32'] if BITS else [f'bic x0, x{a}, x0', 'lsr x0, x0, #63']) + \
-           [f'cbnz x0, {brk}', f'staddb wzr, [x{a}]', add, 'staddb wzr, [x0]']
-    if [dis.get(at + 4 * k) for k in range(9)] != want or dis.get(at + 40) != 'brk #0x2': return None
-    back = re.fullmatch(r'b 0x([0-9a-f]+)', dis.get(at + 36, ''))
-    if not back or (check is not None and int(back[1], 16) != check + 4): return None
-    return {at + k for k in range(0, 44, 4)}
+    `adr x0, <back>; b .`, the `b` at a probe_branch relocation whose probe is the store's (bitness, A, w: A the stub's
+    address register, w its store's width): the resident points it at that shared probe, which probes the store's first
+    and last byte and returns to <back>, the word after the stub's check (`check`: that branch, when given)."""
+    at = s['native_offset']
+    if s['kind'] != 'split' or s.get('imm', 0) != 0: return None
+    back = re.fullmatch(r'adr x0, 0x([0-9a-f]+)', dis.get(at, ''))
+    if not back or (check is not None and int(back[1], 16) != check + 4) or dis.get(at + 4) != f'b {at + 4:#x}': return None
+    want = probe_index(bool(BITS), s['base_reg'], s['width'])
+    if want is None or not any(r['kind'] == 'probe_branch' and r['offset'] == at + 4 and r.get('probe') == want for r in d['code']['relocations']):
+        return None
+    return {at, at + 4}
 
 
 RUN_END = ['mrs x0, fpsr', 'and w0, w0, #0xff', 'ldr w1, [x28, #0x4b4]', 'orr w1, w1, w0', 'str w1, [x28, #0x4b4]', 'ldr w0, [x28, #0xb0]', 'msr fpcr, x0',
@@ -335,7 +340,7 @@ def guards(d, dis, order):
             refs.setdefault(int(m[4], 16), []).append(o)
     probes = {}
     for at, s in stubs.items():
-        if (words := probing(s, dis, refs[at][0] if len(refs.get(at, [])) == 1 else None)) is not None:
+        if (words := probing(s, dis, d, refs[at][0] if len(refs.get(at, [])) == 1 else None)) is not None:
             probes[at] = words
         elif dis.get(at) != STUB_WORD[s['kind']]:
             out.append(f'stub +{at} ({s["kind"]}) is "{dis.get(at)}"')
@@ -807,8 +812,8 @@ def entry_and_branches(d, dis, order):
         if mn in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or mn.startswith('b.'):
             t = int(re.findall(r'0x([0-9a-f]+)$', dis[off])[0], 16)
             dispatch = mn == 'b' and t == off and any(r['kind'] == 'dispatch_branch' and r['offset'] == off for r in d['code']['relocations'])
-            # (A probing split stub's branch back to its store, at or before the access: guards() checks it is the word after the check.)
-            back = mn == 'b' and t in dis and any(s['kind'] == 'split' and (w := probing(s, dis)) and off == max(o for o in w if dis[o].startswith('b ')) and t <= s['access_native_offset'] for s in d['sites'])
+            # (A probing split stub's placeholder `b .` to its shared probe: guards() checks the stub.)
+            back = mn == 'b' and t == off and any(s['kind'] == 'split' and (w := probing(s, dis, d)) and off == s['native_offset'] + 4 for s in d['sites'])
             # (and the return from the run's end of the block's top x87 run test: run_test() checks its words)
             back = back or (mn == 'b' and (e := run_test_end(d, dis)) is not None and off == e + 36 and t == d['code']['layout']['code_region_begin'] + 8)
             if (t <= off or t not in dis) and not dispatch and not back:

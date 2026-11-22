@@ -48,7 +48,7 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
         let r: Reloc = read(o, at)?;
         match r.kind {
             object::RELOC_GUEST_RIP_LITERAL | object::RELOC_GUEST_RIP_MOVE => {}
-            object::RELOC_NAMED_SYMBOL_LITERAL | object::RELOC_DISPATCH_BRANCH => continue,
+            object::RELOC_NAMED_SYMBOL_LITERAL | object::RELOC_DISPATCH_BRANCH | object::RELOC_PROBE_BRANCH => continue,
             _ => return None,
         }
         let value = r.value.wrapping_add(d);
