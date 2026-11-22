@@ -139,12 +139,14 @@ Experiment (an earlier version of the case: 8 GiB and Java's default heap, one b
 ## System calls: hackbench through the boot-time interpreter's branch
 
 `hackbench` (above) makes its system calls by SYSCALL. `hackbench32` is the same program built as 32-bit code (i686),
-which makes them through the kernel's 32-bit vDSO (SYSENTER); `hackbench32-int80` boots with `vdso32=0`, so every
-system call is an INT 0x80. All at 1 vCPU. The commits, all on `boot-interp`: 78f60965, before the boot-time
-interpreter; be626aa8, after its plumbing (d7bc0885 moved the resident's code into its own 2 MiB block, 0624b341 and
-be626aa8 added the interpreter's classification and entry); e21b0209, after CPU start-up (INIT and SIPI) and the
-interpreter itself; 9fd9f346, the branch's final tip (the mode transitions, the firmware boot mode, the real-code
-suites).
+which makes them through the kernel's 32-bit vDSO (SYSENTER); `hackbench32-int80` boots with `vdso32=0`, so every system
+call is an INT 0x80. All at 1 vCPU. Measured before `boot-interp` was rebased onto main (November 22), on its pre-rebase
+commits (tag `boot-interp-prerebase` and its ancestors), so the ids below are theirs; [the commit
+map](restructure/commit-map-boot-interp-2026-11-22.txt) gives each one's id after the rebase. The commits: 78f60965, the
+old base (`m2-32bit`, before the rebase), before the boot-time interpreter; be626aa8, after its plumbing (d7bc0885 moved
+the resident's code into its own 2 MiB block, 0624b341 and be626aa8 added the interpreter's classification and entry);
+e21b0209, after CPU start-up (INIT and SIPI) and the interpreter itself; 9fd9f346, the branch's final tip (the mode
+transitions, the firmware boot mode, the real-code suites).
 
 Bench cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (`TESTKIT_BENCH_AT=<commit>
 tools/natemu-test run --tier bench -k "guest-hackbench and not profile and not qemu"`); Apple M2 Max; November 22,

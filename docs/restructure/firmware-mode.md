@@ -1,10 +1,11 @@
 # natemu's firmware boot mode (boot-time interpreter plan, section 7)
 
-Status: November 22, 2026, built (`boot-interp` commits 0e41c122 to d8049820, on 73aa5b52, with the interpreter's
-resident operations). Spec: [the plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts
-[m2-exit-firmware.md](m2-exit-firmware.md) (the exit test's firmware), [real-code-suites.md](real-code-suites.md) (OVMF)
-and [interp-integration.md](interp-integration.md) (the interpreter's memory layer). The exit test's firmware runs whole
-at 1, 2 and 4 CPUs and OVMF's `main32` and `reset` entries reach SEC with KVM's registers (`reset` through its MOV CR4
+Status: November 22, 2026, built (`boot-interp` commits a8993801 to 1ac78362, on cc63f385, with the interpreter's
+resident operations; 0e41c122 to d8049820 on 73aa5b52 before the branch's rebase onto main). Spec: [the
+plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts [m2-exit-firmware.md](m2-exit-firmware.md)
+(the exit test's firmware), [real-code-suites.md](real-code-suites.md) (OVMF) and
+[interp-integration.md](interp-integration.md) (the interpreter's memory layer). The exit test's firmware runs whole at
+1, 2 and 4 CPUs and OVMF's `main32` and `reset` entries reach SEC with KVM's registers (`reset` through its MOV CR4
 640H: CR4.MCE is accepted though natemu's CPU does not present MCE, a recorded deviation: section 5).
 
 ## 1. The region and its mapping
@@ -119,15 +120,16 @@ The image is read as memory everywhere it can be reached, and a store to it is d
 
 ## 6. Effect on today's boots
 
-Experiment (not a framework case; M2 Max): the release residents of `boot-interp` deea8131 and of this branch, disassembled
-function by function (`llvm-objdump`, addresses, branch targets and literal offsets normalized): 452 of 486 functions are
-identical, among them `translate` (with the shadow install inlined), `segments::pages`, `access_aborted`, `find_from`,
-`mapped`, `fetch_page`, `page_record::translation`, `tables::install`, `system`, `commit`, `set_cpl`, `sys_fast`,
-`miss_fast` and `split_lock`. On the hot paths: `fetch_walk`'s RAM path is identical, its not-RAM arm a call (`rom_page`),
-only branch offsets differ; `segments::copy` differs by a register rename (two callee-saved registers swapped) and its
-not-RAM arm; the page walker's four instances (`paging::walk_once`) inline `GuestTables::read` (the table load with its
-observer), which deea8131 calls: an inlining decision of the code-generation units, not code of this change (paging.rs
-and guest_memory.rs are untouched; it comes and goes with the size of `mmio::ones`' firmware block alone, and against
+Experiment (not a framework case; M2 Max; ids before the rebase onto main, tag `boot-interp-prerebase`): the release
+residents of `boot-interp` deea8131 and of this branch, disassembled function by function (`llvm-objdump`, addresses,
+branch targets and literal offsets normalized): 452 of 486 functions are identical, among them `translate` (with the
+shadow install inlined), `segments::pages`, `access_aborted`, `find_from`, `mapped`, `fetch_page`,
+`page_record::translation`, `tables::install`, `system`, `commit`, `set_cpl`, `sys_fast`, `miss_fast` and `split_lock`.
+On the hot paths: `fetch_walk`'s RAM path is identical, its not-RAM arm a call (`rom_page`), only branch offsets differ;
+`segments::copy` differs by a register rename (two callee-saved registers swapped) and its not-RAM arm; the page
+walker's four instances (`paging::walk_once`) inline `GuestTables::read` (the table load with its observer), which
+deea8131 calls: an inlining decision of the code-generation units, not code of this change (paging.rs and
+guest_memory.rs are untouched; it comes and goes with the size of `mmio::ones`' firmware block alone, and against
 e21b0209 the walker was identical), one call fewer per table level; `maskmov::transaction` and `xsave::transaction`
 differ in scheduling only. The rest are cold paths (`mmio::device`, `mmio::ones`, `atomic_byte`, `accessed`, the
 interpreter) and literal-pool offsets (libm, x87 helpers). Without an image, the host's spans, backing size, `Control`

@@ -1,11 +1,12 @@
 # M2 Part 2: the boot-time 16/32-bit interpreter — plan
 
-Status: built, November 22, 2026, on branch `boot-interp` (from `m2-32bit` at 78f60965). It develops Part 2 of
-[the M2 design notes](m2-32bit-design.md) and takes the 32-bit survey of [the S3g plan](s3g-plan.md) as input. Two
-independent reviews, three rechecks and an independent replication of the upstream census were folded in before the
-build (section 12); the results of the build are folded into each section ("Built"), and the decisions taken are in
-section 11. B0-B5 are built; B5's full gate on the final tip passed but for three failures identical at the parent, its
-AFP cases pending, and its benchmark round: see section 12. B6 stays deferred.
+Status: built, November 22, 2026, on branch `boot-interp` (from `m2-32bit` at 78f60965, the old base; rebased onto main
+a6d03605 the same day, section 12). It develops Part 2 of [the M2 design notes](m2-32bit-design.md) and takes the 32-bit
+survey of [the S3g plan](s3g-plan.md) as input. Two independent reviews, three rechecks and an independent replication
+of the upstream census were folded in before the build (section 12); the results of the build are folded into each
+section ("Built"), and the decisions taken are in section 11. B0-B5 are built; B5's full gate on the final tip passed
+but for three failures identical at the parent, its AFP cases pending, and its benchmark round: see section 12. B6 stays
+deferred.
 Results, all framework cases on the M2 Max:
 
 - the interpreter matches QEMU 11.1.2 and KVM on all 1,716 per-instruction cases in R, P16, P32 and C32 (`tests/interp`
@@ -19,8 +20,9 @@ Results, all framework cases on the M2 Max:
 - no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case; M2
   Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
   [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
-  `segments::copy` and the page walker inlining its table read ([firmware-mode.md](firmware-mode.md) section 6); and the
-  system-call bench cases are no slower: at the final tip against 78f60965, `guest-hackbench32` −4.5% and
+  `segments::copy` and the page walker inlining its table read ([firmware-mode.md](firmware-mode.md) section 6), both
+  before the rebase onto main (against main after it: section 12); and the system-call bench cases are no slower,
+  measured before the rebase (pre-rebase ids): at the final tip against 78f60965, `guest-hackbench32` −4.5% and
   `guest-hackbench32-int80` −5.1%, beyond the noise and from the plumbing commits (d7bc0885 to be626aa8),
   `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
 
@@ -279,7 +281,8 @@ State changes only inside a system transaction, so:
 The arms of `controls()` that return for 64-bit and flat 32-bit user state stay exactly today's two match arms, and
 `controls()` stays inline: the fast system-call path reaches it (`sys_commit` → `system` → `commit` → `controls`, and
 SYSCALL/SYSRET also call `set_cpl`, `execution.rs:854`, `syscalls.rs:100-174`), and an out-of-line `controls()` was the
-cause of the task 1 regression (`ec84a1e6`). `find`'s hit path is unchanged (it tests only CS.L, `execution.rs:211`).
+cause of the task 1 regression (`65669336`, `ec84a1e6` before `m2-32bit`'s rebase). `find`'s hit path is unchanged (it
+tests only CS.L, `execution.rs:211`).
 
 **Far transfers in interpreted modes are the interpreter's own code (decided, owner, November 22).** The far JMP and
 far RET forms of section 1, in R, P16, P32 and C32 at CPL 0, are executed by the interpreter: a real-mode load sets CS
@@ -506,7 +509,8 @@ stretch and the power-on memory-type question off M3's critical path. The choice
 
 The interpreter runs only for state the translator cannot take, but integration edits sit on paths a running 64-bit OS
 uses all the time. Precedent: M2 task 1's plumbing cost hackbench 3-4% and locks 2% at 1 vCPU through one function that
-stopped being inlined (`controls()`, fixed in `ec84a1e6`; [checkpoint A findings](m2-checkpoint-a-findings.md)).
+stopped being inlined (`controls()`, fixed in `65669336`, `ec84a1e6` before `m2-32bit`'s rebase; [checkpoint A
+findings](m2-checkpoint-a-findings.md)).
 
 | Edit | Reaches a running OS through | Safeguard |
 | --- | --- | --- |
@@ -646,7 +650,40 @@ known-bug-passed. The three failures are identical at the parent 78f60965: `stat
 failing on `m2-32bit` too). The AFP cases, on the M3 at the pushed commit: pending. The benchmark round: the system-call
 bench cases against 78f60965, as in the status above ([benchmarks](../benchmarks.md)).
 
-**Commit ids.** Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
-`boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
-cb7cd541 → d4bf265d; 8b022e58 → 0624b341; f29042cf → ce8cea18; bdb5dc09 → 40a888db; 315860f3 → d7bc0885;
-75cfdd22 → be626aa8. A number measured at one of those ids was measured on the agent's tree, not on `boot-interp`'s.
+**The rebase onto main (November 22).** The branch's 87 commits moved from 78f60965 (the old base: `m2-32bit` before its
+own rebase; main holds the same tree as 6388d04e, not 78f60965 itself) onto main a6d03605. The commits before the rebase
+are tag `boot-interp-prerebase` and its ancestors; [the commit map](commit-map-boot-interp-2026-11-22.txt) pairs each
+with its new id (matched by subject). No commit was dropped or emptied. As before the rebase, four commits do not build
+alone: 95c43a21 and 84d018d4 (a driver test lacks `CpuResult::startup` until c7f2ee35) and eb588db1 and 0cb05371 (the
+resident: `Next::Init` unmatched until 4c31966f). Conflicts, all in two commits of B1 (b) and two of the interpreter
+(`Control`'s appended fields, the record flag), against main's K1 chain fix: both sides' appended `Control` fields kept,
+main's first; main's `OFF0` and `OFF1` took flag bits 13 and 14, so `INTERPRETED` moved from 13 to 15
+([interp-integration.md](interp-integration.md), "Records": an interpreter record is dropped from the linear chains for
+good once a walk finds it not current, which nothing reads). Main's shared probes and page-crossing stores leave the
+firmware image's checks as they were (`split` still refuses a page-crossing store with the image on either side,
+`unsupported_mmio`). Experiment (not a framework case; M2 Max): the release residents of main a6d03605 and the rebased
+tip, disassembled (`llvm-objdump`; addresses, symbol hashes, anonymous symbols and literal pools aside), and the same of
+78f60965 and the pre-rebase tip 8f42fd6a: `find_from`, `sys_fast`, `miss_fast` (with `sys_commit` and `events::none`'s
+call sites), both `lookup` instances, `far_transfer`, `far_return`, `load_data`, `translate`, `segments::pages`,
+`access_aborted`, `events::held` and the page walker (which inlined its table read before the rebase) are identical to
+main's; `system` (CR4.MCE), `commit`, `set_cpl`, `refuse_compatibility`, `trap_due`, `events::next` and `take`,
+`fetch_walk`, `segments::copy`, `atomic_byte` and `split_lock` differ from main's exactly as they differed from 78f60965
+before the rebase (the cold arms above). New against main, from the code-generation units' partitioning, with no source
+change: `helpers::x87` inlines `x87::helper` (one call fewer per `svc #X87` than main), `gather::transaction` inlines
+`set_ymm`, `compat::execute` calls `rotate::memory` out of line, `block_at`'s per-candidate test is out of line,
+`maskmov::transaction`'s frame is 32 bytes larger, `fptrap::patch_flush` allocates other registers. Resident text
+245,268 (main) -> 274,176 bytes. Checks on the rebased tip (M2 Max): `tools/natemu-test run --base origin/main` (every
+family's smoke cases and unit tests, and the families boot, diag, faults, interp, io, programs, smp, static and system
+whole): 85,107 passed, 3 failed: `system` `i5b-images::fxsave-full-stack` with its case row (as before the rebase), and
+`static` `fexc-replay`, which cannot build its old compiler in this checkout (the merge base with the local `main` is
+b1c84a0d, whose FEX pin the checkout's submodule does not hold; the branch changes neither `tools/fexc` nor
+`third_party/FEX`). Case `stack`: the gate bound 21,920 of 81,920 bytes (26,256 with one nested entry), boot 11,920 of
+32,768. Not run on the rebased tip: the full gate, the AFP cases and the benchmark round.
+
+**Commit ids.** Ids in this plan and the design notes that name a measurement (a gate, a bench case, a disassembly, a
+stack bound) are the pre-rebase commits it ran on, kept as they were; ids that say where something was built are the
+rebased ones. Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
+`boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as (agent's, before the rebase, after it):
+cb7cd541 → d4bf265d → 9965ceb4; 8b022e58 → 0624b341 → 974d4b8a; f29042cf → ce8cea18 → 95c43a21; bdb5dc09 → 40a888db →
+f0acfaf3; 315860f3 → d7bc0885 → 31564a06; 75cfdd22 → be626aa8 → a2449f26. A number measured at one of the agents' ids
+was measured on the agent's tree, not on `boot-interp`'s.

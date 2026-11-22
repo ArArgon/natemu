@@ -1,11 +1,11 @@
 # M2 exit test: the firmware and its AP part
 
-Status (November 22, 2026, `boot-interp` commits a120f189 to aaa65e74): built by the framework from the repository and
-proven on the pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs the program
-variant whole at 1, 2 and 4 CPUs, each AP's stub in the boot-time interpreter (case `exit-ap-natemu`: the CPU start-up
-slice, B2 of the boot-time interpreter plan); the firmware image runs whole in natemu's firmware boot mode at 1, 2 and
-4 CPUs ([firmware-mode.md](firmware-mode.md), case `exit-fw-natemu`).
-This page is the contract those slices build to.
+Status (November 22, 2026, `boot-interp` commits 6e166015 to 943b3f2e, a120f189 to aaa65e74 before the branch's rebase
+onto main): built by the framework from the repository and proven on the pinned QEMU 11.1.2 (TCG) and on real hardware
+through KVM, at 1, 2 and 4 CPUs. natemu runs the program variant whole at 1, 2 and 4 CPUs, each AP's stub in the
+boot-time interpreter (case `exit-ap-natemu`: the CPU start-up slice, B2 of the boot-time interpreter plan); the
+firmware image runs whole in natemu's firmware boot mode at 1, 2 and 4 CPUs ([firmware-mode.md](firmware-mode.md), case
+`exit-fw-natemu`). This page is the contract those slices build to.
 
 ## The pieces
 

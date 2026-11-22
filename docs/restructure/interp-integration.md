@@ -62,13 +62,19 @@ Exclusion from translated code's paths: the key has `INTERPRETED_CONTEXT` (bit 6
 `kept_system`, `sys_fast`, `miss_fast` and `find_from` never find one; `cut`/`cut_one` find no INBOUND, out slot or L1
 entry; `link`, `template`, `first_test_fires` and the host's block passes exclude SYSTEM.
 
+The flag is bit 15 (`cache::INTERPRETED` = 32768; it was bit 13 until the rebase onto main, whose K1 chain fix took bits
+13 and 14 for `OFF0` and `OFF1`). A record is on its pages' linear chains as any record `file` places: a #PF or INVLPG
+walk of a chain cuts it and then drops it from that chain for good (`OFF0`/`OFF1`), as only `lookup`'s revalidation puts
+a block back and none reaches an interpreter record. Harmless: nothing reads its currency, and it is never current again
+(`checked` is set only when it is filed), so K1's invariants (`check_chains`) hold for it.
+
 Experiment (not a framework case; M2 Max): disassembly against the parent commit (release residents, literal and
 anonymous-symbol offsets aside): `find_from`, both `lookup` instances, `mapped` (with `revalidated` inlined),
 `revalidated_from_record`, `sys_fast`, `miss_fast`, `system`, `commit`, `set_cpl`, `translate`, `fetch_walk`,
 `segments::pages`, `enter`, `linker`, `step_here`, `cut_one`, `invalidate`, `current_at`, `kept_system` and `trap_due`
 identical; `cache::file` (placement) swaps two registers; `split_lock` inlines its `split_begin`, `mmio::ones` calls
 `mmio::page` out of line. Resident 242,624 -> 261,516 bytes (against 5d5594c0, where the same functions are again
-identical).
+identical; the commits before the branch's rebase onto main, tag `boot-interp-prerebase`).
 
 Stops (`Hook::at`): the host's `REQUEST_DECODE` handler asks `stop_at` and `hook.at` at CS.base + EIP first (a stop parks
 the vCPU, `REPLY_PARK`; a test hook's `At::System` there is an error) and ends the run before `hook.boundary` or
