@@ -17,7 +17,7 @@ documented deviations (the M4 has none; the names are the ones `tests/lib/fp_dev
 - `band-ue-flag`: with UE masked, a result just below the smallest normal number that rounds up to it can set MXCSR.UE (x86 judges tininess after rounding).
 - `daz-ftz-band`: with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal.
 - `ftz-band`: with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm's denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right).
-- `x87-nan-results`: an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation on a signalling NaN from memory and a quiet NaN in ST(0) returns the signalling one quieted where x86 keeps ST(0)'s (the flags are right).
+- `x87-nan-results`: an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation whose first operand is a quiet NaN and whose second is a signalling NaN returns the signalling one quieted where x86 keeps the quiet one (the first operand is ST(0), or the memory operand of FSUBR and FDIVR; a signalling NaN reaches an operation as an m64 operand or in a register loaded by FLD m80, FRSTOR or FXRSTOR; a signalling m32 operand is quieted when it is converted and never shows it; the flags are right).
 - `masked-x87-de`: with DE masked, an x87 instruction on a denormal m32 or m64 operand does not set the status word's DE flag (the result is right).
 
 The first six are about SSE and AVX code, the last two about x87 code (what 32-bit programs built for i686 use for all
@@ -61,9 +61,11 @@ mode on a Mac without FEAT_AFP, the two x87 items in the list above.
 Two smaller differences in the x87 status word's flags that neither mode changes. Both come from how the Mac's own
 floating-point unit reports flags, and both were measured against a real x86 processor (an AMD Ryzen 7 8845HS):
 
-- `x87-band-ue-flag` (Macs without FEAT_AFP: M1, M2): with UE masked, an x87 result just below the smallest normal double
-  that rounds up to it sets the status word's UE flag. Arm judges "too small" before rounding, x86 after. Accurate mode
-  fixes the same case for SSE code (`band-ue-flag`), not for x87.
+- `x87-band-ue-flag` (Macs without FEAT_AFP: M1, M2): with UE masked, a result just below the smallest normal number of
+  its format that rounds up to it sets the status word's UE flag: FST or FSTP m32 of a value just below the smallest
+  normal `float`, and arithmetic whose result lies just below the smallest normal double. Arm judges "too small" before
+  rounding, x86 after: the real processor sets only PE for that store, and for the arithmetic no flag at all (it works
+  in 80 bits, `x87-doubles`). Accurate mode fixes the same case for SSE code (`band-ue-flag`), not for x87.
 - `x87-register-de` (Macs with FEAT_AFP: M4): an x87 instruction on a register that holds a denormal double sets the
   status word's DE flag. On x86 that register holds an ordinary 80-bit number and DE stays clear. A Mac without FEAT_AFP
   does not set it, which is x86's behaviour. Removing it on an M4 would mean testing every memory operand in software

@@ -30,7 +30,7 @@ CLASSES = {
                      'a runner case: +-0 with UE and PE where x86 gives +-MIN_NORMAL with PE (run_i5c `daz-ftz-band-*`)'),
     'ftz-band': ('C', 'with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm\'s denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right)',
                  'the smallest-normal result (no tagged case yet)'),
-    'x87-nan-results': ('X', "an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation on a signalling NaN from memory and a quiet NaN in ST(0) returns the signalling one quieted where x86 keeps ST(0)'s (the flags are right)",
+    'x87-nan-results': ('X', "an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation whose first operand is a quiet NaN and whose second is a signalling NaN returns the signalling one quieted where x86 keeps the quiet one (the first operand is ST(0), or the memory operand of FSUBR and FDIVR; a signalling NaN reaches an operation as an m64 operand or in a register loaded by FLD m80, FRSTOR or FXRSTOR; a signalling m32 operand is quieted when it is converted and never shows it; the flags are right)",
                         "a runner case: the documented NaN in the register, everything else exact"),
     'masked-x87-de': ('X', 'with DE masked, an x87 instruction on a denormal m32 or m64 operand does not set the status word\'s DE flag (the result is right)',
                       'a runner case: the exact status word with DE cleared, everything else exact'),
@@ -44,7 +44,7 @@ CLASSES = {
 # name: (where it applies, description)
 X87_OTHER = {
     'x87-doubles': ('every Mac, both modes', 'x87 registers hold 64-bit doubles, not the 80-bit format: `long double` has the precision and range of `double` (the list above)'),
-    'x87-band-ue-flag': ('Macs without FEAT_AFP, both modes', 'with UE masked, an x87 result just below the smallest normal double that rounds up to it sets the status word\'s UE flag (Arm judges tininess before rounding)'),
+    'x87-band-ue-flag': ('Macs without FEAT_AFP, both modes', 'with UE masked, an x87 result just below the smallest normal number of its format that rounds up to it sets the status word\'s UE flag: FST/FSTP m32 below the smallest normal float, arithmetic below the smallest normal double (Arm judges tininess before rounding)'),
     'x87-register-de': ('Macs with FEAT_AFP, both modes', 'an x87 instruction on a register that holds a denormal double sets the status word\'s DE flag; on x86 the register holds a normal 80-bit number and DE stays clear'),
 }
 

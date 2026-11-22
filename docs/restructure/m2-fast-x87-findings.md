@@ -72,8 +72,12 @@ AFP. Fast mode differs from the wrapper in exactly these, and in nothing else (n
 rounding-mode result, or IE, ZE, OE, UE, PE flag):
 
 1. `x87-nan-results`, the default NaN's sign (222 cases): an invalid operation gives +NaN where x86 gives -NaN. IE is set.
-2. `x87-nan-results`, the choice (250 cases): a signalling NaN from memory beside a quiet NaN in ST(0) gives the memory
-   NaN, quieted, where x86 keeps ST(0)'s. IE is set.
+2. `x87-nan-results`, the choice (250 cases): when the operation's first operand is a quiet NaN and its second a
+   signalling one, the result is the signalling one, quieted, where x86 keeps the quiet one. IE is set. The first
+   operand is ST(0), or the memory operand of FSUBR and FDIVR. The signalling NaN is an m64 operand, or sits in a
+   register: FLD m80, FRSTOR and FXRSTOR load one unchanged (`fld tbyte [SNaN]; fld qword [QNaN]; fadd st(0), st(1)`
+   is the VM case `nan-qnan-st0-snan-reg-fadd`). A signalling m32 operand never shows it: its conversion to a double
+   quiets it before the operation.
 3. `masked-x87-de` (312 cases): no DE for a denormal m32 or m64 operand.
 
 With AFP hidden the 32-bit system cases and the i386 campaign pass (177 passed, 12 expected failures, the same twelve),
@@ -99,8 +103,11 @@ So on all three FEX is the same or coarser. natemu keeps more than FEX does: IE,
 
 Found by the same comparison; neither comes from this change and neither mode changes them.
 
-- `x87-band-ue-flag` (Macs without AFP): a product just below the smallest normal double that rounds up to it sets UE
-  (12 of the cases). The wrapper has it too.
+- `x87-band-ue-flag` (Macs without AFP): a result just below the smallest normal number of its format that rounds up to
+  it sets UE (12 of the cases): a product just below the smallest normal double, and FST or FSTP m32 of a double just
+  below the smallest normal float (the narrowing conversion judges "too small" before rounding there). The wrapper has
+  it too. On real x86 (the same Ryzen) the store `fstp m32` of 0x380FFFFFFFFFFFFF stores 0x00800000 with PE and no UE,
+  and the register product sets no flag at all (80 bits).
 - `x87-register-de` (Macs with AFP): the M4's code sets DE whenever an x87 operation meets a denormal double in a
   *register* (3,597 cases), because it takes the CPU's own flag. Checked on real x86 (Ryzen 7 8845HS, a small C program,
   32- and 64-bit): 2^-1023 computed in the x87 and then used by FADD, FMUL, FSQRT, FCOMP and FST m64 sets no DE; the
@@ -111,11 +118,11 @@ Found by the same comparison; neither comes from this change and neither mode ch
 ## Tests
 
 - `tools/fexc/test_slice1.py`: the tests that pinned the wrapper's code and results without AFP now compile with
-  `--accurate` (`AfpX87`, `AfpDenormal`); a new test compares fast mode with accurate mode on every case and accepts
-  only the three differences above, each seen more than 100 times; the state test (`Slice1X87Commit`) also runs
+  `--accurate` (`AfpX87`, `AfpDenormal`); a new test compares fast mode with accurate mode on every case, under each of the
+  four rounding modes, and accepts only the three differences above, each seen more than 100 times; the state test (`Slice1X87Commit`) also runs
   accurate mode's code. The admission unit test of the NaN fix-up's shape compiles with `--accurate`.
 - `tests/lib/fp_deviations.py`: the classes `x87-nan-results` and `masked-x87-de` and one rule for x87 cases
   (`x87_verdict`); the other x87 deviations by name (`X87_OTHER`).
-- `tests/faults/run_i5c.py`, `run_i6_faults.py`: 32 cases carry a class and their deviated result (19 `masked-x87-de`
-  and 11 `x87-nan-results` in `i5c`, 2 `masked-x87-de` in `i6-faults`). On a Mac without AFP in fast mode only the
+- `tests/faults/run_i5c.py`, `run_i6_faults.py`: 33 cases carry a class and their deviated result (19 `masked-x87-de`
+  and 12 `x87-nan-results` in `i5c`, 2 `masked-x87-de` in `i6-faults`). On a Mac without AFP in fast mode only the
   deviated result passes; everywhere else, accurate mode included, only x86's.

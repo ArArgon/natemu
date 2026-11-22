@@ -1486,17 +1486,18 @@ class AfpX87(unittest.TestCase):
     REG = ['d8c1', 'd8c9', 'd8e1', 'd8e9', 'd8f1', 'd8f9', 'dcc1', 'dcc9', 'dce1', 'dce9', 'dcf1', 'dcf9', 'dec1', 'dec9', 'dee1', 'dee9', 'def1', 'def9',
            'd9fa', 'd9fc', 'd8d1', 'd8d9', 'd9c0', 'd9e0', 'd9e1', 'dfe9']
 
-    def run_form(self, form, afp, st0, st1, mem, e, fast=False):
+    def run_form(self, form, afp, st0, st1, mem, e, fast=False, rc=0):
         words, lines, spills = native_words(form, *([] if afp else ['--feature', 'afp=0'] if fast else ['--feature', 'afp=0', '--accurate']))
         self.assertEqual(spills, 0, form)
         i = max(k for k, l in enumerate(lines) if l.startswith('svc'))
         while lines[i - 1].startswith(('mov w0', 'movk w0')): i -= 1
         buf = bytearray(8192)
         buf[0x4b2] = 3 if st1 is not None else 1   # tags: ST0 (and ST1) valid, TOP 0
+        buf[0x4b0:0x4b2] = (rc << 10).to_bytes(2, 'little')   # FCW.RC (a run makes its FPCR from it; the wrapper runs under the caller's)
         buf[0x420:0x428] = st0.to_bytes(8, 'little')
         if st1 is not None: buf[0x430:0x438] = st1.to_bytes(8, 'little')
         if mem is not None: buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
-        out = bytearray(native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500])
+        out = bytearray(native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=(6 if afp else 0) | [0, 2, 1, 3][rc] << 22)[2][:0x500])
         out[0xb0:0xb4] = bytes(4); out[0x411] = 0; out[0x414] = 0   # an x87 run's bookkeeping (hosts with AFP only: M2 task 4)
         out[0x4b4] |= out[0x410] & 1; out[0x410] = 0   # FSW.IE is the IE byte or the word's bit 0: either may hold it
         return bytes(out)
@@ -1545,15 +1546,17 @@ class AfpX87(unittest.TestCase):
                 self.assertEqual(r[0x4b4] & 1, 1, (form, fast, 'IE'))
 
     def test_fast_mode_differs_from_accurate_mode_only_by_its_documented_deviations(self):
-        """Every case of the three tests above, fast mode's code against accurate mode's (both afp=0, FPCR 0). The whole state is equal but:
+        """Every case of the three tests above, fast mode's code against accurate mode's (both afp=0, no AFP bit in FPCR), under each of the
+        four rounding modes. The whole state is equal but:
         `masked-x87-de`: FSW.DE is never set by fast mode (accurate mode sets it for a denormal m32/m64 operand);
         `x87-nan-results`: where accurate mode's result is a NaN, fast mode's may be another NaN: the positive default NaN where no
         operand is a NaN (accurate: the negative one), or a signalling operand quieted where the other, quiet operand comes first
-        (Arm takes a signalling NaN first)."""
+        (Arm takes a signalling NaN first; accurate mode returns that quiet operand). The signalling operand is an m64 one or sits
+        in a register (seeded here; FLD m80 puts one there: run_i5c's nan-qnan-st0-snan-reg-fadd); an m32 one is quieted by its convert."""
         nan = lambda v: (v & 0x7fffffffffffffff) > 0x7ff0000000000000
         seen = {'de': 0, 'default': 0, 'choice': 0}
-        def judge(what, form, st0, st1, mem, e, ops):
-            a, f = bytearray(self.run_form(form, False, st0, st1, mem, e)), bytearray(self.run_form(form, False, st0, st1, mem, e, True))
+        def judge(what, form, st0, st1, mem, e, ops, rc):
+            a, f = bytearray(self.run_form(form, False, st0, st1, mem, e, False, rc)), bytearray(self.run_form(form, False, st0, st1, mem, e, True, rc))
             if a[0x4b4] & 0x80 and not f[0x4b4] & 0x80: seen['de'] += 1
             self.assertEqual(f[0x4b4] & 0x80, 0, (what, 'fast mode sets DE'))
             a[0x4b4] &= 0x7f
@@ -1564,18 +1567,22 @@ class AfpX87(unittest.TestCase):
                 if y == 0x7ff8000000000000 and x == 0xfff8000000000000 and not any(nan(o) for o in ops): seen['default'] += 1
                 else:
                     self.assertIn(y, [o | 1 << 51 for o in ops if nan(o) and not o >> 51 & 1], (what, hex(x), hex(y)))   # a signalling operand, quieted
+                    self.assertIn(x, [o for o in ops if nan(o) and o >> 51 & 1], (what, hex(x), hex(y)))                 # accurate: the quiet one
                     seen['choice'] += 1
                 f[s:s + 8] = a[s:s + 8]
             self.assertEqual(a, f, what)
-        wide = lambda m, e: m if e == 8 else (m & 1 << 31) << 32 | 0x7ff << 52 | (m & 0x7fffff) << 29 if m & 0x7f800000 == 0x7f800000 and m & 0x7fffff else 0   # an m32 NaN as a double
-        for name, op, form, e in self.MEM:
-            for (a, st0), (m, mem) in itertools.product(self.D.items(), self.M4[e].items()): judge((name, a, m), form, st0, None, mem, e, [st0, wide(mem, e)])
-        for form in self.REG:
-            for (a, st0), (b, st1) in itertools.product(self.D.items(), repeat=2): judge((form, a, b), form, st0, st1, None, 8, [st0] if form in ('d9fa', 'd9fc', 'd9c0', 'd9e0', 'd9e1') else [st0, st1])
-        for form, e in (('da03', 4), ('da0b', 4), ('da2b', 4), ('da33', 4), ('de03', 2), ('de3b', 2), ('da13', 4), ('db03', 4)):
-            for a, st0 in self.D.items():
-                for m in (0, 1, 5, 0x7fffffff, 0x80000000, 0xffff): judge((form, a, m), form, st0, None, m & ((1 << 8 * e) - 1), e, [st0])
-        for k, n in seen.items(): self.assertGreater(n, 100, k)
+        # an m32 NaN as the double its convert makes: quiet, whatever it was
+        wide = lambda m, e: m if e == 8 else (m & 1 << 31) << 32 | 0x7ff << 52 | 1 << 51 | (m & 0x7fffff) << 29 if m & 0x7f800000 == 0x7f800000 and m & 0x7fffff else 0
+        for rc in range(4):
+            for name, op, form, e in self.MEM:
+                for (a, st0), (m, mem) in itertools.product(self.D.items(), self.M4[e].items()): judge((name, a, m, rc), form, st0, None, mem, e, [st0, wide(mem, e)], rc)
+            for form in self.REG:
+                for (a, st0), (b, st1) in itertools.product(self.D.items(), repeat=2):
+                    judge((form, a, b, rc), form, st0, st1, None, 8, [st0] if form in ('d9fa', 'd9fc', 'd9c0', 'd9e0', 'd9e1') else [st0, st1], rc)
+            for form, e in (('da03', 4), ('da0b', 4), ('da2b', 4), ('da33', 4), ('de03', 2), ('de3b', 2), ('da13', 4), ('db03', 4)):
+                for a, st0 in self.D.items():
+                    for m in (0, 1, 5, 0x7fffffff, 0x80000000, 0xffff): judge((form, a, m, rc), form, st0, None, m & ((1 << 8 * e) - 1), e, [st0], rc)
+        for k, n in seen.items(): self.assertGreater(n, 400, k)
 
 
 def kind_of(name):
