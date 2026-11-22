@@ -2906,7 +2906,7 @@ impl Compiler {
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
             if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
-                if self.pool.is_some() {
+                if self.pool.is_some() && !self.bits32 {
                     self.last = Some(e.clone());
                 }
                 self.hits += 1;
@@ -5419,9 +5419,10 @@ mod tests {
         let refused = c.relocation_refused;
         insns(&mut c, &pic, 0x0000_2340); // 0x2346: one word
         insns(&mut c, &far, 0x0000_e340); // the target wraps below 0
-        insns(&mut c, &far, 0x5660_e340); // from the wrapped one
-        insns(&mut c, &jcc, 0xffff_fff0 - 4); // ends below 4 GiB, a target above it
-        assert!(c.relocation_refused >= refused + 3, "{} refusals", c.relocation_refused - refused);
+        let fwd = [0x40, 0xe8, 0x00, 0x10, 0x00, 0x00]; // inc eax; call $+0x1006
+        insns(&mut c, &fwd, 0x5655_5340);
+        insns(&mut c, &fwd, 0xffff_f340); // the target wraps past 4 GiB
+        assert_eq!(c.relocation_refused, refused + 3);
         // The null segments and the x87 guess are the answer's: another value is another answer where fexc read it (the
         // guess: in x87 code only).
         let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret
