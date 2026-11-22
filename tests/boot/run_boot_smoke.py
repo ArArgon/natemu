@@ -19,14 +19,31 @@ program (built here with nasm), appended to the initrd as /natemu-i386 and run b
 results (INT 0x80 and SYSENTER system calls, thread-local data through GS, segment pushes and pops, PUSHAD/POPAD, ARPL,
 BOUND, LDS, x87, signals from #BR, #OF and #DE and from kill, sigreturn, a far call); pass: its lines on serial, exit
 status 42 and natemu's exit 0.
+`startup` (`--only startup`, M2 Part 2's CPU start-up slice: boot-interpreter plan sections 6 and 8): the bzImage and
+initrd through the program driver's `boot-linux` (`--host`, `--runtime`: the framework's build), at each `--vcpus` N
+(default 2 and 4), with the ACPI wakeup mailbox (the default) and without it (`--no-mailbox`: each AP waits for INIT and
+SIPI, and Linux starts it through its real-mode trampoline, which the boot-time interpreter runs). Busybox mounts /proc
+and /sys and prints, as `natemu-KEY=VALUE` lines: the guest's uptime, the CPUs /proc/cpuinfo lists and the online mask;
+for each AP n, the online mask after `echo 0` and after `echo 1` to its `online` file (`refused` when the write fails:
+Linux disables offlining with a version-0 mailbox, since it cannot start a CPU twice through one); the CPUs listed at
+the end; and how many times the kernel took its warm-reset path (`smpboot: Setting warm reset code and vector.`, a
+pr_debug turned on by `dyndbg`: once per AP start, each writing CMOS 0FH and the real-mode vector at 467H and restoring
+them once the AP is up), then `poweroff -f`. Pass per boot: every CPU online at boot and at the end; without the
+mailbox each AP offline and online again, with it offlining refused; the warm-reset path once per AP start; the run
+ended by the guest's ACPI S5 (`poweroff`); each AP where Linux 6.12's shutdown leaves it (`native_stop_other_cpus`:
+the reboot vector, then `stop_this_cpu`'s HLT loop with IF = 0; 6.12 parks no CPU with INIT), reported `halted`.
+Each boot's run time (the driver's `stats.seconds`, VM start to S5), the guest's uptime and the CMOS ports' (70H, 71H)
+access counts are reported: 71H's writes grow by two for each warm-reset setup and its restore (0AH, then 0, into 0FH;
+natemu's CMOS keeps 0FH as a plain byte, as QEMU's does, and 467H is guest RAM).
 
     tests/boot/run_boot_smoke.py --fexc FEXC --out DIR [--vcpus 1 4] [--kernel BZIMAGE] [--initrd FILE]
         [--timeout SECONDS] [--only i386]
+    tests/boot/run_boot_smoke.py --only startup --host HOST --runtime RUNTIME --fexc FEXC --out DIR [--vcpus 2 4]
 
 The compile cache is off unless NATEMU_COMPILE_CACHE is set (hermetic). Writes DIR/smoke-N.serial, DIR/smoke.json;
 exit 1 on a failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import argparse, json, os, pathlib, signal, subprocess, sys, time
+import argparse, json, os, pathlib, re, signal, subprocess, sys, time
 from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -168,21 +185,116 @@ def i386(stub, runtime, a):
                 last=[line for line in lines if line][-3:])
 
 
+# `startup`: busybox's script (one argument of `sh -c`: no double quote inside) and the kernel's dynamic debug for the
+# warm-reset message. (`[w]arm`: the kernel's log holds the command line too, which this pattern does not match.)
+STARTUP_SCRIPT = ('mount -t proc proc /proc; mount -t sysfs sys /sys; read up rest < /proc/uptime; echo natemu-uptime=$up; '
+                  'echo natemu-cpus=$(grep -c ^processor /proc/cpuinfo) natemu-online=$(cat /sys/devices/system/cpu/online); '
+                  'for c in /sys/devices/system/cpu/cpu[1-9]*; do n=${c##*cpu}; '
+                  'if echo 0 > $c/online; then echo natemu-off-$n=$(cat /sys/devices/system/cpu/online); else echo natemu-off-$n=refused; fi; '
+                  'if echo 1 > $c/online; then echo natemu-on-$n=$(cat /sys/devices/system/cpu/online); else echo natemu-on-$n=refused; fi; '
+                  'done; echo natemu-cpus-end=$(grep -c ^processor /proc/cpuinfo); '
+                  "echo natemu-warm-reset=$(dmesg | grep -c 'Setting [w]arm reset code'); echo natemu-script=done; poweroff -f")
+STARTUP_CMDLINE = ('console=ttyS0 earlyprintk=serial mitigations=off nokaslr dyndbg="file arch/x86/kernel/smpboot.c +p" '
+                   f'rdinit=/bin/busybox -- sh -c "{STARTUP_SCRIPT}"')
+
+
+def cpu_list(cpus):
+    """Linux's form of a CPU mask (`0-1`, `0,2-3`)."""
+    out, cpus = [], sorted(cpus)
+    while cpus:
+        lo = hi = cpus.pop(0)
+        while cpus and cpus[0] == hi + 1:
+            hi = cpus.pop(0)
+        out.append(f'{lo}' if lo == hi else f'{lo}-{hi}')
+    return ','.join(out)
+
+
+def startup_fields(text):
+    """The script's `natemu-KEY=VALUE` words on serial (the kernel's echo of its command line, whose words hold `$`, is
+    not one)."""
+    return {k: v for k, v in re.findall(r'natemu-([a-z0-9-]+)=([^\s$;()]+)(?=\s|$)', text)}
+
+
+def startup_judge(n, mailbox, rep, fields):
+    """The differences of one `startup` boot from what it must show (module doc)."""
+    every = cpu_list(range(n))
+    want = {'cpus': str(n), 'online': every, 'cpus-end': str(n), 'script': 'done'}
+    for c in range(1, n):
+        want[f'off-{c}'] = 'refused' if mailbox else cpu_list(set(range(n)) - {c})
+        want[f'on-{c}'] = every
+    # do_boot_cpu takes the warm-reset path at every AP start (smpboot.c, x86_platform.legacy.warm_reset), mailbox or not.
+    want['warm-reset'] = str((n - 1) * (1 if mailbox else 2))
+    diffs = [f'{k}: {fields.get(k)!r}, want {v!r}' for k, v in want.items() if fields.get(k) != v]
+    if rep.get('stop') != 'poweroff':
+        diffs.append(f"run ended {rep.get('stop')!r} {rep.get('reason', '')!r}, want poweroff")
+    for v, c in enumerate(rep.get('vcpus', [])[1:], 1):
+        if c.get('waiting') != 'halted':
+            diffs.append(f"vCPU {v}: waiting {c.get('waiting')!r} at the end (stop {c.get('stop')!r}), want halted (stop_this_cpu)")
+    return diffs
+
+
+def startup(a, n, mailbox):
+    """One `startup` boot: the driver's report, the script's fields, the judge's differences, the run's time."""
+    name = f"startup-{'mailbox' if mailbox else 'no-mailbox'}-n{n}"
+    serial = a.out / f'{name}.serial'
+    cmd = [a.host, a.runtime, 'boot-linux', a.fexc, a.kernel, '--initrd', a.initrd, '--cmdline', STARTUP_CMDLINE,
+           '--vcpus', str(n), '--serial', serial, *([] if mailbox else ['--no-mailbox'])]
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=a.timeout)
+        out, err, rc = r.stdout, r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        text = lambda b: b.decode(errors='replace') if isinstance(b, bytes) else b or ''
+        out, err, rc = text(e.stdout), text(e.stderr), 'timeout'
+    wall = round(time.monotonic() - t0, 2)
+    (a.out / f'{name}.json').write_text(out)
+    (a.out / f'{name}.stderr').write_text(err)
+    try:
+        rep = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        rep = {'stop': f'driver exit {rc}', 'reason': err.strip()[-400:]}
+    text = serial.read_text(errors='replace') if serial.exists() else ''
+    fields = startup_fields(text)
+    diffs = startup_judge(n, mailbox, rep, fields)
+    cmos = {x['port']: [x['reads'], x['writes']] for x in rep.get('ports', []) if x['port'] in ('0x70', '0x71')}
+    return dict(case=name, vcpus=n, mailbox=mailbox, ok=not diffs, diffs=diffs, wall_s=wall,
+                run_s=rep.get('stats', {}).get('seconds'), uptime_s=fields.get('uptime'),
+                waiting=[c.get('waiting') for c in rep.get('vcpus', [])], cmos_ports=cmos, fields=fields,
+                last=[line for line in text.splitlines() if line.strip()][-5:] if diffs else [])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
     ap.add_argument('--out', required=True, type=pathlib.Path)
-    ap.add_argument('--vcpus', type=int, nargs='+', default=[1, 4])
+    ap.add_argument('--vcpus', type=int, nargs='+', help='default 1 4 (startup: 2 4)')
     ap.add_argument('--kernel', default=RAW / 'linux')
     ap.add_argument('--initrd', default=RAW / 'initrd.gz')
     ap.add_argument('--timeout', type=float, default=120)
-    ap.add_argument('--only', choices=['i386'])
+    ap.add_argument('--only', choices=['i386', 'startup'])
+    ap.add_argument('--host', help='startup: the program driver (natemu-host)')
+    ap.add_argument('--runtime', help='startup: the resident')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault('NATEMU_COMPILE_CACHE', 'off')
+    if a.only == 'startup':
+        if not (a.host and a.runtime): raise SystemExit('--only startup needs --host and --runtime')
+        results = []
+        for n in a.vcpus or [2, 4]:
+            for mailbox in (True, False):
+                r = startup(a, n, mailbox)
+                print(json.dumps({k: v for k, v in r.items() if k != 'fields'}), flush=True)
+                results.append(r)
+        (a.out / 'smoke.json').write_text(json.dumps(results, indent=1) + '\n')
+        (a.out / 'results.json').write_text(json.dumps({'results': [
+            {'name': r['case'], 'outcome': 'match' if r['ok'] else 'fail', 'diffs': r['diffs']} for r in results]}, indent=1) + '\n')
+        for r in results:
+            print(f"{r['case']}: {'pass' if r['ok'] else 'FAIL ' + '; '.join(r['diffs'])} (run {r['run_s']} s, "
+                  f"guest uptime {r['uptime_s']} s at the script, wall {r['wall_s']} s, APs {r['waiting'][1:]})", flush=True)
+        sys.exit(0 if all(r['ok'] for r in results) else 1)
     stub, runtime = build()
     results = []
-    for n in a.vcpus if not a.only else []:
+    for n in (a.vcpus or [1, 4]) if not a.only else []:
         r = boot(stub, runtime, a, n)
         print(json.dumps(r), flush=True)
         results.append(r)
