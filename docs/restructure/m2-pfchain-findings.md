@@ -1,6 +1,6 @@
 # M2: page faults walk only current blocks
 
-Branch `pfchain`, on `pic32` at 845b7a70. November 22, 2026.
+Branch `pfchain`, on `pic32` at 4adf6c83. November 22, 2026.
 
 [Sharing 32-bit code](m2-pic32-findings.md) made the i386 build faster but made each page fault slower to deliver. To
 deliver a #PF, natemu finds the blocks on the faulting page by walking a hash chain of block records, and those chains
@@ -10,9 +10,9 @@ configure's 86 s of busy vCPU time. Cutting a block that is not current does not
 fetch walk, which checks it again anyway. This branch keeps those blocks off the chains.
 
 **Result** (M4, 4 vCPUs, one run each, seconds). "Before" is `pic32`: its timed numbers (bench case `io5-solo32`, at
-3fd3b398) and its profiled run with the chain counters (bench case `io5-solo32-profile`, at a34481dc; between that
+44d480e2) and its profiled run with the chain counters (bench case `io5-solo32-profile`, at 3abd18d1; between that
 commit and this branch's base the only resident change is a stricter link-point check). "After" is this branch at
-ccea33c8 in the same two cases:
+eb4ef43b in the same two cases:
 
 | Step | before, timed | after, timed | before, profiled | after, profiled |
 | --- | ---: | ---: | ---: | ---: |
@@ -147,10 +147,10 @@ All on the M4 at this branch:
   - All 14 k1 cases (every program, 1 to 4 vCPUs, both block sizes, the reuse check on), `k1-full-links`,
     `frame-alias` and `frame-randomization` (both block sizes), `k2-xmc` and `k2-coherence` passed.
   - The relink, fast-miss and pool mutations are red, except as follows:
-    - `invlpg-cut-keeps-suspended` is now an equivalent and is listed as not testable. It was red at 845b7a70, but a
+    - `invlpg-cut-keeps-suspended` is now an equivalent and is listed as not testable. It was red at 4adf6c83, but a
       cut now reaches current blocks only, and a revalidation has already relinked or dropped every suspended record
       into a block before it is current.
-    - Three fast-miss mutations name source patterns already missing at 845b7a70.
+    - Three fast-miss mutations name source patterns already missing at 4adf6c83.
     - Two survivors that this branch does not touch: `do-prune-tlb-keeps-slot` (its code is built only for `pic-count`)
       and the pool's `no-tail-check`.
 

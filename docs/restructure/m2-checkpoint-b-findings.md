@@ -23,7 +23,7 @@ QEMU. There is no speed bar (the owner's decision); costs are named and labelled
   `1.414213562373095`; real x86 gives `1.4142135623730951`.
 
 Every number is from one Apple M4 (4 performance cores, 16 GiB), each case alone on the machine through
-`tools/natemu-test run --tier bench`, one boot per case, none contended. natemu is `m2-32bit` at 4ffa81d3 (this
+`tools/natemu-test run --tier bench`, one boot per case, none contended. natemu is `m2-32bit` at 213e3566 (this
 checkpoint's commits on top change tests only). QEMU is 11.1.2, `-accel tcg,thread=multi`, machine `pc-i440fx-11.1`, the
 CPU model matched to natemu's features. Real x86 is a Ryzen 7 8845HS.
 

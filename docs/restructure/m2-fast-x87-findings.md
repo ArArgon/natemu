@@ -31,7 +31,7 @@ Nothing else in the shim, the host's admission or the checkers depends on AFP fo
 
 ## Speed
 
-| | before (`ec65cb15`) | now | now, AFP visible |
+| | before (`5c23e3f9`) | now | now, AFP visible |
 | --- | --- | --- | --- |
 | `cray32-small` (s) | 111.4 / 111.4 | 0.66 / 0.56 | 0.72 / 0.68 |
 | `cray32-strict-small` (s) | 66.3 / 66.3 | 0.63 / 0.57 | 0.58 / 0.60 |
@@ -62,7 +62,7 @@ Each variant was built and measured against the fast version above (same machine
   the rest on the rare path, the flag set in the status register inside the run) is exact by the native oracle and in
   the VM cases, and costs about 55% on `cray32-small`, 85% on `cray32-strict-small` and 7 to 14% on SciMark (two boots
   each). The owner's bound for keeping DE exact was about 15%, so the flag is dropped in fast mode. The test's
-  implementation is in the history (commit `5e10e0ee`, reverted by the next one) should the bound change.
+  implementation is in the history (commit `35ba3e90`, reverted by the next one) should the bound change.
 
 ## The differences, found and checked
 

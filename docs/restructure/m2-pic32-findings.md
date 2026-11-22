@@ -1,6 +1,6 @@
 # M2: sharing translated 32-bit code between addresses
 
-Branch `pic32` (FEX branch `natemu-pic32`, 4eba851 on 9554e5b), on `m2-32bit` at 9cd51ca6 (32-bit reuse and the shared
+Branch `pic32` (FEX branch `natemu-pic32`, 4eba851 on 9554e5b), on `m2-32bit` at 9bb301f2 (32-bit reuse and the shared
 store probes). November 22, 2026.
 
 Since [32-bit reuse](m2-reuse32-findings.md) a 32-bit process got its blocks without asking the host, but each one was
@@ -10,11 +10,11 @@ translation. In the i386 configure the copies, and the linking and patching that
 time, against 6.3 s in the 64-bit configure. This branch shares 32-bit user code the same way.
 
 **Result** (M4, 4 vCPUs, one run each, seconds). "Before" is this branch's base without sharing, `m2-32bit` at
-9cd51ca6, in bench case `io5-solo32-profile`; its step times match eedae4a2's timed `io5-solo32` (the 32-bit reuse
+9bb301f2, in bench case `io5-solo32-profile`; its step times match 72114fb1's timed `io5-solo32` (the 32-bit reuse
 findings' run: 57.5, 90.0, 106.7, 114.7), so the shared store probes in between did not move them. "After" is this
-branch at 3fd3b398, timed (`io5-solo32`) and profiled (`io5-solo32-profile`):
+branch at 44d480e2, timed (`io5-solo32`) and profiled (`io5-solo32-profile`):
 
-| Step | before (9cd51ca6, profiled) | after, timed | after, profiled | QEMU |
+| Step | before (9bb301f2, profiled) | after, timed | after, profiled | QEMU |
 | --- | ---: | ---: | ---: | ---: |
 | 64-bit configure | 56.9 | 58.0 | 55.9 | 94.9 |
 | 64-bit `make -j4` | 89.8 | 89.5 | 89.5 | 357.6 |
@@ -71,7 +71,7 @@ In short:
 An experiment, not a framework case. `pic32_survey`, an ignored host test, compiles an i386 ELF block after block as
 the host does for 32-bit user code and counts what `share` would accept. Its inputs are libc and libm from the
 campaign-i386 image, plus `python3.13-i386`, a program that runs at one fixed address. `replay.py --old32` then
-answered the same requests with fexc at 9cd51ca6 (the old forms) and at this branch, compared every reply with
+answered the same requests with fexc at 9bb301f2 (the old forms) and at this branch, compared every reply with
 `only_moves` and summed code bytes. Run on the M4, November 22.
 
 | Input | blocks | templates | shareable | not shareable | code bytes, old to new |
@@ -92,7 +92,7 @@ answered the same requests with fexc at 9cd51ca6 (the old forms) and at this bra
 ### Where the time went
 
 The profiles (bench case `io5-solo32-profile`, M4; `tests/io/io5_compiles.py`) give busy vCPU time in the i386
-configure, in seconds summed over the 4 vCPUs. "Before" is the base, 9cd51ca6, without sharing.
+configure, in seconds summed over the 4 vCPUs. "Before" is the base, 9bb301f2, without sharing.
 
 | Bucket | before | after | 64-bit configure, after |
 | --- | ---: | ---: | ---: |
@@ -115,7 +115,7 @@ configure, in seconds summed over the 4 vCPUs. "Before" is the base, 9cd51ca6, w
 
 The guest's page faults are the same in number but each costs more to deliver. Over the whole boot (all four vCPUs):
 
-| | before (9cd51ca6) | after |
+| | before (9bb301f2) | after |
 | --- | ---: | ---: |
 | page faults delivered | 11.91 million | 11.93 million |
 | time in them, natemu's part | 30.6 s | 39.4 s |
@@ -159,7 +159,7 @@ These ran through `tools/natemu-test` on the M4, at the final code unless noted.
     which its probe check allows.
   - `fexc-replay-order`, now also comparing 32-bit replies: 82 of 82 identical, as it should be (the same compiler on
     both sides).
-  - The recorded boot's stream against fexc at 9cd51ca6: 46 replies differ only by moves, 36 are identical.
+  - The recorded boot's stream against fexc at 9bb301f2: 46 replies differ only by moves, 36 are identical.
 - **Narrow VM cases:**
   - `pic-*`, `compat32` and `m2` passed.
   - `i386` passed with `NATEMU_CHECK_REUSE=1` and without it; the run without the check exercises local links.
@@ -182,7 +182,7 @@ These ran through `tools/natemu-test` on the M4, at the final code unless noted.
 - **Page-fault delivery walks stale records** (7.3 s of the i386 configure, above). Two fixes are proposed, neither
   built.
 - **No framework case compares 32-bit replies with an older compiler.** `main` does not compile 32-bit code yet, so
-  the replay gate's old compiler cannot answer 32-bit requests. The comparison with fexc at 9cd51ca6 above is an
+  the replay gate's old compiler cannot answer 32-bit requests. The comparison with fexc at 9bb301f2 above is an
   experiment. Once M2 is on `main`, the gate's old compiler answers them and `--old32 {fexc_base}` can join
   `fexc-replay`.
 - **The forge tests check nothing for 32-bit code.** A forged high half of the page-base slot is ignored by the

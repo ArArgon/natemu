@@ -67,7 +67,7 @@ BASELINES = {'baseline': False, 'baseline-lc': True}
 # death.)
 # Mutations that cannot be caught by K1, with the argument (reported as `not testable`, never run).
 NOT_TESTABLE = {
-    'invlpg-cut-keeps-suspended': 'an INVLPG or #PF cut reaches current blocks only (linear chains hold only current blocks), and a block becomes current by a placement (no records into it) or a revalidation, whose relink resumes or drops every suspended record into it: no cut meets one (red at 845b7a70, through relink-invlpg, before stale blocks stopped being cut)',
+    'invlpg-cut-keeps-suspended': 'an INVLPG or #PF cut reaches current blocks only (linear chains hold only current blocks), and a block becomes current by a placement (no records into it) or a revalidation, whose relink resumes or drops every suspended record into it: no cut meets one (red at 4adf6c83, through relink-invlpg, before stale blocks stopped being cut)',
     'suspend-skips-barrier': 'the batch\'s `dsb`/`isb` and the cache maintenance order the new words before the next fetch; on this core (CTR_EL0 IDC and DIC set, or the clean nearly free) a missing barrier shows in no run',
     'prune-tlb-calls-unlink-on-suspended': 'prune_tlb is compiled only for `pic-count` builds, where nothing is suspended; the same mutation on `prune` and `unlink_all` is `outbound-unlinks-suspended` and `unlink-all-unlinks-suspended`',
 }

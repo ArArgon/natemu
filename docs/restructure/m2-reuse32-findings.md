@@ -13,7 +13,7 @@ same bytes at the same address.
 persistent cache, and inside the guest a vCPU's own templates and the shared pool. The one thing it does not use is
 position-independent sharing (below).
 
-**Result** (bench case `io5-solo32`, M4, 4 vCPUs, seconds; one run each; "all of it" is this branch at eedae4a2,
+**Result** (bench case `io5-solo32`, M4, 4 vCPUs, seconds; one run each; "all of it" is this branch at 72114fb1,
 November 22):
 
 | Step | Checkpoint B | host side only | all of it | QEMU |
@@ -152,7 +152,7 @@ rewrite needs address moves of two or three words and adds in 64 bits; 32-bit mo
   mismatch stops the run. The `torture32` and `libm32` campaigns now always boot under it (`check_reuse = true`,
   `tests/correctness/family.toml`).
 
-  Runs under the check, all on the M3 at eedae4a2 (the branch's code; this commit changes only comments, a test's
+  Runs under the check, all on the M3 at 72114fb1 (the branch's code; this commit changes only comments, a test's
   position and a variable's name), November 22:
 
   | Run | Result | Wall time (cap 3600 s) |
@@ -241,7 +241,7 @@ no guess, compiles bytes again at the same rate (5.7%). So the guess never cost 
 is for the pool, which would otherwise have published the same template once per guess.
 
 **`startup32`** (bench case `guest-startup32`: one static program started 40 times on one vCPU; M4, this branch at
-eedae4a2, November 22, one run): 7.16 s in its second pass (7.59 s in the first), against 7.18 s at Checkpoint B. No change, as expected: the program loads at the same
+72114fb1, November 22, one run): 7.16 s in its second pass (7.59 s in the first), against 7.18 s at Checkpoint B. No change, as expected: the program loads at the same
 address every time, and a vCPU's blocks are found again by address and physical page without any request.
 
 ## The alternative: one block for every address

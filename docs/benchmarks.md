@@ -5,24 +5,25 @@ the same Mac.
 
 | | natemu speed-up over QEMU |
 | --- | --- |
-| 11 benchmarks, 1 vCPU | **4.8×** (geometric mean; 1.4× to 41×) |
-| 11 benchmarks, 4 vCPUs | **4.5×** (geometric mean; 1.6× to 38×) |
+| 64-bit programs, 12 items, 1 vCPU | **5.3×** (geometric mean; c-ray's two builds count as one item, SciMark as one) |
+| 64-bit, the same with the CPython configure and build (4 vCPUs), 14 items | **4.8×** |
+| 32-bit programs, 8 items | **5.1×** (geometric mean; **4.1×** without the x87 builds; c-ray and SciMark one item each) |
 | Context-switch-heavy Debian workload (cloud image), 4 vCPUs | **1.7×** |
+
+32-bit and 64-bit code are summarised separately, and a program measured in several builds or kernels (c-ray's
+variants, SciMark's five kernels) counts as one item, the geometric mean of its ratios. The 64-bit items are those of
+[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md#64-bit-code-against-qemu) (its table says which
+row is from which date). The 32-bit items are that page's too, except the CPython configure and build, which are this
+page's [32-bit CPython build](#32-bit-i386-cpython-build) at eb4ef43b (configure 0.30× at checkpoint B, 1.9× now; build
+2.1×, now 4.3×). The tables below are the November 14 round, one item per row.
 
 Where the numbers come from: each table names its bench case (`tests/bench/family.toml`, run by
 `tools/natemu-test run --tier bench`), the machine, the natemu commit and the date. The tables from November 14
 were measured before the bench cases existed (with `tools/bench/run.py` directly) and are to be measured again
 through them; numbers from experiments elsewhere in `docs/` are labelled as such and are not this page's numbers.
 
-32-bit programs against QEMU, and a CPython build by a Debian i386 userland, are in
-[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md) (November 22). The i386 build's times since
-32-bit code is reused (bench case `io5-solo32`, M4, November 22: configure 106.7 s, `make -j4` 114.7 s, from 374.2 and
-223.2) are in [the 32-bit reuse findings](restructure/m2-reuse32-findings.md). Since 32-bit user code is shared between
-addresses (bench case `io5-solo32`, M4, `pic32` at 3fd3b398, November 22: configure 82.5 s, `make -j4` 108.1 s; the
-64-bit steps 58.0 and 89.5 s, unchanged) they are in [the 32-bit sharing findings](restructure/m2-pic32-findings.md).
-Since page faults walk only current blocks (bench case `io5-solo32`, M4, `pfchain` at ccea33c8, November 22, one run:
-configure 59.5 s, `make -j4` 107.0 s; the 64-bit steps 54.5 and 89.0 s, within the spread of single runs) they are in
-[the page-fault chain findings](restructure/m2-pfchain-findings.md).
+32-bit (i386) programs: [32-bit CPython build](#32-bit-i386-cpython-build) below; 32-bit programs against QEMU are in
+[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md).
 
 ## Setup
 
@@ -94,6 +95,25 @@ the Linux source from kernel.org and another writes, drops from cache and re-rea
 
 The download and disk loops run for as long as the build does, so their share of the work is not
 identical between the two emulators.
+
+## 32-bit (i386) CPython build
+
+The same CPython 3.13 source as the context-switch workload, configured and built (`make -j4`) first by the 64-bit
+Debian userland and then by a Debian i386 userland in a chroot (bench case `io5-solo32`, 4 vCPUs, 8 GiB). Times in
+seconds; each natemu row is one timed run on an Apple M4, November 22, 2026.
+
+| natemu | i386 configure | i386 make | 64-bit configure | 64-bit make |
+| --- | ---: | ---: | ---: | ---: |
+| Checkpoint B (213e3566) | 374.2 | 223.2 | 58.8 | 89.6 |
+| 32-bit code reused across addresses, pool inside the guest (72114fb1) | 106.7 | 114.7 | 57.5 | 90.0 |
+| 32-bit library code shared between processes (44d480e2) | 82.5 | 108.1 | 58.0 | 89.5 |
+| page faults walk only current blocks (eb4ef43b, in main) | **59.5** | **107.0** | 54.5 | 89.0 |
+| QEMU 11.1.2 TCG, same M4 (1 run, Checkpoint B) | 110.9 | 464.0 | 94.9 | 357.6 |
+| real x86-64, Ryzen 7 8845HS (1 run, Checkpoint B) | 17.5 | 38.2 | 13.3 | 33.0 |
+
+The 64-bit steps moved within the spread of single runs. How each change works and what its profile shows:
+[the 32-bit reuse findings](restructure/m2-reuse32-findings.md), [the 32-bit sharing
+findings](restructure/m2-pic32-findings.md), [the page-fault chain findings](restructure/m2-pfchain-findings.md).
 
 ## Paper (Minecraft server) start
 
