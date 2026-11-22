@@ -73,6 +73,13 @@ argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "kvm",
 needs = { cores = 1 }
 timeout = 2400
 
+# The program variant under natemu (CPU start-up slice): at 1 CPU the pass; at 2 and 4, while the boot-time interpreter is
+# the stop at its entry, the pass up to the SIPI landing (tests/boot/run_exit_fw.py --backend natemu).
+[suite.cases."exit-ap-natemu"]
+argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+smoke = true
+
 # The real-code suites the boot-time interpreter is judged by (docs/restructure/real-code-suites.md), their inputs built
 # in the amd64 builder container from pinned sources (tests/boot/built_inputs.py, tools/boot/*), on the references:
 # -qemu the pinned QEMU 11.1.2 under TCG, -kvm the x86 reference machine under KVM. A run checks that the lock's answer
