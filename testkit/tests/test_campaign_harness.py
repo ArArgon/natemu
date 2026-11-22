@@ -582,6 +582,7 @@ def test_native_vm_boots_the_same_kernel_and_command_line_under_kvm(tmp_path, mo
     assert seen['cmd'][:3] == ['ssh', '-o', 'BatchMode=yes'] and seen['cmd'][3] == 'u@x86'
     script = seen['cmd'][4]
     name = re.search(r'--name (\S+)', script)[1]
+    assert re.fullmatch(r'natemu-ref-ltp-[0-9a-f]{12}-1-4', name)        # random, not a pid: two Macs never clash
     for want in ('--device /dev/kvm', f'-enable-kvm -cpu {campaign.REFERENCE_CPU} -m 2048 -smp 4', 'ct=ltp part=1/4',
                  campaign.artifacts.BENCH_BUILDER, f"trap 'docker kill {name}", 'EXIT HUP TERM INT',
                  f'timeout {campaign.APT_TIMEOUT} apt-get', f'archive/debian/{campaign._snap()}/'):

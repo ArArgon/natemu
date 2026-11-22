@@ -48,6 +48,11 @@ X87_OTHER = {
     'x87-register-de': ('Macs with FEAT_AFP, both modes', 'an x87 instruction on a register that holds a denormal double sets the status word\'s DE flag; on x86 the register holds a normal 80-bit number and DE stays clear'),
 }
 
+# The modes each deviation is seen in (testkit/harness/campaign.py kept_in_accurate reads it): every class only in fast mode,
+# since accurate mode fixes each (FIXED_BY below); the X87_OTHER items in both, as their first field says.
+MODES = {**{name: ('fast',) for name in CLASSES},
+         'x87-doubles': ('fast', 'accurate'), 'x87-band-ue-flag': ('fast', 'accurate'), 'x87-register-de': ('fast', 'accurate')}
+
 
 # Which mode fixes each class on a host without AFP (plan section 3, "fixed by"): accurate mode, in the chunk named; fast mode never,
 # (chunk 6's gate failed for UFE and IOE, so neither moved there: the classes stay registered for fast mode).
@@ -58,6 +63,8 @@ FIXED_BY = {'masked-sse-de': 'accurate (chunk 2)', 'nan-results': 'accurate (chu
             'x87-nan-results': 'accurate (the per-operation x87 wrapper and its NaN fix-up)',
             'masked-x87-de': 'accurate (the per-operation x87 wrapper and its software test of the memory operand)'}
 assert FIXED_BY.keys() == CLASSES.keys()
+assert MODES.keys() == CLASSES.keys() | X87_OTHER.keys()
+assert all(('accurate' in MODES[n]) == ('both modes' in X87_OTHER[n][0]) for n in X87_OTHER)
 
 
 # The corpus programs tagged with a NaN class, by corpus directory (names repeat between i8 and i8b, and the key ties the list to one
