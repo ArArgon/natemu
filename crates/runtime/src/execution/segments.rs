@@ -654,15 +654,15 @@ pub(super) fn load_cs(s: &mut State, selector: u16, raw: u64) {
 /// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
 /// at CPL 3 (`cpl`, the new CPL); else (M2 Part 2) compatibility-mode code at CPL 0 is the boot-time interpreter's and
 /// the transfer goes on, and any other halts `unsupported_code_mode` (module doc; out of line,
-/// [`super::interpret::kernel_compatibility`]). Out of line, as the compiler left it before that arm became a call: so
-/// `far_transfer` and `far_return` stay the same code.
+/// [`super::interpret::kernel_compatibility`], a tail call: the common path has no frame). Out of line, as the compiler
+/// left it before that arm became a call: so `far_transfer` and `far_return` stay the same code.
 #[inline(never)]
 fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
     if raw >> 53 & 3 != 1 {
         if cpl == 3 {
             return Err(gp(selector));
         }
-        super::interpret::kernel_compatibility(s, selector, raw, cpl);
+        return super::interpret::kernel_compatibility(s, selector, raw, cpl);
     }
     Ok(())
 }
