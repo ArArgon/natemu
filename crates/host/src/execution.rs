@@ -3701,6 +3701,8 @@ pub struct Requests {
     /// entropy refills asked for ([`exec::REQUEST_ENTROPY`]).
     pub decodes: std::collections::BTreeMap<u32, u64>,
     pub entropy: u64,
+    /// M2 Part 2: the interpreter's decode requests answered ([`natemu_abi::interp::REQUEST_DECODE`]).
+    pub interpreted: u64,
 }
 
 /// `NATEMU_LINK_CAP`: the link record area's capacity ([`cache::Control::link_cap`]), a test hook for K1's `link-full`.
@@ -4200,6 +4202,14 @@ fn serve(
                 state.reply = exec::REPLY_ENTROPY;
                 area.write_record(exec::STATE_OFFSET, state);
                 lap(compiler, crate::perf::ENTROPY);
+                continue;
+            }
+            // M2 Part 2: the interpreter's decode of the bytes the resident sent (iced alone: no fexc, cache or admission).
+            natemu_abi::interp::REQUEST_DECODE => {
+                crate::interp::serve(area, &mut state)?;
+                requests.interpreted += 1;
+                area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::INTERPRET);
                 continue;
             }
             _ => return Err("translation exit without a request".into()),
