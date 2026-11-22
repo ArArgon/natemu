@@ -2676,7 +2676,8 @@ const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
 const CR0_CD: u64 = 1 << 30;
 const CR0_NW: u64 = 1 << 29;
 /// CR4: a bit outside the presented CPU's valid set (`cpu_profile::CR4_VALID`: its CPUID feature is advertised, SDM
-/// Vol.3 2.5) is reserved (#GP); every valid bit is accepted. PAE is fixed in long mode; PGE, SMEP are the walker's; PSE
+/// Vol.3 2.5; and MCE, which CPUID does not present, a recorded deviation: it enables nothing, natemu raising no machine
+/// check) is reserved (#GP); every valid bit is accepted. PAE is fixed in long mode; PGE, SMEP are the walker's; PSE
 /// has no effect with 4-level paging (SDM Vol.3 4.1); UMIP makes SGDT/SIDT/SLDT/SMSW/STR #GP at CPL > 0; TSD makes RDTSC/RDTSCP #GP at CPL > 0, PCE allows RDPMC there
 /// (which then #GPs for want of counters), DE makes DR4/DR5 #UD. OSFXSR, OSXMMEXCPT, OSXSAVE (CPUID.1:ECX.OSXSAVE
 /// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE ([`syscalls`]).

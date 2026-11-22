@@ -215,8 +215,9 @@ pub fn cr0(cpu: &Cpu, value: u32) -> Result<(u64, u64), Check> {
     Ok((new, efer))
 }
 
-/// MOV CR4 := `value` outside 64-bit mode: #GP(0) for a bit the presented CPU does not support (`CR4_VALID`: MCE, LA57,
-/// PCIDE and SMAP among them) and for a change of PAE while IA-32e mode is active.
+/// MOV CR4 := `value` outside 64-bit mode: #GP(0) for a bit the presented CPU does not support (`CR4_VALID`: LA57,
+/// PCIDE and SMAP among them; MCE is valid though CPUID does not present it, a recorded deviation, as in the 64-bit
+/// transaction, which uses the same mask) and for a change of PAE while IA-32e mode is active.
 pub fn cr4(cpu: &Cpu, value: u32) -> Result<u64, Check> {
     let v = u64::from(value);
     if v & !CR4_VALID != 0 || (cpu.efer & EFER_LMA != 0 && (v ^ cpu.cr4) & CR4_PAE != 0) {
@@ -369,11 +370,13 @@ mod tests {
         assert_eq!(cr0(&c, 0x11), Ok((0x11, EFER_LME))); // deactivation
         assert_eq!(cr0(&c, 0x8001_0011), Ok((0x8001_0011, EFER_LME | EFER_LMA))); // WP
         assert_eq!(cr0(&c, 0x8000_0010), Err(GP0)); // PE cleared under PG
-        // CR4: the profile's features under PG = 0; MCE, LA57 reserved; PAE fixed while IA-32e mode is active.
+        // CR4: the profile's features under PG = 0, MCE among them (the recorded deviation: not in CPUID); LA57 reserved;
+        // PAE fixed while IA-32e mode is active.
         let p = protected(false);
         assert_eq!(cr4(&p, 0x15_0eb0), Ok(0x15_0eb0)); // a Linux trampoline's
         assert_eq!(cr4(&p, 0x710), Ok(0x710));
-        assert_eq!(cr4(&p, 0x750), Err(GP0)); // MCE
+        assert_eq!(cr4(&p, 0x750), Ok(0x750)); // MCE (OVMF's reset vector: 640H)
+        assert_eq!(cr4(&p, 0x640), Ok(0x640));
         assert_eq!(cr4(&p, CR4_LA57 as u32 | 0x20), Err(GP0));
         assert_eq!(cr4(&p, 0), Ok(0));
         assert_eq!(cr4(&c, 0), Err(GP0));

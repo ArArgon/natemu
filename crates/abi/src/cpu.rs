@@ -729,8 +729,8 @@ mod tests {
             v::RESET.len(),
             profile::MSRS.iter().filter(|m| read_ok(m)).count()
         );
-        // CR4: the profile's mask (bits whose CPUID feature is advertised).
-        assert_eq!(profile::CR4_VALID, 0x150fbc);
+        // CR4: the profile's mask (bits whose CPUID feature is advertised, and MCE: the recorded deviation).
+        assert_eq!(profile::CR4_VALID, 0x150ffc);
     }
     /// Power-on: the firmware MTRRs are what `reset_msrs` adds; without them every MTRR is 0 (disabled: all RAM UC), the
     /// rest as `reset_msrs`, the BSP flag on vCPU 0 only.

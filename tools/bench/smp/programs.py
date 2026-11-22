@@ -587,6 +587,15 @@ SYS = {
     mov rax, {ta:#x}
     mov cr3, rax
     mov rdi, [{X:#x}+16]""",
+    # CR4.MCE set and cleared with read-backs: accepted though CPUID.1:EDX.MCE is clear (natemu's recorded deviation,
+    # tools/models/cpu_profile.json control.cr4.bits.MCE; QEMU's TCG accepts it too).
+    'cr4-mce': """    mov rax, cr4
+    bts rax, 6
+    mov cr4, rax
+    mov rbx, cr4
+    btr rax, 6
+    mov cr4, rax
+    mov rsi, cr4""",
     # MOV from CR0/CR3/CR4 and RDMSR EFER; CR4.PGE and SMEP set and cleared with read-backs; supervisor code runs under SMEP.
     'readback': """    mov rbx, cr0
     mov r14, cr3
@@ -930,10 +939,9 @@ SYS_FAULTS = {
     'cr4-pcide': 'mov rax, cr4\n    bts rax, 17\n    mov cr4, rax',
     'cr4-smap': 'mov rax, cr4\n    bts rax, 21\n    mov cr4, rax',
     'cr4-pae-clear': 'mov rax, cr4\n    btr rax, 5\n    mov cr4, rax',
-    # Profile cases (tools/models/cpu_profile.json via system_fault_model): CR4 bits whose CPUID feature is clear (not UMIP: advertised since 9b845e8, its cases are run_x1.py `umip-*`), and WRMSR/RDMSR the profile refuses.
+    # Profile cases (tools/models/cpu_profile.json via system_fault_model): CR4 bits whose CPUID feature is clear (not UMIP: advertised since 9b845e8, its cases are run_x1.py `umip-*`; not MCE, valid as a recorded deviation: SYS `cr4-mce`), and WRMSR/RDMSR the profile refuses.
     'cr4-vme': 'mov rax, cr4\n    bts rax, 0\n    mov cr4, rax',
     'cr4-pvi': 'mov rax, cr4\n    bts rax, 1\n    mov cr4, rax',
-    'cr4-mce': 'mov rax, cr4\n    bts rax, 6\n    mov cr4, rax',
     'cr4-la57': 'mov rax, cr4\n    bts rax, 12\n    mov cr4, rax',
     'cr4-vmxe': 'mov rax, cr4\n    bts rax, 13\n    mov cr4, rax',
     'cr4-smxe': 'mov rax, cr4\n    bts rax, 14\n    mov cr4, rax',
