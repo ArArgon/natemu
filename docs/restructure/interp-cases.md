@@ -1,9 +1,11 @@
 # The boot-time interpreter's per-instruction cases: format and references
 
-Status: November 22, 2026. The reference side runs and is locked (`tests/interp`, case `references`); natemu does not
-run these cases yet: its program driver starts only in 64-bit long mode (`crates/driver/src/drivers/program.rs`). This
-page is the contract between the generator, the reference rig and the natemu side still to come (M2 Part 2, plan
-section 8, "Per-instruction cases in each mode").
+Status: November 22, 2026. The reference side runs and is locked (`tests/interp`, case `references`). natemu's program
+driver sets a case's state directly (its machine descriptions, below) and natemu's runner is written
+(`run_interp_natemu.py`), but natemu does not run the corpus yet: the resident runs no 16- or 32-bit state until the
+interpreter is integrated (its `start()` halts on one), so the corpus case is not registered; case `natemu-machine` runs
+the driver's machine descriptions in 64-bit mode. This page is the contract between the generator, the reference rig and
+the natemu side (M2 Part 2, plan section 8, "Per-instruction cases in each mode").
 
 ## What there is
 
@@ -14,6 +16,7 @@ section 8, "Per-instruction cases in each mode").
 | `tests/interp/interp_rig.py` | The capture blobs, the image (stub + case table), the two references, parsing, each case's answer. |
 | `tests/interp/run_interp_ref.py` | The `references` case: the checks below, from the lock (or, seeding, from the references). |
 | `tests/interp/tests.lock` | Every case's two answers, inline (`[answers]`, `tools/reference/answers.py`). |
+| `tests/interp/run_interp_natemu.py` | natemu's side: each case as a machine description through the program driver, judged against the lock; `--selftest`, case `natemu-machine`. |
 
 The corpus covers exactly section 1's first-version list in R, P32 and C32, the P16 stretch, and the transitions R → P16,
 R → P32, P16 → R, P32 → C32, P32 → 64-bit, C32 → P32 and C32 → 64-bit: 1,716 cases (case `references`, the generator at
@@ -100,20 +103,25 @@ reference's name and `rig_digest` (`interp_rig.py`): the stub, the capture blobs
 (QEMU's pin, CPU model and arguments; KVM's CPU flag, arguments, container image and snapshot). A renamed case keeps its
 answers; a changed case, stub, common block or reference needs new ones.
 
-## What natemu's side is to do (integration, after the driver's start states)
+## natemu's side
 
-For each case: write `common` and the case's `memory` and `code`, set `state` directly (mode from CR0, EFER and CS's
-hidden part; the six segment registers with their hidden parts; GDTR, IDTR; RIP = `eip`; nothing else running), run
-until CS.base + EIP reaches a stop, checked before each instruction (or the interpreter stops with a typed stop: a
-failure), and compare per answer field:
-`by` absent → the locked QEMU answer (equal to KVM's), `qemu` or `kvm` → that one, `profile` → not here. The masks
-apply to natemu's values the same way (`interp_rig.answer` is the projection: give it natemu's record). In 64-bit mode
-(stop mode `L64`) compare the low 32 bits of the GPRs.
+For each case `run_interp_natemu.py` writes a machine description (`crates/driver/src/drivers/program.rs`, its module
+doc): a `machine` line; `memory` lines for `common`, the case's `memory` and its `code` (physical addresses: linear =
+physical in every case; the `rig` bytes are not written); `rip` (= `eip`), `rflags`, `gpr` (the eight, then zeros),
+`cpl`, `cr0`, `cr3`, `cr4`, `efer` as given; `seg` per register with its hidden part (selector, base, limit, attributes);
+`gdtr`, `idtr`; a `stop` per stop's `linear` in id order; a `window` per compared window. LDTR, TR and DR0-DR7 are the
+reset values, nothing else runs. The driver sets that state directly (no page tables, IDT, GDT or TSS of its own),
+ends the run when the vCPU is about to execute a stop's linear address (the first instruction included) and reports
+`machine`: `stop` (the id reached, null otherwise), the low 32 bits of the eight GPRs, `eflags`, the six selectors, CR0,
+CR3, CR4 (low 32 bits), EFER, `gdtr` and `idtr` as [limit, low 32 bits of the base], `window0`... (hex): exactly
+`interp_rig.fields()`. The runner projects them with the case's masks (`interp_rig.project`) and compares per answer
+field: `by` absent → the locked QEMU answer (equal to KVM's), `qemu` or `kvm` → that one, `profile` → not here.
 
-The program driver (`program.rs`) needs, per mode: the six segments with hidden parts (today `flat_segments(cpl)`), RIP
-and the 32-bit GPRs, EFLAGS with IF, CR0, CR3, CR4, EFER as given (today PE/PG/WP and LME/LMA are derived), GDTR and
-IDTR, physical memory blocks (today it builds its own page tables: C32 uses `common`'s instead), and stops at linear
-addresses (today: the end of the body holding the RIP).
+What the integration has to switch on: the driver answers a stop at a translation request for its address
+(`execution::Hook::at`, with blocks ending before it), which is RIP in 64-bit code; the interpreter must ask the same hook
+with CS.base + EIP before it decodes an instruction there (a `REQUEST_DECODE` at a stop is answered with the stop, as a
+translation request at one is, and is never cached), and then register the corpus as case `natemu` (argv in the
+runner's docstring).
 
 ## The references and the rig
 
@@ -150,7 +158,8 @@ and mixed, in every mode: a reference that changed them would fail there.
 
 ## The checks (case `references`) and seeding
 
-`tools/natemu-test run tests/interp`: no VM starts. The corpus is generated; per case both locked answers must exist,
+`tools/natemu-test run tests/interp -k references`: no VM starts (`natemu-machine`, the family's other case, runs
+natemu's program driver). The corpus is generated; per case both locked answers must exist,
 agree on every field both answer, stop at `expect_stop`, and an empty case's must be its starting state. A changed case
 has a new hash and no answer: the case reports it as not seeded.
 

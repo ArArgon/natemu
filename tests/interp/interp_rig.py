@@ -244,14 +244,20 @@ def fields(rec: bytes, wins: list) -> dict:
 
 def answer(case: dict, rec: bytes, wins: list, ref: str) -> dict:
     """The case's answer from reference `ref`: every field it answers (by: both or `ref`), under the case's masks."""
-    f, cmp = fields(rec, wins), case['compare']
+    return project(case, fields(rec, wins), ref)
+
+
+def project(case: dict, f: dict, ref: str) -> dict:
+    """`answer` from the fields themselves (`fields()`'s form, which natemu's program driver also reports: its
+    `machine` output): the fields `ref` answers, under the case's masks."""
+    cmp = case['compare']
     by = cmp['by']
     masks = {**{r: num(m) for r, m in cmp['gpr'].items()}, 'eflags': num(cmp['eflags']), 'cr0': num(cmp['cr0']),
              'cr3': num(cmp['cr3']), 'cr4': num(cmp['cr4']), 'efer': num(cmp['efer'])}
     out = {}
     for k, v in f.items():
         if by.get(k, 'both') not in ('both', ref): continue
-        out[k] = v & masks[k] if k in masks else v
+        out[k] = v & masks[k] if k in masks and isinstance(v, int) else v
     return out
 
 
