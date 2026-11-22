@@ -200,7 +200,7 @@ i386() {   # --i386: Debian's i386 userland in /i386 (debootstrap, same snapshot
   # The built interpreter's answers (run_io5.py I386_CHECK pins their hash, recorded on real x86 under KVM: --backend kvm).
   curl -fsS http://$H/check.py -o /i386/build/check.py
   span i386-check in32 "cd /build/Python-3.13.18 && ./python /build/check.py &&
-      ./python -m test -j\$(nproc) @I386TESTS@ 2>&1 | grep -E '^(Result|Total tests)' | sed -E 's/^Result: .* ([A-Z]+)\$/Result: \1/' &&
+      ./python -m test -j\$(nproc) @I386TESTS@ 2>&1 | grep -E '^(Result|Total tests)' &&
       { ./python -m test test_math > /tmp/test_math.log 2>&1; rc=\$?; grep -E '^(FAIL|ERROR): |^Total tests' /tmp/test_math.log | sed 's/^/note: test_math /'
         [ \$rc = 0 ] || [ \$rc = 2 ]; }"   # 2: tests failed (expected under natemu); anything else is a crash
   sed 's/^/IO5chk /' $L/i386-check.log; say i386-check $(grep -Ev '^(x87|note): ' $L/i386-check.log | sha256sum | cut -c1-16)
@@ -493,7 +493,9 @@ def run(args):
                 code, timed_out, seconds = launch(command(args, disk, args.out / 'compile-cache', phase), args.out, phase, host, limit)
                 contended = before + others()
                 if load:   # other work on the x86 machine: this boot's times are indicative only (after: the VM's own load is in it)
-                    load.append(kvm_load()); busy = phase == 'use' and float(load[0]['load'].split()[0]) > 1 or any(x['containers'] for x in load)
+                    load.append(kvm_load())
+                    try: busy = phase == 'use' and float(load[0]['load'].split()[0]) > 1 or any(x['containers'] for x in load)
+                    except ValueError: busy = True     # the probe gave no load: not known to be idle
                     result.setdefault('reference_host', {})[phase] = {'before': load[0], 'after': load[1], 'times_indicative': busy}
                 r = judge(args.out, phase, code, timed_out, args.i386, args.backend == 'kvm')
                 short = raw_shortfall(disk, args.out) if qcow else 'the disk is on the x86 machine' if args.backend == 'kvm' else None

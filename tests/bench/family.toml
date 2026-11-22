@@ -205,7 +205,7 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
 
-# M2 checkpoint B: the QEMU side (TCG, one vCPU) of the 32-bit cases, and of the two 64-bit cases the November 14 QEMU round did
+# M2 checkpoint B: the QEMU side (TCG) of the 32-bit cases, and of the two 64-bit cases the November 14 QEMU round did
 # not have (cray-strict, scimark). QEMU runs x87 in software, so 32-bit c-ray is the small scene (320x240) only; cray-strict is the full 64-bit scene, as cray
 # was on November 14 (130 s a run). vCPUs as the natemu case of the same name. Each boot (both runs) is capped at 15 minutes; a
 # capped boot is a result (bench.jsonl `capped`, `capped_in`, `at_least_s`), not a failure. Once per QEMU version.
