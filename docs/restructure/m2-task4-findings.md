@@ -1022,7 +1022,7 @@ estimate from the small scene was 1,970 s). So at least 3.4 times faster, about 
   (Go's 386 runtime: about 0.55 microseconds more per call), not for glibc programs.
 - **Macs without AFP (M1, M2)** keep the per-operation x87 wrapper and FLDCW in the shim: x87-heavy 32-bit code is as
   slow there as it was here before. Their NaN and denormal fix-ups read each operation's own flags, which a run does
-  not separate. A lead, not started.
+  not separate. Done since, for fast mode: [fast x87 on Macs without AFP](m2-fast-x87-findings.md).
 - **x87 instructions cost about 48 Arm instructions each:** done after the pause, see "the x87 register stack in host
   registers" above (now about 6).
 - **PCMPxSTRx through the shim** is 12% of `startup32` (glibc's i386 string functions with SSE4.2; 57 ns a call).

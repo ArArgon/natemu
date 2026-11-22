@@ -17,8 +17,19 @@ documented deviations (the M4 has none; the names are the ones `tests/lib/fp_dev
 - `band-ue-flag`: with UE masked, a result just below the smallest normal number that rounds up to it can set MXCSR.UE (x86 judges tininess after rounding).
 - `daz-ftz-band`: with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal.
 - `ftz-band`: with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm's denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right).
+- `x87-nan-results`: an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation on a signalling NaN from memory and a quiet NaN in ST(0) returns the signalling one quieted where x86 keeps ST(0)'s (the flags are right).
+- `masked-x87-de`: with DE masked, an x87 instruction on a denormal m32 or m64 operand does not set the status word's DE flag (the result is right).
 
-## x87 registers hold doubles (every Mac, both modes)
+The first six are about SSE and AVX code, the last two about x87 code (what 32-bit programs built for i686 use for all
+their arithmetic). A program sees `x87-nan-results` when it prints such a NaN: `printf` shows `nan` where x86 shows
+`-nan`. The two x87 items exist because keeping them exact costs a lot there: natemu would have to switch and read the
+CPU's floating-point status around every single x87 operation, which makes x87-heavy 32-bit code more than a hundred times
+slower (the table under "Accurate mode"). FEX-Emu, whose x87 translation natemu uses, behaves the same way on these Macs:
+its faster x87 mode does not model the x87 exception flags other than "invalid" at all and takes Arm's NaN results as they
+come ([findings](restructure/m2-fast-x87-findings.md)). With an x87 exception unmasked (rare: Linux programs run with all
+of them masked) x87 code is exact in fast mode too, at the slow speed.
+
+## x87 deviations on every Mac: registers hold doubles (`x87-doubles`, both modes)
 
 natemu's x87 registers are 64-bit doubles, not the x87's 80-bit format: 53 bits of precision instead of 64, and the
 double's exponent range. 64-bit programs rarely notice (their floating point is SSE). 32-bit programs use the x87 for
@@ -38,13 +49,34 @@ everything, and these are the differences from hardware measured with Debian's i
 - The precision-control field of the x87 control word does nothing. A program that sets it to double (CPython does,
   around float formatting) gets the same results as on hardware.
 
+- A computation whose intermediate result leaves the double's range or precision but fits the x87's sets the flags a
+  double computation sets (UE, OE, PE) where hardware, working in 80 bits, sets none until the value is stored.
+
 Ordinary double arithmetic, casts to integers, the four rounding modes, comparisons, exception flags, and saving and
-restoring the x87 state (signal frames included) match hardware.
+restoring the x87 state (signal frames included) match hardware, apart from the items in the next section and, in fast
+mode on a Mac without FEAT_AFP, the two x87 items in the list above.
+
+## Other x87 deviations, by Mac (both modes)
+
+Two smaller differences in the x87 status word's flags that neither mode changes. Both come from how the Mac's own
+floating-point unit reports flags, and both were measured against a real x86 processor (an AMD Ryzen 7 8845HS):
+
+- `x87-band-ue-flag` (Macs without FEAT_AFP: M1, M2): with UE masked, an x87 result just below the smallest normal double
+  that rounds up to it sets the status word's UE flag. Arm judges "too small" before rounding, x86 after. Accurate mode
+  fixes the same case for SSE code (`band-ue-flag`), not for x87.
+- `x87-register-de` (Macs with FEAT_AFP: M4): an x87 instruction on a register that holds a denormal double sets the
+  status word's DE flag. On x86 that register holds an ordinary 80-bit number and DE stays clear. A Mac without FEAT_AFP
+  does not set it, which is x86's behaviour. Removing it on an M4 would mean testing every memory operand in software
+  instead of taking the CPU's flag, which was measured at 55 to 85% more time on x87-heavy code
+  ([findings](restructure/m2-fast-x87-findings.md)), so it stays.
+
+The complete list of x87 deviations is therefore: `x87-doubles` everywhere; `x87-register-de` on Macs with FEAT_AFP;
+`x87-band-ue-flag` on Macs without it; and there, in fast mode only, `x87-nan-results` and `masked-x87-de`.
 
 ## Accurate mode
 
-`--fp accurate` (or `NATEMU_FP=accurate`; the flag wins) makes every item in the list above exact on a Mac without AFP, so x86 floating-point
-results and flags match what real x86 gives. It does this by letting the CPU trap on the cases that differ and correcting the result in natemu's
+`--fp accurate` (or `NATEMU_FP=accurate`; the flag wins) makes every item in the fast-mode list above exact on a Mac without AFP, so x86 floating-point
+results and flags match what real x86 gives (the x87 items of the two sections before this one stay). It does this by letting the CPU trap on the cases that differ and correcting the result in natemu's
 small EL1 runtime, so it needs a host that reports precise floating-point traps (M1 Pro, M2 Max and M4 do; this is a required host feature).
 natemu prints `natemu: fp: accurate mode` at startup. On an M4 (or any Mac with AFP) accurate mode changes nothing: no code, no cost.
 
@@ -59,6 +91,11 @@ The price is speed, only where a program really hits those cases or is built to 
 | sqlite | about +5.5% (not the x87 mode switching once thought: removing it changed nothing; cause not yet attributed) |
 | avx | about +2.5% |
 | zstd | about 0 |
+| c-ray built as 32-bit x87 code, 320x240 (`cray32-small`, `cray32-strict-small`) | about 170 and 110 times the time (111 s against 0.66 s, 66 s against 0.63 s; measured on an M3 with AFP hidden) |
+| SciMark 2.0 built as 32-bit x87 code | about 1/36 of the speed (33 against 1,176 Mflops; same machine) |
+
+The last two rows are x87 code: accurate mode keeps the x87's NaN results and DE flag exact by switching and reading the
+floating-point status around every x87 operation, where fast mode does it once per run of x87 instructions.
 
 Fast mode stays the default: making only the underflow or only the NaN fixes always-on cost +16% to +18% on average, which was too much.
 
