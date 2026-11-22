@@ -60,6 +60,43 @@ B10 An access that runs across the 4 GiB end of a segment whose effective limit 
    permitted: the fault or completion.
 B9 A not-present SS on IRET or an outer RET: the pseudocode gives #SS(selector) (delivery_model's choice, the model's),
    the exception lists #NP(selector) for "the return code or stack segment" (QEMU's); permitted: either.
+
+THE INTERPRETER'S MODES (M2 Part 2, the boot-interpreter plan sections 5 and 8): `jmp_far_interp`, `ret_far_interp` and
+`load_interp` are far JMP (ptr16:16, ptr16:32, m16:16, m16:32), far RET (16- and 32-bit, with or without imm16) and MOV
+Sreg in the modes `interpreted_mode` names (R, P16, P32, C16, C32) at CPL 0, from Vol. 2 "JMP" (far jumps: real-address
+mode, then protected mode with the conforming and nonconforming code-segment paths), "RET" (real-address mode far
+return; protected mode with LMA = 0; IA-32e mode, whose order puts the L = D = 1 check before the RPL checks; return to
+the same privilege level) and "MOV" (segment loads, protected-mode exceptions), and Vol. 3A "Limit Checking" and "Type
+Checking" (data accesses: #GP(0), #SS(0) through SS). Order of checks, each the SDM's: the operand (segment check, then
+the page walk in compatibility mode), the stack slots, null selector #GP(0), table limit #GP(sel), type #GP(sel), with
+LMA = 1 L = D = 1 #GP(sel), privilege #GP(sel), present #NP(sel), then the offset against the new CS limit #GP(0)
+(none for a 64-bit target, whose 32-bit offset is canonical). Two rules of the 64-bit functions above do not apply
+here: a null SS is #GP(0) at every CPL (`_load`'s CPL < 3 allowance is the 64-bit rule, "MOV" 64-bit mode exceptions),
+and L is ignored when LMA = 0 (a code descriptor with L = D = 1 is a 32-bit segment there; `far` refuses it as the 64-bit
+rule says). natemu's first version (plan section 1) does not interpret gates, task switches, privilege changes or CPL
+1-3: those are `refused` after the checks the SDM makes before them (a typed stop for the interpreter). A far transfer
+that loads a 64-bit CS with LMA = 1 completes with `handoff` True: the vCPU leaves interpreted state for the translator.
+With CR0.PG = 0 there is no #PF: linear = physical, and a page the state's `memory` lacks is unassigned (reads all-ones,
+writes ignored: the plan's section 4, layer 3); in compatibility mode the paged bus is delivery_model's.
+
+The hidden descriptor cache is the state's `seg[sreg]` = (selector, attributes) with `shape[sreg]` = (base, limit) (every
+interpreted state carries `shape` for each loaded segment); `rip` is EIP (the offset in CS), `rsp` ESP, `efer` holds
+LMA (bit 10). Ambiguities, as above:
+B11 A real-mode load (MOV Sreg, far JMP, far RET) changes the selector and the base (selector x 16) only; the hidden limit
+   and attributes stay (KVM's emulator: "keep limit etc. for unreal mode"; QEMU's real-mode loads write only the selector
+   and base). The SDM's return to real mode (Vol. 3A "Switching Back to Real-Address Mode") loads 64 KiB segments in
+   protected mode first, which is consistent with this.
+B12 RET far in real mode with a 32-bit operand size: the pseudocode checks EIP against the CS limit only for a 16-bit
+   operand size; the exception list ("If the return instruction pointer is not within the return code segment limit")
+   for both. Model: #GP(0) for both; permitted for the 32-bit form: completion.
+B13 Each stack slot of a far RET is checked as the pop that reads it: on a 16-bit stack (SS.B = 0) the second slot's
+   offset wraps at 64 KiB ("top n bytes" in the pseudocode). The stack-address size is SS.B in every mode (the
+   real-mode pseudocode's "SP := SP + (SRC AND FFFFH)" is the B = 0 case).
+B14 Real-mode data accesses check the hidden limit (expand-down when the cached type says so) but no rights: KVM (the
+   hardware) checks limits; QEMU's TCG checks none.
+B15 The CS that INIT and SIPI leave: Vol. 3A Table 12-1 gives CS "AR = Present, R/W, Accessed"; KVM loads 9BH (code,
+   readable, accessed). The model uses 9BH (`reset_state`); a fetch checks the CS limit only, never the cached type
+   (rights are checked when CS is loaded), so either value runs the same code.
 """
 import copy
 import pathlib
@@ -184,9 +221,26 @@ def _widen(fault, faults=(), may_complete=False):
     return fault
 
 
+class _PhysBus(_Bus):
+    """CR0.PG = 0: linear = physical, no #PF; a page the state's `memory` lacks is unassigned (all-ones, writes ignored)."""
+
+    def check(self, addr, n, write, cpl, first=None):
+        pass
+
+    def read(self, addr, n, cpl=0):
+        mem = self.state['memory']
+        return bytes(self.writes.get(a, mem[a >> 12]['data'][a & 0xFFF] if a >> 12 in mem else 0xFF)
+                     for a in range(addr, addr + n))
+
+    def write(self, addr, data, cpl=0):
+        for i, b in enumerate(data):
+            if (addr + i) >> 12 in self.state['memory']:
+                self.writes[addr + i] = b
+
+
 def _run(state, body):
     s = copy.deepcopy(state)
-    bus = _Bus(s)
+    bus = (_Bus if s['cr0'] >> 31 & 1 else _PhysBus)(s)
     try:
         body(s, bus)
     except Fault as f:
@@ -461,7 +515,229 @@ def iret(state, width=8):
     return ret(state, width, iret=True)
 
 
+# ---- the interpreter's modes: R, P16, P32, C16, C32 at CPL 0 (boot-interpreter plan sections 5, 8) ----------------
+
+CR0_PE, CR0_PG, EFER_LMA = 1, 1 << 31, 1 << 10
+
+
+def interpreted_mode(cr0, efer, cs_attributes, cpl):
+    """The plan's `Cpu::interpreted_mode`, the predicate "EFER.LMA = 0, or CPL 0 with a non-64-bit code segment": 'R'
+    (CR0.PE = 0), 'P16'/'P32' (PE = 1, LMA = 0, by CS.D; L is ignored), 'C16'/'C32' (LMA = 1, CS.L = 0, CPL 0, by CS.D),
+    None otherwise (64-bit code, or compatibility-mode code at CPL > 0: the translator's)."""
+    d = cs_attributes >> 14 & 1
+    if not cr0 & CR0_PE:
+        return 'R'
+    if not efer & EFER_LMA:
+        return 'P32' if d else 'P16'
+    if cs_attributes >> 13 & 1 or cpl:
+        return None
+    return 'C32' if d else 'C16'
+
+
+def mode_of(s):
+    return interpreted_mode(s['cr0'], s['efer'], s['seg']['cs'][1], s['cpl'])
+
+
+def _cache(s, sreg):
+    """(selector, attributes, base, limit) of `sreg`'s hidden descriptor cache."""
+    sel, a = s['seg'][sreg]
+    base, lim = s.get('shape', {}).get(sreg, (0, 0xFFFFFFFF))
+    return sel, a, base, lim
+
+
+def _within(a, lim, offset, n):
+    """[offset, offset + n) inside a segment with attributes `a` and effective limit `lim` (Vol. 3A "Limit Checking"):
+    expand-up, offset + n - 1 <= limit; expand-down data (type bit 2), limit < offset and the end within FFFFH or
+    FFFFFFFFH by the B flag."""
+    end = offset + n - 1
+    if a & 0x18 == 0x10 and a & 4:
+        return offset > lim and end <= (0xFFFFFFFF if a >> 14 & 1 else 0xFFFF)
+    return end <= lim
+
+
+def _data(s, bus, sreg, offset, n, write=None):
+    """An explicit n-byte access at `offset` (wrapped at the address size by the caller) through `sreg`: the bytes read,
+    or `write` stored. Protected mode: #GP(0) through a null segment, for a write to code or read-only data and a read of
+    execute-only code; outside the limit #GP(0), or #SS(0) through SS (B10 for a flat segment's 4 GiB end). Real mode:
+    the limit only (B14). Linear = base + offset, 32 bits."""
+    _, a, base, lim = _cache(s, sreg)
+    vector = SS if sreg == 'ss' else GP
+    if mode_of(s) != 'R':
+        code = a & 0x18 == 0x18
+        if not a & 0x80:
+            raise Fault(GP, 0)
+        if (code or not a & 2) if write is not None else (code and not a & 2):
+            raise Fault(GP, 0)
+    if not _within(a, lim, offset, n):
+        raise _widen(Fault(vector, 0), may_complete=lim == 0xFFFFFFFF and offset <= lim)
+    linear = base + offset & 0xFFFFFFFF
+    if write is None:
+        return bus.read(linear, n, s['cpl'])
+    bus.write(linear, write, s['cpl'])
+
+
+def _real_cs(s, sel):
+    """Real mode: CS := `sel`, base `sel` x 16, the hidden limit and attributes kept (B11)."""
+    _, a, _, lim = _cache(s, 'cs')
+    s['cs'] = sel
+    s['seg']['cs'] = (sel, a)
+    s.setdefault('shape', {})['cs'] = (sel << 4, lim)
+
+
+def _load_cs(s, bus, sel, daddr, raw, off):
+    _accessed(bus, daddr, raw)
+    s['cs'] = sel & ~3 | s['cpl']
+    _loaded(s, 'cs', s['cs'], raw)
+    s['rip'] = off
+
+
+def _finish(r):
+    r['handoff'] = r['outcome'] == 'done' and mode_of(r['state']) is None
+    return r
+
+
+def _interp(s):
+    assert mode_of(s), 'not an interpreted state'
+    if s['cpl']:
+        raise Refused('CPL 1-3: not interpreted')
+
+
+def jmp_far_interp(state, target=None, pointer=None, osize=32):
+    """JMP far in an interpreted mode: `target` = (selector, offset) from the instruction (EA: ptr16:16 with `osize` 16,
+    ptr16:32 with 32), or `pointer` = (sreg, offset) of the m16:16 / m16:32 operand (FF /5, read first)."""
+    def body(s, bus):
+        _interp(s)
+        width = osize // 8
+        if pointer:
+            raw = _data(s, bus, pointer[0], pointer[1], width + 2)
+            off, sel = int.from_bytes(raw[:width], 'little'), int.from_bytes(raw[width:], 'little')
+        else:
+            sel, off = target
+        if mode_of(s) == 'R':
+            if off > _cache(s, 'cs')[3]:
+                raise Fault(GP, 0)                                 # "tempEIP is beyond code segment limit"
+            _real_cs(s, sel)
+            s['rip'] = off & (1 << osize) - 1
+            return
+        if sel & 0xFFFC == 0:
+            raise Fault(GP, 0)
+        daddr, raw = descriptor(s, bus, sel)
+        st, t, dpl, p, l, d = fields(raw)
+        lma, cpl = s['efer'] & EFER_LMA, s['cpl']
+        if not st:
+            if t == 0xC or not lma and t in (1, 3, 4, 5, 9, 0xB):
+                raise Refused('call gate' if t in (4, 0xC) else 'task gate or TSS: a task switch')
+            raise _gp(sel)
+        if not t & 8 or lma and l and d:
+            raise _gp(sel)
+        if (dpl > cpl) if t & 4 else (sel & 3 > cpl or dpl != cpl):
+            raise _gp(sel)
+        if not p:
+            raise _np(sel)
+        off &= (1 << osize) - 1
+        if not (lma and l) and off > limit(raw):
+            raise Fault(GP, 0)                                     # the new CS's limit (none for a 64-bit target)
+        _load_cs(s, bus, sel, daddr, raw, off)
+    return _finish(_run(state, body))
+
+
+def ret_far_interp(state, osize=32, release=0):
+    """RET far (CB; CA with imm16 `release`) with a 16- or 32-bit operand size in an interpreted mode, to the same
+    privilege level (a return to an outer level is refused: natemu's first version has no privilege changes)."""
+    def body(s, bus):
+        _interp(s)
+        width = osize // 8
+        _, ssa, _, _ = _cache(s, 'ss')
+        mask = 0xFFFFFFFF if ssa >> 14 & 1 else 0xFFFF
+        esp = s['rsp'] & mask
+        slots = [esp, esp + width & mask]
+        for slot in slots:                                         # B13: each pop's slot, before any is read
+            _, a, _, lim = _cache(s, 'ss')
+            if not _within(a, lim, slot, width):
+                raise _widen(Fault(SS, 0), may_complete=lim == 0xFFFFFFFF and slot <= lim)
+        off, sel = (int.from_bytes(_data(s, bus, 'ss', slot, width), 'little') for slot in slots)
+        sel &= 0xFFFF
+        off &= (1 << osize) - 1
+        if mode_of(s) == 'R':
+            if off > _cache(s, 'cs')[3]:
+                raise _widen(Fault(GP, 0), may_complete=osize == 32)   # B12
+            _real_cs(s, sel)
+            s['rip'] = off
+        else:
+            if sel & 0xFFFC == 0:
+                raise Fault(GP, 0)
+            daddr, raw = descriptor(s, bus, sel)
+            st, t, dpl, p, l, d = fields(raw)
+            lma, cpl, rpl = s['efer'] & EFER_LMA, s['cpl'], sel & 3
+            if not st or not t & 8 or lma and l and d:             # IA-32e order: L = D = 1 before the RPL checks
+                raise _gp(sel)
+            if rpl < cpl or ((dpl > rpl) if t & 4 else (dpl != rpl)):
+                raise _gp(sel)
+            if not p:
+                raise _np(sel)
+            if rpl > cpl:
+                raise Refused('return to an outer privilege level')
+            if not (lma and l) and off > limit(raw):
+                raise Fault(GP, 0)
+            _load_cs(s, bus, sel, daddr, raw, off)
+        s['rsp'] = s['rsp'] & ~mask | esp + 2 * width + release & mask
+    return _finish(_run(state, body))
+
+
+def load_interp(state, sreg, sel):
+    """MOV Sreg (not CS) in an interpreted mode. Real mode: selector and base only (B11). Protected and compatibility
+    mode: a null selector loads DS/ES/FS/GS as unusable and is #GP(0) for SS at every CPL (the 64-bit allowance of
+    `_load` does not apply); otherwise `_load`'s descriptor checks."""
+    def body(s, bus):
+        assert sreg != 'cs', 'MOV to CS is #UD'
+        _interp(s)
+        if mode_of(s) == 'R':
+            _, a, _, lim = _cache(s, sreg)
+            s['seg'][sreg] = (sel, a)
+            s.setdefault('shape', {})[sreg] = (sel << 4, lim)
+            if sreg == 'ss':
+                s['ss'] = sel
+            return
+        if sel & 0xFFFC == 0:
+            if sreg == 'ss':
+                raise Fault(GP, 0)
+            s['seg'][sreg] = (sel, 0)
+            s.setdefault('shape', {})[sreg] = (0, 0)
+            return
+        _load(s, bus, sreg, sel)
+        if sreg == 'ss':
+            s['ss'] = sel
+    return _finish(_run(state, body))
+
+
 # ---- builders for tests and runners -----------------------------------------------------------------------------
+
+def segment(base=0, lim=0xFFFF, access=0x93, flags=0):
+    """An 8-byte descriptor: `access` is bits 47:40 (P, DPL, S, type), `flags` bits 55:52 (G, D/B, L, AVL); a limit above
+    FFFFFH is in bytes with its low 12 bits FFFH and sets G."""
+    if lim > 0xFFFFF:
+        lim, flags = lim >> 12, flags | 8
+    return (lim & 0xFFFF | (base & 0xFFFFFF) << 16 | access << 40 | (lim >> 16 & 0xF) << 48 | flags << 52
+            | (base >> 24 & 0xFF) << 56)
+
+
+def reset_state(memory=None, sipi=None, cd_nw=0x60000000):
+    """The INIT state (Vol. 3A Table 12-1, INIT column) in this model's state form: CR0 = CD/NW as kept | ET, EFLAGS 2,
+    EIP FFF0H, CS F000H / base FFFF0000H / limit FFFFH (attributes 9BH, B15), the other segments 0 / 0 / FFFFH (93H),
+    GDTR and IDTR base 0 limit FFFFH, LDTR and TR 0, EFER 0. `sipi`: the state a SIPI with that vector leaves (CS VV00H,
+    base VV000H, EIP 0; the hidden limit and attributes kept)."""
+    seg = {r: (0, 0x93) for r in SREGS}
+    seg['cs'] = (0xF000, 0x9B)
+    shape = {r: (0, 0xFFFF) for r in SREGS}
+    shape['cs'] = (0xFFFF0000, 0xFFFF)
+    s = dict(rip=0xFFF0, length=0, rsp=0, rflags=2, cpl=0, cs=0xF000, ss=0, cr0=cd_nw & 0x60000000 | 0x10, cr2=0, cr4=0,
+             efer=0, gdtr=(0, 0xFFFF), idtr=(0, 0xFFFF), ldtr=None, tr=None, seg=seg, shape=shape, fs_base=0, gs_base=0,
+             memory={} if memory is None else memory)
+    if sipi is not None:
+        s.update(cs=sipi << 8, rip=0)
+        seg['cs'] = (sipi << 8, 0x9B)
+        shape['cs'] = (sipi << 12, 0xFFFF)
+    return s
 
 def system_descriptor(base, lim, kind, dpl=0, present=True, upper_type=0):
     """A 16-byte LDT (kind 2) or 64-bit TSS (kind 9 available, 0xB busy) descriptor as bytes."""
