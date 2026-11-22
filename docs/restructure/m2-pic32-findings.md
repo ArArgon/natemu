@@ -9,19 +9,20 @@ code is rewritten once into a form that reads its page base at run time, and eve
 translation. In the i386 configure the copies, and the linking and patching that come with them, cost 31.9 s of vCPU
 time, against 6.3 s in the 64-bit configure. This branch shares 32-bit user code the same way.
 
-**Result** (bench case `io5-solo32`, M4, 4 vCPUs, one run each, seconds; "before" is eedae4a2, the 32-bit reuse
-findings' run; "after" is this branch at 3fd3b398):
+**Result** (M4, 4 vCPUs, one run each, seconds). "Before" is this branch's base without sharing, `m2-32bit` at
+9cd51ca6, in bench case `io5-solo32-profile`; its step times match eedae4a2's timed `io5-solo32` (the 32-bit reuse
+findings' run: 57.5, 90.0, 106.7, 114.7), so the shared store probes in between did not move them. "After" is this
+branch at 3fd3b398, timed (`io5-solo32`) and profiled (`io5-solo32-profile`):
 
-| Step | before | after | QEMU |
-| --- | ---: | ---: | ---: |
-| 64-bit configure | 57.5 | 58.0 | 94.9 |
-| 64-bit `make -j4` | 90.0 | 89.5 | 357.6 |
-| i386 configure | 106.7 | **82.5** | 110.9 |
-| i386 `make -j4` | 114.7 | **108.1** | 464.0 |
+| Step | before (9cd51ca6, profiled) | after, timed | after, profiled | QEMU |
+| --- | ---: | ---: | ---: | ---: |
+| 64-bit configure | 56.9 | 58.0 | 55.9 | 94.9 |
+| 64-bit `make -j4` | 89.8 | 89.5 | 89.5 | 357.6 |
+| i386 configure | 106.9 | **82.5** | 82.1 | 110.9 |
+| i386 `make -j4` | 115.1 | **108.1** | 108.9 | 464.0 |
 
-The i386 configure is 23% faster: 1.42 times the 64-bit configure, where before it was 1.86 times. The make is 6%
-faster. The 64-bit steps did not move. "Before" is not this branch's base, though: the shared store probes
-(store-stub2) came in between. So this table measures both changes, not sharing alone.
+The gain is sharing's alone. The i386 configure is 23% faster: 1.42 times the 64-bit configure, where before it was
+1.86 times. The make is 6% faster. The 64-bit steps did not move.
 
 ## The design
 
@@ -53,9 +54,11 @@ In short:
   - **Admission.** The check that nothing reads an FMA check's result register stopped scanning at the new `nop`, so
     a read after a 32-bit move went unchecked. The scan now goes on past it.
   - **The replay comparison.** `only_moves` checked a PC-relative word's target only when the word itself changed, so
-    a branch over a move whose words fexc left unchanged would have passed. It now checks every such word. A new
-    mutation tests this: with the old rule, 1,100 such mutations of the libc corpus went unreported; with the new
-    rule, none.
+    a branch over a move whose words fexc left unchanged would have passed. It now checks every such word. A unit test
+    (`tests/static/test_replay_only_moves.py`) pins it with synthetic replies: a two-word move against its three-word
+    twin, a `cbz` over it; it fails under the old rule. The replay's own mutations (a branch over a move shortened by a
+    word) catch it only where OLD and NEW differ: in the libc corpus against the old compiler, the old rule missed 1,100
+    of them and the new one none, but in `fexc-replay-order`, which compares a compiler with itself, no word moves.
 - **Two smaller points, also fixed:** the run address of 32-bit shared code is masked to 32 bits, and the
   self-checking replay case now runs the 32-bit comparison.
 - **One point left open:** the 64-bit `link_point` also accepts a `nop` before `svc` after a 32-bit move form. fexc
@@ -88,28 +91,57 @@ answered the same requests with fexc at 9cd51ca6 (the old forms) and at this bra
 
 ### Where the time went
 
-The profile (bench case `io5-solo32-profile`, M4, this branch; `tests/io/io5_compiles.py`) gives busy vCPU time in
-the i386 configure, in seconds summed over the 4 vCPUs. "Before" is the 32-bit reuse findings' profile.
+The profiles (bench case `io5-solo32-profile`, M4; `tests/io/io5_compiles.py`) give busy vCPU time in the i386
+configure, in seconds summed over the 4 vCPUs. "Before" is the base, 9cd51ca6, without sharing.
 
 | Bucket | before | after | 64-bit configure, after |
 | --- | ---: | ---: | ---: |
-| all busy time | 112.4 | 87.2 | 59.5 |
-| in translated code | 27.8 | 27.8 | 22.7 |
+| all busy time | 112.6 | 87.2 | 59.5 |
+| in translated code | 27.7 | 27.8 | 22.7 |
 | copying ("reuse") | 14.9 | **1.2** | 1.5 |
-| delivery | 14.2 | **21.7** | 3.2 |
-| linking | 12.6 | **4.2** | 4.2 |
+| delivery | 14.4 | **21.7** | 3.2 |
+| linking | 13.1 | **4.2** | 4.2 |
 | pool lookups | 6.9 | **2.2** | 2.2 |
-| patching | 4.4 | **1.0** | 0.8 |
-| requests to the host | 991,778 | 748,199 | 1,062,978 |
+| patching | 4.3 | **1.0** | 0.8 |
+| requests to the host | 977,045 | 748,199 | 1,062,978 |
 
 - Copying, linking, patching and pool lookups in the i386 configure are now the 64-bit configure's: 8.6 s, where
-  before they were 38.8 s.
+  before they were 39.2 s. In the i386 make they went from 55.2 s to 24.5 s.
 - Over the whole boot, the resident shared 2.08 million templates and made 30.5 million instances. It refused no
   instance and found no rewrite unproved. The INT 0x80 fast path never declined because of a link target.
-- **Delivery grew from 14.2 s to 21.7 s, and this is not explained.** That is 25% of the i386 configure's busy time,
-  against 5% in the 64-bit configure. The bucket counts every event delivered through the IDT and is not split by
-  vector. The store probes also came in between the two runs. A profile of the base (9cd51ca6), and a count by vector,
-  would tell which change moved it.
+- **Delivery grew from 14.4 s to 21.7 s.** Its cause is below.
+
+### Why delivery grew
+
+The guest's page faults are the same in number but each costs more to deliver. Over the whole boot (all four vCPUs):
+
+| | before (9cd51ca6) | after |
+| --- | ---: | ---: |
+| page faults delivered | 11.91 million | 11.93 million |
+| time in them, natemu's part | 30.6 s | 39.4 s |
+| block records visited on linear chains, all callers | 345 million | 481 million |
+| flushes of the code cache because it was full | 101 | 45 |
+
+A delivered #PF counts in the delivery bucket, and in it natemu cuts every block on the faulting linear page
+(`page_faulted`, `cache::invlpg`): it walks that page's hash chain of block records. With sharing the code area fills
+more slowly, because an instance has no code of its own, so the cache is flushed when full less than half as often,
+and the chains hold records longer. A count added to the perf build (`page_fault_scanned`, `scanned_instances`,
+`scanned_stale`; one profiled run, this branch, M4) shows what they hold: of the 481 million visits, 384 million were
+made while delivering a #PF (32 per fault), 399 million were of instances, and 480 million were of blocks that were
+not current. These are most likely the instances left by earlier processes at the same addresses: i386 libraries load at
+few distinct bases, so every new process adds instances at the same linear pages. Delivery's growth (7.3 s in the
+configure, 1.3 s in the make, 0.3 s in the 64-bit steps) matches the 8.8 s more time in page faults.
+
+So it is work, not misattributed time, and nearly all of it is wasted: a block that is not current is checked again
+(walked, its frames compared) before it is entered, so cutting it at a #PF does nothing a later revalidation would
+not do. Two fixes, neither built (each changes behaviour):
+
+- Leave blocks that are not current off the linear chains: a scan drops one it meets, as it drops a dead one, and
+  revalidation puts a block back on its chain. A #PF or INVLPG then walks only current blocks. This needs care where
+  a block becomes current again without revalidation (L1 tables kept across context switches), if anywhere.
+- Kill an instance that is not current when a scan meets it, rather than keep it: an instance has no code, so one is
+  made again cheaply, and its translation stays. Simpler, but it trades revalidations for new instances and fills the
+  record arena sooner; it needs measuring.
 
 ### Other benchmarks
 
@@ -147,7 +179,8 @@ These ran through `tools/natemu-test` on the M4, at the final code unless noted.
 - **The cheaper move form is not built.** It would keep two words (`movz; movk`) and add the `nop` only where a value
   is beyond the two-word rewrite's reach. The always-three form costs 4.3% more code on the corpus, and 7.1% on the
   fixed-address program, which is over the 5% line set for this change. Whether to switch is the owner's decision.
-- **Delivery in the i386 configure grew from 14.2 s to 21.7 s** (above). The cause is not known.
+- **Page-fault delivery walks stale records** (7.3 s of the i386 configure, above). Two fixes are proposed, neither
+  built.
 - **No framework case compares 32-bit replies with an older compiler.** `main` does not compile 32-bit code yet, so
   the replay gate's old compiler cannot answer 32-bit requests. The comparison with fexc at 9cd51ca6 above is an
   experiment. Once M2 is on `main`, the gate's old compiler answers them and `--old32 {fexc_base}` can join
