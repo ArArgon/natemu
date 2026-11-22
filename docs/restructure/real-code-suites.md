@@ -79,7 +79,7 @@ answers field by field, a trace that saw nothing, an image whose SEC entry diffe
 
 ## kvm-unit-tests: the cases and what natemu's side must provide
 
-**How a test runs** (as upstream's `x86/run` runs it, with the environment natemu will give): Multiboot v1 through
+**How a test runs** (as upstream's `x86/run` runs it, with the environment natemu gives): Multiboot v1 through
 QEMU's `-kernel` on machine `pc` with 128 MiB, the one module (`-initrd`) the text `NR_CPUS=<N>\n`, COM1 into a file,
 `isa-debug-exit` at F4H, `-smp N`, `-display none` (with `-nographic`, SeaBIOS mirrors its banner onto COM1; natemu loads
 the image itself, so the answer must be the test's output alone, and the judge refuses firmware text).

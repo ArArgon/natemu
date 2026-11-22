@@ -5,7 +5,7 @@
     tests/boot/run_kut.py --backend natemu --fexc FEXC [--tests smptest dummy] [--cpus 1 2 3 4] --out DIR
 
 The images come from the framework's build (NATEMU_INPUT_KVM_UNIT_TESTS, tests/boot/built_inputs.py: x86/<test>.flat
-and provenance.json). Each runs as kvm-unit-tests runs it (x86/run), here as natemu will: Multiboot v1 through QEMU's
+and provenance.json). Each runs as kvm-unit-tests runs it (x86/run), here as natemu does: Multiboot v1 through QEMU's
 -kernel (machine pc, 128 MiB), its environment as the one module (-initrd, the text `NR_CPUS=<N>`: natemu's board has
 no fw_cfg, from which the tests otherwise read the CPU count), COM1 into a file, isa-debug-exit at F4H (the test's exit
 writes its status there: QEMU exits with (status << 1) | 1, so 1 is a pass), N CPUs (-smp N).
