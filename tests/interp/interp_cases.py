@@ -73,7 +73,7 @@ EFLAGS_MASK, CR0_MASK, CR4_MASK, EFER_MASK = 0x3C7FD7, 0xE005003F, 0x7FF, 0xD01
 CF, PF, AF, ZF, SF, DF, OF, IF = 0x1, 0x4, 0x10, 0x40, 0x80, 0x400, 0x800, 0x200
 ARITH = CF | PF | AF | ZF | SF | OF
 REFERENCES = ('qemu', 'kvm')
-# A far transfer into a code descriptor whose accessed bit is clear sets it (SDM Vol.3 3.4.5.1; AMD does), QEMU 10 and 11's
+# A far transfer into a code descriptor whose accessed bit is clear sets it (SDM Vol.3 3.4.5.1; AMD does), QEMU 10.0 and 11.1's
 # TCG do not (the rig's first runs): the hardware answers those GDT windows.
 ACCESSED = 'the GDT window: KVM answers (QEMU does not set a code descriptor\'s accessed bit on a far transfer)'
 P16_PROLOGUE = 14       # bytes before a P16 case's first instruction: EAX's slot (4) and the prologue (10)

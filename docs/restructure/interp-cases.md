@@ -84,11 +84,11 @@ that loads a segment register shows its base through an access (a store through 
 `by` is how vendor and emulator differences are settled (plan section 8):
 
 - `profile`: CPUID's four outputs and RDMSR IA32_MISC_ENABLE's EDX:EAX are the CPU's own values; natemu's are its
-  profile's (`tools/models/cpu_profile.json`), which a separate check holds it to. Every other field of those cases is
-  compared.
+  profile's (`tools/models/cpu_profile.json`): natemu's side is to compare those with the profile, not with a
+  reference (no such check exists yet). Every other field of those cases is compared.
 - `kvm`: a far transfer into a code descriptor whose accessed bit is clear sets the bit (SDM Vol.3 3.4.5.1, and AMD
-  does); QEMU's TCG does not (Debian's 10.0.13 in the rig's first runs), so the GDT windows of the protected-mode far
-  transfers (45 cases) are the hardware's. A data segment load sets it on both.
+  does); QEMU's TCG does not (11.1.2 and Debian's 10.0.13: 13 cases differ there), so the GDT windows of the
+  protected-mode far transfers (45 cases) are the hardware's. A data segment load sets it on both.
 - `qemu`: for an AMD answer that differs from the Intel CPU natemu presents. None so far: on everything else the two
   references agree.
 
