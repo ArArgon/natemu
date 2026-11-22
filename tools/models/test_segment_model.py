@@ -400,6 +400,10 @@ class Interpreted(unittest.TestCase):
         u['shape']['ds'] = (0, 0xFFFFFFFF)                                       # big real mode survives a load
         self.assertEqual(m.load_interp(u, 'ds', 0x10)['state']['shape']['ds'], (0x100, 0xFFFFFFFF))
         self.assertEqual(m.load_interp(interp('R'), 'ss', 0)['outcome'], 'done')  # no null rule in real mode
+        r = m.load_interp(interp('R'), 'fs', 0x1234)['state']
+        self.assertEqual((r['shape']['fs'][0], r['fs_base']), (0x12340, 0x12340))   # the base kept in both places
+        p = m.load_interp(m.load_interp(interp('P32'), 'gs', 0x10)['state'], 'gs', 0)['state']
+        self.assertEqual((p['shape']['gs'], p['gs_base']), ((0, 0), 0))
 
     def test_protected_far_jump_checks(self):
         s = interp('P16')
@@ -412,6 +416,10 @@ class Interpreted(unittest.TestCase):
                           (0x10, (dm.GP, 0x10)), (0x30, (dm.NP, 0x30)), (0x38, (dm.GP, 0x38)), (0x0B, (dm.GP, 0x08)),
                           (0x60, (dm.GP, 0x60)), (0x68, (dm.GP, 0x68))):
             self.assertEqual(self.f(m.jmp_far_interp(s, (sel, 0))), ('fault', want), hex(sel))
+        dm.place(s['memory'], 8, m.segment(0x10000, 0xFFFF, 0x9B).to_bytes(8, 'little'))
+        r = m.jmp_far_interp(s, (0x0C, 0x20), osize=16)                           # B16: the INIT LDT, base 0
+        self.assertEqual((r['outcome'], r['state']['shape']['cs']), ('done', (0x10000, 0xFFFF)))
+        self.assertEqual((s['ldtr'], s['tr'], s['tr_attributes'] & 0xF), ((0, 0, 0xFFFF), (0, 0, 0xFFFF), 0xB))
         r = m.jmp_far_interp(s, (0x43, 0x10))                                    # conforming: RPL ignored, RPL := CPL
         self.assertEqual(r['state']['cs'], 0x40)
         self.assertEqual(self.f(m.jmp_far_interp(s, (0x18, 0x10000))), ('fault', (dm.GP, 0)))   # the new CS's limit

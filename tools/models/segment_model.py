@@ -98,6 +98,10 @@ B14 Real-mode data accesses check the hidden limit (expand-down when the cached 
 B15 The CS that INIT and SIPI leave: Vol. 3A Table 12-1 gives CS "AR = Present, R/W, Accessed"; KVM loads 9BH (code,
    readable, accessed). The model uses 9BH (`reset_state`); a fetch checks the CS limit only, never the cached type
    (rights are checked when CS is loaded), so either value runs the same code.
+B16 LDTR and TR after INIT: Table 12-1 gives selector 0, base 0, limit FFFFH, "AR = Present, R/W", no type. KVM loads an
+   LDT (82H) and a busy 32-bit TSS (8BH), QEMU types 2 and 0BH. Model: LDTR and TR (0, 0, FFFFH) with
+   `ldtr_attributes` 82H and `tr_attributes` 8BH (a present LDT is read at base 0 for a TI = 1 selector; IA-32e
+   activation without LTR sees a 32-bit TSS, not a 16-bit one).
 """
 import copy
 import pathlib
@@ -698,12 +702,16 @@ def load_interp(state, sreg, sel):
             s.setdefault('shape', {})[sreg] = (sel << 4, lim)
             if sreg == 'ss':
                 s['ss'] = sel
+            if sreg in ('fs', 'gs'):
+                s[sreg + '_base'] = sel << 4                       # the base, as `_load` keeps it
             return
         if sel & 0xFFFC == 0:
             if sreg == 'ss':
                 raise Fault(GP, 0)
             s['seg'][sreg] = (sel, 0)
             s.setdefault('shape', {})[sreg] = (0, 0)
+            if sreg in ('fs', 'gs'):
+                s[sreg + '_base'] = 0                              # B7
             return
         _load(s, bus, sreg, sel)
         if sreg == 'ss':
@@ -723,16 +731,18 @@ def segment(base=0, lim=0xFFFF, access=0x93, flags=0):
 
 
 def reset_state(memory=None, sipi=None, cd_nw=0x60000000):
-    """The INIT state (Vol. 3A Table 12-1, INIT column) in this model's state form: CR0 = CD/NW as kept | ET, EFLAGS 2,
-    EIP FFF0H, CS F000H / base FFFF0000H / limit FFFFH (attributes 9BH, B15), the other segments 0 / 0 / FFFFH (93H),
-    GDTR and IDTR base 0 limit FFFFH, LDTR and TR 0, EFER 0. `sipi`: the state a SIPI with that vector leaves (CS VV00H,
-    base VV000H, EIP 0; the hidden limit and attributes kept)."""
+    """The INIT state (Vol. 3A Table 12-1, INIT column) in this model's state form: CR0 = CD/NW as kept | ET, CR2-CR4 0,
+    EFLAGS 2, EIP FFF0H, CS F000H / base FFFF0000H / limit FFFFH (attributes 9BH, B15), the other segments 0 / 0 / FFFFH
+    (93H), GDTR and IDTR base 0 limit FFFFH, EFER 0, and LDTR and TR selector 0, base 0, limit FFFFH, "AR = Present, R/W"
+    (B16). `sipi`: the state a SIPI with that vector leaves (CS VV00H, base VV000H, EIP 0; the hidden limit and
+    attributes kept)."""
     seg = {r: (0, 0x93) for r in SREGS}
     seg['cs'] = (0xF000, 0x9B)
     shape = {r: (0, 0xFFFF) for r in SREGS}
     shape['cs'] = (0xFFFF0000, 0xFFFF)
-    s = dict(rip=0xFFF0, length=0, rsp=0, rflags=2, cpl=0, cs=0xF000, ss=0, cr0=cd_nw & 0x60000000 | 0x10, cr2=0, cr4=0,
-             efer=0, gdtr=(0, 0xFFFF), idtr=(0, 0xFFFF), ldtr=None, tr=None, seg=seg, shape=shape, fs_base=0, gs_base=0,
+    s = dict(rip=0xFFF0, length=0, rsp=0, rflags=2, cpl=0, cs=0xF000, ss=0, cr0=cd_nw & 0x60000000 | 0x10, cr2=0, cr3=0,
+             cr4=0, efer=0, gdtr=(0, 0xFFFF), idtr=(0, 0xFFFF), ldtr=(0, 0, 0xFFFF), tr=(0, 0, 0xFFFF),
+             ldtr_attributes=0x82, tr_attributes=0x8B, seg=seg, shape=shape, fs_base=0, gs_base=0,
              memory={} if memory is None else memory)
     if sipi is not None:
         s.update(cs=sipi << 8, rip=0)

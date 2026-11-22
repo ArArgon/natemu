@@ -31,11 +31,12 @@ class Protocol(unittest.TestCase):
         for variant, name in (('sipi-needs-wfs', 'sipi-before-init-taken'), ('init-two-steps', 'init-in-mailbox'),
                               ('init-keeps-sipi', 'init-sipi-init'), ('hlt-ignores-init', 'hlt-init-not-sipi'),
                               ('wfs-not-idle', 'never-started'), ('wfs-reported-halted', 'park-with-init'),
-                              ('nmi-wakes-wfs', 'nmi-held'), ('fixed-held-in-wfs', 'fixed-in-wfs')):
+                              ('nmi-wakes-wfs', 'nmi-held'), ('fixed-held-in-wfs', 'fixed-in-wfs'),
+                              ('init-keeps-nmi-in-wfs', 'nmi-init-in-wfs')):
             self.assertNotEqual(m.check(name, (variant,)), [], (variant, name))
         self.assertEqual(sorted(m.VARIANTS), sorted(['sipi-needs-wfs', 'init-two-steps', 'init-keeps-sipi',
                                                      'hlt-ignores-init', 'wfs-not-idle', 'wfs-reported-halted',
-                                                     'nmi-wakes-wfs', 'fixed-held-in-wfs']))
+                                                     'nmi-wakes-wfs', 'fixed-held-in-wfs', 'init-keeps-nmi-in-wfs']))
 
     def test_state_invariants_name_the_rule(self):
         self.assertTrue(any(v.startswith('J1') for v in m.check('init-in-mailbox', ('init-two-steps',))))
@@ -77,6 +78,9 @@ class Rules(unittest.TestCase):
         # instruction; held for good without a SIPI.
         self.assertEqual(ends('nmi-in-wfs'), {('stop', 1, 'nmi', (((('boot', 2),), 0, 0), ((), 0, 0)))})
         self.assertEqual({c[0] for _, c in per_cpu('nmi-held', 1)}, {'wait-for-sipi'})
+        # W1: an INIT that finds the CPU waiting drops the held NMI; the trampoline then runs.
+        self.assertEqual(ends('nmi-init-in-wfs'), {('end', (('halted', (('boot', 3),), 0, 0),
+                                                            ('halted', ((('sipi', V), 4),), 0, 0)))})
         # A6: one pending when the INIT is taken may have been delivered or is dropped; the one after it is held.
         self.assertEqual({(how, c[1]) for how, c in per_cpu('nmi-around-init', 1)},   # (runs, NMIs, interrupts)
                          {(('stop', 1, 'nmi'), 0), (('stop', 1, 'nmi'), 1)})
@@ -107,6 +111,8 @@ class InitState(unittest.TestCase):
         self.assertEqual((s['gpr']['rdx'], s['gpr']['rax'], s['dr6'], s['dr7'], s['apic']['svr']),
                          (0x306C3, 0, 0xFFFF0FF0, 0x400, 0xFF))
         self.assertEqual(m.init_state(cd_nw=0)['cr0'], 0x10)
+        self.assertEqual((s['cr3'], s['gpr']['r8'], s['gpr']['r15'], s['ldtr'], s['tr'], s['tr_attributes']),
+                         (0, 0, 0, (0, 0, 0xFFFF), (0, 0, 0xFFFF), 0x8B))           # Table 12-1; B16
         t = m.init_state(sipi=V)
         self.assertEqual((t['seg']['cs'][0], t['shape']['cs'], t['rip']), (V << 8, (V << 12, 0xFFFF), 0))
 

@@ -25,8 +25,11 @@ A2 External interrupts: INIT leaves the local APIC as after power-up except the 
    messages" and holds what its IRR and ISR already have (13.4.7.2); of new fixed interrupts Intel says nothing. AMD: a
    disabled APIC does not accept fixed, lowest-priority or ExtINT interrupts (APM 16.3.1, 16.4.7); KVM drops them
    (`if (unlikely(!apic_enabled(apic))) break;`); QEMU sets the IRR bit and delivers it once enabled. natemu's `send`
-   already refuses them at a software-disabled target. So in wait-for-SIPI no fixed vector is pending: INIT cleared the
-   IRR and nothing enters it until software enables the APIC (the plan says fixed vectors stay pending: corrected).
+   already refuses them at a software-disabled target. So architecturally no fixed vector is pending in wait-for-SIPI:
+   INIT cleared the IRR and nothing enters it until software enables the APIC (the plan says fixed vectors stay pending:
+   corrected). natemu's fixed send is two steps (read SW_ENABLED, then set the IRR bit), so a sender that read it before
+   the INIT can set the bit in wait-for-SIPI (reachable in `fixed-around-init`); nothing delivers it before software
+   enables the APIC, and the reference accepts it as delivery latency. The resident must not assert IRR = 0 there.
 A3 SIPI: "If a logical processor is not in the wait-for-SIPI activity state when a SIPI arrives, no VM exit occurs and
    the SIPI is discarded" (3C 28.2: the only Intel statement, in VMX text; nothing outside VMX was found, nor in AMD's
    manual). KVM drops a SIPI unless the vCPU is INIT_RECEIVED; QEMU unless `wait_for_sipi`. SIPIs are not retried (3A
@@ -55,12 +58,15 @@ A8 A second SIPI while the CPU runs its trampoline (Linux sends two): discarded 
 AMD differs: it states A1's holding and A2's refusal; it has no wait-for-SIPI wording, no BSP rule, nothing on a STARTUP
 sent to a processor not waiting; INIT is held while GIF = 0 under SVM (APM 15.13.4, Table 15-12) where Intel blocks it in
 VMX root operation (3C 26.8); its INIT keeps CR8, and its table gives the APIC "Disabled" after RESET, "Enabled" after
-INIT (APM Table 14-1), Intel "Enabled" for both.
+INIT (APM Table 14-1), where Intel's Table 12-1 gives "Enabled" after power-up and RESET and "Unchanged" at INIT.
 
 MODEL CHOICES where the sources leave room
 W1 INIT in wait-for-SIPI: blocked (Intel); KVM re-INITs (a latched SIPI and a queued NMI dropped), QEMU re-INITs keeping a
    pending SIPI. Model: KVM's. It is the history "the SIPI started the CPU, the INIT stopped it before its first
-   instruction", which the reference permits.
+   instruction", which the reference permits. AMD 16.5 read literally ("All other interrupts ... are held pending until
+   the STARTUP IPI has been accepted") would hold the INIT and take it right after the first SIPI, undoing that start;
+   the SDM's MP flow (3A 11.4.4.1 step 15) sends INIT-SIPI-SIPI to APs that after power-up are already in wait-for-SIPI
+   as the equivalent of a single SIPI, which holds only if an INIT there leaves nothing to take later.
 W2 A SIPI that arrives while an INIT is pending but not yet taken (kvm-unit-tests sends them back to back) is latched and
    honoured after the INIT (KVM: both are pending-event bits, taken INIT first; QEMU keeps the SIPI across
    `do_cpu_init`). natemu's INIT-pending window is its own lag (hardware takes INIT at the next boundary), so the
@@ -85,7 +91,12 @@ NATEMU'S PROTOCOL (what `explore` runs)
   interrupt; in wait-for-SIPI the latch, taken by one atomic update clearing S and W: the start); else publish
   `halted` = seen and sleep until the doorbell.
 - The host ends the run when every vCPU has ended or is idle (published `halted` equal to its `posts`), and reports each
-  by where it waited: halted, wait-for-SIPI (not finished: never started or parked), mailbox.
+  by where it waited: halted, wait-for-SIPI (not finished: never started or parked), mailbox. The model takes that
+  decision on one atomic snapshot of every vCPU; the driver reads every vCPU's park state twice, and `park` looks at its
+  events once more after it reads `end` (`events.rs`: "A peer's post may land between `next` and the load of `end`").
+  The wait-for-SIPI loop needs the same recheck: after it reads `end`, it looks at S (and I) once more and starts (or
+  takes the INIT) rather than ending. In the model no step is enabled after an all-idle decision, so that final look
+  can find nothing (`_impl_end` checks it, J4); it guards against a source that posts after the decision.
 
 THE REFERENCE (`explore(..., spec=True)`): IPIs queue per sender-target pair and arrive in order at any later instruction
 boundary of the target. On arrival INIT puts an AP in wait-for-SIPI (the BSP at the reset vector) and drops its pending
@@ -130,11 +141,13 @@ KEPT_BY_INIT = ('x87, SSE, AVX and AVX-512 registers', 'MXCSR', 'XCR0', 'IA32_XS
 
 def init_state(cd_nw=0x60000000, sipi=None):
     """The architectural state INIT leaves (A4: Table 12-1, INIT column), or, with `sipi`, the state a SIPI with that
-    vector starts: segment_model's register and segment state plus EDX (the CPU profile's signature), the other GPRs 0,
-    DR0-DR3 0, DR6 FFFF0FF0H, DR7 400H, EFER and the FS/GS bases 0; the local APIC as after power-up but its ID (SVR FFH:
-    software disabled, TPR, IRR, ISR, TMR 0, every LVT masked); TLBs flushed. `cd_nw`: CR0.CD and CR0.NW as before."""
+    vector starts: segment_model's register and segment state (CR3 0, LDTR and TR present at base 0, limit FFFFH: its
+    B16) plus EDX (the CPU profile's signature), the other GPRs and R8-R15 0, DR0-DR3 0, DR6 FFFF0FF0H, DR7 400H, EFER
+    and the FS/GS bases 0; the local APIC as after power-up but its ID (SVR FFH: software disabled, TPR, IRR, ISR, TMR
+    0, every LVT masked); TLBs flushed. `cd_nw`: CR0.CD and CR0.NW as before."""
     s = segment_model.reset_state(sipi=sipi, cd_nw=cd_nw)
-    s.update(gpr={r: 0 for r in ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp')}, dr=(0, 0, 0, 0),
+    names = ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp') + tuple('r%d' % k for k in range(8, 16))
+    s.update(gpr={r: 0 for r in names}, dr=(0, 0, 0, 0),
              dr6=0xFFFF0FF0, dr7=0x400, fs_base=0, gs_base=0, efer=0,
              apic=dict(svr=0xFF, tpr=0, irr=0, isr=0, tmr=0, lvt_masked=True, ldr=0, dfr=0xFFFFFFFF))
     s['gpr']['rdx'] = int(cpu_profile.load().d['identity']['signature'], 16)
@@ -155,6 +168,7 @@ VARIANTS = {
     'wfs-reported-halted': 'the host reports a wait-for-SIPI CPU as halted',
     'nmi-wakes-wfs': "an NMI is taken in wait-for-SIPI (QEMU's TCG)",
     'fixed-held-in-wfs': 'a fixed IPI enters the IRR of a software-disabled APIC (the plan\'s wording; QEMU)',
+    'init-keeps-nmi-in-wfs': 'an INIT in wait-for-SIPI leaves a held NMI in place',
 }
 
 Cpu = namedtuple('Cpu', 'ctx phase prog pc tr if_ word vec sw irr posts seen halted bell look send runs nmis ints')
@@ -269,7 +283,10 @@ def _send_step(sc, cpus, i, variant):
             what = step[2]
             if what == 'init':
                 drop = {N} if 'init-keeps-sipi' in variant else {S, N}
-                w = w - drop if W in w else w - drop | {I}
+                if W in w:
+                    w = w - (drop - {N} if 'init-keeps-nmi-in-wfs' in variant else drop)
+                else:
+                    w = w - drop | {I}
             elif what == 'sipi':
                 if (W in w or I in w and 'sipi-needs-wfs' not in variant) and S not in w:
                     w, vec = w | {S}, step[3]
@@ -380,7 +397,8 @@ def _impl_invariants(cpus):
 
 
 def _impl_end(cpus, variant):
-    """The host's end decision: every vCPU ended or idle with every post seen; and J4's check."""
+    """The host's end decision: every vCPU ended or idle with every post seen; and J4, the final look each loop makes
+    after it reads `end` (I and S; for HLT every event it takes)."""
     if not all(c.ctx == 'done' or c.halted is not None and c.halted == c.posts for c in cpus):
         return None, []
     bad = []
@@ -568,6 +586,10 @@ SCENARIOS = {
                              dict(ctx='wfs', start=STUB)]),
     # ... held for good when no SIPI follows; and around an INIT: one before it may be delivered or dropped.
     'nmi-held': dict(cpus=[dict(tr=True, boot=[('icr', 'nmi', 1), ('halt',)]), dict(ctx='wfs', start=STUB)]),
+    # ... dropped by an INIT that finds the CPU already waiting (W1), so the SIPI after it starts a trampoline that runs.
+    'nmi-init-in-wfs': dict(cpus=[dict(tr=True, boot=[('icr', 'nmi', 1), ('icr', 'init', 1), ('icr', 'sipi', 1, V),
+                                                      ('halt',)]),
+                                  dict(ctx='wfs', start=STUB)]),
     'nmi-around-init': dict(cpus=[dict(tr=True, boot=[('icr', 'nmi', 1), ('icr', 'init', 1), ('icr', 'nmi', 1),
                                                       ('icr', 'sipi', 1, V), ('halt',)]),
                                   dict(tr=True, boot=[('op',), ('halt',)], start=STUB)]),
