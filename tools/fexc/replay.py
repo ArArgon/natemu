@@ -286,20 +286,20 @@ def only_moves(old, new):
         edits.append((o, m[0], n)); shift += 12 - m[0]
     tail = (u32(ca, 0), u32(cb, 0))   # FEX's block header word: the offset of its tail (JITCodeTail)
 
-    def at(x):
-        """NEW's offset of OLD's offset `x` (a word boundary outside a move's later words), or None."""
-        if x >= tail[0]: return x - tail[0] + tail[1]
+    def code_at(x):
+        """NEW's offset of OLD's offset `x` in the code before the tail (a word boundary outside a move's later words), or None."""
         d = 0
         for o, size, n in edits:
             if o < x < o + size: return None
             if o == x: return n
             if o + size <= x: d = n + 12 - (o + size)
         return x + d
+    at = lambda x: x - tail[0] + tail[1] if x >= tail[0] else code_at(x)
     # The code before the tail: OLD's last non-zero word maps to NEW's.
     end = [t for t in tail]
     for k, c in enumerate((ca, cb)):
         while end[k] > 4 and u32(c, end[k] - 4) == 0: end[k] -= 4
-    if at(end[0]) != end[1]: return f'the code before the tail: {end[0]:#x} | {end[1]:#x}'
+    if code_at(end[0]) != end[1]: return f'the code before the tail: {end[0]:#x} | {end[1]:#x}'
     moves = {o: size for o, size, _ in edits}
     x = 4
     while x < end[0]:

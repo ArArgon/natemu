@@ -5533,15 +5533,16 @@ mod tests {
             }
             assert_eq!((c.compiles - compiles, c.relocated - relocated), (1, 3), "{code:x?}");
         }
-        // Refused, so compiled: a value whose word count differs (bits 31:16 or 15:0 of a target zero), and anything that
-        // wraps at 4 GiB at either end (the target below 0; the return address at 4 GiB).
-        let refused = c.relocation_refused;
-        insns(&mut c, &pic, 0x0000_2340); // 0x2346: one word
+        // Refused, so compiled: anything that wraps at 4 GiB at either end (the target below 0; the return address at 4
+        // GiB). A value with a zero half (once another word count) moves: 32-bit code's one form.
+        let (refused, relocated) = (c.relocation_refused, c.relocated);
+        insns(&mut c, &pic, 0x0000_2340); // 0x2346
+        assert_eq!((c.relocation_refused, c.relocated), (refused, relocated + 1));
         insns(&mut c, &far, 0x0000_e340); // the target wraps below 0
         let fwd = [0x40, 0xe8, 0x00, 0x10, 0x00, 0x00]; // inc eax; call $+0x1006
         insns(&mut c, &fwd, 0x5655_5340);
         insns(&mut c, &fwd, 0xffff_f340); // the target wraps past 4 GiB
-        assert_eq!(c.relocation_refused, refused + 3);
+        assert_eq!(c.relocation_refused, refused + 2);
         // The null segments are the answer's, and the x87 guess where the compile read it (x87 code): another value is
         // another answer. An answer that read no guess is one entry under every guess, and says so (`guess_read`).
         let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret

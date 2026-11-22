@@ -154,6 +154,8 @@ enum Insn {
     Isb,
     /// A word the decoder does not know, admitted by [`screened`] with the code-shape check off: no branch, no x25/x28.
     Other,
+    /// `nop`: only as the third word of a guest-RIP move of 32-bit code (fexc's one form there, [`Verifier::rip_move`]).
+    MovePad,
 }
 impl Insn {
     /// Registers written (bit 31: sp).
@@ -732,7 +734,11 @@ impl<'a> Verifier<'a> {
                 continue;
             }
             let w = u32::from_le_bytes(c.code[i * 4..i * 4 + 4].try_into().unwrap());
+            let pad = c.bits32
+                && w == natemu_abi::execution::NOP
+                && c.relocs.iter().any(|r| r.kind == object::RELOC_GUEST_RIP_MOVE && r.offset as usize + 8 == i * 4);
             *slot = Some(match decode(w, i as u32 * 4) {
+                _ if pad => Insn::MovePad,
                 Some(insn) => insn,
                 None if !c.shape && screened(w) => Insn::Other,
                 None => {
@@ -2816,7 +2822,8 @@ mod tests {
         assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24
     }
 
-    /// M2 task 4, with `FEXC` set: the test for an open x87 run at the top of a 32-bit block of SSE code (`mulsd xmm0, xmm1`):
+    /// M2 task 4, with `FEXC` set: the test for an open x87 run at the top of a 32-bit block of SSE code (`mulsd xmm0, xmm1`
+    /// twice, so that a zero word pads the code after the run's end: a branch there is forward):
     /// `ldrb w0, [x28, #X87_RUN]` at 0x4, `cbnz w0, E` at 0x8, the run's end's nine words at E and the branch back to 0xc.
     #[test]
     fn top_run_tests_are_verified() {
@@ -2825,12 +2832,12 @@ mod tests {
         };
         let object = std::env::temp_dir().join(format!("natemu-admit-run-{}", std::process::id()));
         let out = std::process::Command::new(&fexc)
-            .args(["--hex", "f20f59c1", "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--ext-conds", "4", "--object"])
+            .args(["--hex", "f20f59c1f20f59c1", "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--ext-conds", "4", "--object"])
             .arg(&object)
             .output()
             .unwrap();
         assert!(out.status.success());
-        let block = (std::fs::read(&object).unwrap(), vec![0xf2, 0x0f, 0x59, 0xc1]);
+        let block = (std::fs::read(&object).unwrap(), vec![0xf2, 0x0f, 0x59, 0xc1, 0xf2, 0x0f, 0x59, 0xc1]);
         let _ = std::fs::remove_file(&object);
         let block = (&block.0[..], &block.1[..]);
         let admit = |o: &[u8], shape: bool| {

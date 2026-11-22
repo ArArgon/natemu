@@ -717,7 +717,8 @@ mod tests {
             let code: Vec<u8> = [0, z, m, N].iter().flat_map(|w| w.to_le_bytes()).collect();
             let (n, f) = one(&code, 4, 5, base, true).unwrap();
             assert_eq!((n, value(&f[..3], 5, true)), (3, Some(k)));
-            assert_eq!((built(base, k, true), built(base, k, false) ^ v), (v, 1 << 32));
+            assert_eq!((built(base, k, true), built(base, k, false) & 0xffff_ffff), (v, v));
+            assert_ne!(built(base, k, false), v, "a 64-bit sum is 2^32 off");
             // Not fexc's form (no `nop`, a 64-bit move, another register): refused.
             for w in [[0, z, m, 0], [0, z | 1 << 31, m | 1 << 31, N], [0, z ^ 1, m ^ 1, N]] {
                 let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
