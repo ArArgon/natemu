@@ -4869,6 +4869,9 @@ mod tests {
         // (So is the code-size record: no block record exists here, so every count is 0.)
         assert_eq!(new.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         new.as_object_mut().unwrap().remove("segments");
+        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale"] {
+            assert_eq!(new.as_object_mut().unwrap().remove(k), Some(serde_json::json!(0)), "{k}");
+        }
         assert_eq!(old, new);
     }
 
