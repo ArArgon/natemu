@@ -5384,7 +5384,7 @@ mod tests {
         let args = String::from_utf8_lossy(&body[4..body.len() - 1]).replace('\0', " ");
         assert!(args.contains("--bitness 32") && args.contains("--push-run"), "{args}");
         let code = [0x40, 0x01, 0xd8, 0xc3]; // inc eax; add eax, ebx; ret (64-bit code: REX add; ret)
-        let mut insns = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
+        let insns = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
             Code::Block(b) => b.guest_insns,
             _ => panic!("no block"),
         };
@@ -5425,7 +5425,7 @@ mod tests {
         // The null segments and the x87 guess are the answer's: another value is another answer where fexc read it (the
         // guess: in x87 code only).
         let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret
-        let mut same = |c: &mut super::Compiler, code: &[u8], rip| {
+        let same = |c: &mut super::Compiler, code: &[u8], rip| {
             let n = c.compiles;
             insns(c, code, rip);
             c.compiles == n
@@ -6211,6 +6211,25 @@ mod tests {
             (moved.compiles, moved.disk_hits, moved.relocated),
             (0, 1, 1)
         );
+        // M2 reuse: 32-bit code's answers too, under their own key (the request's `--bitness 32`, null segments and guess):
+        // stored, then served at another EIP, relocated; never to a 64-bit request for the same bytes, nor under a null DS.
+        let call = [0x40, 0xe8, 0x00, 0x00, 0x00, 0x00]; // inc eax; call $+5 (64-bit code: a REX call)
+        let mut c32 = super::Compiler { bits32: true, ..new(open("good")) };
+        assert!(matches!(c32.compile(&call, 0x5655_5000, false, &mut ()), Ok(Code::Block(b)) if b.guest_insns == 2));
+        assert_eq!((c32.compiles, c32.disk_hits), (1, 0));
+        drop(c32);
+        let mut c32 = super::Compiler { bits32: true, check_reuse: true, ..new(open("good")) };
+        assert!(
+            matches!(c32.compile(&call, 0xf7c5_6000, false, &mut ()), Ok(Code::Block(b)) if b.object[24..32] == 0xf7c5_6000u64.to_le_bytes())
+        );
+        assert_eq!((c32.compiles, c32.disk_hits, c32.relocated), (0, 1, 1));
+        c32.null_segments = [false, false, true, false];
+        c32.compile(&call, 0xf7c5_7000, false, &mut ()).unwrap();
+        assert_eq!((c32.compiles, c32.disk_hits), (1, 1));
+        c32.bits32 = false;
+        assert!(matches!(c32.compile(&call, 0x5655_5000, false, &mut ()), Ok(Code::Block(b)) if b.guest_insns == 1));
+        assert_eq!((c32.compiles, c32.disk_hits), (2, 1));
+        drop(c32);
         let disk = c.disk.clone().unwrap();
         let stored = disk.get(&disk.key(&body)).unwrap();
         assert_eq!(stored[..8], 0x5000u64.to_le_bytes()); // the RIP it was compiled at

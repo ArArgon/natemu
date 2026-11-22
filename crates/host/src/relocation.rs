@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use natemu_abi::execution::{
         LinkPoint, MAX_LINK_POINTS, RELOC_MOVE, bitmask, load_constant, logical_immediate,
-        move_value, pack_reloc, refusal, relocate_code,
+        move_value, pack_reloc, refusal, relocate_code, relocate_move,
     };
 
     macro_rules! fixture {
