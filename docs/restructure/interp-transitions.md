@@ -133,23 +133,27 @@ review: the CR3, the CR0 and the CR4 flushes of `mov_to_cr`, one run of case `sy
 both block sizes, every other program passes); the past-the-limit stop (the three cases above) and the busy-TSS rule
 (the eight P16 and P32 far JMPs to B0H and B8H), in one run.
 
-## The hot paths (resident release builds, `llvm-objdump`, b5266dc4 against this change)
+## The hot paths (resident release builds, `llvm-objdump`, addresses, symbol hashes and literal-pool addresses aside)
 
-Identical, addresses, symbol hashes and literal-pool addresses aside: `find_from`, `sys_fast`, `miss_fast` (both with
-`sys_commit` inlined), `system` (with `transaction`), `commit`, `set_cpl`, `far_transfer` (with `same_mode` and
-`far_target`), `far_return`, `load_data`, `trap_due`, `segments::pages`, `linear`, `copy`, `descriptor`, `accessed`,
-`translate`, `fetch_walk`, `enter`, `step_here`, and every other function both builds have but `refuse_compatibility`
-and the interpreter's own. `refuse_compatibility`'s common path (a 64-bit target: every 64-bit far JMP, CALL and RET
-and every IRETQ to 64-bit code, `sys_commit`'s fast IRET among them) is `and`, `mov`, `cmp`, `b.ne`, `str`, `ret`: 6
-instructions, no frame (b5266dc4: the same test, then `mov`, `b`, `str`, `ret`). Its CPL-0 arm is `b
+Against b5266dc4 (this change on deea8131), identical: `find_from`, `sys_fast`, `miss_fast` (both with `sys_commit`
+inlined), `system` (with `transaction`), `commit`, `set_cpl`, `far_transfer` (with `same_mode` and `far_target`),
+`far_return`, `load_data`, `trap_due`, `segments::pages`, `linear`, `copy`, `descriptor`, `accessed`, `translate`,
+`fetch_walk`, `enter`, `step_here`. `refuse_compatibility`'s common path (a 64-bit target: every 64-bit far JMP, CALL
+and RET and every IRETQ to 64-bit code, `sys_commit`'s fast IRET among them) is `and`, `mov`, `cmp`, `b.ne`, `str`,
+`ret`: 6 instructions, no frame (b5266dc4: the same test, then `mov`, `b`, `str`, `ret`). Its CPL-0 arm is `b
 kernel_compatibility`, a tail call (the cold function returns `refuse_compatibility`'s result), where a copy of `State`
 and a halt were. Without `#[inline(never)]` the smaller function was inlined into `far_transfer` and `far_return`, which
 then differed. The first version called `kernel_compatibility` and returned `Ok(())` after it: the common path kept a
-frame (`stp x30, x19`, `mov x19, x8`, `ldp`), 11 instructions (the review's finding). It also moved three functions
-with no source change through the code-generation units' partitioning: `helpers::x87` called an outlined
-`x87::helper` (one more call per `svc #X87`), and `mmio::ones` and `maskmov::transaction` differed in frame and
-register allocation. `#[inline]` on `x87::helper` (its one caller) restores all three. Resident text 261,516 ->
-267,228 bytes.
+frame (`stp x30, x19`, `mov x19, x8`, `ldp`), 11 instructions (the review's finding).
+
+The first version also moved three functions with no source change through the code-generation units' partitioning:
+`helpers::x87` called an outlined `x87::helper` (one more call per `svc #X87`), and `mmio::ones` and
+`maskmov::transaction` differed in frame and register allocation. On deea8131 `#[inline]` on `x87::helper` (its one
+caller) restored all three; on `boot-interp` d8049820, whose firmware mode moved the partitioning again, it restores
+`helpers::x87` and `xsave::transaction` but changes `sse::bank`, which every exit's bank runs, so it is not taken:
+`helpers::x87` keeps the outlined call. Against d8049820 this change's code differs only in `refuse_compatibility`,
+`kernel_compatibility`, `interpret::record` and `natemu_abi::interp::system::jump`. Resident text: 261,516 (b5266dc4)
+-> 267,440 bytes on deea8131; 269,780 (d8049820) -> 269,796.
 
 ## Risks for a running 64-bit OS
 
@@ -159,4 +163,4 @@ register allocation. `#[inline]` on `x87::helper` (its one caller) restores all 
 - Everything else runs only from interpreted state.
 - A 64-bit far transfer into CPL-0 compatibility-mode code with RIP outside the new CS limit stops loudly after it
   completes, where x86 raises #GP(0) at the instruction (the recorded deviation above; no known code does this).
-- The resident grows by 5.6 KB; the interpreter's gate path deepens (the static `stack` case).
+- The resident grows by 5.8 KB; the interpreter's gate path deepens (the static `stack` case).
