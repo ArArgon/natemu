@@ -149,3 +149,46 @@ sha256 = "a8bc4725549060d1e696d358e32a3699d947d5381871553a290389830bebccbd"
 [resource.paper-deb-openjdk-25-jre-headless]
 urls = ["https://snapshot.debian.org/archive/debian-security/20261120T000000Z/pool/updates/main/o/openjdk-25/openjdk-25-jre-headless_25.0.5.1%2b2-1%7edeb13u1_amd64.deb"]
 sha256 = "9540ecfe0082ef35a5649df546635780be6232432416383f2457b0d726efe837"
+
+# The boot-time interpreter's real-code suites (tests/boot: kvm-unit-tests and OVMF; docs/restructure/real-code-suites.md):
+# source archives of upstream commits as each host generates them. The sha256 is of the archive fetched on November 22,
+# 2026 (fetched twice: the same bytes); the commit is in each URL. A host that regenerates its archives differently
+# means re-pinning here.
+[resource.kvm-unit-tests-src]
+# kvm-unit-tests master a2891d9528eff31188bb16f08980637532735d1b (November 16, 2026), the plan's census commit.
+urls = ["https://gitlab.com/kvm-unit-tests/kvm-unit-tests/-/archive/a2891d9528eff31188bb16f08980637532735d1b/kvm-unit-tests-a2891d9528eff31188bb16f08980637532735d1b.tar.gz"]
+sha256 = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[resource.edk2-src]
+# edk2-stable202608 (2970e5699ba6267f3384ffab20f96647578aebc8, August 21, 2026): the last release before the census's
+# master 556dcfb466e9 (November 17, 2026).
+urls = ["https://github.com/tianocore/edk2/archive/2970e5699ba6267f3384ffab20f96647578aebc8.tar.gz"]
+sha256 = "d4956bf7c7dc65aec6c81e0e2346f8c49d196ba1ba1df62b79375467774c85ce"
+
+[resource.edk2-openssl-src]
+# edk2-stable202608's submodule CryptoPkg/Library/OpensslLib/openssl.
+urls = ["https://github.com/openssl/openssl/archive/8cf17aaeb4599f8af87fefd810b5b5fee90fe69e.tar.gz"]
+sha256 = "03154360ff8808ac38da7530cd69d211e105683e077e9835e48161493c3d0050"
+
+[resource.edk2-brotli-src]
+# edk2-stable202608's submodules MdeModulePkg/Library/BrotliCustomDecompressLib/brotli and
+# BaseTools/Source/C/BrotliCompress/brotli (the same commit).
+urls = ["https://github.com/google/brotli/archive/e230f474b87134e8c6c85b630084c612057f253e.tar.gz"]
+sha256 = "a9ba3940267de5dd73581a47c2e81b3eb1e1df6a704138c599020d66f3677a92"
+
+# Three more of its submodules, which OvmfPkgX64 compiles nothing from but whose include folders the packages it uses
+# declare (MdePkg.dec, CryptoPkg.dec, SecurityPkg.dec): the build refuses a declared folder that is missing.
+[resource.edk2-mipisyst-src]
+# MdePkg/Library/MipiSysTLib/mipisyst.
+urls = ["https://github.com/MIPI-Alliance/public-mipi-sys-t/archive/370b5944c046bab043dd8b133727b2135af7747a.tar.gz"]
+sha256 = "9fda3b9a78343ab2be6f06ce6396536e7e065abac29b47c8eb2e42cbb4c4f00b"
+
+[resource.edk2-mbedtls-src]
+# CryptoPkg/Library/MbedTlsLib/mbedtls.
+urls = ["https://github.com/ARMmbed/mbedtls/archive/0bebf8b8c7f07abe3571ded48a11aa907a1ffb20.tar.gz"]
+sha256 = "61ac65f6362f898677b2a4cf2a769b41e4aee0985cb45f046d3b719388e5be59"
+
+[resource.edk2-libspdm-src]
+# SecurityPkg/DeviceSecurity/SpdmLib/libspdm.
+urls = ["https://github.com/DMTF/libspdm/archive/f55cf6d48ec69b4ac60a63903e9c6a2cb0fd155d.tar.gz"]
+sha256 = "a815aa38874d2c82255f379a7ee1eb07cccbb439a7788ff14316fce52d61a516"
