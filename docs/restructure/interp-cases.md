@@ -163,7 +163,7 @@ cases, run natemu's program driver). The corpus is generated; per case both lock
 agree on every field both answer, stop at `expect_stop`, and an empty case's must be its starting state. A changed case
 has a new hash and no answer: the case reports it as not seeded.
 
-Seeding: `TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=ubuntu@192.168.12.11 tools/natemu-test run tests/interp`, twice (the two
+Seeding: `TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host tools/natemu-test run tests/interp`, twice (the two
 runs must agree: the lock refuses answers that differ), then `tools/natemu-test lock tests/interp --from-run RUN1 RUN2`.
 QEMU runs on the Mac through the framework (seconds), KVM on the x86 machine in a container that is removed afterwards
 (about a minute with QEMU's installation). Each run keeps both COM1 outputs and the KVM machine's description (CPU,
