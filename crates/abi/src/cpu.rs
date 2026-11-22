@@ -293,6 +293,25 @@ pub const fn arch_capabilities(rdcl_no: bool) -> u64 {
 }
 /// A vCPU's MSRs after reset (vCPU 0 is the BSP) with the virtual firmware's MTRR state applied.
 pub const fn reset_msrs(bsp: bool) -> Msrs {
+    let mut out = power_on_msrs(bsp);
+    let mut i = 0;
+    while i < out.len() {
+        let mut k = 0;
+        while k < profile::MTRR_INITIAL.len() {
+            if profile::MTRR_INITIAL[k].0 == profile::MSRS[i].index {
+                out[i] = profile::MTRR_INITIAL[k].1;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    out
+}
+/// A vCPU's MSRs at power-on and RESET (vCPU 0 is the BSP: IA32_APIC_BASE's BSP flag), before any firmware: every MSR at
+/// the profile's reset value, so the fixed and variable MTRRs are disabled (IA32_MTRR_DEF_TYPE 0, SDM Vol.3 Table 12-1)
+/// and all RAM is UC by the MTRRs ([`mtrr_type`]); the TSC slot is the offset the host sets. INIT changes none of these
+/// ([`crate::power_on`]).
+pub const fn power_on_msrs(bsp: bool) -> Msrs {
     let mut out = [0; profile::MSRS.len()];
     let mut i = 0;
     while i < out.len() {
@@ -302,13 +321,6 @@ pub const fn reset_msrs(bsp: bool) -> Msrs {
         } else {
             m.reset
         };
-        let mut k = 0;
-        while k < profile::MTRR_INITIAL.len() {
-            if profile::MTRR_INITIAL[k].0 == m.index {
-                out[i] = profile::MTRR_INITIAL[k].1;
-            }
-            k += 1;
-        }
         i += 1;
     }
     out
@@ -719,5 +731,24 @@ mod tests {
         );
         // CR4: the profile's mask (bits whose CPUID feature is advertised).
         assert_eq!(profile::CR4_VALID, 0x150fbc);
+    }
+    /// Power-on: the firmware MTRRs are what `reset_msrs` adds; without them every MTRR is 0 (disabled: all RAM UC), the
+    /// rest as `reset_msrs`, the BSP flag on vCPU 0 only.
+    #[test]
+    fn power_on_has_the_mtrrs_disabled() {
+        for bsp in [false, true] {
+            let (on, fw) = (power_on_msrs(bsp), reset_msrs(bsp));
+            for (i, m) in profile::MSRS.iter().enumerate() {
+                if is_mtrr(m.index) {
+                    assert_eq!(on[i], 0, "{:#x}", m.index);
+                } else {
+                    assert_eq!(on[i], fw[i], "{:#x}", m.index);
+                }
+            }
+            for gpa in [0, 0x7_c000, 0xf_0000, 0x10_0000, 0x7fff_f000, 0xffff_f000] {
+                assert_eq!(mtrr_type(&on, gpa), memory_type::UC, "{gpa:#x}");
+            }
+            assert_eq!(on[msr(MSR_APIC_BASE).unwrap()] >> 8 & 1, u64::from(bsp));
+        }
     }
 }

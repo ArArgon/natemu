@@ -31,6 +31,7 @@ pub mod page_study;
 pub mod paging;
 pub mod pic;
 pub mod pool;
+pub mod power_on;
 pub mod resident;
 pub mod shadow;
 pub mod strings;
