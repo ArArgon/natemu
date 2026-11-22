@@ -340,10 +340,60 @@ def build_env_described() -> str:
 
 
 def build_env() -> str:
-    """What a container-built input is keyed by: the image, and the machine it ran on when that is not this Mac (an
-    entry built natively there is never taken for one built here, and the other way round)."""
+    """What a container-built input is keyed by: an equivalent build environment, not identical bytes (builds are not
+    byte-reproducible even on one machine: timestamps, temporary paths). Its parts:
+    - the pinned image, BENCH_BUILDER: the whole userland the recipes build with;
+    - this Mac's builds (the amd64 image through Rosetta) are only that, and every other key says 'native', so an entry
+      built on an x86 machine is never taken for one built here, nor the other way round: Rosetta's CPU is not the
+      x86 machine's, and recipes can detect CPU features at build time or record outputs of programs run there;
+    - on an x86 machine, its CPU vendor and model name, and a digest of its CPU flags (the whole `flags` line, sorted:
+      what configure scripts and test programs can see), for the same reason;
+    - and its kernel release: the container runs on that kernel, which build-time checks and recorded outputs can see.
+    Not its address, nor its CPU count (only how fast it builds): two equivalent machines share their entries, and
+    which one built an entry is recorded in its provenance (build_env_described). Read from the machine once per run."""
     b = container_builder()
-    return BENCH_BUILDER if b == 'local' else f'{BENCH_BUILDER} on {b[4:]}'
+    if b == 'local': return BENCH_BUILDER
+    if in_run := bool(os.environ.get('TESTKIT_RUN_DIR')):
+        if p := _pinned(f'build-env:{b}'): return p
+    env = f'{BENCH_BUILDER} {_native_env(b[4:])}'
+    if in_run: pin_for_run(f'build-env:{b}', env)
+    return env
+
+
+_native_envs: dict[str, str] = {}
+
+
+def _native_env(host: str) -> str:
+    """build_env()'s description of the x86 machine `host`, read over ssh once per process. The last one read is kept
+    in the state folder and used when the machine cannot be reached, so what is already built is still found."""
+    if host in _native_envs:
+        if isinstance(e := _native_envs[host], BuildFailure): raise e      # unreachable: tried once, not per input
+        return e
+    saved = paths.state_dir() / 'builder-env' / host
+    try:
+        out = _run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host,
+                    "uname -r && grep -m3 -E '^(vendor_id|model name|flags)[[:space:]]*:' /proc/cpuinfo"], timeout=60).stdout
+    except BuildFailure as e:
+        # ponytail: if the machine comes back (say, rebooted into a new kernel) before this run builds on it, that build
+        # is stored under the last description; re-describe in _in_docker_over_ssh if that ever matters
+        last = saved.read_text().strip() if saved.is_file() else ''
+        _native_envs[host] = last if last.startswith('native: ') else e
+        return _native_env(host)
+    env = _describe_native(out)                 # not a description: a failure, never the saved one
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    tmp = saved.with_name(f'.{host}.{os.getpid()}'); tmp.write_text(env + '\n'); os.replace(tmp, saved)
+    _native_envs[host] = env
+    return env
+
+
+def _describe_native(out: str) -> str:
+    """`uname -r` and /proc/cpuinfo's vendor_id, model name and flags lines -> build_env()'s native part."""
+    lines = out.strip().splitlines()
+    info = {k.strip(): v.strip() for k, _, v in (l.partition(':') for l in lines[1:])}
+    if not lines or any(k not in info for k in ('vendor_id', 'model name', 'flags')):
+        raise BuildFailure('container-builder', f'cannot describe the builder from {out[-500:]!r}')
+    flags = hashlib.sha256(' '.join(sorted(set(info['flags'].split()))).encode()).hexdigest()[:16]
+    return f"native: {info['vendor_id']} {info['model name']}, flags {flags}, kernel {lines[0].strip()}"
 
 
 def bench_builder() -> str:
