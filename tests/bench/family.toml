@@ -207,51 +207,51 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--
 
 # M2 checkpoint B: the QEMU side (TCG) of the 32-bit cases, and of the two 64-bit cases the November 14 QEMU round did
 # not have (cray-strict, scimark). QEMU runs x87 in software, so 32-bit c-ray is the small scene (320x240) only; cray-strict is the full 64-bit scene, as cray
-# was on November 14 (130 s a run). vCPUs as the natemu case of the same name. Each boot (both runs) is capped at 15 minutes; a
+# was on November 14 (130 s a run). vCPUs as the natemu case of the same name. Each boot (both runs) is capped at 10 minutes (the owner's bound); a
 # capped boot is a result (bench.jsonl `capped`, `capped_in`, `at_least_s`), not a failure. Once per QEMU version.
 [suite.cases.guest-hackbench32-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "hackbench32",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-hackbench32-int80-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32-int80", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "hackbench32",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900", "--append", "vdso32=0"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600", "--append", "vdso32=0"]
 
 [suite.cases.guest-sqlite32-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "sqlite32",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-startup32-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "startup32",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-cray32-strict-small-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-strict-small", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "cray32-strict-small",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-cray32-sse2-small-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-sse2-small", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "cray32-sse2-small",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-cray32-small-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "cray32-small",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-scimark32-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark32",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-scimark32-sse2-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark32-sse2",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-cray-strict-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-strict", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "cray-strict",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 [suite.cases.guest-scimark-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "900"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
 # The Debian cloud-image workload (tests/io/run_io5.py, docs/benchmarks.md "Context-switch-heavy Debian workload") with its
 # build timed alone (--solo-build: configure and make -j4 again after the run, without the download and disk loops):
@@ -273,7 +273,7 @@ argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--input
 # The 32-bit toolchain build (M2 checkpoint B; run_io5.py --i386): in one boot, CPython's configure and make -j4 by the 64-bit
 # userland (steps configure, make; nothing else running) and by a Debian i386 userland debootstrapped into /i386 (steps
 # i386-configure, i386-make), whose python must then give the x86 reference machine's answers. -qemu: the same under QEMU TCG
-# (about an hour; once per version). -profile: natemu's timing log (perf-use.log; a profile, not a timing). -reference: the
+# (its first boot is stopped at 45 minutes, the owner's bound: the steps finished by then are its result; once per version). -profile: natemu's timing log (perf-use.log; a profile, not a timing). -reference: the
 # same boots on the x86 machine under KVM; prints the check's hash and x87 lines to pin in run_io5.py (I386_CHECK, I386_X87), and
 # its step times are real x86's. `remote`: it uses none of this Mac's cores, takes no exclusive window, and runs only when
 # seeding (TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host), never in an ordinary bench round.
@@ -288,9 +288,9 @@ argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--input
         "--i386", "--perf-log", "--lock", "{out}/vm.lock"]
 
 [suite.cases.io5-solo32-qemu]
-timeout = 9000
+timeout = 3900
 argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "qemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
-        "--vcpus", "4", "--ram", "8", "--mitigations-off", "--i386", "--limit", "7800", "--lock", "{out}/vm.lock"]
+        "--vcpus", "4", "--ram", "8", "--mitigations-off", "--i386", "--limit", "2700", "--lock", "{out}/vm.lock"]
 
 [suite.cases.io5-solo32-reference]
 remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
