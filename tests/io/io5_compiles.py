@@ -8,7 +8,8 @@ much of the step the lines span). Per step: seconds summed over vCPUs in each re
 not halted (`host` is the time a vCPU waits for the host, nearly all of it translation requests), then the requests
 begun in the step: how many compiled, their seconds, how many were for 32-bit code, and how many compiled bytes that an
 earlier compile of the boot had already compiled (the same bytes hash and length), at the same address or another."""
-import collections, json, pathlib, sys
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
+import collections, json
 
 d = pathlib.Path(sys.argv[1])
 BUCKETS = ('start guest host halted mailbox link miss division helper stop irq abort place system tlb delivery revalidate '
