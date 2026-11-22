@@ -1004,6 +1004,133 @@ fn flags_stops_and_records() {
             operands: [sreg(6), reg(1, 4), Operand::NONE],
             ..good
         },
+        // Shapes the operation does not have: the executor would read an operand it never checked.
+        Insn {
+            operands: [reg(0, 2), reg(1, 4), Operand::NONE],
+            ..good
+        },
+        Insn {
+            operands: [mem(4), mem(4), Operand::NONE],
+            ..good
+        },
+        Insn {
+            operands: [reg(0, 4), reg(1, 4), imm(1)],
+            ..good
+        },
+        Insn {
+            op: op::PUSH,
+            operands: [mem(4), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::POP,
+            operands: [imm(1), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::SHL,
+            operands: [reg(0, 4), reg(2, 1), Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::JMP_FAR,
+            operands: [mem(4), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::JMP_FAR,
+            operands: [imm(1), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::LGDT,
+            operands: [mem(4), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::JCC,
+            operands: [reg(0, 4), Operand::NONE, Operand::NONE],
+            ..good
+        },
+        Insn {
+            op: op::CPUID,
+            operands: [reg(0, 4), Operand::NONE, Operand::NONE],
+            ..good
+        },
     ];
-    assert!(good.well_formed() && bad.iter().all(|i| !i.well_formed()));
+    for (k, i) in bad.iter().enumerate() {
+        assert!(!i.well_formed(), "{k}: {i:?}");
+    }
+    assert!(good.well_formed());
+}
+
+/// Sequential EIP wraps at 32 bits (a branch's target at the operand size, `near_branches`).
+#[test]
+fn eip_wraps_at_32_bits() {
+    let mut c = flat();
+    c.rip = 0xffff_ffff;
+    run(&mut c, P32, &insn(op::NOP, 4, &[]), &mut Mem::default()).unwrap();
+    assert_eq!(c.rip, 1);
+    c.rip = 0xffff_fffe;
+    run(
+        &mut c,
+        P32,
+        &insn(op::INC, 4, &[reg(0, 4)]),
+        &mut Mem::default(),
+    )
+    .unwrap();
+    assert_eq!(c.rip, 0);
+}
+
+/// A real-mode segment load or far JMP releases no stack and leaves ESP alone, whatever SS.B (it would otherwise rewrite
+/// ESP, clearing RSP's upper half on a 32-bit stack).
+#[test]
+fn real_mode_loads_leave_the_stack() {
+    let ctx = Context {
+        stack32: true,
+        ..REAL
+    };
+    let mut c = real();
+    c.gpr[4] = 0xdead_beef_0000_1234;
+    c.gpr[0] = 0x2000;
+    let m = &mut Mem::default();
+    run(
+        &mut c,
+        ctx,
+        &insn(op::MOV_SREG, 2, &[sreg(SREG_ES), reg(0, 2)]),
+        m,
+    )
+    .unwrap();
+    run(
+        &mut c,
+        ctx,
+        &insn(op::JMP_FAR, 2, &[imm(0x10), imm(0x3000)]),
+        m,
+    )
+    .unwrap();
+    assert_eq!(
+        (c.seg[SREG_ES].base, c.seg[SREG_CS].base, c.gpr[4]),
+        (0x2_0000, 0x3_0000, 0xdead_beef_0000_1234)
+    );
+}
+
+/// Far RET checks both slots against the stack limit before the memory of either (SDM Vol.2 RET: #SS(0) before #PF).
+#[test]
+fn far_return_checks_both_limits_first() {
+    let mut f = flat();
+    f.seg[SREG_SS].limit = 0x1003;
+    f.gpr[4] = 0x1000;
+    let mut m = Mem::default();
+    m.absent.push(1);
+    // Slot 0 (0x1000..0x1003) is within the limit but its page is absent; slot 1 (0x1004..) is past the limit.
+    assert_eq!(faults(&f, P32, &insn(op::RET_FAR, 4, &[]), &m), SS);
+    f.seg[SREG_SS].limit = 0x1007;
+    assert_eq!(
+        faults(&f, P32, &insn(op::RET_FAR, 4, &[]), &m),
+        Exit::Fault {
+            vector: 14,
+            error: 0,
+            address: 0x1000
+        }
+    );
 }

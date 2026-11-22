@@ -11,9 +11,10 @@
 //! iced alone: no fexc, no answer cache, no admission, and it reads no guest memory.
 //!
 //! 1. **The resident supplies the bytes.** It fetches up to [`MAX_FETCH`] bytes at CS:EIP itself, as an instruction
-//!    fetch: each byte inside the CS limit (#GP(0) past it), CS executable, through the current translation (the
-//!    identity with paging off, the 4-level walk in compatibility mode) and from fetchable memory only (guest RAM, the
-//!    firmware region). It stops at the first byte it cannot fetch and remembers why (the #GP(0), the next page's #PF,
+//!    fetch: each byte inside the CS limit (#GP(0) past it; CS's execute right is the segment load's to check, not
+//!    the fetch's: the reset and INIT CS is a data type, 93h, and the stale CS after MOV CR0 must still fetch), through
+//!    the current translation (the identity with paging off, the 4-level walk in compatibility mode) and from
+//!    fetchable memory only (guest RAM, the firmware region). It stops at the first byte it cannot fetch and remembers why (the #GP(0), the next page's #PF,
 //!    or a typed stop). It writes a [`Decode`] at `STAGING_VA + DECODE_OFFSET`: `bits` (16 or 32: CS.D, the only mode
 //!    fact decoding needs), `max` (1 ..= [`MAX_RUN`] records wanted) and `available` bytes. Fifteen bytes are always
 //!    enough for one record.
@@ -28,8 +29,9 @@
 //! 4. **The resident checks every record** before it uses or caches one: [`Insn::well_formed`], its bytes equal to what
 //!    it sent at that position and the lengths adding up within `available`; anything else is a bad reply (a halt).
 //!    A cached record is keyed by the linear address of its first byte and the context it was decoded in; before each
-//!    execution its `bytes[..length]` are compared with memory fetched as in step 1 (byte validation: the CS limit and
-//!    rights are checked again), and a mismatch decodes again.
+//!    execution its `bytes[..length]` are compared with memory fetched as in step 1 (byte validation: the CS limit is
+//!    checked again), and a mismatch decodes again. `Decoded` is 912 bytes: the resident reads records in place in the
+//!    staging area and copies only the one it keeps, never the reply onto its stack.
 //!
 //! A malformed request (`bits` not 16 or 32, `max` or `available` out of range) ends the run with the host's error.
 use crate::execution::Cpu;
@@ -218,7 +220,59 @@ impl Insn {
             || (op::JCC..=op::RET_FAR).contains(&self.op)
             || (op::MOV_SREG..=op::WBINVD).contains(&self.op)
             || (op::UD..=op::OTHER).contains(&self.op);
+        // Each operation's operand shapes (a bit per kind) and sizes, so the executor never reads an operand it did not
+        // check: a destination of the operation's size, sources as the forms have them, no third operand.
+        let [a, b, c] = &self.operands;
+        let bit = |o: &Operand| 1u8 << (o.kind & 7);
+        let (n, r, m, i, s, cr) = (
+            1,
+            1 << kind::REG,
+            1 << kind::MEM,
+            1 << kind::IMM,
+            1 << kind::SREG,
+            1 << kind::CR,
+        );
+        let (first, second) = match self.op {
+            op::ADD..=op::CMP => (r | m, r | m | i),
+            op::TEST | op::SHL..=op::BTC => (r | m, r | i),
+            op::INC | op::DEC => (r | m, n),
+            op::XADD => (r | m, r),
+            op::MOV => (r | m, r | m | i | s),
+            op::MOVZX => (r, r | m),
+            op::LEA => (r, m),
+            op::PUSH => (r | i, n),
+            op::POP => (r, n),
+            op::NOP => (n | r | m, n),
+            op::JCC..=op::CALL => (i, n),
+            op::RET | op::RET_FAR => (n | i, n),
+            op::JMP_FAR => (i | m, i | n),
+            op::MOV_SREG => (s, r | m),
+            op::LGDT | op::LIDT => (m, n),
+            op::MOV_TO_CR => (cr, r),
+            op::MOV_FROM_CR => (r, cr),
+            _ => (n, n),
+        };
+        let sized = |o: &Operand| !matches!(o.kind, kind::REG | kind::MEM) || o.size == self.size;
+        let sizes = match self.op {
+            op::MOVZX => sized(a) && b.size <= self.size,
+            op::SHL..=op::SAR => sized(a) && (b.kind != kind::REG || (b.reg == 1 && b.size == 1)),
+            op::LEA => sized(a),
+            op::ADD..=op::MOV | op::PUSH | op::POP => sized(a) && sized(b),
+            op::JMP_FAR => {
+                (a.kind == kind::MEM && a.size == self.size + 2 && b.kind == kind::NONE)
+                    || (a.kind == kind::IMM && b.kind == kind::IMM)
+            }
+            op::LGDT | op::LIDT => a.size == 6,
+            op::MOV_SREG => b.kind != kind::MEM || b.size == 2,
+            _ => true,
+        };
+        let shape = bit(a) & first != 0
+            && bit(b) & second != 0
+            && c.kind == kind::NONE
+            && !(a.kind == kind::MEM && b.kind == kind::MEM)
+            && sizes;
         known
+            && shape
             && (1..=15).contains(&self.length)
             && matches!(self.size, 1 | 2 | 4)
             && matches!(self.address, 2 | 4)

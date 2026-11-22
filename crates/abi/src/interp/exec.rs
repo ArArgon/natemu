@@ -505,8 +505,11 @@ pub fn step<M: Memory>(cpu: &mut Cpu, ctx: Context, i: &Insn, m: &mut M) -> Resu
         op::JMP_FAR | op::RET_FAR => {
             let (selector, offset, release) = if o == op::RET_FAR {
                 // Two pops: the offset at SP, the selector (the slot's low 16 bits) after it.
-                let l0 = access(m, cpu, ctx, SREG_SS, sp, n, false)?;
-                let l1 = access(m, cpu, ctx, SREG_SS, sp.wrapping_add(n) & smask, n, false)?;
+                // (Both slots' stack limit before either's memory: SDM Vol.2 RET, #SS before #PF.)
+                let l0 = linear(cpu, ctx, SREG_SS, sp, n, false)?;
+                let l1 = linear(cpu, ctx, SREG_SS, sp.wrapping_add(n) & smask, n, false)?;
+                m.check(l0, n, false)?;
+                m.check(l1, n, false)?;
                 let imm = if a.kind == kind::IMM {
                     a.value & 0xffff
                 } else {
@@ -591,9 +594,12 @@ pub fn step<M: Memory>(cpu: &mut Cpu, ctx: Context, i: &Insn, m: &mut M) -> Resu
     cpu.rip = u64::from(rip);
     Ok(Outcome::Done)
 }
-/// A real-mode segment load (base = selector × 16; limit and attributes unchanged), after releasing `bytes` of stack.
+/// A real-mode segment load (base = selector × 16; limit and attributes unchanged), after releasing `bytes` of stack
+/// (none: ESP is not written).
 fn release_and_load(cpu: &mut Cpu, ctx: Context, sreg: usize, selector: u16, bytes: u32) {
-    release(cpu, ctx, bytes);
+    if bytes != 0 {
+        release(cpu, ctx, bytes);
+    }
     let s = &mut cpu.seg[sreg.min(SREG_GS)];
     (s.selector, s.base) = (selector, u64::from(selector) << 4);
 }

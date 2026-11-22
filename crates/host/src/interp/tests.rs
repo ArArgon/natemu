@@ -126,6 +126,7 @@ fn sweep(mut each: impl FnMut(u32, &[u8], &Instruction, DecoderError)) {
         &[0x66],
         &[0x67],
         &[0xf3],
+        &[0xf2],
         &[0xf0],
         &[0xf0, 0x66],
         &[0x2e, 0x66, 0x67],
@@ -327,6 +328,32 @@ fn maps_every_first_version_code() {
         let n = usize::from(r.length);
         assert_eq!((n, &r.bytes[..n]), (i.len(), &bytes[..i.len()]));
         assert!(r.bytes[n..].iter().all(|&b| b == 0));
+        // Every record the host can send is one the resident accepts, a stop's too.
+        assert!(
+            r.well_formed(),
+            "{bits}-bit {:02x?} {:?}: {r:?}",
+            &bytes[..n],
+            i.code()
+        );
+        // F2/F3 on a form that does not take them are ignored: the same instruction (iced's code) without the prefix
+        // has the same record but for its bytes.
+        if matches!(bytes[0], 0xf2 | 0xf3) {
+            let mut d = Decoder::new(bits, &bytes[1..], DecoderOptions::NONE);
+            let j = d.decode();
+            if j.code() == i.code() {
+                let plain = insn(&j, d.last_error(), &bytes[1..], bits);
+                let what = format!("{bits}-bit {:02x?} {:?}", &bytes[..n], i.code());
+                assert_eq!(
+                    Insn {
+                        length: plain.length,
+                        bytes: plain.bytes,
+                        ..r
+                    },
+                    plain,
+                    "{what}"
+                );
+            }
+        }
         if matches!(r.op, op::OTHER | op::UD | op::TOO_LONG) {
             return;
         }
@@ -357,7 +384,7 @@ fn maps_every_first_version_code() {
         assert!(accepted.iter().any(|c| c.mnemonic() == *m), "{m:?}");
     }
     assert!(
-        accepted.len() > 300 && instructions > 2_000_000,
+        accepted.len() > 300 && instructions > 2_300_000,
         "{} codes, {instructions}",
         accepted.len()
     );
@@ -482,19 +509,34 @@ fn stub_forms() {
     );
     assert_eq!(one(16, &[0xf3, 0x90]).op, op::PAUSE);
     assert_eq!(one(16, &[0x0f, 0x30]).op, op::WRMSR);
-    // Stops: UD2, MOV CS, LOCK on a register destination (#UD); MUL (not in the first version); fifteen prefixes.
+    // Stops: UD2, MOV CS, LOCK on a register destination (#UD); MUL (not in the first version); fifteen prefixes. Each is
+    // well formed, with the sizes its prefixes give, so the resident gets the typed stop, not a bad reply.
     for b in [&[0x0f, 0x0b][..], &[0x8e, 0xc8], &[0xf0, 0x01, 0xc0]] {
         let r = one(32, b);
-        assert_eq!((r.op, &r.bytes[..b.len()]), (op::UD, b));
+        assert_eq!(
+            (r.op, &r.bytes[..b.len()], r.well_formed()),
+            (op::UD, b, true)
+        );
     }
-    assert_eq!(one(32, &[0xf7, 0xe0]).op, op::OTHER);
+    let r = one(16, &[0x66, 0x67, 0xf7, 0xe0]);
+    assert_eq!(
+        (r.op, r.size, r.address, r.well_formed()),
+        (op::OTHER, 4, 4, true)
+    );
     let mut long = [0x66; 16];
     long[15] = 0x90;
     let r = record(&long, 32).unwrap();
     assert_eq!(
-        (r.op, r.length, r.bytes[..15].to_vec()),
-        (op::TOO_LONG, 15, vec![0x66; 15])
+        (r.op, r.length, r.bytes[..15].to_vec(), r.well_formed()),
+        (op::TOO_LONG, 15, vec![0x66; 15], true)
     );
+    // Fifteen bytes and no instruction: 13 prefixes then MOV CS ends at the 15th byte (#UD); 13 then 0F 04 needs a 16th by
+    // iced's reading (it takes a ModRM byte for 0F 04), so too long.
+    let mut b = [0x66; 15];
+    b[13..].copy_from_slice(&[0x8e, 0xc8]);
+    assert_eq!((one(32, &b).op, one(32, &b).length), (op::UD, 15));
+    b[13..].copy_from_slice(&[0x0f, 0x04]);
+    assert_eq!(record(&b, 32).unwrap().op, op::TOO_LONG);
 }
 
 /// A request's straight run: it ends after a control transfer, a resident operation or a stop, at `max`, or before an
