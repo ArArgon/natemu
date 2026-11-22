@@ -664,7 +664,7 @@ fn boot_method_rules() {
     let e = err(load_file(&format!("{eng}[boot]\n"), &[]).1);
     assert!(
         e.contains(
-            "[boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found none"
+            "[boot] needs exactly one boot method, [boot.kernel], [boot.firmware] or [boot.uefi]; found none"
         ),
         "{e}"
     );
@@ -673,7 +673,13 @@ fn boot_method_rules() {
         &[],
     )
     .1);
-    assert!(e.contains("found both"), "{e}");
+    assert!(e.contains("found more"), "{e}");
+    let e = err(load_file(
+        &format!("{eng}[boot.kernel]\nimage = \"k\"\n[boot.firmware]\nimage = \"f\"\n"),
+        &[],
+    )
+    .1);
+    assert!(e.contains("found more"), "{e}");
     let e = err(load_file(&format!("{eng}[boot.uefi]\nfirmware = \"x\"\n"), &[]).1);
     assert!(
         e.contains("UEFI boot is planned (M3) and not built yet"),
@@ -685,6 +691,38 @@ fn boot_method_rules() {
         load_file(eng, &["--kernel", "k"]).1.unwrap().kernel,
         Some(PathBuf::from("k"))
     );
+}
+
+/// M2 Part 2, the firmware boot mode: `--firmware` or `[boot.firmware]` (paths from the file's folder), its start, and the
+/// refusals (two boot methods, an initrd or command line, devices, an unknown start, a table without its image).
+#[test]
+fn firmware_boot() {
+    use natemu::boot::firmware::Start;
+    let _env = lock();
+    let eng = "[engine]\nfexc = \"f\"\n";
+    let c = load_args(&["--fexc", "f", "--firmware", "fw.bin"]).unwrap();
+    assert_eq!((c.firmware, c.kernel, c.firmware_start), (Some(PathBuf::from("fw.bin")), None, Start::Reset));
+    let (d, c) = load_file(&format!("{eng}[boot.firmware]\nimage = \"fw.bin\"\nstart = \"flat32\"\n"), &[]);
+    let c = c.unwrap();
+    assert_eq!((c.firmware, c.firmware_start), (Some(d.join("fw.bin")), Start::Flat32));
+    let c = load_args(&["--fexc", "f", "--firmware", "fw.bin", "--set", "boot.firmware.start=flat32"]).unwrap();
+    assert_eq!(c.firmware_start, Start::Flat32);
+    // The file's table takes its image from --firmware; without either it is refused.
+    let c = load_file(&format!("{eng}[boot.firmware]\n"), &["--firmware", "x"]).1.unwrap();
+    assert_eq!(c.firmware, Some(PathBuf::from("x")));
+    assert!(err(load_file(&format!("{eng}[boot.firmware]\n"), &[]).1).contains("[boot.firmware] needs image"));
+    // Refused: clap's conflicts, two methods through the file, extras, devices, a bad start.
+    assert!(err(load_args(&["--fexc", "f", "--firmware", "a", "--kernel", "k"])).contains("cannot be used with"));
+    assert!(err(load_args(&["--fexc", "f", "--firmware", "a", "--cmdline", "x"])).contains("cannot be used with"));
+    let e = err(load_file(MIN, &["--firmware", "a"]).1);
+    assert!(e.contains("two boot methods"), "{e}");
+    let e = err(load_args(&["--fexc", "f", "--firmware", "a", "--set", "boot.kernel.cmdline=x"]));
+    assert!(e.contains("no initrd or kernel command line"), "{e}");
+    let e = err(load_file(&format!("{eng}[boot.firmware]\nimage = \"a\"\n[[rng]]\nid = \"r\"\n"), &[]).1);
+    assert!(e.contains("no virtio devices"), "{e}");
+    let e = err(load_file(&format!("{eng}[boot.firmware]\nimage = \"a\"\nstart = \"main32\"\n"), &[]).1);
+    assert!(e.contains("reset or flat32"), "{e}");
+    assert!(err(load_file(&format!("{eng}[boot.firmware]\nimage = \"a\"\nentry = 1\n"), &[]).1).contains("unknown field"));
 }
 
 #[test]

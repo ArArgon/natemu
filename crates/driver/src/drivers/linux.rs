@@ -43,6 +43,12 @@
 //! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V
 //! ends the run with the stop `debug_exit` and the result's `debug_exit` [V, (V << 1) | 1] (QEMU's exit status).
 //!
+//! M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `--firmware` boots IMAGE as a firmware image
+//! instead of a kernel (`Boot::firmware`): at guest-physical [4 GiB - its size, 4 GiB), vCPU 0 at the reset vector in the
+//! power-on state (`--firmware-start flat32`: in flat 32-bit protected mode at FFFFFFF0H), the others waiting for a SIPI,
+//! the MTRRs at their power-on values; no tables, no mailbox (`--initrd`, `--cmdline`, `--rsdp`, `--no-mailbox`, `--rng`
+//! and `--load-only` are refused). The placement's `kernel` and `window` are the image's range.
+//!
 //! Performance phase (perf plan §2): `--perf-log FILE` (or `NATEMU_PERF_LOG=FILE`) turns on the library's timing log (`natemu::perf`): process
 //! phases and one line per vCPU in FILE, one line per translation request in FILE.vN. The resident's buckets need a
 //! runtime built with `--features perf` (else they read zero and `"magic":false`).
@@ -70,7 +76,7 @@ fn number(text: &str) -> Result<u64> {
 pub(crate) struct Args {
     /// The fexc compiler (`unused` with --load-only)
     fexc: String,
-    /// The Linux bzImage
+    /// The Linux bzImage (with --firmware, the firmware image)
     image: String,
     #[arg(long, value_name = "FILE")]
     initrd: Option<String>,
@@ -159,6 +165,12 @@ pub(crate) struct Args {
     /// Test only: QEMU's isa-debug-exit device at ports F4H-F7H (a write ends the run)
     #[arg(long)]
     debug_exit: bool,
+    /// IMAGE is a firmware image (the firmware boot mode), not a kernel
+    #[arg(long)]
+    firmware: bool,
+    /// The firmware boot processor's start: reset (the power-on state) or flat32
+    #[arg(long, value_name = "reset|flat32", requires = "firmware", value_parser = natemu::boot::firmware::Start::parse)]
+    firmware_start: Option<natemu::boot::firmware::Start>,
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
@@ -194,7 +206,12 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         perf_log,
         no_mailbox,
         debug_exit,
+        firmware,
+        firmware_start,
     } = args;
+    if firmware && (initrd.is_some() || !cmdline.is_empty() || rsdp.is_some() || no_mailbox || rng || load_only) {
+        return Err("--firmware: no --initrd, --cmdline, --rsdp, --no-mailbox, --rng or --load-only".into());
+    }
     if let Some(path) = perf_log {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
@@ -220,7 +237,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let image_path = image.clone();
     let image = memory::read_input(image, MAX_INPUT)?;
     // Multiboot (QEMU's `-kernel`): the information's command line is the image's name, a space, then the arguments.
-    let cmdline = if boot::is_multiboot(&image) {
+    let cmdline = if !firmware && boot::is_multiboot(&image) {
         format!("{image_path} {cmdline}")
     } else {
         cmdline
@@ -293,7 +310,17 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         pool,
         mailbox: !no_mailbox,
         debug_exit,
-        ..natemu::linux::Boot::new(resident, fexc, image)
+        ..if firmware {
+            natemu::linux::Boot {
+                firmware: Some(natemu::boot::firmware::Firmware {
+                    image,
+                    start: firmware_start.unwrap_or_default(),
+                }),
+                ..natemu::linux::Boot::new(resident, fexc, Vec::new())
+            }
+        } else {
+            natemu::linux::Boot::new(resident, fexc, image)
+        }
     };
     if let Some(path) = &serial {
         boot.serial = Some(Box::new(
@@ -394,6 +421,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 blocks: s.blocks,
                 compiles,
                 requests: s.requests,
+                decodes: outcome.decodes.get(v).copied().filter(|&n| n != 0),
                 reuse: (c.reuse_copies, c.reuse_refused, c.reuse_checks),
                 halts: s.halts,
                 interrupts: s.interrupts,
@@ -632,6 +660,9 @@ struct VcpuReport {
     blocks: u64,
     compiles: u64,
     requests: u64,
+    /// M2 Part 2: its boot-time interpreter decode requests (`Outcome::decodes`), absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decodes: Option<u64>,
     reuse: (u64, [u64; 5], u64),
     halts: u64,
     interrupts: u64,
@@ -832,6 +863,7 @@ mod tests {
             blocks: 11,
             compiles: 12,
             requests: 13,
+            decodes: None,
             reuse: (14, [1, 2, 3, 4, 5], 15),
             halts: 16,
             interrupts: 17,

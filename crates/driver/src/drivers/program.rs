@@ -140,8 +140,11 @@
 //! bits 47:40 in 7:0 and 55:52 in 15:12; the byte-granular limit); `gdtr BASE LIMIT`, `idtr BASE LIMIT`; `stop LINEAR`
 //! (repeatable: the run ends when the vCPU is about to execute that linear address, stop ids 0.. in order, the first
 //! instruction included); `window GPA LEN` (repeatable; LEN in hex, as every number here: bytes read back at the end).
-//! The only address-space item is `memory GPA HEX`, bytes written at that guest-physical address (inside guest RAM);
-//! code is memory too. LDTR and TR are the reset values, DR0-DR7 too, FCW 0040H as the SDM says (QEMU and KVM start
+//! The only address-space items are `memory GPA HEX`, bytes written at that guest-physical address (inside guest RAM;
+//! code is memory too), and (M2 Part 2, docs/restructure/firmware-mode.md) `firmware HEX`, once, before the first `cpu`
+//! line: a firmware image (whole 4 KiB pages) at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its
+//! stores dropped (the backing as the firmware boot mode's, `execution::prepare_with_firmware`; the MSRs stay the
+//! firmware's, below). LDTR and TR are the reset values, DR0-DR7 too, FCW 0040H as the SDM says (QEMU and KVM start
 //! with 037FH; no first-version instruction reads it; the rest of the x87 state, in the guest-state page, is FNINIT's).
 //! The MSRs are the firmware's, as for every driver-started vCPU (`execution::set_cpu`: `reset_msrs`, the MTRRs on),
 //! not power-on's (`cpu::power_on_msrs`). The vCPU's output gains `machine`: the fields `tests/interp/interp_rig.py`'s `fields()`
@@ -196,6 +199,8 @@ struct Space {
     identity: bool,
     /// M3: (linear page, device page, a test device there) of `mmio` items.
     mmio: Vec<(u64, u64, bool)>,
+    /// M2 Part 2: a machine description's firmware image (`firmware HEX`; empty: none).
+    firmware: Vec<u8>,
 }
 /// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
 #[derive(Debug, PartialEq)]
@@ -550,6 +555,7 @@ fn machine_items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section
         };
         match (words[0], &words[1..]) {
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
+            ("firmware", [h]) if space.firmware.is_empty() => space.firmware = hex(h)?,
             ("rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
                 items(&[*line], space, cpu.as_deref_mut())?
             }
@@ -1887,6 +1893,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         return Err(format!("mmio page {gpa:#x} is guest RAM"));
     }
     require_vcpus(n)?;
+    // M2 Part 2: a machine description's firmware image, in its shared space only.
+    if d.spaces.iter().skip(1).any(|s| !s.firmware.is_empty()) {
+        return Err("firmware: an item of the shared space (before the first cpu line)".into());
+    }
+    let firmware = d.spaces[0].firmware.as_slice();
     let backing = match args.guest_state_alias {
         Some(va) => execution::prepare_with_guest_state_alias(
             resident,
@@ -1895,8 +1906,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             ram_bytes as usize,
             va,
             pool,
+            firmware,
         )?,
-        None => execution::prepare_with_pool(resident, code_bytes, n, ram_bytes as usize, pool)?,
+        None => execution::prepare_with_firmware(resident, code_bytes, n, ram_bytes as usize, pool, firmware)?,
     };
     // One answer map for the vCPUs under the pool (its entries are the answers other vCPUs compiled).
     let answers = std::sync::OnceLock::new();

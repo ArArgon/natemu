@@ -1,7 +1,7 @@
 //! `natemu`, the boot entry: boots a Linux bzImage on the library's [`natemu::linux::Boot`] with the persistent compile
 //! cache on by default ([`natemu::compile_cache::Config::new`]).
 //!
-//!   natemu [--config FILE] [--set KEY=VALUE]... [--fexc FILE] [--kernel FILE] [--runtime FILE] [--initrd FILE] [--cmdline TEXT]
+//!   natemu [--config FILE] [--set KEY=VALUE]... [--fexc FILE] [--kernel FILE | --firmware FILE] [--runtime FILE] [--initrd FILE] [--cmdline TEXT]
 //!       [--ram SIZE] [--vcpus N] [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]]
 //!       [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE] [--page-currency on|off|check]
 //!       [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
@@ -11,7 +11,10 @@
 //!
 //! **Layers.** A launch is built lowest first from: the built-in defaults, the `--config FILE`, the deprecated environment
 //! variables, the flags, then `--set KEY=VALUE` (so `--set` wins). `--kernel` and `--fexc` are required unless the file gives
-//! `[boot.kernel] image` and `[engine] fexc`. `--disk`, `--net` and `--rng` are refused when the file lists devices of that
+//! `[boot.kernel] image` and `[engine] fexc`. M2 Part 2: `--firmware FILE` (or `[boot.firmware] image`) boots a firmware image
+//! instead of a kernel, at the top of the 4 GiB space, read-only, the boot processor at its reset vector in the power-on state
+//! (`[boot.firmware] start = "flat32"`: in flat 32-bit protected mode), the others waiting for a start-up IPI; no initrd,
+//! command line or virtio device then. `--disk`, `--net` and `--rng` are refused when the file lists devices of that
 //! kind; edit a listed device with `--set disk.ID.path=...`. Paths in the file are relative to the file's folder; paths in
 //! flags and `--set` are relative to the working directory.
 //!
@@ -86,9 +89,13 @@ struct Cli {
     /// The fexc compiler (required unless the --config file has `[engine] fexc`)
     #[arg(long, value_name = "FILE")]
     fexc: Option<PathBuf>,
-    /// The Linux bzImage (required unless the --config file has `[boot.kernel] image`)
+    /// The Linux bzImage (required unless the --config file has `[boot.kernel] image`, or a firmware image is booted)
     #[arg(long, value_name = "FILE")]
     kernel: Option<PathBuf>,
+    /// Boot a firmware image instead of a kernel: it lies at the top of the 4 GiB space, read-only, and the boot processor
+    /// starts at its reset vector (`[boot.firmware]` in the file; docs/configuration.md)
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["kernel", "initrd", "cmdline"])]
+    firmware: Option<PathBuf>,
     /// An initrd (initramfs) to load
     #[arg(long, value_name = "FILE")]
     initrd: Option<PathBuf>,
@@ -354,9 +361,15 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         std::fs::metadata(path).map_err(|e| format!("{what} {}: {e}", path.display()))?;
     }
     let read = |path: &PathBuf| natemu::memory::read_input(&path.to_string_lossy(), MAX_INPUT);
-    let kernel = read(cfg.kernel.as_ref().unwrap())?;
+    // A kernel, or (M2 Part 2) a firmware image: `config::validate` checked there is exactly one.
+    let kernel = cfg.kernel.as_ref().map(read).transpose()?.unwrap_or_default();
+    let firmware = cfg.firmware.as_ref().map(read).transpose()?;
     let initrd = cfg.initrd.as_ref().map(read).transpose()?;
     let mut boot = config::to_boot(&cfg, runtime, kernel, initrd)?;
+    boot.firmware = firmware.map(|image| natemu::boot::firmware::Firmware {
+        image,
+        start: cfg.firmware_start,
+    });
     boot.serial = Some(match &cfg.serial_output {
         Some(path) => Box::new(
             std::fs::File::create(path).map_err(|e| format!("--serial {}: {e}", path.display()))?,
