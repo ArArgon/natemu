@@ -271,6 +271,8 @@ def only_moves(old, new):
     (ha, ja, Ha, ca, sa, pa, ra), (hb, jb, Hb, cb, sb, pb, rb) = a, b
     u32 = lambda c, o: struct.unpack_from('<I', c, o)[0]
     if ha[:8] != hb[:8] or ha[12:20] != hb[12:20] or ja != jb: return 'the status, report, extent or args_read differ'
+    # (Header words that move with the code: +16 total_size and +44 code_size, which the longer code changes (the parts they
+    # cover are compared below), +64/+72/+80 the tables' offsets behind it, +48/+52/+56 code offsets, mapped below.)
     for o in range(0, 128, 4):
         if o not in (16, 44, 48, 52, 56, 64, 72, 80) and u32(Ha, o) != u32(Hb, o): return f'header word +{o}'
     if len(sa) != len(sb) or len(pa) != len(pb) or len(ra) != len(rb): return 'the number of sites, PC entries or relocations'

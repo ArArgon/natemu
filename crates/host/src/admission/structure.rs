@@ -2854,7 +2854,7 @@ mod tests {
         assert_eq!((word(8) & 0xff00_001f, word(end), word(end + 36)), (0x3500_0000, RUN_END[0], 0x1400_0000 | (0xc_u32.wrapping_sub(end + 36) / 4) & 0x3ff_ffff));
         // The return is the one backward branch: not to another word, and only behind the run's end's exact words (so
         // also with the code shape off).
-        for (at, new) in [(end + 36, word(end + 36) + 1), (end, NOP), (end + 32, NOP)] {
+        for (at, new) in [(end + 36, word(end + 36) + 1), (end, MOV_X0), (end + 32, MOV_X0)] {
             let e = admit(&patched(block, at, word(at), new), false).expect_err("admitted");
             assert!(e.contains("not forward"), "{at:#x}: {e}");
         }
@@ -2939,7 +2939,7 @@ mod tests {
                 let [z, k] = natemu_abi::execution::guest_rip_move32(r.value, r.register.into());
                 assert_eq!([word(&o, r.offset), word(&o, r.offset + 4), word(&o, r.offset + 8)], [z, k, 0xd503_201f], "{hex} at {rip}");
                 for shape in [true, false] {
-                    let p = patched((&o, &source), r.offset + 8, 0xd503_201f, NOP);
+                    let p = patched((&o, &source), r.offset + 8, 0xd503_201f, MOV_X0);
                     let e = super::super::admit_mode(&p, h.guest_rip, &source, u64::MAX, shape, false, true).expect_err("an unpadded move");
                     assert!(e.contains("guest-RIP move at"), "{hex} at {rip}: {e}");
                 }
@@ -2978,7 +2978,8 @@ mod tests {
             (r, _) => panic!("{new:#010x} at {at:#x}: {r:?}, want {why:?}"),
         }
     }
-    const NOP: u32 = 0xaa00_03e0; // mov x0, x0
+    /// `mov x0, x0`: a harmless word to put in place of another.
+    const MOV_X0: u32 = 0xaa00_03e0;
     const ADDRESS: (&[u8], &[u8]) = FIXTURES[0];
     const DIVISION: (&[u8], &[u8]) = FIXTURES[1];
     /// `call rsp`: branch-target check at 0x4, `mov x0, x22` at 0x34, the dispatch branch at 0x38.
@@ -3469,9 +3470,9 @@ mod tests {
         const LOCK: (&[u8], &[u8]) = FIXTURES[9];
         const DMB_ISH: u32 = 0xd503_3bbf;
         // Each LOCK CMPXCHG* CAS needs its `dmb ish` right before it (code shape) ...
-        refused(LOCK, 0x18, DMB_ISH, NOP, "without the dmb ish");
-        refused(LOCK, 0x54, DMB_ISH, NOP, "without the dmb ish");
-        validated(LOCK, 0x18, DMB_ISH, NOP, None);
+        refused(LOCK, 0x18, DMB_ISH, MOV_X0, "without the dmb ish");
+        refused(LOCK, 0x54, DMB_ISH, MOV_X0, "without the dmb ish");
+        validated(LOCK, 0x18, DMB_ISH, MOV_X0, None);
         // ... and a `dmb ish` anywhere else is refused, also by object validation alone: before the unlocked cmpxchg8b's
         // caspal, before LOCK XADD's ldaddal, in a straight-line block.
         for (f, at, old) in [
@@ -3540,15 +3541,15 @@ mod tests {
     #[test]
     fn split_checks_are_verified() {
         refused(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
-        refused(ADDRESS, 0x1c, 0x9100_1c20, NOP, "split check");
+        refused(ADDRESS, 0x1c, 0x9100_1c20, MOV_X0, "split check");
         refused(ADDRESS, 0x18, 0x8b34_e0c1, 0x8b34_e4c1, "split check"); // add x1, x6, x20, sxtx #1: not its address
         refused(ADDRESS, 0x4, 0x8b07_0cd4, 0x1400_0006, "split check"); // b 0x1c: enters the checked window
-        refused(ADDRESS, 0x24, 0x3760_0580, NOP, "reached by 0 branches"); // tbnz removed
+        refused(ADDRESS, 0x24, 0x3760_0580, MOV_X0, "reached by 0 branches"); // tbnz removed
         let large = FIXTURES[5];
         refused(large, 0x20, 0x5284_0001, 0x5282_0001, "split check"); // mov w1, #0x1000 for a store at +0x2000
         // Without the code-shape check none of this is refused: a missing or wrong split check is a producer bug whose
         // effect (a page-crossing store committed in part) stays in the guest.
-        validated(ADDRESS, 0x24, 0x3760_0580, NOP, None);
+        validated(ADDRESS, 0x24, 0x3760_0580, MOV_X0, None);
         validated(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, None);
     }
 
@@ -3558,11 +3559,11 @@ mod tests {
     fn push_run_alignment_checks_are_verified() {
         const RUN: (&[u8], &[u8]) = fixture!("push-run");
         admit(RUN).unwrap();
-        refused(RUN, 0x4, 0x9240_0900, NOP, "stack alignment check"); // the check's `and` removed
+        refused(RUN, 0x4, 0x9240_0900, MOV_X0, "stack alignment check"); // the check's `and` removed
         refused(RUN, 0x4, 0x9240_0900, 0x9240_0d00, "stack alignment check"); // and x0, x8, #15: not the alignment of an 8-byte push
         refused(RUN, 0x14, 0x2a0a_03e4, 0xaa0a_03e8, "covering its base"); // mov x8, x10 between the second and third push
         refused(RUN, 0x14, 0x2a0a_03e4, 0xd100_1108, "covering its base"); // sub x8, x8, #4: misaligns it
-        validated(RUN, 0x4, 0x9240_0900, NOP, None); // a producer bug, confined to the guest: object validation admits it
+        validated(RUN, 0x4, 0x9240_0900, MOV_X0, None); // a producer bug, confined to the guest: object validation admits it
         // The check's base is x2 or above (x0 is the check's result; x1 may be written before the store): the same run with
         // the first push on base x0 (the `and` destroys it; object validation refuses) or x1 is refused at that push (0xc).
         for base in [0u32, 1] {
@@ -3599,14 +3600,14 @@ mod tests {
         let (rip, noncanonical) = (FIXTURES[3], FIXTURES[4]);
         refused(rip, 0x8, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
         validated(rip, 0x8, 0x72a0_0214, 0x72a0_0234, Some("guest-RIP move")); // a relocation: object validation
-        refused(rip, 0x1c, 0x1400_001d, NOP, "reached by 0 branches"); // the crossing store's `b split`
+        refused(rip, 0x1c, 0x1400_001d, MOV_X0, "reached by 0 branches"); // the crossing store's `b split`
         // A non-canonical guest-RIP load has no stub (it faults at its site); the crossing non-canonical store keeps
         // its `b split` (the resident's split raises #GP before writing).
         refused(
             noncanonical,
             0x24,
             0x1400_0006,
-            NOP,
+            MOV_X0,
             "reached by 0 branches",
         );
         refused(
@@ -3646,7 +3647,7 @@ mod tests {
             0xaa16_03e1,
             Some("does not follow `mov x0, xR`"),
         ); // the exit's form
-        refused(CALL, 0x34, 0xaa16_03e0, NOP, "does not follow `mov x0, xR`");
+        refused(CALL, 0x34, 0xaa16_03e0, MOV_X0, "does not follow `mov x0, xR`");
         refused(
             CALL,
             0x38,
@@ -3754,7 +3755,7 @@ mod tests {
             STOSQ,
             find(STOSQ, 0xb400_00c1),
             0xb400_00c1,
-            NOP,
+            MOV_X0,
             Some("not forward"),
         );
         validated(
@@ -3765,14 +3766,14 @@ mod tests {
             Some("not forward"),
         );
         let fast = find(STOSQ, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5) + 4;
-        validated(STOSQ, fast, 0x3400_0260, NOP, Some("not forward"));
+        validated(STOSQ, fast, 0x3400_0260, MOV_X0, Some("not forward"));
     }
     #[test]
     fn link_point_form_is_pinned() {
         let at = LINK_FT;
         refused(JCC, at, MOV_W0_5, MOV_W0_5 | 2, "guest-RIP move"); // mov w2: not the relocation's register
         refused(JCC, at + 8, SVC_LINK, SVC_DIV_U, "not a literal exit"); // the move then a division
-        refused(JCC, at + 8, SVC_LINK, NOP, "not a literal exit"); // no gate: falls through into the next exit
+        refused(JCC, at + 8, SVC_LINK, MOV_X0, "not a literal exit"); // no gate: falls through into the next exit
         refused(JCC, at + 4, 0x72a0_0200, 0x9100_0400, "guest-RIP move"); // add x0, x0, #1 instead of the movk
         // A branch into its later words (the b.ne at 0xc targets the taken exit's first word, 0x1c).
         refused(
@@ -3799,7 +3800,7 @@ mod tests {
             SVC_LINK,
             "dispatch branch",
         );
-        validated(JCC, at + 8, SVC_LINK, NOP, Some("not a literal exit")); // object validation
+        validated(JCC, at + 8, SVC_LINK, MOV_X0, Some("not a literal exit")); // object validation
         validated(
             ADDRESS,
             mid,
@@ -4073,10 +4074,10 @@ mod tests {
             DIVISION,
             0x14,
             0xb6f8_0000 | DIVISION_STUB_IMM,
-            NOP,
+            MOV_X0,
             "reached by 0 branches",
         ); // check removed
-        validated(DIVISION, 0x14, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, None); // x86 semantics: the code-shape check
+        validated(DIVISION, 0x14, 0xb6f8_0000 | DIVISION_STUB_IMM, MOV_X0, None); // x86 semantics: the code-shape check
         // The checks read FEX's own operands.
         refused(DIVISION, 0x10, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
         refused(DIVISION, 0xc, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
@@ -4092,7 +4093,7 @@ mod tests {
         refused(DIVISION, 0x8, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
         refused(DIVISION, 0x4, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
         // A division `svc` without its verdict, or anywhere else.
-        refused(DIVISION, 0x160, 0xb500_0d62, NOP, "reached by 0 branches");
+        refused(DIVISION, 0x160, 0xb500_0d62, MOV_X0, "reached by 0 branches");
         let (at, old) = MIDDLE;
         refused(ADDRESS, at, old, SVC_DIV_U, "division svc outside");
         validated(ADDRESS, at, old, SVC_DIV_U, Some("division svc outside"));
@@ -4140,7 +4141,7 @@ mod tests {
         for (at, old, new) in [
             (0x98, movz(0xfe), movz(0xff)), // FSIN's svc with FCOS's function code
             (0xa0, movz(0xf8), movz(0xf5)), // FPREM's with FPREM1's
-            (0xa0, movz(0xf8), NOP),        // no movz
+            (0xa0, movz(0xf8), MOV_X0),        // no movz
             (0xb4, movz(0x12), movz(0x13)), // another imm8
             (0xf0, movz(0x34c), movz(0x24c)), // REX.W dropped
             (0xf0, movz(0x34c), movz(0x14c)), // the explicit bit dropped
