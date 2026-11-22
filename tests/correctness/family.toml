@@ -492,16 +492,20 @@ kind = "judged"
 harness = "campaign"
 tier = "campaign"
 # M2: glibc's math tests built for i686 (recipes/libm32: the libm suite's glibc 2.41, x87 code), judged as libm (exit 0
-# passes, 77 is unsupported), beside the x86 reference machine's status (tests/correctness/libm32.txt; seeding runs
+# passes, 77 is unsupported), against the x86 reference machine's status (tests/correctness/libm32.txt; seeding runs
 # the image there in a chroot). Also with AFP hidden (host.afp = false, NATEMU_FEXC_FEATURE_OFF=afp): x87 fast mode on
-# a Mac without AFP differs, and expected_without.afp lists what fails only there.
+# a Mac without AFP differs, and expected_without.afp lists what fails only there; and in accurate mode there
+# (rules.py: not with AFP, where it changes nothing), where those must pass. A failing program must fail exactly as
+# recorded for its mode (libm32-fails-MODE.txt, verdicts.libm32): an expected program hides no new failure.
 reference = "x86"
 ct = "libm"
 parts = 1
 cap = 3600
 verdict = "verdicts:libm32"
-matrix = { "machine.vcpus" = [4], "host.afp" = [true, false] }
+answers = ["libm32.txt", "libm32-fails-afp.txt", "libm32-fails-noafp.txt", "libm32-fails-noafp-accurate.txt"]
+matrix = { "machine.vcpus" = [4], "host.afp" = [true, false], "engine.fp" = ["fast", "accurate"] }
 needs = { cores = 4, perf = true }
+smoke = ["part-0"]    # its only part: about 95 s of guest time with AFP
 
 [suite.expected]
 # The x86 reference machine passes all 1427 (tests/correctness/libm32.txt). 468 fail under natemu in both modes,
@@ -1145,59 +1149,26 @@ harness = "campaign"
 tier = "campaign"
 # M2: the ltp suite's 1,446 entries with LTP built for i686 (recipes/ltp32: the same release, selection and runner, a
 # 32-bit dynamic build against the multilib's libc), so every system call goes through the kernel's 32-bit entry and
-# compat layer. Judged as ltp (exit 0 passes, 32 TCONF is unsupported), beside the x86 reference machine's status for
-# the same image and kernel (tests/correctness/ltp32.txt): seeding boots each part there under KVM (reference_boot),
-# not in a chroot, since the kernel decides most LTP results. A TCONF here that passed there fails.
+# compat layer. Judged as ltp (exit 0 passes, 32 TCONF is unsupported), against the x86 reference machine's status
+# for the same image and kernel (tests/correctness/ltp32.txt, provenance in ltp32-reference.txt): seeding boots each
+# part there under KVM (reference_boot), not in a chroot, since the kernel decides most LTP results. A failure with
+# the reference's own status passes (the environment: no block device, modules or network, LTP against 6.12, as the
+# 64-bit suite's expected entries); a TCONF here that passed there fails.
 reference = "x86"
 reference_boot = "kvm"
 ct = "ltp"
 parts = 4
 cap = 3600
 verdict = "verdicts:ltp32"
+answers = ["ltp32.txt"]
 matrix = { "machine.vcpus" = [4] }
 needs = { cores = 4, perf = true }
-# The smoke case: part 2, the quickest (361 entries, 13 of them expected; about 150 s of guest time).
+# The smoke case: part 2, the quickest (361 entries, one of them expected; about 150 s of guest time).
 smoke = ["part-2"]
 
-[suite.flaky]
-# As in the 64-bit ltp suite: timing assertions (docs/restructure/correctness-userspace.md). All three passed here.
-"syscalls:getrusage04" = "timing assertion: system time must stay under 5,000 us (QEMU failed it, too slow; docs/restructure/correctness-userspace.md)"
-"syscalls:pselect01_64" = "timing assertion: fails when the sleep overshoots (QEMU failed it, too slow; docs/restructure/correctness-userspace.md)"
-"syscalls:kill11" = "internal 120 s timeout: TBROK natively for lack of progress, passed on natemu and QEMU (docs/restructure/correctness-userspace.md)"
-
 [suite.expected]
-# Every non-pass other than TCONF of natemu's first run (November 21, 2026, the M4), each the same on the x86 reference
-# machine, and two TCONFs where it passes. Where the 64-bit suite has the entry, its reason. natemu and the reference
-# differ on four tests only: those two, and cve-2017-17052 (mmap ENOMEM) and clock_gettime03 (timens_offsets ERANGE),
-# which fail on the reference only (under KVM) and pass here.
-"cve:cve-2020-25705" = "no network prerequisites: TBROK, veth creation EOPNOTSUPP, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:accept02" = "no network prerequisites: TBROK, multicast setsockopt ENODEV, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:epoll_ctl04" = "TFAIL: kernel 6.12 returns ELOOP where this LTP expects EINVAL at nesting depth 5, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:fgetxattr02" = "no usable block device in an initramfs-only machine: TBROK, ENXIO, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:fstatfs01_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:keyctl05" = "no kernel modules in the image: TBROK from modprobe, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:lchown03" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:lchown03_16" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:linkat02" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:listmount04" = "exit 127: not built, its headers are newer than trixie's linux-libc-dev 6.12, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:lstat03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:mknod07" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:mknodat02" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:mseal02" = "TFAIL: mseal of a length that wraps the 32-bit address space gives ENOMEM where this LTP expects EINVAL (kernel 6.12); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:nice05" = "TBROK \"Runtime not set!\" under run-ltp.sh's LTP_RUNTIME_MUL, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:open12" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:preadv03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:preadv203_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:prot_hsymlinks" = "exit 134: useradd and userdel are not in the image, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:pwritev03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:rename11" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:renameat01" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:shmctl03" = "TFAIL: a 32-bit process reads /proc/sys/kernel/shmmax and shmall as 4294967295 where this LTP expects the 32-bit limits (kernel 6.12); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:stat04_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:statfs01_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:umount2_01" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device, as in the 64-bit ltp suite (docs/restructure/correctness-userspace.md); the same on the x86 reference machine (this image and kernel under KVM, tests/correctness/ltp32.txt)"
-"syscalls:pkey01" = "TCONF: natemu's CPU profile (tools/models/cpu_profile.json; docs/restructure/boot-handoff.md, CPU profile) has no protection keys (CPUID.(7,0):ECX.PKU 0, CR4.PKE reserved); passes on the x86 reference machine"
-"syscalls:perf_event_open02" = "TCONF: natemu's CPU profile (tools/models/cpu_profile.json; docs/restructure/boot-handoff.md, CPU profile) has no performance-monitoring counters (no PMU); passes on the x86 reference machine"
+# The reference passes it with the PMU it keeps (native_vm's CPU: QEMU's pmu=off would change cve-2015-3290's answer).
+"syscalls:perf_event_open02" = "TCONF: natemu's CPU profile has no performance-monitoring counters (docs/restructure/boot-handoff.md, CPU profile: no PMU); passes on the x86 reference machine"
 
 [[suite]]
 name = "stress"

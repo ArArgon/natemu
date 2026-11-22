@@ -15,7 +15,9 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
                                 testkit/host.py reads hw.optional.arm: libm's band-ue-flag tests without afp; or
                                 hidden by NATEMU_FEXC_FEATURE_OFF, as a "host.afp" = false variant does); on a
                                 host with it they are judged as any other test and must pass; `afp` entries also
-                                not under NATEMU_FP=accurate, which makes those deviations exact (docs/floating-point.md).
+                                not under NATEMU_FP=accurate, which makes those deviations exact (docs/floating-point.md),
+                                except an entry whose reason starts with a deviation accurate mode keeps
+                                (`x87-band-ue-flag: ...`, tests/lib/fp_deviations.py X87_OTHER, "both modes").
                                 A FEAT the host does not report at all fails part-0 (a misspelt name), unapplied
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     verdict_flaky = true        the verdict may itself return `flaky` (a test whose only failures are known
@@ -25,7 +27,13 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
     matrix = { "machine.vcpus" = [4] }
     reference_boot = "kvm"      seeding a `reference = "x86"` suite boots each part on the x86 machine under KVM, with
                                 the kernel and command line of a natemu boot (native_vm()), instead of a chroot on the
-                                machine's own kernel: for a suite whose results depend on the kernel (ltp32)
+                                machine's own kernel: for a suite whose results depend on the kernel (ltp32). Seeding
+                                writes `<suite>-reference.txt` beside the suite: the machine, kernel, QEMU and image
+    answers = ["file", ...]     answer files in the family folder (`NAME ...` lines): part-0 reports an answer for a
+                                test the image does not list as a stale-entry
+    "engine.fp" in the matrix   boots with NATEMU_FP set to the variant's value (fast, accurate); a verdict that takes
+                                `mode` gets {'afp': AFP present and not hidden, 'fp': the mode}. A verdict may return
+                                `changed` (a test that failed otherwise than recorded): a failure, expected or not
     ct = "word"                 the kernel's ct= word, which picks the guest's /ct/run-<word>.sh and is CT-END's suite=
                                 (default: the suite's name; cpyt's is cpy)
     unreported = "verdicts:fn"  fn(name, serial) -> (verdict, message) | None, for a listed test with no result line:
@@ -82,6 +90,7 @@ class BootResult:
     reached: bool               # CT-END was printed
     serial: str
     note: str = ''              # how the boot ended (exit status, cap, time), for the case's message
+    reference: dict = dataclasses.field(default_factory=dict)  # a reference run's machine (REF_LINE), for provenance
 
 
 def image(suite: str) -> pathlib.Path:
@@ -103,7 +112,7 @@ def _cmdline(suite: str, part: str, args: tuple = ()) -> str:
 
 
 def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.Path, cap: float,
-         kernel: pathlib.Path | None = None, args: tuple = ()) -> BootResult:
+         kernel: pathlib.Path | None = None, args: tuple = (), env: dict | None = None) -> BootResult:
     """One boot of `image` under natemu, as tools/correctness/boot.py runs it (the netboot 6.12.107 kernel, its command
     line, compile cache off), with the serial console and natemu's output in `work`, a folder no other boot uses. The
     image is only read. Ends AFTER_END seconds after CT-END, when natemu exits, or at `cap` seconds. `kernel` replaces
@@ -117,7 +126,7 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
     cmd = [str(n.stub), '--runtime', str(n.runtime), '--fexc', str(fexc), '--kernel', str(kernel), '--initrd', str(image),
            '--cmdline', cmdline, '--vcpus', str(vcpus), '--serial', str(serial)]
     (work / 'cmd.json').write_text(json.dumps(cmd) + '\n')
-    env = dict(os.environ, NATEMU_COMPILE_CACHE='off')
+    env = dict(os.environ, **(env or {}), NATEMU_COMPILE_CACHE='off')
     env.pop('NATEMU_PERF_LOG', None)
     t0 = time.monotonic()
     end_at, how = None, None
@@ -154,7 +163,7 @@ def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float, wo
     clean = ('for m in proc dev; do ! mountpoint -q "$d/r/$m" || sudo umount "$d/r/$m" || sudo umount -l "$d/r/$m"; done; '
              'if mountpoint -q "$d/r/proc" || mountpoint -q "$d/r/dev"; then echo "left $d: still mounted" >&2; '
              'else sudo rm -rf --one-file-system "$d"; fi')
-    script = (f"set -e; d=$(mktemp -d); trap '{clean}' EXIT; "
+    script = (f"set -e; d=$(mktemp -d); trap '{clean}' EXIT; {REF_HOST}echo 'ref-boot: chroot' >&2; "
               'mkdir "$d/r"; zstd -dc | (cd "$d/r" && sudo cpio -idm --quiet); '
               'sudo mount -t proc proc "$d/r/proc"; sudo mount --bind /dev "$d/r/dev"; '
               f'echo "CT-BEGIN suite={suite} part={part} native kernel=$(uname -r)"; '
@@ -164,42 +173,80 @@ def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float, wo
         r = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], stdin=f, capture_output=True, timeout=cap)
     text = r.stdout.decode(errors='replace')
     work.mkdir(parents=True, exist_ok=True); (work / 'native.txt').write_text(text)
-    return BootResult(end_of(text) is not None, text, f'run natively on {host}' + (f': {r.stderr.decode(errors="replace")[-400:]}' if r.returncode else ''))
+    return BootResult(end_of(text) is not None, text, f'run natively on {host}' + (f': {r.stderr.decode(errors="replace")[-400:]}' if r.returncode else ''),
+                      _reference(r.stderr))
 
 
-REFERENCE_SNAP = '20260915T000000Z'      # tools/correctness/recipes/common.sh's SNAP: the QEMU of native_vm()
+def _snap() -> str:
+    """tools/correctness/recipes/common.sh's SNAP, the campaign images' Debian snapshot: native_vm()'s QEMU comes from it."""
+    from testkit import paths
+    m = re.search(r'^SNAP=(\S+)$', (paths.repo_root() / 'tools/correctness/recipes/common.sh').read_text(), re.M)
+    return m[1]
+
+
+# The reference CPU: the host's less protection keys, which natemu's profile has not. Not pmu=off as well: that leaves
+# perf_event_open02 passing (software events) and makes cve-2015-3290 break (TBROK, munmap EINVAL) where it reported TCONF.
+REFERENCE_CPU = 'host,-pku'
+REF_HOST = ("echo \"ref-cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')\" >&2; "
+            'echo "ref-kernel: $(uname -r)" >&2; ')
+REF_LINE = re.compile(r'^ref-(\w+): (.*)$', re.M)
+APT_TIMEOUT = 900
+
+
+def _reference(stderr: bytes) -> dict:
+    return {k: v.strip() for k, v in REF_LINE.findall(stderr.decode(errors='replace'))}
 
 
 def native_vm(image: pathlib.Path, suite: str, part: str, vcpus: int, host: str, cap: float, work: pathlib.Path,
               kernel: pathlib.Path | None = None, args: tuple = ()) -> BootResult:
     """One part booted on the x86 machine `host` under KVM instead of under natemu: the kernel, command line, vCPUs and
-    2 GiB of RAM (natemu's default) of boot(), the serial console on stdout, kept as `work`/native.txt. QEMU is Debian
-    trixie's (the snapshot of the campaign images), installed in the builds' pinned container image for each boot, so
-    the machine needs only Docker and /dev/kvm; the boot takes one of the machine's build slots (its RAM)."""
+    2 GiB of RAM (natemu's default) of boot(), the serial console on stdout, kept as `work`/native.txt. The CPU is the
+    host's less protection keys, which natemu's profile has not (REFERENCE_CPU; a named Intel model on an AMD machine
+    would have KVM emulate SYSENTER and drop features natemu has). QEMU is Debian trixie's at the campaign
+    images' snapshot, installed in the builds' pinned container image for each boot, so the machine needs only Docker
+    and /dev/kvm; the boot takes one of the machine's build slots (its RAM). The container is named and killed when the
+    ssh session ends, however it ends. The result's `reference` names the machine, its kernel and the QEMU."""
     import tarfile
     from testkit import inputs
     work.mkdir(parents=True, exist_ok=True)
     pack = work / 'boot.tar'
     with tarfile.open(pack, 'w') as t:
         t.add(kernel or resources.fetch('debian-netboot-linux'), 'kernel'); t.add(image, 'initrd')
-    apt = f'http://snapshot.debian.org/archive/debian/{REFERENCE_SNAP}/'
+    name = f'natemu-ref-{suite}-{os.getpid()}-{re.sub(r"[^A-Za-z0-9]", "-", part)}'
+    apt = f'http://snapshot.debian.org/archive/debian/{_snap()}/'
     guest = (f"rm -f /etc/apt/sources.list.d/*; echo 'deb [check-valid-until=no] {apt} trixie main' > /etc/apt/sources.list; "
-             'apt-get -o Acquire::Retries=5 update -qq >&2 && '
-             'apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends qemu-system-x86 >&2 && '
-             f'exec timeout -s KILL {int(cap)} qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp {vcpus} -nodefaults '
-             f'-display none -serial stdio -no-reboot -kernel /b/kernel -initrd /b/initrd -append "{_cmdline(suite, part, args)}"')
-    script = (f"set -e; d=$(mktemp -d); trap 'rm -rf \"$d\"' EXIT; tar xf - -C \"$d\"; {inputs._slot_wait()}"
-              f'docker run --rm -i --device /dev/kvm -v "$d:/b:ro" {artifacts.BENCH_BUILDER} sh -c {shlex.quote(guest)} '
-              '< /dev/null || true')
+             f'timeout {APT_TIMEOUT} apt-get -o Acquire::Retries=5 update -qq >&2 && '
+             f'timeout {APT_TIMEOUT} apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends qemu-system-x86 >&2 && '
+             'echo "ref-qemu: $(qemu-system-x86_64 --version | head -1)" >&2 && '
+             f'exec timeout -s KILL {int(cap)} qemu-system-x86_64 -enable-kvm -cpu {REFERENCE_CPU} -m 2048 -smp {vcpus} '
+             f'-nodefaults -display none -serial stdio -no-reboot -kernel /b/kernel -initrd /b/initrd '
+             f'-append "{_cmdline(suite, part, args)}"')
+    script = (f'set -e; d=$(mktemp -d); trap \'docker kill {name} >/dev/null 2>&1 || true; rm -rf "$d"\' EXIT HUP TERM INT; '
+              f'tar xf - -C "$d"; {REF_HOST}echo "ref-boot: KVM, -cpu {REFERENCE_CPU}" >&2; {inputs._slot_wait()}'
+              f'docker run --rm -i --name {name} --device /dev/kvm -v "$d:/b:ro" {artifacts.BENCH_BUILDER} '
+              f'sh -c {shlex.quote(guest)} < /dev/null || true')
     try:
         with open(pack, 'rb') as f:
-            r = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], stdin=f, capture_output=True, timeout=cap + 900)
+            r = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], stdin=f, capture_output=True,
+                               timeout=cap + 2 * APT_TIMEOUT + 300)
+    except subprocess.TimeoutExpired:
+        subprocess.run(['ssh', '-o', 'BatchMode=yes', host, f'docker kill {name}'], capture_output=True, timeout=60)
+        raise
     finally:
         pack.unlink(missing_ok=True)
     text = r.stdout.decode(errors='replace')
     (work / 'native.txt').write_text(text)
     return BootResult(end_of(text) is not None, text, f'booted under KVM on {host}' +
-                      ('' if end_of(text) else f': {r.stderr.decode(errors="replace")[-400:]}'))
+                      ('' if end_of(text) else f': {r.stderr.decode(errors="replace")[-400:]}'), _reference(r.stderr))
+
+
+def write_reference(fam_dir: pathlib.Path, suite: str, img: pathlib.Path, br: BootResult) -> None:
+    """`<suite>-reference.txt` beside the suite: the machine a seeding run recorded its answers on (CPU, kernel, how it
+    ran: chroot, or KVM with its CPU model and QEMU) and the image it ran (its sha256 and cache key)."""
+    sha = json.loads((img / 'manifest.json').read_text())['image']['sha256'] if (img / 'manifest.json').is_file() else '?'
+    lines = [f'# The x86 reference machine of the {suite} answers (testkit/harness/campaign.py writes it when seeding).',
+             *(f'{k}: {v}' for k, v in sorted(br.reference.items())), f'image: sha256 {sha}, cache entry {img.name}']
+    (fam_dir / f'{suite}-reference.txt').write_text('\n'.join(lines) + '\n')
 
 
 _LIVE: set = set()          # natemu processes this worker started (each in its own session: a worker's group kill misses them)
@@ -342,7 +389,7 @@ def read_boot(img: pathlib.Path, suite: str) -> dict[str, dict]:
 
 # --- verdicts ---
 
-RANK = {'passed': 0, 'unsupported': 1, 'unverified': 2, 'flaky': 3, 'failed': 4}
+RANK = {'passed': 0, 'unsupported': 1, 'unverified': 2, 'flaky': 3, 'failed': 4, 'changed': 4}
 
 
 @functools.lru_cache(maxsize=None)
@@ -351,14 +398,17 @@ def _verdict(fam_dir: str, fam_name: str, spec: str):
     return getattr(family._load_module(pathlib.Path(fam_dir) / f'{mod}.py', f'testkit_verdicts_{fam_name}_{mod}'), fn)
 
 
-def judge(br: BootResult, fn, img: pathlib.Path) -> dict[str, tuple[str, str]]:
-    """name -> (verdict, message) for every result of one boot; a test reported twice keeps its worse verdict."""
-    wants_image = 'image' in inspect.signature(fn).parameters
+def judge(br: BootResult, fn, img: pathlib.Path, mode: dict | None = None) -> dict[str, tuple[str, str]]:
+    """name -> (verdict, message) for every result of one boot; a test reported twice keeps its worse verdict. A
+    verdict that takes `image` gets the image's folder, one that takes `mode` the run's floating-point mode
+    ({'afp': present and not hidden, 'fp': fast or accurate})."""
+    params = inspect.signature(fn).parameters
+    kw = {**({'image': img} if 'image' in params else {}), **({'mode': mode or {}} if 'mode' in params else {})}
     out = {}
     for name, f in parse(br.serial):
         extra = f.pop('extra')
         try:
-            v, msg = fn(name, f, extra, image=img) if wants_image else fn(name, f, extra)
+            v, msg = fn(name, f, extra, **kw)
         except Exception as e:          # a verdict that cannot read a result does not pass it
             v, msg = 'failed', f'the verdict raised {e!r} on {f}'
         if v not in RANK: v, msg = 'failed', f'the verdict returned {v!r}: {msg}'
@@ -386,6 +436,7 @@ def unreported(br: BootResult, fill, tests, got: dict) -> dict[str, tuple[str, s
 
 def adjust(name: str, verdict: str, msg: str, expected: dict) -> SubResult:
     if verdict == 'missing': return SubResult(name, 'failed', msg, category='missing')
+    if verdict == 'changed': return SubResult(name, 'failed', msg, category='changed')     # expected or not
     if verdict == 'flaky': return SubResult(name, 'skipped', msg, category='flaky')
     if name in expected:
         why = expected[name]
@@ -418,6 +469,17 @@ def part_args(suite: str, declared: str, env: str | None) -> str:
             bare = entry.strip()
     got = named.get(suite, bare)
     return (declared if got is None else got).strip(',')
+
+
+def kept_in_accurate(why: str) -> bool:
+    """Whether an expected_without.afp reason names a deviation that accurate mode keeps (fp_deviations.X87_OTHER's
+    "both modes" items, x87-band-ue-flag): its leading `name:`."""
+    from testkit import paths
+    paths.use_test_scripts()
+    import fp_deviations
+    other = getattr(fp_deviations, 'X87_OTHER', {})
+    name = why.split(':', 1)[0].strip()
+    return name in other and 'both modes' in other[name][0]
 
 
 class Campaign:
@@ -457,10 +519,14 @@ class Campaign:
         expected, flaky = dict(ex.get('expected', {})), dict(ex.get('flaky', {}))
         without = {f: dict(d) for f, d in ex.get('expected_without', {}).items()}
         off = os.environ.get('NATEMU_FEXC_FEATURE_OFF', '').split(',')      # hidden (a host.afp = false variant)
-        have = {f: v and f not in off for f, v in host.detect().features.items()} if without else {}
-        accurate = os.environ.get('NATEMU_FP') == 'accurate'
+        have = {f: v and f not in off for f, v in host.detect().features.items()}
+        fp = variant.get('engine.fp') or os.environ.get('NATEMU_FP') or 'fast'   # an engine.fp variant sets NATEMU_FP
+        accurate = fp == 'accurate'
+        mode = {'afp': bool(have.get('afp')), 'fp': fp}
+        fp_env = {'env': {'NATEMU_FP': fp}} if variant.get('engine.fp') else {}
         for f, d in without.items():
-            if f in have and not have[f] and not (f == 'afp' and accurate): expected.update(d)
+            if f in have and not have[f]:
+                expected.update({t: why for t, why in d.items() if not (f == 'afp' and accurate) or kept_in_accurate(why)})
         img = image(suite.name)
         parts = read_list(img, suite.name)
         declared = int(ex.get('parts', 1))
@@ -479,7 +545,7 @@ class Campaign:
         booted = f'{part},{args}' if args else part         # the kernel's part= word: the list's, plus the suite's options
 
         def results(br: BootResult) -> dict[str, tuple[str, str]]:
-            got = judge(br, fn, img)
+            got = judge(br, fn, img, mode)
             return got if fill is None else {**unreported(br, fill, tests, got), **got}
 
         x86 = os.environ.get('NATEMU_X86_HOST')
@@ -487,11 +553,12 @@ class Campaign:
         if seed and not x86: return CaseResult('failed', 'seeding needs NATEMU_X86_HOST=user@host')
 
         def once(w: pathlib.Path) -> BootResult:
-            if not seed: return boot(cpio, ct, booted, vcpus, w, cap, **how)
+            if not seed: return boot(cpio, ct, booted, vcpus, w, cap, **how, **fp_env)
             if ex.get('reference_boot') == 'kvm': return native_vm(cpio, ct, booted, vcpus, x86, cap, w, **how)
             return native(cpio, ct, booted, x86, cap, w)
 
         first = once(work / 'boot-1')
+        if seed and first.reached: write_reference(fam.dir, suite.name, img, first)
         got = results(first)
         listed = set(tests)
         missing = 'listed in the image for part ' + part + ' but not in the output' + \
@@ -529,6 +596,13 @@ class Campaign:
                     if name not in every:
                         sub.append(SubResult(f'{kind}:{name}', 'failed', f'the {kind} entry names no test the image '
                                              f'lists (renamed or removed?): {why}', category='stale-entry'))
+            for a in ex.get('answers', []):         # answer files: a name the image does not list is stale
+                af = fam.dir / a
+                names = {ln.split()[0] for ln in af.read_text().splitlines() if ln.strip() and not ln.startswith('#')} \
+                    if af.is_file() else set()
+                for name in sorted(names - every):
+                    sub.append(SubResult(f'answers:{a}:{name}', 'failed', f'{a} has an answer for {name}, which the image '
+                                         'does not list (renamed or removed? reseed: docs/testing.md)', category='stale-entry'))
             for f in without:
                 if f not in have:
                     sub.append(SubResult(f'expected_without.{f}', 'failed', f'this host reports no FEAT_{f.upper()} '

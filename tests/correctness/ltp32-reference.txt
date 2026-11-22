@@ -1,0 +1,6 @@
+# The x86 reference machine of the ltp32 answers (testkit/harness/campaign.py writes it when seeding).
+boot: KVM, -cpu host,-pku
+cpu: AMD Ryzen 7 8845HS w/ Radeon 780M Graphics
+kernel: 7.0.0-43-generic
+qemu: QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)
+image: sha256 775aab393283351a590d6fd8945ee8e526b1f0a23998bb3e0df4e918ba171f81, cache entry ce1dc7854f0034eea1674bc4190fd3c03f275f3a231edd73ebcc950aa50603ea

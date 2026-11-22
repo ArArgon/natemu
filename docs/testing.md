@@ -382,20 +382,28 @@ Four campaigns of 32-bit programs compare with the x86 reference machine (`refer
 (small 32-bit C programs built static and dynamic, Debian's i386 BusyBox and CPython with part of its regression tests,
 and 32- and 64-bit programs at once; in the gate, at 1, 2 and 4 vCPUs), and in the campaign tier `torture32` (the
 torture suite built for i686), `ltp32` (the `ltp` suite's LTP and selection built for i686) and `libm32` (glibc's math
-tests built for i686: x87 code; also with AFP hidden). `ltp32` and `libm32` judge each test by its own exit status, as
-`ltp` and `libm` do, and compare it with the reference machine's: a test unsupported under natemu that passed there
-fails. Their recipes share `tools/correctness/i386.sh` (gcc's
+tests built for i686: x87 code; also with AFP hidden, and in accurate mode then). `ltp32` and `libm32` judge each test
+by its own exit status, as `ltp` and `libm` do, against the reference machine's: a failure with the reference's own
+status passes (it fails the same way there, as in `torture32`), and a test unsupported under natemu that passed there
+fails. A `libm32` program that fails (all of them x87 long double or extended-precision deviations, listed in
+`expected`) must also fail exactly as recorded for its floating-point mode, by the count and hash of its failing cases
+(`tests/correctness/libm32-fails-MODE.txt`); otherwise it is `changed`, a failure, so an expected program hides no new
+failure. Record those after a change that alters them, on natemu, with `TESTKIT_SEED_FAILURES=1`, delete the files
+first and check the run with a second one. Their recipes share `tools/correctness/i386.sh` (gcc's
 32-bit multilib in the sysroot, Debian's i386 packages through a third private apt), which the `x86st` recipe also uses
 for the kernel selftests' `*_32` programs. The answers are files in the repo: each `i386` test's whole output in
 `tests/correctness/i386/`, each `torture32` program's exit status and output hash in `tests/correctness/torture32.txt`,
-each `ltp32` and `libm32` test's exit status in `tests/correctness/ltp32.txt` and `libm32.txt`.
+each `ltp32` and `libm32` test's exit status in `tests/correctness/ltp32.txt` and `libm32.txt` (a suite's `answers`
+key names its files: an answer for a test the image no longer lists is a stale-entry).
 To record them after changing a program or the recipe, run the suite with `TESTKIT_SEED_ANSWERS=1
 NATEMU_X86_HOST=user@host` (an x86-64 Linux machine with `zstd`, `cpio` and passwordless `sudo`): each part then runs
 there instead of under natemu, in the image's own root (`chroot`), and the verdict writes the answer files; commit
-them with the change. Such a run reports every test as unverified, never as passed. `ltp32` (`reference_boot =
-"kvm"`) instead boots each part there under KVM, with the stock kernel, command line, vCPUs and RAM of a natemu boot,
-since the kernel decides most LTP results: the machine also needs Docker and `/dev/kvm` (QEMU is Debian's, installed in
-the builds' pinned container image at each boot). For `torture32`, `ltp32` and `libm32`, delete the answer file first
+them with the change. Such a run reports every test as unverified, never as passed, and writes
+`tests/correctness/<suite>-reference.txt` (the machine's CPU and kernel, how it ran, the image). `ltp32`
+(`reference_boot = "kvm"`) instead boots each part there under KVM, with the stock kernel, command line, vCPUs and RAM
+of a natemu boot, since the kernel decides most LTP results, and the machine's CPU less protection keys,
+which natemu's profile has not: the machine also needs Docker and `/dev/kvm` (QEMU is Debian's, at the recipes'
+snapshot, installed in the builds' pinned container image at each boot). For `torture32`, `ltp32` and `libm32`, delete the answer file first
 and seed twice: a program whose output hash differs between the two runs (it prints an address)
 is recorded as `rc *` and compared by exit status alone (an `ltp32` or `libm32` test whose status differs, as `*`),
 so seeding over an old file would mark changed programs that way too.

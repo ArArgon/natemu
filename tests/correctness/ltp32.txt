@@ -20,7 +20,7 @@ cve:cve-2017-15299 0
 cve:cve-2017-15649 0
 cve:cve-2017-15951 0
 cve:cve-2017-16939 32
-cve:cve-2017-17052 2
+cve:cve-2017-17052 *
 cve:cve-2017-17053 0
 cve:cve-2017-17805 32
 cve:cve-2017-17806 32
@@ -920,7 +920,7 @@ syscalls:pipeio_6 0
 syscalls:pipeio_7 0
 syscalls:pipeio_8 0
 syscalls:pivot_root01 0
-syscalls:pkey01 0
+syscalls:pkey01 32
 syscalls:poll01 0
 syscalls:posix_fadvise01 0
 syscalls:posix_fadvise01_64 0

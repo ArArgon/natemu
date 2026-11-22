@@ -116,41 +116,73 @@ def torture32(name, f, extra):
 
 LTP32 = pathlib.Path(__file__).parent / 'ltp32.txt'
 LIBM32 = pathlib.Path(__file__).parent / 'libm32.txt'
+LIBM32_FAILS = pathlib.Path(__file__).parent      # libm32-fails-MODE.txt
+
+
+def _answers(file) -> dict:
+    return dict(ln.split(None, 1) for ln in file.read_text().splitlines() if ln.strip()) if file.is_file() else {}
+
+
+def _record(file, key, value):
+    """KEY VALUE into `file` (sorted lines), under a lock: parts may record at once."""
+    import fcntl
+    with open(file, 'a+') as h:
+        fcntl.flock(h, fcntl.LOCK_EX); h.seek(0)
+        known = dict(ln.split(None, 1) for ln in h.read().splitlines() if ln.strip())
+        known[key] = value(known.get(key))
+        h.seek(0); h.truncate(); h.write(''.join(f'{k} {v}\n' for k, v in sorted(known.items())))
 
 
 def _x86_rc(name, f, extra, file, own):
-    """`own`, the suite's own verdict from the test's exit status, beside the x86 reference machine's status for the
-    same test of the same image (`file`: `NAME RC` lines, `*` where two seeding runs differed). A test natemu reports
-    unsupported that passed there fails: natemu lacks something the real machine has. A failure's message gives the
-    reference's status. Under TESTKIT_SEED_ANSWERS=1 the status is the reference machine's: it is recorded (under a
-    lock: parts may seed at once), and the result is unverified."""
-    import fcntl, os
+    """`own`, the suite's own verdict from the test's exit status, against the x86 reference machine's status for the
+    same test of the same image (`file`: `NAME RC` lines, `*` where two seeding runs differed). A failure with the
+    reference's own non-zero status passes (it fails the same way there: the environment, not the CPU, as torture32);
+    a test natemu reports unsupported that passed there fails (natemu lacks something the real machine has). Under
+    TESTKIT_SEED_ANSWERS=1 the status is the reference machine's: it is recorded, and the result is unverified."""
+    import os
     rc = f.get('rc', '')
     if os.environ.get('TESTKIT_SEED_ANSWERS'):
-        with open(file, 'a+') as h:
-            fcntl.flock(h, fcntl.LOCK_EX); h.seek(0)
-            known = dict(ln.split(None, 1) for ln in h.read().splitlines())
-            known[name] = rc if known.get(name, rc) == rc else '*'
-            h.seek(0); h.truncate(); h.write(''.join(f'{k} {v}\n' for k, v in sorted(known.items())))
+        _record(file, name, lambda old: rc if old in (None, rc) else '*')
         return 'unverified', 'recorded'
-    known = dict(ln.split(None, 1) for ln in file.read_text().splitlines()) if file.is_file() else {}
+    known = _answers(file)
     if name not in known: return 'failed', f'no answer in {file.name} (seed it: docs/testing.md)'
+    ref = known[name]
     v, msg = own(name, f, extra)
-    if v == 'unsupported' and known[name] == '0':
+    if v == 'unsupported' and ref == '0':
         return 'failed', f'{msg}: unsupported here, passed on the x86 reference machine'
-    return v, f'{msg} (the x86 reference machine: rc={known[name]})' if v == 'failed' else msg
+    if v == 'failed' and rc == ref:
+        return 'passed', f'rc {rc}: fails the same way on the x86 reference machine'
+    return v, f'{msg} (the x86 reference machine: rc={ref})' if v == 'failed' else msg
 
 
 def ltp32(name, f, extra):
-    """run-ltp.sh on the i686 build of LTP: judged as ltp, beside the x86 reference machine's status (tests/correctness/
+    """run-ltp.sh on the i686 build of LTP: judged as ltp, against the x86 reference machine's status (tests/correctness/
     ltp32.txt; the same image and kernel booted there under KVM, testkit/harness/campaign.py native_vm)."""
     return _x86_rc(name, f, extra, LTP32, ltp)
 
 
-def libm32(name, f, extra):
-    """run-libm.sh on the i686 build of glibc's math tests: judged as libm, beside the x86 reference machine's status
-    (tests/correctness/libm32.txt; the image run there in a chroot, testkit/harness/campaign.py native)."""
-    return _x86_rc(name, f, extra, LIBM32, _glibc)
+def libm32(name, f, extra, mode=None):
+    """run-libm.sh on the i686 build of glibc's math tests: judged as libm, against the x86 reference machine's status
+    (tests/correctness/libm32.txt; the image run there in a chroot, testkit/harness/campaign.py native). A failure must
+    also be the one recorded for natemu in this floating-point mode (libm32-fails-MODE.txt, MODE afp, noafp or
+    noafp-accurate; `NAME fails=N fp=HASH`:
+    run-libm.sh's count and hash of the test's `Failure:` and `Maximal error of` lines, or of its whole output where
+    it has none), else it is `changed`, a failure whether `expected` lists it or not: an expected whole program cannot
+    hide a new failure inside it. TESTKIT_SEED_FAILURES=1 records natemu's failures instead."""
+    import os
+    v, msg = _x86_rc(name, f, extra, LIBM32, _glibc)
+    if v != 'failed' or f.get('rc') in ('77', 'skip') or os.environ.get('TESTKIT_SEED_ANSWERS'): return v, msg
+    if 'fp' not in f: return 'changed', f'{msg}; its result line has no failure fingerprint (run-libm.sh)'
+    mode = mode or {}
+    m = ('afp' if mode.get('afp') else 'noafp') + ('-accurate' if mode.get('fp') == 'accurate' else '')
+    got, file = f'fails={f.get("fails")} fp={f["fp"]}', LIBM32_FAILS / f'libm32-fails-{m}.txt'
+    if os.environ.get('TESTKIT_SEED_FAILURES'):
+        _record(file, name, lambda old: got)
+        return v, f'{msg} (failure recorded: {got})'
+    want = _answers(file).get(name)
+    if want is None: return 'changed', f'{msg}; no failure of it recorded in {file.name}'
+    if want != got: return 'changed', f'{msg}; it fails otherwise than recorded for {m} ({want}, now {got})'
+    return v, msg
 
 
 I386 = pathlib.Path(__file__).parent / 'i386'

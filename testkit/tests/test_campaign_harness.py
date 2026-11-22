@@ -62,8 +62,8 @@ class FakeBoot:
         self.by_part = {k: list(v) if isinstance(v, list) else [v] for k, v in by_part.items()}
         self.calls = []
 
-    def __call__(self, image, suite, part, vcpus, work, cap):
-        self.calls.append(dict(image=image, suite=suite, part=part, vcpus=vcpus, work=work, cap=cap))
+    def __call__(self, image, suite, part, vcpus, work, cap, env=None):
+        self.calls.append(dict(image=image, suite=suite, part=part, vcpus=vcpus, work=work, cap=cap, env=env))
         work.mkdir(parents=True, exist_ok=True)
         q = self.by_part[part]
         text = q.pop(0) if len(q) > 1 else q[0]
@@ -469,8 +469,9 @@ def test_reference_compared_verdicts(tmp_path, monkeypatch):
 
 
 def test_reference_status_verdicts(tmp_path, monkeypatch):
-    """ltp32 and libm32: the suite's own verdict from the exit status, and the x86 reference machine's status recorded
-    when seeding (`*` where two seeding runs differ); unsupported here where the reference passed fails."""
+    """ltp32 and libm32: the suite's own verdict from the exit status against the x86 reference machine's status,
+    recorded when seeding (`*` where two seeding runs differ): a failure with the reference's own status passes (as
+    torture32), another fails, and unsupported here where the reference passed fails."""
     v = verdicts()
     monkeypatch.setattr(v, 'LTP32', tmp_path / 'ltp32.txt'); monkeypatch.setattr(v, 'LIBM32', tmp_path / 'libm32.txt')
     monkeypatch.setenv('TESTKIT_SEED_ANSWERS', '1')
@@ -480,17 +481,73 @@ def test_reference_status_verdicts(tmp_path, monkeypatch):
     assert (tmp_path / 'ltp32.txt').read_text() == 's:a 0\ns:b 32\ns:c 2\ns:t *\n'
     monkeypatch.delenv('TESTKIT_SEED_ANSWERS')
     t = lambda n, rc: v.ltp32(n, {'rc': rc}, [])[0]
-    assert [t('s:a', '0'), t('s:a', '32'), t('s:a', '1'), t('s:b', '32'), t('s:c', '2'), t('s:t', '32')] == \
-        ['passed', 'failed', 'failed', 'unsupported', 'failed', 'unsupported']
-    assert 'reference machine: rc=2' in v.ltp32('s:c', {'rc': '2'}, [])[1]
+    assert [t('s:a', '0'), t('s:a', '32'), t('s:a', '1'), t('s:b', '32'), t('s:c', '2'), t('s:c', '1'), t('s:t', '32')] == \
+        ['passed', 'failed', 'failed', 'unsupported', 'passed', 'failed', 'unsupported']
+    assert 'fails the same way' in v.ltp32('s:c', {'rc': '2'}, [])[1]
+    assert 'reference machine: rc=2' in v.ltp32('s:c', {'rc': '1'}, [])[1]
     assert t('s:new', '0') == 'failed'
-    m = lambda rc: v.libm32('math/test-x', {'rc': rc}, [])[0]
-    assert [m('0'), m('77'), m('1')] == ['passed', 'failed', 'failed']
+    m = lambda rc: v.libm32('math/test-x', {'rc': rc, 'fails': '0', 'fp': 'x'}, [], mode={'afp': True, 'fp': 'fast'})[0]
+    assert [m('0'), m('77')] == ['passed', 'failed']
+
+
+def test_libm32_failure_must_match_its_recorded_one(tmp_path, monkeypatch):
+    """libm32: a failing program must fail exactly as recorded for its floating-point mode (count and hash of its
+    failure lines, libm32-fails-MODE.txt), else `changed`, which fails even when `expected` lists the program."""
+    v = verdicts()
+    monkeypatch.setattr(v, 'LIBM32', tmp_path / 'libm32.txt'); monkeypatch.setattr(v, 'LIBM32_FAILS', tmp_path)
+    (tmp_path / 'libm32.txt').write_text('math/test-x 0\n')
+    f = lambda fp: {'rc': '1', 'fails': '3', 'fp': fp}
+    afp, noafp, acc = {'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'fast'}, {'afp': False, 'fp': 'accurate'}
+    assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'changed'           # nothing recorded
+    monkeypatch.setenv('TESTKIT_SEED_FAILURES', '1')
+    assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'failed'
+    assert v.libm32('math/test-x', f('bb'), [], mode=noafp)[0] == 'failed'
+    assert (tmp_path / 'libm32-fails-afp.txt').read_text() == 'math/test-x fails=3 fp=aa\n'
+    assert (tmp_path / 'libm32-fails-noafp.txt').read_text() == 'math/test-x fails=3 fp=bb\n'
+    monkeypatch.delenv('TESTKIT_SEED_FAILURES')
+    assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'failed'
+    assert v.libm32('math/test-x', f('aa'), [], mode=noafp)[0] == 'changed'
+    assert v.libm32('math/test-x', f('aa'), [], mode=acc)[0] == 'changed'          # libm32-fails-noafp-accurate.txt
+    assert v.libm32('math/test-x', {'rc': '1'}, [], mode=afp)[0] == 'changed'        # no fingerprint on the line
+    assert campaign.adjust('math/test-x', 'changed', 'm', {'math/test-x': 'why'}).outcome == 'failed'
+
+
+def test_answers_naming_no_test_of_the_image_are_stale(setup, tmp_path):
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', 'CT-RESULT openssl default:test_a rc=0 ok=1 notok=0',
+                                                'CT-RESULT openssl generic:test_a rc=0 ok=1 notok=0')},
+                      extra='answers = ["a.txt"]\n')
+    (tmp_path / 'tests' / 'c' / 'a.txt').write_text('default:test_a 0\nold:test 2\n')
+    s = subs(run('part-0'))
+    assert s['answers:a.txt:old:test'] == ('failed', 'stale-entry') and 'answers:a.txt:default:test_a' not in s
+
+
+def test_engine_fp_variant_boots_with_natemu_fp_and_tells_the_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=1')
+    monkeypatch.setenv('NATEMU_FEXC_FEATURE_OFF', 'afp')
+    fam, suite = make_family(tmp_path)
+    img = make_image(tmp_path, suite.name, OSSL_LIST)
+    monkeypatch.setattr(campaign, 'image', lambda name: img)
+    fake = FakeBoot({'0/2': serial('0/2', *BAD_A)})
+    monkeypatch.setattr(campaign, 'boot', fake)
+    seen = []
+    monkeypatch.setattr(campaign, '_verdict', lambda *a: lambda name, f, extra, mode: (seen.append(mode), ('passed', ''))[1])
+    variant = family.Variant((('engine.fp', 'accurate'), ('machine.vcpus', 4)))
+    campaign.HARNESS.run_part(fam, suite, 'part-0', variant, tmp_path / 'run')
+    assert fake.calls[0]['env'] == {'NATEMU_FP': 'accurate'} and seen[0] == {'afp': False, 'fp': 'accurate'}
+
+
+def test_libm32_accurate_variant_only_without_afp():
+    rules = family._load_module(REPO / 'tests' / 'correctness' / 'rules.py', 'test_correctness_rules')
+    v = lambda **p: family.Variant(tuple(sorted({'machine.vcpus': 4, **p}.items())))
+    assert rules.applies('libm32', 'part-0', v(**{'host.afp': True, 'engine.fp': 'accurate'}), {})
+    assert rules.applies('libm32', 'part-0', v(**{'host.afp': False, 'engine.fp': 'accurate'}), {}) is None
+    assert rules.applies('libm32', 'part-0', v(**{'host.afp': True, 'engine.fp': 'fast'}), {}) is None
 
 
 def test_native_vm_boots_the_same_kernel_and_command_line_under_kvm(tmp_path, monkeypatch):
     """native_vm(): the kernel and image go to the x86 machine in one tar, and QEMU there boots them under KVM with
-    boot()'s command line, vCPUs and 2 GiB; the serial output is the result."""
+    boot()'s command line, vCPUs and 2 GiB, in a named container the session's end kills; the serial output is the
+    result and the machine's stderr lines its provenance."""
     import subprocess, tarfile, types
     (tmp_path / 'k').write_bytes(b'kernel'); (tmp_path / 'i.cpio.zst').write_bytes(b'initrd')
     seen = {}
@@ -498,15 +555,28 @@ def test_native_vm_boots_the_same_kernel_and_command_line_under_kvm(tmp_path, mo
     def fake(cmd, stdin, capture_output, timeout):
         seen['cmd'] = cmd
         with tarfile.open(fileobj=stdin) as t: seen['files'] = {m.name: t.extractfile(m).read() for m in t}
-        return types.SimpleNamespace(returncode=0, stdout=serial('1/4', 'CT-RESULT ltp s:a rc=0', suite='ltp').encode(), stderr=b'')
+        return types.SimpleNamespace(returncode=0, stdout=serial('1/4', 'CT-RESULT ltp s:a rc=0', suite='ltp').encode(),
+                                     stderr=b'ref-cpu: AMD X\nref-kernel: 7.0\nref-boot: KVM\nref-qemu: QEMU emulator version 10\n')
     monkeypatch.setattr(subprocess, 'run', fake)
     r = campaign.native_vm(tmp_path / 'i.cpio.zst', 'ltp', '1/4', 4, 'u@x86', 600, tmp_path / 'w', kernel=tmp_path / 'k')
     assert r.reached and seen['files'] == {'kernel': b'kernel', 'initrd': b'initrd'}
     assert seen['cmd'][:3] == ['ssh', '-o', 'BatchMode=yes'] and seen['cmd'][3] == 'u@x86'
     script = seen['cmd'][4]
-    for want in ('--device /dev/kvm', '-enable-kvm -cpu host -m 2048 -smp 4', 'ct=ltp part=1/4', campaign.artifacts.BENCH_BUILDER):
+    name = re.search(r'--name (\S+)', script)[1]
+    for want in ('--device /dev/kvm', f'-enable-kvm -cpu {campaign.REFERENCE_CPU} -m 2048 -smp 4', 'ct=ltp part=1/4',
+                 campaign.artifacts.BENCH_BUILDER, f"trap 'docker kill {name}", 'EXIT HUP TERM INT',
+                 f'timeout {campaign.APT_TIMEOUT} apt-get', f'archive/debian/{campaign._snap()}/'):
         assert want in script, want
+    assert r.reference == {'cpu': 'AMD X', 'kernel': '7.0', 'boot': 'KVM', 'qemu': 'QEMU emulator version 10'}
     assert (tmp_path / 'w' / 'native.txt').read_text().count('CT-RESULT') == 1 and not (tmp_path / 'w' / 'boot.tar').exists()
+    img = tmp_path / 'img'; img.mkdir(); (img / 'manifest.json').write_text('{"image": {"sha256": "ab"}}')
+    campaign.write_reference(tmp_path, 'ltp32', img, r)
+    assert (tmp_path / 'ltp32-reference.txt').read_text().splitlines()[1:] == \
+        ['boot: KVM', 'cpu: AMD X', 'kernel: 7.0', 'qemu: QEMU emulator version 10', 'image: sha256 ab, cache entry img']
+
+
+def test_reference_snapshot_is_the_recipes_one():
+    assert campaign._snap() == re.search(r'^SNAP=(\S+)$', (REPO / 'tools/correctness/recipes/common.sh').read_text(), re.M)[1]
 
 
 def test_x86st_fail_count_fails():
@@ -867,8 +937,9 @@ def test_correctness_family_declares_its_campaigns():
     assert {s.name for s in fam.suites} >= {'openssl', 'torture', 'libm', 'gstr', 'x86st', 'litmus'}
     for name in ('torture', 'libm', 'gstr', 'x86st'):   # every known non-pass names the document that records it
         assert all(re.search(r'docs/\S+\.md', why) for why in fam.suite(name).extra['expected'].values()), name
-    assert fam.suite('x86st').extra['parts'] == 25
-    assert sorted(fam.suite('x86st').extra['expected']) == ['sigreturn_64', 'sysret_ss_attrs_64', 'test_shadow_stack_64']
+    assert fam.suite('x86st').extra['parts'] == 49        # 25 64-bit programs and, since M2 checkpoint A, 24 32-bit ones
+    assert sorted(fam.suite('x86st').extra['expected']) == ['ldt_gdt_32', 'sigreturn_32', 'sigreturn_64', 'sysret_ss_attrs_64',
+                                                            'test_shadow_stack_64', 'test_syscall_vdso_32']
     assert list(fam.suite('gstr').extra['expected']) == ['wcsmbs/tst-wcstod-round']
     libm = fam.suite('libm').extra['expected']      # correctness-userspace.md, finding 1: 320 by family + 12 named
     fams = re.compile(r'math/test-(ldouble|float64x|(float|double|float32|float32x|float64)-(ldouble|float64x))-')
@@ -876,10 +947,23 @@ def test_correctness_family_declares_its_campaigns():
     assert all('reduced precision' in why and 'correctness-userspace.md' in why for why in libm.values())
     v = verdicts()
     for s in fam.suites:
-        assert (s.kind, s.harness, s.extra['tier']) == ('judged', 'campaign', 'campaign')
+        # i386 has no tier: it is in the gate
+        assert (s.kind, s.harness, s.extra.get('tier')) == ('judged', 'campaign', None if s.name == 'i386' else 'campaign')
+        # every known non-pass names the document that records it, and no test is both always and only-without expected
+        without = {t: why for d in s.extra.get('expected_without', {}).values() for t, why in d.items()}
+        for t, why in {**s.extra.get('expected', {}), **without, **s.extra.get('flaky', {})}.items():
+            assert re.search(r'docs/\S+\.md', why), (s.name, t)
+        assert not set(s.extra.get('expected', {})) & set(without), s.name
         mod, fn = s.extra['verdict'].split(':')
         assert mod == 'verdicts' and callable(getattr(v, fn))
         if s.name in ('openssl', 'torture'): assert s.matrix == {'machine.vcpus': [4]}
+    # the 32-bit campaigns: answers from the x86 reference machine, LTP's from the same kernel under KVM; their answer
+    # files exist (part-0 reports a stale one)
+    for name in ('i386', 'torture32', 'ltp32', 'libm32'): assert fam.suite(name).reference == 'x86', name
+    assert fam.suite('ltp32').extra.get('reference_boot') == 'kvm' and 'reference_boot' not in fam.suite('libm32').extra
+    for name in ('ltp32', 'libm32'):
+        assert all((fam.dir / a).is_file() for a in fam.suite(name).extra['answers']), name
+    assert fam.suite('libm32').matrix == {'machine.vcpus': [4], 'host.afp': [True, False], 'engine.fp': ['fast', 'accurate']}
     t = fam.suite('torture').extra['expected']
     assert sorted(t) == sorted(f'{n}.{o}' for n in ('ieee_inf-2', 'ieee_inf-3', 'ieee_pr36332', 'pr39228') for o in ('O0', 'O2'))
     assert all('reduced precision' in why and 'docs/restructure/correctness-userspace.md' in why for why in t.values())
