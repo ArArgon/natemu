@@ -6,15 +6,19 @@
 use natemu_abi::code_object::{self as object, Header, Reloc};
 use crate::admission::Admitted;
 use natemu_abi::execution::{
-    LinkPoint, MAX_LINK_POINTS, cache::MAX_RELOCS, canonical, pack_reloc, relocate_code, relocate_move,
+    LinkPoint, MAX_LINK_POINTS, cache::MAX_RELOCS, canonical, in_32_bits, pack_reloc, relocate_code_mode,
+    relocate_move_mode,
 };
 
 /// The object for `to`, or `None` when relocation alone would not give fexc's own answer there:
 /// - the block was cut before a direct branch to a non-canonical target (`unsupported_form`): at `to` the target may be
 ///   canonical and fexc compile further (the reverse canonical case);
 /// - a relocated value, `to` or the block's end is not canonical (fexc cuts such a branch at `to`);
-/// - a guest-RIP move's words are a 32-bit form, before or after (conservative: a 32-bit `EntrypointOffset` would be
-///   masked by FEX, which an added shift is not; slice1 is 64-bit only, so this never occurs, but nothing here proves it);
+/// - in 64-bit code, a guest-RIP move's words are a 32-bit form, before or after (conservative: nothing proves fexc's
+///   choice there; such code runs at one RIP);
+/// - in 32-bit code (the object's own `guest_bitness`, which admission holds to the request's mode; M2 reuse), where fexc
+///   masks every guest-EIP constant to 32 bits and loads it in the 32-bit form: a move in another form, or a RIP, block
+///   end or relocated value, old or new, not below 4 GiB (a wrap at 4 GiB is never relocated);
 /// - a move needs another number of words for its new value (FEX's `LoadConstant` picks the form by the value);
 /// - a relocation of any other kind, or a malformed object (admission's to refuse; not relocated).
 pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
@@ -31,6 +35,11 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
     if !canonical(to) || !canonical(to.wrapping_add(h.guest_bytes.into())) {
         return None;
     }
+    let bits32 = match h.guest_bitness {
+        64 => false,
+        32 if in_32_bits(from, h.guest_bytes) && in_32_bits(to, h.guest_bytes) => true,
+        _ => return None,
+    };
     let (code, size) = (h.code_offset as usize, h.code_size as usize);
     let mut out = o.to_vec();
     out[24..32].copy_from_slice(&to.to_le_bytes());
@@ -43,7 +52,7 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
             _ => return None,
         }
         let value = r.value.wrapping_add(d);
-        if !canonical(value) {
+        if !canonical(value) || (bits32 && (r.value | value) >> 32 != 0) {
             return None;
         }
         out[at + 8..at + 16].copy_from_slice(&value.to_le_bytes());
@@ -57,7 +66,7 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
                 .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                 .collect();
             // The rule the resident's copies share (perf chunk 10).
-            let (new, n, old) = relocate_move(&words, u32::from(r.register), d)?;
+            let (new, n, old) = relocate_move_mode(&words, u32::from(r.register), d, bits32)?;
             if old != r.value {
                 return None;
             }
@@ -116,7 +125,7 @@ pub(crate) fn kept(
         .to_vec();
     let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
     links[..form.links.len()].copy_from_slice(&form.links);
-    relocate_code(&mut code, &relocs, &mut links, from, to, h.guest_bytes).ok()?;
+    relocate_code_mode(&mut code, &relocs, &mut links, from, to, h.guest_bytes, h.guest_bitness == 32).ok()?;
     // Safety does not rest on two relocators agreeing: the code is the moved object's.
     if rest.object.get(h.code_offset as usize..)?.get(..h.code_size as usize)? != code {
         return None;
@@ -562,6 +571,52 @@ mod tests {
             None
         );
         assert_eq!(relocate_move(&w[..n], 6, 0x1000), None);
+    }
+
+    /// M2 reuse, the move rule for 32-bit code: the 32-bit form alone, re-encoded in as many words; refused when the value
+    /// wraps at 4 GiB either way, the word count differs, or the words are the 64-bit form.
+    #[test]
+    fn the_move_rule_of_32_bit_code() {
+        use natemu_abi::execution::{in_32_bits, relocate_code_mode, relocate_move_mode as mv};
+        let low = |c: u64| {
+            let (w, n) = load_constant(c, 0);
+            assert!(w[0] >> 31 == 0);
+            (w, n)
+        };
+        for (old, new) in [
+            (0x5655_5346u64, 0xf7c5_6346u64), // movz + movk
+            (0xf7c5_6346, 0x5655_5346),
+            (0xffff_1346, 0xffff_8346), // movn
+            (0x00ff_f000, 0x0ff0_0000), // a bitmask, both
+        ] {
+            let (w, n) = low(old);
+            assert_eq!(mv(&w[..n], 0, new.wrapping_sub(old), true), Some((low(new).0, n, old)), "{old:#x} to {new:#x}");
+            // 64-bit code refuses the form, as before.
+            assert_eq!(mv(&w[..n], 0, new.wrapping_sub(old), false), None);
+            assert_eq!(relocate_move(&w[..n], 0, new.wrapping_sub(old)), None);
+        }
+        let (w, n) = low(0x5655_5346);
+        // Past 4 GiB and below 0 (FEX would wrap; never relocated), and other word counts (a zero half, a bitmask, movn).
+        for to in [0x1_0000_0346u64, 0xffff_ffff_ffff_f346, 0x5655_0000, 0x2346, 0x00ff_f000, 0xffff_1346] {
+            assert_eq!(mv(&w[..n], 0, to.wrapping_sub(0x5655_5346), true), None, "to {to:#x}");
+        }
+        // The 64-bit form in 32-bit code (an unmasked site's value at or above 4 GiB).
+        let (w, n) = load_constant(0x1_5655_5346, 0);
+        assert_eq!(mv(&w[..n], 0, 0x1000, true), None);
+        assert_eq!(mv(&w[..n], 0, 0u64.wrapping_sub(0x1_0000_0000), true), None);
+        // The block's place: both ends below 4 GiB at both RIPs.
+        assert!(in_32_bits(0xffff_f000, 0xfff) && !in_32_bits(0xffff_f000, 0x1000) && !in_32_bits(1 << 32, 0));
+        let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+        for (from, to, bytes) in [(0xffff_f000u64, 0x5655_5000u64, 0x1000), (0x5655_5000, 0xffff_f000, 0x1000), (0x5655_5000, 0x1_5655_5000, 4)] {
+            assert_eq!(relocate_code_mode(&mut [], &[], &mut links, from, to, bytes, true), Err(refusal::PLACE));
+        }
+        assert_eq!(relocate_code_mode(&mut [], &[], &mut links, 0x5655_5000, 0xffff_f000, 0xfff, true), Ok(()));
+        // A literal slot's value, old and new.
+        for (value, to, ok) in [(0x5655_5346u64, 0xf7c5_6000u64, true), (0xffff_f346, 0x5655_6000, false), (0x1_0000_0346, 0x5655_4000, false)] {
+            let mut code = value.to_le_bytes();
+            let moved = relocate_code_mode(&mut code, &[0], &mut links, 0x5655_5000, to, 4, true);
+            assert_eq!(moved.is_ok(), ok, "{value:#x}: {moved:?}");
+        }
     }
 
     /// Every logical immediate the decoder knows encodes back to one that decodes to it, and nothing else encodes.

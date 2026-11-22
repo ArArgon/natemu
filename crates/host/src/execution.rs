@@ -2086,8 +2086,23 @@ impl Answer {
         }
     }
 }
-/// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-pub(crate) const GATING: usize = 15;
+/// The number of fexc's gating arguments (`FEXC_ARG_*`: the bits of its `args_read`), the x87 guess last.
+const FEXC_ARGS: usize = 16;
+/// The values kept answers are matched by ([`Compiler::gating`]): fexc's gating arguments, each compared where the compile
+/// read it, then [`MODE`].
+pub(crate) const GATING: usize = FEXC_ARGS + 1;
+/// The index (and `Entry::read` bit) of the request's code mode among the gating values: what fexc reads of a request
+/// without reporting it in `args_read`, so always compared ([`mode_read`]).
+const MODE: usize = FEXC_ARGS;
+/// fexc's `args_read` as a kept answer's `read`: with [`MODE`]. An argument beyond the ones answers are matched by is an
+/// error: an answer that read it would be served to a request with another value of it (M2 task 4's review: the x87
+/// guess, then outside the key).
+fn mode_read(args_read: u32) -> Result<u32> {
+    if args_read >> FEXC_ARGS != 0 {
+        return Err(format!("fexc read an argument beyond the ones kept answers are matched by ({args_read:#x})").into());
+    }
+    Ok(args_read | 1 << MODE)
+}
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -2836,7 +2851,10 @@ impl Compiler {
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
     /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, (perf chunk 26) bulk REP STOS, and
-    /// (AFP fallback chunk 3a) DAZ and effective FTZ, (AFP accurate plan chunk 1) accurate mode, and `--push-run`.
+    /// (AFP fallback chunk 3a) DAZ and effective FTZ, (AFP accurate plan chunk 1) accurate mode, `--push-run`, and (M2 task
+    /// 4) the x87 guess as [`Compiler::body_with`] sends it; then [`MODE`]: 32-bit code and its null FS, GS, DS and ES
+    /// (`--bitness 32`, `--fs-null` .. `--es-null`). With the block limit, the RIP's half and page offset, the bytes read
+    /// (the key) and the features (one map per feature set) that is every part of a request ([`Compiler::body_with`]).
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -2864,6 +2882,12 @@ impl Compiler {
             flag("--ftz"),
             flag("--accurate"),
             self.push_run.into(),
+            if self.bits32 { self.x87_guess } else { 0 },
+            if self.bits32 {
+                self.null_segments.iter().enumerate().fold(1, |m, (i, &null)| m | u64::from(null) << (i + 1))
+            } else {
+                0
+            },
         ]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
@@ -2877,7 +2901,7 @@ impl Compiler {
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
-        let (found, waited) = if self.bits32 { (None, 0) } else { self.answers.find(bytes, rip, limit, &gating) };
+        let (found, waited) = self.answers.find(bytes, rip, limit, &gating);
         self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
@@ -2897,7 +2921,7 @@ impl Compiler {
         }
         // Nothing kept, or an answer kept for another RIP that is not fexc's here: the persistent cache only in the first
         // case (it is keyed as memory is, so it would hold the same answer).
-        let mut disk = found.is_none() && !self.bits32;
+        let mut disk = found.is_none();
         loop {
             let (compiles, disk_hits) = (self.compiles, self.disk_hits);
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
@@ -2907,13 +2931,7 @@ impl Compiler {
                 reply.extent as usize >= bytes.len(),
                 bytes.len().min(reply.extent as usize),
             );
-            // Every argument fexc read must be one the kept answers are matched by ([`Compiler::gating`]): an answer that read
-            // another would never be served again, silently (M2 task 4's review: the x87 guess, read for 64-bit code too).
-            // 32-bit code's answers are not kept; its guess is beyond the gating arguments.
-            if !self.bits32 && reply.read >> GATING != 0 {
-                return Err(format!("fexc read an argument beyond the gating arguments ({:#x}) for 64-bit code", reply.read));
-            }
-            let (read, prefix) = (reply.read, bytes[..end].to_vec());
+            let (read, prefix) = (mode_read(reply.read)?, bytes[..end].to_vec());
             let entry = Arc::new(Entry {
                 rip: at,
                 owner: self.vcpu,
@@ -2925,7 +2943,7 @@ impl Compiler {
                 kept: Default::default(),
                 published: AtomicU64::new(0),
             });
-            let (held, waited) = if self.bits32 { (None, 0) } else { self.answers.insert(limit, entry.clone(), bytes, rip) };
+            let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
             self.waited(waited);
             // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
             if disk && self.compiles > compiles && held.is_some_and(|o| o != self.vcpu) {
@@ -2933,7 +2951,7 @@ impl Compiler {
             }
             // PIC study: fexc compiled again an answer the map had dropped (by this vCPU's own: `.1`).
             let mut recompiled = false;
-            if self.compiles > compiles && !self.bits32 {
+            if self.compiles > compiles {
                 if let Some(owner) = self.answers.recompiled(limit, &entry) {
                     self.recompiled[0] += 1;
                     self.recompiled[1] += u64::from(owner == self.vcpu);
@@ -3116,7 +3134,7 @@ impl Compiler {
         }
         self.reuse_checks += 1;
         let fresh = (
-            reply.read,
+            mode_read(reply.read)?,
             reply.extent as usize >= bytes.len(),
             bytes.len().min(reply.extent as usize),
         );
@@ -3415,7 +3433,7 @@ impl Compiler {
         _hook: &mut impl Hook,
     ) -> Result<(Reply, u64)> {
         let t = self.stamp();
-        let cache = self.disk.clone().filter(|_| self.cpl3 && !self.bits32);
+        let cache = self.disk.clone().filter(|_| self.cpl3);
         let key = cache
             .as_ref()
             .filter(|d| disk && !d.is_empty())
@@ -4318,7 +4336,9 @@ fn translation(
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
         compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
-        if !step {
+        // (The pool holds 64-bit code only, [`Compiler::publish`]'s `template`: 32-bit code's requests of one context differ
+        // in the x87 guess.)
+        if !step && !compiler.bits32 {
             compiler.note_gating(state.cpu.code_context())?;
         }
         let code = compiler.compile(&bytes, rip, step, hook)?;
@@ -5350,10 +5370,10 @@ mod tests {
         }
     }
     /// M2, with `FEXC` set: a request for 32-bit code asks fexc for `--bitness 32` (with `--push-run`, task 4), is admitted under
-    /// the 32-bit rules, and is compiled every time: its answer is not kept, so it is neither found again nor moved to
-    /// another RIP, and a 64-bit request for the same bytes at the same RIP gets its own compile.
+    /// the 32-bit rules, and its answer is kept and moved to other EIPs as 64-bit code's is (M2 reuse), apart from a 64-bit
+    /// request's for the same bytes and from one under other null segments or another x87 guess it read.
     #[test]
-    fn requests_for_32_bit_code_are_always_compiled() {
+    fn answers_for_32_bit_code_are_kept_by_mode_segments_and_guess() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
@@ -5364,20 +5384,67 @@ mod tests {
         let args = String::from_utf8_lossy(&body[4..body.len() - 1]).replace('\0', " ");
         assert!(args.contains("--bitness 32") && args.contains("--push-run"), "{args}");
         let code = [0x40, 0x01, 0xd8, 0xc3]; // inc eax; add eax, ebx; ret (64-bit code: REX add; ret)
-        let mut insns = |c: &mut super::Compiler, rip| match c.compile(&code, rip, false, &mut ()).unwrap() {
+        let mut insns = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
             Code::Block(b) => b.guest_insns,
             _ => panic!("no block"),
         };
-        assert_eq!(insns(&mut c, 0x1000), 3);
-        assert_eq!(insns(&mut c, 0x1000), 3);
-        assert_eq!(insns(&mut c, 0x2000), 3);
-        assert_eq!((c.compiles, c.hits, c.relocated, c.disk_hits), (3, 0, 0, 0));
+        // M2 reuse: kept by code mode, under the reuse check (a relocated answer is fexc's at the new EIP, a kept form
+        // admission's). The same bytes are another answer in 64-bit code, at the same RIP and at another.
+        c.check_reuse = true;
+        assert_eq!(insns(&mut c, &code, 0x1000), 3);
+        assert_eq!(insns(&mut c, &code, 0x1000), 3);
+        assert_eq!(insns(&mut c, &code, 0x2000), 3);
+        assert_eq!((c.compiles, c.hits, c.relocated, c.disk_hits), (1, 2, 1, 0));
         c.bits32 = false;
-        assert_eq!(insns(&mut c, 0x1000), 2);
-        assert_eq!((c.compiles, c.hits), (4, 0));
+        assert_eq!(insns(&mut c, &code, 0x1000), 2);
+        assert_eq!(insns(&mut c, &code, 0x3000), 2);
+        assert_eq!((c.compiles, c.hits, c.relocated), (2, 3, 2));
         c.bits32 = true;
-        assert_eq!(insns(&mut c, 0x1000), 3);
-        assert_eq!((c.compiles, c.hits), (5, 0));
+        assert_eq!(insns(&mut c, &code, 0x3000), 3);
+        assert_eq!((c.compiles, c.hits, c.relocated), (2, 4, 3));
+        // Guest-EIP constants (a CALL's return address and target, a branch's two exits, the PC-thunk CALL to the next
+        // instruction) at library and program addresses: relocated, the moves in their 32-bit form.
+        let pic = [0x40, 0xe8, 0x00, 0x00, 0x00, 0x00]; // inc eax; call $+5
+        let jcc = [0x40, 0x75, 0x10, 0x90]; // inc eax; jne $+0x12; ...
+        let far = [0x40, 0xe8, 0x00, 0x10, 0xff, 0xff]; // inc eax; call $-0xf000+6
+        for code in [&pic[..], &jcc, &far] {
+            let (compiles, relocated) = (c.compiles, c.relocated);
+            for rip in [0xf7d1_2340u64, 0xf7c5_6340, 0x5655_5340, 0x5661_2340] {
+                insns(&mut c, code, rip);
+            }
+            assert_eq!((c.compiles - compiles, c.relocated - relocated), (1, 3), "{code:x?}");
+        }
+        // Refused, so compiled: a value whose word count differs (bits 31:16 or 15:0 of a target zero), and anything that
+        // wraps at 4 GiB at either end (the target below 0; the return address at 4 GiB).
+        let refused = c.relocation_refused;
+        insns(&mut c, &pic, 0x0000_2340); // 0x2346: one word
+        insns(&mut c, &far, 0x0000_e340); // the target wraps below 0
+        insns(&mut c, &far, 0x5660_e340); // from the wrapped one
+        insns(&mut c, &jcc, 0xffff_fff0 - 4); // ends below 4 GiB, a target above it
+        assert!(c.relocation_refused >= refused + 3, "{} refusals", c.relocation_refused - refused);
+        // The null segments and the x87 guess are the answer's: another value is another answer where fexc read it (the
+        // guess: in x87 code only).
+        let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret
+        let mut same = |c: &mut super::Compiler, code: &[u8], rip| {
+            let n = c.compiles;
+            insns(c, code, rip);
+            c.compiles == n
+        };
+        c.x87_guess = 0x1000;
+        assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
+        assert!(same(&mut c, &code, 0x4000), "no x87: the guess is not read");
+        c.x87_guess = 0x1701;
+        assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
+        c.x87_guess = 0;
+        assert!(!same(&mut c, &fld, 0x5655_5800));
+        c.x87_guess = 0x1000;
+        assert!(same(&mut c, &fld, 0x5655_5800));
+        c.null_segments = [true, false, false, false];
+        assert!(!same(&mut c, &fld, 0x5655_5800) && !same(&mut c, &code, 0x4000));
+        c.null_segments = [false; 4];
+        c.x87_guess = 0;
+        assert!(same(&mut c, &code, 0x4000));
+        c.check_reuse = false;
         // M2 task 3a: system cuts are decoded in 32-bit mode (40 is INC EAX before the INT, not a REX prefix), and an
         // access through a null FS or GS is the #GP cut; the other segment's, and 64-bit code's, are translated.
         let kind = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {

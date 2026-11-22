@@ -1925,13 +1925,22 @@ pub fn load_constant(c: u64, reg: u8) -> ([u32; 4], usize) {
 /// after (conservative: slice1 is 64-bit only), a non-canonical new value, another word count, or a decode of the new
 /// words that is not the new value in as many words (an encoder fault caught here).
 pub fn relocate_move(words: &[u32], reg: u32, d: u64) -> Option<([u32; 4], usize, u64)> {
+    relocate_move_mode(words, reg, d, false)
+}
+/// [`relocate_move`] for the code mode of the block. 32-bit code (`bits32`; M2 reuse): fexc masks every guest-EIP constant
+/// to 32 bits and loads it in the 32-bit form, so there that form alone is accepted, before and after, and the new value
+/// is the old plus `d` only where neither wraps at 4 GiB (a value that would wrap is fexc's to compile: refused, whether
+/// or not its site masks).
+pub fn relocate_move_mode(words: &[u32], reg: u32, d: u64, bits32: bool) -> Option<([u32; 4], usize, u64)> {
     let (n, old) = move_value(words, reg)?;
     let value = old.wrapping_add(d);
-    if words[0] >> 31 == 0 || !canonical(value) || reg > 30 {
+    // (A 32-bit form's old value is below 4 GiB by its decode.)
+    let wide = !bits32;
+    if (words[0] >> 31 == 1) != wide || !canonical(value) || (bits32 && value >> 32 != 0) || reg > 30 {
         return None;
     }
     let (new, k) = load_constant(value, reg as u8);
-    if k != n || new[0] >> 31 == 0 {
+    if k != n || (new[0] >> 31 == 1) != wide {
         return None;
     }
     let mut check = [0; 5];
@@ -2151,10 +2160,31 @@ pub fn relocate_code(
     to: u64,
     guest_bytes: u32,
 ) -> Result<(), usize> {
+    relocate_code_mode(code, relocs, links, from, to, guest_bytes, false)
+}
+/// A guest address range of 32-bit code that relocation moves: `[at, at + guest_bytes]` below 4 GiB (the block's end may
+/// be 4 GiB itself only as a wrapped 0, which fexc decides: refused).
+pub fn in_32_bits(at: u64, guest_bytes: u32) -> bool {
+    at.checked_add(guest_bytes.into()).is_some_and(|end| end >> 32 == 0)
+}
+/// [`relocate_code`] for the block's code mode (`bits32`: M2 reuse, the host's kept forms of 32-bit code; the resident's
+/// own copies are 64-bit code's). 32-bit code: both RIPs and block ends, every literal's old and new value below 4 GiB,
+/// and every move by [`relocate_move_mode`]'s 32-bit rule.
+#[allow(clippy::too_many_arguments)]
+pub fn relocate_code_mode(
+    code: &mut [u8],
+    relocs: &[u32],
+    links: &mut [LinkPoint; MAX_LINK_POINTS],
+    from: u64,
+    to: u64,
+    guest_bytes: u32,
+    bits32: bool,
+) -> Result<(), usize> {
     let d = to.wrapping_sub(from);
     if (from ^ to) & (1 << 63 | 0xfff) != 0
         || !canonical(to)
         || !to.checked_add(guest_bytes.into()).is_some_and(canonical)
+        || (bits32 && !(in_32_bits(from, guest_bytes) && in_32_bits(to, guest_bytes)))
     {
         return Err(refusal::PLACE);
     }
@@ -2199,8 +2229,9 @@ pub fn relocate_code(
                 return Err(refusal::LITERAL);
             }
             free = at + 8;
-            let value = u64::from_le_bytes(code[at..at + 8].try_into().unwrap()).wrapping_add(d);
-            if !canonical(value) {
+            let old = u64::from_le_bytes(code[at..at + 8].try_into().unwrap());
+            let value = old.wrapping_add(d);
+            if !canonical(value) || (bits32 && (old | value) >> 32 != 0) {
                 return Err(refusal::LITERAL);
             }
             code[at..at + 8].copy_from_slice(&value.to_le_bytes());
@@ -2215,7 +2246,7 @@ pub fn relocate_code(
             *w = word(code, at + 4 * k);
         }
         let reg = r & 31;
-        let Some((new, k, _)) = relocate_move(&words[..n], reg, d) else {
+        let Some((new, k, _)) = relocate_move_mode(&words[..n], reg, d, bits32) else {
             return Err(refusal::MOVE);
         };
         free = at + 4 * k;
