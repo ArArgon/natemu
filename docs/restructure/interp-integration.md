@@ -12,14 +12,20 @@ One instruction per pass, until `Cpu::interpreted_mode()` is `None`; it then ret
 `boundary`), or `start` dispatches.
 
 1. `rip &= 0xffff_ffff`; `io_checkpoint`, `take_invalidations`, `lapic::poll`: `find`'s order.
-2. Both shadows cleared (the interpreter sets and honours none). A pending trap (`State::debug & TRAP` but
-   `INTERPRET`), RFLAGS.TF or any DR7 enable: typed stop `interp_debug`.
-3. Events: `interpret::events` is the one place they are read. It calls `events::undelivered` (`find`'s `next`, nothing
-   taken) and turns any event into the typed stop `interp_event` (`event_stop`: kind and vector), left pending. The
-   CPU start-up work's `events::interpreted` (which takes INIT itself) replaces that one call.
+2. A pending trap (`State::debug & TRAP` but `INTERPRET`), RFLAGS.TF or any DR7 enable: typed stop `interp_debug`.
+3. Events: `interpret::events` is the one place they are read, through the CPU start-up's event point
+   `events::interpreted`: it takes a pending INIT itself (the bank is then the INIT or SIPI state, which the rest of the
+   pass reads afresh) and returns any other event as an `Undelivered`, which `event_stop` turns into the typed stop
+   `interp_event` (kind and vector), the event left pending. Shadows are not consulted.
 4. Mode: protected mode at CPL > 0, paging without EFER.LMA, or paging controls `Cpu::paging` refuses: `interp_mode`.
 5. The record at linear = CS.base + EIP (32-bit wrap): a cached one whose bytes still match, else a decode; then
-   `exec::step` on a copy of the bank (the memory layer borrows the record), written back on `Done` (RF cleared).
+   `exec::step` on a copy of the bank (the memory layer borrows the record), written back on `Done` (RF cleared). A
+   completed instruction ends any shadow a start state had (the interpreter sets none).
+
+Tests only: `NATEMU_INTERPRETER=off` (`Control::interpreter_off`) makes `run` stop at its entry as the resident did
+before the interpreter ran (`unsupported_mode`, `unsupported_code_mode`); the CPU start-up tests that observe each start
+state there (`tests/system` `initsipi` and `initsipi-1`, `tests/boot` `exit-ap-natemu`) set it until the interpreter runs
+their AP stub (its MOV CR0 and far JMPs, the next step).
 
 Resident operations: CPUID, RDMSR, WRMSR, WBINVD through the existing `transaction` (`#[inline(always)]` now: out of
 line it put a call on the fast system-call path, `system`; with it `system` is unchanged), its `Err` a fault stop with
@@ -34,8 +40,8 @@ from guest RAM only (else `interp_memory`, detail fetch). A page's walk is made 
 decode fetches to the end of RIP's page (at most 240 bytes), stopping short at the first byte it cannot fetch and keeping
 that byte's stop; only when the first instruction is truncated does it fetch the next page, up to 15 bytes in all, and
 ask again; a fault there, or past the CS limit, is raised only for an instruction that reaches it. The request goes out
-even with no byte fetched, so the host's stop answer comes before a fetch fault there. Validation fetches the record's
-`length` bytes the same way.
+even with no byte fetched, so the host's stop answer comes before a fetch fault there; nothing is fetched at the host's
+stop RIP (`State::stop_at`), as at a translation request. Validation fetches the record's `length` bytes the same way.
 
 ## Records
 
@@ -58,11 +64,13 @@ commit (release residents, literal and anonymous-symbol offsets aside): `find_fr
 (with `revalidated` inlined), `revalidated_from_record`, `sys_fast`, `miss_fast`, `system`, `commit`, `set_cpl`,
 `translate`, `fetch_walk`, `segments::pages`, `enter`, `linker`, `step_here`, `cut_one`, `invalidate`, `current_at`,
 `kept_system` and `trap_due` identical; `cache::file` (placement) swaps two registers; `split_lock` inlines its
-`split_begin`, `mmio::ones` calls `mmio::page` out of line. Resident 240,164 -> 260,784 bytes.
+`split_begin`, `mmio::ones` calls `mmio::page` out of line. Resident 242,624 -> 261,516 bytes (against 5d5594c0, where the
+same functions are again identical).
 
 Stops (`Hook::at`): the host's `REQUEST_DECODE` handler asks `stop_at` and `hook.at` at CS.base + EIP first (a stop parks
 the vCPU, `REPLY_PARK`; a test hook's `At::System` there is an error) and ends the run before `hook.boundary` or
-`stop_at` (`interp::run_to`), so no record is made for a stop's address.
+`stop_at` (`interp::run_to`), and before 4 GiB (an address past the wrap is one the hook was not asked about), so no
+record is made for a stop's address.
 
 ## Memory layer (`interpret::Mem`, layers 2-5)
 
@@ -74,8 +82,8 @@ page; unassigned (the legacy hole among them): reads all-ones, writes ignored; t
 instruction are kept for `read`/`write`/`compare_exchange` (a miss is an interpreter bug: a halt). 1, 2 or 4 bytes inside
 16 are one Arm access (inline `ldr`/`str`, aligned or not: FEAT_LSE2), byte by byte across 16 (the existing tearing
 deviation); stores follow `segments::copy`'s code-write protocol (`code_write` when translated, `dsb ish`,
-`rechecked`). LOCK: `casal{b,h}` inside 16 bytes, else (or on unassigned bytes) read-compare-write under
-`cache::split_begin`/`split_end`, as `split_lock`.
+`rechecked`). LOCK: `casal{b,h}` inside 16 bytes; with no byte RAM, all-ones and nothing written (no lock); else
+read-compare-write under `cache::split_begin`/`split_end`, as `split_lock`.
 
 ## Typed stops
 
@@ -93,9 +101,9 @@ reserved bit 12; the interpreter delivers no #DB and runs no MOV DR (typed stops
 ## Stack
 
 The exception stack is 80 KiB (0x5c000-0x70000, its own commit). Static case `stack` (M2 Max, run
-20261122-053137-98b3): the deepest gate path now runs through the interpreter with a transaction under it (`run`'s frame
-2,960 bytes, the transaction inlined into it), 20,960 bytes, 25,296 with the nested entry, of 61,440 allowed (36,144
-headroom beyond the 25% reserve); boot 11,072 of 24,576.
+20261122-063906-3753): the deepest gate path now runs through the interpreter with a transaction under it (the
+transaction inlined into `run`), 20,944 bytes, 25,280 with the nested entry, of 61,440 allowed (36,160 headroom beyond
+the 25% reserve); boot 11,056 of 24,576.
 
 ## Cases
 
@@ -105,7 +113,25 @@ stop at a resident operation not built yet (far JMP 25, far RET 11, segment load
 LOCK BTS inside 16 bytes (FEAT_LSE2 at EL1: no alignment fault) and a LOCK XADD across 16 bytes; an instruction ending
 at a page end before an unmapped page, one crossing into it (#PF, CR2 the page, error 0); an instruction ending at the CS
 limit, the byte after it and one crossing it (#GP(0)); unassigned and device pages; self-modifying code; three typed
-stops.
+stops. Each of these checks was shown to fail when it should (a temporary mutation, run 20261122-053853-a162).
+
+CPU start-up (`tests/system`, the INIT/SIPI work's): `initsipi` and `initsipi-1` (the entry regime, each start state
+observed at the interpreter's entry) and `tests/boot` `exit-ap-natemu` run with `NATEMU_INTERPRETER=off` and pass as
+before. `initsipi-interpreter` (the interpreter regime) runs the six scenarios whose outcome does not need the AP stub
+past its MOV CR0: sipi-then-init, nmi-in-wfs (the held NMI is the first boundary's event: `interp_event`), nmi-held,
+park-with-init, never-started, one-cpu. Not yet: linux, sipi-sipi, kvm-unit-tests, edk2, edk2-back-to-back,
+sipi-before-init-taken, sipi-during-host-request, init-in-mailbox, init-in-translated-hlt, nmi-init-in-wfs and
+fixed-in-wfs (each AP stops at the stub's MOV CR0), and init-sipi-init (its second INIT races the stub to that MOV CR0);
+the five scenarios the runner leaves out (interpreted HLT, events in interpreted code) wait for interpreted HLT.
+
+## Review
+
+An independent review of the code (subagent, read-only, November 22) found no blocking defect. Fixed from its minor
+points: shadows were cleared before a pass's typed stops (now after a completed instruction); a decode fetched at the
+host's stop RIP; a run could pass a hook stop beyond a 4 GiB wrap; a LOCK on wholly unassigned memory took the split
+lock. Accepted: the reply's records are compared with the request buffer after the host returned (the host writes only
+its reply there; a wrong record would fail its byte check at its next execution); a far RET's first slot's device stop
+comes before its second slot's #PF (both typed stops); the host asks its hook twice for a truncated decode's retry.
 
 ## Risks
 

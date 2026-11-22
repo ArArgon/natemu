@@ -240,8 +240,11 @@ def run_natemu(n, images, work, fexc):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(natemu_description(images['program']['bytes'], n))
     try:
+        # (Until the interpreter runs the AP stub, its MOV CR0 and far JMPs: NATEMU_INTERPRETER=off keeps the stop at the
+        # interpreter's entry this judges, as before the interpreter ran.)
         r = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(),
-                            *vm.CODE_SHAPE], capture_output=True, text=True, timeout=QEMU_TIMEOUT)
+                            *vm.CODE_SHAPE], capture_output=True, text=True, timeout=QEMU_TIMEOUT,
+                           env={**os.environ, 'NATEMU_INTERPRETER': 'off'})
     except subprocess.TimeoutExpired:
         return {'exit': 'timeout'}
     if r.returncode:

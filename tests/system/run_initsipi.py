@@ -17,8 +17,9 @@ woken), the others translated 64-bit code. The model's vectors map to natemu's: 
 entry regime only, since the identity space cannot hold code on page 0: 08H in the interpreter regime), the scenario's
 second vector to 09H (a real-mode park there, never to be started), any other to 08H.
 
-`--regime entry` (the default, while the boot-time interpreter is the stop at its entry): the driver runs with
-`--entry-ends`, and a CPU that stopped at the interpreter's entry is observed as done with the start its state shows
+`--regime entry` (the default, until the boot-time interpreter runs the stub's MOV CR0 and far JMPs): the driver runs with
+`--entry-ends` and `NATEMU_INTERPRETER=off` (the resident stops at the interpreter's entry, as before it ran), and a CPU
+that stopped at the interpreter's entry is observed as done with the start its state shows
 (the SIPI's CS VV00H, base VV000H, IP 0, or the BSP's reset state), each such state also checked field by field (CR0
 CD/NW as before | ET, EFER 0, EDX the signature, RFLAGS 2). `--regime interpreter` (once the interpreter runs the stub):
 a start counts when its CPU arrived on the counter (the stub's per-APIC-ID arrival byte), and scenarios that need
@@ -26,7 +27,7 @@ firmware at the reset vector (`bsp-init`) are left out.
 
 Writes DIR/initsipi.json and DIR/results.json (one case per scenario); exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import argparse, json, pathlib, re, subprocess, sys
+import argparse, json, os, pathlib, re, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/bench/smp'), str(ROOT / 'tests/smp')]
 import case_results, run_slice1_vm as vm  # noqa: E402
@@ -204,7 +205,10 @@ def observe(name, out, vec, syms, regime):
             label = 'wait-for-sipi'
         if label is None:
             if regime == 'interpreter' and st == 'resident':
-                stop = ('stop', i, 'nmi' if 'nmi' in reason else reason)
+                # The interpreter's typed stop for an event (interp_event) names an NMI by its detail (State::native[0]
+                # bits 31:24, exec::stop::interp::NMI = 1).
+                nmi = 'nmi' in reason or reason.startswith('interp_event ') and int(o.get('native', ['0x0'])[0], 16) >> 24 & 0xff == 1
+                stop = ('stop', i, 'nmi' if nmi else reason)
                 per.append(expect.ANY)
             else:
                 per.append((st, reason))
@@ -226,7 +230,10 @@ def run(a, name):
     work = a.out / name
     text, vec, syms = description(name, a.regime, work)
     extra = (['--entry-ends'] if a.regime == 'entry' else []) + ([a.max_block] if a.max_block else [])
-    rc, out, err = driver(a.host, a.runtime, a.fexc, text, work, extra, timeout=300)
+    # The entry regime observes each start state at the interpreter's entry: NATEMU_INTERPRETER=off keeps the stop there,
+    # as before the interpreter ran (it cannot run the AP stub's MOV CR0 and far JMPs yet).
+    env = {**os.environ, 'NATEMU_INTERPRETER': 'off'} if a.regime == 'entry' else None
+    rc, out, err = driver(a.host, a.runtime, a.fexc, text, work, extra, timeout=300, env=env)
     if rc:
         return None, [f'{name}: driver exit {rc}: {err.strip()[-600:]}']
     if 'cpus' not in out:

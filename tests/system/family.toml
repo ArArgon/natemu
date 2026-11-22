@@ -188,6 +188,16 @@ smoke = true
 argv = ["tests/system/run_initsipi.py", "--max-block", "1", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
 
+# The interpreter regime (the interpreter runs each AP from its SIPI; a start counts at its arrival): the scenarios whose
+# outcome does not need the AP stub run past its MOV CR0 (the interpreter's next step). Not yet: linux, sipi-sipi,
+# kvm-unit-tests, edk2, edk2-back-to-back, sipi-before-init-taken, sipi-during-host-request, init-in-mailbox,
+# init-in-translated-hlt, nmi-init-in-wfs, fixed-in-wfs (each AP stops at the stub's MOV CR0, interp_unsupported) and
+# init-sipi-init (its second INIT races the stub to that MOV CR0); bsp-init is the entry regime's alone.
+[suite.cases."initsipi-interpreter"]
+argv = ["tests/system/run_initsipi.py", "--regime", "interpreter", "--only",
+        "sipi-then-init,nmi-in-wfs,nmi-held,park-with-init,never-started,one-cpu", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
 [suite.cases."k1-c1"]
 argv = ["tests/system/run_k1.py", "--cpus", "1", "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
