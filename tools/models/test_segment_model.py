@@ -135,6 +135,16 @@ class Transfers(unittest.TestCase):
         # M2 Part 2: CPL-0 compatibility-mode code (0x38: L = 0, D = 1) is the boot-time interpreter's: the JMP completes.
         r = m.far(self.pointer(machine(), 0x1000, 0x38), 'jmp', PTR)
         self.assertEqual((r['outcome'], r['state']['rip'], r['state']['cs']), ('done', 0x1000, 0x38))
+        # Its RIP outside the new CS limit: x86's #GP(0) at the instruction; natemu completes and stops (its deviation).
+        r = m.far(self.pointer(machine(), 1 << 32 | 0x1000, 0x38), 'call', PTR)
+        self.assertEqual((r['outcome'], r['fault_rip'], r['x86'], r['state']['cs'], r['state']['rsp']),
+                         ('refused', 1 << 32 | 0x1000, (dm.GP, 0, 0), 0x38, STACK + 0x7F0))
+        self.assertIn(STACK + 0x7F0, r['diff'])                                            # the pushes were made
+        self.assertEqual(m.far(self.pointer(machine(), 0xFFFF_FFFF, 0x38), 'jmp', PTR)['outcome'], 'done')
+        s = self.pointer(machine(), 0x10_0000, 0x38)
+        dm.place(s['memory'], GDT + 0x38, m.segment(0, 0xF_FFFF, 0x9B, 4).to_bytes(8, 'little'))   # limit FFFFFH
+        self.assertEqual(m.far(s, 'jmp', PTR)['fault_rip'], 0x10_0000)
+        self.assertEqual(m.far(self.pointer(s, 0xF_FFFF, 0x38), 'jmp', PTR)['outcome'], 'done')
         self.assertEqual(m.far(self.pointer(machine(), 0x1000, CALL_GATE), 'jmp', PTR)['outcome'], 'refused')
         for sel, want in ((0x10, (dm.GP, 0x10)), (0x20, (dm.GP, 0x20)), (0x60, (dm.NP, 0x60)), (0x0B, (dm.GP, 0x08)),
                           (0x70, (dm.GP, 0x70)), (0, (dm.GP, 0))):
@@ -156,6 +166,10 @@ class Transfers(unittest.TestCase):
         self.assertEqual(m.ret(push(machine(cpl=3), 0x40_2000, 0x08))['fault'][:2], (dm.GP, 0x08))  # RPL < CPL
         r = m.ret(push(machine(), 0x40_2000, 0x38))                                         # to CPL-0 32-bit code
         self.assertEqual((r['outcome'], r['state']['rip'], r['state']['cs']), ('done', 0x40_2000, 0x38))
+        r = m.ret(push(machine(), 1 << 32 | 0x2000, 0x38))                                  # RIP above its limit: the stop
+        self.assertEqual((r['outcome'], r['fault_rip'], r['x86'], r['state']['rsp']),
+                         ('refused', 1 << 32 | 0x2000, (dm.GP, 0, 0), STACK + 0x810))
+        self.assertEqual(m.ret(push(machine(), 1 << 47, 0x38))['fault'][:2], (dm.GP, 0))       # not canonical: #GP(0)
         self.assertEqual(m.iret(push(machine(), 0x40_2000, 0x38, 2, STACK, 0x10))['outcome'], 'refused')   # IRET: refused
         # The compatibility-mode deviation: a return to RPL 3 compatibility-mode code is #GP(selector), at CPL 0 too.
         s = machine()

@@ -13,9 +13,10 @@
 //! other transfers to one are not built (task 5): JMP/CALL far at CPL 3 and RET far whose new CS has RPL 3, and any
 //! transfer to L = D = 1, raise #GP(that selector) at the instruction before any change (owner decision, November 6: a
 //! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program); one that would run
-//! CPL 0 compatibility-mode code completes and is the boot-time interpreter's (M2 Part 2, [`refuse_compatibility`]); L = D
-//! = 1, CPL 1 or 2, or an IRET there stops `unsupported_code_mode` with that CS in the record and RIP at the instruction,
-//! nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
+//! CPL 0 compatibility-mode code completes and is the boot-time interpreter's (M2 Part 2, [`refuse_compatibility`]; with
+//! a RIP outside the new CS limit, where x86 raises #GP(0) at the instruction, it stops `unsupported_code_mode` once it
+//! has completed, `interpret::record`: also a recorded deviation, no known code does this); L = D = 1, CPL 1 or 2, or an
+//! IRET there stops `unsupported_code_mode` with that CS in the record and RIP at the instruction, nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
 //! CPL-3 transfer stops the machine). M2 task 3b, executed in 32-bit code: operands at 32-bit addresses in their segment
 //! ([`address`]), the stack at 32 bits (ESP wraps, 4-byte slots), JMP/CALL/RET far within 32-bit code (to 64-bit code:
 //! #GP(selector), task 5), IRET's three pops at the same level, the 32-bit-only far-pointer loads. `tools/models/segment_model.py`

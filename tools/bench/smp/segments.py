@@ -405,6 +405,15 @@ def cases():
               lambda s: sm.ret(_stack(s, [0x110000, 0x38])), {}))
     c.append(('iret-compat-cpl0', pushes([0x110000, 0x38, 2, P.STACK(0), 0x10]), '    iretq\n',
               lambda s: sm.iret(_stack(s, [0x110000, 0x38, 2, P.STACK(0), 0x10])), {}))
+    # There with a RIP outside the new CS limit (at or above 4 GiB; or past a smaller one: a 32-bit CPL-0 code segment of
+    # limit FFFFFH written into slot C0H), where x86 raises #GP(0) at the instruction: natemu completes the transfer and
+    # stops `unsupported_code_mode` at the target (its recorded deviation, segment_model's `Stopped`; QEMU is not run).
+    high, small = 1 << 32 | 0x110000, sm.segment(0, 0xF_FFFF, 0x9B, 4)
+    c.append(('jmp-far-compat-rip', f'    mov rax, {high:#x}\n    mov [{{p:#x}}+0x90], rax\n    mov word [{{p:#x}}+0x98], 0x38\n',
+              '    jmp far [{p:#x}+0x90]\n', lambda s: sm.far(_ptr(s, high, 0x38), 'jmp', d + PTR + 0x90), {}))
+    c.append(('lret-compat-rip',) + ret([high, 0x38]))
+    c.append(('call-far-compat-limit', f'    mov rax, {small:#x}\n    mov [{{g:#x}}+0xc0], rax\n' + far(0xc0)[0],
+              '    call far [{p:#x}+0x90]\n', lambda s: sm.far(_ptr(_gdt(s, 0xc0, small), 0x110000, 0xc0), 'call', d + PTR + 0x90), {}))
     # Compatibility-mode code at CPL 3 that natemu does not run is its recorded deviation, judged by segment_model alone
     # (x86 runs the code). From CPL 0: IRETQ to the 16-bit DPL 3 code segment (0xd3) completes and takes #GP(0xd0) at its
     # target (M2 task 3a; IRETQ to the 32-bit one runs the code: compat.py); an outer RET to the 32-bit one (0xdb) is
@@ -442,6 +451,11 @@ def cases():
 
 def _ptr(s, off, sel):
     dm.place(s['memory'], P.SYS_D(0) + PTR + 0x90, off.to_bytes(8, 'little') + sel.to_bytes(2, 'little'))
+    return s
+
+
+def _gdt(s, sel, raw):
+    dm.place(s['memory'], P.SYS_D(0) + GDT + sel, raw.to_bytes(8, 'little'))
     return s
 
 
