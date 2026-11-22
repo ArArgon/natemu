@@ -2,6 +2,7 @@
 """kvm-unit-tests a2891d95's smptest and dummy on the references (docs/restructure/real-code-suites.md).
 
     tests/boot/run_kut.py --backend qemu|kvm [--tests smptest dummy] [--cpus 1 2 3 4] --out DIR
+    tests/boot/run_kut.py --backend natemu --fexc FEXC [--tests smptest dummy] [--cpus 1 2 3 4] --out DIR
 
 The images come from the framework's build (NATEMU_INPUT_KVM_UNIT_TESTS, tests/boot/built_inputs.py: x86/<test>.flat
 and provenance.json). Each runs as kvm-unit-tests runs it (x86/run), here as natemu will: Multiboot v1 through QEMU's
@@ -19,7 +20,10 @@ Also, per image as built (`code`): its 16- and 32-bit code the boot runs (CODE: 
 trampoline, prepare_64 with enter_long_mode, ap_start32), found by its symbols and disassembled by ndisasm, uses only
 the boot-time interpreter's first-version instructions (tests/boot/first_version.py; the 5-level switch is not run).
 Answers (tools/reference/answers.py, NATEMU_ANSWERS): seed runs the backend and records each answer; locked never runs
-it: the lock's answer must pass the judge; live (unset) runs it. Writes DIR/results.json (one result per test and N, and
+it: the lock's answer must pass the judge; live (unset) runs it.
+natemu (real-code-suites.md, "The natemu cases"): natemu's program driver boots the image (`boot-linux`: its Multiboot
+loader, the module, 128 MiB, N vCPUs whose APs wait for INIT and SIPI, `--debug-exit`, COM1 into a file); the answer
+is natemu's debug-exit status and COM1's lines, judged by `judge` and equal in its lines to the locked KVM answer. Writes DIR/results.json (one result per test and N, and
 per image's code) and DIR/kut.json (the images' provenance and code, the answers, the reference machine); exit 1 on a
 failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -157,6 +161,29 @@ def run_tcg(test, n, img: pathlib.Path, work: pathlib.Path) -> dict:
     return answer(rc, out.read_bytes() if out.exists() else b'')
 
 
+def run_natemu(test, n, img: pathlib.Path, work: pathlib.Path, fexc) -> dict:
+    """One boot under natemu: the answer (`exit` the debug exit's status, QEMU's form: 1 for the test's status 0)."""
+    import run_slice1_vm as vm                  # tests/lib
+    host, runtime = vm.build()
+    work.mkdir(parents=True, exist_ok=True)
+    env, out = work / f'env-{n}', work / f'{test}-{n}.com1'
+    env.write_text(environment(n)); out.unlink(missing_ok=True)
+    cmd = [host, runtime, 'boot-linux', fexc, img, '--initrd', env, '--ram', hex(MEM_MB << 20), '--vcpus', str(n),
+           '--debug-exit', '--serial', out]
+    try:
+        r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=QEMU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {'exit': 'timeout', 'lines': []}
+    (work / f'{test}-{n}.json').write_text(r.stdout)
+    (work / f'{test}-{n}.stderr').write_text(r.stderr)
+    try:
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {'exit': f'driver exit {r.returncode}: {r.stderr.strip()[-400:]}', 'lines': []}
+    status = (res.get('debug_exit') or [None, f"{res.get('stop')}: {res.get('reason', '')}"])[1]
+    return answer(status, out.read_bytes() if out.exists() else b'')
+
+
 def run_kvm(runs: list, d: pathlib.Path, work: pathlib.Path) -> tuple:
     """Every (test, N) of `runs` in one session on NATEMU_X86_HOST: ({(test, n): answer}, the machine's description)."""
     host = os.environ.get('NATEMU_X86_HOST')
@@ -178,14 +205,35 @@ def run_kvm(runs: list, d: pathlib.Path, work: pathlib.Path) -> tuple:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--backend', choices=('qemu', 'kvm'), required=True)
+    ap.add_argument('--backend', choices=('qemu', 'kvm', 'natemu'), required=True)
     ap.add_argument('--tests', nargs='+', choices=TESTS, default=list(TESTS))
     ap.add_argument('--cpus', type=int, nargs='+', default=list(CPUS))
+    ap.add_argument('--fexc', type=pathlib.Path)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     d, prov = inputs()
     runs = [(t, n) for t in a.tests for n in a.cpus]
+    if a.backend == 'natemu':
+        if not a.fexc: raise SystemExit('--backend natemu needs --fexc')
+        results, got = [], {}
+        for t, n in runs:
+            got[(t, n)] = run_natemu(t, n, d / f'{t}.flat', a.out / 'natemu', a.fexc)
+            diffs = judge(t, n, got[(t, n)])
+            try:                                    # the lines of the locked reference answer (KVM's; QEMU's agree)
+                e = answers.lookup(key(t, n, 'kvm', prov))
+                want = json.loads(e.value)['lines'] if e.value is not None else None
+            except answers.Missing:
+                want = None
+            if want is None: diffs.append('no KVM answer locked with its lines')
+            elif got[(t, n)].get('lines') != want:
+                diffs.append(f"COM1 differs from KVM's: natemu {got[(t, n)].get('lines')}, KVM {want}")
+            results.append({'name': f'{t}-natemu N={n}', 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+            print(f"{t} natemu N={n}: {'pass' if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
+        (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
+        (a.out / 'kut.json').write_text(json.dumps({'backend': 'natemu', 'provenance': prov,
+                                                    'answers': {f'{t} N={n}': got[(t, n)] for t, n in runs}}, indent=1) + '\n')
+        return 1 if any(r['diffs'] for r in results) else 0
     keys = {r: key(*r, a.backend, prov) for r in runs}
     mode, got, ref = answers.mode(), {}, {}
     if mode == 'locked':
