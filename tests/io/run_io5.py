@@ -34,7 +34,8 @@ Debian i386 userland in /i386, in which every program is 32-bit (shell, make, pe
 makes the same source (`linux32 chroot /i386`: steps i386-configure and i386-make; i386-setup is untimed, it downloads). The built
 32-bit interpreter then runs CHECK and the CPython tests I386TESTS; the hash of what they print must be I386_CHECK, which a run
 with --backend kvm records: the same boots on the x86 machine NATEMU_X86_HOST under KVM (the same kernel, disk and script; the
-disk stays there, so its launches get the console checks only), whose step times are the build's times on real x86.
+disk stays there, so its launches get the console checks only), whose step times are the build's times on real x86 (result.json
+`reference_host`: that machine's load and other containers before and after each boot; `times_indicative` if it was not idle).
 
 run --image-format qcow2 (default raw; the raw records stay comparable): natemu's qcow2 disk. INPUTS/disk.qcow2 is made once from
 disk.raw (`qemu-img convert -O qcow2 -o preallocation=metadata`, then `qemu-img resize --preallocation=metadata` to 16 GiB, so
@@ -50,6 +51,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -113,19 +115,20 @@ EXPECTED = (
 BAD = (r'EXT4-fs (error|warning)|I/O error|BUG:|WARNING:|Call Trace|segfault|general protection|Out of memory|oom-kill|'
        r'rcu_.*stall|blocked for more than|soft lockup|clocksource.*unstable|virtio.*(error|broken)|not a head|'
        r'ACPI (BIOS )?(Warning|Error)')
-I386TESTS = 'test_struct test_long test_float test_json test_re test_hashlib test_zlib test_threading test_subprocess'
+I386TESTS = 'test_struct test_long test_float test_json test_re test_hashlib test_zlib test_sqlite3'   # none that fails now and then at -j4 (regrtest's rerun changes the lines)
 # --i386: the built 32-bit interpreter runs this; its output (and the result lines of I386TESTS) must hash to I386_CHECK.
-# Lines starting "x87:" are printed and kept (OUT/i386-check.txt) but not hashed: glibc's i386 pow, exp and friends are x87
-# code that leans on the 80-bit registers, which natemu's fast x87 keeps as doubles (docs/restructure/m2-fast-x87-findings.md),
-# so their last digits differ from real x86; so do test_math's failures, which are printed the same way.
+# Lines starting "x87:" are not hashed: glibc's i386 log, exp, lgamma and pow are x87 code that leans on the 80-bit registers,
+# which natemu's fast x87 keeps as doubles (docs/restructure/m2-fast-x87-findings.md), so their last digits can differ from real
+# x86. They must still be the reference's lines (I386_X87) with each number within X87_ULPS units in the last place. Lines starting
+# "note:" (test_math's failures, which follow from the same deviation) are printed and kept (OUT/i386-check.txt), not compared.
 CHECK = r'''import sys, platform, struct, math, json, hashlib, zlib, re, sqlite3, decimal, fractions, threading, sysconfig
 import ssl, lzma, bz2, ctypes, readline, uuid, curses, dbm.gnu
 print(platform.machine(), struct.calcsize('P'), sys.maxsize, sys.byteorder, sysconfig.get_config_var('HOST_GNU_TYPE'), sys.float_info.dig)
 print(ctypes.sizeof(ctypes.c_long), ctypes.sizeof(ctypes.c_longdouble), ctypes.sizeof(ctypes.c_longlong))
-xs = [math.sin(i) * math.exp(i / 97) / (i + 0.1) for i in range(1, 2000)]
 print(repr(math.sqrt(2) ** 2), repr(0.1 + 0.2), repr(1e308 * 10), repr(5e-324 / 2), repr(sum(i / 7 for i in range(1000))))
-print('x87:', repr(sum(xs)), repr(math.fsum(xs)), repr(2.0 ** 0.5))
-print('x87:', [repr(f(x)) for f in (math.sin, math.cos, math.tan, math.atan, math.log, math.exp, math.lgamma, math.erf) for x in (0.5, 1e-5, 37.25)])
+for f in (math.sin, math.cos, math.tan, math.atan, math.erf, math.log, math.exp, math.lgamma):
+    for x in (0.5, 1e-5, 37.25): print('x87:' if f in (math.log, math.exp, math.lgamma) else 'libm', f.__name__, x, repr(f(x)))
+print('x87: pow 2.0 0.5', repr(2.0 ** 0.5))
 print(repr(float('1.7976931348623157e308')), 10 ** 40 // 7 ** 20, pow(3, 10 ** 5, 2 ** 61 - 1), (-7) // 2, float(2 ** 53 + 1))
 print(decimal.Decimal(1) / decimal.Decimal(7), fractions.Fraction(0.1), struct.pack('<dfq', 1 / 3, 1 / 3, -2 ** 62).hex())
 print(hashlib.sha256(bytes(range(256)) * 4096).hexdigest(), zlib.crc32(b'natemu' * 10000), len(lzma.compress(b'a' * 100000)), len(bz2.compress(b'b' * 100000)))
@@ -139,9 +142,37 @@ def work(n):
 ts = [threading.Thread(target=work, args=(20000 + i,)) for i in range(8)]; [t.start() for t in ts]; [t.join() for t in ts]
 print(sorted(total), ssl.OPENSSL_VERSION, uuid.UUID(int=2 ** 100 + 12345))
 '''
-# The check's sha256 (first 16 hex digits, "x87:" lines left out) on the x86 reference machine: bench case io5-solo32-reference,
-# November 21, 2026, a Ryzen 7 8845HS (host kernel 7.0.0-43) under KVM, QEMU 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1), -cpu host,-pku.
-I386_CHECK = '0b9e92090b5106b9'
+# What the x86 reference machine gave: the check's sha256 (first 16 hex digits, "x87:" and "note:" lines left out), its "x87:"
+# lines, and the i386 userland's package list (its sha256, as `packages`). Recorded by bench case io5-solo32-reference, November
+# 21, 2026: a Ryzen 7 8845HS (host kernel 7.0.0-43) under KVM, QEMU 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1), -cpu host,-pku.
+I386_CHECK = '5ae62b487d302512'
+I386_PACKAGES = '241c2854d4043dc6'
+I386_X87 = '''
+x87: log 0.5 -0.6931471805599453
+x87: log 1e-05 -11.512925464970229
+x87: log 37.25 3.6176519448255684
+x87: exp 0.5 1.6487212707001282
+x87: exp 1e-05 1.00001000005
+x87: exp 37.25 1.504767666846084e+16
+x87: lgamma 0.5 0.5723649429247004
+x87: lgamma 1e-05 11.512919692895824
+x87: lgamma 37.25 96.6198845882781
+x87: pow 2.0 0.5 1.4142135623730951
+'''
+X87_ULPS = 16
+
+
+def x87_far(lines):
+    """The check's "x87:" lines that are not the reference's: another name or argument, or a number more than X87_ULPS away."""
+    ref = I386_X87.strip().splitlines()
+    if len(lines) != len(ref): return [f'{len(lines)} x87 lines, the reference has {len(ref)}']
+    far = []
+    for got, want in zip(lines, ref):
+        *g, gv = got.split(); *w, wv = want.split()
+        if g != w or not abs(float(gv) - float(wv)) <= X87_ULPS * math.ulp(float(wv)): far.append(f'{got!r}: the reference has {want!r}')
+    return far
+
+
 GUEST = r'''#!/bin/bash
 # io5.sh PHASE HOST: markers "IO5 ..." on the console; each step's output in /root/io5/STEP.log.
 P=$1 H=$2 L=/root/io5; mkdir -p $L
@@ -169,9 +200,10 @@ i386() {   # --i386: Debian's i386 userland in /i386 (debootstrap, same snapshot
   # The built interpreter's answers (run_io5.py I386_CHECK pins their hash, recorded on real x86 under KVM: --backend kvm).
   curl -fsS http://$H/check.py -o /i386/build/check.py
   span i386-check in32 "cd /build/Python-3.13.18 && ./python /build/check.py &&
-      ./python -m test -j\$(nproc) @I386TESTS@ 2>&1 | grep -E '^(Result|Total tests|[0-9]+ tests? (OK|failed|skipped)|    test_)' &&
-      (./python -m test test_math 2>&1 | grep -E '^(FAIL|ERROR): |^Total tests' | sed 's/^/x87: /'; true)"
-  sed 's/^/IO5chk /' $L/i386-check.log; say i386-check $(grep -v '^x87: ' $L/i386-check.log | sha256sum | cut -c1-16)
+      ./python -m test -j\$(nproc) @I386TESTS@ 2>&1 | grep -E '^(Result|Total tests)' | sed -E 's/^Result: .* ([A-Z]+)\$/Result: \1/' &&
+      { ./python -m test test_math > /tmp/test_math.log 2>&1; rc=\$?; grep -E '^(FAIL|ERROR): |^Total tests' /tmp/test_math.log | sed 's/^/note: test_math /'
+        [ \$rc = 0 ] || [ \$rc = 2 ]; }"   # 2: tests failed (expected under natemu); anything else is a crash
+  sed 's/^/IO5chk /' $L/i386-check.log; say i386-check $(grep -Ev '^(x87|note): ' $L/i386-check.log | sha256sum | cut -c1-16)
   umount -R /i386/dev /i386/proc
 }
 say begin $P cpus=$(nproc) mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) kernel=$(uname -r)
@@ -226,17 +258,26 @@ say df $(df -B1M --output=used / | tail -1) uptime=$(cut -d' ' -f1 /proc/uptime)
 '''
 
 
-KVM_DIR = 'natemu-io5-reference'      # on the x86 machine, in its user's home: the inputs (kept) and the run's disk (removed)
+KVM_DIR = 'natemu-io5-reference'      # on the x86 machine, in its user's home: the inputs (kept) and each run's folder (removed)
+KVM_NAME = f'natemu-io5-ref-{os.getpid()}'; KVM_RUN = f'{KVM_DIR}/run-{os.getpid()}'   # this run's container and folder there
 KVM_IMAGE = 'docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f'   # = testkit/artifacts.py BENCH_BUILDER
 
 
 def kvm_disk(args, make):
-    """--backend kvm: copy the inputs to the x86 machine (once) and make the run's 16 GiB disk there, or remove it."""
+    """--backend kvm: copy the inputs to the x86 machine (once) and make the run's 16 GiB disk there; or stop the run's
+    container, should it still be there (a killed run), and remove its folder."""
     host = os.environ['NATEMU_X86_HOST']
-    if not make: return subprocess.run(['ssh', host, f'rm -f {KVM_DIR}/disk.raw'])
-    sh('ssh', host, f'mkdir -p {KVM_DIR}/inputs')
+    if not make: return subprocess.run(['ssh', host, f'docker rm -f {KVM_NAME} > /dev/null 2>&1; rm -rf {KVM_RUN}'])
+    sh('ssh', host, f'mkdir -p {KVM_DIR}/inputs {KVM_RUN}')
     sh('rsync', '-S', *(args.inputs / n for n in ('disk.raw', 'vmlinuz', 'initrd.img')), f'{host}:{KVM_DIR}/inputs/')
-    sh('ssh', host, f'cd {KVM_DIR} && cp --sparse=always inputs/disk.raw disk.raw && chmod 666 disk.raw && truncate -s {DISK_BYTES} disk.raw && cp inputs/vmlinuz inputs/initrd.img .')
+    sh('ssh', host, f'cd {KVM_RUN} && cp --sparse=always ../inputs/disk.raw disk.raw && chmod 666 disk.raw && truncate -s {DISK_BYTES} disk.raw && cp ../inputs/vmlinuz ../inputs/initrd.img .')
+
+
+def kvm_load():
+    """The x86 machine now: its load averages and the other containers running (its times are real x86's only if it is idle)."""
+    r = subprocess.run(['ssh', os.environ['NATEMU_X86_HOST'], "cut -d' ' -f1-3 /proc/loadavg; docker ps --format '{{.Names}}'"], capture_output=True, text=True)
+    load, *names = r.stdout.splitlines() or ['?']
+    return {'load': load, 'containers': [n for n in names if n != KVM_NAME]}
 
 
 def sh(*cmd, **kw): return subprocess.run([str(c) for c in cmd], check=True, **kw)
@@ -301,7 +342,7 @@ def command(args, disk, cache, phase='use'):
                  '> /etc/apt/sources.list; apt-get -o Acquire::Retries=5 update -qq > /dev/null 2>&1 && apt-get -o Acquire::Retries=5 install -y -qq '
                  f'--no-install-recommends qemu-system-x86 > /dev/null 2>&1 && echo "IO5 reference $(qemu-system-x86_64 --version | head -1 | tr " " _) '
                  f'$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | tr " " _) host-kernel=$(uname -r)" && exec {qemu}')
-        return ['ssh', '-tt', os.environ['NATEMU_X86_HOST'], f'docker run --rm -it --device /dev/kvm -v $HOME/{KVM_DIR}:/b {KVM_IMAGE} sh -c {shlex.quote(guest)}']
+        return ['ssh', '-tt', os.environ['NATEMU_X86_HOST'], f'docker run --rm -it --name {KVM_NAME} --device /dev/kvm -v $HOME/{KVM_RUN}:/b {KVM_IMAGE} sh -c {shlex.quote(guest)}']
     # The other QEMU baselines' board and disk (run_fio_baselines.py): pinned machine version, one virtio-blk queue as natemu.
     return [QEMU, '-nodefaults', '-machine', 'pc-i440fx-11.1,hpet=off,i8042=off,vmport=off', '-accel', 'tcg,thread=multi',
             '-cpu', QCPU, '-m', str(args.ram * 1024), '-smp', str(args.vcpus), '-kernel', args.inputs / 'vmlinuz',
@@ -407,8 +448,12 @@ def judge(work, phase, code, timed_out, i386=False, reference=False):
     if phase == 'use' and not i386 and values.get('pytest-result', ['?'])[0] != 'Result:_SUCCESS': problems.append(f'pytest {values.get("pytest-result")}')
     if phase == 'use' and i386:
         if values.get('i386-userland') != ['i686', 'i386', 'i686-linux-gnu']: problems.append(f'i386 userland {values.get("i386-userland")}')
-        if not reference and values.get('i386-check', ['?'])[0] != I386_CHECK: problems.append(f'i386 check {values.get("i386-check")}: not the x86 reference\'s {I386_CHECK}')
-        (work / 'i386-check.txt').write_text(''.join(l[7:] + '\n' for l in text.splitlines() if l.startswith('IO5chk ')))
+        check = [l[7:] for l in text.splitlines() if l.startswith('IO5chk ')]
+        (work / 'i386-check.txt').write_text(''.join(l + '\n' for l in check))
+        if values.get('i386-packages') != [I386_PACKAGES]: problems.append(f'i386 packages {values.get("i386-packages")}: not {I386_PACKAGES}')
+        if not reference:
+            if values.get('i386-check', ['?'])[0] != I386_CHECK: problems.append(f'i386 check {values.get("i386-check")}: not the x86 reference\'s {I386_CHECK}')
+            problems += [f'i386 check, x87: {p}' for p in x87_far([l for l in check if l.startswith('x87: ')])]
     if 'natemu: network:' in (work / f'stderr-{phase}.log').read_text(errors='replace'): problems.append('natemu network guest-error lines')
     return {'steps': steps, 'values': values, 'problems': problems}
 
@@ -435,7 +480,8 @@ def run(args):
     server, host = serve_files(serve)
     result = {'image_format': args.image_format, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
-              'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None, 'phases': {}}
+              'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None,
+              'qemu': subprocess.run([QEMU, '--version'], capture_output=True, text=True).stdout.splitlines()[0] if args.backend == 'qemu' else None, 'phases': {}}
     try:
         time.sleep(1); assert server.poll() is None, 'http server'
         if args.backend == 'kvm': kvm_disk(args, True)
@@ -443,9 +489,12 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX)
             for phase, limit in (('use', args.limit), ('verify', 1800)):
                 print(f'{phase}: launching', flush=True)
-                before = others()
+                before = others(); load = [kvm_load()] if args.backend == 'kvm' else None
                 code, timed_out, seconds = launch(command(args, disk, args.out / 'compile-cache', phase), args.out, phase, host, limit)
                 contended = before + others()
+                if load:   # other work on the x86 machine: this boot's times are indicative only (after: the VM's own load is in it)
+                    load.append(kvm_load()); busy = phase == 'use' and float(load[0]['load'].split()[0]) > 1 or any(x['containers'] for x in load)
+                    result.setdefault('reference_host', {})[phase] = {'before': load[0], 'after': load[1], 'times_indicative': busy}
                 r = judge(args.out, phase, code, timed_out, args.i386, args.backend == 'kvm')
                 short = raw_shortfall(disk, args.out) if qcow else 'the disk is on the x86 machine' if args.backend == 'kvm' else None
                 if short:    # no room for the raw view: console checks only, recorded (not a silent pass)

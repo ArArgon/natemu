@@ -19,14 +19,17 @@ or QEMU, not this boot's own children), recorded as `contended`. natemu: the stu
 target/release/natemu; its resident `--runtime`, default the one built beside it), `--fexc` required; the compile cache
 is `--compile-cache` when given, else the stub's default (its NATEMU_COMPILE_CACHE fallback included). QEMU: TCG
 thread=multi or single, the board and CPU model of natemu-raw/qcmp-20261103-01 (`-max`: `-cpu max`). JOBS defaults to
-VCPUS. The guest powers off after its last VERIFY line; the run is capped at `--cap` s (default 600). Exit 0 verified, 1
-not reached or not verified, 3 verified but contended. Appends one JSON line to DIR/bench.jsonl; serial to
+VCPUS. The guest powers off after its last VERIFY line; the whole boot (both runs) is capped at `--cap` s (default 600): a
+capped boot is recorded (`capped`, `capped_in`: the run it was in, `at_least_s`: how long that run had lasted). Exit 0 verified
+(or QEMU capped: a result, "> cap"), 1 not reached or not verified (natemu capped included), 3 contended. A QEMU record
+names its version, machine type and CPU model (`qemu`). Appends one JSON line to DIR/bench.jsonl; serial to
 DIR/NAME.serial. Run it under the VM lock (`/usr/bin/lockf -k .../natemu-raw/.vm.lock`) with no other VM running.
 """
 import argparse, json, os, pathlib, re, signal, subprocess, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 HERE = pathlib.Path(__file__).resolve().parent
+QMACHINE = 'pc-i440fx-11.1'   # what `pc` named in QEMU 11.1.2 (the November 14 round); pinned, as tests/io/run_io5.py's
 QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip'   # qcmp-20261103-01's like-for-like model
 
 
@@ -91,7 +94,7 @@ def main():
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
                '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else [])]
     else:
-        cmd = [a.qemu, '-nodefaults', '-machine', 'pc,hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
+        cmd = [a.qemu, '-nodefaults', '-machine', f'{QMACHINE},hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
                '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,
                '-display', 'none', '-monitor', 'none', '-serial', f'file:{serial}', '-no-reboot']
     t0 = time.monotonic()
@@ -125,7 +128,8 @@ def main():
         if now - last >= 0.5:
             others |= foreign(p.pid); last = now
         read_serial()
-    if p.poll() is None:
+    capped = p.poll() is None      # the cap is on the whole boot (both runs), not on one run
+    if capped:
         p.send_signal(signal.SIGINT)
         try: p.wait(10)
         except subprocess.TimeoutExpired: p.kill(); p.wait()
@@ -160,9 +164,19 @@ def main():
                cmd=[str(c) for c in cmd], stderr=pathlib.Path(f'{out}/{name}.stderr').read_text()[-300:])
     rec['fp_traps'] = fp_traps(pathlib.Path(f'{out}/{name}.stderr').read_text())
     rec['system_counts'] = system_counts(pathlib.Path(f'{out}/{name}.stderr').read_text())
+    if emu != 'natemu':
+        rec['qemu'] = dict(version=subprocess.run([a.qemu, '--version'], capture_output=True, text=True).stdout.splitlines()[0], machine=QMACHINE, cpu=cmd[cmd.index('-cpu') + 1])
+    # A boot stopped by the cap: which run it was in and how long that run had lasted, a lower bound on its time ("> cap").
+    rec['capped'] = capped; rec['cap_s'] = cap
+    if capped:
+        k = 'START2 ' if M['START2 '] is not None else 'START '
+        rec['capped_in'] = None if M[k] is None else 'run 2' if k == 'START2 ' else 'run 1'
+        rec['at_least_s'] = None if M[k] is None else round(t0 + total - M[k], 1)
     rec['outputs'] = re.findall(r'NATEMU-BENCH-OUTPUT\S* (.*)', text)    # what a benchmark without a pinned hash printed
     with open(f'{out}/bench.jsonl', 'a') as f: f.write(json.dumps(rec) + '\n')
-    print(json.dumps({k: rec[k] for k in ('name', 'verified', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
+    print(json.dumps({k: rec.get(k) for k in ('name', 'verified', 'capped', 'capped_in', 'at_least_s', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
+    if capped and emu != 'natemu':   # a QEMU baseline too slow for its cap is a result (recorded above), not a failure
+        sys.exit(3 if others else 0)
     sys.exit(1 if not verified else 3 if others else 0)
 
 

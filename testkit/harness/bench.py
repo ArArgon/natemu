@@ -3,7 +3,9 @@ reports where its numbers are. Numbers are kept per machine (<run>/bench/<machin
 machines. Baseline caching and the drift canary (R3.7) are not part of this wrapper yet.
 
     [[suite]] kind = "bench"  harness = "bench"  tier = "bench"  params = { timeout = SECONDS }
-    [suite.cases.<name>]  argv = [...]  needs = ["{raw}/..."]  env = { NAME = "..." }  baseline = "REV"  remote = true
+    [suite.cases.<name>]  argv = [...]  needs = ["{raw}/..."]  env = { NAME = "..." }  baseline = "REV"  timeout = N
+                          remote = true  (its VM runs on the x86 machine: no exclusive window; runs only when seeding,
+                          TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host, and is skipped otherwise)
 Placeholders (in argv, env and needs): {out} {fexc} {natemu} {runtime} {host} {kernel} {raw}, and these, each built only
 when a case of the suite uses it (and then prepared before the run starts):
     {bench_image}       the benchmark initramfs (artifacts.bench_image)
@@ -113,6 +115,10 @@ class Bench:
         if not piece: return base, spec, spec
         return base, spec, dict(spec, argv=[*spec['argv'], '--limit', '1'])
 
+    def case_timeout(self, fam, suite, case):
+        """The case's own `timeout` (seconds), else None: the suite's `params.timeout` applies (as the runner harness)."""
+        return self._spec(suite, case)[2].get('timeout')
+
     def case_needs(self, fam, suite, case):
         if self._spec(suite, case)[2].get('remote'):       # `remote = true`: the case's VM runs on another machine and times
             return Needs(cores=1)                          # nothing here (io5-solo32-reference); it only waits, on one core
@@ -194,6 +200,9 @@ class Bench:
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:
                 out[it.nodeid] = CaseResult('skipped', f'needs {missing[0]} (not on this machine)', 'not-runnable'); continue
+            if spec.get('remote') and not (os.environ.get('TESTKIT_SEED_ANSWERS') and os.environ.get('NATEMU_X86_HOST')):
+                out[it.nodeid] = CaseResult('skipped', 'records a reference on the x86 machine: only with TESTKIT_SEED_ANSWERS=1 '
+                                                       'NATEMU_X86_HOST=user@host', 'not-runnable'); continue
             argv = [self._subst(a, vals) for a in spec['argv']]
             env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1',
                        **{k: self._subst(v, vals) for k, v in spec.get('env', {}).items()})
