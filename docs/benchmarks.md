@@ -17,7 +17,9 @@ through them; numbers from experiments elsewhere in `docs/` are labelled as such
 32-bit programs against QEMU, and a CPython build by a Debian i386 userland, are in
 [the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md) (November 22). The i386 build's times since
 32-bit code is reused (bench case `io5-solo32`, M4, November 22: configure 106.7 s, `make -j4` 114.7 s, from 374.2 and
-223.2) are in [the 32-bit reuse findings](restructure/m2-reuse32-findings.md).
+223.2) are in [the 32-bit reuse findings](restructure/m2-reuse32-findings.md). Since 32-bit user code is shared between
+addresses (bench case `io5-solo32`, M4, `pic32` at 3fd3b398, November 22: configure 82.5 s, `make -j4` 108.1 s; the
+64-bit steps 58.0 and 89.5 s, unchanged) they are in [the 32-bit sharing findings](restructure/m2-pic32-findings.md).
 
 ## Setup
 
