@@ -34,6 +34,14 @@
 //! entry state) and, after a run, the stop and the final state. SIGINT or SIGTERM cancels the run (the library's
 //! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
 //!
+//! M2 Part 2 (boot-interpreter plan sections 6, 7): `--no-mailbox` leaves the multiprocessor wakeup mailbox out of the
+//! MADT, and each AP starts in the INIT state waiting for a SIPI (`Boot::mailbox`; the resident does not take INIT and
+//! SIPI yet, so such an AP halts at its first entry). An image without the bzImage magic but with a Multiboot header is
+//! loaded by Multiboot (`boot::multiboot`: `--initrd` its one module, the command line QEMU's `-kernel` gives, the image's
+//! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the
+//! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V
+//! ends the run with the stop `debug_exit` and the result's `debug_exit` [V, (V << 1) | 1] (QEMU's exit status).
+//!
 //! Performance phase (perf plan §2): `--perf-log FILE` (or `NATEMU_PERF_LOG=FILE`) turns on the library's timing log (`natemu::perf`): process
 //! phases and one line per vCPU in FILE, one line per translation request in FILE.vN. The resident's buckets need a
 //! runtime built with `--features perf` (else they read zero and `"magic":false`).
@@ -144,6 +152,12 @@ pub(crate) struct Args {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<std::path::PathBuf>,
+    /// Leave the multiprocessor wakeup mailbox out of the MADT: the APs wait for INIT and SIPI
+    #[arg(long)]
+    no_mailbox: bool,
+    /// Test only: QEMU's isa-debug-exit device at ports F4H-F7H (a write ends the run)
+    #[arg(long)]
+    debug_exit: bool,
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
@@ -177,6 +191,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compile_cache,
         compile_cache_mb,
         perf_log,
+        no_mailbox,
+        debug_exit,
     } = args;
     if let Some(path) = perf_log {
         natemu::perf::enable(path)?;
@@ -200,7 +216,14 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         .map(|s| Ok((number(&s[0])?, number(&s[1])?, s[2].clone())))
         .collect::<Result<Vec<_>>>()?;
     let lost = lost.unwrap_or(crate::clock::LostTicks::DEFAULT);
+    let image_path = image.clone();
     let image = memory::read_input(image, MAX_INPUT)?;
+    // Multiboot (QEMU's `-kernel`): the information's command line is the image's name, a space, then the arguments.
+    let cmdline = if boot::is_multiboot(&image) {
+        format!("{image_path} {cmdline}")
+    } else {
+        cmdline
+    };
     let initrd = initrd
         .map(|p| memory::read_input(&p, MAX_INPUT))
         .transpose()?;
@@ -223,7 +246,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         } else {
             Vec::new()
         };
-        let tables = boot::acpi::build_with_virtio(vcpus, rsdp, &manifest);
+        let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox);
         let inputs = Inputs {
             image: &image,
             cmdline: &cmdline,
@@ -234,7 +257,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let mut host = vec![0u64; exec::ram_end(ram) as usize / 8];
         // SAFETY: `host` backs [0, L) and outlives `guest`.
         let guest = unsafe { exec::guest_ram(ram, host.as_mut_ptr() as u64) };
-        let loaded = boot::load(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
+        let loaded = boot::load_kernel(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
         if let Some(path) = &dump {
             write_dump(path, &guest, &loaded)?;
         }
@@ -267,6 +290,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         accurate_fp: fp,
         rng,
         pool,
+        mailbox: !no_mailbox,
+        debug_exit,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {
@@ -486,6 +511,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         },
         ended_first,
         vcpus,
+        debug_exit: prepared
+            .debug_exit()
+            .map(|v| [v, natemu::debug_exit::DebugExit::status(v)]),
     };
     println!("{}", serde_json::to_string(&report).unwrap());
     natemu::perf::mark("exit");
@@ -543,6 +571,9 @@ struct Report<'a> {
     ticks: Ticks<'a>,
     ended_first: Option<EndedFirst>,
     vcpus: Vec<VcpuReport>,
+    /// `--debug-exit`: the value written to its port and QEMU's exit status for it, [V, (V << 1) | 1].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug_exit: Option<[u64; 2]>,
 }
 #[derive(Serialize)]
 struct Stats {
@@ -628,7 +659,7 @@ impl Placement {
             zero_page: Hex(l.zero_page),
             cmdline: Hex(l.cmdline),
             initrd: l.initrd.map(|(a, n)| [Hex(a), Hex(n)]),
-            version: Hex(l.setup.version.into()),
+            version: Hex(l.setup.as_ref().map_or(0, |s| s.version.into())),
             memory_map: l
                 .map
                 .iter()
@@ -889,6 +920,7 @@ mod tests {
                     vcpu_new("reached", &state, fault),
                     vcpu_new("resident halted status=1 detail=0", &entry, [0; 4]),
                 ],
+                debug_exit: None,
             };
             let (r, st, cache) = (&report, &report.stats, &report.stats.cache);
             let compiles = st.compiles;

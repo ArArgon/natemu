@@ -18,6 +18,7 @@ use natemu_abi::guest_memory::GuestRam;
 use std::fmt;
 
 pub mod acpi;
+pub mod multiboot;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -118,6 +119,19 @@ pub enum LoadError {
     },
     /// An ACPI blob (the RSDP, a table, the AP mailbox) at this address does not lie in the map's ACPI NVS range.
     BadTables(u64),
+    /// Multiboot ([`multiboot`]): the header's flags require what this loader does not provide (bits 0-15 other than 0
+    /// and 1: a video mode, or an unknown requirement).
+    MultibootFlags(u32),
+    /// Multiboot: the header's address fields are inconsistent with each other or with the file.
+    MultibootAddress(&'static str),
+    /// Multiboot: no address fields and not a loadable ELF32 i386 executable.
+    MultibootElf(&'static str),
+    /// Multiboot: the boot data (GDT, information structure, module list, memory map, strings) does not fit in RAM
+    /// after the kernel and its modules.
+    BootDataDoesNotFit {
+        start: u64,
+        bytes: u64,
+    },
 }
 impl LoadError {
     pub(crate) fn code(&self) -> &'static str {
@@ -143,6 +157,10 @@ impl LoadError {
             KernelDoesNotFit { .. } => "KERNEL_DOES_NOT_FIT",
             InitrdDoesNotFit { .. } => "INITRD_DOES_NOT_FIT",
             BadTables(_) => "BAD_TABLES",
+            MultibootFlags(_) => "MULTIBOOT_FLAGS",
+            MultibootAddress(_) => "MULTIBOOT_ADDRESS",
+            MultibootElf(_) => "MULTIBOOT_ELF",
+            BootDataDoesNotFit { .. } => "BOOT_DATA_DOES_NOT_FIT",
         }
     }
 }
@@ -370,10 +388,12 @@ pub struct Inputs<'a> {
     /// ignore it, finding the RSDP by their own search, which these tables do not serve (none lies below 1 MiB).
     pub acpi: Option<&'a acpi::Tables>,
 }
-/// Where everything went, and the BSP's entry state.
+/// Where everything went, and the BSP's entry state. A Multiboot image ([`multiboot::load`]) has no setup header
+/// (`setup` `None`): its `zero_page` is the Multiboot information structure, `initrd` its first module, `map` its
+/// memory map ([`multiboot::map`]) and `ap` the INIT state, in which its other processors wait for a SIPI.
 #[derive(Debug, Clone)]
 pub struct Loaded {
-    pub setup: Setup,
+    pub setup: Option<Setup>,
     pub kernel: u64,
     /// The kernel's reserved window `[kernel, kernel + window)`.
     pub window: u64,
@@ -425,6 +445,26 @@ pub fn ap_wake(base: Cpu) -> Cpu {
         idtr: Table { base: 0, limit: 0 },
         ..base
     }
+}
+
+/// Loads a bzImage by the 64-bit protocol ([`load`]) or, when the image has no setup header magic ("HdrS" at 0x202) but
+/// a Multiboot header, by Multiboot ([`multiboot::load`]: `inputs.initrd`, if given, is its one module, with an empty
+/// string; no ACPI tables), telling them apart as QEMU's `-kernel` does (`x86_load_linux`: the Linux magic first).
+pub fn load_kernel(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, LoadError> {
+    if is_multiboot(inputs.image) {
+        let modules: Vec<multiboot::Module> = inputs
+            .initrd
+            .map(|data| multiboot::Module { data, string: "" })
+            .into_iter()
+            .collect();
+        return multiboot::load(ram, layout, inputs.image, inputs.cmdline, &modules);
+    }
+    load(ram, layout, inputs)
+}
+
+/// Whether [`load_kernel`] loads `image` by Multiboot: no bzImage magic, a Multiboot header.
+pub fn is_multiboot(image: &[u8]) -> bool {
+    image.get(at::HEADER..at::HEADER + 4) != Some(&b"HdrS"[..]) && multiboot::header(image).is_some()
 }
 
 /// M1: `ram` is one range from 0; high RAM (`Layout::high`) needs a multi-range RAM description here (`GuestRam::and`)
@@ -645,7 +685,7 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
         ..cpu
     });
     Ok(Loaded {
-        setup: s,
+        setup: Some(s),
         kernel,
         window,
         zero_page: ZERO_PAGE,
@@ -691,12 +731,12 @@ pub(crate) mod tests {
         d[at..at + bytes.len()].copy_from_slice(bytes);
         d
     }
-    const SMALL: Layout = Layout {
+    pub(crate) const SMALL: Layout = Layout {
         low_end: 64 * MIB,
         high: 0,
         pci: false,
     };
-    fn ram(bytes: u64) -> (Vec<u64>, GuestRam) {
+    pub(crate) fn ram(bytes: u64) -> (Vec<u64>, GuestRam) {
         let mut v = vec![0u64; bytes as usize / 8];
         let r = unsafe { GuestRam::new(0, bytes, v.as_mut_ptr() as u64) };
         (v, r)

@@ -292,6 +292,16 @@ fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> 
 
 /// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`).
 fn plan_tables(vcpus: usize, rsdp: u64, placed: &[Placed], ram: u64) -> Result<LaunchPlan> {
+    plan_tables_with(vcpus, rsdp, placed, ram, true)
+}
+/// As [`plan_tables`]; `mailbox` false leaves the multiprocessor wakeup mailbox out ([`Boot::mailbox`]).
+fn plan_tables_with(
+    vcpus: usize,
+    rsdp: u64,
+    placed: &[Placed],
+    ram: u64,
+    mailbox: bool,
+) -> Result<LaunchPlan> {
     let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
     for p in placed {
@@ -302,7 +312,7 @@ fn plan_tables(vcpus: usize, rsdp: u64, placed: &[Placed], ram: u64) -> Result<L
         }
     }
     functions.sort_unstable();
-    let tables = boot::acpi::build_with_devices(vcpus, rsdp, &manifest, &functions);
+    let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &functions, mailbox);
     Ok(LaunchPlan {
         manifest,
         functions,
@@ -382,6 +392,16 @@ pub struct Boot {
     pub pool: bool,
     /// Per device, virtio-MMIO (default) or virtio-PCI.
     pub transports: Transports,
+    /// X4: the MADT's multiprocessor wakeup mailbox, on which every AP waits (default on). Off (boot-interpreter plan
+    /// section 6), the MADT has none and each AP starts in the INIT state ([`natemu_abi::power_on::init`]) waiting for a
+    /// start-up IPI, as firmware leaves the processors it did not boot: Linux then starts them with INIT and SIPI. A
+    /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). The resident does not take
+    /// INIT or SIPI yet (the interpreter's integration): until it does, an AP started so halts at its first entry.
+    pub mailbox: bool,
+    /// Test only (kvm-unit-tests' exit, plan section 7): QEMU's isa-debug-exit device at ports F4H-F7H
+    /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
+    /// [`Prepared::debug_exit`]. Default off.
+    pub debug_exit: bool,
 }
 
 impl Boot {
@@ -415,6 +435,8 @@ impl Boot {
             net_options: crate::virtio::SlirpOptions::default(),
             pool: true,
             transports: Transports::all(Transport::Mmio),
+            mailbox: true,
+            debug_exit: false,
         }
     }
 
@@ -447,7 +469,7 @@ impl Boot {
             self.ram as usize,
             self.pool,
         )?;
-        let plan = plan_tables(self.vcpus, self.rsdp, &placed, self.ram)?;
+        let plan = plan_tables_with(self.vcpus, self.rsdp, &placed, self.ram, self.mailbox)?;
         let (layout, tables) = (plan.layout, plan.tables);
         let inputs = Inputs {
             image: &self.kernel,
@@ -455,13 +477,20 @@ impl Boot {
             initrd: self.initrd.as_deref(),
             acpi: Some(&tables),
         };
-        let loaded = boot::load(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
+        let loaded = boot::load_kernel(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
         execution::guest_ram_written(&backing.memory);
         let lost = self.lost_ticks;
+        // The APs: on the mailbox (a bzImage with it), else in the INIT state waiting for a SIPI (`mailbox` off, or a
+        // Multiboot kernel, whose `ap` is that state already).
+        let mailbox = self.mailbox && loaded.setup.is_some();
+        let mut ap = loaded.ap;
+        if !mailbox && loaded.setup.is_some() {
+            natemu_abi::power_on::init(&mut ap);
+        }
         for v in 0..self.vcpus {
             execution::set_cpu(
                 backing.vcpu(v),
-                if v == 0 { loaded.cpu } else { loaded.ap },
+                if v == 0 { loaded.cpu } else { ap },
                 self.speculation_barriers,
             )?;
             execution::set_lapic(
@@ -471,7 +500,7 @@ impl Boot {
                     ..natemu_abi::lapic::RESET
                 },
             );
-            if v > 0 {
+            if v > 0 && mailbox {
                 let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
                 state.mailbox = tables.mailbox;
                 backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
@@ -485,6 +514,17 @@ impl Boot {
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
         // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
+        let debug_exit = if self.debug_exit {
+            let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
+            devices.register_ports(
+                crate::debug_exit::PORT.into(),
+                crate::debug_exit::PORTS,
+                Arc::new(Mutex::new(device)),
+            )?;
+            Some(value)
+        } else {
+            None
+        };
         let mut virtio = Vec::new();
         let mut serials = Vec::new();
         let mut bus = crate::pci::Bus::new();
@@ -553,6 +593,7 @@ impl Boot {
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
             serial_input: Mutex::new(None),
+            debug_exit,
         })
     }
 
@@ -591,6 +632,8 @@ pub struct Prepared {
     cancel: Arc<AtomicBool>,
     /// [`Prepared::serial_input`], taken by the run.
     serial_input: Mutex<Option<Box<dyn Read + Send>>>,
+    /// [`Boot::debug_exit`]: the value its device was written ([`crate::debug_exit::NONE`] until then).
+    debug_exit: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -1017,6 +1060,14 @@ impl Prepared {
     }
     pub fn devices(&self) -> &devices::Devices {
         &self.devices
+    }
+    /// [`Boot::debug_exit`]: the value the guest wrote to its port (the run then ended with `Stop::Power(pm::DEBUG_EXIT)`;
+    /// QEMU's exit status is [`crate::debug_exit::DebugExit::status`] of it), or `None` (no device, or no write).
+    pub fn debug_exit(&self) -> Option<u64> {
+        self.debug_exit
+            .as_ref()
+            .map(|v| v.load(SeqCst))
+            .filter(|&v| v != crate::debug_exit::NONE)
     }
     /// The bytes COM1 has sent so far.
     pub fn serial_bytes(&self) -> usize {

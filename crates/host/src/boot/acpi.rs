@@ -61,7 +61,8 @@ pub mod platform {
 use crate::pci::platform::WINDOW;
 use platform::*;
 
-/// The built tables: the RSDP's address, the AP wakeup mailbox page (X4), and every blob at its guest-physical address.
+/// The built tables: the RSDP's address, the AP wakeup mailbox page (X4; 0 when the tables have none), and every blob at
+/// its guest-physical address.
 #[derive(Debug, Clone)]
 pub struct Tables {
     pub(crate) rsdp: u64,
@@ -367,8 +368,9 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)]) -> Vec<u8> {
 /// The MADT (5.2.12, revision 6): APIC IDs = processor UIDs = vCPU index (CPUID 1/0xB, X3), enabled; the IOAPIC;
 /// ISA IRQ0 -> GSI 2 (flags 0: conforms to ISA, edge/high) and the SCI, IRQ9 -> GSI 9 level/high (QEMU's; not its PCI
 /// link overrides for IRQs 5, 10, 11: no PCI devices); LINT1 of every processor is NMI; the version-0
-/// multiprocessor wakeup mailbox (5.2.12.19 as of 6.5: 16 bytes). PCAT_COMPAT: the dual 8259 is present (L4a).
-fn madt(vcpus: usize, mailbox: u64) -> Vec<u8> {
+/// multiprocessor wakeup mailbox (5.2.12.19 as of 6.5: 16 bytes), unless `mailbox` is `None` (then the OS starts its
+/// other processors with INIT and SIPI, boot-interpreter plan section 6). PCAT_COMPAT: the dual 8259 is present (L4a).
+fn madt(vcpus: usize, mailbox: Option<u64>) -> Vec<u8> {
     let mut m = [LAPIC_BASE.to_le_bytes(), 1u32.to_le_bytes()].concat();
     for v in 0..vcpus as u8 {
         m.extend([0, 8, v, v, 1, 0, 0, 0]);
@@ -383,8 +385,10 @@ fn madt(vcpus: usize, mailbox: u64) -> Vec<u8> {
     m.extend(u32::from(SCI_IRQ).to_le_bytes());
     m.extend(SCI_FLAGS.to_le_bytes());
     m.extend([4, 6, 0xff, 0, 0, 1]);
-    m.extend([0x10, 16, 0, 0, 0, 0, 0, 0]);
-    m.extend(mailbox.to_le_bytes());
+    if let Some(mailbox) = mailbox {
+        m.extend([0x10, 16, 0, 0, 0, 0, 0, 0]);
+        m.extend(mailbox.to_le_bytes());
+    }
     table(b"APIC", 6, &m)
 }
 
@@ -407,6 +411,18 @@ pub fn build_with_devices(
     virtio: &[VirtioMmio],
     pci: &[(u8, u32)],
 ) -> Tables {
+    build_tables(vcpus, base, virtio, pci, true)
+}
+
+/// As [`build_with_devices`]; with `mailbox` false, without the multiprocessor wakeup structure and its mailbox page
+/// ([`Tables::mailbox`] 0): the OS then starts its other processors with INIT and SIPI (boot-interpreter plan section 6).
+pub fn build_tables(
+    vcpus: usize,
+    base: u64,
+    virtio: &[VirtioMmio],
+    pci: &[(u8, u32)],
+    mailbox: bool,
+) -> Tables {
     assert!(
         (1..=254).contains(&vcpus),
         "xAPIC MADT entries hold APIC IDs below 255"
@@ -420,8 +436,8 @@ pub fn build_with_devices(
     let dsdt_at = next(facs_at, 64, 64);
     let dsdt = dsdt(vcpus, virtio, pci);
     let madt_at = next(dsdt_at, dsdt.len(), 64);
-    let madt_len = 44 + 8 * vcpus + 12 + 2 * 10 + 6 + 16;
-    let mailbox = next(madt_at, madt_len, 4096);
+    let madt_len = 44 + 8 * vcpus + 12 + 2 * 10 + 6 + if mailbox { 16 } else { 0 };
+    let mailbox = mailbox.then(|| next(madt_at, madt_len, 4096));
     let madt = madt(vcpus, mailbox);
     debug_assert_eq!(madt.len(), madt_len);
     // RSDP (5.2.5.3, revision 2): no RSDT (RsdtAddress 0), the XSDT; checksum over 0..20, extended over all 36.
@@ -434,19 +450,19 @@ pub fn build_with_devices(
     r[8] = checksum(&r[..20]);
     r[32] = checksum(&r);
     let xsdt_body = [fadt_at.to_le_bytes(), madt_at.to_le_bytes()].concat();
-    let blobs = vec![
+    let mut blobs = vec![
         (rsdp, r),
         (xsdt, table(b"XSDT", 1, &xsdt_body)),
         (fadt_at, fadt(facs_at, dsdt_at)),
         (facs_at, facs()),
         (dsdt_at, dsdt),
         (madt_at, madt),
-        // The mailbox starts as Noop (all zero): written so the dump and the QEMU image carry it.
-        (mailbox, vec![0u8; 4096]),
     ];
+    // The mailbox starts as Noop (all zero): written so the dump and the QEMU image carry it.
+    blobs.extend(mailbox.map(|m| (m, vec![0u8; 4096])));
     Tables {
         rsdp,
-        mailbox,
+        mailbox: mailbox.unwrap_or(0),
         blobs,
     }
 }
@@ -665,6 +681,42 @@ mod tests {
             assert!(
                 d.windows(rtc.len()).any(|w| w == rtc),
                 "RTC: 0x70 length 2, IRQ 8"
+            );
+        }
+    }
+
+    /// Without the mailbox: the same tables at the same addresses, the MADT 16 bytes shorter with no wakeup structure
+    /// (every other entry as with it), and no mailbox page.
+    #[test]
+    fn tables_without_the_mailbox() {
+        for n in [1, 2, 4, 64] {
+            let (with, without) = (
+                build_tables(n, ACPI_NVS.0, &[], &[], true),
+                build_tables(n, ACPI_NVS.0, &[], &[], false),
+            );
+            assert_eq!((without.mailbox, without.rsdp), (0, with.rsdp));
+            assert_eq!(without.blobs.len() + 1, with.blobs.len());
+            for ((a, x), (b, y)) in without.blobs.iter().zip(&with.blobs) {
+                assert_eq!(a, b);
+                if &x[..4] != b"APIC" {
+                    assert_eq!(x, y);
+                }
+            }
+            assert_eq!(with.blobs.last().unwrap(), &(with.mailbox, vec![0; 4096]));
+            let madt = |t: &Tables| {
+                let x = at(t, u64_at(at(t, t.rsdp), 24));
+                at(t, u64_at(x, 44)).to_vec()
+            };
+            let (m, m0) = (madt(&without), madt(&with));
+            assert_eq!((u32_at(&m, 4) as usize, m.len() + 16), (m.len(), m0.len()));
+            assert_eq!(checksum(&m), 0);
+            let (e, e0) = (madt_entries(&m), madt_entries(&m0));
+            assert!(e.iter().all(|s| s[0] != 0x10));
+            assert_eq!(
+                e,
+                e0.into_iter()
+                    .filter(|s| s[0] != 0x10)
+                    .collect::<Vec<_>>()
             );
         }
     }
