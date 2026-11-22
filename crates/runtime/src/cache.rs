@@ -425,6 +425,11 @@ fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
         let k = usize::from(lbucket(pages[0]) != h);
         let next = b.lnext[k];
         c.scanned += 1;
+        #[cfg(feature = "perf")]
+        {
+            c.scanned_instances += u64::from(b.flags & INSTANCE != 0);
+            c.scanned_stale += u64::from(b.flags & DEAD == 0 && b.checked != c.epoch);
+        }
         if b.flags & DEAD != 0 {
             match prev {
                 None => unsafe { lhead(h).write(next) },

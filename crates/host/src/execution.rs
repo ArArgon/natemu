@@ -801,6 +801,9 @@ pub struct K1 {
     /// counter is zero.
     #[serde(skip_serializing_if = "writers_empty")]
     writers: [u64; natemu_abi::writers::count::COUNT],
+    page_fault_scanned: u64,
+    scanned_instances: u64,
+    scanned_stale: u64,
 }
 fn writers_empty(w: &[u64; natemu_abi::writers::count::COUNT]) -> bool {
     w.iter().all(|&n| n == 0)
@@ -1080,6 +1083,9 @@ impl K1 {
                 links_susp: c.links_susp,
             },
             writers: c.writers,
+            page_fault_scanned: c.page_fault_scanned,
+            scanned_instances: c.scanned_instances,
+            scanned_stale: c.scanned_stale,
         }
     }
 }

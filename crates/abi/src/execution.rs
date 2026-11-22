@@ -930,6 +930,12 @@ pub mod cache {
         /// M2 task 4: firings of the stack alignment check ([`super::Cpu::stack_traps`] is the same count per address
         /// space). A plain counter in every build. Appended.
         pub stack_checks: u64,
+        /// `perf` resident builds (zero otherwise): block records visited on linear chains while delivering a #PF (its page's
+        /// blocks cut, [`Self::scanned`]'s share there), and, of all chain visits, those of instances (PIC study stage 3) and
+        /// of blocks not current (`checked` 0 or an earlier epoch). Appended.
+        pub page_fault_scanned: u64,
+        pub scanned_instances: u64,
+        pub scanned_stale: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32

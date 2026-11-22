@@ -1930,6 +1930,8 @@ fn ticks() -> u64 {
 pub(super) fn page_faulted(s: &mut State, cr2: u64) {
     let t0 = ticks();
     crate::study::invalidated(cr2, false);
+    #[cfg(feature = "perf")]
+    let scanned = cache::control().scanned;
     match cache::invlpg(cr2) {
         Some(n) => s.unlinks += n,
         None => halt(s, stop::BAD_LINK),
@@ -1940,6 +1942,10 @@ pub(super) fn page_faulted(s: &mut State, cr2: u64) {
     let c = cache::control();
     c.page_faults += 1;
     c.page_fault_ticks += ticks() - t0;
+    #[cfg(feature = "perf")]
+    {
+        c.page_fault_scanned += c.scanned - scanned;
+    }
 }
 /// Removes every shadow of this vCPU (both spaces) and its writable bits, and counts the reset.
 fn reset_shadows(s: &mut State) {
