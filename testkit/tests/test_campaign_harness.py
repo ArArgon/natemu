@@ -392,7 +392,7 @@ def test_perf_parts_take_performance_cores_only(tmp_path):
     assert campaign.HARNESS.case_needs(fam, suite, 'part-1').perf
     assert campaign.HARNESS.case_needs(fam, suite, 'part-0') == suite.needs and not suite.needs.perf
     pub = next(s for s in family.load(paths.repo_root() / 'tests/correctness/family.toml').suites if s.name == 'public')
-    assert [c for c in campaign.HARNESS.cases(fam, pub) if campaign.HARNESS.case_needs(fam, pub, c).perf] == ['part-1', 'part-2']
+    assert [c for c in campaign.HARNESS.cases(fam, pub) if campaign.HARNESS.case_needs(fam, pub, c).perf] == ['part-1', 'part-2', 'part-10', 'part-11']
 
 
 def test_boot_runs_natemu_with_boot_py_command_line(tmp_path, monkeypatch):
