@@ -117,7 +117,11 @@ others run on.
   need boot programs that start in interpreted code, which the runner's descriptions cannot state beside a translated
   BSP, or a translated NMI or interrupt delivery, which the driver's logging IDT ends): `hlt-init-not-sipi`,
   `nmi-in-interpreted-hlt`, `init-in-interpreted-code`, `nmi-around-init`, `fixed-around-init`; interpreted HLT woken by
-  an INIT and by an NMI is `tests/interp` case `natemu-machine`'s (`r-hlt-init`, `p32-hlt-nmi`).
+  an INIT and by an NMI is `tests/interp` case `natemu-machine`'s (`r-hlt-init`, `p32-hlt-nmi`), and so is
+  `hlt-init-not-sipi` on two CPUs (`smp-hlt-sipi-init`: a machine description; CPU 1 halts in real mode with IF = 0,
+  the BSP in P32 sends it a SIPI, which leaves the HLT as it is, then an INIT, which ends it and is taken before the
+  next instruction, then a SIPI, which starts it at vector 0AH; each wait bounded and its success recorded; shown to
+  fail with a SIPI that wakes the HLT and with an INIT that does not).
   Case `initsipi-interpreter` (the interpreter regime): every scenario but `bsp-init`, the interpreter running each AP's
   stub from its SIPI to 64-bit code (a start counts at its arrival); `fixed-in-wfs`'s own start program (the climb, the
   APIC enabled, STI, an idle HLT) is the stub with a jump the BSP patches at its 64-bit code.
@@ -129,7 +133,18 @@ others run on.
   interpreter's entry) are new.
 - `exit-ap-natemu` (tests/boot, `exit_prog.asm` with the wait item): the pass at 1, 2 and 4 vCPUs (every AP climbs in the
   interpreter and arrives once, counted from 64-bit code).
-- Debian with `--no-mailbox`: the next slice, once the interpreter is merged.
+- `boot-startup` (tests/boot, `run_boot_smoke.py --only startup`, B2's Debian slice): Debian's 6.12.107 kernel and
+  installer initrd through `boot-linux` at 2 and 4 vCPUs, with the mailbox and with `--no-mailbox`, a busybox script on
+  serial. Every CPU is online at boot. Without the mailbox each AP goes offline (`hlt_play_dead`: translated HLT with
+  IF = 0) and online again (an INIT that ends that HLT, the SIPIs, the trampoline in the interpreter); with it Linux
+  refuses offlining (a version-0 mailbox cannot start a CPU twice). Each AP start takes Linux's warm-reset path, with
+  the mailbox too: CMOS 0FH := 0AH and the vector at 467H, restored once the AP is up (counted by the pr_debug `Setting
+  warm reset code and vector.`, turned on with `dyndbg`; port 71H's writes: 4 with the mailbox at 2 and 4 vCPUs, 6 and
+  10 without, two per extra setup and restore). Both are benign here: natemu's CMOS keeps 0FH as a plain byte, as
+  QEMU's does, and 467H is guest RAM. Shutdown (`poweroff -f`): Linux 6.12 parks no CPU with INIT; its
+  `native_stop_other_cpus` sends the reboot vector and each AP stays in `stop_this_cpu`'s HLT (IF = 0), reported
+  `halted`; the run ends at S5. No typed stop. With `NATEMU_INTERPRETER=off` both `--no-mailbox` boots fail (vCPU 1
+  stops at the interpreter's entry) and the mailbox boots pass.
 
 ## Files
 

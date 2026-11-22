@@ -35,10 +35,8 @@
 //! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
 //!
 //! M2 Part 2 (boot-interpreter plan sections 6, 7): `--no-mailbox` leaves the multiprocessor wakeup mailbox out of the
-//! MADT, and each AP starts in the INIT state waiting for a SIPI (`Boot::mailbox`). The SIPI's state is the boot-time
-//! interpreter's, not built yet: the AP stops there (`unsupported_mode`), which ends the whole run: until then
-//! `--no-mailbox` with 2 or more vCPUs ends when the kernel starts its first AP, and every Multiboot boot (its BSP
-//! starts in 32-bit protected mode) at once. Each vCPU's report says where it waited at the end (`waiting`: `sipi`,
+//! MADT, and each AP starts in the INIT state waiting for a SIPI (`Boot::mailbox`), which starts it in the boot-time
+//! interpreter (Linux's real-mode trampoline). Each vCPU's report says where it waited at the end (`waiting`: `sipi`,
 //! `mailbox` or `halted`; absent while it ran). An image without the bzImage magic but with a Multiboot header is
 //! loaded by Multiboot (`boot::multiboot`: `--initrd` its one module, the command line QEMU's `-kernel` gives, the image's
 //! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the

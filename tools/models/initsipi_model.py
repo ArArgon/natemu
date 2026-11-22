@@ -620,8 +620,9 @@ SCENARIOS = {
     'init-in-interpreted-code': dict(cpus=[dict(tr=True, boot=[('icr', 'init', 1), ('icr', 'sipi', 1, V),
                                                                ('await', 1), ('halt',)]),
                                            dict(boot=[('op',), ('op',), ('op',), ('halt',)], start=STUB)]),
-    # Linux's shutdown without a mailbox: the other CPUs halted with IF = 0 are parked with INIT; the run ends with
-    # them waiting for a SIPI, reported as such.
+    # CPUs halted with IF = 0 parked with INIT (what the plan expected of Linux's shutdown without a mailbox; v6.12 does
+    # not: it stops them with its reboot vector and leaves them in HLT, tests/boot case `boot-startup`); the run ends
+    # with them waiting for a SIPI, reported as such.
     'park-with-init': dict(cpus=[dict(tr=True, boot=[('icr', 'init', 'others'), ('halt',)]),
                                  dict(ctx='hlt', tr=True, boot=[('halt',)]), dict(ctx='hlt', tr=True, boot=[('halt',)])]),
     # Firmware boot with an AP never started: the run ends when the BSP halts; the AP is reported waiting.

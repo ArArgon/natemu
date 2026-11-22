@@ -111,7 +111,7 @@ the 25% reserve); boot 11,056 of 24,576.
 
 Case `natemu` (M2 Max): all 1,716 corpus cases match their answers (the resident operations of
 [the transitions](interp-transitions.md) built). Case `natemu-machine` adds 12 interpreted-mode self-tests (and the
-transitions' four): an unaligned LOCK XADD and
+transitions' four, and B2's two-CPU `smp-hlt-sipi-init`, [INIT and SIPI](initsipi-resident.md)): an unaligned LOCK XADD and
 LOCK BTS inside 16 bytes (FEAT_LSE2 at EL1: no alignment fault) and a LOCK XADD across 16 bytes; an instruction ending
 at a page end before an unmapped page, one crossing into it (#PF, CR2 the page, error 0); an instruction ending at the CS
 limit, the byte after it and one crossing it (#GP(0)); unassigned and device pages; self-modifying code; three typed
