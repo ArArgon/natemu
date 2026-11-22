@@ -941,11 +941,6 @@ pub mod cache {
         /// or not current), and pushed back on their chain by a revalidation. Appended.
         pub chain_dropped: u64,
         pub relisted: u64,
-        /// M2 Part 2: nonzero while a system transaction in progress has left the vCPU in a state only the boot-time
-        /// interpreter runs ([`super::Cpu::interpreted_mode`]): set where the end of a transaction (the resident's `commit`,
-        /// `set_cpl`) halted before, taken and cleared at the exit of the resident's `system`, once the transaction has
-        /// completed. Appended.
-        pub interpret: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1316,8 +1311,8 @@ pub mod cache {
     pub const OFF1: u32 = 16384;
     /// M2 Part 2, reserved (none is placed yet): the boot-time interpreter's record of an instruction, validated by its bytes
     /// at every execution instead of by write-watching (no source page marked). Always with [`SYSTEM`] (no code, never in L1,
-    /// never entered or linked), so the one `SYSTEM` test on the resident's hit path (`find_from`) covers both kinds and
-    /// they part inside its taken arm.
+    /// never entered or linked), keyed by an [`super::interpreted_context`], which no code context equals: the resident's
+    /// lookups in translatable state (`find_from`) never find one, and the interpreter's own lookup parts the two kinds.
     pub const INTERPRETED: u32 = 32768;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
@@ -2954,6 +2949,19 @@ pub enum InterpretedMode {
     Compat32 = 5,
 }
 
+/// [`Cpu::code_context`] uses bits 0 to 33 only ([`CODE_CONTEXT_BITS`]; its code mode field, bits 4:2, holds 0 to 3).
+pub const CODE_CONTEXT_BITS: u32 = 34;
+/// M2 Part 2: the bit every context of a boot-time interpreter record has and no [`Cpu::code_context`] has, so a lookup in
+/// translatable state never finds one ([`interpreted_context`]).
+pub const INTERPRETED_CONTEXT: u64 = 1 << 63;
+const _: () = assert!(INTERPRETED_CONTEXT >> CODE_CONTEXT_BITS != 0);
+/// M2 Part 2: the context an interpreter record is cached under ([`cache::INTERPRETED`]): [`INTERPRETED_CONTEXT`], the
+/// interpreted mode in bits 4:2 and the CPL in bits 1:0. Never [`cache::NO_CONTEXT`].
+pub const fn interpreted_context(mode: InterpretedMode, cpl: u64) -> u64 {
+    INTERPRETED_CONTEXT | (mode as u64) << 2 | cpl & 3
+}
+const _: () = assert!(interpreted_context(InterpretedMode::Compat32, 3) != cache::NO_CONTEXT);
+
 impl Cpu {
     /// M2 Part 2: the mode the boot-time interpreter runs this state in, from CR0.PE, EFER.LMA, the hidden CS.L and CS.D
     /// and the CPL; `None` for a state the translator runs or none runs. Interpretable exactly when EFER.LMA = 0, or at CPL
@@ -4003,8 +4011,15 @@ pub mod halt_poll {
 }
 /// S4: [`State::debug`]'s fields.
 pub mod debug {
-    /// The pending trap's DR6 bits.
+    /// The pending trap's DR6 bits (B0..B3 and BS), and [`INTERPRET`].
     pub const TRAP: u64 = 0xffff;
+    /// M2 Part 2: a system transaction left the vCPU in a state only the boot-time interpreter runs
+    /// ([`super::Cpu::interpreted_mode`]; set where the end of a transaction, the resident's `commit` or `set_cpl`, halted
+    /// before). The interpreter is entered at the next boundary, before its trap-class #DB (the resident's `trap_due`, which
+    /// clears it). A DR6 bit no trap sets (bit 12, reserved), inside [`TRAP`], so the tests every boundary and the fast
+    /// system-call path already make (`State::debug` nonzero, or its trap bits) send the vCPU there with no test of their own.
+    pub const INTERPRET: u64 = 1 << 12;
+    const _: () = assert!(INTERPRET & TRAP != 0 && INTERPRET & (0xf | super::DR6_BS) == 0);
     /// B0..B3 the instruction in progress met, at this shift.
     pub const HITS: u32 = 16;
     pub const STEP: u64 = 1 << 20;
@@ -5680,6 +5695,25 @@ mod tests {
         ] {
             let c = state(cr0, efer, attributes, cpl);
             assert_eq!(c.interpreted_mode(), want, "{cr0:#x} {efer:#x} {attributes:#x} CPL {cpl}");
+        }
+    }
+
+    /// M2 Part 2: no code context reaches bit 34 (so none has [`INTERPRETED_CONTEXT`]): every field at its widest.
+    #[test]
+    fn code_contexts_leave_the_interpreted_bit_clear() {
+        // SAFETY: `Cpu` is plain integers.
+        let mut c: Cpu = unsafe { core::mem::zeroed() };
+        (c.cpl, c.cr0, c.cr4, c.xcr0) = (3, CR0_EM | CR0_TS | CR0_MP | CR0_AM, CR4_OSFXSR | CR4_OSXSAVE, 7);
+        (c.rflags, c.dr[5], c.stack_traps) = (RFLAGS_AC, 0xff | 0x3 << 16, STACK_TRAP_LIMIT);
+        for (fcw, mxcsr, no_afp, accurate) in [(0, 0, 0, 1), (0xc00, MXCSR_DAZ | 1 << 15, 1, 1), (0x37f, MXCSR_RESET, 1, 0)] {
+            (c.fcw, c.mxcsr, c.no_afp, c.accurate_fp) = (fcw, mxcsr, no_afp, accurate);
+            for attributes in [0x00fb, 0xa0fb, 0xc0fb, 0xe0fb] {
+                c.seg[SREG_CS].attributes = attributes;
+                assert_eq!(c.code_context() >> CODE_CONTEXT_BITS, 0, "{c:x?}");
+            }
+        }
+        for mode in [InterpretedMode::Real, InterpretedMode::Compat32] {
+            assert_ne!(interpreted_context(mode, 0) & INTERPRETED_CONTEXT, 0);
         }
     }
 

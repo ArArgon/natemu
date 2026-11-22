@@ -1,44 +1,49 @@
 //! M2 Part 2: the boot-time interpreter's plumbing in the resident (docs/restructure/m2-boot-interpreter-plan.md
 //! sections 4 and 5). A vCPU reaches a state only the interpreter runs ([`Cpu::interpreted_mode`]: real mode, protected
 //! mode outside IA-32e mode, compatibility mode at CPL 0) only at a cold point: the end of a system transaction (its
-//! `commit`, or `set_cpl` inside it), where the resident halted before, records it ([`record`]) and [`system`]'s exit
-//! enters the interpreter once the transaction has completed ([`enter`]); the vCPU's start enters directly ([`run`]).
-//! The interpreter itself is not built yet: [`run`] stops the vCPU as it stopped before (`unsupported_mode`,
-//! `unsupported_code_mode`), so a guest sees the same stop, now after the transaction that made the state.
+//! `commit`, or `set_cpl` inside it), where the resident halted before, records it ([`record`]: [`debug::INTERPRET`] in
+//! `State::debug`), and the next boundary enters the interpreter once the transaction has completed ([`boundary`], from
+//! `find_from`'s loop, before a trap-class #DB). Every path out of a system transaction reaches that loop, and none needs a
+//! test of its own: the fast system-call path declines when `State::debug` is nonzero, and the loop's first look at the
+//! debug state is at its trap bits, which hold the record. The interpreter returns to that loop when the state is one the
+//! translator runs again (no cycle through `dispatch`). The vCPU's start enters directly ([`run`]). The interpreter itself is
+//! not built yet: [`run`] stops the vCPU as it stopped before (`unsupported_mode`, `unsupported_code_mode`), so a guest
+//! sees the same stop, now after the transaction that made the state.
 //!
 //! The paging-off walk ([`unpaged_pages`], [`fetch_unpaged`], [`revalidated_unpaged`]) is the variant of
 //! [`segments::pages`], [`fetch_walk`] and [`revalidated`] for the interpreter's accesses, fetches and records with CR0.PG =
 //! 0; those three keep their mode check (translatable state only: a halt otherwise, an assertion).
 use super::*;
 
-/// [`ends_in_mode`]'s arms where [`controls`] halts with `reason`: a state the interpreter runs is recorded for
-/// [`system`]'s exit; any other halts as [`controls`] does (`unsupported_mode` for the paging mode or CPL,
-/// `unsupported_code_mode` for the code segment), at the instruction.
+/// [`ends_in_mode`]'s arms where [`controls`] halts with `reason`: a state the interpreter runs is recorded for the next
+/// boundary; any other halts as [`controls`] does (`unsupported_mode` for the paging mode or CPL, `unsupported_code_mode`
+/// for the code segment), at the instruction.
 #[cold]
 #[inline(never)]
-pub(super) fn record(s: &State, reason: u64) {
+pub(super) fn record(s: &mut State, reason: u64) {
     if s.cpu.interpreted_mode().is_some() {
-        cache::control().interpret = 1;
+        s.debug |= debug::INTERPRET;
     } else {
         halt(s, reason)
     }
 }
 
-/// [`system`]'s exit after a transaction [`record`]ed a state the interpreter runs: the interpreter, once the
-/// transaction has completed (and the record cleared). A state that is no longer one (the transaction restored the
-/// bank after it recorded) goes on as any other.
+/// The boundary after a transaction [`record`]ed a state the interpreter runs (`trap_due`'s first check, which it ends):
+/// clears the record and runs the interpreter; true, so `find_from` looks at the boundary again (a state that is no longer
+/// one, the transaction having restored the bank after it recorded, then goes on as any other).
 #[cold]
 #[inline(never)]
-pub(super) fn enter(s: &mut State) {
-    cache::control().interpret = 0;
+pub(super) fn boundary(s: &mut State) -> bool {
+    s.debug &= !debug::INTERPRET;
     if s.cpu.interpreted_mode().is_some() {
-        run(s)
+        run(s);
     }
+    true
 }
 
-/// The interpreter from the bank's state ([`Cpu::interpreted_mode`]): not built yet, so the stop natemu made before there
-/// was one.
-pub(super) fn run(s: &mut State) -> ! {
+/// The interpreter from the bank's state ([`Cpu::interpreted_mode`]), returning once the state is one the translator runs.
+/// Not built yet: the stop natemu made before there was one.
+pub(super) fn run(s: &mut State) {
     halt(s, stopped(s))
 }
 

@@ -129,10 +129,10 @@ fn controls(s: &State) -> paging::Control {
 }
 /// [`controls`]' check at the end of a system transaction ([`commit`], and [`set_cpl`] inside one), where the controls are
 /// not needed: its two returning arms, unchanged; where it halts, M2 Part 2: a state the boot-time interpreter runs is
-/// recorded for [`system`]'s exit to enter once the transaction has completed, any other halts as there
-/// ([`interpret::record`], out of line). Inlined, as [`controls`] is (SYSCALL and SYSRET pass through both callers).
+/// recorded ([`debug::INTERPRET`]) for the next boundary to enter once the transaction has completed, any other halts as
+/// there ([`interpret::record`], out of line). Inlined, as [`controls`] is (SYSCALL and SYSRET pass through both callers).
 #[inline(always)]
-fn ends_in_mode(s: &State) {
+fn ends_in_mode(s: &mut State) {
     match (s.cpu.paging(), s.cpu.code_mode()) {
         (Some(_), Some(CodeMode::Bits64)) => {}
         (Some(c), Some(_)) if c.cpl == 3 => {}
@@ -291,13 +291,10 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
         crate::perf::leave(p);
         let block = match found {
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
+            // (M2 Part 2: the boot-time interpreter's records are SYSTEM records too, [`cache::INTERPRETED`], but under an
+            // interpreted context, which no code context equals: this lookup never finds one.)
             Some(b) if b.flags & cache::SYSTEM != 0 => {
                 s.l2_hits += 1;
-                // M2 Part 2: the boot-time interpreter's records are SYSTEM records too ([`cache::INTERPRETED`]), parted
-                // from the decodes here; none is placed yet.
-                if b.flags & cache::INTERPRETED != 0 {
-                    halt(s, stop::BAD_REPLY)
-                }
                 #[cfg(feature = "perf")]
                 {
                     cache::control().system_chained += chained as u64;
@@ -494,10 +491,14 @@ fn at_breakpoint(c: &Cpu, b: &Block) -> bool {
     c.dr[5] & DR7_ENABLES != 0 && c.code_breakpoints().any(|a| a == b.rip)
 }
 /// S4: delivers the trap-class #DB pending at this boundary (`State::debug_trap`), unless a MOV SS shadow holds, which
-/// discards a single-step trap (delivery_model A9). True when delivered.
+/// discards a single-step trap (delivery_model A9). True when delivered, or (M2 Part 2) when the interpreter ran.
 #[cold]
 #[inline(never)]
 fn trap_due(s: &mut State) -> bool {
+    // M2 Part 2: first the boot-time interpreter, when a transaction left a state only it runs ([`debug::INTERPRET`]).
+    if s.debug & debug::INTERPRET != 0 {
+        return interpret::boundary(s);
+    }
     let hits = s.debug & debug::TRAP;
     if hits == 0 {
         return false;
@@ -2723,11 +2724,6 @@ fn system(s: &mut State, i: System) {
         c.system_from[(p & 31) as usize] += 1;
     }
     crate::perf::leave(p);
-    // M2 Part 2: the one test on this exit. A transaction that left a state only the boot-time interpreter runs
-    // ([`ends_in_mode`]) enters it now that it has completed.
-    if cache::control().interpret != 0 {
-        interpret::enter(s)
-    }
 }
 /// CNTVCT without a barrier (accounting only).
 #[cfg(feature = "perf")]
@@ -3272,8 +3268,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
 }
 /// Ends a system transaction: RIP past the instruction (it completed: RF ends, except the RF an IRET just loaded); with
 /// `flush_all`, a global TLB flush ([`tlb`]: shadows go, translations stay). M2 Part 2: a state the boot-time interpreter
-/// runs ([`ends_in_mode`]) completes the same way, then [`system`] enters it: none of this needs walk controls (the flush
-/// drops shadows, which the interpreter never uses; the interpreter applies its own IP width to RIP).
+/// runs ([`ends_in_mode`]) completes the same way, and the next boundary enters it: none of this needs walk controls (the
+/// flush drops shadows, which the interpreter never uses; the interpreter applies its own IP width to RIP).
 fn commit(s: &mut State, i: System, flush_all: bool) {
     ends_in_mode(s);
     if i.kind != system::IRET {
