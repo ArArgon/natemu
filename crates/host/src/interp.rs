@@ -326,9 +326,12 @@ pub(crate) fn linear_ip(state: &State) -> u64 {
     state.cpu.seg[SREG_CS].base.wrapping_add(state.cpu.rip) & 0xffff_ffff
 }
 /// Serves [`natemu_abi::interp::REQUEST_DECODE`]: the request from the vCPU's staging area, the reply into it; the run
-/// ends before the instruction at `stop` (the next address the run's hook answers, above [`linear_ip`]), if any.
+/// ends before the instruction at `stop` (the next address the run's hook answers, above [`linear_ip`]), if any, and
+/// before 4 GiB.
 pub(crate) fn serve(area: Area, state: &mut State, stop: Option<u64>) -> Result<()> {
-    let limit = stop.map_or(usize::MAX, |s| usize::try_from(s - linear_ip(state)).unwrap_or(usize::MAX));
+    // (And before 4 GiB: an address the run would reach past the wrap is one the hook was not asked about.)
+    let to_wrap = (1 << 32) - linear_ip(state);
+    let limit = usize::try_from(stop.map_or(to_wrap, |s| (s - linear_ip(state)).min(to_wrap))).unwrap_or(usize::MAX);
     let reply = answer(&area.read_record(STAGING_OFFSET + DECODE_OFFSET), limit)?;
     area.write_record(STAGING_OFFSET + DECODED_OFFSET, reply);
     state.reply = REPLY_DECODE;

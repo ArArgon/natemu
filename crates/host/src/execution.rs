@@ -3849,6 +3849,11 @@ pub fn run(
         control + std::mem::offset_of!(cache::Control, miss_fast_off),
         u64::from(std::env::var("NATEMU_MISS_FAST").as_deref() == Ok("off")),
     );
+    // Tests only (M2 Part 2): NATEMU_INTERPRETER=off stops a vCPU at the boot-time interpreter's entry, as before it ran.
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, interpreter_off),
+        u64::from(std::env::var("NATEMU_INTERPRETER").as_deref() == Ok("off")),
+    );
     // Fault-around plan chunk 1 (A/B measurement): the flag's value, overridden by NATEMU_WRITABLE_ON_READ=on|off (every driver reads it).
     let writable = match std::env::var("NATEMU_WRITABLE_ON_READ") {
         Ok(v) => parse_writable_on_read(&v)?,

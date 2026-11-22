@@ -97,6 +97,10 @@ impl At {
 /// is one the translator runs. Each pass starts with `find`'s boundary prologue in its order ([`find_from`]); a pass that
 /// cannot run its instruction stops the vCPU ([`stopped`]).
 pub(super) fn run(s: &mut State) {
+    // (Tests only: the stop made at the interpreter's entry before it ran, `Control::interpreter_off`.)
+    if cache::control().interpreter_off != 0 {
+        halt(s, if s.cpu.paging().is_none() { stop::UNSUPPORTED_MODE } else { stop::UNSUPPORTED_CODE_MODE })
+    }
     loop {
         s.cpu.rip &= 0xffff_ffff;
         io_checkpoint(s);
@@ -115,8 +119,6 @@ pub(super) fn run(s: &mut State) {
 /// One instruction at a boundary: the debug state, the events and the mode first (each a typed stop when it asks for
 /// what the interpreter does not do), then the record at CS.base + EIP and its execution.
 fn pass(s: &mut State, at: &mut At) -> Result<(), Stop> {
-    // The interpreter sets neither shadow and honours none (no event is delivered here; plan section 5).
-    (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
     debugging(s)?;
     events(s)?;
     let paging = walks(s)?;
@@ -129,7 +131,11 @@ fn pass(s: &mut State, at: &mut At) -> Result<(), Stop> {
         _ => decode(s, paging, linear, key, at)?,
     };
     (at.op, at.count, at.bytes) = (i.op, i.length, i.bytes);
-    execute(s, paging, &i)
+    execute(s, paging, &i)?;
+    // The interpreter sets neither shadow and honours none (no event is delivered here, plan section 5); one it found
+    // (a start state's) ends with the instruction, as a shadow does.
+    (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
+    Ok(())
 }
 
 /// A pending trap-class #DB, RFLAGS.TF or an armed breakpoint (DR7): the interpreter delivers no #DB and checks no
@@ -149,17 +155,23 @@ fn debugging(s: &State) -> Result<(), Stop> {
 }
 
 /// The events this boundary would take: the one place the interpreter reads them (`find` takes them with
-/// `events::take`). No event is delivered in an interpreted mode (plan section 6): each is a typed stop naming it
-/// ([`event_stop`]), left pending. (INIT and SIPI are the CPU start-up work's: its reading of the events, which takes INIT
-/// itself, replaces the call below and keeps the stop.)
+/// `events::take`), through the CPU start-up's event point ([`events::interpreted`]): it takes a pending INIT itself (the
+/// bank is then the INIT or SIPI state, which the rest of the pass reads afresh) and names any other event, which no
+/// interpreted mode delivers (plan section 6): a typed stop ([`event_stop`]), the event left pending.
 fn events(s: &mut State) -> Result<(), Stop> {
-    match events::undelivered(s) {
+    match events::interpreted(s) {
         None => Ok(()),
-        Some((kind, vector)) => Err(event_stop(kind, vector)),
+        Some(e) => Err(event_stop(e)),
     }
 }
-/// The typed stop for an event an interpreted mode does not deliver: its kind (`stop::interp::NMI` ..) and vector.
-fn event_stop(kind: u64, vector: u64) -> Stop {
+/// The typed stop for an event an interpreted mode does not deliver: its kind (`stop::interp::NMI` ..) and vector (2 for
+/// an NMI; an ExtINT's comes from the PIC only when it is taken: 0).
+fn event_stop(e: events::Undelivered) -> Stop {
+    let (kind, vector) = match e {
+        events::Undelivered::Nmi => (detail::NMI, 2),
+        events::Undelivered::Interrupt(v) => (detail::INTERRUPT, v),
+        events::Undelivered::ExtInt => (detail::EXTINT, 0),
+    };
     Stop::new(stop::INTERP_EVENT, kind, [vector, 0, 0])
 }
 
@@ -284,7 +296,8 @@ fn decode(
     at: &mut At,
 ) -> Result<Insn, Stop> {
     let bytes = request_bytes();
-    let first = (4096 - (linear & 4095) as usize).min(MAX_FETCH);
+    // (Nothing is fetched at the host's stop RIP, as at a translation request: the host ends the run there.)
+    let first = if u64::from(linear) == s.stop_at { 0 } else { (4096 - (linear & 4095) as usize).min(MAX_FETCH) };
     // SAFETY: `first` <= MAX_FETCH bytes of the request's buffer.
     let (mut available, mut short) = match fetch(s, paging, 0, unsafe {
         core::slice::from_raw_parts_mut(bytes, first)
@@ -647,8 +660,12 @@ impl Memory for Mem<'_> {
             self.stored(g, || was = unsafe { cas(p, size, old & m, new & m) });
             return was;
         }
-        // Crossing 16 bytes, or not RAM: under the VM's split lock, as translated code's (`split_lock`).
-        let last = self.page(linear.wrapping_add(u32::from(size) - 1)).0;
+        let (last, last_ram) = self.page(linear.wrapping_add(u32::from(size) - 1));
+        // No byte of it RAM: all-ones read, the write ignored, nothing to lock.
+        if !ram && !last_ram {
+            return m;
+        }
+        // Crossing 16 bytes, or partly RAM: under the VM's split lock, as translated code's (`split_lock`).
         let s = &mut *self.s;
         s.splits += 1;
         cache::split_begin([g, last], s.vcpus as usize, || {

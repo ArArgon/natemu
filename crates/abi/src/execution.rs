@@ -930,6 +930,11 @@ pub mod cache {
         /// M2 task 4: firings of the stack alignment check ([`super::Cpu::stack_traps`] is the same count per address
         /// space). A plain counter in every build. Appended.
         pub stack_checks: u64,
+        /// M2 Part 2, set by the host from `NATEMU_INTERPRETER=off` (tests only; zero, the default, is on): the boot-time
+        /// interpreter is not run, and a vCPU reaching it stops as it did before there was one (`stop::UNSUPPORTED_MODE`,
+        /// `stop::UNSUPPORTED_CODE_MODE`, at its entry): for the CPU start-up tests that observe each start state there
+        /// until the interpreter runs their AP stub. Appended.
+        pub interpreter_off: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
