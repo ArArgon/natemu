@@ -334,6 +334,15 @@ def test_expected_without_afp_does_not_apply_in_accurate_mode(setup, monkeypatch
     assert res.outcome == 'failed' and subs(res)['default:test_a'] == ('failed', None)
 
 
+def test_expected_without_afp_applies_with_afp_hidden(setup, monkeypatch):
+    """A host.afp = false variant on a Mac with AFP hides it (NATEMU_FEXC_FEATURE_OFF=afp, tests/features.toml): its
+    expected_without.afp entries apply as on a Mac without it."""
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=1')
+    monkeypatch.setenv('NATEMU_FEXC_FEATURE_OFF', 'afp')
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', *BAD_A)}, extra=WITHOUT_AFP)
+    assert subs(run('part-0'))['default:test_a'] == ('skipped', 'expected-fail')
+
+
 def test_expected_without_an_unknown_feature_fails_and_is_not_applied(setup, monkeypatch):
     extra = '''
         expected_without.apf = { "default:test_a" = "misspelt (docs/x.md)" }
@@ -457,6 +466,47 @@ def test_reference_compared_verdicts(tmp_path, monkeypatch):
     t = lambda n, rc, o: v.torture32(n, {'rc': rc, 'out': o}, [])[0]
     assert [t('t.O0', '0', 'aa'), t('t.O0', '0', 'zz'), t('t.O0', '1', 'aa'), t('new.O0', '0', 'aa')] == ['passed', 'failed', 'failed', 'failed']
     assert [t('addr.O0', '0', 'zz'), t('addr.O0', '1', 'zz'), t('abort.O0', '134', 'zz'), t('abort.O0', '0', 'cc')] == ['passed', 'failed', 'passed', 'failed']
+
+
+def test_reference_status_verdicts(tmp_path, monkeypatch):
+    """ltp32 and libm32: the suite's own verdict from the exit status, and the x86 reference machine's status recorded
+    when seeding (`*` where two seeding runs differ); unsupported here where the reference passed fails."""
+    v = verdicts()
+    monkeypatch.setattr(v, 'LTP32', tmp_path / 'ltp32.txt'); monkeypatch.setattr(v, 'LIBM32', tmp_path / 'libm32.txt')
+    monkeypatch.setenv('TESTKIT_SEED_ANSWERS', '1')
+    for name, rc in (('s:a', '0'), ('s:b', '32'), ('s:c', '2'), ('s:t', '0'), ('s:t', '1'), ('s:a', '0')):
+        assert v.ltp32(name, {'rc': rc}, [])[0] == 'unverified'
+    assert v.libm32('math/test-x', {'rc': '0'}, [])[0] == 'unverified'
+    assert (tmp_path / 'ltp32.txt').read_text() == 's:a 0\ns:b 32\ns:c 2\ns:t *\n'
+    monkeypatch.delenv('TESTKIT_SEED_ANSWERS')
+    t = lambda n, rc: v.ltp32(n, {'rc': rc}, [])[0]
+    assert [t('s:a', '0'), t('s:a', '32'), t('s:a', '1'), t('s:b', '32'), t('s:c', '2'), t('s:t', '32')] == \
+        ['passed', 'failed', 'failed', 'unsupported', 'failed', 'unsupported']
+    assert 'reference machine: rc=2' in v.ltp32('s:c', {'rc': '2'}, [])[1]
+    assert t('s:new', '0') == 'failed'
+    m = lambda rc: v.libm32('math/test-x', {'rc': rc}, [])[0]
+    assert [m('0'), m('77'), m('1')] == ['passed', 'failed', 'failed']
+
+
+def test_native_vm_boots_the_same_kernel_and_command_line_under_kvm(tmp_path, monkeypatch):
+    """native_vm(): the kernel and image go to the x86 machine in one tar, and QEMU there boots them under KVM with
+    boot()'s command line, vCPUs and 2 GiB; the serial output is the result."""
+    import subprocess, tarfile, types
+    (tmp_path / 'k').write_bytes(b'kernel'); (tmp_path / 'i.cpio.zst').write_bytes(b'initrd')
+    seen = {}
+
+    def fake(cmd, stdin, capture_output, timeout):
+        seen['cmd'] = cmd
+        with tarfile.open(fileobj=stdin) as t: seen['files'] = {m.name: t.extractfile(m).read() for m in t}
+        return types.SimpleNamespace(returncode=0, stdout=serial('1/4', 'CT-RESULT ltp s:a rc=0', suite='ltp').encode(), stderr=b'')
+    monkeypatch.setattr(subprocess, 'run', fake)
+    r = campaign.native_vm(tmp_path / 'i.cpio.zst', 'ltp', '1/4', 4, 'u@x86', 600, tmp_path / 'w', kernel=tmp_path / 'k')
+    assert r.reached and seen['files'] == {'kernel': b'kernel', 'initrd': b'initrd'}
+    assert seen['cmd'][:3] == ['ssh', '-o', 'BatchMode=yes'] and seen['cmd'][3] == 'u@x86'
+    script = seen['cmd'][4]
+    for want in ('--device /dev/kvm', '-enable-kvm -cpu host -m 2048 -smp 4', 'ct=ltp part=1/4', campaign.artifacts.BENCH_BUILDER):
+        assert want in script, want
+    assert (tmp_path / 'w' / 'native.txt').read_text().count('CT-RESULT') == 1 and not (tmp_path / 'w' / 'boot.tar').exists()
 
 
 def test_x86st_fail_count_fails():
