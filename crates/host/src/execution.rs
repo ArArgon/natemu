@@ -3067,6 +3067,11 @@ impl Compiler {
         let t = self.stamp();
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
+            // The reuse check, of the key: a kept answer of 32-bit code found again at its own RIP (not its first use) is
+            // fexc's answer to this request too (M2 reuse: the mode, null segments and x87 guess it is matched by).
+            if self.check_reuse && self.bits32 && origin.is_none() {
+                self.check(&e.answer, read, bytes, rip, limit, from, hook)?;
+            }
             self.answered(&e.answer, bytes, rip, hook, Some(e), origin)?
         } else {
             let Some(answer) = e.answer.at(from, rip) else {
@@ -3143,7 +3148,7 @@ impl Compiler {
         let same_extent = fresh.0 == read.0 && fresh.2 == read.2 && (fresh.1 == read.1 || bytes.len() == read.2);
         if !same_extent || Answer::new(reply, rip)? != *answer {
             return Err(format!(
-                "reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"
+                "reuse check: the answer kept for {from:#x} is not fexc's at {rip:#x}"
             ));
         }
         Ok(())
@@ -5473,6 +5478,41 @@ mod tests {
         c.bits32 = false;
         assert_eq!(kind(&mut c, &load), None);
         assert!(!String::from_utf8_lossy(&c.body(&load, 0x1000, None)).contains("--fs-null"));
+    }
+    /// M2 reuse, with `FEXC` set: the move forms an i386 program's addresses seldom give, each moved answer compared with
+    /// fexc's compile at the new EIP by the reuse check: the one-word `movn` (0xffffxxxx), `orr #bitmask` and `movz` forms
+    /// moved into each other; a change of word count, a target of 0 and a block ending at 4 GiB refused.
+    #[test]
+    fn rare_move_forms_of_32_bit_code_move_as_fexc_compiles_them() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.bits32, c.check_reuse) = (true, true);
+        let jcc = [0x40, 0x75, 0x10, 0x90]; // inc eax; jne $+0x12; ...
+        let pic = [0x40, 0xe8, 0x00, 0x00, 0x00, 0x00]; // inc eax; call $+5
+        let zero = [0x40, 0xe9, 0xba, 0xec, 0xff, 0xff]; // inc eax; jmp 0 (at 0x1340)
+        // (code, EIP, relocated, refused): in order; an answer is moved from the first kept one of its bytes.
+        let steps: [(&[u8], u64, u64, u64); 12] = [
+            (&jcc, 0xffff_1340, 0, 0),
+            (&jcc, 0xffff_8340, 1, 0), // movn to movn
+            (&jcc, 0x5655_5340, 0, 1), // movn to movz + movk
+            (&pic, 0x0ffe_fffa, 0, 0), // 0x0ffff000: orr #bitmask
+            (&pic, 0x00fe_fffa, 1, 0), // 0x00fff000: to another bitmask
+            (&pic, 0x0f0f_fffa, 1, 0), // 0x0f100000: to one movz
+            (&pic, 0x5655_5ffa, 0, 1), // 0x56556000: two words
+            (&pic, 0xffff_fffa, 0, 1), // ends at 4 GiB: the return address is 0
+            (&pic, 0xffff_fffa, 0, 0), // (its own answer, found again and checked)
+            (&zero, 0x0000_1340, 0, 0), // the target is 0: one movz
+            (&zero, 0x5655_5340, 0, 1), // 0x56554000: two words
+            (&zero, 0x0000_1340, 0, 0),
+        ];
+        for (i, (code, rip, relocated, refused)) in steps.into_iter().enumerate() {
+            let before = (c.relocated, c.relocation_refused);
+            assert!(matches!(c.compile(code, rip, false, &mut ()).unwrap(), Code::Block(_)), "step {i}");
+            assert_eq!((c.relocated - before.0, c.relocation_refused - before.1), (relocated, refused), "step {i} at {rip:#x}");
+        }
+        assert_eq!((c.compiles, c.reuse_checks), (7, 5));
     }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
