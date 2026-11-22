@@ -135,6 +135,8 @@ both block sizes, every other program passes); the past-the-limit stop (the thre
 
 ## The hot paths (resident release builds, `llvm-objdump`, addresses, symbol hashes and literal-pool addresses aside)
 
+Experiment (not a framework case; M2 Max): the disassembly and the resident's sizes below.
+
 Against b5266dc4 (this change on deea8131), identical: `find_from`, `sys_fast`, `miss_fast` (both with `sys_commit`
 inlined), `system` (with `transaction`), `commit`, `set_cpl`, `far_transfer` (with `same_mode` and `far_target`),
 `far_return`, `load_data`, `trap_due`, `segments::pages`, `linear`, `copy`, `descriptor`, `accessed`, `translate`,
@@ -163,4 +165,4 @@ caller) restored all three; on `boot-interp` d8049820, whose firmware mode moved
 - Everything else runs only from interpreted state.
 - A 64-bit far transfer into CPL-0 compatibility-mode code with RIP outside the new CS limit stops loudly after it
   completes, where x86 raises #GP(0) at the instruction (the recorded deviation above; no known code does this).
-- The resident grows by 5.8 KB; the interpreter's gate path deepens (the static `stack` case).
+- The resident grows by 5.8 KB (the experiment above); the interpreter's gate path deepens (the static `stack` case).

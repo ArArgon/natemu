@@ -157,7 +157,10 @@ waits, the hook), `execution/startup.rs` (new), `execution.rs` (`start`, `trap_d
 ## Risks for a running 64-bit OS
 
 - `next` runs at every boundary and in `sys_commit`: still one load of the word; the common path loses one load.
-  Checked by the disassembly, the gate and the hackbench cases.
+  Checked by the disassembly (below, an experiment) and the hackbench cases at e21b0209
+  ([benchmarks](../benchmarks.md)). B2 had no gate run of its own: its author ran the CPU start-up cases (`initsipi`,
+  `initsipi-1`, `x3-cases`, `exit-ap-natemu`); after the interpreter's merge the system, smp, interp and unit families
+  ran at e21b0209 (M2 Max), and the full gate on the final tip ([the plan](m2-boot-interpreter-plan.md), section 12).
 - NMI post and take become read-modify-writes: the NMI path only.
 - INIT and SIPI code runs only for a guest that sends them; Debian with the mailbox never does (today they stop the
   VM). No new test on the hot path; the mailbox wait gains two loads per pass (APs before their wakeup only).
@@ -166,6 +169,7 @@ waits, the hook), `execution/startup.rs` (new), `execution.rs` (`start`, `trap_d
 
 ## The hot path, before and after (resident release build, `llvm-objdump`; ac111723 against this change)
 
+Experiment (not a framework case; M2 Max).
 `events::none` is not a function of its own: it is a call of the out-of-line `events::next` and a test of its `None`
 (-1). Its call sites, `miss_fast`'s own test and the two of `sys_commit` (before the commit and after the transaction),
 which is inlined into both `miss_fast` and `sys_fast`, are, like the rest of both functions, the same instructions before
