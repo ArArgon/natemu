@@ -416,6 +416,9 @@ def cases():
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
                              ('call-far-compat16', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xd3\n    call far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xd3), 'call', s['rsp'] - 16, stack=True)),
+                             # (M2 Part 2's lock: a far call to the 32-bit CS as well, 64 -> 32 at CPL 3, plan section 8.)
+                             ('call-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    call far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'call', s['rsp'] - 16, stack=True)),
                              ('lret-compat', '    push 0xdb\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0xdb]))),
                              ('jmp-far-call-gate', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xb3\n    jmp far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xb3), 'jmp', s['rsp'] - 16, stack=True))):

@@ -924,6 +924,11 @@ pub mod cache {
         /// M2 task 4: firings of the stack alignment check ([`super::Cpu::stack_traps`] is the same count per address
         /// space). A plain counter in every build. Appended.
         pub stack_checks: u64,
+        /// M2 Part 2: nonzero while a system transaction in progress has left the vCPU in a state only the boot-time
+        /// interpreter runs ([`super::Cpu::interpreted_mode`]): set where the end of a transaction (the resident's `commit`,
+        /// `set_cpl`) halted before, taken and cleared at the exit of the resident's `system`, once the transaction has
+        /// completed. Appended.
+        pub interpret: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1274,6 +1279,11 @@ pub mod cache {
     /// currency, L1 and L2 entries, linear and frame chains and link-point targets; no code (`code` the fill point,
     /// `code_size` 0, as a [`SYSTEM`] record), no sites (its translation's).
     pub const INSTANCE: u32 = 4096;
+    /// M2 Part 2, reserved (none is placed yet): the boot-time interpreter's record of an instruction, validated by its bytes
+    /// at every execution instead of by write-watching (no source page marked). Always with [`SYSTEM`] (no code, never in L1,
+    /// never entered or linked), so the one `SYSTEM` test on the resident's hit path (`find_from`) covers both kinds and
+    /// they part inside its taken arm.
+    pub const INTERPRETED: u32 = 8192;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
     /// design's 16-byte shift of FEX's body.
@@ -2712,7 +2722,56 @@ pub enum CodeMode {
     Compat16 = 3,
 }
 
+/// M2 Part 2: the modes the boot-time interpreter runs ([`Cpu::interpreted_mode`]), the plan's R, P16, P32, C16 and C32.
+/// Nonzero, so a byte can hold one with 0 for none. Translated code runs none of them: 64-bit code, and compatibility-mode
+/// code at CPL 3 (32-bit user code under a 64-bit OS, M2 Part 1), are [`Cpu::code_mode`]'s.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpretedMode {
+    /// Real mode (CR0.PE = 0): segment bases and limits from the hidden descriptor cache, CPL 0.
+    Real = 1,
+    /// Protected mode outside IA-32e mode (CR0.PE = 1, EFER.LMA = 0) with a 16-bit code segment (CS.D = 0; CS.L is
+    /// ignored outside IA-32e mode, SDM Vol.3 3.4.5).
+    Protected16 = 2,
+    /// The same with a 32-bit code segment (CS.D = 1).
+    Protected32 = 3,
+    /// Compatibility mode (EFER.LMA = 1, CS.L = 0) at CPL 0 with a 16-bit code segment (CS.D = 0).
+    Compat16 = 4,
+    /// The same with a 32-bit code segment (CS.D = 1).
+    Compat32 = 5,
+}
+
 impl Cpu {
+    /// M2 Part 2: the mode the boot-time interpreter runs this state in, from CR0.PE, EFER.LMA, the hidden CS.L and CS.D
+    /// and the CPL; `None` for a state the translator runs or none runs. Interpretable exactly when EFER.LMA = 0, or at CPL
+    /// 0 with a code segment that is not a 64-bit one (CS.L = 0): never for CPL 3 code under a 64-bit OS (whose 32-bit user
+    /// code is translated), so every rule the interpreter widens is gated on this, never on "not 64-bit code" (which the
+    /// resident reads as 32-bit user code: `same_mode`, `far_return`, the address helpers). Outside IA-32e mode the CPL
+    /// is not looked at (in real mode it is 0; other CPLs are the interpreter's to refuse), nor is CS.L (ignored there,
+    /// so L = D = 1 is a 32-bit segment), nor are paging, RFLAGS.VM or CR4. EFER.LMA = 1 implies CR0.PE = CR0.PG = 1
+    /// (IA-32e mode is active only with paging on, SDM Vol.3 "Initializing IA-32e Mode"); a state against that is
+    /// classified by LMA alone.
+    pub fn interpreted_mode(&self) -> Option<InterpretedMode> {
+        let cs = self.seg[SREG_CS].attributes;
+        let d = cs & ATTR_D != 0;
+        if self.efer & EFER_LMA == 0 {
+            Some(if self.cr0 & CR0_PE == 0 {
+                InterpretedMode::Real
+            } else if d {
+                InterpretedMode::Protected32
+            } else {
+                InterpretedMode::Protected16
+            })
+        } else if self.cpl == 0 && cs & ATTR_L == 0 {
+            Some(if d {
+                InterpretedMode::Compat32
+            } else {
+                InterpretedMode::Compat16
+            })
+        } else {
+            None
+        }
+    }
     /// Walk controls for 4-level long-mode paging at CPL 0 or 3; `None` for any other paging mode (paging off,
     /// legacy/PAE, LA57, SMAP: not supported by this slice), CPL 1 or 2, and for a CR3 with bits above the
     /// physical-address width set. [`CR3_IGNORED`] bits are ignored. The code segment's mode is [`Self::code_mode`] (M2
@@ -3420,7 +3479,10 @@ pub mod system {
 pub mod stop {
     /// The bank does not describe a supported paging mode or CPL ([`super::Cpu::paging`] is `None`). When a
     /// transaction's change caused it, the record holds the new control registers or CPL and the old RIP (the
-    /// instruction that made the change).
+    /// instruction that made the change). M2 Part 2: a state the boot-time interpreter runs
+    /// ([`super::Cpu::interpreted_mode`]) stops so at the interpreter's entry instead, which stands for the interpreter
+    /// until it is built: after the transaction that made it completed (RIP past the instruction, or the far transfer's
+    /// target), or at the vCPU's start.
     pub const UNSUPPORTED_MODE: u64 = 1;
     /// The host reply or staged object is unusable.
     pub const BAD_REPLY: u64 = 2;
@@ -3470,7 +3532,7 @@ pub mod stop {
     /// (M2 task 1.) The code segment is not a 64-bit one ([`super::Cpu::code_mode`] is not `Bits64`: compatibility
     /// mode, or L = D = 1), where only 64-bit code runs yet; paging and CPL are supported ([`UNSUPPORTED_MODE`]
     /// otherwise, which is checked first). The record is as for [`UNSUPPORTED_MODE`]: the CS that caused it, RIP at the
-    /// instruction.
+    /// instruction (M2 Part 2: for compatibility-mode code at CPL 0 reached by a completed transaction, as there).
     pub const UNSUPPORTED_CODE_MODE: u64 = 18;
     /// (X2, numbered apart from the other chunks' reasons.) The vCPU was halted (HLT) with no event it could take, and the
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
@@ -5290,6 +5352,83 @@ mod tests {
             assert_eq!(c.code_context() & !(7 << 2), cpu.code_context() & !(7 << 2) | null);
         }
         assert_eq!(cpu.code_context() & 0x1ff, 3 | 1 << 2); // CPL 3, 64-bit: unchanged by the field
+    }
+
+    /// M2 Part 2: the interpreted modes from CR0.PE, EFER.LMA, CS.L, CS.D and the CPL; the CPL matters only in IA-32e mode
+    /// and CS.L only there.
+    #[test]
+    fn interpreted_mode_from_pe_lma_cs_and_cpl() {
+        use InterpretedMode::*;
+        // SAFETY: `Cpu` is plain integers.
+        let zero: Cpu = unsafe { core::mem::zeroed() };
+        let state = |cr0: u64, efer: u64, attributes: u16, cpl: u64| {
+            let mut c = zero;
+            (c.cr0, c.cr3, c.cr4, c.efer, c.cpl) = (cr0, 0x1000, CR4_PAE, efer, cpl);
+            c.seg[SREG_CS].attributes = attributes;
+            c
+        };
+        let (long, lma) = (CR0_PE | CR0_PG, EFER_LME | EFER_LMA);
+        for (cr0, efer, attributes, cpl, want) in [
+            // Real mode: whatever the hidden CS holds (the reset CS is a 16-bit data-like segment, 0x93).
+            (0x6000_0010, 0, 0x0093, 0, Some(Real)),
+            (0, 0, 0xc09b, 0, Some(Real)),
+            (0, EFER_LME, 0x209b, 0, Some(Real)),
+            // Protected mode, paging off or legacy/PAE paging: CS.D alone (L ignored), any CPL.
+            (CR0_PE, 0, 0x009b, 0, Some(Protected16)),
+            (CR0_PE, 0, 0x209b, 0, Some(Protected16)),
+            (CR0_PE, 0, 0xc09b, 0, Some(Protected32)),
+            (CR0_PE, 0, 0xe09b, 0, Some(Protected32)),
+            (CR0_PE, 0, 0xc0fb, 3, Some(Protected32)),
+            (long, 0, 0xc09b, 0, Some(Protected32)),
+            (CR0_PE, EFER_LME, 0xc09b, 0, Some(Protected32)),
+            // IA-32e mode: compatibility mode at CPL 0 only.
+            (long, lma, 0x009b, 0, Some(Compat16)),
+            (long, lma, 0xc09b, 0, Some(Compat32)),
+            (long, lma, 0xa09b, 0, None), // 64-bit code
+            (long, lma, 0xe09b, 0, None), // L = D = 1: reserved
+            (long, lma, 0xc0fb, 3, None), // 32-bit user code: translated
+            (long, lma, 0x00fb, 3, None),
+            (long, lma, 0xa0fb, 3, None),
+            (long, lma, 0xc0bb, 1, None), // CPL 1 and 2: neither
+            (long, lma, 0xc0db, 2, None),
+        ] {
+            let c = state(cr0, efer, attributes, cpl);
+            assert_eq!(c.interpreted_mode(), want, "{cr0:#x} {efer:#x} {attributes:#x} CPL {cpl}");
+        }
+    }
+
+    /// M2 Part 2: the interpretable predicate (EFER.LMA = 0, or CPL 0 with CS.L = 0), and that no interpretable state is
+    /// one of the two the resident's `controls` returns for (64-bit code, or compatibility-mode code at CPL 3, with 4-level
+    /// paging): every state reaching its halting arms is either interpreted or still a halt, none is both.
+    #[test]
+    fn interpretable_states_are_never_translated_ones() {
+        // SAFETY: `Cpu` is plain integers.
+        let zero: Cpu = unsafe { core::mem::zeroed() };
+        let mut interpretable = 0;
+        for cr0 in [0, CR0_PE, CR0_PE | CR0_PG, CR0_PG] {
+            for efer in [0, EFER_LME, EFER_LME | EFER_LMA, EFER_LMA] {
+                for cr4 in [0, CR4_PAE, CR4_PAE | CR4_SMAP] {
+                    for lmd in 0..4u16 {
+                        for cpl in 0..4 {
+                            let mut c = zero;
+                            (c.cr0, c.cr3, c.cr4, c.efer, c.cpl) = (cr0, 0x1000, cr4, efer, cpl);
+                            c.seg[SREG_CS].attributes = 0x9b | lmd << 13;
+                            let mode = c.interpreted_mode();
+                            let predicate = efer & EFER_LMA == 0 || (cpl == 0 && lmd & 1 == 0);
+                            assert_eq!(mode.is_some(), predicate, "{c:x?}");
+                            let translated = match (c.paging(), c.code_mode()) {
+                                (Some(_), Some(CodeMode::Bits64)) => true,
+                                (Some(p), Some(_)) => p.cpl == 3,
+                                _ => false,
+                            };
+                            assert!(!(translated && mode.is_some()), "{c:x?}");
+                            interpretable += usize::from(mode.is_some());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(interpretable, 4 * 2 * 3 * 4 * 4 + 4 * 2 * 3 * 2);
     }
 
     /// M2 task 3a: 32-bit code runs at CPL 3 only with flat CS/SS/DS/ES (else the selector the deviation's #GP names);
