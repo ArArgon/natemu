@@ -1,6 +1,6 @@
 //! Host-owned guest RAM: allocation, byte/record transfer, the resident image and
 //! the resident's private translation tables. Offsets are relative to the base of
-//! the backing, which the VM maps at `IPA`; owner `n` uses window `n * RAM_SIZE`.
+//! the backing, which the VM maps at `IPA`; each vCPU's window starts its own block of it.
 use super::*;
 
 unsafe extern "C" {
@@ -24,9 +24,10 @@ unsafe impl Sync for Memory {}
 // SAFETY: the mapping is not tied to the thread that made it; any thread may unmap it.
 unsafe impl Send for Memory {}
 impl Memory {
+    /// One window and its text block.
     #[cfg(test)]
     pub(crate) fn new() -> Result<Self> {
-        Self::with_size(RAM_SIZE)
+        Self::with_size(resident::TEXT_END)
     }
     pub fn with_size(size: usize) -> Result<Self> {
         let p = unsafe { mmap(ptr::null_mut(), size, 3, 0x1002, -1, 0) };
@@ -78,9 +79,10 @@ impl Memory {
         self.check(offset, length);
         unsafe { sys_icache_invalidate(self.0.add(offset).cast(), length) };
     }
-    /// Copies the loaded resident text from window 0 into another owner's window.
-    pub(crate) fn replicate_resident_text(&self, window: usize) {
-        for offset in (0..RAM_SIZE).step_by(4096) {
+    /// Copies the loaded resident text from window 0 into another owner's window: its pages up to `end`, the image's
+    /// end ([`load_elf`]; the rest of the text block stays zero).
+    pub(crate) fn replicate_resident_text(&self, window: usize, end: usize) {
+        for offset in (0..end).step_by(4096) {
             if resident::executable_offset(offset) {
                 self.copy(window + offset, &self.read::<4096>(offset));
             }
@@ -119,11 +121,14 @@ pub fn read_input(path: &str, max: usize) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-/// Reads the resident ELF at `path` and loads it into window 0.
-pub(crate) fn load_resident(memory: &Memory, path: &str) -> Result<()> {
-    load_elf(memory, &read_input(path, 2 * 1024 * 1024)?)
+/// Reads the resident ELF at `path` and loads it into window 0; gives the image's end (as [`load_elf`]). The limit
+/// leaves room for a full text block and the symbols beside it.
+pub(crate) fn load_resident(memory: &Memory, path: &str) -> Result<usize> {
+    load_elf(memory, &read_input(path, 4 * (resident::TEXT_END - resident::TEXT_OFFSET))?)
 }
-pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
+/// Loads the resident ELF into window 0; gives the window offset after its last loaded byte, page-aligned (what
+/// [`Memory::replicate_resident_text`] and the instruction-cache flush need to cover).
+pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<usize> {
     if data.get(..7) != Some(b"\x7fELF\x02\x01\x01")
         || u16_at(data, 16)? != 2
         || u16_at(data, 18)? != 183
@@ -169,7 +174,8 @@ pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
     if !spans.iter().any(|&(lo, hi)| lo == PRIVATE && hi > PRIVATE) {
         return Err("no resident entry segment".into());
     }
-    Ok(())
+    let end = spans.iter().map(|&(_, hi)| hi).max().unwrap_or(PRIVATE) - PRIVATE;
+    Ok((end as usize).next_multiple_of(4096))
 }
 
 /// Protection of a private alias: resident text is EL1 read-only and EL1-executable; generated code (the code area:
@@ -431,7 +437,7 @@ pub(crate) mod tests {
                 (resident::TEXT_END - resident::TEXT_OFFSET) as u64,
             ),
         ]);
-        load_elf(&memory, &data).unwrap();
+        assert_eq!(load_elf(&memory, &data).unwrap(), resident::TEXT_END);
         assert_eq!(memory.read::<4>(0), [0x40; 4]);
         assert_eq!(memory.read::<4>(resident::TEXT_OFFSET), [0x41; 4]);
         assert_eq!(memory.read::<4>(resident::BOOT_END), [0; 4]);
@@ -444,6 +450,7 @@ pub(crate) mod tests {
             (PRIVATE, resident::BOOT_END as u64 + 1),
             (PRIVATE + resident::BOOT_END as u64, 4),
             (PRIVATE + 0x10000, 4096),
+            (PRIVATE + 0xa_0000, 4),
             (PRIVATE + resident::TEXT_OFFSET as u64 - 4, 8),
             (PRIVATE + resident::TEXT_END as u64 - 4, 8),
             (PRIVATE + resident::TEXT_END as u64, 4),
@@ -473,22 +480,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// The window's 4 KiB pages: only the boot page is executable; the text block is one EL1-executable, read-only level-2
+    /// block of the window's own backing; nothing else in the window's first 4 MiB is executable.
     #[test]
     fn private_resident_mapping_has_no_executable_gap() {
-        let memory = Memory::new().unwrap();
-        let mut spans = resident_text(0);
-        spans.push(Span::data(SHARED_OFFSET, 0x8000, SHARED_OFFSET));
-        private_space(&memory, 0, &spans, false);
-        let leaf = |offset| u64::from_le_bytes(memory.read::<8>(0x14000 + offset / 4096 * 8));
-        for offset in (0..RAM_SIZE).step_by(4096) {
-            let pte = leaf(offset);
-            if resident::executable_offset(offset) {
-                assert_eq!(pte, (IPA + offset as u64) | PAGE | READ_ONLY | UXN);
-            } else if (resident::BOOT_END..0x10000).contains(&offset) {
-                assert_eq!(pte, 0);
-            } else if pte != 0 {
-                assert_eq!(pte & (PXN | UXN | 3 << 6), PXN | UXN);
+        for window in [0, 6 << 20] {
+            let memory = Memory::with_size(window + resident::TEXT_END).unwrap();
+            let mut spans = resident_text(window);
+            spans.push(Span::data(SHARED_OFFSET, 0x8000, window + SHARED_OFFSET));
+            private_space(&memory, window, &spans, false);
+            let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
+            for offset in (0..2 * RAM_SIZE).step_by(4096) {
+                let pte = word(PRIVATE_LEAF + offset / 4096 * 8);
+                if resident::executable_offset(offset) {
+                    assert_eq!(pte, (IPA + (window + offset) as u64) | PAGE | READ_ONLY | UXN);
+                } else if (resident::BOOT_END..0x10000).contains(&offset) {
+                    assert_eq!(pte, 0);
+                } else if pte != 0 {
+                    assert_eq!(pte & (PXN | UXN | 3 << 6), PXN | UXN, "{offset:#x}");
+                }
             }
+            let block = |offset: usize| word(PRIVATE_L2 + offset / (2 * RAM_SIZE) * 8);
+            assert_eq!(word(PRIVATE_L2), IPA + (window + PRIVATE_LEAF) as u64 + 3);
+            for offset in (resident::TEXT_OFFSET..resident::TEXT_END).step_by(2 * RAM_SIZE) {
+                assert_eq!(block(offset), (IPA + (window + offset) as u64) | BLOCK | READ_ONLY | UXN);
+            }
+            assert_eq!(block(resident::TEXT_END), 0);
         }
     }
 
@@ -530,9 +547,9 @@ pub(crate) mod tests {
             (1 << 39) - 4096,
         ] {
             let va = GUEST_STATE_SLOT.start + offset;
-            let memory = Memory::with_size(MAX_VCPUS * RAM_SIZE).unwrap();
+            let memory = Memory::with_size(MAX_VCPUS * resident::TEXT_END).unwrap();
             for v in 0..MAX_VCPUS {
-                let window = v * RAM_SIZE;
+                let window = v * resident::TEXT_END;
                 let mut spans = resident_text(window);
                 spans.push(Span::data(FRAME_OFFSET, 4096, window + FRAME_OFFSET));
                 private_space(&memory, window, &spans, true);
@@ -684,8 +701,8 @@ pub(crate) mod tests {
             fn invalidate(&mut self, _: u64) {}
             fn invalidate_all(&mut self) {}
         }
-        let memory = Memory::with_size(2 * RAM_SIZE).unwrap();
-        let window = RAM_SIZE;
+        let window = resident::TEXT_END;
+        let memory = Memory::with_size(2 * window).unwrap();
         private_space(&memory, window, &resident_text(window), true);
         let leaf = |offset: usize| {
             u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))

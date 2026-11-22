@@ -216,7 +216,7 @@ const _: () =
 /// structures. Shared between vCPUs ([`cache::GLOBAL_VA`]): the code-page and
 /// writable-shadow masks over guest-physical pages, one invalidation record and one
 /// shadow-reset counter per vCPU. Areas are mapped in 2 MiB blocks; vCPU v's block of
-/// the backing holds its window, then these areas at the offsets below, the code area
+/// the backing holds its window and the resident's text block, then these areas at the offsets below, the code area
 /// last because its size is set at `prepare`; guest RAM follows the last block. vCPU v's own areas (window, lookup, metadata, code) sit at the same
 /// private addresses as every other vCPU's, backed by its own block of the backing.
 pub mod cache {
@@ -406,8 +406,9 @@ pub mod cache {
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
-    /// Backing offsets in a vCPU's block (2 MiB aligned), after its window's 2 MiB.
-    pub const LOOKUP_OFFSET: usize = 2 * crate::RAM_SIZE;
+    /// Backing offsets in a vCPU's block (2 MiB aligned), after its window's 2 MiB and the resident's text block
+    /// ([`crate::resident::TEXT_OFFSET`], backed at its own private offset).
+    pub const LOOKUP_OFFSET: usize = crate::resident::TEXT_END;
     pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
@@ -1463,9 +1464,10 @@ pub mod cache {
     /// `Events::halted`: the shift of the `posts` count the vCPU had seen.
     pub const HALTED_SEEN_SHIFT: u32 = 8;
 
-    // The window's 2 MiB (its pages and the shadow pool) precede the areas in a vCPU's block.
+    // The window's 2 MiB (its pages and the shadow pool) and the text block precede the areas in a vCPU's block.
     const _: () = assert!(
-        crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET
+        crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= crate::resident::TEXT_OFFSET
+            && crate::resident::TEXT_END <= LOOKUP_OFFSET
             && LOOKUP_OFFSET % BLOCK == 0
     );
     // Every per-vCPU area lies in PRIVATE..PRIVATE + 1 GiB; the shared global area and pool above it. All are 2 MiB

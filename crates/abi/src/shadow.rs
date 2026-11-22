@@ -69,7 +69,7 @@ pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= 2 * crate::RAM_SIZE);
-const _: () = assert!(crate::resident::TEXT_END <= POOL_OFFSET);
+const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= crate::resident::TEXT_OFFSET);
 const _: () =
     assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
 
