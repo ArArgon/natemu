@@ -2508,9 +2508,10 @@ pub const X87_FPCR_EXPLICIT: u64 = 1 << 32;
 /// with. With `no_afp` a word that differs carries [`X87_FPCR_EXPLICIT`], so it is never 0 (a bare 0 would be that "equal").
 /// M2 task 4: 0 too on a host with AFP while every x87 exception is masked: translated code then switches FPCR once per run of
 /// x87 instructions and makes the word from FCW.RC as it is when the run starts (tools/fexc/shim/fexc_hook.h, "x87 runs"), so
-/// neither the rounding control nor MXCSR's flush bits key the code, and FLDCW is translated.
+/// neither the rounding control nor MXCSR's flush bits key the code, and FLDCW is translated. Fast x87 without AFP: the same
+/// on a host without AFP in fast mode (fexc's `FexcX87Exact`: only accurate mode keeps the per-operation wrapper there).
 pub const fn x87_fpcr(fcw: u64, mxcsr: u64, no_afp: bool, mode: u64) -> u64 {
-    if !no_afp && x87_unmasked(fcw) == 0 {
+    if accurate_key(mode, no_afp as u64) == 0 && x87_unmasked(fcw) == 0 {
         return 0;
     }
     let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 };
@@ -4718,7 +4719,8 @@ mod tests {
             assert_eq!(fpcr_run(mxcsr, true, FP_FAST_IOE), base | FPCR_IOE);
             assert_eq!(fpcr_run(mxcsr, true, FP_FAST_UFE | FP_FAST_IOE), base | ufe | FPCR_IOE);
             assert_eq!(fpcr_run(mxcsr, false, FP_FAST_UFE | FP_FAST_IOE), fpcr(mxcsr, false));
-            assert_ne!(x87_fpcr(FCW_INIT, mxcsr, true, FP_FAST_IOE), 0, "keyed: x87 switches to its trap-free word");
+            assert_eq!(x87_fpcr(FCW_INIT, mxcsr, true, FP_FAST_IOE), 0, "not keyed: an x87 run makes its own trap-free word");
+            assert_ne!(x87_fpcr(FCW_INIT & !1, mxcsr, true, FP_FAST_IOE), 0, "keyed: unmasked x87 switches to its trap-free word");
             assert_eq!(accurate_key(FP_FAST_UFE | FP_FAST_IOE, 1), 0);
         }
     }
@@ -4759,7 +4761,9 @@ mod tests {
             let fz = (with >> 24 & mxcsr >> 6 & 1) << 24;
             assert_eq!(without, with & !AFP & !(1 << 24) | fz, "{mxcsr:#x}: RMode as with AFP, FZ with DAZ and FTZ");
             for rc in 0..4u64 {
-                let fcw = FCW_INIT & !(3 << 10) | rc << 10;
+                // Fast mode with every x87 exception masked: no keyed word (x87 runs, as with AFP); else the own word.
+                assert_eq!(x87_fpcr(FCW_INIT & !(3 << 10) | rc << 10, mxcsr, true, 0), 0);
+                let fcw = FCW_INIT & !(3 << 10 | 1) | rc << 10;
                 let x87 = x87_fpcr(fcw, mxcsr, true, 0);
                 assert_eq!(x87 & AFP, 0);
                 // Own word: RMode from FCW.RC only (marked explicit); none when it equals MXCSR's.
@@ -4770,12 +4774,16 @@ mod tests {
         }
         // The default modes need no x87 word without AFP either; FTZ and a different RC do, and so does nearest rounding
         // under FTZ or another MXCSR.RC, whose FPCR is 0: it is sent with the explicit marker, never as a bare 0.
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, true, 0), 0);
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true, 0), 0); // FTZ alone: FZ stays clear (software flush)
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 6, true, 0), 0); // DAZ alone, likewise
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15 | 1 << 6, true, 0), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true, 0), X87_FPCR_EXPLICIT);
-        assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true, 0), X87_FPCR_EXPLICIT | 3 << 22);
+        // (With an x87 exception unmasked, IE here: masked x87 has no keyed word in fast mode.)
+        const UNMASKED: u64 = FCW_INIT & !1;
+        assert_eq!(x87_fpcr(UNMASKED, MXCSR_RESET, true, 0), 0);
+        assert_eq!(x87_fpcr(UNMASKED, MXCSR_RESET | 1 << 15, true, 0), 0); // FTZ alone: FZ stays clear (software flush)
+        assert_eq!(x87_fpcr(UNMASKED, MXCSR_RESET | 1 << 6, true, 0), 0); // DAZ alone, likewise
+        assert_eq!(x87_fpcr(UNMASKED, MXCSR_RESET | 1 << 15 | 1 << 6, true, 0), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
+        assert_eq!(x87_fpcr(UNMASKED, MXCSR_RESET | 1 << 13, true, 0), X87_FPCR_EXPLICIT);
+        assert_eq!(x87_fpcr(UNMASKED | 3 << 10, MXCSR_RESET, true, 0), X87_FPCR_EXPLICIT | 3 << 22);
+        // Accurate mode keeps the keyed word with every exception masked too (the per-operation wrapper).
+        assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true, 1), X87_FPCR_EXPLICIT | 3 << 22);
     }
 
     /// `code_context` bit 33 is the stack check's state alone: set from [`STACK_TRAP_LIMIT`] firings, and clearing the count (what a

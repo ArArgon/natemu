@@ -194,7 +194,7 @@ bool Arm64JITCore::FexcX87Op(const IR::IROp_Header* IROp) {
 // M2 task 4 (fexc_hook.h, "x87 runs"): whether x87 ops run in runs here; the start and the end of a run (x0 and x1 are free
 // before an op). `fexc_x87_run`: what is known at the emit cursor, FEXC_RUN_CLOSED, _OPEN, or (32-bit code, at an IR block's
 // start) _UNKNOWN: the run byte says, and the start or end is skipped by a branch when it is already so.
-static bool FexcX87Runs() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+static bool FexcX87Runs() { return fexc_slice1 && !FexcX87Exact() && uint64_t(fexc_x87_unmasked) == 0; }
 // M2 task 4, lazy x87 flags (fexc_hook.h): FPSR's flags of the run or-ed into the x87 exception word (x0 = FPSR's flag byte after).
 static void FexcX87FoldWords(Arm64JITCore& J) {
   J.mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
@@ -253,7 +253,7 @@ static void FexcX87RunStart(Arm64JITCore& J) {
   J.ldrh(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, FCW));
   J.rbit(ARMEmitter::Size::i32Bit, TMP1, TMP1);
   J.ubfx(ARMEmitter::Size::i32Bit, TMP1, TMP1, 20, 2);
-  J.movz(ARMEmitter::Size::i32Bit, TMP2, 6);
+  J.movz(ARMEmitter::Size::i32Bit, TMP2, fexc_no_afp ? 0 : 6);   // (AH and NEP are RES0 without AFP, and must stay clear on an M4 emulating that)
   J.orr(ARMEmitter::Size::i32Bit, TMP1, TMP2, TMP1, ARMEmitter::ShiftType::LSL, 22);
   J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   (void)J.Bind(&Open);
@@ -266,7 +266,7 @@ void Arm64JITCore::FexcX87Begin() {
     // (FexcAfterOp) reads that op's DZC and the instruction's IDC, so neither may be left from earlier in the run. Every flag
     // in FPSR here is of a completed instruction, committed already: when one of the two is set FPSR is cleared (rare).
     // (Lazy flags: those flags are not in the exception word yet; they are or-ed into it first.)
-    if (fexc_x87_m32_convert) {
+    if (fexc_x87_m32_convert && !fexc_no_afp) {   // (the fix-up is a host with AFP's)
       ARMEmitter::ForwardLabel Set, Clear;
       mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
       (void)tbnz(TMP1, 1, &Set);     // DZC
@@ -995,7 +995,7 @@ void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_
 //             first: orr x1, x1, #(1 << 51); put: fmov Dd, x1; done:
 bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
   using IR::IROps;
-  if (!fexc_no_afp || !FexcX87Op(IROp)) return false;
+  if (!fexc_no_afp || FexcX87Lazy() || !FexcX87Op(IROp)) return false;   // (fast mode: no fix-up, the `x87-nan-results` deviation)
   if (IROp->Op != IROps::OP_VFADD && IROp->Op != IROps::OP_VFSUB && IROp->Op != IROps::OP_VFMUL && IROp->Op != IROps::OP_VFDIV &&
       IROp->Op != IROps::OP_VFSQRT) return false;
   if (IROp->Size != IR::OpSize::i64Bit || IROp->ElementSize != IR::OpSize::i64Bit) return false;
