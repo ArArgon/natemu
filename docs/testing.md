@@ -195,8 +195,9 @@ A natemu bug a test catches never blocks a run: list it in the family's `known-b
 ### Adding a test for an instruction
 
 A test for one x86 instruction is a small straight-line program in one of the program corpora. Each corpus is produced by
-a generator under `tools/reference/`, named in the family's `[input.*]` entry: add the program to the generator whose
-subject fits, then seed (below) and commit the generator and the lock together.
+a generator under `tools/reference/`, named in the family's `[input.*]` entry (the boot-time interpreter's by
+`tests/interp/interp_cases.py`): add the program to the generator whose subject fits, then seed (below) and commit the
+generator and the lock together.
 
 | Subject | Family, suite | Generator |
 | --- | --- | --- |
@@ -210,6 +211,7 @@ subject fits, then seed (below) and commit the generator and the lock together.
 | the 66 prefix on near branches | `tests/programs`: `br66` | `gen_br66.py` |
 | string compares (PCMPxSTRx), x87 transcendentals | `tests/programs`: `i6b` | `gen_i6b.py` |
 | SSE, AVX, AVX2, FMA, F16C (floating point) | `tests/fp`: `i8`, `i8b` | `gen_i8.py` |
+| 16- and 32-bit boot code (real mode, 16- and 32-bit protected mode, compatibility mode at CPL 0: the boot-time interpreter's) | `tests/interp`: `references` (QEMU's and KVM's answers), `natemu` ([format](restructure/interp-cases.md)) | `tests/interp/interp_cases.py` |
 
 An instruction none of these fits gets its own generator, `[input.<name>]` and `[[suite]]` in `tests/programs` (or
 `tests/fp` when its result depends on the floating-point mode or on AFP). Faults, paging, interrupts and several vCPUs
@@ -343,6 +345,16 @@ each case's answers are logged in the run folder), twice, then `tools/natemu-tes
 Answers that differ between the two runs are dropped where no comparison uses them, and an answer that differs from the
 locked one is refused rather than overwritten. Each answer is a hash, with the value inline when it is short, and the steps
 that reproduce it (supplier, pin, program or image hash, arguments).
+
+Some runner cases are answered by real x86 hardware instead: the `interp` family's `references` case (its KVM half)
+and `boot`'s `*-kvm` cases (`exit-fw-kvm`, `exit-ap-kvm`, `kut-kvm`, `ovmf-kvm`) run under KVM on an x86 machine when
+they are seeded. Seed them the same way with `NATEMU_X86_HOST=user@host` set too, for example
+`TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host tools/natemu-test run tests/interp`, twice, then the lock; without it
+they refuse to seed. That machine is an x86-64 Linux machine with KVM that `ssh user@host` reaches without a password
+prompt (the scripts use `BatchMode`), whose user runs Docker and which has `/dev/kvm`: each run starts the builds'
+pinned container image with `--device /dev/kvm`, installs Debian's QEMU in it (at the recipes' snapshot, so the machine
+also needs the Internet) and removes it afterwards. An ordinary run never reaches the machine: it judges the locked
+answers.
 
 The compiler's own checks under `tools/fexc` (the smoke check, `check_sites.py`, `verify_precision.py`, `scan_skips.py`,
 the serve and channel tests and the unittest files `test_fexc.py` and `test_slice1.py`) are the `fexc` suite of
