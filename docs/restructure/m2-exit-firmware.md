@@ -1,9 +1,10 @@
 # M2 exit test: the firmware and its AP part
 
 Status (November 22, 2026, branch `boot-interp-exit-fw`): built by the framework from the repository and proven on the
-pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs neither yet: the program
-variant needs the CPU start-up slice (B2 of the boot-time interpreter plan), the firmware image needs the firmware boot
-mode (B5). This page is the contract those slices build to.
+pinned QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2 and 4 CPUs. natemu runs the program variant at one
+CPU, and at 2 and 4 up to the SIPI landing (case `exit-ap-natemu`: the CPU start-up slice, B2 of the boot-time interpreter
+plan, without the interpreter yet); the firmware image needs the firmware boot mode (B5). This page is the contract
+those slices build to.
 
 ## The pieces
 
@@ -79,8 +80,8 @@ no CPU, and QEMU's `-smp N`, so the program starts the others.
 
 **What the program driver must give it (B2).** Today every vCPU of a description starts running its own section; the
 ACPI mailbox is opt-in per vCPU (`mailbox GPA`, X4), and the driver builds no MADT, so leaving the mailbox out needs
-nothing. B2 adds the missing piece: a `cpu` section item that starts the vCPU in the wait-for-SIPI state (the INIT
-state, no other state items). The description is then:
+nothing. B2 adds the missing piece: the `cpu` section item `wait-for-sipi`, which starts the vCPU in the wait-for-SIPI
+state (the power-on state, no other state items). The description is then:
 
     identity
     body 0x110000 <exit_prog.bin>
@@ -91,10 +92,13 @@ state, no other state items). The description is then:
     nxe 0                          (the APs copy the BSP's EFER; the tables carry no NX bit)
     gpr 0 0 0 0 0x3e1800 0 ...
     cpu                            (one per AP)
-    <the new wait-for-SIPI item>
+    wait-for-sipi
 
 The driver's tables (placed from `--place`, 1000H by default) are below 4 GiB, as the stub's 32-bit `mov cr3` needs.
-The pass is vCPU 0 reaching its end with the registers above; each AP ends halted in its park loop.
+The pass is vCPU 0 reaching its end with the registers above; each AP ends halted in its park loop. Until the
+boot-time interpreter runs the stub, `exit-ap-natemu` (`run_exit_fw.py --backend natemu`) passes at 2 and 4 CPUs up to
+the SIPI landing: every AP that stopped did so at the interpreter's entry with the SIPI's state for vector 08H (CS 0800H,
+base 8000H, IP 0), and its stop cancelled the others; at one CPU, where the IPIs select no CPU, it passes whole.
 
 ## What natemu's firmware boot mode must provide
 

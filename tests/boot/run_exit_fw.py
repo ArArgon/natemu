@@ -2,6 +2,13 @@
 """The M2 exit test's firmware and its AP part as a 64-bit program, on the references (docs/restructure/m2-exit-firmware.md).
 
     tests/boot/run_exit_fw.py --variant firmware|program --backend qemu|kvm [--cpus 1 2 4] --out DIR
+    tests/boot/run_exit_fw.py --variant program --backend natemu --fexc FEXC [--cpus 1 2 4] --out DIR
+
+natemu (M2 Part 2, the program variant only): the program driver runs exit_prog.asm's body with CPU 0 at its start and
+every other vCPU waiting for a SIPI (`wait-for-sipi`): the description of docs/restructure/m2-exit-firmware.md. Pass:
+CPU 0 reaches the body's end with `expected_registers(N)`. While the boot-time interpreter is the stop at its entry, a
+run with APs ends when the first AP reaches it: that pass is up to the SIPI landing (every AP that stopped did so at the
+SIPI's state for vector 08H, CS 0800H base 8000H IP 0; the other vCPUs cancelled by that stop).
 
 Both images are assembled here with nasm from tests/boot (exit_fw.asm, exit_prog.asm and the shared exit_ap.inc).
 - firmware: the 64 KiB image QEMU maps below 4 GiB with `-bios` (machine pc, 64 MiB, isa-debug-exit at F4H, COM1 into a
@@ -217,15 +224,75 @@ def run_kvm(variant, cpus, img, work):
     return got, ref                             # the machine's CPU and kernel, the QEMU (not its address)
 
 
+def natemu_description(image, n):
+    """The program variant in natemu's program driver (the contract's description): CPU 0 runs the program, the others
+    wait for a SIPI."""
+    lines = ['identity', f'body {BODY:#x} {image.hex()}', f'region {AP_BASE:#x} 0x1000', 'cpu', f'rip {START:#x}', 'cpl 0',
+             'nxe 0', 'if 0', 'gpr ' + ' '.join(hex(RSP) if i == 4 else '0' for i in range(16))]
+    return '\n'.join(lines + ['cpu', 'wait-for-sipi'] * (n - 1)) + '\n'
+
+
+def run_natemu(n, images, work, fexc):
+    """One run of the program variant under natemu: the answer `judge` reads (`exit` 'reached' when CPU 0 reached the
+    program's end), or, while the boot-time interpreter is the stop at its entry, the APs' stops (`entry`)."""
+    import run_slice1_vm as vm                  # tests/lib
+    host, runtime = vm.build()
+    work.mkdir(parents=True, exist_ok=True)
+    (work / 'program.txt').write_text(natemu_description(images['program']['bytes'], n))
+    try:
+        r = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(),
+                            *vm.CODE_SHAPE], capture_output=True, text=True, timeout=QEMU_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {'exit': 'timeout'}
+    if r.returncode:
+        return {'exit': f'driver exit {r.returncode}: {r.stderr.strip()[-400:]}'}
+    out = json.loads(r.stdout)
+    cpus = out['cpus'] if 'cpus' in out else [out]
+    (work / f'out-{n}.json').write_text(json.dumps(out, indent=1) + '\n')
+    bsp = cpus[0]
+    aps = [{'stop': c['stop'], 'reason': c.get('reason', ''), **{k: (c.get('startup') or {}).get(k) for k in ('cs', 'cs_base', 'rip')}}
+           for c in cpus[1:]]
+    if bsp['stop'] != 'reached' and any(a['reason'].startswith('unsupported_mode') for a in aps):
+        return {'exit': 'entry', 'bsp': bsp['stop'], 'aps': aps}
+    return {'exit': bsp['stop'], 'gpr': [smp.num(x) for x in bsp['gpr']], 'rflags': smp.num(bsp['rflags']) & smp.FLAG_MASK,
+            'fault': None if bsp['stop'] == 'reached' else f"{bsp['stop']} {bsp.get('reason')}", 'aps': aps}
+
+
+def judge_entry(ans):
+    """Differences of a natemu run that ended at an AP's interpreter entry (the boot-time interpreter is not built): every
+    AP that stopped did so at the SIPI's state for vector 08H (CS 0800H, base 8000H, IP 0), the others were cancelled by
+    that stop, as was CPU 0. Up to the SIPI landing; once the interpreter runs the stub, `judge` applies."""
+    d = [] if ans.get('bsp') == 'cancelled' else [f"CPU 0 {ans.get('bsp')} (want cancelled by the AP's stop)"]
+    for i, a in enumerate(ans['aps'], 1):
+        if a['stop'] == 'cancelled':
+            continue
+        if not a['reason'].startswith('unsupported_mode') or (a['cs'], a['cs_base'], a['rip']) != (0x800, 0x8000, 0):
+            d.append(f'CPU {i}: {a}')
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--variant', choices=('firmware', 'program'), required=True)
-    ap.add_argument('--backend', choices=('qemu', 'kvm'), required=True)
+    ap.add_argument('--backend', choices=('qemu', 'kvm', 'natemu'), required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=list(CPUS))
+    ap.add_argument('--fexc', type=pathlib.Path)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     images = build(a.out / 'build')
+    if a.backend == 'natemu':
+        if a.variant != 'program' or not a.fexc:
+            raise SystemExit('--backend natemu runs the program variant, with --fexc')
+        results = []
+        for n in a.cpus:
+            ans = run_natemu(n, images, a.out / 'natemu', a.fexc)
+            diffs = judge_entry(ans) if ans['exit'] == 'entry' else judge('program', n, ans, want_exit='reached')
+            stage = ' (up to the SIPI landing: the interpreter is not built)' if ans['exit'] == 'entry' else ''
+            results.append({'name': f'program-natemu N={n}', 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
+            print(f"program natemu N={n}: {'pass' + stage if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
+        (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
+        return 1 if any(r['diffs'] for r in results) else 0
     img = boot_image(a.variant, images, a.out)
     sha = hashlib.sha256(img).hexdigest()
     keys = {}
