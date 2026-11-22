@@ -380,22 +380,35 @@ def typed_stop(out: dict, want: dict) -> list:
 def judge_fault(case: dict, out: dict, want: dict) -> list:
     """The differences of a fault case's run (interp_faults.py) from the model's result."""
     got, reason = out.get('machine'), str(out.get('reason', ''))
-    if 'ending' in want:                                  # a modes_model program: where it ends
-        if want['ending'] is None:
-            return [] if out.get('stop') == 'reached' and got and got.get('stop') == 0 else [f'stop {out.get("stop")}: {reason}, want the end']
-        index, vector, error, paging = want['ending']
-        name = 'interp_mode' if paging else 'interp_fault'
-        if out.get('stop') != 'resident' or not reason.startswith(name + ' '):
-            return [f'stop {out.get("stop")}: {reason}, want {name} at instruction {index}']
-        up = out.get('startup') or {}
-        at = (num(up.get('cs_base', 0)) + num(up.get('rip', 0))) & 0xffffffff     # (the driver's numbers: ints)
-        where = at - num(case['code']['addr'])
-        d = [] if where == want['offsets'][index] else [f'stopped at offset {where:#x}, want instruction {index} at {want["offsets"][index]:#x}']
-        fault = [int(x, 16) for x in out.get('fault', [])[:3]]
-        if paging:
-            detail = int(out.get('native', ['0x0'])[0], 16) >> 24 & 0xff
-            return d + ([] if detail == 1 else [f'detail {detail}, want PAGING (1)'])
-        return d + ([] if (fault[0], fault[2]) == (vector, error) else [f'fault {fault}, want vector {vector} error {error:#x}'])
+    if 'ending' in want:                                  # a modes_model program: where it ends, its controls there
+        controls = ([f'{k}: natemu {R._show(got.get(k))}, want {R._show(v)}' for k, v in want['controls'].items()
+                     if got.get(k) != v] if got else [f'no machine output: {reason}'])
+        return ending(case, out, want, reason) + controls
+    return reached(out, want, got, reason)
+
+
+def ending(case: dict, out: dict, want: dict, reason: str) -> list:
+    """The differences of where a modes_model program's run ended from where the model ends it."""
+    got = out.get('machine')
+    if want['ending'] is None:
+        return [] if out.get('stop') == 'reached' and got and got.get('stop') == 0 else [f'stop {out.get("stop")}: {reason}, want the end']
+    index, vector, error, paging = want['ending']
+    name = 'interp_mode' if paging else 'interp_fault'
+    if out.get('stop') != 'resident' or not reason.startswith(name + ' '):
+        return [f'stop {out.get("stop")}: {reason}, want {name} at instruction {index}']
+    up = out.get('startup') or {}
+    at = (num(up.get('cs_base', 0)) + num(up.get('rip', 0))) & 0xffffffff     # (the driver's numbers: ints)
+    where = at - num(case['code']['addr'])
+    d = [] if where == want['offsets'][index] else [f'stopped at offset {where:#x}, want instruction {index} at {want["offsets"][index]:#x}']
+    fault = [int(x, 16) for x in out.get('fault', [])[:3]]
+    if paging:
+        detail = int(out.get('native', ['0x0'])[0], 16) >> 24 & 0xff
+        return d + ([] if detail == 1 else [f'detail {detail}, want PAGING (1)'])
+    return d + ([] if (fault[0], fault[2]) == (vector, error) else [f'fault {fault}, want vector {vector} error {error:#x}'])
+
+
+def reached(out: dict, want: dict, got, reason: str) -> list:
+    """The differences of a segment case's run from the model's result (a typed stop, or the fields it reaches)."""
     fields = {k: v for k, v in want.items() if k not in ('resident', 'permitted', 'detail', 'may_complete')}
     if 'resident' in want:
         if out.get('stop') != 'resident' or not reason.startswith(want['resident'] + ' '):

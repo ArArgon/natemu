@@ -16,7 +16,8 @@ result the model gives. Run by run_interp_natemu.py --faults (case `natemu-fault
 - **Mode programs** (`tools/models/modes_model.py`'s profiles 22-49 that end in an interpreted mode or complete): the
   model's program from P32 with paging off, run whole; natemu must end where the model's records first fault or stop (a
   typed stop `interp_fault` with the record's vector and error code at its instruction, or `interp_mode` detail PAGING at
-  the MOV to CR0 that enables paging without long mode), or reach the program's end. Their 64-bit stretches run
+  the MOV to CR0 that enables paging without long mode), or reach the program's end, with the model's CR0, CR3, CR4 and
+  EFER there. Their 64-bit stretches run
   translated: the far JMP to 64-bit code is the interpreter's hand-off, the 64-bit m16:64 far JMP back to the 32-bit
   CS the translator's entry into the interpreter (`refuse_compatibility`'s CPL-0 arm). Left out: profiles whose ending is
   in 64-bit code (24, 28, 30, 34, 35, 38: the translator's, already the `system` family's), and 36 (a 16-bit TSS in TR,
@@ -274,21 +275,26 @@ PROFILES = [p for p in M.PROFILES if p not in (24, 28, 30, 34, 35, 36, 38)]
 
 def model_ending(profile):
     """(index, vector, error, stop) where natemu's run of the profile must end (the model's first record that faults or
-    stops), or None when it completes; and the records' count."""
+    stops), or None when it completes; the interpreted mode there ('end' at the end); and the controls natemu must end
+    with: CR0, CR3, CR4 and EFER as that record found them (nothing of a faulting or stopping instruction is committed),
+    or as the last record left them."""
     res = M.model(profile, 0, M.data(profile, [0] * 0x400))
     for rec in res['records']:
         if rec['vector'] or rec.get('stop'):
-            return (rec['index'], rec['vector'], rec['error'], bool(rec.get('stop'))), rec['imode']
-    return None, 'end'
+            ending = (rec['index'], rec['vector'], rec['error'], bool(rec.get('stop')))
+            return ending, rec['imode'], (*rec['before'], rec['efer_before'])
+    last = res['records'][-1]
+    return None, 'end', (*last['after'], last['efer_after'])
 
 
 def mode_cases(N):
     """(name, case, want) of each profile: P32, paging off, CS 08H of the model's GDT at DATA + 200H; EBX DATA (the load),
     ESI DATA + 100H (the m16:64 pointer), ECX EFER's number, ESP STACK; the model's page tables at 6000H; the code at
-    SOURCE. `want`: `ending` (index, vector, error, paging stop) or None, and the program's instruction offsets."""
+    SOURCE. `want`: `ending` (index, vector, error, paging stop) or None, the program's instruction offsets, and the
+    `controls` (CR0, CR3, CR4, EFER) natemu must end with."""
     out = []
     for p in PROFILES:
-        ending, imode = model_ending(p)
+        ending, imode, controls = model_ending(p)
         assert imode is not None, (p, 'ends in 64-bit code')
         prog = M.programs(p)
         code = b''.join(prog)
@@ -303,7 +309,8 @@ def mode_cases(N):
                           gdtr={'base': G.h(M.DATA + 0x200), 'limit': G.h(0x37)})
         c['code'] = {'addr': G.h(M.SOURCE), 'data': code.hex()}
         c['stops'] = [{'id': 0, 'linear': G.h(M.SOURCE + len(code))}]
-        out.append((f'modes-{p}', c, {'ending': ending, 'offsets': offsets}))
+        out.append((f'modes-{p}', c, {'ending': ending, 'offsets': offsets,
+                                      'controls': dict(zip(('cr0', 'cr3', 'cr4', 'efer'), controls))}))
     return out
 
 
