@@ -36,7 +36,8 @@ pub mod io_test;
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
 /// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed. With the template pool
 /// ([`prepare_with_pool`]) its span (`cache::POOL_BYTES`) lies between the last block and guest RAM (RAM stays the backing's
-/// last bytes), every vCPU maps it read-only at `cache::POOL_VA`.
+/// last bytes), every vCPU maps it read-only at `cache::POOL_VA`. With a firmware image ([`prepare_with_firmware`], M2 Part
+/// 2) the RAM span reaches 4 GiB at least and the image lies at its guest-physical place in it.
 pub struct Backing {
     /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]) and the
     /// VM ([`Machine`]). Not public: replacing it would leave `ram` pointing into a mapping that is gone.
@@ -199,6 +200,21 @@ pub fn prepare_with_pool(
     ram_bytes: usize,
     pool: bool,
 ) -> Result<Backing> {
+    prepare_with_firmware(resident, code_bytes, n, ram_bytes, pool, &[])
+}
+/// [`prepare_with_pool`] with a firmware image (M2 Part 2, docs/restructure/firmware-mode.md; empty: none, as
+/// [`prepare_with_pool`]): `image` (whole pages, at most `exec::MAX_FIRMWARE_BYTES`) at guest-physical
+/// `[4 GiB - its size, 4 GiB)`, read and fetched as RAM, its stores dropped. The backing's RAM span then reaches 4 GiB (address
+/// space only: the untouched part is never backed), so the image's backing offset is its guest-physical address's as RAM's
+/// is; the resident's alias maps its 2 MiB blocks read-only (`Control::firmware_bytes` tells it the image's size).
+pub fn prepare_with_firmware(
+    resident: &str,
+    code_bytes: usize,
+    n: usize,
+    ram_bytes: usize,
+    pool: bool,
+    image: &[u8],
+) -> Result<Backing> {
     unsafe extern "C" {
         fn getentropy(buf: *mut u8, len: usize) -> i32;
     }
@@ -206,7 +222,7 @@ pub fn prepare_with_pool(
         // SAFETY: the buffer is writable and 8 bytes, below getentropy's 256-byte limit.
         unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) }
     })?;
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image)
 }
 
 fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
@@ -231,8 +247,9 @@ pub fn prepare_with_guest_state_alias(
     ram_bytes: usize,
     va: u64,
     pool: bool,
+    image: &[u8],
 ) -> Result<Backing> {
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image)
 }
 
 fn prepare_at_alias(
@@ -242,6 +259,7 @@ fn prepare_at_alias(
     ram_bytes: usize,
     va: u64,
     pool: bool,
+    image: &[u8],
 ) -> Result<Backing> {
     if !exec::guest_state_alias_valid(va) {
         return Err(format!(
@@ -258,6 +276,13 @@ fn prepare_at_alias(
         return Err(format!(
             "guest RAM of {ram_bytes:#x} bytes: a nonzero 2 MiB multiple up to {:#x}",
             exec::MAX_GUEST_RAM_BYTES
+        ));
+    }
+    let firmware = image.len() as u64;
+    if firmware != 0 && !exec::firmware_size(firmware) {
+        return Err(format!(
+            "firmware image of {firmware:#x} bytes: whole 4 KiB pages, at most {:#x}",
+            exec::MAX_FIRMWARE_BYTES
         ));
     }
     if !(cache::MAX_BLOCK_BYTES..=cache::CODE_BYTES_MAX - cache::HEAD_BYTES).contains(&code_bytes) {
@@ -279,6 +304,12 @@ fn prepare_at_alias(
     let pool_bytes = if pool { pool_layout.mapped_bytes() } else { 0 };
     let ram_offset = pool_offset + pool_bytes;
     let ram_span = exec::ram_end(ram_bytes as u64) as usize;
+    // (A firmware image lies below 4 GiB, at its guest-physical offset in the span.)
+    let ram_span = if firmware != 0 {
+        ram_span.max(exec::FIRMWARE_END as usize)
+    } else {
+        ram_span
+    };
     let memory = Memory::with_size(ram_offset + ram_span)?;
     let image_end = load_resident(&memory, resident)?;
     for v in 0..n {
@@ -337,6 +368,17 @@ fn prepare_at_alias(
                 pool_offset,
             ));
         }
+        if firmware != 0 {
+            // The 2 MiB blocks holding the image, read-only: the resident drops the guest's stores to it, and a store that
+            // reached the alias would halt it rather than change the image. Their bytes below the image are no guest
+            // memory (unassigned, as on a PC).
+            let base = (exec::FIRMWARE_END - firmware) as usize & !(cache::BLOCK - 1);
+            spans.push(Span::read_only(
+                (exec::GUEST_RAM_VA - PRIVATE) as usize + base,
+                exec::FIRMWARE_END as usize - base,
+                ram_offset + base,
+            ));
+        }
         if ram_bytes as u64 > exec::LOW_RAM_END {
             spans.push(Span::data(
                 (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
@@ -351,6 +393,7 @@ fn prepare_at_alias(
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
         control.ram_bytes = ram_bytes as u64;
+        control.firmware_bytes = firmware;
         control.guest_state_va = va;
         memory.write_record(base + cache::LOOKUP_OFFSET + cache::CONTROL, control);
         // SAFETY: Shared is plain integers; all-zero is its empty value.
@@ -362,8 +405,13 @@ fn prepare_at_alias(
             memory.flush_instruction_cache(base + resident::TEXT_OFFSET, image_end - resident::TEXT_OFFSET);
         }
     }
-    // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
-    let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    // Before any vCPU runs: the image's bytes, through the backing (the guest's view of them is read-only).
+    if firmware != 0 {
+        memory.copy(ram_offset + (exec::FIRMWARE_END - firmware) as usize, image);
+    }
+    // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value. The host
+    // reads the firmware image through it too (code for a translation, reports); nothing of the host writes it.
+    let ram = unsafe { exec::guest_memory(ram_bytes as u64, firmware, memory.0 as u64 + ram_offset as u64) };
     let memory = Arc::new(memory);
     // Zero memory, nothing reading yet: the publisher makes the pool empty and on.
     let pool = pool.then(|| {
@@ -427,20 +475,35 @@ fn halt_poll_max_us() -> u64 {
 /// page-walk barriers (PCID plan P1) and, together with the host's FEAT_CSV3, is the sole condition for advertising
 /// RDCL_NO: a guest never sees "not susceptible to Meltdown" without the barriers that make it true.
 pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) -> Result<()> {
+    set_cpu_with(area, cpu, speculation_barriers, false)
+}
+/// [`set_cpu`] for the firmware boot mode (M2 Part 2, docs/restructure/firmware-mode.md): the MSRs at their power-on values
+/// (`cpu::power_on_msrs`: the MTRRs disabled, IA32_MTRR_DEF_TYPE 0, no variable range), not the virtual firmware's that
+/// [`set_cpu`] gives every other start; the TSC and IA32_ARCH_CAPABILITIES as there.
+pub fn set_cpu_at_power_on(area: Area, cpu: Cpu, speculation_barriers: bool) -> Result<()> {
+    set_cpu_with(area, cpu, speculation_barriers, true)
+}
+fn set_cpu_with(area: Area, cpu: Cpu, speculation_barriers: bool, power_on: bool) -> Result<()> {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
     state.halt_poll_max_us = halt_poll_max_us();
     area.write_record(exec::STATE_OFFSET, state);
     // The TSC (L5, `natemu_abi::clock::tsc`) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
     const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident
-    let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
+    let mut msrs = if power_on {
+        natemu_abi::cpu::power_on_msrs(area.vcpu == 0)
+    } else {
+        natemu_abi::cpu::reset_msrs(area.vcpu == 0)
+    };
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] =
         ticks_ns(area.epoch).wrapping_neg();
     // The virtual firmware's MTRRs cover the guest RAM this VM has (M1's run-time size, set at prepare).
     let mut control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     control.speculation_barriers = u64::from(speculation_barriers);
     area.write_record(cache::LOOKUP_OFFSET + cache::CONTROL, control);
-    natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes.min(exec::LOW_RAM_END));
+    if !power_on {
+        natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes.min(exec::LOW_RAM_END));
+    }
     // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
     // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
     let rdcl_no = speculation_barriers && crate::probe::csv3()?;
@@ -4731,7 +4794,7 @@ mod tests {
             exec::GUEST_STATE_SLOT.end,
         ] {
             assert!(
-                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false)
+                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false, &[])
                     .err()
                     .unwrap()
                     .starts_with("guest-state alias")

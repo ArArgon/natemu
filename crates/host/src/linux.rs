@@ -10,7 +10,8 @@
 //! (all-ones reads, ignored writes, counted; with `strict_unassigned` a typed stop). The ACPI tables describe `vcpus`
 //! processors and start with the RSDP at `rsdp`; vCPU 0 is the BSP, each other one starts as an AP in the firmware's
 //! waiting state on the tables' wakeup mailbox (X4), or without it in the wait-for-SIPI state (M2 Part 2, [`Boot::mailbox`]). [`Prepared::run`] runs the VM: the run ends when any vCPU's run ends
-//! (the BSP's `stop_at`, a stop, power off or reset, its watchdog), and the others are cancelled.
+//! (the BSP's `stop_at`, a stop, power off or reset, its watchdog), and the others are cancelled. M2 Part 2: with
+//! [`Boot::firmware`] the VM boots a firmware image instead of a kernel (the firmware boot mode, [`boot::firmware`]).
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Backing, Compiler, Stop};
 use crate::vm::{Machine, Vcpu, hv, require_vcpus};
@@ -407,6 +408,12 @@ pub struct Boot {
     /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
     /// [`Prepared::debug_exit`]. Default off.
     pub debug_exit: bool,
+    /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
+    /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
+    /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
+    /// power-on state waiting for a SIPI, all with the MTRRs at their power-on values. Nothing else is loaded (`kernel`,
+    /// `initrd` and `cmdline` must be empty: no ACPI tables, no e820 map, no mailbox) and the board has no virtio device.
+    pub firmware: Option<boot::firmware::Firmware>,
 }
 
 impl Boot {
@@ -442,11 +449,15 @@ impl Boot {
             transports: Transports::all(Transport::Mmio),
             mailbox: true,
             debug_exit: false,
+            firmware: None,
         }
     }
 
     /// Loads everything into a new backing and builds the devices; nothing runs yet.
     pub fn prepare(self) -> Result<Prepared> {
+        if self.firmware.is_some() {
+            return self.prepare_firmware();
+        }
         if !self.net && (self.net_options.host_loopback || !self.net_options.forwards.is_empty()) {
             return Err("network: forwarding and host-loopback options require --net".into());
         }
@@ -581,6 +592,107 @@ impl Boot {
             board,
             virtio,
             net: Mutex::new(net),
+            fexc: self.fexc,
+            max_block: self.max_block,
+            stop_at: self.stop_at,
+            watchdog: self.watchdog,
+            launch: crate::probe::Launch {
+                speculation_barriers: self.speculation_barriers,
+                accurate_fp: self.accurate_fp,
+                pool: self.pool,
+                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
+            },
+            compile_cache: self.compile_cache,
+            check_reuse: self.check_reuse,
+            page_currency: self.page_currency,
+            writable_on_read: self.writable_on_read,
+            code_shape: self.code_shape,
+            accurate_fp: self.accurate_fp,
+            ran: AtomicBool::new(false),
+            cancel: Arc::default(),
+            serial_input: Mutex::new(None),
+            debug_exit,
+        })
+    }
+
+    /// [`Boot::prepare`] of a firmware boot ([`Boot::firmware`]): the image in a new backing, every vCPU at power-on (vCPU 0
+    /// at its start, the others waiting for a SIPI), the board of a kernel boot without virtio devices or a PCI bus.
+    fn prepare_firmware(mut self) -> Result<Prepared> {
+        let firmware = self.firmware.take().unwrap();
+        if !self.kernel.is_empty() || self.initrd.is_some() || !self.cmdline.is_empty() {
+            return Err("a firmware boot loads no kernel, initrd or command line".into());
+        }
+        if self.rng || self.net || !self.disks.is_empty() {
+            return Err("a firmware boot has no virtio devices (no disk, network or entropy device)".into());
+        }
+        if !exec::firmware_size(firmware.image.len() as u64) {
+            return Err(format!(
+                "firmware image of {} bytes: whole 4 KiB pages, at most {} MiB",
+                firmware.image.len(),
+                exec::MAX_FIRMWARE_BYTES >> 20
+            ));
+        }
+        if self.speculation_barriers && !crate::probe::sb()? {
+            return Err(
+                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)"
+                    .into(),
+            );
+        }
+        layout_of(&[], self.ram)?; // the RAM size's checks, before allocating it
+        require_vcpus(self.vcpus)?;
+        let backing = execution::prepare_with_firmware(
+            &self.runtime.to_string_lossy(),
+            self.code_bytes,
+            self.vcpus,
+            self.ram as usize,
+            self.pool,
+            &firmware.image,
+        )?;
+        let loaded = boot::firmware::loaded(&firmware);
+        let lost = self.lost_ticks;
+        for v in 0..self.vcpus {
+            execution::set_cpu_at_power_on(
+                backing.vcpu(v),
+                if v == 0 { loaded.cpu } else { loaded.ap },
+                self.speculation_barriers,
+            )?;
+            execution::set_lapic(
+                backing.vcpu(v),
+                natemu_abi::lapic::Lapic {
+                    reinject: u64::from(lost.lapic),
+                    ..natemu_abi::lapic::RESET
+                },
+            );
+            if v > 0 {
+                execution::wait_for_sipi(backing.vcpu(v));
+            }
+        }
+        let uart = Arc::new(Mutex::new(uart::Uart::new()));
+        uart.lock().unwrap().sink = self.serial.take();
+        let mut devices = devices::Devices::new(self.ram);
+        let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
+        let board = clock::install(&mut devices, &irqs, lost, &uart)?;
+        let debug_exit = if self.debug_exit {
+            let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
+            devices.register_ports(
+                crate::debug_exit::PORT.into(),
+                crate::debug_exit::PORTS,
+                Arc::new(Mutex::new(device)),
+            )?;
+            Some(value)
+        } else {
+            None
+        };
+        devices.strict = self.strict_unassigned;
+        Ok(Prepared {
+            backing,
+            loaded,
+            uart,
+            devices: devices.freeze(),
+            irqs,
+            board,
+            virtio: Vec::new(),
+            net: Mutex::new(None),
             fexc: self.fexc,
             max_block: self.max_block,
             stop_at: self.stop_at,
@@ -742,6 +854,9 @@ pub struct Outcome {
     pub each: Vec<Option<(Stop, u64)>>,
     /// The vCPU whose end ended the run (not cancelled); `usize::MAX` when none did.
     pub ended_first: usize,
+    /// M2 Part 2: each vCPU's boot-time interpreter decode requests (`execution::Requests::interpreted`; 0 for one that
+    /// never ran).
+    pub decodes: Vec<u64>,
 }
 impl Outcome {
     /// The BSP's stop.
@@ -784,6 +899,7 @@ impl Prepared {
             Ok(cpu)
         };
         let ended_first = AtomicUsize::new(usize::MAX);
+        let decodes: Vec<std::sync::atomic::AtomicU64> = (0..vcpus).map(|_| Default::default()).collect();
         // Perf chunk 13: one map of fexc's answers for every vCPU.
         let answers = std::sync::OnceLock::new();
         let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, u64)> {
@@ -825,6 +941,7 @@ impl Prepared {
                 &mut (),
             );
             let end = crate::perf::now();
+            decodes[v].store(requests.interpreted, SeqCst);
             // Close device admission before a participant disappears. Pending copies must be
             // canceled rather than waiting for an acknowledgement from the ended vCPU.
             for device in &self.virtio {
@@ -1030,6 +1147,7 @@ impl Prepared {
         Ok(Outcome {
             each: supervision.outputs,
             ended_first: ended_first.load(SeqCst),
+            decodes: decodes.iter().map(|d| d.load(SeqCst)).collect(),
         })
     }
     /// The run's end, before the VM is destroyed (under the GIC lock, `Machine::destroy`). R2 review: no source may ring

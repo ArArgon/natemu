@@ -52,6 +52,11 @@ pub struct Config {
     pub kernel: Option<PathBuf>,
     /// The file has a `[boot.kernel]` table (its `image` may still come from `--kernel`).
     pub kernel_table: bool,
+    /// M2 Part 2, the firmware boot mode: the image (`--firmware`, `[boot.firmware] image`) and the boot processor's start
+    /// (`[boot.firmware] start`, default the reset state); the file has a `[boot.firmware]` table.
+    pub firmware: Option<PathBuf>,
+    pub firmware_start: natemu::boot::firmware::Start,
+    pub firmware_table: bool,
     pub initrd: Option<PathBuf>,
     pub cmdline: String,
     pub disks: Vec<Disk>,
@@ -91,6 +96,9 @@ impl Config {
             speculation_barriers: false,
             kernel: None,
             kernel_table: false,
+            firmware: None,
+            firmware_start: natemu::boot::firmware::Start::Reset,
+            firmware_table: false,
             initrd: None,
             cmdline: String::new(),
             disks: vec![],
@@ -169,7 +177,14 @@ struct FEngine {
 #[serde(deny_unknown_fields)]
 struct FBoot {
     kernel: Option<FKernel>,
+    firmware: Option<FFirmware>,
     uefi: Option<toml::Value>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FFirmware {
+    image: Option<PathBuf>, // required after merging with --firmware (see `validate`)
+    start: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -294,27 +309,30 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         cfg.speculation_barriers = e.speculation_barriers.unwrap_or(cfg.speculation_barriers);
     }
     if let Some(b) = f.boot {
-        match (b.kernel, b.uefi) {
-            (None, None) => {
-                return Err(format!(
-                    "{who}: [boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found none"
-                ));
-            }
-            (Some(_), Some(_)) => {
-                return Err(format!(
-                    "{who}: [boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found both"
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(format!(
-                    "{who}: [boot.uefi]: UEFI boot is planned (M3) and not built yet"
-                ));
-            }
-            (Some(k), None) => {
-                cfg.kernel_table = true;
-                cfg.kernel = k.image.map(|p| rel(base, &p)).or(cfg.kernel.take());
-                cfg.initrd = k.initrd.map(|p| rel(base, &p));
-                cfg.cmdline = k.cmdline.unwrap_or_default();
+        let methods = usize::from(b.kernel.is_some()) + usize::from(b.firmware.is_some()) + usize::from(b.uefi.is_some());
+        if methods != 1 {
+            return Err(format!(
+                "{who}: [boot] needs exactly one boot method, [boot.kernel], [boot.firmware] or [boot.uefi]; found {}",
+                if methods == 0 { "none" } else { "more" }
+            ));
+        }
+        if b.uefi.is_some() {
+            return Err(format!(
+                "{who}: [boot.uefi]: UEFI boot is planned (M3) and not built yet"
+            ));
+        }
+        if let Some(k) = b.kernel {
+            cfg.kernel_table = true;
+            cfg.kernel = k.image.map(|p| rel(base, &p)).or(cfg.kernel.take());
+            cfg.initrd = k.initrd.map(|p| rel(base, &p));
+            cfg.cmdline = k.cmdline.unwrap_or_default();
+        }
+        if let Some(fw) = b.firmware {
+            cfg.firmware_table = true;
+            cfg.firmware = fw.image.map(|p| rel(base, &p)).or(cfg.firmware.take());
+            if let Some(s) = fw.start {
+                cfg.firmware_start = natemu::boot::firmware::Start::parse(&s)
+                    .map_err(|e| format!("{who}: boot.firmware.start: {e}"))?;
             }
         }
     }
@@ -450,6 +468,9 @@ fn apply_flags(
     if on("kernel", &["boot.kernel.image"]) {
         cfg.kernel = cli.kernel.clone();
     }
+    if on("firmware", &["boot.firmware.image"]) {
+        cfg.firmware = cli.firmware.clone();
+    }
     if on("initrd", &["boot.kernel.initrd"]) {
         cfg.initrd = cli.initrd.clone();
     }
@@ -554,7 +575,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 24] = [
+const KEYS: [&str; 26] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -572,6 +593,8 @@ const KEYS: [&str; 24] = [
     "boot.kernel.image",
     "boot.kernel.initrd",
     "boot.kernel.cmdline",
+    "boot.firmware.image",
+    "boot.firmware.start",
     "debug.check_reuse",
     "debug.pool",
     "debug.page_currency",
@@ -716,6 +739,10 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "boot.kernel.image" => cfg.kernel = Some(path()),
         "boot.kernel.initrd" => cfg.initrd = Some(path()),
         "boot.kernel.cmdline" => cfg.cmdline = text.to_string(), // a string stays a string: --set boot.kernel.cmdline=3
+        "boot.firmware.image" => cfg.firmware = Some(path()),
+        "boot.firmware.start" => {
+            cfg.firmware_start = natemu::boot::firmware::Start::parse(text).map_err(err)?
+        }
         "debug.check_reuse" => cfg.check_reuse = boolish(text).map_err(err)?,
         "debug.pool" => cfg.pool = boolish(text).map_err(err)?,
         "debug.page_currency" => {
@@ -751,10 +778,27 @@ pub fn validate(cfg: &Config) -> Res<()> {
             "{who}: [boot.kernel] needs image (or pass --kernel FILE)"
         ));
     }
-    if cfg.kernel.is_none() {
+    if cfg.firmware.is_none() && cfg.firmware_table {
         return Err(format!(
-            "{who}: no boot method: --kernel FILE, or [boot.kernel] in a --config file"
+            "{who}: [boot.firmware] needs image (or pass --firmware FILE)"
         ));
+    }
+    if cfg.kernel.is_some() && cfg.firmware.is_some() {
+        return Err(format!(
+            "{who}: two boot methods: a kernel and a firmware image (--kernel or [boot.kernel], --firmware or [boot.firmware])"
+        ));
+    }
+    if cfg.kernel.is_none() && cfg.firmware.is_none() {
+        return Err(format!(
+            "{who}: no boot method: --kernel FILE, or [boot.kernel] in a --config file (or a firmware image: --firmware FILE)"
+        ));
+    }
+    // M2 Part 2: a firmware boot loads no initrd or command line, and its board has no virtio device yet.
+    if cfg.firmware.is_some() && (cfg.initrd.is_some() || !cfg.cmdline.is_empty()) {
+        return Err(format!("{who}: a firmware boot takes no initrd or kernel command line"));
+    }
+    if cfg.firmware.is_some() && !(cfg.disks.is_empty() && cfg.nics.is_empty() && cfg.rngs.is_empty()) {
+        return Err(format!("{who}: a firmware boot has no virtio devices yet (no disk, nic or rng)"));
     }
     if cfg.fexc.is_none() {
         return Err(format!(

@@ -18,6 +18,7 @@ use natemu_abi::guest_memory::GuestRam;
 use std::fmt;
 
 pub mod acpi;
+pub mod firmware;
 pub mod multiboot;
 
 const MIB: u64 = 1 << 20;
