@@ -26,7 +26,7 @@ the interpreter from 64-bit kernel code (`refuse_compatibility`'s CPL-0 arm).
 
 | Operation | Checks (in order), each a typed stop `interp_fault` with nothing committed | Commit |
 | --- | --- | --- |
-| far JMP, protected mode (ptr16:16, ptr16:32, m16:16, m16:32; the core has read and checked the operand) | null #GP(0); table limit (TI = 1: LDTR present) #GP(sel); a call gate, or with LMA = 0 a task gate or TSS: `interp_unsupported` GATE; other system or data #GP(sel); LMA and L = D = 1 #GP(sel); privilege #GP(sel); P #NP(sel); offset past the new limit (not into 64-bit code) #GP(0); the accessed-bit write (#PF) | CS (RPL = CPL), EIP, RF clear |
+| far JMP, protected mode (ptr16:16, ptr16:32, m16:16, m16:32; the core has read and checked the operand) | null #GP(0); table limit (TI = 1: LDTR present) #GP(sel); a call gate, or with LMA = 0 a task gate or an available TSS: `interp_unsupported` GATE; other system (a busy TSS among them) or data #GP(sel); LMA and L = D = 1 #GP(sel); privilege #GP(sel); P #NP(sel); offset past the new limit (not into 64-bit code) #GP(0); the accessed-bit write (#PF) | CS (RPL = CPL), EIP, RF clear |
 | far RET 16/32, imm16, protected mode (the core has checked and read both slots) | null #GP(0); table limit; not code, or LMA and L = D = 1 #GP(sel); RPL < CPL, DPL #GP(sel); P #NP(sel); RPL > CPL: `interp_unsupported` OUTER; offset past the limit #GP(0); the accessed bit | ESP (or SP, by SS.B) released, CS, EIP |
 | MOV Sreg, protected mode | null: SS #GP(0), else the unusable segment (FS/GS base 0); table limit; `load_data`'s type, DPL/RPL and P rules (#GP/#SS/#NP(sel)); the accessed bit | the segment, EIP; no MOV SS shadow |
 | MOV CR0 | value & CR0_VALID \| ET; PG without PE, NW without CD #GP(0); PG 0 -> 1: without EFER.LME `interp_mode` PAGING (legacy or PAE paging); without CR4.PAE, with CS.L = 1 or a 16-bit TSS in TR #GP(0), else LMA := 1; PG 1 -> 0: LMA := 0 (64-bit mode never interprets) | CR0, EFER |
@@ -52,6 +52,8 @@ their bytes, so mode changes need nothing for them. What translated code sees af
 - EFER through WRMSR (the existing transaction): its global flush on LME/LMA/NXE.
 - CR0 TS/EM/MP/NE/AM/CD/NW, CR4 OSFXSR and the other feature bits: nothing (in the code context, or not modelled).
 
+The `tests/smp` program `seg-compat-tlb` checks the CR3, CR0.PG and CR4 flushes, each alone (Cases, below).
+
 ## The hand-off and the way in
 
 - **Out:** a far JMP or far RET that loads a 64-bit CS (L = 1) with LMA = 1 completes in its pass; the loop's next top
@@ -64,7 +66,15 @@ their bytes, so mode changes need nothing for them. What translated code sees af
   CPL 1 or 2, and any IRET (the instruction's opcode after its prefixes: an IRET into compatibility mode may load a null
   SS, which x86 refuses with #GP(0) and the 64-bit IRET does not check; no known code makes one). The CPL-3 arm is
   untouched. `refuse_compatibility` is kept out of line (`#[inline(never)]`, as the compiler had left it), so its
-  callers are the same code.
+  callers are the same code, and its CPL-0 arm is a tail call of `kernel_compatibility` (which returns its result), so
+  its common path keeps no frame.
+- **A deviation there:** `far_transfer` and `far_return` check only that the target RIP is canonical (and stay as they
+  are), where x86 raises #GP(0) at the instruction for a compatibility-mode target outside the new CS limit (a RIP at or
+  above 4 GiB, or past a smaller limit). The cold `interpret::record` (before `commit` cuts RIP to 32 bits) stops such a
+  transfer once it has completed: `unsupported_code_mode` with `native[0]` = `stop::code_mode::PAST_LIMIT`, the limit
+  and RIP (the host's report names the case), the bank the state at the target. A loud stop where x86 gives #GP(0), in
+  place of the code running at the wrong address; no known code does this. `segment_model`'s 64-bit `far` and `ret`
+  give it as `Stopped` (a refusal at the target, with x86's #GP(0) in `x86`).
 
 ## The driver's `init` event source
 
@@ -81,14 +91,15 @@ the INIT-before-TF order and the HLT wakes deterministically; machine descriptio
   cases were changed: `R-mov_cr4,_r32-02` and `P32-mov_cr4,_r32-02` wrote CR4 = 750H, whose MCE bit natemu's CPU
   profile does not advertise (#GP(0) where QEMU's and KVM's CPU models load it); they write 710H, and their answers were
   seeded again on QEMU and on the x86 reference machine's KVM and locked.
-- `tests/interp` case `natemu-faults` (`interp_faults.py`): 288 segment cases, `segment_model`'s far JMP (ptr16:16,
-  ptr16:32, m16:32), far RET (16, 32, imm16) and MOV Sreg in R, P16, P32 and C32 over a GDT covering every check (with
-  not-present operand, stack and descriptor pages and a read-only GDT page under CR0.WP in C32), each judged by the
-  model's result: the typed stop and its record with nothing committed (every field and the GDT's bytes as they
-  started), a refusal's detail, or the state the model reaches (the stop at the target, the selectors, ESP, the GDT's
-  accessed bits); and 21 of `modes_model`'s programs (profiles 22-49 but 24, 28, 30, 34, 35, 36, 38, whose endings are
-  64-bit code's or need a 16-bit TSS) run whole, ending where the model's records first fault or stop (or at the end).
-  Their 64-bit stretches run translated, through the hand-off and the CPL-0 arm.
+- `tests/interp` case `natemu-faults` (`interp_faults.py`): 306 segment cases, `segment_model`'s far JMP (ptr16:16,
+  ptr16:32, m16:32), far RET (16, 32, imm16) and MOV Sreg in R, P16, P32 and C32 over a GDT covering every check (busy
+  32- and 16-bit TSSs among them; with not-present operand, stack and descriptor pages and a read-only GDT page under
+  CR0.WP in C32), each judged by the model's result: the typed stop and its record with nothing committed (every field
+  and the GDT's bytes as they started), a refusal's detail, or the state the model reaches (the stop at the target, the
+  selectors, ESP, the GDT's accessed bits); and 21 of `modes_model`'s programs (profiles 22-49 but 24, 28, 30, 34, 35, 36, 38, whose endings are
+  64-bit code's or need a 16-bit TSS) run whole, ending where the model's records first fault or stop (or at the end),
+  with the model's CR0, CR3, CR4 and EFER there. Their 64-bit stretches run translated, through the hand-off and the
+  CPL-0 arm.
 - `tests/interp` case `natemu-machine` adds: an INIT posted at the POPFD that sets TF is taken first; HLT woken by an
   NMI (the typed stop, vector 2) and by an INIT; HLT alone ends the run halted.
 - `tests/system` case `initsipi-interpreter`: every scenario but `bsp-init`; `fixed-in-wfs`'s own start program (the
@@ -102,24 +113,42 @@ the INIT-before-TF order and the HLT wakes deterministically; machine descriptio
   against QEMU system mode (64-bit code into the CPL-0 32-bit segment 38H, EAX set there, back by a far JMP m16:32 or a
   32-bit far RET); new `seg-iret-compat-cpl0` (IRETQ there: still `unsupported_code_mode`). `segment_model`'s 64-bit
   `far`/`ret` follow (`_refuse_compatibility` completes CPL 0 with L = 0 but IRET; `_refuse_shape` only at CPL 3). The
-  CPL-3 lock cases are unchanged and pass.
-- Static case `stack`: the gate bound is 21,808 of 81,920 bytes (26,144 with one nested entry), its deepest path now
+  CPL-3 lock cases are unchanged and pass. `seg-jmp-far-compat-rip` (JMP m16:64 to 38H at 1_0011_0000H),
+  `seg-lret-compat-rip` (RETQ there) and `seg-call-far-compat-limit` (CALL m16:64 to a 32-bit CPL-0 segment of limit
+  FFFFFH at 110000H): the deviation's stop at the target (`segment_model`'s `Stopped`). New `seg-compat-tlb`, judged
+  against QEMU system mode (registers, captured memory): 64-bit code reads V (its shadow made), goes to 38H, changes V's
+  translation there and reads V back in 64-bit code: (1) CR3 := a second table that maps V elsewhere, (2) V's PTE
+  rewritten without INVLPG, then CR0.PG cleared and set (IA-32e mode off and on, P32 with paging off between), (3) the
+  same with CR4.PGE set and cleared; CR0, CR4 and EFER read back in 64-bit code.
+- Static case `stack`: the gate bound is 21,792 of 81,920 bytes (26,128 with one nested entry), its deepest path now
   through the interpreter into a 64-bit far transfer's `kernel_compatibility` (the static over-approximation of
-  `transaction` inlined into `run`); boot 11,920 of 32,768.
+  `transaction` inlined into `run`; `refuse_compatibility`'s frame is 0 since the tail call); boot 11,904 of 32,768.
 
 Each new check was shown to fail when it should, by a temporary mutation of each: the INIT-before-TF order
 (`p32-init-before-tf`), L = D = 1 under LMA (the C32 far JMPs and RETs to 58H), the accessed-bit write (the far
 transfers and loads of 30H and A0H), LMA cleared on deactivation (the round-trip programs), the CPL-0 arm (the modes
-programs through it), HLT's wait (`r-hlt-halted`), and an interrupt delivered in `fixed-in-wfs`'s idle.
+programs through it), HLT's wait (`r-hlt-halted`), and an interrupt delivered in `fixed-in-wfs`'s idle. After the
+review: the CR3, the CR0 and the CR4 flushes of `mov_to_cr`, one run of case `system` each (`seg-compat-tlb` fails at
+both block sizes, every other program passes); the past-the-limit stop (the three cases above) and the busy-TSS rule
+(the eight P16 and P32 far JMPs to B0H and B8H), in one run.
 
-## The hot paths (resident release builds, `llvm-objdump`, e21b0209 against this change)
+## The hot paths (resident release builds, `llvm-objdump`, b5266dc4 against this change)
 
-Identical, addresses and symbol hashes aside: `find_from`, `sys_fast`, `miss_fast` (both with `sys_commit` inlined),
-`system` (with `transaction`), `commit`, `set_cpl`, `far_transfer` (with `same_mode` and `far_target`), `far_return`,
-`load_data`, `trap_due`, `segments::pages`, `linear`, `copy`, `descriptor`, `accessed`, `translate`, `fetch_walk`,
-`enter`, `step_here`. Different: `refuse_compatibility`'s own body (its CPL-0 arm a call of the cold
-`kernel_compatibility` instead of a copy of `State` and a halt). Without `#[inline(never)]` the smaller function was
-inlined into `far_transfer` and `far_return`, which then differed. Resident text 261,516 -> 267,424 bytes.
+Identical, addresses, symbol hashes and literal-pool addresses aside: `find_from`, `sys_fast`, `miss_fast` (both with
+`sys_commit` inlined), `system` (with `transaction`), `commit`, `set_cpl`, `far_transfer` (with `same_mode` and
+`far_target`), `far_return`, `load_data`, `trap_due`, `segments::pages`, `linear`, `copy`, `descriptor`, `accessed`,
+`translate`, `fetch_walk`, `enter`, `step_here`, and every other function both builds have but `refuse_compatibility`
+and the interpreter's own. `refuse_compatibility`'s common path (a 64-bit target: every 64-bit far JMP, CALL and RET
+and every IRETQ to 64-bit code, `sys_commit`'s fast IRET among them) is `and`, `mov`, `cmp`, `b.ne`, `str`, `ret`: 6
+instructions, no frame (b5266dc4: the same test, then `mov`, `b`, `str`, `ret`). Its CPL-0 arm is `b
+kernel_compatibility`, a tail call (the cold function returns `refuse_compatibility`'s result), where a copy of `State`
+and a halt were. Without `#[inline(never)]` the smaller function was inlined into `far_transfer` and `far_return`, which
+then differed. The first version called `kernel_compatibility` and returned `Ok(())` after it: the common path kept a
+frame (`stp x30, x19`, `mov x19, x8`, `ldp`), 11 instructions (the review's finding). It also moved three functions
+with no source change through the code-generation units' partitioning: `helpers::x87` called an outlined
+`x87::helper` (one more call per `svc #X87`), and `mmio::ones` and `maskmov::transaction` differed in frame and
+register allocation. `#[inline]` on `x87::helper` (its one caller) restores all three. Resident text 261,516 ->
+267,228 bytes.
 
 ## Risks for a running 64-bit OS
 
@@ -127,4 +156,6 @@ inlined into `far_transfer` and `far_return`, which then differed. Resident text
   now enters the interpreter (Ubuntu 6.8's AP route, Linux's LA57 switch, kvm-unit-tests' 5-level tests; the LA57 switch
   itself still stops, CR4.LA57 being reserved in the profile). CPL-3 transfers keep their #GP deviation.
 - Everything else runs only from interpreted state.
-- The resident grows by 5.9 KB; the interpreter's gate path deepens (the static `stack` case).
+- A 64-bit far transfer into CPL-0 compatibility-mode code with RIP outside the new CS limit stops loudly after it
+  completes, where x86 raises #GP(0) at the instruction (the recorded deviation above; no known code does this).
+- The resident grows by 5.6 KB; the interpreter's gate path deepens (the static `stack` case).
