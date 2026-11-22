@@ -126,15 +126,19 @@ pub(crate) fn record(bytes: &[u8], bits: u32) -> Option<Insn> {
 }
 /// The record of `i`, decoded (at any IP) from `bytes` in a `bits`-bit code segment with `error` its decoder's verdict.
 pub(crate) fn insn(i: &Instruction, error: DecoderError, bytes: &[u8], bits: u32) -> Insn {
+    // Every record, a stop's too, has the sizes its prefixes give (the resident checks them all).
+    let (size, address) = sizes(&bytes[..i.len()], bits);
     let mut r = Insn {
         length: i.len() as u8,
+        size,
+        address,
         ..Insn::NONE
     };
     r.bytes[..i.len()].copy_from_slice(&bytes[..i.len()]);
-    // Fifteen bytes and no instruction: one that needs a 16th byte (iced stops at 15; the 16th is never fetched). UD0, UD1
-    // and UD2 are #UD by definition.
+    // UD0, UD1 and UD2 are #UD by definition.
     if i.is_invalid() || matches!(i.mnemonic(), Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2) {
-        let long = i.len() == 15 && error == DecoderError::InvalidInstruction;
+        let long =
+            i.len() == 15 && error == DecoderError::InvalidInstruction && too_long(bytes, bits);
         r.op = if long { op::TOO_LONG } else { op::UD };
         return r;
     }
@@ -154,16 +158,33 @@ pub(crate) fn insn(i: &Instruction, error: DecoderError, bytes: &[u8], bits: u32
     }
     r
 }
+/// Whether the 15 `bytes` iced found no instruction in need a 16th (#GP(0)) rather than end there with an invalid opcode
+/// (#UD): iced stops at 15 bytes either way. A legacy prefix repeated later in the run changes nothing when dropped, so
+/// the rest is decoded without the first byte: past 14 bytes it needs a 16th. Without a repeated prefix iced cannot tell
+/// the two apart, and the instruction is taken as too long (natemu's choice). The length is iced's (for an undefined
+/// two-byte opcode such as 0F 04 iced reads a ModRM byte too).
+fn too_long(bytes: &[u8], bits: u32) -> bool {
+    let run = bytes.iter().take_while(|b| legacy(b)).count();
+    if bytes.get(1..run).is_none_or(|p| !p.contains(&bytes[0])) {
+        return true;
+    }
+    let mut rest = [0; 15];
+    rest[..14].copy_from_slice(&bytes[1..15]);
+    Decoder::new(bits, &rest, DecoderOptions::NONE)
+        .decode()
+        .len()
+        > 14
+}
+fn legacy(b: &u8) -> bool {
+    matches!(
+        b,
+        0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 | 0x64 | 0x65 | 0x66 | 0x67
+    )
+}
 /// The legacy prefixes' sizes: the operand and address size (bytes) in a `bits`-bit code segment, each toggled by its
 /// prefix (66, 67).
 fn sizes(bytes: &[u8], bits: u32) -> (u8, u8) {
-    let legacy = |b: &&u8| {
-        matches!(
-            b,
-            0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 | 0x64 | 0x65 | 0x66 | 0x67
-        )
-    };
-    let prefixes = &bytes[..bytes.iter().take_while(legacy).count()];
+    let prefixes = &bytes[..bytes.iter().take_while(|b| legacy(b)).count()];
     let size = |p: u8| {
         if (bits == 32) != prefixes.contains(&p) {
             4
