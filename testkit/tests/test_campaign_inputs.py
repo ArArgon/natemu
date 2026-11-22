@@ -61,7 +61,10 @@ def test_campaign_image_key_changes_with_recipe(monkeypatch, tmp_path):
 # What each Task 8 recipe reads besides remote.sh and its own folder (its uses.txt), and a file it must not be keyed by.
 OWN = {'libm': (['correctness/libm.py', 'correctness/run-libm.sh'], 'correctness/gstr.py'),
        'gstr': (['correctness/gstr.py', 'correctness/cpy-remote.sh', 'correctness/run-gstr.sh'], 'correctness/libm.py'),
-       'x86st': (['correctness/x86-remote.sh', 'correctness/run-x86st.sh', 'correctness/x86st-skip.txt'], 'correctness/libm.py')}
+       'x86st': (['correctness/x86-remote.sh', 'correctness/run-x86st.sh', 'correctness/x86st-skip.txt'], 'correctness/libm.py'),
+       'ltp32': (['correctness/i386.sh', 'correctness/ltp-list.py', 'correctness/run-ltp.sh', 'correctness/recipes/ltp/cases.sh'],
+                 'correctness/libm.py'),
+       'libm32': (['correctness/i386.sh', 'correctness/libm.py', 'correctness/run-libm.sh'], 'correctness/gstr.py')}
 
 
 @pytest.mark.parametrize('suite', sorted(OWN))
