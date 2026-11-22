@@ -3211,7 +3211,8 @@ mod tests {
             }
         }
         // The NaN fix-up's `b` (between the mask and the `add`) retargeted to the slot store skips the `add`: refused.
-        let object = compile("d8c9", &["--feature", "afp=0"]);
+        // (Accurate mode's code: fast mode without AFP runs x87 in runs and has no fix-up.)
+        let object = compile("d8c9", &["--feature", "afp=0", "--accurate"]);
         let h: Header = super::super::record(&object, 0);
         let word = |i: usize| u32::from_le_bytes(object[h.code_offset as usize + 4 * i..][..4].try_into().unwrap());
         let words = (object.len() - h.code_offset as usize) / 4;

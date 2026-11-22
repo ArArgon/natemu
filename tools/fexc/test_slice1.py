@@ -1266,7 +1266,11 @@ class AfpDenormal(unittest.TestCase):
                 self.assertEqual(soft_de_words(native_words(form, *self.AFP0, *extra)[1]), 1, name)
             for mask in ('0x0', '0x3d', '0x1'):   # DE masked: a host with AFP has none of it; without, the flag is or-ed into the pending byte (AfpX87 judges it)
                 self.assertFalse(any(l.startswith('and w') and l.endswith('#0x80') for l in native_words(form, '--x87-unmasked', mask)[1]), (name, mask))
-                self.assertTrue(any(l.startswith('and w') and l.endswith('#0x80') for l in native_words(form, *self.AFP0, '--x87-unmasked', mask)[1]), (name, mask))
+                # (fast mode with every x87 exception masked runs x87 in runs and has no such test: the `masked-x87-de` deviation;
+                # accurate mode and any unmasked exception keep the per-operation wrapper and the test)
+                has = lambda *more: any(l.startswith('and w') and l.endswith('#0x80') for l in native_words(form, *self.AFP0, '--x87-unmasked', mask, *more)[1])
+                self.assertEqual(has(), mask != '0x0', (name, mask))
+                self.assertTrue(has('--accurate'), (name, mask))
         # not the integer forms (fiadd m32, fiadd m16, fild), the register forms: no memory operand to test
         for form in ('da03', 'de03', 'df03', 'd8c1', 'dec1', 'd9c0', 'd8d1', 'dfe9', 'd9e4'):
             self.assertEqual(soft_de_words(native_words(form, *self.AFP0, '--x87-unmasked', '0x2')[1]), 0, form)
@@ -1461,10 +1465,13 @@ def uz_block(fexc, hexs, *extra):
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class AfpX87(unittest.TestCase):
-    """AFP fallback, x87 in default mode (afp=0): the masked DE of m32/m64 memory operands and the NaN results of arithmetic. The M4
-    (FPCR 6, AFP code) is the oracle: the guest state after the instruction (ST registers as stored doubles, the pending flags, TOP, tags)
-    is the same as the M2's (FPCR 0, afp=0 code), and FSW.DE of both is x86's rule (below). Both the M4's code and the afp=0 code fix the
-    m32 convert's IDC (a denormal single beside a NaN in ST0, or FDIVR m32 over a zero ST0: the M4 hardware raises DE, x86 does not)."""
+    """x87 on a host without AFP (afp=0): the masked DE of m32/m64 memory operands and the NaN results of arithmetic.
+    Accurate mode (`--accurate`: the per-operation wrapper) is exact: the M4 (FPCR 6, AFP code) is the oracle: the guest state after
+    the instruction (ST registers as stored doubles, the pending flags, TOP, tags) is the same as the M2's (FPCR 0, afp=0 code), and
+    FSW.DE of both is x86's rule (below). Both the M4's code and the afp=0 code fix the m32 convert's IDC (a denormal single beside
+    a NaN in ST0, or FDIVR m32 over a zero ST0: the M4 hardware raises DE, x86 does not).
+    Fast mode (no `--accurate`: x87 runs, as on the M4) differs from accurate mode only by its two documented deviations
+    (docs/floating-point.md, tests/lib/fp_deviations.py): `masked-x87-de` and `x87-nan-results`."""
     D = dict(one=0x3ff0000000000000, two=0x4000000000000000, zero=0, nzero=1 << 63, inf=0x7ff0000000000000, ninf=0xfff0000000000000,
              qnan=0x7ff8000000000000, nqnan=0xfff8000000000000, qnanp=0x7ff8000000001234, snan=0x7ff0000000000001, nsnan=0xfff0000000000007,
              snanp=0x7ff4000000000000)
@@ -1479,8 +1486,8 @@ class AfpX87(unittest.TestCase):
     REG = ['d8c1', 'd8c9', 'd8e1', 'd8e9', 'd8f1', 'd8f9', 'dcc1', 'dcc9', 'dce1', 'dce9', 'dcf1', 'dcf9', 'dec1', 'dec9', 'dee1', 'dee9', 'def1', 'def9',
            'd9fa', 'd9fc', 'd8d1', 'd8d9', 'd9c0', 'd9e0', 'd9e1', 'dfe9']
 
-    def run_form(self, form, afp, st0, st1, mem, e):
-        words, lines, spills = native_words(form, *([] if afp else ['--feature', 'afp=0']))
+    def run_form(self, form, afp, st0, st1, mem, e, fast=False):
+        words, lines, spills = native_words(form, *([] if afp else ['--feature', 'afp=0'] if fast else ['--feature', 'afp=0', '--accurate']))
         self.assertEqual(spills, 0, form)
         i = max(k for k, l in enumerate(lines) if l.startswith('svc'))
         while lines[i - 1].startswith(('mov w0', 'movk w0')): i -= 1
@@ -1527,11 +1534,48 @@ class AfpX87(unittest.TestCase):
                     self.assertEqual(self.run_form(form, False, st0, None, m, e), self.run_form(form, True, st0, None, m, e), (form, a, m))
 
     def test_invalid_operations_give_the_negative_indefinite(self):
-        """x86's real indefinite is the negative QNaN (AH = 0's default is the positive one); the NaN-operand cases are judged by the M4 above."""
+        """x86's real indefinite is the negative QNaN (AH = 0's default is the positive one); the NaN-operand cases are judged by the M4 above.
+        Fast mode gives the positive one (`x87-nan-results`)."""
         for form, st0, st1 in (('d8f1', self.D['zero'], self.D['zero']), ('d8e1', self.D['inf'], self.D['inf']), ('d8c9', self.D['inf'], self.D['zero']),
                                ('d8c1', self.D['inf'], self.D['ninf']), ('d9fa', 0xbff0000000000000, None), ('d9fa', self.D['ninf'], None)):
-            got = int.from_bytes(self.run_form(form, False, st0, st1, None, 8)[0x420:0x428], 'little')
-            self.assertEqual(got, 0xfff8000000000000, (form, hex(got)))
+            for fast, want in ((False, 0xfff8000000000000), (True, 0x7ff8000000000000)):
+                r = self.run_form(form, False, st0, st1, None, 8, fast)
+                got = int.from_bytes(r[0x420:0x428], 'little')
+                self.assertEqual(got, want, (form, fast, hex(got)))
+                self.assertEqual(r[0x4b4] & 1, 1, (form, fast, 'IE'))
+
+    def test_fast_mode_differs_from_accurate_mode_only_by_its_documented_deviations(self):
+        """Every case of the three tests above, fast mode's code against accurate mode's (both afp=0, FPCR 0). The whole state is equal but:
+        `masked-x87-de`: FSW.DE is never set by fast mode (accurate mode sets it for a denormal m32/m64 operand);
+        `x87-nan-results`: where accurate mode's result is a NaN, fast mode's may be another NaN: the positive default NaN where no
+        operand is a NaN (accurate: the negative one), or a signalling operand quieted where the other, quiet operand comes first
+        (Arm takes a signalling NaN first)."""
+        nan = lambda v: (v & 0x7fffffffffffffff) > 0x7ff0000000000000
+        seen = {'de': 0, 'default': 0, 'choice': 0}
+        def judge(what, form, st0, st1, mem, e, ops):
+            a, f = bytearray(self.run_form(form, False, st0, st1, mem, e)), bytearray(self.run_form(form, False, st0, st1, mem, e, True))
+            if a[0x4b4] & 0x80 and not f[0x4b4] & 0x80: seen['de'] += 1
+            self.assertEqual(f[0x4b4] & 0x80, 0, (what, 'fast mode sets DE'))
+            a[0x4b4] &= 0x7f
+            for s in range(0x420, 0x4a0, 16):
+                x, y = (int.from_bytes(r[s:s + 8], 'little') for r in (a, f))
+                if x == y: continue
+                self.assertTrue(nan(x) and nan(y), (what, hex(x), hex(y)))
+                if y == 0x7ff8000000000000 and x == 0xfff8000000000000 and not any(nan(o) for o in ops): seen['default'] += 1
+                else:
+                    self.assertIn(y, [o | 1 << 51 for o in ops if nan(o) and not o >> 51 & 1], (what, hex(x), hex(y)))   # a signalling operand, quieted
+                    seen['choice'] += 1
+                f[s:s + 8] = a[s:s + 8]
+            self.assertEqual(a, f, what)
+        wide = lambda m, e: m if e == 8 else (m & 1 << 31) << 32 | 0x7ff << 52 | (m & 0x7fffff) << 29 if m & 0x7f800000 == 0x7f800000 and m & 0x7fffff else 0   # an m32 NaN as a double
+        for name, op, form, e in self.MEM:
+            for (a, st0), (m, mem) in itertools.product(self.D.items(), self.M4[e].items()): judge((name, a, m), form, st0, None, mem, e, [st0, wide(mem, e)])
+        for form in self.REG:
+            for (a, st0), (b, st1) in itertools.product(self.D.items(), repeat=2): judge((form, a, b), form, st0, st1, None, 8, [st0] if form in ('d9fa', 'd9fc', 'd9c0', 'd9e0', 'd9e1') else [st0, st1])
+        for form, e in (('da03', 4), ('da0b', 4), ('da2b', 4), ('da33', 4), ('de03', 2), ('de3b', 2), ('da13', 4), ('db03', 4)):
+            for a, st0 in self.D.items():
+                for m in (0, 1, 5, 0x7fffffff, 0x80000000, 0xffff): judge((form, a, m), form, st0, None, m & ((1 << 8 * e) - 1), e, [st0])
+        for k, n in seen.items(): self.assertGreater(n, 100, k)
 
 
 def kind_of(name):
@@ -2436,9 +2480,12 @@ class Slice1X87Commit(unittest.TestCase):
         # instruction's x87 map applied, which must again be what the instructions before it leave when run alone.)
         # (afp: the code for a Mac without AFP, run here under its FPCR: the same caches, the flags copied after each op.)
         points = stubs_seen = guessed = exits = mapped = stale = 0
-        for bits, guess, afp in ((64, False, True), (32, False, True), (32, True, True), (64, False, False), (32, True, False)):
-            extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else []) + ([] if afp else ['--feature', 'afp=0'])
-            fpcr = 6 if afp else 0
+        # ('accurate': the same Mac's accurate mode, the per-operation wrapper; False is its fast mode, x87 runs as with AFP.)
+        for bits, guess, afp in ((64, False, True), (32, False, True), (32, True, True), (64, False, False), (32, True, False),
+                                 (64, False, 'accurate'), (32, True, 'accurate')):
+            extra = ['--ext-conds', '4', '--push-run', '--narrow-cmp'] + (['--bitness', '32'] if bits == 32 else []) + \
+                    ([] if afp is True else ['--feature', 'afp=0'] + (['--accurate'] if afp else []))
+            fpcr = 6 if afp is True else 0
             for prog in self.X87_PROGRAMS:
                 lines = [l.replace('rbx', 'ebx').replace('rax', 'eax').replace('rcx', 'ecx') for l in prog] if bits == 32 else prog
                 each = [x86_asm((['.code32'] if bits == 32 else []) + [l]) for l in lines]

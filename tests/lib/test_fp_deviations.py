@@ -9,7 +9,7 @@ import fp_deviations as dev
 def readme_list():   # (the list moved from the README to docs/floating-point.md)
     text = (ROOT / 'docs/floating-point.md').read_text()
     body = text.split('## Fast mode on a Mac without FEAT_AFP\n', 1)[1].split('\n#', 1)[0]
-    return dict(re.findall(r'^- `([a-z-]+)`: (.*)$', body, re.M))
+    return dict(re.findall(r'^- `([a-z0-9-]+)`: (.*)$', body, re.M))
 
 
 class Registry(unittest.TestCase):
@@ -18,6 +18,22 @@ class Registry(unittest.TestCase):
         self.assertEqual(sorted(readme), sorted(dev.CLASSES))
         for name, (_, description, _) in dev.CLASSES.items():
             self.assertEqual(readme[name].rstrip('.'), description, name)
+
+    def test_the_page_names_every_other_x87_deviation(self):
+        text = (ROOT / 'docs/floating-point.md').read_text()
+        for name in dev.X87_OTHER: self.assertIn(f'`{name}`', text, name)
+        self.assertFalse(set(dev.X87_OTHER) & set(dev.CLASSES))
+
+    def test_the_x87_rule(self):
+        m2, m4, acc = {'afp': False, 'fp': 'fast'}, {'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'accurate'}
+        v = lambda r, exact, deviated: dev.x87_verdict('masked-x87-de', r, exact, deviated)[0]
+        self.assertEqual(v(m2, ['fsw'], []), 'deviated')
+        self.assertEqual(v(m2, [], ['fsw']), 'fail')         # tagged but exact
+        self.assertEqual(v(m2, ['fsw'], ['fsw']), 'fail')    # another wrong result
+        for r in (m4, acc, {}):
+            self.assertEqual(v(r, [], ['fsw']), 'ok')
+            self.assertEqual(v(r, ['fsw'], []), 'fail')      # the deviated result where the case is judged exactly
+        self.assertEqual(dev.x87_verdict(None, m2, [], ['x']), ('ok', []))
 
     def test_every_tagged_corpus_program_names_a_registered_class(self):
         for corpus, progs in json.loads(dev.PREDICTIONS.read_text()).items():
