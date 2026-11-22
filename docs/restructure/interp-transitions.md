@@ -96,7 +96,16 @@ the INIT-before-TF order and the HLT wakes deterministically; machine descriptio
 - `tests/boot` case `exit-ap-natemu`: the pass at 1, 2 and 4 vCPUs with the interpreter (each AP climbs and arrives
   once, counted from 64-bit code).
 - `tests/boot` case `kut-natemu`: kvm-unit-tests' smptest and dummy at 1 to 4 vCPUs through the Multiboot loader and
-  `--debug-exit`, judged by `run_kut.judge` and against the locked KVM answer's lines.
+  `--debug-exit`, judged by `run_kut.judge` and against the locked KVM answer's lines (all eight pass; with
+  `NATEMU_INTERPRETER=off` all fail).
+- `tests/smp` case `system`: `seg-jmp-far-compat` and `seg-lret-compat`, refusals until now, are round trips judged
+  against QEMU system mode (64-bit code into the CPL-0 32-bit segment 38H, EAX set there, back by a far JMP m16:32 or a
+  32-bit far RET); new `seg-iret-compat-cpl0` (IRETQ there: still `unsupported_code_mode`). `segment_model`'s 64-bit
+  `far`/`ret` follow (`_refuse_compatibility` completes CPL 0 with L = 0 but IRET; `_refuse_shape` only at CPL 3). The
+  CPL-3 lock cases are unchanged and pass.
+- Static case `stack`: the gate bound is 21,808 of 81,920 bytes (26,144 with one nested entry), its deepest path now
+  through the interpreter into a 64-bit far transfer's `kernel_compatibility` (the static over-approximation of
+  `transaction` inlined into `run`); boot 11,920 of 32,768.
 
 Each new check was shown to fail when it should, by a temporary mutation of each: the INIT-before-TF order
 (`p32-init-before-tf`), L = D = 1 under LMA (the C32 far JMPs and RETs to 58H), the accessed-bit write (the far
