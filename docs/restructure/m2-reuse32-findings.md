@@ -190,7 +190,7 @@ is the request itself. Each process still asks the host for every block it runs,
 configure; the host answers from its kept answers in about 1.4 microseconds, but the round trip from the guest and
 back, and installing the copy, cost more than that: 34% of the step waiting and 22% installing. The 64-bit configure
 makes 1.06 million requests for the same work, because there the template pool serves copies inside the guest without
-asking the host. The pool for 32-bit code is the next step for this workload (see Not done).
+asking the host. Reuse inside the guest for 32-bit code is what removes them (the design section above).
 
 **The guess in the key.** The x87 guess is part of every 32-bit entry's tag, so a block without x87 instructions is
 compiled once per guess value it is asked for under. The 5,771 compiles of bytes compiled before are the upper bound
