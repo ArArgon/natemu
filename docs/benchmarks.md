@@ -109,6 +109,44 @@ Bench case `guest-paper`; Apple M2 Max; natemu 41e78e44; November 21, 2026; medi
 Experiment (an earlier version of the case: 8 GiB and Java's default heap, one boot, with internet, November 20, M2 Max): without
 `--speculation-barriers`, so with PTI on, the two starts took 191.7 s and 170.8 s, against 32.6 s and 35.1 s with it.
 
+## System calls: hackbench at three commits
+
+`hackbench` (above) makes its system calls by SYSCALL. `hackbench32` is the same program built as 32-bit code (i686),
+which makes them through the kernel's 32-bit vDSO (SYSENTER); `hackbench32-int80` boots with `vdso32=0`, so every
+system call is an INT 0x80. All at 1 vCPU. The commits: 78f60965, before the boot-time interpreter's plumbing; 75cfdd22,
+after it (the resident's code moved into its own 2 MiB block, then the interpreter's classification and entry);
+e21b0209, after CPU start-up (INIT and SIPI) and the interpreter itself.
+
+Bench cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80`; Apple M2 Max; natemu 78f60965,
+75cfdd22 and e21b0209 (`TESTKIT_BENCH_AT`); November 22, 2026. Seconds, the mean of 3 boots of two runs each; the
+spread is the largest minus the smallest of the 3 boots' means, as a share of the mean.
+
+78f60965 and e21b0209, booted alternately:
+
+| Case | 78f60965 | spread | e21b0209 | spread | change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `hackbench` | 13.57 | 5.3% | 13.13 | 3.9% | −3.3% |
+| `hackbench32` | 13.43 | 1.1% | 12.66 | 3.3% | −5.7% |
+| `hackbench32-int80` | 31.41 | 3.8% | 30.63 | 0.9% | −2.5% |
+
+75cfdd22, 3 boots after those (`hackbench32-int80`: a further 6 boots alternating 75cfdd22 and e21b0209):
+
+| Case | 75cfdd22 | spread | e21b0209 | spread | change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `hackbench` | 13.02 | 0.5% | 13.13 (above) | 3.9% | +0.8% |
+| `hackbench32` | 12.59 | 4.7% | 12.66 (above) | 3.3% | +0.6% |
+| `hackbench32-int80` | 30.12 | 3.0% | 30.33 | 0.6% | +0.7% |
+
+Only `hackbench32`'s gain is clearly larger than the noise: no boot of one commit comes near the other's (13.37 to
+13.52 s against 12.51 to 12.92 s). `hackbench`'s and `hackbench32-int80`'s gains go the same way but are about as
+large as the spread between boots. From 75cfdd22 to e21b0209 every change is within the noise. 75cfdd22's own
+`hackbench32-int80` boots took 29.76 s in the earlier set and 30.12 s in the later one, so separate sets also differ
+by about 1%. The gain is therefore from the plumbing (78f60965 to 75cfdd22). Its likely source is the code move (315860f3):
+the resident's code is now mapped by one 2 MiB block entry instead of 4 KiB pages, and its instructions stayed the same
+(that commit found the same instructions in all 449 functions but one literal). The classification and entry are meant
+to leave the fast system-call path's instructions as they were. This is likely, not shown: no commit between 78f60965
+and 75cfdd22 was measured.
+
 ## CPU vulnerability mitigations
 
 The numbers above use `mitigations=off`. On a default kernel command line natemu reports its virtual
