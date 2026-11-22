@@ -70,7 +70,7 @@
 //! `unsupported_mmio`: precise stops before the instruction, like a guest fault) cancels the others (another resident halt, the watchdog).
 //! The end rule's stops (`halted`, `wait_for_sipi`) are each vCPU's own end too. `--entry-ends` (test only, M2 Part 2):
 //! a stop at the boot-time interpreter's entry (`unsupported_mode` or `unsupported_code_mode` with the vCPU in a state only
-//! the interpreter runs, `Cpu::interpreted_mode`: the stop that stands for the interpreter until it is built) is the
+//! the interpreter runs, `Cpu::interpreted_mode`: the stop it makes with `NATEMU_INTERPRETER=off`) is the
 //! vCPU's own end as well, so every AP a SIPI started reports its start state while the others run on.
 //!
 //! M2 Part 2: a vCPU of a `wait-for-sipi` section, one with INIT or SIPI state in its pending word at the end, and one
@@ -1355,8 +1355,8 @@ fn finished(stop: &Stop) -> bool {
     )
 }
 
-/// `--entry-ends`: the vCPU stopped at the boot-time interpreter's entry (the stop that stands for the interpreter until it
-/// is built, `stop::UNSUPPORTED_MODE`'s doc), in a state only the interpreter runs.
+/// `--entry-ends`: the vCPU stopped at the boot-time interpreter's entry (the stop it makes with `NATEMU_INTERPRETER=off`,
+/// `stop::UNSUPPORTED_MODE`'s doc), in a state only the interpreter runs.
 fn interpreter_entry(stop: &Stop, area: Area) -> bool {
     matches!(
         stop,
