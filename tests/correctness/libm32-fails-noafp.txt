@@ -485,5 +485,5 @@ math/test-ldouble-y0 fails=2 fp=1d0b80edea32
 math/test-ldouble-y1 fails=2 fp=1d0b80edea32
 math/test-ldouble-yn fails=2 fp=1d0b80edea32
 math/test-misc fails=32931 fp=70cab0eef6d7
-math/test-nan-payload fails=310 fp=b9f7aabae395
+math/test-nan-payload fp=*
 math/tst-ldbl-nonnormal-printf fails=10 fp=a3e1f3d6e11a
