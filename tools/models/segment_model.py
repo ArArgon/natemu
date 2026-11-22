@@ -84,8 +84,9 @@ interpreted state carries `shape` for each loaded segment); `rip` is EIP (the of
 LMA (bit 10). Ambiguities, as above:
 B11 A real-mode load (MOV Sreg, far JMP, far RET) changes the selector and the base (selector x 16) only; the hidden limit
    and attributes stay (KVM's emulator: "keep limit etc. for unreal mode"; QEMU's real-mode loads write only the selector
-   and base). The SDM's return to real mode (Vol. 3A "Switching Back to Real-Address Mode") loads 64 KiB segments in
-   protected mode first, which is consistent with this.
+   and base). The SDM's return to real mode (Vol. 3A 12.9.2 "Switching Back to Real-Address Mode") loads 64 KiB segments
+   in protected mode first and says that "if the segment registers are not reloaded, execution continues using the
+   descriptor attributes loaded during protected mode".
 B12 RET far in real mode with a 32-bit operand size: the pseudocode checks EIP against the CS limit only for a 16-bit
    operand size; the exception list ("If the return instruction pointer is not within the return code segment limit")
    for both. Model: #GP(0) for both; permitted for the 32-bit form: completion.
