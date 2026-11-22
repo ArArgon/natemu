@@ -4,8 +4,8 @@ Status: November 22, 2026, built (branch `worktree-agent-a5639dd274d60b095`, on 
 interpreter's resident operations). Spec: [the plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts
 [m2-exit-firmware.md](m2-exit-firmware.md) (the exit test's firmware), [real-code-suites.md](real-code-suites.md) (OVMF)
 and [interp-integration.md](interp-integration.md) (the interpreter's memory layer). The exit test's firmware runs whole
-at 1, 2 and 4 CPUs and OVMF's `main32` entry reaches SEC with KVM's registers; OVMF's `reset` entry stops at its MOV CR4
-640H (CR4.MCE, which natemu's CPU does not present: section 5).
+at 1, 2 and 4 CPUs and OVMF's `main32` and `reset` entries reach SEC with KVM's registers (`reset` through its MOV CR4
+640H: CR4.MCE is accepted though natemu's CPU does not present MCE, a recorded deviation: section 5).
 
 ## 1. The region and its mapping
 
@@ -106,13 +106,13 @@ The image is read as memory everywhere it can be reached, and a store to it is d
 - **`ovmf-natemu`** (tests/boot; `run_ovmf.py --backend natemu`; same run): `--stop-at` SEC's entry FFFD5E24H, `judge`
   without its debug-port line (natemu stops before SEC writes it; RBP names the boot firmware volume) and the registers
   equal to the locked KVM answer's. `main32` passes (RIP = RSI = FFFD5E24H, RBP FFFCC000H, CS 38H, CR0 E0000011H, CR3
-  800000H, CR4 20H, EFER 500H; no port or unassigned-page access before it). `reset` stops at FFFFFE94H, in 32-bit
-  protected mode with paging off at CPL 0, at `mov cr4, eax` with EAX 640H (MCE, OSFXSR, OSXMMEXCPT): natemu's CPU
-  presents no MCE (CPUID.1:EDX.MCE = 0, so CR4.MCE is outside `cpu_profile::CR4_VALID`) and the interpreter's MOV CR4
-  raises #GP(0), as a CPU without MCE would (`interp_fault` 13); QEMU's and KVM's CPUs have MCE. Recorded as the known
-  bug `ovmf-reset-cr4-mce` (tests/boot/known-bugs.toml). Decided (coordinator, November 22): natemu accepts CR4.MCE
-  writes as a no-op without presenting MCE in CPUID, a recorded deviation, in the CR4 rules (another change, which also
-  removes the known bug once `reset` passes).
+  800000H, CR4 20H, EFER 500H; no port or unassigned-page access before it). `reset` passes too: at FFFFFE94H, in
+  32-bit protected mode with paging off at CPL 0, its `mov cr4, eax` with EAX 640H (MCE, OSFXSR, OSXMMEXCPT) raised
+  #GP(0) while CR4.MCE was outside `cpu_profile::CR4_VALID` (natemu's CPU presents no MCE: CPUID.1:EDX.MCE = 0), the
+  known bug `ovmf-reset-cr4-mce`. Decided (coordinator, November 22) and built: natemu accepts CR4.MCE writes without
+  presenting MCE in CPUID, a recorded deviation (`tools/models/cpu_profile.json` `control.cr4.bits.MCE`, so
+  `CR4_VALID` holds it: the interpreter's CR4 rule and the 64-bit MOV CR4 transaction share the mask); the known bug is
+  gone.
 - **Default boots:** the families `boot`, `programs`, `system`, `smp`, `interp`, `static` and `unit` (the final report
   names the run).
 
