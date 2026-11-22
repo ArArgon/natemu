@@ -533,8 +533,13 @@ fn check_chains() {
         if current(b) {
             halt(2 << 32 | n as u64, u64::from(b.flags))
         }
+        // (Only tables with a context: a global flush or a reset leaves the others' entries, unreachable, until a context takes one
+        // and `select_l1` clears it.)
         let (w0, w1) = area::l1_slots_of(b.rip);
-        if (0..area::L1_TABLES).any(|t| [w0, w1].iter().any(|&i| l1_block(t, i) == b.number + 1)) {
+        if (0..area::L1_TABLES)
+            .filter(|&t| c.l1_contexts[t] != area::NO_CONTEXT)
+            .any(|t| [w0, w1].iter().any(|&i| l1_block(t, i) == b.number + 1))
+        {
             halt(3 << 32 | n as u64, 0)
         }
         let mut at = b.inbound;
