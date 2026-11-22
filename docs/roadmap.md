@@ -161,19 +161,22 @@ weeks for a first demonstration.
   jump to 64-bit. Not general real mode or protected-mode support. **Needed by M3.**
   - An interpreter is enough: boot-time 16-bit and 32-bit code has no performance
     expectation. Correctness only.
-  - Scope to settle first: segment-descriptor loads; control-register and mode-switch
-    writes; memory access with paging off; the handoff to the translator; where the
-    interpreter runs (shim or host). Today the CPU model admits only 64-bit mode.
-  - **INIT and start-up inter-processor interrupts** are not supported today (they stop
-    the VM as "unsupported"; extra CPUs start only through the ACPI wake-up mailbox).
-    Firmware on more than one vCPU and, as I understand it, Windows need them: parked
-    vCPUs that start in real mode at the given vector.
-  - **Not yet estimated.** The earlier cost note's 2–4 weeks covers flat 32-bit
-    kernel-mode code with paging off only; real mode falls under its "no defensible
-    estimate" row, and an interpreter does not share work with the translator. Do a
-    short spike first and replace this line with a number.
+  - **Built** (branch `boot-interp`, November 22, 2026;
+    [the plan](restructure/m2-boot-interpreter-plan.md)): the interpreter runs in the
+    shim, fed by the host's decoder, in real mode, 16- and 32-bit protected mode with
+    paging off and compatibility mode at CPL 0, and hands over to the translator once
+    64-bit code runs. Segment-descriptor loads, control-register and mode-switch writes
+    and memory with paging off are its own. Instructions outside its first list (what
+    real start-up code uses) stop the VM with a report naming them; each one a real boot
+    hits becomes a small addition.
+  - **INIT and start-up inter-processor interrupts** work: parked vCPUs start in real
+    mode at the given vector. Debian's kernel starts its CPUs that way when the ACPI
+    wake-up mailbox is left out (`--no-mailbox`), and kvm-unit-tests' SMP tests pass.
+  - **Estimate:** the plan guessed 72–118 agent hours (low confidence); the earlier cost
+    note's 2–4 weeks covered flat 32-bit kernel-mode code only.
   - **Test in M2:** an exit test that runs a firmware-style reset vector from a mapped
-    image through to 64-bit mode, since the real firmware only arrives in M3.
+    image through to 64-bit mode, since the real firmware only arrives in M3. It passes
+    at 1, 2 and 4 vCPUs, and OVMF's reset vector runs to SEC, its first 64-bit stage.
 - **P3** Other 64-bit distributions (Fedora, Alpine, Ubuntu...), which usually carry
   32-bit code at boot or in their installers, to test the OS-agnostic claim.
 - **P3** Emulated USB controller with keyboard and mouse (HID). Nothing needs it while
