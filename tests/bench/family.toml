@@ -341,10 +341,11 @@ argv = ["python3", "tests/bench/run_paper.py", "run", "--inputs", "{io5_inputs}"
         "--boots", "3", "--speculation-barriers"]
 env = { NATEMU_FEXC_FEATURE_OFF = "afp" }
 
-# A profile, not a timing: guest-paper-noafp with one timed boot and natemu's timing log of each boot (OUT/perf-PHASE.log:
-# host time by part and exit kind, the translation requests and their parts, the fexc server's CPU time).
+# A profile, not a timing: guest-paper-noafp with one timed boot, the resident built with its `perf` feature and natemu's timing
+# log of each boot (OUT/perf-PHASE.log: host time by part and exit kind, the resident's buckets, the translation requests and
+# their parts, the fexc server's CPU time).
 [suite.cases.guest-paper-noafp-profile]
 argv = ["python3", "tests/bench/run_paper.py", "run", "--inputs", "{io5_inputs}", "--paper-inputs", "{paper_inputs}", "--out", "{out}",
-        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}", "--vcpus", "4", "--ram", "2", "--starts", "2",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}", "--vcpus", "4", "--ram", "2", "--starts", "2",
         "--boots", "1", "--speculation-barriers", "--perf-log"]
 env = { NATEMU_FEXC_FEATURE_OFF = "afp" }
