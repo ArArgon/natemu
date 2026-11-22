@@ -14,6 +14,9 @@ Where the numbers come from: each table names its bench case (`tests/bench/famil
 were measured before the bench cases existed (with `tools/bench/run.py` directly) and are to be measured again
 through them; numbers from experiments elsewhere in `docs/` are labelled as such and are not this page's numbers.
 
+32-bit programs against QEMU, and a CPython build by a Debian i386 userland, are in
+[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md) (November 22).
+
 ## Setup
 
 - **Host:** Apple M4, macOS 26. One emulator ran at a time, with no other VM on the machine.
