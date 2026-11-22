@@ -7503,7 +7503,7 @@ mod tests {
                 links0[..code.links.len()].copy_from_slice(&code.links);
                 let word = |at: u64| u32::from_le_bytes(code_bytes[at as usize..at as usize + 4].try_into().unwrap());
                 // The resident's reply checks on the entry as published.
-                if code.links.iter().any(|p| !link_point(word, h.code_size, p))
+                if code.links.iter().any(|p| !link_point(word, h.code_size, p, false))
                     || code.dispatch_exit.is_some_and(|d| word(u64::from(d)) != natemu_abi::execution::DISPATCH_PLACEHOLDER)
                 {
                     reply_bad += 1;

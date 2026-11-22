@@ -637,6 +637,15 @@ mod tests {
         assert_eq!(n, 2);
         let mut l = point(from, &code);
         assert_eq!(relocate_code_mode(&mut code, &[1 << 6 | RELOC_MOVE], &mut l, from, to, 8, true), Err(refusal::MOVE));
+        // The reply check's rule (abi `link_point`) by mode: 32-bit code's link point is the one form, `svc` after its `nop`;
+        // 64-bit code's is the move then `svc` (a w-form move too, for a value below 4 GiB), never with a `nop` between.
+        let lp = |w: &[u8], bits32: bool| {
+            let p = point(from, w)[0];
+            natemu_abi::execution::link_point(|o| u32::from_le_bytes(w[o as usize..o as usize + 4].try_into().unwrap()), w.len() as u32, &p, bits32)
+        };
+        let (padded, unpadded) = (at(from), block(&[0, old[0], old[1], svc]));
+        assert_eq!([lp(&padded, true), lp(&unpadded, true)], [true, false]);
+        assert_eq!([lp(&padded, false), lp(&unpadded, false)], [false, true]);
         // The block's place: both ends below 4 GiB at both RIPs.
         assert!(in_32_bits(0xffff_f000, 0xfff) && !in_32_bits(0xffff_f000, 0x1000) && !in_32_bits(1 << 32, 0));
         let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];

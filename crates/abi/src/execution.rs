@@ -2003,9 +2003,9 @@ pub fn relocate_move_mode(words: &[u32], reg: u32, d: u64, bits32: bool) -> Opti
 }
 /// `p` names an exit of the code whose words `word` reads (`code_size` bytes) as admission returns it: its word is in the
 /// code and is `p.word`, the first of a move (`movz|movn|orr` from the zero register, then `movk`s; at most four words)
-/// building `p.target` in x0, and an `svc #LINK` follows the move (inside the code; after a 32-bit move's `nop`, 32-bit
-/// code's form, [`guest_rip_move32`]).
-pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> bool {
+/// building `p.target` in x0, and an `svc #LINK` follows the move (inside the code). 32-bit code (`bits32`): the move is
+/// its one form ([`move32_value`]: `movz w0; movk w0; nop`), `svc #LINK` after the `nop`.
+pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint, bits32: bool) -> bool {
     let at = u64::from(p.offset);
     let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
     if at % 4 != 0
@@ -2020,9 +2020,10 @@ pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> b
     for (k, w) in words[..n].iter_mut().enumerate() {
         *w = word(at + 4 * k as u64);
     }
-    let svc = |k: usize| words.get(k) == Some(&svc_link)
-        || (words[0] >> 31 == 0 && words.get(k) == Some(&NOP) && words.get(k + 1) == Some(&svc_link));
-    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && svc(k) && value == p.target)
+    if bits32 {
+        return n >= 4 && move32_value(&words[..n], 0) == Some(p.target) && words[3] == svc_link;
+    }
+    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
 }
 
 /// Perf chunk 10, reuse inside the resident: a placed block keeps its admitted object's guest-RIP relocations after its
@@ -2271,7 +2272,7 @@ pub fn relocate_code_mode(
         return if links
             .iter()
             .filter(|p| p.offset != 0)
-            .all(|p| link_point(|at| word(code, at as usize), size, p))
+            .all(|p| link_point(|at| word(code, at as usize), size, p, bits32))
         {
             Ok(())
         } else {
@@ -2326,7 +2327,7 @@ pub fn relocate_code_mode(
     }
     let size = size as u32;
     for (i, p) in links.iter().enumerate().filter(|(_, p)| p.offset != 0) {
-        if !moved[i] || !link_point(|at| word(code, at as usize), size, p) {
+        if !moved[i] || !link_point(|at| word(code, at as usize), size, p, bits32) {
             return Err(refusal::LINK);
         }
     }

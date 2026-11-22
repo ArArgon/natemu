@@ -1448,7 +1448,7 @@ unsafe fn pooled_entry(
     use natemu_abi::execution::cache::pool_recheck as how;
     if e.links
         .iter()
-        .any(|p| p.offset != 0 && !natemu_abi::execution::link_point(word, code.len() as u32, p))
+        .any(|p| p.offset != 0 && !natemu_abi::execution::link_point(word, code.len() as u32, p, cache::bits32(context)))
     {
         return Err(recheck(how::LINK_POINT));
     }
@@ -1662,9 +1662,10 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
 fn staged_word(h: &Header, offset: u64) -> u32 {
     unsafe { ((STAGING_VA + u64::from(h.code_offset) + offset) as *const u32).read_unaligned() }
 }
-/// `p` names an exit of the staged block as admission returns it ([`natemu_abi::execution::link_point`]).
+/// `p` names an exit of the staged block as admission returns it ([`natemu_abi::execution::link_point`]; the code mode
+/// the object says, which admission held to the request's).
 fn link_point(h: &Header, p: &LinkPoint) -> bool {
-    natemu_abi::execution::link_point(|at| staged_word(h, at), cache::placed_size(h), p)
+    natemu_abi::execution::link_point(|at| staged_word(h, at), cache::placed_size(h), p, h.guest_bitness == 32)
 }
 /// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` and its leaf's flags into byte i of
 /// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
