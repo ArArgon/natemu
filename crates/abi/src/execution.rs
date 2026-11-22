@@ -3833,8 +3833,19 @@ pub mod stop {
     /// (M2 task 1.) The code segment is not a 64-bit one ([`super::Cpu::code_mode`] is not `Bits64`: compatibility
     /// mode, or L = D = 1), where only 64-bit code runs yet; paging and CPL are supported ([`UNSUPPORTED_MODE`]
     /// otherwise, which is checked first). The record is as for [`UNSUPPORTED_MODE`]: the CS that caused it, RIP at the
-    /// instruction (M2 Part 2: for compatibility-mode code at CPL 0 reached by a completed transaction, as there).
+    /// instruction (M2 Part 2: for compatibility-mode code at CPL 0 reached by a completed transaction, as there); with
+    /// `State::native[0]` = [`code_mode::PAST_LIMIT`], the state after the far transfer that made it.
     pub const UNSUPPORTED_CODE_MODE: u64 = 18;
+    /// The cases of an [`UNSUPPORTED_CODE_MODE`] stop that `State::native[0]` names (M2 Part 2); a stop with any other
+    /// value there is the plain one.
+    pub mod code_mode {
+        /// A far JMP, CALL or RET of 64-bit kernel code into compatibility-mode code at CPL 0 (the boot-time
+        /// interpreter's) completed with RIP above the new CS limit (4 GiB at most): x86 raises #GP(0) at the instruction,
+        /// natemu stops once the transfer has completed (its recorded deviation; no known code does this). The bank is
+        /// the state after the transfer (CS the new one, RIP the target, not cut to 32 bits); `native[1]` the limit,
+        /// `native[2]` RIP. (No ESR, which `native[0]` holds at a native abort, has bits above 31.)
+        pub const PAST_LIMIT: u64 = 0xc0de_0000_0000_0001;
+    }
     /// (X2, numbered apart from the other chunks' reasons.) The vCPU was halted (HLT) with no event it could take, and the
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
     /// HLT.

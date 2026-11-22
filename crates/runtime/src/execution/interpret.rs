@@ -33,10 +33,23 @@ mod transitions;
 /// [`ends_in_mode`]'s arms where [`controls`] halts with `reason`: a state the interpreter runs is recorded for the next
 /// boundary; any other halts as [`controls`] does (`unsupported_mode` for the paging mode or CPL, `unsupported_code_mode`
 /// for the code segment), at the instruction.
+///
+/// In compatibility mode, RIP above the CS limit halts `unsupported_code_mode` with `native[0]` =
+/// `stop::code_mode::PAST_LIMIT`: only a far JMP, CALL or RET of 64-bit kernel code ([`kernel_compatibility`]'s) gets
+/// here that way, for `far_transfer` and `far_return` check only that the target is canonical (and stay as they are),
+/// where x86 raises #GP(0) at the instruction when it lies outside the new CS limit (a RIP at or above 4 GiB among
+/// them). The transfer has completed (`commit`, before it cuts RIP to 32 bits): the recorded deviation, a loud stop in
+/// place of the code running at the wrong address. Any other transaction ending in compatibility mode is at an
+/// instruction the interpreter fetched, within the limit.
 #[cold]
 #[inline(never)]
 pub(super) fn record(s: &mut State, reason: u64) {
     if s.cpu.interpreted_mode().is_some() {
+        let limit = u64::from(s.cpu.seg[SREG_CS].limit);
+        if s.cpu.efer & EFER_LMA != 0 && s.cpu.rip > limit {
+            s.native = [stop::code_mode::PAST_LIMIT, limit, s.cpu.rip];
+            halt(s, stop::UNSUPPORTED_CODE_MODE)
+        }
         s.debug |= debug::INTERPRET;
     } else {
         halt(s, reason)

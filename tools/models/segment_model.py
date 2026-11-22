@@ -19,7 +19,10 @@ only with flat segments (`refused_shape`): where the state after such an IRET (o
 transfers to compatibility mode at CPL 3 are not built (task 5). M2 Part 2: a far JMP, CALL or RET whose target is
 compatibility-mode code (L = 0) at CPL 0 completes (the boot-time interpreter runs that code); an IRET to it, and any
 transfer to L = D = 1, is `refused`, after the descriptor checks the SDM makes before the mode matters; so is a 64-bit
-call gate (not built). Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
+call gate (not built). With a RIP outside the new CS limit (at or above 4 GiB, or past a smaller limit), where x86
+raises #GP(0) at the instruction (JMP, CALL, RET: "IF ... target mode is compatibility mode and tempEIP outside the
+new code segment limit"), natemu completes the transfer and then stops (`Stopped`, a refusal with the completed state
+and the target as `fault_rip`; `x86` holds the SDM's fault): its recorded deviation, no known code does this. Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
 3, RET far to RPL 3; a call gate at CPL 3) it is instead the deviation #GP(selector) with nothing changed (a `Deviation`
 fault: the result's `deviation` is True). `null_access` and `flat_access` are the two faults of a 32-bit access that
 translated code must still raise (a null FS, GS, DS or ES; the 4 GiB limit). An IRET loading TF is
@@ -125,6 +128,23 @@ class Deviation(Fault):
     def __init__(self, vector, error, rip=None, state=None):
         super().__init__(vector, error)
         self.rip, self.state = rip, state
+
+
+class Stopped(Refused):
+    """natemu's stop after an instruction completed where x86 faults (M2 Part 2): a far JMP, CALL or RET of 64-bit code
+    into CPL-0 compatibility-mode code with RIP outside the new CS limit. `x86`: the SDM's (vector, error, cr2) at the
+    instruction; `rip` and `state`: the target and the completed state natemu stops with."""
+    def __init__(self, reason, x86, rip, state):
+        super().__init__(reason)
+        self.x86, self.rip, self.state = x86, rip, state
+
+
+def _past_limit(s, rip, raw):
+    """The `Stopped` deviation when a 64-bit far transfer to CPL-0 compatibility-mode code (`raw`) completed with `rip`
+    outside its limit."""
+    if rip > limit(raw):
+        raise Stopped('compatibility-mode RIP above the new code segment limit (x86: #GP(0) at the instruction)',
+                      (GP, 0, 0), rip, copy.deepcopy(s))
 
 
 def refused_shape(s):
@@ -256,8 +276,10 @@ def _run(state, body):
                     permitted=frozenset({('fault', fault)}) | getattr(f, 'permitted', frozenset()),
                     deviation=isinstance(f, Deviation), fault_rip=getattr(f, 'rip', None))
     except Refused as r:
-        return dict(outcome='refused', state=copy.deepcopy(state), diff={}, fault=None, reason=str(r),
-                    permitted=frozenset({('refused', None)}))
+        stopped = isinstance(r, Stopped)                           # (after the instruction: its state and writes)
+        return dict(outcome='refused', state=r.state if stopped else copy.deepcopy(state), diff=bus.commit() if stopped else {},
+                    fault=None, reason=str(r), permitted=frozenset({('refused', None)}),
+                    fault_rip=r.rip if stopped else None, x86=r.x86 if stopped else None)
     return dict(outcome='done', state=s, diff=bus.commit(), fault=None, reason=None, permitted=frozenset({('done', None)}))
 
 
@@ -436,6 +458,8 @@ def far(state, kind, addr, width=8, stack=False):
         s['cs'] = sel & ~3 | cpl
         _loaded(s, 'cs', s['cs'], raw)
         s['rip'] = rip
+        if not compat and not l:
+            _past_limit(s, rip, raw)                               # CPL-0 compatibility-mode code (the interpreter's)
     return _run(state, body)
 
 
@@ -465,8 +489,10 @@ def ret(state, width=8, release=0, iret=False):
         if from32 and not iret and fields(raw)[4]:
             raise Deviation(GP, sel & 0xFFFC)                      # RET far from 32- to 64-bit code: task 5
         _refuse_compatibility(raw, sel, rpl, iret or from32)
-        compat = not fields(raw)[4]                                # (to RPL 3 only: every other one was refused)
-        bad_rip = rip >> 32 != 0 if compat else not canonical(rip)  # the flat 32-bit segment's limit, or 64-bit canonical
+        compat = not fields(raw)[4]
+        kernel = compat and rpl == 0                               # RET to CPL-0 compatibility-mode code (the interpreter's)
+        # The flat 32-bit segment's limit at RPL 3; 64-bit canonical, and for the interpreter's code natemu's stop below.
+        bad_rip = rip >> 32 != 0 if compat and not kernel else not canonical(rip)
         if iret and bad_rip:
             raise Fault(GP, 0)                                     # B4: IRETQ checks RIP before SS
         outer = rpl > cpl
@@ -517,6 +543,8 @@ def ret(state, width=8, release=0, iret=False):
                 sel_r, a = s['seg'][r]
                 if not a & 0x80 or ((not a & 8 or not a & 4) and (a >> 5 & 3) < rpl):
                     s['seg'][r] = (0, 0)
+        if kernel:
+            _past_limit(s, rip, raw)
         _refuse_shape(s, rip)
     return _run(state, body)
 

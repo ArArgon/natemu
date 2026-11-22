@@ -138,6 +138,13 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
     if let Some(line) = interpreted(&state) {
         out += &format!("{p}: {line}\n");
     }
+    if state.stop == exec::stop::UNSUPPORTED_CODE_MODE && state.native[0] == exec::stop::code_mode::PAST_LIMIT {
+        let [_, limit, rip] = state.native;
+        out += &format!(
+            "{p}: a 64-bit far JMP, CALL or RET into CPL-0 compatibility-mode code with RIP {rip:#x} above the new CS \
+             limit {limit:#x}: x86 raises #GP(0) at the instruction; natemu stops after the transfer (its deviation)\n"
+        );
+    }
     out
 }
 
