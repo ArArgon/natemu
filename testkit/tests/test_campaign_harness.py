@@ -510,6 +510,11 @@ def test_libm32_failure_must_match_its_recorded_one(tmp_path, monkeypatch):
     assert v.libm32('math/test-x', f('aa'), [], mode=acc)[0] == 'changed'          # libm32-fails-noafp-accurate.txt
     assert v.libm32('math/test-x', {'rc': '1'}, [], mode=afp)[0] == 'changed'        # no fingerprint on the line
     assert campaign.adjust('math/test-x', 'changed', 'm', {'math/test-x': 'why'}).outcome == 'failed'
+    monkeypatch.setenv('TESTKIT_SEED_FAILURES', '1')                         # a second recording that differs: fp=*
+    v.libm32('math/test-x', f('cc'), [], mode=afp)
+    monkeypatch.delenv('TESTKIT_SEED_FAILURES')
+    assert (tmp_path / 'libm32-fails-afp.txt').read_text() == 'math/test-x fp=*\n'
+    assert v.libm32('math/test-x', f('dd'), [], mode=afp)[0] == 'failed'
 
 
 def test_answers_naming_no_test_of_the_image_are_stale(setup, tmp_path):
@@ -534,6 +539,20 @@ def test_engine_fp_variant_boots_with_natemu_fp_and_tells_the_verdict(tmp_path, 
     variant = family.Variant((('engine.fp', 'accurate'), ('machine.vcpus', 4)))
     campaign.HARNESS.run_part(fam, suite, 'part-0', variant, tmp_path / 'run')
     assert fake.calls[0]['env'] == {'NATEMU_FP': 'accurate'} and seen[0] == {'afp': False, 'fp': 'accurate'}
+
+
+def test_expected_without_afp_kept_in_accurate_mode_by_its_deviation(setup, monkeypatch):
+    """In accurate mode with AFP hidden, an expected_without.afp entry applies only when its reason names a deviation
+    accurate mode keeps (x87-band-ue-flag); a band-ue-flag one must pass."""
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')
+    monkeypatch.setenv('NATEMU_FP', 'accurate')
+    extra = '''
+        expected_without.afp = { "default:test_a" = "x87-band-ue-flag: x87 (docs/x.md)", "generic:test_a" = "band-ue-flag: sse (docs/x.md)" }
+        '''
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', 'CT-RESULT openssl default:test_a rc=1 ok=2 notok=1',
+                                                'CT-RESULT openssl generic:test_a rc=1 ok=2 notok=1')}, extra=extra)
+    s = subs(run('part-0'))
+    assert s['default:test_a'] == ('skipped', 'expected-fail') and s['generic:test_a'] == ('failed', None)
 
 
 def test_libm32_accurate_variant_only_without_afp():
@@ -964,6 +983,15 @@ def test_correctness_family_declares_its_campaigns():
     for name in ('ltp32', 'libm32'):
         assert all((fam.dir / a).is_file() for a in fam.suite(name).extra['answers']), name
     assert fam.suite('libm32').matrix == {'machine.vcpus': [4], 'host.afp': [True, False], 'engine.fp': ['fast', 'accurate']}
+    # each AFP-only entry names its deviation (tests/lib/fp_deviations.py), which decides whether accurate mode keeps it
+    paths.use_test_scripts()
+    import fp_deviations
+    names = {*fp_deviations.CLASSES, *fp_deviations.X87_OTHER}
+    for name in ('libm', 'libm32'):
+        for t, why in fam.suite(name).extra['expected_without']['afp'].items():
+            assert why.split(':', 1)[0] in names, (name, t)
+    kept = [t for t, why in fam.suite('libm32').extra['expected_without']['afp'].items() if campaign.kept_in_accurate(why)]
+    assert len(kept) == 15 and all(not t.endswith('fma') or '-float-double-' in t or '-float32-float' in t for t in kept)
     t = fam.suite('torture').extra['expected']
     assert sorted(t) == sorted(f'{n}.{o}' for n in ('ieee_inf-2', 'ieee_inf-3', 'ieee_pr36332', 'pr39228') for o in ('O0', 'O2'))
     assert all('reduced precision' in why and 'docs/restructure/correctness-userspace.md' in why for why in t.values())

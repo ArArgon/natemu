@@ -168,7 +168,9 @@ def libm32(name, f, extra, mode=None):
     noafp-accurate; `NAME fails=N fp=HASH`:
     run-libm.sh's count and hash of the test's `Failure:` and `Maximal error of` lines, or of its whole output where
     it has none), else it is `changed`, a failure whether `expected` lists it or not: an expected whole program cannot
-    hide a new failure inside it. TESTKIT_SEED_FAILURES=1 records natemu's failures instead."""
+    hide a new failure inside it. TESTKIT_SEED_FAILURES=1 records natemu's failures instead (record twice: a program
+    whose failure differs between the two is recorded `fp=*` and judged by failing alone; test-nan-payload is one, its
+    memcmp of two long doubles that natemu leaves equal but for the format's two padding bytes, stack garbage)."""
     import os
     v, msg = _x86_rc(name, f, extra, LIBM32, _glibc)
     if v != 'failed' or f.get('rc') in ('77', 'skip') or os.environ.get('TESTKIT_SEED_ANSWERS'): return v, msg
@@ -177,11 +179,11 @@ def libm32(name, f, extra, mode=None):
     m = ('afp' if mode.get('afp') else 'noafp') + ('-accurate' if mode.get('fp') == 'accurate' else '')
     got, file = f'fails={f.get("fails")} fp={f["fp"]}', LIBM32_FAILS / f'libm32-fails-{m}.txt'
     if os.environ.get('TESTKIT_SEED_FAILURES'):
-        _record(file, name, lambda old: got)
+        _record(file, name, lambda old: got if old in (None, got) else 'fp=*')    # differs between two recordings
         return v, f'{msg} (failure recorded: {got})'
     want = _answers(file).get(name)
     if want is None: return 'changed', f'{msg}; no failure of it recorded in {file.name}'
-    if want != got: return 'changed', f'{msg}; it fails otherwise than recorded for {m} ({want}, now {got})'
+    if want != got and want != 'fp=*': return 'changed', f'{msg}; it fails otherwise than recorded for {m} ({want}, now {got})'
     return v, msg
 
 
