@@ -4,7 +4,8 @@ Status: built, November 22, 2026, on branch `boot-interp` (from `m2-32bit` at 78
 [the M2 design notes](m2-32bit-design.md) and takes the 32-bit survey of [the S3g plan](s3g-plan.md) as input. Two
 independent reviews, three rechecks and an independent replication of the upstream census were folded in before the
 build (section 12); the results of the build are folded into each section ("Built"), and the decisions taken are in
-section 11. B0-B5 are built; B5's full gate and benchmark round on the final tip: see section 12. B6 stays deferred.
+section 11. B0-B5 are built; B5's full gate on the final tip passed but for three failures identical at the parent, its
+AFP cases pending, and its benchmark round: see section 12. B6 stays deferred.
 Results, all framework cases on the M2 Max:
 
 - the interpreter matches QEMU 11.1.2 and KVM on all 1,716 per-instruction cases in R, P16, P32 and C32 (`tests/interp`
@@ -638,11 +639,12 @@ INIT/SIPI and interpreter together (ready; the INIT-before-TF order fixed), and 
 stop; TLB-flush tests added). The test pieces (reference rig, exit-test firmware, real-code suites) and INIT/SIPI were
 also reviewed by reviewers their authors briefed.
 
-**Final checks (B5, on the final tip 9fd9f346, M2 Max, November 22):** the full gate (`tools/natemu-test run --gate`):
-90,971 tests, 3 failures, none of them this branch's and the same as at 78f60965 (B1 (b)'s gate): `static` `fexc-replay`
-(it compares the compiler at the merge base with `main` against the checkout's) and `system` `i5b-images`'
-`fxsave-full-stack` (with its suite). The benchmark round: the system-call bench cases against 78f60965, as in the
-status above ([benchmarks](../benchmarks.md)).
+**Final checks (B5, on the final tip 9fd9f346, M2 Max, November 22):** the full gate (`tools/natemu-test run --gate`,
+30 min 18 s): 87,622 passed, 3 failed, 2,329 not-runnable (they need AFP), 12 expected-fail, 2 known-bug, 3
+known-bug-passed. The three failures are identical at the parent 78f60965: `static` `fexc-replay` (it compares against
+`main`'s compiler) and `system` `i5b-images::fxsave-full-stack` with its case row (an AFP-dependent x87 status byte,
+failing on `m2-32bit` too). The AFP cases, on the M3 at the pushed commit: pending. The benchmark round: the system-call
+bench cases against 78f60965, as in the status above ([benchmarks](../benchmarks.md)).
 
 **Commit ids.** Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
 `boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
