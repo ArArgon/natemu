@@ -26,9 +26,22 @@ use natemu_abi::execution::{
     REQUEST_DEVICE_POLL, REQUEST_PAGE, mmio as status,
 };
 
-/// `gpa` is guest RAM (anything else is a device page).
+/// `gpa` is guest RAM (anything else is a device page, or the firmware image: [`rom`]).
 pub(super) fn ram(gpa: u64) -> bool {
     guest_ram().range(gpa, 1).is_some()
+}
+/// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `gpa`, which is not RAM, is in the firmware image
+/// (`exec::FIRMWARE_END` - `Control::firmware_bytes` .. 4 GiB; none when that is 0). Read and fetched as RAM, a store to it
+/// dropped, as x86 drops a store to ROM. Asked only on the paths that found a page outside RAM, so RAM's paths are as
+/// without a firmware.
+pub(super) fn rom(gpa: u64) -> bool {
+    let bytes = cache::control().firmware_bytes;
+    gpa.wrapping_sub(natemu_abi::execution::FIRMWARE_END - bytes) < bytes
+}
+/// The firmware image through the resident's alias (mapped read-only: a store reaching it would halt the resident).
+pub(super) fn firmware() -> GuestRam {
+    // SAFETY: the host maps the image's blocks of the alias at prepare, for the VM's life.
+    unsafe { natemu_abi::execution::firmware_ram(cache::control().firmware_bytes, GUEST_RAM_VA) }
 }
 fn exchange() -> *mut Mmio {
     MMIO_VA as *mut Mmio
@@ -60,7 +73,8 @@ pub(super) fn system_access(s: &State) -> ! {
 }
 
 /// L3 (amendment): a read at `site` whose non-RAM pages (`device`, of the linear pages `touched`; walked, so every fault
-/// came first) are all unassigned: each is shadowed read-only onto the shared all-ones page and `true` returned (the caller
+/// came first) are all unassigned or in the firmware image: each is shadowed read-only onto the shared all-ones page (the
+/// image's onto the image) and `true` returned (the caller
 /// retries the instruction, which then runs natively, any read form). `false`: a page is a device's (this vCPU's LAPIC page
 /// whatever its mode, or one the host's registry claims): the device path. Under the strict switch the read stops
 /// (`unassigned`). The host counts each page asked about as a read (a fill), also one then found next to a claimed page.
@@ -71,8 +85,23 @@ pub(super) fn ones(
     b: &Block,
     site: &Site,
     touched: [Option<u64>; 2],
-    device: [Option<u64>; 2],
+    mut device: [Option<u64>; 2],
 ) -> bool {
+    // M2 Part 2: a page of the firmware image is shadowed read-only onto the image (no host request; not global, so a CR3
+    // load drops it and the next read shadows it again); the caller retries the read, which then runs natively.
+    if device.iter().flatten().any(|&g| rom(g)) {
+        for (va, gpa) in touched.into_iter().zip(device.iter_mut()) {
+            if let (Some(va), Some(g)) = (va, *gpa)
+                && rom(g)
+            {
+                super::install_rom(s, va, g, false);
+                *gpa = None;
+            }
+        }
+        if device == [None; 2] {
+            return true;
+        }
+    }
     if device.iter().flatten().any(|&g| super::lapic::claims(g)) {
         return false;
     }
@@ -231,7 +260,19 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     // the linear address, never a Site/Block reference into cache metadata across that wait.
     let linear = site_address(site, f);
     bank_at(&mut s, f, b, site);
-    let value = match local(&mut s, gpa, width, data) {
+    // M2 Part 2: a store to the firmware image is dropped here, with no host exit (x86's ROM); a load reads it (none comes
+    // here: [`translate`] shadows its reads).
+    let image = rom(gpa).then(|| match data {
+        Some(_) => 0,
+        None => {
+            let mut v = [0u8; 8];
+            if !firmware().copy_out(gpa, &mut v[..(width as usize).min(8)]) {
+                halt(&s, stop::BAD_REPLY)
+            }
+            u64::from_le_bytes(v)
+        }
+    });
+    let value = match image.or_else(|| local(&mut s, gpa, width, data)) {
         Some(v) => v,
         None => unsafe {
             let done = read_record(exchange()).completed;

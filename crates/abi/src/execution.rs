@@ -203,6 +203,37 @@ pub const unsafe fn guest_ram(bytes: u64, va: u64) -> crate::guest_memory::Guest
         ram
     }
 }
+/// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): a firmware image of `bytes` lies at guest-physical
+/// `[FIRMWARE_END - bytes, FIRMWARE_END)`, inside the PC hole above 3 GiB (so disjoint from RAM) and above the I/O APIC and
+/// the local APIC ([`MAX_FIRMWARE_BYTES`]). It is read and fetched as RAM is, and x86's rule for ROM applies to it: a store
+/// to it is dropped. It is not RAM ([`ram_contains`], [`guest_ram`]): the paths that find a page outside RAM look for it.
+pub const FIRMWARE_END: u64 = 4 << 30;
+/// The largest firmware image: 16 MiB, `[FF000000H, 4 GiB)`.
+pub const MAX_FIRMWARE_BYTES: u64 = 16 << 20;
+/// Whether `bytes` is a firmware image's size: nonzero, whole pages, at most [`MAX_FIRMWARE_BYTES`].
+pub const fn firmware_size(bytes: u64) -> bool {
+    bytes != 0 && bytes % 4096 == 0 && bytes <= MAX_FIRMWARE_BYTES
+}
+/// The firmware image of `bytes` (0: none, an empty region) through the alias of guest-physical 0 at `va`.
+///
+/// # Safety
+/// As `GuestRam::new`: `[va + FIRMWARE_END - bytes, va + FIRMWARE_END)` backs the image while the value is used.
+pub const unsafe fn firmware_ram(bytes: u64, va: u64) -> crate::guest_memory::GuestRam {
+    unsafe { crate::guest_memory::GuestRam::new(FIRMWARE_END - bytes, bytes, va + FIRMWARE_END - bytes) }
+}
+/// Installed RAM ([`guest_ram`]) and, when `firmware` is nonzero, the firmware image as one more region: guest memory
+/// that can be read or fetched. Its users drop stores to the image themselves.
+///
+/// # Safety
+/// As [`guest_ram`] and [`firmware_ram`].
+pub const unsafe fn guest_memory(bytes: u64, firmware: u64, va: u64) -> crate::guest_memory::GuestRam {
+    let ram = unsafe { guest_ram(bytes, va) };
+    if firmware == 0 {
+        ram
+    } else {
+        unsafe { ram.and(FIRMWARE_END - firmware, firmware, va + FIRMWARE_END - firmware) }
+    }
+}
 /// The private window: per-vCPU areas, shared bookkeeping, then the guest-RAM alias.
 pub const PRIVATE_BYTES: u64 = (PRIVATE_GIBS as u64) << 30;
 const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
@@ -952,6 +983,9 @@ pub mod cache {
         /// `stop::UNSUPPORTED_CODE_MODE`, at its entry): for the CPU start-up tests that observe each start state there
         /// until the interpreter runs their AP stub. Appended.
         pub interpreter_off: u64,
+        /// M2 Part 2, the firmware boot mode: the firmware image's size (`super::FIRMWARE_END` - size .. 4 GiB), set by the
+        /// host at prepare; 0, the default, is none. Read only where a page is found outside guest RAM. Appended.
+        pub firmware_bytes: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -4886,6 +4920,33 @@ mod tests {
             assert_eq!(vcpu_mask(v as u64 + 1).count_ones(), v as u32 + 1);
         }
         assert_eq!(vcpu_mask(0), 0);
+    }
+
+    /// The firmware image: its own region below 4 GiB, after RAM's (two, or three above 3 GiB of RAM: four in all at most),
+    /// never RAM, and none without an image.
+    #[test]
+    fn firmware_region() {
+        const VA: u64 = 0x10_0000_0000;
+        let fw = 0x40_0000;
+        for bytes in [2 << 20, 3 << 30, 4 << 30] {
+            let mem = unsafe { guest_memory(bytes, fw, VA) };
+            let ram = unsafe { guest_ram(bytes, VA) };
+            assert_eq!(mem.range(FIRMWARE_END - fw, fw), Some((VA + FIRMWARE_END - fw) as *mut u8));
+            assert_eq!(mem.range(FIRMWARE_END - fw - 1, 1), None);
+            assert_eq!(mem.range(FIRMWARE_END - 1, 2), None);
+            assert_eq!(ram.range(FIRMWARE_END - fw, 1), None);
+            assert!(!ram_contains(bytes, FIRMWARE_END - fw));
+            assert_eq!(mem.range(0x1000, 8), ram.range(0x1000, 8));
+            assert_eq!(unsafe { guest_memory(bytes, 0, VA) }, ram);
+        }
+        let image = unsafe { firmware_ram(fw, VA) };
+        assert_eq!(image.range(FIRMWARE_END - 16, 16), Some((VA + FIRMWARE_END - 16) as *mut u8));
+        assert_eq!(image.range(0x1000, 1), None);
+        assert_eq!(unsafe { firmware_ram(0, VA) }.range(FIRMWARE_END - 1, 1), None);
+        assert!(firmware_size(0x1_0000) && firmware_size(MAX_FIRMWARE_BYTES));
+        assert!(!firmware_size(0) && !firmware_size(0x1_0800) && !firmware_size(MAX_FIRMWARE_BYTES + 4096));
+        // Above the I/O APIC and the local APIC, inside the hole RAM leaves below 4 GiB.
+        assert!(FIRMWARE_END - MAX_FIRMWARE_BYTES > 0xfee0_0fff && FIRMWARE_END - MAX_FIRMWARE_BYTES >= LOW_RAM_END);
     }
 
     #[test]

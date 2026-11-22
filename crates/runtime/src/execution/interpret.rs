@@ -262,7 +262,7 @@ fn walk(
 }
 
 /// The guest-physical page linear `va` is fetched from (paging off: its own, wrapping at 4 GiB; else a fetch walk), when
-/// it is guest RAM (the only fetchable memory yet; the firmware region is M2's B5).
+/// it is guest RAM or the firmware image (docs/restructure/firmware-mode.md: the reset vector's code).
 fn fetch_page(s: &mut State, paging: Option<paging::Control>, va: u64) -> Result<u64, Stop> {
     let gpa = match paging {
         None => paging::unpaged(va, 1).0,
@@ -270,14 +270,15 @@ fn fetch_page(s: &mut State, paging: Option<paging::Control>, va: u64) -> Result
             .map_err(|(error, cr2)| Stop::exception(14, error, cr2))?
             .gpa,
     } & !4095;
-    match guest_ram().range(gpa, 4096) {
+    match ram_and_rom().range(gpa, 4096) {
         Some(_) => Ok(gpa),
         None => Err(Stop::memory(detail::FETCH, va, gpa)),
     }
 }
 
 /// Fetches `out.len()` bytes of the instruction stream from EIP + `from` (plan section 4): each inside the CS limit
-/// (#GP(0) past it; CS's execute right is its load's to check), through the current translation, from guest RAM, one page
+/// (#GP(0) past it; CS's execute right is its load's to check), through the current translation, from guest RAM or the
+/// firmware image, one page
 /// at a time (a page's walk only when a byte of it is wanted). Short: how many bytes came, and the stop the first one not
 /// fetched raises.
 fn fetch(
@@ -299,10 +300,10 @@ fn fetch(
             .min(4096 - (linear & 4095) as usize)
             .min((limit - offset + 1).min(4096) as usize);
         let page = fetch_page(s, paging, u64::from(linear)).map_err(|why| (done, why))?;
-        let Some(p) = guest_ram().range(page | u64::from(linear & 4095), n as u64) else {
+        let Some(p) = ram_and_rom().range(page | u64::from(linear & 4095), n as u64) else {
             halt(s, stop::INTERP_BUG)
         };
-        // SAFETY: `p` is `n` bytes of guest RAM in the resident's alias; `out` holds them.
+        // SAFETY: `p` is `n` bytes of guest RAM or the image in the resident's alias; `out` holds them.
         unsafe { guest_memory::copy_volatile(out[done..].as_mut_ptr(), p, n) };
         done += n;
     }
@@ -556,7 +557,8 @@ fn stopped(s: &mut State, at: &At, why: Stop) -> ! {
 /// The interpreter's memory for one instruction (plan section 4, layers 2-5), at linear addresses the core has checked
 /// against their segments (layer 1). [`Memory::check`] translates every page an access touches (paging off: the identity,
 /// wrapping at 4 GiB; compatibility mode: the 4-level walk at CPL 0, A and D set, #PF with its error code), classifies it
-/// (guest RAM; unassigned, the legacy hole among them: reads all-ones, writes ignored; a device's: a typed stop) and makes
+/// (guest RAM; the firmware image, docs/restructure/firmware-mode.md: read as RAM, its stores dropped as x86 drops a store
+/// to ROM; unassigned, the legacy hole among them: reads all-ones, writes ignored; a device's: a typed stop) and makes
 /// the access wait for a peer's split lock; the core makes every check before it commits anything. RAM of type UC is
 /// accessed in program order as the resident's own accesses are (`segments::pages`). Accesses: one Arm access for 1, 2 or
 /// 4 bytes inside 16 (single-copy atomic, aligned or not: FEAT_LSE2), byte by byte across 16 bytes (the tearing deviation
@@ -565,25 +567,29 @@ fn stopped(s: &mut State, at: &At, why: Stop) -> ! {
 struct Mem<'a> {
     s: &'a mut State,
     paging: Option<paging::Control>,
-    /// The pages the instruction's checks found: [linear page, guest-physical page | 1 for RAM] (at most two checks of two
-    /// pages: far RET's slots).
+    /// The pages the instruction's checks found: [linear page, guest-physical page | its class, [`RAM`], [`ROM`] or 0 for
+    /// unassigned] (at most two checks of two pages: far RET's slots).
     pages: [[u64; 2]; 4],
     count: usize,
     /// A memory stop's linear address and guest-physical page.
     stopped: [u64; 2],
 }
+/// The classes of [`Mem::pages`]' pages: guest RAM, and the firmware image (read as RAM, a store to it dropped); neither is
+/// unassigned.
+const RAM: u64 = 1;
+const ROM: u64 = 2;
 impl Mem<'_> {
-    /// The guest-physical page of `linear`'s page and whether it is RAM, from the checks made.
-    fn page(&self, linear: u32) -> (u64, bool) {
+    /// The guest-physical page of `linear`'s page and its class ([`RAM`], [`ROM`], 0), from the checks made.
+    fn page(&self, linear: u32) -> (u64, u64) {
         let p = u64::from(linear & !4095);
         match self.pages[..self.count].iter().find(|e| e[0] == p) {
-            Some(e) => (e[1] & !1, e[1] & 1 != 0),
+            Some(e) => (e[1] & !3, e[1] & 3),
             None => halt(self.s, stop::INTERP_BUG), // an access no check covered
         }
     }
-    /// The resident's pointer to `n` bytes of guest RAM at `gpa`.
+    /// The resident's pointer to `n` bytes of guest RAM or the firmware image at `gpa`.
     fn pointer(&self, gpa: u64, n: u8) -> *mut u8 {
-        match guest_ram().range(gpa, u64::from(n)) {
+        match ram_and_rom().range(gpa, u64::from(n)) {
             Some(p) => p,
             None => halt(self.s, stop::INTERP_BUG), // a RAM page whose bytes are not: a classification bug
         }
@@ -594,12 +600,12 @@ impl Mem<'_> {
     }
     fn byte(&self, linear: u32) -> u32 {
         match self.page(linear) {
-            (g, true) => {
+            (g, RAM | ROM) => {
                 let p = self.pointer(g | u64::from(linear & 4095), 1);
-                // SAFETY: a guest RAM byte in the alias.
+                // SAFETY: a guest RAM or image byte in the alias.
                 u32::from(unsafe { p.read_volatile() })
             }
-            (_, false) => 0xff,
+            _ => 0xff,
         }
     }
     /// A store to RAM page `page` made by `store`: the code-write protocol around it, as `segments::copy`'s.
@@ -642,6 +648,13 @@ impl Memory for Mem<'_> {
             let (g, pat) = found[k];
             let page = g & !4095;
             let ram = mmio::ram(page);
+            let class = if ram {
+                RAM
+            } else if mmio::rom(page) {
+                ROM
+            } else {
+                0
+            };
             if ram {
                 let kind = match pat {
                     None => cpu::mtrr_type(msrs(), page), // without paging the PAT is not used
@@ -652,7 +665,7 @@ impl Memory for Mem<'_> {
                     (c.uncached_fence, c.uncached_resident) = (1, c.uncached_resident + 1);
                     uncached = true;
                 }
-            } else if let Err(d) = mmio::unassigned(self.s, page) {
+            } else if class == 0 && let Err(d) = mmio::unassigned(self.s, page) {
                 self.stopped = [va, page];
                 return Err(Exit::Stop(d as u32));
             }
@@ -660,7 +673,7 @@ impl Memory for Mem<'_> {
             if self.count == self.pages.len() {
                 halt(self.s, stop::INTERP_BUG)
             }
-            self.pages[self.count] = [va & !4095, page | u64::from(ram)];
+            self.pages[self.count] = [va & !4095, page | class];
             self.count += 1;
         }
         if owed || uncached {
@@ -673,21 +686,22 @@ impl Memory for Mem<'_> {
     fn read(&mut self, linear: u32, size: u8) -> u32 {
         if Self::single(linear, size) {
             return match self.page(linear) {
-                (g, true) => {
+                (g, RAM | ROM) => {
                     let p = self.pointer(g | u64::from(linear & 4095), size);
-                    // SAFETY: `size` bytes of guest RAM in the alias.
+                    // SAFETY: `size` bytes of guest RAM or the image in the alias.
                     unsafe { load_word(p, size) }
                 }
-                (_, false) => exec::mask(size),
+                _ => exec::mask(size),
             };
         }
         (0..u32::from(size))
             .rev()
             .fold(0, |v, k| v << 8 | self.byte(linear.wrapping_add(k)))
     }
+    /// A store to RAM; to the firmware image or an unassigned page, dropped.
     fn write(&mut self, linear: u32, size: u8, value: u32) {
         if Self::single(linear, size) {
-            if let (g, true) = self.page(linear) {
+            if let (g, RAM) = self.page(linear) {
                 let p = self.pointer(g | u64::from(linear & 4095), size);
                 // SAFETY: `size` bytes of guest RAM in the alias.
                 self.stored(g, || unsafe { store_word(p, size, value) });
@@ -696,7 +710,7 @@ impl Memory for Mem<'_> {
         }
         for k in 0..u32::from(size) {
             let at = linear.wrapping_add(k);
-            if let (g, true) = self.page(at) {
+            if let (g, RAM) = self.page(at) {
                 let p = self.pointer(g | u64::from(at & 4095), 1);
                 // SAFETY: a guest RAM byte in the alias.
                 self.stored(g, || unsafe { p.write_volatile((value >> (8 * k)) as u8) });
@@ -705,20 +719,26 @@ impl Memory for Mem<'_> {
     }
     fn compare_exchange(&mut self, linear: u32, size: u8, old: u32, new: u32) -> u32 {
         let m = exec::mask(size);
-        let (g, ram) = self.page(linear);
-        if ram && Self::single(linear, size) {
+        let (g, class) = self.page(linear);
+        if class != 0 && Self::single(linear, size) {
             let p = self.pointer(g | u64::from(linear & 4095), size);
+            if class == ROM {
+                // The firmware image: what it holds; the locked write is dropped.
+                // SAFETY: `size` bytes of the image in the alias.
+                return unsafe { load_word(p, size) };
+            }
             let mut was = 0;
             // SAFETY: `size` bytes of guest RAM in the alias, inside one 16-byte block.
             self.stored(g, || was = unsafe { cas(p, size, old & m, new & m) });
             return was;
         }
-        let (last, last_ram) = self.page(linear.wrapping_add(u32::from(size) - 1));
-        // No byte of it RAM: all-ones read, the write ignored, nothing to lock.
-        if !ram && !last_ram {
+        let (last, last_class) = self.page(linear.wrapping_add(u32::from(size) - 1));
+        // No byte of it RAM or the image: all-ones read, the write ignored, nothing to lock.
+        if class == 0 && last_class == 0 {
             return m;
         }
-        // Crossing 16 bytes, or partly RAM: under the VM's split lock, as translated code's (`split_lock`).
+        // Crossing 16 bytes, or partly RAM: under the VM's split lock, as translated code's (`split_lock`); a byte of the
+        // image is read and its store dropped.
         let s = &mut *self.s;
         s.splits += 1;
         cache::split_begin([g, last], s.vcpus as usize, || {

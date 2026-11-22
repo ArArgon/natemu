@@ -322,9 +322,11 @@ pub(super) fn copy(
         super::watch::access(s, va, n, write);
     }
     let first = (4096 - (va & 4095)).min(n) as usize;
-    // Only guest RAM is accessed, and nothing is written unless every byte is RAM (M3: a device page stops first).
+    // Only guest RAM is accessed, and nothing is written unless every byte is RAM (M3: a device page stops first; M2 Part 2:
+    // the firmware image is read, a store to it dropped, out of line).
     if !super::mmio::ram(gpa[0]) || (first < n as usize && !super::mmio::ram(gpa[1])) {
-        super::mmio::system_access(s)
+        copy_rom(s, gpa[0], gpa[1], buf, write);
+        return Ok(());
     }
     let (low, high) = buf.split_at_mut(first);
     for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
@@ -346,6 +348,39 @@ pub(super) fn copy(
         }
     }
     Ok(())
+}
+/// [`copy`] when a page of the access is not RAM: with every such page in the firmware image (M2 Part 2,
+/// docs/restructure/firmware-mode.md), the access is made, the image read and a store to it dropped (x86's ROM; a descriptor
+/// table, an SGDT, a delivery's frame there); else a device page's stop, nothing written.
+#[cold]
+#[inline(never)]
+fn copy_rom(s: &mut State, low: u64, high: u64, buf: &mut [u8], write: bool) {
+    let (gpa, first) = ([low, high], (4096 - (low & 4095) as usize).min(buf.len()));
+    let pages = 1 + usize::from(first < buf.len());
+    if gpa[..pages].iter().any(|&g| !super::mmio::ram(g) && !super::mmio::rom(g)) {
+        super::mmio::system_access(s)
+    }
+    let (low, high) = buf.split_at_mut(first);
+    for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
+        if chunk.is_empty() || write && super::mmio::rom(gpa) {
+            continue;
+        }
+        let done = if super::mmio::rom(gpa) {
+            super::mmio::firmware().copy_out(gpa, chunk)
+        } else if write {
+            if cache::translated(gpa) {
+                FetchWrites(s).code_write(gpa);
+            }
+            let done = guest_ram().copy_in(gpa, chunk);
+            cache::rechecked(gpa);
+            done
+        } else {
+            guest_ram().copy_out(gpa, chunk)
+        };
+        if !done {
+            halt(s, stop::UNSUPPORTED_SYSTEM)
+        }
+    }
 }
 /// The guest-physical addresses of `[va, va + n)` (its page, and the next one when it crosses), walked for [`linear`]
 /// (which accesses only guest RAM) and for CLFLUSH (M3: a device page is uncached, nothing to flush; the walk's faults
@@ -421,7 +456,7 @@ fn atomic_byte(
 ) -> Result<Result<u8, u8>, Exception> {
     let gpa = pages(s, va, 1, true, true, GP0)?[0];
     let Some(p) = guest_ram().range(gpa, 1) else {
-        super::mmio::system_access(s)
+        return Ok(rom_byte(s, gpa, update));
     };
     if cache::translated(gpa) {
         FetchWrites(s).code_write(gpa);
@@ -436,6 +471,21 @@ fn atomic_byte(
     );
     cache::rechecked(gpa);
     Ok(done)
+}
+
+/// [`atomic_byte`] on a byte outside RAM: in the firmware image (M2 Part 2), `update` meets the byte and nothing is written
+/// (x86 drops the locked write to ROM: an accessed or busy bit there stays clear); else a device page's stop.
+#[cold]
+#[inline(never)]
+fn rom_byte(s: &State, gpa: u64, mut update: impl FnMut(u8) -> Option<u8>) -> Result<u8, u8> {
+    let mut byte = [0u8];
+    if !super::mmio::rom(gpa) || !super::mmio::firmware().copy_out(gpa, &mut byte) {
+        super::mmio::system_access(s)
+    }
+    match update(byte[0]) {
+        Some(_) => Ok(byte[0]),
+        None => Err(byte[0]),
+    }
 }
 
 /// The descriptor `selector` names (8 bytes, or 16 for a `wide` system descriptor) in the GDT, or for TI = 1 the LDT,
