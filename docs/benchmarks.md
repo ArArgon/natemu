@@ -20,6 +20,9 @@ through them; numbers from experiments elsewhere in `docs/` are labelled as such
 223.2) are in [the 32-bit reuse findings](restructure/m2-reuse32-findings.md). Since 32-bit user code is shared between
 addresses (bench case `io5-solo32`, M4, `pic32` at 3fd3b398, November 22: configure 82.5 s, `make -j4` 108.1 s; the
 64-bit steps 58.0 and 89.5 s, unchanged) they are in [the 32-bit sharing findings](restructure/m2-pic32-findings.md).
+Since page faults walk only current blocks (bench case `io5-solo32`, M4, `pfchain` at ccea33c8, November 22, one run:
+configure 59.5 s, `make -j4` 107.0 s; the 64-bit steps 54.5 and 89.0 s, within the spread of single runs) they are in
+[the page-fault chain findings](restructure/m2-pfchain-findings.md).
 
 ## Setup
 
