@@ -28,8 +28,6 @@ MUTATIONS = {
     'dead-source-relinked': ([(CACHE, '        if source.flags & DEAD != 0 || !unlinked(source, point) {', '        if !unlinked(source, point) {')], 'relink-dead-source', False),
     'kill-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if (all || i < control().links_tlb) && i >= control().links_susp {\n            // (A suspended record')],
                              'relink-smc', True),
-    'invlpg-cut-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if all || (i < control().links_tlb && i >= control().links_susp) {\n            // (A suspended record')],
-                                    'relink-invlpg,remap-link,cross-link', True),
     'unlink-all-unlinks-suspended': ([(CACHE, '        if i as u64 >= c.links_susp {\n            unlink(r)?;', '        if true {\n            unlink(r)?;')], 'cr3-relink', False),
     'inbound-unlinks-suspended': ([(CACHE, '            if i >= control().links_susp {\n                unlink(r)?;\n                undone += 1;', '            if true {\n                unlink(r)?;\n                undone += 1;')], 'relink-smc', False),
     # (A suspended record is named by no outbound slot: `suspend` clears the slot, so a reclaim, a relink's drop or a dead source never meets one.)
@@ -69,6 +67,7 @@ BASELINES = {'baseline': False, 'baseline-lc': True}
 # death.)
 # Mutations that cannot be caught by K1, with the argument (reported as `not testable`, never run).
 NOT_TESTABLE = {
+    'invlpg-cut-keeps-suspended': 'an INVLPG or #PF cut reaches current blocks only (linear chains hold only current blocks), and a block becomes current by a placement (no records into it) or a revalidation, whose relink resumes or drops every suspended record into it: no cut meets one (red at 845b7a70, through relink-invlpg, before stale blocks stopped being cut)',
     'suspend-skips-barrier': 'the batch\'s `dsb`/`isb` and the cache maintenance order the new words before the next fetch; on this core (CTR_EL0 IDC and DIC set, or the clean nearly free) a missing barrier shows in no run',
     'prune-tlb-calls-unlink-on-suspended': 'prune_tlb is compiled only for `pic-count` builds, where nothing is suspended; the same mutation on `prune` and `unlink_all` is `outbound-unlinks-suspended` and `unlink-all-unlinks-suspended`',
 }
