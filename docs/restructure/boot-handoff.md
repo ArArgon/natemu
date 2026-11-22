@@ -273,8 +273,8 @@ Built (X1b, X1c); the TSC is CNTVCT scaled to 1 GHz, Built (S1), L5). Aligned 16
 no tearing is declared any more (Built (I5a)). The I/O APIC (R2 review): a fixed, lowest-priority or ExtINT message
 with vector 0-15 is dropped at the chipset without the target LAPIC's receive-illegal-vector ESR bit (SDM Vol.3 11.5.3
 sets it; only the target's resident keeps its ESR); SMI and INIT delivery modes deliver nothing (no SMM in the profile;
-INIT has no model, the AP start is the mailbox), nor do the reserved modes 3 and 6 (as QEMU). Linux programs none of
-these. **Compatibility mode at CPL 3** (owner decision, November 6; compatibility mode is not built, owner decision 3): a
+CPUs start through the mailbox or, since M2 Part 2, the local APIC's INIT and start-up IPIs), nor do the reserved modes
+3 and 6 (as QEMU). Linux programs none of these. **Compatibility mode at CPL 3** (owner decision, November 6; compatibility mode is not built, owner decision 3): a
 transfer that would run CPL-3 code in a 32-bit or 16-bit code segment (CS.L = 0, or L = D = 1) is contained to the program
 instead of stopping the machine. JMP/CALL far at CPL 3 and RET far or IRET/IRETQ whose new CS has RPL 3 (from any CPL, so the
 kernel's IRET of a sigreturn or of Linux's SYSENTER compat path too) raise #GP(that selector) at the instruction before any
@@ -284,19 +284,35 @@ the program's #GP, a SIGSEGV. SYSRET and SYSEXIT with a 32-bit operand size comp
 and the first instruction at the target takes #GP(the new CS selector) at CPL 3 (an OS returns by SYSRET with the user's stack
 and GS base loaded, so a CPL-0 fault there could not be handled; a fault after a completed SYSRET is what AMD processors give
 for a non-canonical RCX); a TF the return loads gives no trap before it. A call gate at CPL 3 is #GP(its selector) too (call
-gates are not built). x86 would run the code: a recorded deviation. CPL-0 code entering compatibility mode keeps the typed
-stop below. Checks: `run_slice3_vm.py system` (`seg-*-compat*`, `seg-cpl3-*`, `sc-sysretl`: segment_model's and
+gates are not built). x86 would run the code: a recorded deviation. CPL-0 code entering compatibility mode runs in the
+boot-time interpreter since M2 Part 2 (below). Checks: `run_slice3_vm.py system` (`seg-*-compat*`, `seg-cpl3-*`, `sc-sysretl`: segment_model's and
 syscall_model's `Deviation`, natemu only), the kernel x86 selftests sigreturn_64, single_step_syscall_64,
 syscall_arg_fault_64 and sysret_ss_attrs_64 ([correctness-nostop.md](correctness-nostop.md)).
 
 **Typed refusals** (a stop naming the reason, never a silent wrong result; `crates/abi/src/execution.rs` stop kinds):
 (`unsupported_atomic`, a LOCKed access or an unlocked CMPXCHG8B crossing 16 bytes, is no longer a stop since November 6: split
 locks run atomically in the resident under a VM-wide split lock, [correctness-nostop.md](correctness-nostop.md) §3);
-`unsupported_mode` for CPL 1/2, compatibility-mode code at CPL 0 (JMP/CALL far at CPL 0 or RET far/IRET to RPL 0 into a
-32- or 16-bit code segment; at CPL 3 it is the deviation above), 32-bit and paging-off modes (owner decision 3), page tables
-outside guest RAM (in the firmware image too); `unsupported_system` for call gates at CPL 0, an ICR INIT/start-up IPI or
-any delivery mode but fixed, lowest priority and NMI (the mailbox is the AP start; `execution/lapic.rs`), a LAPIC base moved onto RAM, DR7 R/W = 10 without
-CR4.DE, more data breakpoints than the host offers; `unsupported_mmio` for RMW, atomic, pair, page-crossing, string and
+`unsupported_mode` for CPL 1/2 and page tables outside guest RAM (in the firmware image too); `unsupported_code_mode` for
+64-bit code's far transfers to code nothing runs: a CPL-0 target with L = D = 1, a far RET to CPL 1 or 2 in a 32- or
+16-bit segment, and an IRET from 64-bit code into CPL-0 compatibility mode (still a halt: such an IRET may load a null SS,
+which x86 refuses and the 64-bit IRET does not check), and, with `native[0]` = `PAST_LIMIT` (M2 Part 2), a far JMP, CALL
+or RET from 64-bit code into CPL-0 compatibility-mode code past the new CS limit: a stop once the transfer has completed,
+where x86 raises #GP(0) at the instruction (a recorded deviation; no known code does this). **Interpreted since M2
+Part 2** (once `unsupported_mode` or `unsupported_code_mode`, owner decision 3; [interp-transitions.md](interp-transitions.md)):
+compatibility-mode code at CPL 0 (a far JMP, CALL or RET of 64-bit kernel code into a 32- or 16-bit code segment; at
+CPL 3 it is the deviation above) and the 32-bit and paging-off modes (real mode, 16- and 32-bit protected mode). What
+the boot-time interpreter does not run is one of its typed stops, each with nothing committed and a record
+([interp-integration.md](interp-integration.md)): `interp_fault` (80: an exception the instruction raises; interpreted
+modes deliver nothing), `interp_unsupported` (81: an instruction outside the first version, a far JMP through a gate or to
+an available TSS, a far RET to an outer level, a descriptor table above 4 GiB in compatibility mode), `interp_memory`
+(82: a device page, an unassigned page under the strict switch, a fetch outside RAM and the firmware image),
+`interp_event` (83: an NMI, an interrupt or an ExtINT it would deliver), `interp_debug` (84: TF, a DR7 breakpoint or a
+pending trap), `interp_mode` (85: protected mode at CPL > 0, legacy or PAE paging, paging controls the walker has none
+for); `interp_bug` (86) halts on a broken interpreter invariant (natemu's bug, no record). Not a refusal: `wait_for_sipi` (33), as `halted`, ends a vCPU
+the host ended while it waited for a start-up IPI. `unsupported_system` for call gates at CPL 0, an ICR delivery mode
+other than fixed, lowest priority, NMI, INIT and start-up (SMI and the reserved modes; INIT and SIPI are built since M2
+Part 2, [initsipi-resident.md](initsipi-resident.md); `execution/lapic.rs`), a LAPIC base moved onto RAM, DR7 R/W = 10
+without CR4.DE, more data breakpoints than the host offers; `unsupported_mmio` for RMW, atomic, pair, page-crossing, string and
 vector forms on a device page, and (M2 Part 2, the firmware boot mode, [firmware-mode.md](firmware-mode.md)) for the
 same forms stored to the firmware image from translated code (a store pair, a push, a store crossing a page, a
 read-modify-write such as `add [rom], eax`, a LOCKed form or XCHG) and for an operand in the image of the resident's own
