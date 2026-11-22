@@ -36,7 +36,8 @@
 //! (base 0, limit 4 GiB, execute/read, 32-bit), DS = ES = FS = GS = SS = 10H (base 0, limit 4 GiB, read/write), GDTR the
 //! loader's GDT, IDTR base 0 limit 3FFH (the real-mode IVT a BIOS leaves; the specification leaves it undefined), CR0 =
 //! PE | ET, CR3 = CR4 = 0, EFER 0, EFLAGS 2 (IF = VM = 0), the other GPRs (ESP among them: the OS sets its own stack) 0,
-//! CPL 0; the floating-point state as after FNINIT and caches on, as firmware leaves them.
+//! CPL 0; the floating-point state as after FNINIT, caches on and the MSRs as firmware leaves them (`execution::set_cpu`:
+//! `reset_msrs`, the MTRRs on).
 use super::{E820, E820_RAM, E820_RESERVED, Layout, LoadError, Loaded, MIB, PAGE, place};
 use natemu_abi::execution::{self as exec, Cpu, SREG_CS, Segment, Table};
 use natemu_abi::guest_memory::GuestRam;
@@ -85,8 +86,9 @@ fn u32_at(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
 }
 
-/// The image's Multiboot header, or `None` (no aligned magic with a valid checksum in its first 8192 bytes). An image
-/// whose header is too short for the address fields its flags announce is refused (`TruncatedHeader`).
+/// The image's Multiboot header, or `None` (no aligned magic with a valid checksum in its first 8192 bytes). A header
+/// whose address fields (flag bit 16) end past those 8192 bytes is refused (`MultibootAddress`: the specification wants
+/// the whole header inside them), and so is one the file ends inside (`TruncatedHeader`).
 pub fn header(image: &[u8]) -> Option<Result<Header, LoadError>> {
     let end = image.len().min(SEARCH);
     let offset = (0..end.saturating_sub(11)).step_by(4).find(|&o| {
@@ -100,6 +102,11 @@ pub fn header(image: &[u8]) -> Option<Result<Header, LoadError>> {
             flags,
             address: None,
         }));
+    }
+    if offset + 32 > SEARCH {
+        return Some(Err(LoadError::MultibootAddress(
+            "the header's address fields end past the image's first 8192 bytes",
+        )));
     }
     if image.len() < offset + 32 {
         return Some(Err(LoadError::TruncatedHeader(image.len())));
@@ -214,8 +221,9 @@ fn by_elf(image: &[u8], h: Header) -> Result<Image, LoadError> {
         if u64::from(paddr) + u64::from(memsz) > 1 << 32 {
             return Err(Bad("a PT_LOAD segment does not fit below 4 GiB"));
         }
+        // The segment's virtual range may wrap at 4 GiB; the physical entry lies in [paddr, paddr + memsz), below 4 GiB.
         if physical_entry.is_none() && entry.wrapping_sub(vaddr) < memsz {
-            physical_entry = Some(entry - vaddr + paddr);
+            physical_entry = Some(entry.wrapping_sub(vaddr).wrapping_add(paddr));
         }
         segments.push(Segment32 {
             gpa: paddr.into(),
@@ -512,7 +520,7 @@ mod tests {
         put16(&mut d, 16, 2);
         put16(&mut d, 18, 3);
         put32(&mut d, 20, 1);
-        put32(&mut d, 24, vaddr + 12); // e_entry: after the header
+        put32(&mut d, 24, vaddr.wrapping_add(12)); // e_entry: after the header
         put32(&mut d, 28, 52); // e_phoff
         put16(&mut d, 40, 52);
         put16(&mut d, 42, 32);
@@ -523,7 +531,7 @@ mod tests {
             [
                 1,
                 0x1100,
-                vaddr + 0x2000,
+                vaddr.wrapping_add(0x2000),
                 paddr + 0x2000,
                 0x80,
                 0x400,
@@ -584,6 +592,15 @@ mod tests {
         assert_eq!(header(&odd), None);
         let far = [vec![0u8; 8192], img.clone()].concat();
         assert_eq!(header(&far), None);
+        // The magic inside the first 8 KiB, its address fields past them: refused.
+        let at0 = flat(0, 0, 0x10_0000, 0x100, 0);
+        let edge = [vec![0u8; 8192 - 20], at0.clone()].concat();
+        assert!(matches!(
+            header(&edge),
+            Some(Err(LoadError::MultibootAddress(_)))
+        ));
+        let inside = [vec![0u8; 8192 - 32], at0].concat();
+        assert_eq!(header(&inside).unwrap().unwrap().offset, 8192 - 32);
         assert!(
             header(&img[..0x40 + 20]).unwrap().is_err(),
             "address fields cut off"
@@ -688,11 +705,15 @@ mod tests {
             ]
         );
         assert_eq!(p.entry, 0x40_000c);
-        // A virtual entry is translated through the segment holding it.
+        // A virtual entry is translated through the segment holding it, also one whose virtual range wraps at 4 GiB.
         assert_eq!(
             parse(&elf(0, 0xc040_0000, 0x40_0000)).unwrap().entry,
             0x40_000c
         );
+        let mut d = elf(0, 0xffff_f000, 0x40_0000);
+        d[52 + 20..52 + 24].copy_from_slice(&0x2000u32.to_le_bytes()); // memsz 2000H: FFFFF000H..1000H
+        d[24..28].copy_from_slice(&0x10u32.to_le_bytes()); // e_entry 10H
+        assert_eq!(parse(&d).unwrap().entry, 0x40_1010);
         let mut d = elf(0, 0x40_0000, 0x40_0000);
         d[18] = 62; // EM_X86_64
         assert!(matches!(parse(&d), Err(LoadError::MultibootElf(_))));

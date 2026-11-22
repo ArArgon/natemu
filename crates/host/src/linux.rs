@@ -290,11 +290,13 @@ fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> 
     layout_of(&place(&Wanted::old(enabled, t))?, ram)
 }
 
-/// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`).
+/// The ACPI tables (with the mailbox) and the lists they are built from, for the tests ([`plan_tables_with`]).
+#[cfg(test)]
 fn plan_tables(vcpus: usize, rsdp: u64, placed: &[Placed], ram: u64) -> Result<LaunchPlan> {
     plan_tables_with(vcpus, rsdp, placed, ram, true)
 }
-/// As [`plan_tables`]; `mailbox` false leaves the multiprocessor wakeup mailbox out ([`Boot::mailbox`]).
+/// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`);
+/// `mailbox` false leaves the multiprocessor wakeup mailbox out ([`Boot::mailbox`]).
 fn plan_tables_with(
     vcpus: usize,
     rsdp: u64,
@@ -395,8 +397,11 @@ pub struct Boot {
     /// X4: the MADT's multiprocessor wakeup mailbox, on which every AP waits (default on). Off (boot-interpreter plan
     /// section 6), the MADT has none and each AP starts in the INIT state ([`natemu_abi::power_on::init`]) waiting for a
     /// start-up IPI, as firmware leaves the processors it did not boot: Linux then starts them with INIT and SIPI. A
-    /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). The resident does not take
-    /// INIT or SIPI yet (the interpreter's integration): until it does, an AP started so halts at its first entry.
+    /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). Nothing marks such an AP as
+    /// waiting for a SIPI yet (no `State` field holds that state: the CPU start-up work adds it), and the resident runs
+    /// no state outside 64-bit mode yet: it stops the AP at its first entry (`unsupported_mode`), and one vCPU's end ends
+    /// the whole run ([`Prepared::run`]). So until then a boot with this off and 2 or more vCPUs, and every Multiboot boot
+    /// (its BSP starts in 32-bit protected mode), ends at once.
     pub mailbox: bool,
     /// Test only (kvm-unit-tests' exit, plan section 7): QEMU's isa-debug-exit device at ports F4H-F7H
     /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
