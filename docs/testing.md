@@ -314,9 +314,9 @@ nothing left reports the verdict.
 `./configure` and `make -j4` by the 64-bit userland and then by a Debian i386 userland that `debootstrap` installs in the
 guest, whose python must give the x86 reference machine's answers (a pinned hash). `io5-solo32-qemu` is the same under
 QEMU, `io5-solo32-profile` writes natemu's timing log (`tests/io/io5_compiles.py DIR` summarizes it), and
-`NATEMU_X86_HOST=user@host tools/natemu-test run --tier bench -k io5-solo32-reference` boots it on the x86 machine under
+`TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host tools/natemu-test run --tier bench -k io5-solo32-reference` boots it on the x86 machine under
 KVM to record that hash and real x86's times. That last case is marked `remote = true`: nothing runs or is timed on this
-Mac, so it takes one core instead of the whole machine.
+Mac, so it takes one core instead of the whole machine, and it is skipped in any run that is not seeding.
 
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not
