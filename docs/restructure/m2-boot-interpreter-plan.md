@@ -638,6 +638,12 @@ INIT/SIPI and interpreter together (ready; the INIT-before-TF order fixed), and 
 stop; TLB-flush tests added). The test pieces (reference rig, exit-test firmware, real-code suites) and INIT/SIPI were
 also reviewed by reviewers their authors briefed.
 
+**Final checks (B5, on the final tip 9fd9f346, M2 Max, November 22):** the full gate (`tools/natemu-test run --gate`):
+90,971 tests, 3 failures, none of them this branch's and the same as at 78f60965 (B1 (b)'s gate): `static` `fexc-replay`
+(it compares the compiler at the merge base with `main` against the checkout's) and `system` `i5b-images`'
+`fxsave-full-stack` (with its suite). The benchmark round: the system-call bench cases against 78f60965, as in the
+status above ([benchmarks](../benchmarks.md)).
+
 **Commit ids.** Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
 `boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
 cb7cd541 → d4bf265d; 8b022e58 → 0624b341; f29042cf → ce8cea18; bdb5dc09 → 40a888db; 315860f3 → d7bc0885;
