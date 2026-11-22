@@ -186,8 +186,9 @@ pub(super) enum Undelivered {
 /// events there (the I/O checkpoint, the invalidations, the LAPIC poll, the debug state).
 ///
 /// Contract: a pending INIT is taken here ([`super::startup::init`]: the INIT state; an AP then waits for its SIPI and
-/// leaves with the SIPI's state, the BSP at the reset vector) and `None` is returned, as when nothing is pending: the
-/// caller goes on with the instruction at the bank's state, which may be a new one, so it reads its mode and CS again.
+/// leaves with the SIPI's state, the BSP at the reset vector), and the boundary of that new state is then looked at as
+/// any other. `None`: nothing to stop for; the caller goes on with the instruction at the bank's state, which may be a
+/// new one, so it reads its mode and CS again.
 /// Nothing else is taken or acknowledged: `Some` names the event that would be delivered at this boundary (an NMI not
 /// blocked; with RFLAGS.IF, the ExtINT at LINT0 or the APIC's highest deliverable vector, Table 7-2's order), left
 /// pending for the caller's typed stop (no event is delivered in interpreted modes). Shadows are not consulted (the MOV
@@ -197,10 +198,12 @@ pub(super) enum Undelivered {
 /// for the typed stop, a SIPI does not (it changes nothing in a vCPU that is neither INIT-pending nor waiting).
 #[expect(dead_code, reason = "M2 Part 2: `interpret::events` (the interpreter loop) calls it when the branches meet")]
 pub(super) fn interpreted(s: &mut State) -> Option<Undelivered> {
-    let p = word(s, core::mem::offset_of!(Events, pending)).load(SeqCst);
+    let mut p = word(s, core::mem::offset_of!(Events, pending)).load(SeqCst);
     if p & pending::INIT != 0 {
+        // The boundary after the INIT state or the SIPI's start (no instruction between) looks again: an NMI held through
+        // the wait, or sent since, is the first event there (initsipi_model A1, J5).
         super::startup::init(s);
-        return None;
+        p = word(s, core::mem::offset_of!(Events, pending)).load(SeqCst);
     }
     if p & pending::NMI != 0 && s.nmi_blocked == 0 {
         return Some(Undelivered::Nmi);

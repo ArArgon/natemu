@@ -1,8 +1,9 @@
-# INIT and SIPI in the resident: design (boot-interpreter plan B2)
+# INIT and SIPI in the resident (boot-interpreter plan B2)
 
-Status: design, November 22, 2026, on `boot-interp` be626aa8 plus the power-on branch (`natemu_abi::power_on`,
-`--no-mailbox`, Multiboot, the program driver's machine sections). Nothing built. The spec is natemu's protocol in
-`tools/models/initsipi_model.py`; plan sections 6 and 9c.
+Status: built, November 22, 2026, on `boot-interp` ac111723 (with `natemu_abi::power_on`, `--no-mailbox`, Multiboot,
+the program driver's machine sections); the interpreter itself is not merged yet, so a SIPI's start reaches today's
+stop at the interpreter's entry. The spec is natemu's protocol in `tools/models/initsipi_model.py`; plan sections 6 and
+9c.
 
 ## The pending word
 
@@ -67,13 +68,14 @@ Where it is taken:
   changes nothing there (S needs I or W), so it neither posts nor wakes.
 - **The mailbox wait:** looks at I after reading `posts`, before publishing `halted`, and again after reading `end`; on
   I it leaves (`start()` then runs `init`).
-- **The interpreter loop:** a hook, `events::interpreted(s) -> Option<Pending>`, for each interpreted boundary: it takes
-  INIT (None: go on from the new state) and returns an NMI, an interrupt with IF = 1 or an ExtINT for the interpreter's
-  typed stop. Interpreted HLT can use `park` (INIT wakes it, an NMI ends it for the typed stop, a SIPI does not). The
-  stub `interpret::run` calls the hook once before its stop, so a held NMI stops as the model says
-  (`stop::INTERPRETED_EVENT`, the vector in `State::fault`); the interpreter keeps the call at the top of its loop.
+- **The interpreter loop:** a hook, `events::interpreted(s) -> Option<Undelivered>` (its contract in its doc), for
+  `interpret::events` to call at each interpreted boundary once the two branches meet: it takes INIT, then looks at the
+  new state's boundary again, and returns an NMI, an interrupt with IF = 1 or an ExtINT, left pending, for the
+  interpreter's typed stop (`None`: go on). Interpreted HLT can use `park` (INIT wakes it, an NMI ends it for the typed
+  stop, a SIPI does not). Until then nothing calls it: a start reaches the stub through `debug::INTERPRET`, and an NMI
+  still pending there is seen in the program driver's report (`startup.pending`).
 
-## The wait for a SIPI (`events::wait_sipi`, a `wfi` loop like `wait_mailbox`)
+## The wait for a SIPI (`startup::wait`, a `wfi` loop like `wait_mailbox`)
 
 Each pass: `doorbells`, `io_checkpoint`, `take_invalidations` (it keeps serving peers' shadow requests); `seen` =
 `posts`; if S: `halted` = 0 first (the host never sees an idle vCPU that is starting), then the start CAS (on failure the
@@ -115,18 +117,21 @@ others run on.
   the interpreter runs (they need interpreted boot programs, or a translated NMI or interrupt delivery, which the
   driver's logging IDT ends): `hlt-init-not-sipi`, `nmi-in-interpreted-hlt`, `init-in-interpreted-code`,
   `nmi-around-init`, `fixed-around-init`.
+  The judge reads each CPU's pending word as its own run ended (the driver's `startup.pending`): an entry stop with an
+  NMI pending is the model's NMI stop there, one with an INIT pending is open (the interpreter's first boundary would
+  take it).
 - `x3-cases`: `ipi-init`, `ipi-startup`, `ipi-init-xapic` (to APIC ID 1 at one vCPU) now reach their end with no effect
-  (they stopped `unsupported_system`).
-- `exit_prog.asm` under natemu with the wait item (tests/boot): at one vCPU the pass now; at 2 and 4 the first AP stops
-  at its entry with CS 0800H, IP 0.
-- Debian with `--no-mailbox` at 2 vCPUs ends at AP 1's entry with Linux's trampoline vector (if the boot is cheap).
+  (they stopped `unsupported_system`); `ipi-startup-self` (discarded), `ipi-init-self` (the BSP's reset state at the
+  interpreter's entry) are new.
+- `exit-ap-natemu` (tests/boot, `exit_prog.asm` with the wait item): at one vCPU the pass; at 2 and 4 up to the SIPI
+  landing (every AP that stopped did so at its entry with CS 0800H, base 8000H, IP 0).
+- Debian with `--no-mailbox`: the next slice, once the interpreter is merged.
 
 ## Files
 
-`crates/abi`: `execution.rs` (`Events::pending`, its bits, the two stops), `lapic.rs` (rules, tests).
+`crates/abi`: `execution.rs` (`Events::pending`, its bits, `stop::WAIT_FOR_SIPI`), `lapic.rs` (rules, tests).
 `crates/runtime`: `execution/lapic.rs` (send, the APIC's INIT reset), `execution/events.rs` (`next`, `take`, the
-waits, the hook), `execution/startup.rs` (new), `execution.rs` (`start`, `trap_due`), `execution/interpret.rs` (the
-stub's hook call). `crates/host`: `execution.rs` (NMI post, `wait_for_sipi`, `waiting`), `linux.rs`. `crates/driver`:
+waits, the hook), `execution/startup.rs` (new), `execution.rs` (`start`, `trap_due`). `crates/host`: `execution.rs` (NMI post, `wait_for_sipi`, `waiting`), `linux.rs`. `crates/driver`:
 `program.rs`, `linux.rs`. `tests/system` (runner, judge, its unit tests, `family.toml`, `run_x3.py`), `tests/boot`,
 `tools/models/initsipi_model.py` (the two scenarios).
 
@@ -139,3 +144,26 @@ stub's hook call). `crates/host`: `execution.rs` (NMI post, `wait_for_sipi`, `wa
   VM). No new test on the hot path; the mailbox wait gains two loads per pass (APs before their wakeup only).
 - `State` and `Events` keep their layout; the end rule is unchanged, and wait-for-SIPI vCPUs exist only on the new
   boot paths and in the new cases.
+
+## The hot path, before and after (resident release build, `llvm-objdump`; ac111723 against this change)
+
+`events::none` is not a function of its own: it is a call of the out-of-line `events::next` and a test of its `None`
+(-1). Its call sites, `miss_fast`'s own test and the two of `sys_commit` (before the commit and after the transaction),
+which is inlined into both `miss_fast` and `sys_fast`, are, like the rest of both functions, the same instructions before
+and after (the diff differs only in the symbols' hash suffixes):
+
+    mov   x0, x19
+    bl    events::next
+    cmn   x0, #0x1            ; None?
+    b.ne  <declined>          ; (b.eq in miss_fast's first site)
+
+`events::held` is the same instructions too. `events::next`'s common path (no event, RFLAGS.IF = 0, NMIs not blocked)
+was, after the frame set-up, `ldr x8, [x0, #0x4f8]` (`nmi_blocked`), `cbz`, the event record's address from
+`State::vcpu` (`ldr`, `lsl`, `sub`, `mov`, two `movk`, `add`, `sub`), `ldar x20` (the NMI word), `ldrb` (IF),
+`tbnz`, `cbnz`, `mov x0, #-1`; it is now the address (`ldr`, `lsl`, `sub`, `mov`, two `movk`, `add`), `ldar x10`
+(the pending word), `cbz x10` (zero: no NMI, no INIT), `mov w20, wzr`, `b`, `ldrb` (IF), `tbnz`, `tbz`, `mov x0,
+#-1`: 22 instructions in both counting the frame, one load fewer. A nonzero word is tested for INIT (`tbnz w10, #1`:
+`Next::Init`) and then NMI (`tbnz w10, #0`, then `nmi_blocked`), so an NMI is recognised exactly when it was before:
+its bit set and NMIs not blocked. The NMI bit is cleared only where an NMI is taken (`take`, only after `next` saw it
+unblocked) and by an INIT (which discards pending events); while NMIs are blocked it stays set and nothing wakes a HLT
+for it, and the boundary after the IRET that unblocks them takes it, as before.
