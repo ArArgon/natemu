@@ -11,7 +11,7 @@ use crate::{Result, execution::Area};
 use iced_x86::{
     Code, Decoder, DecoderError, DecoderOptions, Instruction, Mnemonic, OpKind, Register,
 };
-use natemu_abi::execution::{SREG_DS, STAGING_OFFSET, State};
+use natemu_abi::execution::{SREG_CS, SREG_DS, STAGING_OFFSET, State};
 use natemu_abi::interp::{
     DECODE_OFFSET, DECODED_OFFSET, Decode, Decoded, Insn, MAX_FETCH, MAX_RUN, NO_REG, Operand,
     REPLY_DECODE, ends_run, kind, op,
@@ -294,14 +294,20 @@ fn fields(i: &Instruction, bits: u32, mut r: Insn) -> Option<Insn> {
 }
 
 /// The reply to a decode request: records for the straight run at the start of `bytes`, at most `max`.
+#[cfg(test)]
 pub(crate) fn run(bytes: &[u8], bits: u32, max: usize) -> Decoded {
+    run_to(bytes, bits, max, usize::MAX)
+}
+/// [`run`], ending before an instruction that starts `limit` or more bytes in (the next stop the run's hook answers: no
+/// record is ever made for a stop's address, so the resident never caches one).
+pub(crate) fn run_to(bytes: &[u8], bits: u32, max: usize, limit: usize) -> Decoded {
     let mut out = Decoded {
         count: 0,
         pad: [0; 3],
         records: [Insn::NONE; MAX_RUN],
     };
     let mut at = 0;
-    while (out.count as usize) < max.min(MAX_RUN) {
+    while (out.count as usize) < max.min(MAX_RUN) && (at == 0 || at < limit) {
         let Some(r) = record(&bytes[at..], bits) else {
             break;
         };
@@ -314,15 +320,22 @@ pub(crate) fn run(bytes: &[u8], bits: u32, max: usize) -> Decoded {
     }
     out
 }
-/// Serves [`natemu_abi::interp::REQUEST_DECODE`]: the request from the vCPU's staging area, the reply into it.
-pub(crate) fn serve(area: Area, state: &mut State) -> Result<()> {
-    let reply = answer(&area.read_record(STAGING_OFFSET + DECODE_OFFSET))?;
+/// The linear address of the vCPU's next instruction in an interpreted mode: CS.base + EIP, wrapping at 32 bits (where
+/// the run's hook is asked, `execution::Hook::at`).
+pub(crate) fn linear_ip(state: &State) -> u64 {
+    state.cpu.seg[SREG_CS].base.wrapping_add(state.cpu.rip) & 0xffff_ffff
+}
+/// Serves [`natemu_abi::interp::REQUEST_DECODE`]: the request from the vCPU's staging area, the reply into it; the run
+/// ends before the instruction at `stop` (the next address the run's hook answers, above [`linear_ip`]), if any.
+pub(crate) fn serve(area: Area, state: &mut State, stop: Option<u64>) -> Result<()> {
+    let limit = stop.map_or(usize::MAX, |s| usize::try_from(s - linear_ip(state)).unwrap_or(usize::MAX));
+    let reply = answer(&area.read_record(STAGING_OFFSET + DECODE_OFFSET), limit)?;
     area.write_record(STAGING_OFFSET + DECODED_OFFSET, reply);
     state.reply = REPLY_DECODE;
     Ok(())
 }
-/// The reply to request `q`, or the error that ends the run for a malformed one.
-fn answer(q: &Decode) -> Result<Decoded> {
+/// The reply to request `q` (ending before `limit` bytes in), or the error that ends the run for a malformed one.
+fn answer(q: &Decode, limit: usize) -> Result<Decoded> {
     if !matches!(q.bits, 16 | 32)
         || !(1..=MAX_RUN as u32).contains(&q.max)
         || q.available as usize > MAX_FETCH
@@ -332,10 +345,11 @@ fn answer(q: &Decode) -> Result<Decoded> {
             q.bits, q.max, q.available
         ));
     }
-    Ok(run(
+    Ok(run_to(
         &q.bytes[..q.available as usize],
         q.bits,
         q.max as usize,
+        limit,
     ))
 }
 

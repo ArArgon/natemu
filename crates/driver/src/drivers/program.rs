@@ -2982,6 +2982,7 @@ fn report(
             stop: exec::stop::SHUTDOWN,
             ..
         } => ("shutdown", "triple fault".into(), s.fault),
+        // (M2 Part 2: an interpreter's typed stop holds its exception or address in the record's `fault`.)
         Stop::Resident {
             stop,
             status,
@@ -2992,7 +2993,11 @@ fn report(
                 "{} status={status} detail={detail}",
                 exec::stop::name(*stop)
             ),
-            [0; 4],
+            if (exec::stop::INTERP_FAULT..=exec::stop::INTERP_MODE).contains(stop) {
+                s.fault
+            } else {
+                [0; 4]
+            },
         ),
         Stop::Watchdog { pc, el0, asked } => {
             let place = if *el0 { "guest" } else { "resident" };

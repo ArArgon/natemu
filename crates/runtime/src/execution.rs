@@ -591,7 +591,9 @@ fn debug_exception(s: &mut State, hits: u64, event: Event) {
     let matched = (0..4)
         .filter(|&n| dr7_rw(s.cpu.dr[5], n) == 0 && s.cpu.dr[n] == s.cpu.rip)
         .fold(0, |m, n| m | 1 << n);
-    s.cpu.dr[4] = s.cpu.dr[4] & !0xf | matched | hits;
+    // (M2 Part 2: `debug::INTERPRET` is the resident's, never DR6's; `trap_due` hands it to the interpreter before it gets
+    // here, and this keeps it out of the guest's DR6 whatever a later path does.)
+    s.cpu.dr[4] = s.cpu.dr[4] & !0xf | matched | hits & !debug::INTERPRET;
     deliver(s, event);
 }
 
@@ -2744,7 +2746,10 @@ fn perf_ticks() -> u64 {
     unsafe { asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
     t
 }
-/// [`system`]'s checks and effect: `Err` with the exception due at the instruction.
+/// [`system`]'s checks and effect: `Err` with the exception due at the instruction. Inlined: M2 Part 2's interpreter calls
+/// it too (CPUID, RDMSR, WRMSR, WBINVD), and out of line it would put a call on the fast system-call path
+/// (`sys_commit` → [`system`]).
+#[inline(always)]
 fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     if i.kind == system::SET_CPL {
         // The test hook owns the rest of the transition: the flat CS and SS of the new CPL (RPL = CPL).

@@ -31,6 +31,7 @@ use natemu_abi::execution::{
         SLOT_VA, SLOT_WRITE_VA,
     },
 };
+use natemu_abi::interp::Insn;
 use natemu_abi::pic::{self, count};
 
 /// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
@@ -1822,6 +1823,65 @@ pub fn system_of(b: &Block) -> System {
     unsafe { (b as *const Block).add(1).cast::<System>().read() }
 }
 const _: () = assert!(size_of::<Block>() % align_of::<System>() == 0);
+
+/// M2 Part 2: files the boot-time interpreter's record `i` of the instruction at linear address `linear`, under `key`
+/// ([`area::INTERPRETED`] with [`SYSTEM`]: no code, no source page, never in L1; validated by its bytes, so its currency is
+/// never looked at), or replaces the record filed under that key in place (a stale one: a key has one record). `None` when
+/// the metadata arena or the block index is full.
+pub fn place_interpreted(linear: u64, key: u64, i: &Insn) -> Option<()> {
+    if let Some(b) = interpreted_at(linear, key) {
+        // SAFETY: the record's tail is its `Insn` (filed below); the arena is this vCPU's and writable.
+        unsafe { block_ptr(b.number as usize).add(1).cast::<Insn>().write(*i) };
+        return Some(());
+    }
+    let record = Block {
+        rip: linear,
+        context: key,
+        checked: control().epoch,
+        source_gpa: [u64::MAX; 2],
+        next: [0; 2],
+        lnext: [0; 2],
+        code: control().code_used as u32,
+        code_size: 0,
+        sites_count: 0,
+        guest_bytes: u32::from(i.length),
+        number: 0,
+        flags: SYSTEM | area::INTERPRETED,
+        dispatch_exit: 0,
+        rep_exits: 0,
+        links: [LinkPoint::NONE; MAX_LINK_POINTS],
+        shared: 0,
+        inbound: 0,
+        out: [0; MAX_LINK_POINTS],
+        hot: 0,
+        hot_size: 0,
+        hot_body: 0,
+        patch: [0; MAX_LINK_POINTS],
+    };
+    unsafe { file(record, (i as *const Insn).cast(), size_of::<Insn>(), 0) }.map(|_| ())
+}
+/// M2 Part 2: the interpreter's live record for (`linear`, `key`), current or not (its bytes decide). Its own probe of L2,
+/// so the translated blocks' lookups stay as they were; no code context equals an interpreted key, so it finds only
+/// interpreter records.
+pub fn interpreted_at(linear: u64, key: u64) -> Option<&'static Block> {
+    let mut i = hash(linear, key);
+    loop {
+        let [k, number] = unsafe { l2(i).read() };
+        if number == 0 {
+            return None;
+        }
+        let b = block(number as usize - 1);
+        if k == linear && b.rip == linear && b.context == key && b.flags & (DEAD | area::INTERPRETED) == area::INTERPRETED {
+            return Some(b);
+        }
+        i = (i + 1) & (area::L2_ENTRIES - 1);
+    }
+}
+/// The record an interpreter record holds ([`place_interpreted`]).
+pub fn interpreted_of(b: &Block) -> Insn {
+    unsafe { (b as *const Block).add(1).cast::<Insn>().read() }
+}
+const _: () = assert!(size_of::<Block>() % align_of::<Insn>() == 0);
 /// Files `record` (its number assigned here) with `tail_bytes` from `tail` after it (sites, or a decode) and `extra` bytes
 /// the caller writes after them (a template's relocations) in the metadata arena, the block index and L2 (and, when
 /// [`RELOCATABLE`], the hint table); `None` when either is full.

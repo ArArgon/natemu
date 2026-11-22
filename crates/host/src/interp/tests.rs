@@ -570,6 +570,14 @@ fn runs() {
     assert_eq!(ops(&run(&[0x0f, 0xff, 0x00, 0x90], 32, MAX_RUN)), [op::UD]);
     // At most MAX_RUN records, from as many bytes as a request carries.
     assert_eq!(run(&[0x90; MAX_FETCH], 32, MAX_RUN).count as usize, MAX_RUN);
+    // A stop ends the run before the instruction at it (none is made for its address), not before one it falls inside;
+    // the first is always made (the hook answered a stop there before the decode).
+    let code = [0x90, 0xb8, 1, 0, 0, 0, 0x90, 0x90]; // nop; mov eax, 1; nop; nop
+    assert_eq!(ops(&run_to(&code, 32, MAX_RUN, 6)), [op::NOP, op::MOV]);
+    assert_eq!(ops(&run_to(&code, 32, MAX_RUN, 3)), [op::NOP, op::MOV]);
+    assert_eq!(ops(&run_to(&code, 32, MAX_RUN, 1)), [op::NOP]);
+    assert_eq!(ops(&run_to(&code, 32, MAX_RUN, 0)), [op::NOP]);
+    assert_eq!(run_to(&code, 32, MAX_RUN, usize::MAX).count, 4);
     // The request's checks.
     let q = |bits, max, available| {
         let mut d = Decode {
@@ -580,7 +588,7 @@ fn runs() {
             bytes: [0x90; MAX_FETCH],
         };
         d.bytes[1] = 0xc3;
-        answer(&d).map(|d| d.count)
+        answer(&d, usize::MAX).map(|d| d.count)
     };
     assert_eq!(q(16, 4, 15), Ok(2));
     assert_eq!(q(32, 1, 0), Ok(0));

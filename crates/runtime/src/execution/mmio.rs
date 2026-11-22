@@ -111,6 +111,26 @@ pub(super) fn ones(
     }
     true
 }
+/// M2 Part 2, the boot-time interpreter's access to non-RAM page `gpa` (layer 3 of its memory model): `Ok` for an
+/// unassigned page (reads all-ones, writes ignored), else the typed stop's detail: a device's page
+/// (`stop::interp::DEVICE`: this vCPU's LAPIC page whatever its mode, a claim remembered, or the host's registry), or an
+/// unassigned page under the strict switch (`stop::interp::UNASSIGNED`). The host counts the page asked about as a fill, as
+/// for [`ones`]'s.
+pub(super) fn unassigned(s: &mut State, gpa: u64) -> Result<(), u64> {
+    let gpa = gpa & !4095;
+    if super::lapic::claims(gpa) || cache::control().claimed(gpa) {
+        return Err(stop::interp::DEVICE);
+    }
+    match unsafe { page(s, gpa) } {
+        status::DONE => Ok(()),
+        status::CLAIMED => {
+            cache::control().remember_claim(gpa);
+            Err(stop::interp::DEVICE)
+        }
+        status::UNASSIGNED => Err(stop::interp::UNASSIGNED),
+        _ => halt(s, stop::BAD_REPLY),
+    }
+}
 /// Asks the host about non-RAM page `gpa` ([`REQUEST_PAGE`]): its status.
 unsafe fn page(s: &mut State, gpa: u64) -> u64 {
     unsafe {

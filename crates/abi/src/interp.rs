@@ -14,18 +14,24 @@
 //!    fetch: each byte inside the CS limit (#GP(0) past it; CS's execute right is the segment load's to check, not
 //!    the fetch's: the reset and INIT CS is a data type, 93h, and the stale CS after MOV CR0 must still fetch), through
 //!    the current translation (the identity with paging off, the 4-level walk in compatibility mode) and from
-//!    fetchable memory only (guest RAM, the firmware region). It stops at the first byte it cannot fetch and remembers why (the #GP(0), the next page's #PF,
-//!    or a typed stop). It writes a [`Decode`] at `STAGING_VA + DECODE_OFFSET`: `bits` (16 or 32: CS.D, the only mode
-//!    fact decoding needs), `max` (1 ..= [`MAX_RUN`] records wanted) and `available` bytes. Fifteen bytes are always
-//!    enough for one record.
-//! 2. **The host replies** [`REPLY_DECODE`] with a [`Decoded`] at `STAGING_VA + DECODED_OFFSET`: `count` records for
+//!    fetchable memory only (guest RAM, the firmware region), to the end of RIP's page. It stops at the first byte it
+//!    cannot fetch and remembers why (the #GP(0), or a typed stop). It writes a [`Decode`] at
+//!    `STAGING_VA + DECODE_OFFSET`: `bits` (16 or 32: CS.D, the only mode fact decoding needs), `max` (1 ..= [`MAX_RUN`]
+//!    records wanted) and `available` bytes (0 too: the host answers a stop at CS.base + EIP before anything, step 2).
+//!    Only when the first instruction needs more (a truncated decode, step 3) does it fetch the next page, up to 15
+//!    bytes in all, and ask again: a fault there is raised only for an instruction that reaches it. Fifteen bytes are
+//!    always enough for one record.
+//! 2. **The host replies** (after the run's stops: a stop at CS.base + EIP, the caller's or its hook's, parks the vCPU,
+//!    `REPLY_PARK`, and the run ends before the next such address, so no record is ever made for one)
+//!    [`REPLY_DECODE`] with a [`Decoded`] at `STAGING_VA + DECODED_OFFSET`: `count` records for
 //!    consecutive instructions from `bytes[0]`, each carrying its own bytes as the host decoded them (copied from the
 //!    request, so the snapshot and the record agree; the resident never re-reads memory to fill a record). A straight
 //!    run ends after a control transfer, a resident operation or a stop record ([`ends_run`]), at `max` records, or before
 //!    an instruction not all of whose bytes lie within `available` (that one is not reported).
 //! 3. **Truncated decode:** `count` 0 means the first instruction needs bytes past `available` (never with 15 or more).
-//!    The resident then raises what stopped its fetch; nothing is cached. A fetch fault is never cached: a record is
-//!    complete in its bytes, and a fault past them belongs to the instruction after it.
+//!    The resident then raises what stopped its fetch, or, when the fetch only reached the page's end, fetches the next
+//!    page's bytes and asks again; nothing is cached. A fetch fault is never cached: a record is complete in its bytes,
+//!    and a fault past them belongs to the instruction after it.
 //! 4. **The resident checks every record** before it uses or caches one: [`Insn::well_formed`], its bytes equal to what
 //!    it sent at that position and the lengths adding up within `available`; anything else is a bad reply (a halt).
 //!    A cached record is keyed by the linear address of its first byte and the context it was decoded in; before each
