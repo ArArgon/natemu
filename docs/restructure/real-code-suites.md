@@ -104,8 +104,8 @@ version's list):
   GS_BASE, `call prepare_64`, then `push 08H; push edx; retf` (a 32-bit far RET from compatibility mode to 64-bit code).
 - 64-bit code from then on (translated): IDT, `ltr`, xAPIC reset and enable, PIC masking, serial, and the start-up.
 
-**What natemu must provide** (branch `worktree-agent-ac0a1ff6b23c084f1`, `crates/host` `boot::multiboot` and
-`--debug-exit`, plus B2):
+**What natemu must provide** (built on `boot-interp`: `crates/host` `boot::multiboot` and `--debug-exit`, cf40d9ee and
+ac111723; CPU start-up, B2, ce8cea18):
 
 - The Multiboot v1 loader: the ELF32 image at its physical addresses, the information structure with `mem_upper`, the
   memory map, the command line (the image's path first) and exactly one module, the environment text; EAX 2BADB002H,
