@@ -1615,8 +1615,10 @@ def program(name, n, k):
         if name in ('straddle', 'pf-relist-straddle'):
             extra += [{'addr': f'0x{P.sys_leaf(i, 0, 0x1ff000):x}', 'data': (0x1ff000 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
             extra += [{'addr': '0x1ffffe', 'data': 'b800', 'capture': False}] if i == 0 else []   # shared by every CPU
-        if name == 'pf-remap' or name in RELIST and name != 'pf-relist-large':
+        if name == 'pf-remap':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False)]
+        if name in RELIST and name != 'pf-relist-large':   # (not over `cross`'s first instruction bytes at d + 0x3ffe)
+            extra += [dict(P.zero(d + IDT, 0xffe), capture=False)]
         if name == 'contexts':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + CX:x}', 'data': P.asm('addss xmm0, xmm1\nmov eax, 1\njmp r13').hex()},
                       {'addr': f'0x{d + CD:x}', 'data': b''.join(m.to_bytes(4, 'little') for m in CTX_MXCSR).hex(), 'capture': False},

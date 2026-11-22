@@ -54,6 +54,8 @@ MUTATIONS = {
     # ---- linear chains hold only current blocks (a walk drops the rest, a revalidation relists): run on a `link-check` resident,
     # whose `check_chains` halts on a chain that lost a current block or holds a cycle, and whose walks halt rather than loop
     'pfchain-no-relist': ([(CACHE, '                relist(n);\n', '')], PFCHAIN, True),
+    # (The same on a plain resident: the programs' values alone show the stale code run.)
+    'pfchain-no-relist-plain': ([(CACHE, '                relist(n);\n', '')], PFCHAIN, False),
     'pfchain-no-off-guard': ([(CACHE, '        if b.flags & off != 0 {', '        if true {')], PFCHAIN, True),
     # (A global block stays current across a CR3 load with `checked` behind the epoch: the walk must cut it by `current`.)
     'pfchain-cut-by-epoch': ([(CACHE, '        if b.flags & DEAD == 0 && current(&b) && pages.contains(&page) {',
