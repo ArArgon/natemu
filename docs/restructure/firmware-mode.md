@@ -109,8 +109,9 @@ The image is read as memory everywhere it can be reached, and a store to it is d
   800000H, CR4 20H, EFER 500H; no port or unassigned-page access before it). `reset` passes too: at FFFFFE94H, in
   32-bit protected mode with paging off at CPL 0, its `mov cr4, eax` with EAX 640H (MCE, OSFXSR, OSXMMEXCPT) raised
   #GP(0) while CR4.MCE was outside `cpu_profile::CR4_VALID` (natemu's CPU presents no MCE: CPUID.1:EDX.MCE = 0), the
-  known bug `ovmf-reset-cr4-mce`. Decided (coordinator, November 22) and built: natemu accepts CR4.MCE writes without
-  presenting MCE in CPUID, a recorded deviation (`tools/models/cpu_profile.json` `control.cr4.bits.MCE`, so
+  known bug `ovmf-reset-cr4-mce`. Decided by the session, under the owner's delegation (November 22; the owner later
+  confirmed minor deviations are fine as long as OS boots are unaffected), and built: natemu accepts CR4.MCE writes
+  without presenting MCE in CPUID, a recorded deviation (`tools/models/cpu_profile.json` `control.cr4.bits.MCE`, so
   `CR4_VALID` holds it: the interpreter's CR4 rule and the 64-bit MOV CR4 transaction share the mask); the known bug is
   gone.
 - **Default boots:** the families `boot`, `programs`, `system`, `smp`, `interp`, `static` and `unit` (the final report

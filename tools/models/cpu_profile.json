@@ -2389,7 +2389,7 @@
      "bit": 6,
      "gate": "arch",
      "valid": true,
-     "note": "A recorded deviation (M2 Part 2, orchestrator decision of November 22): MOV CR4 accepts MCE although CPUID.1:EDX.MCE is clear, where SDM Vol.3 2.5 makes the bit reserved (#GP(0)). Every x86-64 CPU has MCE, natemu never raises a machine check (the bit enables nothing), and firmware sets it unconditionally: OVMF's reset vector loads CR4 = 640H. QEMU's TCG accepts it the same way."
+     "note": "A recorded deviation (M2 Part 2, November 22: decided by the session, under the owner's delegation; the owner later confirmed minor deviations are fine as long as OS boots are unaffected): MOV CR4 accepts MCE although CPUID.1:EDX.MCE is clear, where SDM Vol.3 2.5 makes the bit reserved (#GP(0)). Every x86-64 CPU has MCE, natemu never raises a machine check (the bit enables nothing), and firmware sets it unconditionally: OVMF's reset vector loads CR4 = 640H. QEMU's TCG accepts it the same way."
     },
     "PGE": {
      "bit": 7,
