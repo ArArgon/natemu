@@ -52,18 +52,32 @@ into queue, start-up and test time, and the slowest requirements to prepare.
 
 ## When the gate is needed
 
-The full gate (`--gate`, passing at that exact commit) is for changes that can alter what natemu or the tests do,
-before they merge into `main` or an integration branch:
+The full gate (`--gate`, passing at that exact commit) is for changes that can alter what natemu does, before they
+merge into `main` or an integration branch:
 
 - code on a shared path: code identity, dispatcher and lookup tables, resident entry and exit, register save,
   admission, the FEX fork or fexc's output;
 - the build: toolchain or dependency pins, build flags, the FEX submodule;
-- the test framework itself: `testkit/`, harnesses, locks, generators;
 - a change set that closes a plan's task or checkpoint.
 
-Everything else gets `tools/natemu-test run` (the affected families plus every family's smoke cases): a change confined
-to one area the framework attributes to its families, and new or changed test cases. If `run` lists files no family
-claims, attribute them or run the gate.
+A change confined to one area the framework attributes to its families gets `tools/natemu-test run` (the affected
+families plus every family's smoke cases). If `run` lists files no family claims, attribute them or run the gate.
+
+**Test-only changes.** A change only to tests and the test framework (nothing under `crates/`, `tools/fexc/` or
+`third_party/FEX`, and nothing natemu or fexc is built from) needs no gate. It re-runs instead:
+
+- every test it adds or changes, and each new check shown to fail when it should (run it once against a deliberately
+  wrong input or a reverted fix), so a check that cannot fail does not pass for one that works;
+- every test that uses changed framework code, a changed recipe, script or image, or a changed expectation. An
+  expectation is anything that decides a verdict without being the test itself: expected-failure and flaky lists,
+  recorded answers, fingerprints and locks, timeouts, verdict rules. Changing one counts as changing every test it
+  applies to, because it can make a failing test pass.
+
+`tools/natemu-test run` selects the first and most of the second, but not the campaign suites: for a campaign suite
+whose recipe, runner or expectations changed, add `--tier campaign -k SUITE`. A shared script counts for every suite
+that uses it: `tools/correctness/run-libm.sh` is in both the `libm` and `libm32` recipes, so a change to it re-runs
+both. Where a change reaches testkit's core (the scheduler, the run loop, collection, the lock format), every test uses
+it: that is the gate.
 
 No gate at all for docs, comments, plans and READMEs, or for pushing a work branch; its gate comes when it merges.
 

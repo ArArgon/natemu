@@ -21,8 +21,9 @@ names it. Before creating or revising error or learning records, read
 
 Run tests only through `tools/natemu-test`; read [the testing page](docs/testing.md) first. `tools/natemu-test run`
 runs what your change concerns, `--tier smoke` one small case of everything, `--gate` everything. The gate is needed
-before a change that can alter what natemu or the tests do merges into `main` or an integration branch; docs-only
-changes and pushes of work branches need none, and the user may explicitly bypass it.
+before a change that can alter what natemu does merges into `main` or an integration branch. A change only to tests
+and the test framework instead re-runs every test it adds, changes or can weaken, each new check shown to fail when it
+should; docs-only changes and pushes of work branches need none, and the user may explicitly bypass either.
 [When the gate is needed](docs/testing.md#when-the-gate-is-needed) and [how much to run](docs/testing.md#how-much-to-run)
 give the details: iterate on narrow runs and keep heavy runs (gate, stress, benchmarks) to once per change set. A new
 test is a case in a family under `tests/`, not a new script; the scripts a family runs live in its folder or
