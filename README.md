@@ -41,7 +41,8 @@ natemu boots the unmodified Debian 13 cloud image with networking and a disk. It
 
 On M1 and M2, a few rare floating-point edge cases come out slightly differently from real x86 by default. Ordinary
 programs do not notice. If you need results that match x86 bit for bit, use `--fp accurate`; it can make math-heavy
-programs several times slower. On M4 results are always exact, at no cost. Details:
+programs several times slower, and 32-bit programs that do their arithmetic in the old x87 unit more than a hundred times
+slower. On M4 these cases are exact at no cost. Details:
 [docs/floating-point.md](docs/floating-point.md).
 
 ## Setup
