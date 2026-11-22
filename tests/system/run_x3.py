@@ -435,12 +435,12 @@ def cases():
     # INIT and start-up (M2 Part 2) to APIC ID 1, absent at one vCPU: no CPU is selected, so nothing happens and the next
     # instruction runs (they stopped `unsupported_system` before INIT and SIPI were built); a SIPI to self finds the
     # sender neither INIT-pending nor waiting (discarded); INIT to self restarts the BSP at the reset vector, where the
-    # boot-time interpreter would run (its entry: `unsupported_mode` with the reset state, RIP FFF0H). SMI: a typed stop
-    # before any effect; INIT level de-assert: no effect.
+    # boot-time interpreter runs: its fetch at FFFF_FFF0H finds no firmware there (not guest RAM: the typed stop
+    # `interp_memory`, the reset state, RIP FFF0H). SMI: a typed stop before any effect; INIT level de-assert: no effect.
     for name, low in (('init', 0x4500), ('startup', 0x4608), ('startup-self', 0x44608)):
         case(f'ipi-{name}', X2_ON + SVR_ON + f'mov ecx, 0x830\nmov eax, {low:#x}\nmov edx, 1\nwrmsr\nmov ebx, 1\n', reached(rbx=1))
     case('ipi-init-self', X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0x44500\nxor edx, edx\nwrmsr\nmov ebx, 1\n',
-         stopped('unsupported_mode', 0xfff0))
+         stopped('interp_memory', 0xfff0))
     pre = X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0x4200\nmov edx, 1\n'
     case('ipi-smi', pre + 'wrmsr\n', stopped('unsupported_system', at(pre)))
     case('ipi-init-deassert', X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0xc8500\nxor edx, edx\nwrmsr\nmov ebx, 1\n', reached(rbx=1))
