@@ -20,12 +20,13 @@ CATEGORIES = {
     'missing': ('m', 'MISSING'),                        # in the image's list, not in the output (crash, hang): fails
     'unexpected-pass': ('X', 'UNEXPECTED PASS'),        # listed in `expected` but passed: fails until the entry goes
     'stale-entry': ('!', 'STALE ENTRY'),                # an `expected`/`flaky` entry naming no test of the image: fails
+    'changed': ('c', 'CHANGED'),                        # failed otherwise than its recorded failure (libm32): fails
 }
 # Fail every run, gate or not: something the selection asked for could not run here, and no other run is to blame
 # (not-runnable, the machine being too small or lacking a feature, is not a failure: a gate then passes only when another machine's run covers it or a person accepts it, plugin.accepted_without).
 RUN_FAILS = ('stale-lock', 'build-failure', 'unpreparable', 'exclusion-changed')
 GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'exclusion-changed',
-              'missing', 'unexpected-pass', 'stale-entry')
+              'missing', 'unexpected-pass', 'stale-entry', 'changed')
 
 
 def category(report) -> str | None:
