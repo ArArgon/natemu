@@ -94,6 +94,8 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `speculation_barriers` | `false` | Page-walk barriers (needs FEAT_SB) |
 | `[boot.kernel]` | `image` | none (required) | The Linux bzImage |
 | | `initrd`, `cmdline` | none, empty | Initramfs and kernel command line |
+| `[boot.firmware]` | `image` | none (required) | A firmware image to boot instead of a kernel (`--firmware FILE`; see below) |
+| | `start` | `"reset"` | `"reset"` or `"flat32"`: where the first processor starts (see below) |
 | `[[disk]]` | `id`, `path` | required | A disk image |
 | | `readonly` | `false` | The guest cannot write it |
 | | `backing` | none | The base image of a qcow2 overlay at `path` (see below) |
@@ -112,8 +114,22 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
 
-`[boot]` must name exactly one boot method. Only `[boot.kernel]` exists; `[boot.uefi]` is refused
+`[boot]` must name exactly one boot method: `[boot.kernel]` or `[boot.firmware]`; `[boot.uefi]` is refused
 for now.
+
+### Booting a firmware image
+
+`[boot.firmware]` (or `--firmware FILE`) boots a firmware image instead of a Linux kernel, the way a PC
+starts: the image sits at the top of the first 4 GiB of the guest's address space (a 4 MiB image at
+FFC00000H to FFFFFFFFH), read-only as a PC's flash ROM is (the guest's writes to it are ignored), and the
+first processor starts at its reset vector, the last 16 bytes, in the state a processor has right after
+power-on: 16-bit real mode. `start = "flat32"` starts it at the same address in 32-bit protected mode with
+flat segments, the start some firmware (OVMF's `Main32`) also takes. The other processors wait until the
+firmware starts them. The image must be whole 4 KiB pages, at most 16 MiB. natemu loads nothing else: no
+initrd, no command line, no ACPI tables, and no virtio devices (a launch with any of them is refused).
+This is a development feature: natemu runs a firmware's 16- and 32-bit start-up code with its boot-time
+interpreter, which does not yet run every instruction such code uses
+([docs/restructure/firmware-mode.md](restructure/firmware-mode.md)).
 
 ### Transport default
 
@@ -165,10 +181,13 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: string values must be quoted, expected literal string` | TOML syntax error (the text is the TOML parser's) |
 | `c.toml: machine.ram: bad size 4X: bytes, 0x hex, or a K/M/G suffix` | `ram` is not a size |
 | `c.toml: machine.transport.disk: bad transport "usb": mmio or pci` | Transport is not `mmio` or `pci` |
-| `c.toml: [boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found none` | `[boot]` without a method (also `found both`) |
+| `c.toml: [boot] needs exactly one boot method, [boot.kernel], [boot.firmware] or [boot.uefi]; found none` | `[boot]` without a method (also `found more`) |
 | `c.toml: [boot.uefi]: UEFI boot is planned (M3) and not built yet` | No UEFI boot yet |
 | `c.toml: [boot.kernel] needs image (or pass --kernel FILE)` | The table has no kernel |
-| `c.toml: no boot method: --kernel FILE, or [boot.kernel] in a --config file` | No kernel anywhere |
+| `c.toml: no boot method: --kernel FILE, or [boot.kernel] in a --config file (or a firmware image: --firmware FILE)` | No kernel or firmware anywhere |
+| `c.toml: two boot methods: a kernel and a firmware image (...)` | A kernel and a firmware image both given |
+| `c.toml: [boot.firmware] needs image (or pass --firmware FILE)` | The table has no image |
+| `c.toml: a firmware boot takes no initrd or kernel command line` | Also `has no virtio devices yet` for a disk, nic or rng |
 | `c.toml: no fexc: --fexc FILE, or [engine] fexc in a --config file` | No compiler anywhere |
 | `c.toml: device id "A b" must match [a-z0-9_-]+ (disk 1)` | An id has other characters |
 | `c.toml: device id "a" is used twice (disk 1 and nic 1)` | Ids are unique across all device kinds |
@@ -232,4 +251,5 @@ none) and the key. All of these are found before the VM starts, and the process 
   flush still waits as long.
 - Two read-only disks on one file get different serials: the second use's serial starts with a
   letter after `f` (`g`, `h`, ...), so it matches no file's.
-- A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it.
+- A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it, and `[boot.firmware]` unless
+  `--firmware` does.
