@@ -1,0 +1,20 @@
+# The boot-time interpreter's per-instruction cases (docs/restructure/interp-cases.md): the generated corpus, its two
+# references (the pinned QEMU's TCG and the x86 machine under KVM) and their checks. Ordinary runs compare the locked
+# answers only: nothing starts a VM. natemu is not run here yet (its program driver starts only in 64-bit long mode);
+# the cases that run natemu come with the driver's start states in these modes.
+[family]
+name = "interp"
+covers = ["tests/interp/**", "tests/lib/testenv.py", "tools/reference/answers.py", "tools/correctness/recipes/common.sh"]
+
+[[suite]]
+name = "interp"
+kind = "judged"
+harness = "runner"
+params = { timeout = 1800 }
+
+# Every case's QEMU and KVM answers are locked and agree on every field both answer; the empty cases read back their
+# starting state; every case stops where it means to. Seeding: TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host, twice,
+# then `natemu-test lock tests/interp --from-run RUN1 RUN2`.
+[suite.cases."references"]
+argv = ["tests/interp/run_interp_ref.py", "--out", "{out}"]
+smoke = true

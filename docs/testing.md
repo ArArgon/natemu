@@ -346,8 +346,9 @@ in the framework yet: the drift canary and stored baselines (`tools/bench/canary
 ## Runner families
 
 The unit, fp and programs families have their own harnesses. The rest are runner families
-(`tests/{boot,static,system,smp,faults,io}`): each case is one invocation of a script in the family's folder (or
-`tests/lib`, for scripts several families share; [tests/README.md](../tests/README.md)) that reports per case
+(`tests/{boot,static,system,smp,faults,io,interp}`; `interp`, the boot-time interpreter's cases and their QEMU and KVM
+answers, has [its own page](restructure/interp-cases.md)): each case is one invocation of a script in the family's
+folder (or `tests/lib`, for scripts several families share; [tests/README.md](../tests/README.md)) that reports per case
 (`results.json`), reads its inputs from the input root below and compares with QEMU's locked answers instead of running
 QEMU. The scripts refuse to start outside the framework. To debug one, run its case with `--keep-outputs`: the case's
 log (`.natemu/runs/<run>/runner/<case>.log`) starts with the exact command and the settings the framework gave it.
