@@ -311,7 +311,7 @@ comparison). Each takes the whole machine. Numbers are written per machine, to
 `.natemu/runs/<id>/bench/<machine id>/<benchmark>/`, and never compared across machines.
 
 The guest benchmarks' initramfs is built the first time it is needed, from `tools/bench/image` (the reference box's
-recipe, unchanged), and then comes from the cache; the kernel is Debian's pinned package. Where it is built is a setting:
+recipe, its Debian packages and sources from a fixed snapshot.debian.org date), and then comes from the cache; the kernel is Debian's pinned package. Where it is built is a setting:
 
 ```toml
 # .natemu/config.toml (this machine only, not committed); or NATEMU_BENCH_BUILDER=...
