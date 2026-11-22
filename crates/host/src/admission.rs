@@ -364,7 +364,9 @@ fn lock_neg(insn: &[u8]) -> bool {
 
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
 /// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check; `cpl0`: the
-/// request was at CPL 0 (perf chunk 15: its CLI and STI may be translated, [`interrupt_flag`]).
+/// request was at CPL 0 (perf chunk 15: its CLI and STI may be translated, [`interrupt_flag`]). Tests only: the host
+/// admits through [`admit_mode`], which carries the request's code mode.
+#[cfg(test)]
 pub(crate) fn admit(
     bytes: &[u8],
     rip: u64,
