@@ -47,6 +47,10 @@ pub struct Backing {
     /// Guest-physical RAM through the host's alias: valid while `memory` is mapped, so never handed out by value in safe
     /// code (`GuestRam` is `Copy`: a copy would outlive the backing; R2 review).
     pub(crate) ram: GuestRam,
+    /// M2 Part 2: guest RAM and the firmware image (`exec::guest_memory`; RAM alone without one), as `ram`: the vCPUs' view
+    /// ([`Area::ram`]) through which the host reads code to translate and reports read memory. Never written: every host
+    /// writer (loaders, device DMA, copy windows) uses `ram`, so nothing of the host changes the image.
+    pub(crate) readable: GuestRam,
     /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
     /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
     epoch: u64,
@@ -88,7 +92,7 @@ impl Backing {
             vcpus: self.n,
             epoch: self.epoch,
             base: v * self.stride,
-            ram: self.ram,
+            ram: self.readable,
         }
     }
 }
@@ -102,7 +106,7 @@ pub struct Area<'a> {
     pub(crate) epoch: u64,
     /// Backing offset of its block (its window).
     pub(crate) base: usize,
-    /// The VM's guest RAM ([`Backing::ram`]).
+    /// The VM's guest RAM and its firmware image ([`Backing::readable`]): read only (code to translate, reports).
     pub(crate) ram: GuestRam,
 }
 impl<'a> Area<'a> {
@@ -409,9 +413,10 @@ fn prepare_at_alias(
     if firmware != 0 {
         memory.copy(ram_offset + (exec::FIRMWARE_END - firmware) as usize, image);
     }
-    // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value. The host
-    // reads the firmware image through it too (code for a translation, reports); nothing of the host writes it.
-    let ram = unsafe { exec::guest_memory(ram_bytes as u64, firmware, memory.0 as u64 + ram_offset as u64) };
+    // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
+    let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    // SAFETY: as `ram`; the image lies in the same span.
+    let readable = unsafe { exec::guest_memory(ram_bytes as u64, firmware, memory.0 as u64 + ram_offset as u64) };
     let memory = Arc::new(memory);
     // Zero memory, nothing reading yet: the publisher makes the pool empty and on.
     let pool = pool.then(|| {
@@ -426,6 +431,7 @@ fn prepare_at_alias(
         n,
         stride,
         ram,
+        readable,
         epoch: unsafe { mach_absolute_time() },
         io_epoch: Mutex::new(0),
         io_counts: io::WindowCounters::default(),

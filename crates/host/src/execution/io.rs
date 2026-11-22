@@ -901,6 +901,7 @@ pub(crate) mod tests {
             n,
             stride: 0,
             ram,
+            readable: ram,
             epoch: 0,
             io_epoch: Mutex::new(0),
             io_counts: WindowCounters::default(),
