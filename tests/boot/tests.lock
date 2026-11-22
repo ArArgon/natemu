@@ -1,28 +1,63 @@
 # Written by `natemu-test lock`; do not edit (docs/testing.md).
+[answers.13f61f249a7b25ace02d2a0e26da33f155fd72a323e86e22dcd0485446580ef2]
+repro = "86ff49a161bc image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "f3461590173bcf235960fc639a933de9c6600d3fe6eb47af78a43731898caba3"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"setup: CPU 3 online\",\"smp: waiting for 3 APs\"]}"
+
 [answers.189fe124cbff3dc55e8128370a158c71ef7a6cc0684d008cdfa1b0066174f1db]
 repro = "b0296114bc05 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
+
+[answers.1b1499399640abdc65c8766adb52fa493261869acd5475c860a27e7f240289aa]
+repro = "5e26e2db02f1 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "18e780690e2dd2909cd44693f58403af50d1ffd680b700e819ef214230c5833a"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"found 4 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"ipi called, cpu 2\",\"ipi called, cpu 3\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"setup: CPU 3 online\",\"smp: waiting for 3 APs\"]}"
 
 [answers.3b8fb709200ef037afa3431a86bd98df660a4f8f3ebdbc4ba0a43b3ca2cc48a9]
 repro = "f06f765e9c1a image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
+[answers.4a543f63527282c0946b5ddd07f5992a764f4ced82a7c469e6f56b3b8833b219]
+repro = "d8382737be26 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "319668cf974879349c7d697cfd4657264a6a7ddfebccf163ae25b713e4dab7c9"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"smp: waiting for 1 APs\"]}"
+
 [answers.4c13096beceb27ad54bfd753cd7fff585b09ecae0a7be9672b7b5d36292f5208]
 repro = "ce917e519f55 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.4cca68c36e5fd84bcb5a793d0dad3da6df398f91e5bec883128a1e12202b1749]
+repro = "865c1bc2a423 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "e22d03af781a977e54bc30c04a50f3b5520b42d2f6fc2fd6f8715fe071bfccbd"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"found 3 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"ipi called, cpu 2\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"smp: waiting for 2 APs\"]}"
 
 [answers.57f2616205f05ae6b4ac5da979fb7607c7dbb45238417c883f4077b6486d402e]
 repro = "b6fe72ac23d5 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
 
+[answers.5852c76da75d969b2adb825b7140d4bb2cd19ef500c80bc11bcba655f9477c80]
+repro = "a78a5bdd81bd image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "adfaffe576a26785bec643b2b60a9cde7b4b0f0299781d30c80ea3420fd689ed"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"smp: waiting for 2 APs\"]}"
+
+[answers.72392fa0477a5f4f695bdab37f02b0291b81abdc4e38faf549b00a024d51e1b8]
+repro = "8f530a278976 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "18e780690e2dd2909cd44693f58403af50d1ffd680b700e819ef214230c5833a"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"found 4 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"ipi called, cpu 2\",\"ipi called, cpu 3\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"setup: CPU 3 online\",\"smp: waiting for 3 APs\"]}"
+
 [answers.7303aaef6a0bc404d2c4ed346bf9d2264aed2e8b36b4e811d3a9be71459ba4a1]
 repro = "09373697de79 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.751b0ae5f687c63de1f3041088b176f0177bbcf9f2252b1e88a1b42f0bd9cf07]
+repro = "d58a78dceb45 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "fe60fac6f6c3bd261a986146a60a8e9345cf7781a2e1be2ff555521c453018cb"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"found 1 cpus\",\"ipi called, cpu 0\",\"smp: waiting for 0 APs\"]}"
 
 [answers.7a8ecac916eb9a75edb36979eb21923681bd8114e7dc7a56aecd97fea9745d2f]
 repro = "3bee7048be91 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
@@ -34,10 +69,35 @@ repro = "746e2e954c00 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e55
 sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
 
+[answers.7fdd3abebd52735c6258ded7e42b1eebd7ff44b842863a30648a8a518b3e2db5]
+repro = "9d4cd6893255 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "16caf56dbb3e584dff55a04cdc58a6ea4158db089490c9f56a240e6f1d883123"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"smp: waiting for 0 APs\"]}"
+
+[answers.8464d7909d8270db171ba73c329e07b23f54408477c5bca96c6e9aa8d35c2f9b]
+repro = "a29bc620debb image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "c2d02a0611f4b3f7e132d54767fb36597f8ace787a654fe9330fba732a21c2b0"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"found 2 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"setup: CPU 1 online\",\"smp: waiting for 1 APs\"]}"
+
+[answers.9b399c5f9786adfe3a9fe3b26bcff19868373946d7e09e1c1ef4749705539bb7]
+repro = "262393282292 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "fe60fac6f6c3bd261a986146a60a8e9345cf7781a2e1be2ff555521c453018cb"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"found 1 cpus\",\"ipi called, cpu 0\",\"smp: waiting for 0 APs\"]}"
+
+[answers.a0c28cb228dfec56ddd690d8f7557761379f2205286b6c3f58d4054987e9583e]
+repro = "0ba9dcb6d4b1 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "c2d02a0611f4b3f7e132d54767fb36597f8ace787a654fe9330fba732a21c2b0"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"found 2 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"setup: CPU 1 online\",\"smp: waiting for 1 APs\"]}"
+
 [answers.a92e5356c6638130e86daf6f9c72e8d8cdd1a1f4c2cd75bf4fa5e8c855adf3b1]
 repro = "204ec1584718 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.b435345d04a7bb181faec39366c225cd3a9a265229df5dc1e3dc93757bbdd148]
+repro = "43d1e8c853f0 image_sha256=aebcf3469bc9b8235b6b4a93af7e96dce43edce6454137326db0dcb4a17262af"
+sha256 = "b2eab7ae53e546faaa38ab6b22036cf3dc5bb014d8b63488f99ab3ff0e0e121c"
+value = "{\"debugcon\":[\"SecCoreStartupWithStack(0xFFFCC000, 0x820000)\"],\"devices\":[],\"regs\":{\"cr0\":3758096401,\"cr3\":8388608,\"cr4\":32,\"cs\":56,\"ds\":24,\"efer\":1280,\"eflags\":70,\"es\":24,\"fs\":24,\"fs_base\":0,\"gs\":24,\"gs_base\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\"r8\":0,\"r9\":0,\"rax\":0,\"rbp\":4294754304,\"rbx\":0,\"rcx\":1,\"rdi\":0,\"rdx\":0,\"rip\":4294794788,\"rsi\":4294794788,\"rsp\":0,\"ss\":24},\"stop\":\"breakpoint\"}"
 
 [answers.b5890ee3983aaa6d8532ce864badc8cccbe68ec1ddcb0a1049084efac675aac5]
 repro = "55ea89e4415a image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
@@ -49,6 +109,36 @@ repro = "3ab23c1da9ce image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288c
 sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
+[answers.b8ff3866e1a1671dfd00082878c59fc3159e4bf4e8583a707005fdf08c3fef50]
+repro = "a42dfc6505c2 image_sha256=aebcf3469bc9b8235b6b4a93af7e96dce43edce6454137326db0dcb4a17262af"
+sha256 = "ff9ca37dde7bee32701020318fc7154588b60875eaca39cff27888dc104160dd"
+value = "{\"debugcon\":[\"SecCoreStartupWithStack(0xFFFCC000, 0x820000)\"],\"devices\":[],\"regs\":{\"cr0\":2147483699,\"cr3\":8388608,\"cr4\":1632,\"cs\":56,\"ds\":24,\"efer\":1280,\"eflags\":70,\"es\":24,\"fs\":24,\"fs_base\":0,\"gs\":24,\"gs_base\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\"r8\":0,\"r9\":0,\"rax\":0,\"rbp\":4294754304,\"rbx\":0,\"rcx\":1,\"rdi\":20546,\"rdx\":0,\"rip\":4294794788,\"rsi\":4294794788,\"rsp\":0,\"ss\":24},\"stop\":\"breakpoint\"}"
+
+[answers.bc543569f7981961cde587ae64108b9686d0ea854e1d931c2a1b8d7a7b556e82]
+repro = "1cea04a6c6fa image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
+sha256 = "e22d03af781a977e54bc30c04a50f3b5520b42d2f6fc2fd6f8715fe071bfccbd"
+value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"found 3 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"ipi called, cpu 2\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"smp: waiting for 2 APs\"]}"
+
+[answers.bcb04f20d180147abf7042afa6fda9e0658693df0632733df6063c0b71cfb920]
+repro = "35b7b69ba477 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "16caf56dbb3e584dff55a04cdc58a6ea4158db089490c9f56a240e6f1d883123"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"smp: waiting for 0 APs\"]}"
+
+[answers.bd89c726fce3c341927df3ad7a4a9eaefa58973d21ca72ddc8dce8a52f1b55be]
+repro = "a8be0e147a21 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "adfaffe576a26785bec643b2b60a9cde7b4b0f0299781d30c80ea3420fd689ed"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"smp: waiting for 2 APs\"]}"
+
+[answers.c1b82f42204cbc050802bd73edc287321799d16301dda8d74124777d9c2def1a]
+repro = "c7070491f187 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "f3461590173bcf235960fc639a933de9c6600d3fe6eb47af78a43731898caba3"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"setup: CPU 3 online\",\"smp: waiting for 3 APs\"]}"
+
+[answers.c1cc392ae60675b6ba47b50874a9710a15f0f2938da9f9cca2d46f0688567b25]
+repro = "f645b705dd58 image_sha256=aebcf3469bc9b8235b6b4a93af7e96dce43edce6454137326db0dcb4a17262af"
+sha256 = "b2eab7ae53e546faaa38ab6b22036cf3dc5bb014d8b63488f99ab3ff0e0e121c"
+value = "{\"debugcon\":[\"SecCoreStartupWithStack(0xFFFCC000, 0x820000)\"],\"devices\":[],\"regs\":{\"cr0\":3758096401,\"cr3\":8388608,\"cr4\":32,\"cs\":56,\"ds\":24,\"efer\":1280,\"eflags\":70,\"es\":24,\"fs\":24,\"fs_base\":0,\"gs\":24,\"gs_base\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\"r8\":0,\"r9\":0,\"rax\":0,\"rbp\":4294754304,\"rbx\":0,\"rcx\":1,\"rdi\":0,\"rdx\":0,\"rip\":4294794788,\"rsi\":4294794788,\"rsp\":0,\"ss\":24},\"stop\":\"breakpoint\"}"
+
 [answers.c8a0cd5d56338c98ae7b8c6eabaecbec07a1754d9d18936e889b69f059920596]
 repro = "e0719a150e0e image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
@@ -58,6 +148,16 @@ value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2
 repro = "1dd1f68546bd image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
 sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
 value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
+
+[answers.d18ce564258be0af22b6d0e4bffa33c87d7f32f5a3c1c91e96e4d08d656e6352]
+repro = "f70155fad881 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
+sha256 = "319668cf974879349c7d697cfd4657264a6a7ddfebccf163ae25b713e4dab7c9"
+value = "{\"exit\":1,\"lines\":[\"Dummy Hello World!\",\"enabling apic\",\"enabling apic\",\"setup: CPU 1 online\",\"smp: waiting for 1 APs\"]}"
+
+[answers.d498e54944c79788a461d6c6fc2e5d69114feb75a14c7a944a02d0ffc021b448]
+repro = "4873e411a8b3 image_sha256=aebcf3469bc9b8235b6b4a93af7e96dce43edce6454137326db0dcb4a17262af"
+sha256 = "ff9ca37dde7bee32701020318fc7154588b60875eaca39cff27888dc104160dd"
+value = "{\"debugcon\":[\"SecCoreStartupWithStack(0xFFFCC000, 0x820000)\"],\"devices\":[],\"regs\":{\"cr0\":2147483699,\"cr3\":8388608,\"cr4\":1632,\"cs\":56,\"ds\":24,\"efer\":1280,\"eflags\":70,\"es\":24,\"fs\":24,\"fs_base\":0,\"gs\":24,\"gs_base\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\"r8\":0,\"r9\":0,\"rax\":0,\"rbp\":4294754304,\"rbx\":0,\"rcx\":1,\"rdi\":20546,\"rdx\":0,\"rip\":4294794788,\"rsi\":4294794788,\"rsp\":0,\"ss\":24},\"stop\":\"breakpoint\"}"
 
 [repro.09373697de79]
 args = [
@@ -93,6 +193,92 @@ test = "exit-program"
 cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
 kernel = "7.0.0-43-generic"
 qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.0ba9dcb6d4b1]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "2",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 2
+environment = "NR_CPUS=2\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests smptest"
+
+[repro.0ba9dcb6d4b1.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.0ba9dcb6d4b1.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.0ba9dcb6d4b1.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.1cea04a6c6fa]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "3",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 3
+environment = "NR_CPUS=3\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests smptest"
+
+[repro.1cea04a6c6fa.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.1cea04a6c6fa.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
 
 [repro.1dd1f68546bd]
 args = [
@@ -162,6 +348,92 @@ cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
 kernel = "7.0.0-43-generic"
 qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
 
+[repro.262393282292]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "1",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 1
+environment = "NR_CPUS=1\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests smptest"
+
+[repro.262393282292.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.262393282292.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.262393282292.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.35b7b69ba477]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 1
+environment = "NR_CPUS=1\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests dummy"
+
+[repro.35b7b69ba477.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.35b7b69ba477.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
 [repro.3ab23c1da9ce]
 args = [
     "-accel",
@@ -225,6 +497,130 @@ cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
 kernel = "7.0.0-43-generic"
 qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
 
+[repro.43d1e8c853f0]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "1",
+    "-m",
+    "256",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-debugcon",
+    "file:DBG",
+    "-global",
+    "isa-debugcon.iobase=0x402",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+    "-msg",
+    "timestamp=on",
+    "-trace",
+    "enable=memory_region_ops_*,file=TRACE",
+    "-S",
+    "-gdb",
+    "unix:SOCK,server=on,wait=off",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "ovmf main32"
+
+[repro.43d1e8c853f0.image]
+base = "0xffc00000"
+boot_fv = "0xfffcc000"
+early_bsp_init_real16 = "0xfffffef0"
+main32 = "0xffffff08"
+reset = "0xfffffff0"
+sec_entry = "0xfffd5e24"
+size = "0x400000"
+
+[repro.43d1e8c853f0.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.43d1e8c853f0.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "f984a9be20c1b3762cfea0ce8c6ca5b81eb4caf62f5a6100e1e171983e2bcfa2"
+
+[repro.43d1e8c853f0.upstream.sources]
+edk2-brotli-src = "a9ba3940267de5dd73581a47c2e81b3eb1e1df6a704138c599020d66f3677a92"
+edk2-libspdm-src = "a815aa38874d2c82255f379a7ee1eb07cccbb439a7788ff14316fce52d61a516"
+edk2-mbedtls-src = "61ac65f6362f898677b2a4cf2a769b41e4aee0985cb45f046d3b719388e5be59"
+edk2-mipisyst-src = "9fda3b9a78343ab2be6f06ce6396536e7e065abac29b47c8eb2e42cbb4c4f00b"
+edk2-openssl-src = "03154360ff8808ac38da7530cd69d211e105683e077e9835e48161493c3d0050"
+edk2-src = "d4956bf7c7dc65aec6c81e0e2346f8c49d196ba1ba1df62b79375467774c85ce"
+
+[repro.4873e411a8b3]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "256",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-debugcon",
+    "file:DBG",
+    "-global",
+    "isa-debugcon.iobase=0x402",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+    "-msg",
+    "timestamp=on",
+    "-trace",
+    "enable=memory_region_ops_*,file=TRACE",
+    "-S",
+    "-gdb",
+    "unix:SOCK,server=on,wait=off",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "ovmf reset"
+
+[repro.4873e411a8b3.image]
+base = "0xffc00000"
+boot_fv = "0xfffcc000"
+early_bsp_init_real16 = "0xfffffef0"
+main32 = "0xffffff08"
+reset = "0xfffffff0"
+sec_entry = "0xfffd5e24"
+size = "0x400000"
+
+[repro.4873e411a8b3.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "f984a9be20c1b3762cfea0ce8c6ca5b81eb4caf62f5a6100e1e171983e2bcfa2"
+
+[repro.4873e411a8b3.upstream.sources]
+edk2-brotli-src = "a9ba3940267de5dd73581a47c2e81b3eb1e1df6a704138c599020d66f3677a92"
+edk2-libspdm-src = "a815aa38874d2c82255f379a7ee1eb07cccbb439a7788ff14316fce52d61a516"
+edk2-mbedtls-src = "61ac65f6362f898677b2a4cf2a769b41e4aee0985cb45f046d3b719388e5be59"
+edk2-mipisyst-src = "9fda3b9a78343ab2be6f06ce6396536e7e065abac29b47c8eb2e42cbb4c4f00b"
+edk2-openssl-src = "03154360ff8808ac38da7530cd69d211e105683e077e9835e48161493c3d0050"
+edk2-src = "d4956bf7c7dc65aec6c81e0e2346f8c49d196ba1ba1df62b79375467774c85ce"
+
 [repro.55ea89e4415a]
 args = [
     "-accel",
@@ -255,6 +651,52 @@ pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 test = "exit-program"
 
+[repro.5e26e2db02f1]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "4",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 4
+environment = "NR_CPUS=4\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests smptest"
+
+[repro.5e26e2db02f1.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.5e26e2db02f1.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.5e26e2db02f1.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
 [repro.746e2e954c00]
 args = [
     "-accel",
@@ -282,6 +724,369 @@ args = [
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 test = "exit-firmware"
+
+[repro.865c1bc2a423]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "3",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 3
+environment = "NR_CPUS=3\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests smptest"
+
+[repro.865c1bc2a423.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.865c1bc2a423.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.865c1bc2a423.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.86ff49a161bc]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "4",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 4
+environment = "NR_CPUS=4\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests dummy"
+
+[repro.86ff49a161bc.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.86ff49a161bc.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.8f530a278976]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "4",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 4
+environment = "NR_CPUS=4\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests smptest"
+
+[repro.8f530a278976.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.8f530a278976.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.9d4cd6893255]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "1",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 1
+environment = "NR_CPUS=1\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests dummy"
+
+[repro.9d4cd6893255.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.9d4cd6893255.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.9d4cd6893255.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.a29bc620debb]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "2",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 2
+environment = "NR_CPUS=2\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests smptest"
+
+[repro.a29bc620debb.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.a29bc620debb.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.a42dfc6505c2]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "1",
+    "-m",
+    "256",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-debugcon",
+    "file:DBG",
+    "-global",
+    "isa-debugcon.iobase=0x402",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+    "-msg",
+    "timestamp=on",
+    "-trace",
+    "enable=memory_region_ops_*,file=TRACE",
+    "-S",
+    "-gdb",
+    "unix:SOCK,server=on,wait=off",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "ovmf reset"
+
+[repro.a42dfc6505c2.image]
+base = "0xffc00000"
+boot_fv = "0xfffcc000"
+early_bsp_init_real16 = "0xfffffef0"
+main32 = "0xffffff08"
+reset = "0xfffffff0"
+sec_entry = "0xfffd5e24"
+size = "0x400000"
+
+[repro.a42dfc6505c2.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.a42dfc6505c2.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "f984a9be20c1b3762cfea0ce8c6ca5b81eb4caf62f5a6100e1e171983e2bcfa2"
+
+[repro.a42dfc6505c2.upstream.sources]
+edk2-brotli-src = "a9ba3940267de5dd73581a47c2e81b3eb1e1df6a704138c599020d66f3677a92"
+edk2-libspdm-src = "a815aa38874d2c82255f379a7ee1eb07cccbb439a7788ff14316fce52d61a516"
+edk2-mbedtls-src = "61ac65f6362f898677b2a4cf2a769b41e4aee0985cb45f046d3b719388e5be59"
+edk2-mipisyst-src = "9fda3b9a78343ab2be6f06ce6396536e7e065abac29b47c8eb2e42cbb4c4f00b"
+edk2-openssl-src = "03154360ff8808ac38da7530cd69d211e105683e077e9835e48161493c3d0050"
+edk2-src = "d4956bf7c7dc65aec6c81e0e2346f8c49d196ba1ba1df62b79375467774c85ce"
+
+[repro.a78a5bdd81bd]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "3",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 3
+environment = "NR_CPUS=3\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests dummy"
+
+[repro.a78a5bdd81bd.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.a78a5bdd81bd.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.a78a5bdd81bd.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.a8be0e147a21]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "3",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 3
+environment = "NR_CPUS=3\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests dummy"
+
+[repro.a8be0e147a21.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.a8be0e147a21.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
 
 [repro.b0296114bc05]
 args = [
@@ -344,6 +1149,52 @@ cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
 kernel = "7.0.0-43-generic"
 qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
 
+[repro.c7070491f187]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "4",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 4
+environment = "NR_CPUS=4\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests dummy"
+
+[repro.c7070491f187.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.c7070491f187.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.c7070491f187.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
 [repro.ce917e519f55]
 args = [
     "-accel",
@@ -373,6 +1224,92 @@ args = [
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 test = "exit-program"
+
+[repro.d58a78dceb45]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 1
+environment = "NR_CPUS=1\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests smptest"
+
+[repro.d58a78dceb45.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.d58a78dceb45.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.d8382737be26]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host,-pku",
+    "-smp",
+    "2",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 2
+environment = "NR_CPUS=2\n"
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z, -cpu host,-pku, image docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+supplier = "kvm"
+test = "kvm-unit-tests dummy"
+
+[repro.d8382737be26.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+virt = "kvm"
+
+[repro.d8382737be26.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.d8382737be26.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
 
 [repro.e0719a150e0e]
 args = [
@@ -436,3 +1373,102 @@ test = "exit-program"
 cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
 kernel = "7.0.0-43-generic"
 qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.f645b705dd58]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "256",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-debugcon",
+    "file:DBG",
+    "-global",
+    "isa-debugcon.iobase=0x402",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+    "-msg",
+    "timestamp=on",
+    "-trace",
+    "enable=memory_region_ops_*,file=TRACE",
+    "-S",
+    "-gdb",
+    "unix:SOCK,server=on,wait=off",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "ovmf main32"
+
+[repro.f645b705dd58.image]
+base = "0xffc00000"
+boot_fv = "0xfffcc000"
+early_bsp_init_real16 = "0xfffffef0"
+main32 = "0xffffff08"
+reset = "0xfffffff0"
+sec_entry = "0xfffd5e24"
+size = "0x400000"
+
+[repro.f645b705dd58.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "f984a9be20c1b3762cfea0ce8c6ca5b81eb4caf62f5a6100e1e171983e2bcfa2"
+
+[repro.f645b705dd58.upstream.sources]
+edk2-brotli-src = "a9ba3940267de5dd73581a47c2e81b3eb1e1df6a704138c599020d66f3677a92"
+edk2-libspdm-src = "a815aa38874d2c82255f379a7ee1eb07cccbb439a7788ff14316fce52d61a516"
+edk2-mbedtls-src = "61ac65f6362f898677b2a4cf2a769b41e4aee0985cb45f046d3b719388e5be59"
+edk2-mipisyst-src = "9fda3b9a78343ab2be6f06ce6396536e7e065abac29b47c8eb2e42cbb4c4f00b"
+edk2-openssl-src = "03154360ff8808ac38da7530cd69d211e105683e077e9835e48161493c3d0050"
+edk2-src = "d4956bf7c7dc65aec6c81e0e2346f8c49d196ba1ba1df62b79375467774c85ce"
+
+[repro.f70155fad881]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "2",
+    "-m",
+    "128",
+    "-machine",
+    "pc",
+    "-display",
+    "none",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-kernel",
+    "IMG",
+    "-initrd",
+    "ENV",
+]
+cpus = 2
+environment = "NR_CPUS=2\n"
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "kvm-unit-tests dummy"
+
+[repro.f70155fad881.upstream]
+image = "docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f"
+recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f78"
+
+[repro.f70155fad881.upstream.sources]
+kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
