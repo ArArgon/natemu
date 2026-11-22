@@ -3,7 +3,13 @@
 # Debian trixie packages and sources, build the static benchmarks with Debian's gcc 14, make the input, and stage the
 # initramfs (mkroot.sh). Needs apt-get/apt-cache, dpkg, curl, python3, readelf (binutils). The host's own compiler is
 # not used: every binary in the guest is either a Debian package file or built by Debian gcc against Debian libc.a.
+# Debian's packages and orig tarballs come from the snapshot.debian.org archive at SNAP, so the versions packages.txt
+# pins stay downloadable: trixie main as it was when packages.txt was resolved (glibc 2.41-12+deb13u4; the moving mirror
+# replaced it with Debian 13.8 on 2026-11-21). apt checks the archive's signature, as before. To re-pin, move SNAP and
+# delete packages.txt: the next build resolves the set again at the new date.
 set -euo pipefail
+SNAP=20261120T000000Z
+MIRROR=http://snapshot.debian.org/archive/debian/$SNAP
 here=$(dirname "$(realpath "$0")"); mkdir -p "$1"; B=$(realpath "$1"); S=$B/sysroot
 mkdir -p "$B"/{apt/lists/partial,apt/cache/archives/partial,apt/etc/preferences.d,apt/etc/apt.conf.d,debs,src,out/bin}
 
@@ -15,10 +21,10 @@ Dir::State "$B/apt"; Dir::State::Lists "$B/apt/lists"; Dir::State::status "$B/ap
 Dir::Etc::SourceList "$B/apt/sources.list"; Dir::Etc::SourceParts "$B/apt/etc/none";
 Dir::Etc::Preferences "$B/apt/etc/preferences"; Dir::Etc::PreferencesParts "$B/apt/etc/preferences.d";
 Dir::Etc::Parts "$B/apt/etc/apt.conf.d"; APT::Architecture "amd64"; APT::Architectures { "amd64"; };
-APT::Architecture-Variants "amd64"; Debug::NoLocking "true";
+APT::Architecture-Variants "amd64"; Debug::NoLocking "true"; Acquire::Retries "5";
 EOF
 touch "$B/apt/status"
-echo "deb [signed-by=$B/kr/usr/share/keyrings/debian-archive-keyring.pgp] https://deb.debian.org/debian trixie main" > "$B/apt/sources.list"
+echo "deb [signed-by=$B/kr/usr/share/keyrings/debian-archive-keyring.pgp check-valid-until=no] $MIRROR/ trixie main" > "$B/apt/sources.list"
 export APT_CONFIG=$B/apt/apt.conf
 apt-get update -qq
 # The exact package set and versions are pinned by packages.txt (written at the first run; later runs download it).
@@ -37,18 +43,22 @@ for l in lib lib64 bin sbin; do ln -sfn usr/$l "$S/$l"; done
 if [ -d "$S/lib32" ] && [ ! -L "$S/lib32" ]; then mkdir -p "$S/usr/lib32"; cp -a "$S/lib32/." "$S/usr/lib32/"; rm -rf "$S/lib32"; fi
 ln -sfn usr/lib32 "$S/lib32"
 
-# 2. Sources and input, checked against pinned hashes.
+# 2. Sources and input, checked against pinned hashes. fetch URL FILE SHA256 [URL2]: URL2, when given, is a fixed copy
+#    of the same file, tried when URL fails.
 cd "$B/src"
-fetch() { [ -f "$2" ] || curl -sSLf -o "$2" "$1"; echo "$3  $2" | sha256sum -c --quiet; }
+fetch() { [ -f "$2" ] || curl -sSLf --retry 5 -o "$2" "$1" || { [ -n "${4:-}" ] && curl -sSLf --retry 5 -o "$2" "$4"; }
+          echo "$3  $2" | sha256sum -c --quiet; }
 fetch https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz zstd-1.5.7.tar.gz \
       eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
 fetch https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git/snapshot/rt-tests-2.8.tar.gz rt-tests-2.8.tar.gz \
       5f5c8fac9bae903dd670bd12009f793c53cdc114c64dbec2ea8c8b02879d14d3
+# (the corpus's own host was unreachable on 2026-11-22; the Internet Archive's capture of it is the same bytes)
 fetch https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip silesia.zip \
-      0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
-fetch https://deb.debian.org/debian/pool/main/l/luajit/luajit_2.1.0+openresty20250117.orig.tar.xz luajit_2.1.0+openresty20250117.orig.tar.xz \
+      0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af \
+      https://web.archive.org/web/20260410165452id_/https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip
+fetch $MIRROR/pool/main/l/luajit/luajit_2.1.0+openresty20250117.orig.tar.xz luajit_2.1.0+openresty20250117.orig.tar.xz \
       99ad5fdfa85e08a291454f797f625fbb53f4d2129cac063922255a1fe34ccf1c
-fetch https://deb.debian.org/debian/pool/main/s/stress-ng/stress-ng_0.19.02.orig.tar.xz stress-ng_0.19.02.orig.tar.xz \
+fetch $MIRROR/pool/main/s/stress-ng/stress-ng_0.19.02.orig.tar.xz stress-ng_0.19.02.orig.tar.xz \
       ffe8907154cc3b65cc66cde8663106355f88c948b58169cee1badbde9e0f52bd
 fetch https://github.com/LuaJIT/LuaJIT-test-cleanup/archive/014708bceb70550a3ab8d539cff14d9085ca9cb8.tar.gz LuaJIT-test-cleanup-014708b.tar.gz \
       6003d032d74e48516526a5e81f1e40ea13072395af85c79b63aeffd415756fba
@@ -56,11 +66,11 @@ fetch https://math.nist.gov/scimark2/scimark2_1c.zip scimark2_1c.zip \
       223464cd7e90b4c22e2af08dbae6f6faa33e65b01e1c58e5a176837bc67958be
 fetch https://github.com/jtsiomb/c-ray/releases/download/c-ray-1.1/c-ray-1.1.tar.gz c-ray-1.1.tar.gz \
       6f507aae47a9367334b8cb50f50eb4ad0f6fef99aeae9f2f7d55ba9818e798bf
-fetch https://deb.debian.org/debian/pool/main/7/7zip/7zip_25.01+dfsg.orig.tar.xz 7zip_25.01+dfsg.orig.tar.xz \
+fetch $MIRROR/pool/main/7/7zip/7zip_25.01+dfsg.orig.tar.xz 7zip_25.01+dfsg.orig.tar.xz \
       077c424cd50001e2be8847892522bc83e807e0b9448af1b69512c03d769c88ef
-fetch https://deb.debian.org/debian/pool/main/s/sqlite3/sqlite3_3.46.1.orig.tar.xz sqlite3_3.46.1.orig.tar.xz \
+fetch $MIRROR/pool/main/s/sqlite3/sqlite3_3.46.1.orig.tar.xz sqlite3_3.46.1.orig.tar.xz \
       d0cdd2ece271b29e7ce18095745d892517ee26d0f270065b3a25c2e9eb11639c
-fetch https://deb.debian.org/debian/pool/main/x/x264/x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164.3108+git31e19f9.orig.tar.gz \
+fetch $MIRROR/pool/main/x/x264/x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164.3108+git31e19f9.orig.tar.gz \
       41606cb8e788a7f8c4514290646d4ba5c7bc68d9e1ccd1a73f446a90546913eb
 fetch https://media.xiph.org/video/derf/y4m/foreman_cif.y4m foreman_cif.y4m \
       b0e3c35eff9fe1da91521a02eb9f0e3ef4bc5aec341ecef1567cd87f1711267b
