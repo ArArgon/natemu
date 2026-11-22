@@ -1,0 +1,438 @@
+# Written by `natemu-test lock`; do not edit (docs/testing.md).
+[answers.2be9aff9ab4d938fd2c63a32639de586eab745c081535bb57fb614fbb47ea98d]
+repro = "746e2e954c00 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
+
+[answers.3779e9439408918c93a5efaad9ee11699c8693d6caa4e918e110c652f54b0cc4]
+repro = "ce917e519f55 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.3cb204c432674f4309bd9a863beb0282cd9a4789bedf9d0001ffd3bbcc566574]
+repro = "3ab23c1da9ce image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.5c4cd194c3e951ec9b3ed12c2379e65de52a966edcd2bad07f5e1c8a7f905b14]
+repro = "204ec1584718 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.6e5de763a40887bf79a7cecb79139c8d12f074d10e441aed966e18eb063142eb]
+repro = "55ea89e4415a image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.79d33673908be2d5e1cef619135b386967aefd86f15fe0ed61d0c4dbb6855efa]
+repro = "f06f765e9c1a image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.7ca6e8f0e9df501b816ca5377cc3b3216433423dfbcc8a85a87b46be385aa84b]
+repro = "3bee7048be91 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2,3 status=0\\n\"}"
+
+[answers.9dd954a68a621f0ec1015b92749d32229f65fdbad2fdae9d5fcb01ce3a8e0059]
+repro = "09373697de79 image_sha256=7364b88387fba3ad1672860e6fd6ea5cdb2232af59f21403adb7ec8b5e9c9c10"
+sha256 = "de35a8144df2ab46c605add87f1369734b807a9e0af8c2d5c01c317f2d1ae2e2"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[2,0,2,1,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.a9a0d6ac3e159d1209420d518e777a61c7b2b46965865d700d3550de5f2072fd]
+repro = "e0719a150e0e image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "2582613b3697c447a03290dcdbefbf9c9bc6a3304035c405fa2f175fa8cc1f14"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=4 aps=3 ids=1,2,3 status=0\\n\"}"
+
+[answers.bad8696759d85fe1a5a18570fa41c09cffde5125ab5783f4fd62364e9cda6502]
+repro = "b0296114bc05 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
+
+[answers.ea423cbcbe823098f3307c92b9979c660fac596b19540581a366307fa0c34740]
+repro = "b6fe72ac23d5 image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "0d2822c6b815b368b8a29c265884bfa1b5c33cdb042f9d64fc02daf5365934ff"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=2 aps=1 ids=1 status=0\\n\"}"
+
+[answers.fdcbaf1bbefce8b7606fae6d9a3e3d7a67021108cf102780bc7ade7b5d7b3fdf]
+repro = "1dd1f68546bd image_sha256=2e536d5791a0ff0d4fcc805d8c358b0b2363dd3719f5da8a767959577c771eae"
+sha256 = "442e56006cc2e094218ba220a92fada29c7c444b10746d400171706698f56806"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=1 aps=0 ids=- status=0\\n\"}"
+
+[repro.09373697de79]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "2",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-program"
+
+[repro.09373697de79.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.1dd1f68546bd]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "1",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-firmware"
+
+[repro.1dd1f68546bd.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.204ec1584718]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "4",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-program"
+
+[repro.204ec1584718.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.3ab23c1da9ce]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "2",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-program"
+
+[repro.3bee7048be91]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "4",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-firmware"
+
+[repro.3bee7048be91.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.55ea89e4415a]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-program"
+
+[repro.746e2e954c00]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "1",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-firmware"
+
+[repro.b0296114bc05]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "2",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-firmware"
+
+[repro.b6fe72ac23d5]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "2",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-firmware"
+
+[repro.b6fe72ac23d5.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+
+[repro.ce917e519f55]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "4",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-program"
+
+[repro.e0719a150e0e]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "4",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-firmware"
+
+[repro.f06f765e9c1a]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "1",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-program"
+
+[repro.f06f765e9c1a.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
