@@ -165,12 +165,13 @@ def libm32(name, f, extra, mode=None):
     """run-libm.sh on the i686 build of glibc's math tests: judged as libm, against the x86 reference machine's status
     (tests/correctness/libm32.txt; the image run there in a chroot, testkit/harness/campaign.py native). A failure must
     also be the one recorded for natemu in this floating-point mode (libm32-fails-MODE.txt, MODE afp, noafp or
-    noafp-accurate; `NAME fails=N fp=HASH`:
-    run-libm.sh's count and hash of the test's `Failure:` and `Maximal error of` lines, or of its whole output where
-    it has none), else it is `changed`, a failure whether `expected` lists it or not: an expected whole program cannot
-    hide a new failure inside it. TESTKIT_SEED_FAILURES=1 records natemu's failures instead (record twice: a program
-    whose failure differs between the two is recorded `fp=*` and judged by failing alone; test-nan-payload is one, its
-    memcmp of two long doubles that natemu leaves equal but for the format's two padding bytes, stack garbage)."""
+    noafp-accurate; `NAME fails=N fp=HASH`: run-libm.sh's count of the test's `Failure:` lines and hash of its whole
+    output and exit status, test-nan-payload's long double lines left out: they memcmp two long doubles that natemu
+    leaves equal but for the format's two padding bytes, stack garbage), else it is `changed`, a failure whether
+    `expected` lists it or not: an expected whole program cannot hide a new failure inside it, nor a case that fails
+    by more. TESTKIT_SEED_FAILURES=1 records natemu's failures instead, and each recorded one is unverified (delete the
+    files and record twice: a program whose failure differs between the two is recorded `fp=*` and judged by failing
+    alone; the family's test lists the only ones allowed)."""
     import os
     v, msg = _x86_rc(name, f, extra, LIBM32, _glibc)
     if v != 'failed' or f.get('rc') in ('77', 'skip') or os.environ.get('TESTKIT_SEED_ANSWERS'): return v, msg
@@ -180,7 +181,7 @@ def libm32(name, f, extra, mode=None):
     got, file = f'fails={f.get("fails")} fp={f["fp"]}', LIBM32_FAILS / f'libm32-fails-{m}.txt'
     if os.environ.get('TESTKIT_SEED_FAILURES'):
         _record(file, name, lambda old: got if old in (None, got) else 'fp=*')    # differs between two recordings
-        return v, f'{msg} (failure recorded: {got})'
+        return 'unverified', f'{msg} (failure recorded: {got})'
     want = _answers(file).get(name)
     if want is None: return 'changed', f'{msg}; no failure of it recorded in {file.name}'
     if want != got and want != 'fp=*': return 'changed', f'{msg}; it fails otherwise than recorded for {m} ({want}, now {got})'

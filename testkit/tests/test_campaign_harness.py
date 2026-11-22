@@ -499,9 +499,10 @@ def test_libm32_failure_must_match_its_recorded_one(tmp_path, monkeypatch):
     f = lambda fp: {'rc': '1', 'fails': '3', 'fp': fp}
     afp, noafp, acc = {'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'fast'}, {'afp': False, 'fp': 'accurate'}
     assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'changed'           # nothing recorded
-    monkeypatch.setenv('TESTKIT_SEED_FAILURES', '1')
-    assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'failed'
-    assert v.libm32('math/test-x', f('bb'), [], mode=noafp)[0] == 'failed'
+    monkeypatch.setenv('TESTKIT_SEED_FAILURES', '1')                         # recording: never a pass or an expected fail
+    assert v.libm32('math/test-x', f('aa'), [], mode=afp)[0] == 'unverified'
+    assert v.libm32('math/test-x', f('bb'), [], mode=noafp)[0] == 'unverified'
+    assert campaign.adjust('math/test-x', 'unverified', 'm', {'math/test-x': 'why'}).category == 'unverified'
     assert (tmp_path / 'libm32-fails-afp.txt').read_text() == 'math/test-x fails=3 fp=aa\n'
     assert (tmp_path / 'libm32-fails-noafp.txt').read_text() == 'math/test-x fails=3 fp=bb\n'
     monkeypatch.delenv('TESTKIT_SEED_FAILURES')
@@ -515,6 +516,50 @@ def test_libm32_failure_must_match_its_recorded_one(tmp_path, monkeypatch):
     monkeypatch.delenv('TESTKIT_SEED_FAILURES')
     assert (tmp_path / 'libm32-fails-afp.txt').read_text() == 'math/test-x fp=*\n'
     assert v.libm32('math/test-x', f('dd'), [], mode=afp)[0] == 'failed'
+
+
+def _run_libm(tmp_path, progs):
+    """tools/correctness/run-libm.sh over canned programs {name: (output bytes, exit status)}: {name: fields}."""
+    import hashlib, os, subprocess
+    d = tmp_path / f'libm-{hashlib.md5(repr(progs).encode()).hexdigest()[:8]}'
+    (d / 'bin').mkdir(parents=True)
+    (d / 'bin' / 'timeout').write_text('#!/bin/sh\nshift 3\nexec "$@"\n'); (d / 'bin' / 'timeout').chmod(0o755)
+    rows = []
+    for i, (name, (out, rc)) in enumerate(progs.items()):
+        (d / f'{i}.out').write_bytes(out)
+        rows.append(f'{name}\t{d / "cwd"}\tsh -c \'cat {d / f"{i}.out"}; exit {rc}\'\n')
+    (d / 'libm-cmds.txt').write_text(''.join(rows))
+    env = dict(os.environ, PATH=f'{d / "bin"}:{os.environ["PATH"]}', TMPDIR=str(d))
+    r = subprocess.run(['sh', str(REPO / 'tools/correctness/run-libm.sh'), str(d)], capture_output=True, env=env, check=True)
+    return {w[2]: campaign._kv(w[3:]) for w in (ln.split() for ln in r.stdout.decode().splitlines()) if w[:2] == ['CT-RESULT', 'libm']}
+
+
+def test_run_libm_fingerprints_the_whole_output_and_status(tmp_path):
+    """run-libm.sh's fp= is the md5 prefix of a failing program's whole output followed by `rc=EXIT`: a case that fails
+    by more (NaN for a few ulp) or a changed exit status changes it, a NUL byte in the output does not put the script's
+    pid into it, and only test-nan-payload's long double lines are left out."""
+    import hashlib
+    base = b'testing double\nFailure: Test: cos (0x1p+0)\nResult:\n is:          1.0000000000000002e+00\n' \
+           b' should be:   1.0000000000000000e+00\nMaximal error of `cos\'\n is      : 1 ulp\n'
+    worse = base.replace(b'1.0000000000000002e+00', b'nan')
+    nul = b'Failure: Test: x\n\x00\n'
+    got = _run_libm(tmp_path, {'math/a': (base, 1), 'math/b': (worse, 1), 'math/c': (base, 2), 'math/d': (nul, 1),
+                               'math/e': (b'Segmentation fault\n', 139), 'math/p': (base, 0), 'math/u': (base, 77)})
+    assert got['math/a'] == {'rc': '1', 'fails': '1', 'fp': hashlib.md5(base + b'rc=1\n').hexdigest()[:12]}
+    assert got['math/b']['fp'] != got['math/a']['fp'] and got['math/b']['fails'] == '1'          # a value changed
+    assert got['math/c']['fp'] != got['math/a']['fp']                                            # the status changed
+    assert got['math/e'] == {'rc': '139', 'fails': '0', 'fp': hashlib.md5(b'Segmentation fault\nrc=139\n').hexdigest()[:12]}
+    assert got['math/p'] == {'rc': '0'} and got['math/u'] == {'rc': '77'}
+    again = _run_libm(tmp_path, {'math/d': (nul, 1), 'math/a': (base, 1)})                      # another pid
+    assert again['math/d'] == got['math/d'] == {'rc': '1', 'fails': '1', 'fp': hashlib.md5(nul + b'rc=1\n').hexdigest()[:12]}
+    nan = lambda *lines: (b''.join(ln + b'\n' for ln in lines), 1)
+    p = 'math/test-nan-payload'
+    one = _run_libm(tmp_path, {p: nan(b'PASS: float n123', b'FAIL: long double n123 = n123', b'FAIL: _Float64x payload')})[p]
+    two = _run_libm(tmp_path, {p: nan(b'PASS: float n123', b'PASS: long double n123 = n123', b'PASS: _Float64x payload')})[p]
+    three = _run_libm(tmp_path, {p: nan(b'FAIL: float n123', b'FAIL: long double n123 = n123', b'FAIL: _Float64x payload')})[p]
+    assert one['fp'] == two['fp'] == hashlib.md5(b'PASS: float n123\nrc=1\n').hexdigest()[:12] and three['fp'] != one['fp']
+    other = _run_libm(tmp_path, {'math/test-x': nan(b'PASS: float n123', b'FAIL: long double n123 = n123')})['math/test-x']
+    assert other['fp'] != one['fp']                                     # the filter is test-nan-payload's alone
 
 
 def test_answers_naming_no_test_of_the_image_are_stale(setup, tmp_path):
@@ -951,6 +996,11 @@ def test_public_lkmm_skipped_is_unsupported_only_when_threads_exceed_cpus(lkmm_i
 
 # --- the committed family ---
 
+# The libm32 programs whose recorded failure is `fp=*` (judged by failing alone), by mode, each with the reason its output
+# differs between two recordings: none.
+FP_STAR: dict[str, set[str]] = {}
+
+
 def test_correctness_family_declares_its_campaigns():
     family.load.cache_clear()
     fam = family.load(REPO / 'tests' / 'correctness' / 'family.toml')
@@ -993,6 +1043,14 @@ def test_correctness_family_declares_its_campaigns():
             assert why.split(':', 1)[0] in names, (name, t)
     kept = [t for t, why in fam.suite('libm32').extra['expected_without']['afp'].items() if campaign.kept_in_accurate(why)]
     assert len(kept) == 15 and all(not t.endswith('fma') or '-float-double-' in t or '-float32-float' in t for t in kept)
+    # libm32's recorded failures: in each mode exactly the programs expected to fail there, and none judged by failing
+    # alone (`fp=*`, a failure that differed between two recordings) but those listed here, each with its reason
+    libm32 = fam.suite('libm32').extra
+    always, without = set(libm32['expected']), set(libm32['expected_without']['afp'])
+    for mode, want in (('afp', always), ('noafp', always | without), ('noafp-accurate', always | set(kept))):
+        recorded = v._answers(fam.dir / f'libm32-fails-{mode}.txt')
+        assert set(recorded) == want, (mode, sorted(set(recorded) ^ want)[:5])
+        assert {t for t, fp in recorded.items() if fp == 'fp=*'} == FP_STAR.get(mode, set()), mode
     t = fam.suite('torture').extra['expected']
     assert sorted(t) == sorted(f'{n}.{o}' for n in ('ieee_inf-2', 'ieee_inf-3', 'ieee_pr36332', 'pr39228') for o in ('O0', 'O2'))
     assert all('reduced precision' in why and 'docs/restructure/correctness-userspace.md' in why for why in t.values())
