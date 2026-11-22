@@ -669,6 +669,10 @@ def x87_cases():
     nan = lambda name, lines, mem, fsw, st, arm=None: out.append(case(f'nan-{name}', ['fninit'] + lines + ['fwait'], data(*mem), None, check=expect(fsw=fsw | 7 << 11, mask=MK, st={7: st}),
                                                                       xdev=arm and ('x87-nan-results', expect(fsw=fsw | 7 << 11, mask=MK, st={7: arm}))))
     nan('qnan-st0-snan-mem-fadd', ['fld qword ptr [rdi + 0x108]', 'fadd qword ptr [rdi + 0x100]'], (SN64, QN64), IE, QN64, arm=SN64Q)   # (Arm: the signalling NaN first)
+    # The signalling NaN in a register (FLD m80 loads one unchanged), the quiet one the first operand: x86 keeps the quiet one.
+    out.append(case('nan-qnan-st0-snan-reg-fadd', ['fninit', 'fld tbyte ptr [rdi + 0x100]', 'fld qword ptr [rdi + 0x110]', 'fadd st(0), st(1)', 'fwait'],
+                    data(0x8000000000000800, 0x7fff, QN64), None, check=expect(fsw=IE | 6 << 11, mask=MK, st={6: QN64}),
+                    xdev=('x87-nan-results', expect(fsw=IE | 6 << 11, mask=MK, st={6: SN64Q}))))
     nan('snan-mem-fdivr-one', ['fld1', 'fdivr qword ptr [rdi + 0x100]'], (SN64,), IE, SN64Q)
     nan('two-qnans-larger-mem-first-fsubr', ['fld qword ptr [rdi + 0x108]', 'fsubr qword ptr [rdi + 0x100]'], (QN64 | 0x1234, QN64), 0, QN64 | 0x1234)
     nan('two-qnans-larger-st0-first-fmul', ['fld qword ptr [rdi + 0x108]', 'fmul qword ptr [rdi + 0x100]'], (QN64, QN64 | 0x1234), 0, QN64 | 0x1234)
