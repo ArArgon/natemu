@@ -9,7 +9,7 @@
 //! pair (L4a); the PIT, the RTC and the ACPI PM block (L4b). Every other port and device-range page is unassigned
 //! (all-ones reads, ignored writes, counted; with `strict_unassigned` a typed stop). The ACPI tables describe `vcpus`
 //! processors and start with the RSDP at `rsdp`; vCPU 0 is the BSP, each other one starts as an AP in the firmware's
-//! waiting state on the tables' wakeup mailbox (X4). [`Prepared::run`] runs the VM: the run ends when any vCPU's run ends
+//! waiting state on the tables' wakeup mailbox (X4), or without it in the wait-for-SIPI state (M2 Part 2, [`Boot::mailbox`]). [`Prepared::run`] runs the VM: the run ends when any vCPU's run ends
 //! (the BSP's `stop_at`, a stop, power off or reset, its watchdog), and the others are cancelled.
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Backing, Compiler, Stop};
@@ -397,11 +397,12 @@ pub struct Boot {
     /// X4: the MADT's multiprocessor wakeup mailbox, on which every AP waits (default on). Off (boot-interpreter plan
     /// section 6), the MADT has none and each AP starts in the INIT state ([`natemu_abi::power_on::init`]) waiting for a
     /// start-up IPI, as firmware leaves the processors it did not boot: Linux then starts them with INIT and SIPI. A
-    /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). Nothing marks such an AP as
-    /// waiting for a SIPI yet (no `State` field holds that state: the CPU start-up work adds it), and the resident runs
-    /// no state outside 64-bit mode yet: it stops the AP at its first entry (`unsupported_mode`), and one vCPU's end ends
-    /// the whole run ([`Prepared::run`]). So until then a boot with this off and 2 or more vCPUs, and every Multiboot boot
-    /// (its BSP starts in 32-bit protected mode), ends at once.
+    /// Multiboot kernel's APs always start so (it gets no ACPI tables, [`boot::multiboot`]). Each such AP is published
+    /// as waiting for a SIPI before any vCPU runs ([`execution::wait_for_sipi`]), and waits in the resident for one;
+    /// the SIPI's state is the boot-time interpreter's, which is not built yet: the AP stops there (`unsupported_mode`
+    /// at the SIPI's state), and one vCPU's end ends the whole run ([`Prepared::run`]). So until then a boot with this
+    /// off ends when the kernel starts its first AP, and every Multiboot boot (its BSP starts in 32-bit protected mode)
+    /// ends at once.
     pub mailbox: bool,
     /// Test only (kvm-unit-tests' exit, plan section 7): QEMU's isa-debug-exit device at ports F4H-F7H
     /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
@@ -509,6 +510,8 @@ impl Boot {
                 let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
                 state.mailbox = tables.mailbox;
                 backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
+            } else if v > 0 {
+                execution::wait_for_sipi(backing.vcpu(v));
             }
         }
         // L3: COM1 and the unassigned rule.

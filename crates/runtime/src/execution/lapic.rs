@@ -20,8 +20,9 @@
 //!
 //! **IPIs** (11.6): an ICR write sends at once (delivery status always idle): fixed and lowest-priority set the target's
 //! IRR bit, NMI its NMI bit, by atomic OR, then ring it (an SGI to a peer; this vCPU looks at its own events at its next
-//! boundary). INIT and start-up stop `unsupported_system` (`ap_start`: real mode does not exist; X4 starts APs through the ACPI
-//! mailbox), as do SMI and the reserved modes, before any effect.
+//! boundary). M2 Part 2: INIT (level assert) and start-up update each target's pending word in one atomic step
+//! ([`super::startup::send`]) and ring it only when that changed the word; a shorthand or destination that selects no
+//! CPU sends nothing. SMI and the reserved modes stop `unsupported_system`, before any effect.
 //!
 //! **Timer** (11.5.4): counts the crystal clock (`clock::CRYSTAL_HZ`) through the divider from V = CNTVCT, exactly
 //! (`clock`); the next expiry's V is programmed into the Arm virtual timer (CNTV, PPI 27 through the in-kernel GIC), whose
@@ -36,14 +37,15 @@
 //!
 //! LINT1 in NMI mode is published (`lapic::LINT1_NMI`): the host's NMI input posts the NMI to the APICs taking it.
 //!
+//! **INIT** (M2 Part 2, [`init_reset`]): the APIC as after power-up but its ID, IA32_APIC_BASE and x2APIC mode (13.4.7.3).
+//!
 //! **Not built:** LINT0/LINT1 in fixed mode (no board source drives them so), thermal
-//! and performance-counter sources (none in the profile), INIT/start-up (real mode; X4 uses the mailbox), TSC-deadline
-//! (not advertised).
+//! and performance-counter sources (none in the profile), TSC-deadline (not advertised).
 use super::segments::Exception;
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::clock;
-use natemu_abi::execution::cache::{EVENTS, Events, GLOBAL_VA};
+use natemu_abi::execution::cache::{EVENTS, Events, GLOBAL_VA, pending};
 use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_IRQ, REQUEST_IRQ};
 use natemu_abi::lapic::{self as apic, Lapic, icr};
 
@@ -738,20 +740,49 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
             for t in (0..s.vcpus)
                 .filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::HW_ENABLED != 0)
             {
-                event_word(t, core::mem::offset_of!(Events, nmi)).store(1, SeqCst);
+                // The pending word's NMI bit (it holds INIT and SIPI state too: an OR, not a store).
+                event_word(t, core::mem::offset_of!(Events, pending)).fetch_or(pending::NMI, SeqCst);
                 ring(t);
             }
         }
         // INIT level de-assert (level 0, trigger level): no effect on this processor generation (11.6.1).
         icr::INIT if icr & (icr::ASSERT | icr::LEVEL) == icr::LEVEL => {}
-        icr::INIT | icr::STARTUP => ap_start(s),
+        // M2 Part 2 (initsipi_model's protocol): each target's pending word in one atomic update, a post and a doorbell
+        // only when it changed. Targets as for NMI (a hardware-disabled APIC takes no IPI); INIT to self or all includes
+        // the sender (taken at its next boundary), as QEMU and KVM do (the SDM calls those shorthands invalid for it).
+        icr::INIT | icr::STARTUP => {
+            let sipi = (mode == icr::STARTUP).then_some(vector as u8);
+            for t in (0..s.vcpus)
+                .filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::HW_ENABLED != 0)
+            {
+                if super::startup::send(t, sipi) {
+                    ring(t);
+                }
+            }
+        }
         _ => halt(s, stop::UNSUPPORTED_SYSTEM),
     }
 }
-/// INIT and start-up IPIs: a typed stop at the sending instruction, nothing sent. X4 decided to keep it: APs start
-/// through the ACPI wakeup mailbox ([`super::events::wait_mailbox`]), which Linux prefers whenever the MADT has one
-/// (`do_boot_cpu`); INIT-SIPI-SIPI would start the target in real mode at vector << 12 (SDM Vol.3 9.4.4), and no 16- or
-/// 32-bit execution exists, so it is deferred with them (an INIT alone, the wait-for-SIPI state, is deferred with it).
-fn ap_start(s: &State) -> ! {
-    halt(s, stop::UNSUPPORTED_SYSTEM)
+/// M2 Part 2: what INIT does to the local APIC (SDM Vol.3 13.4.7.3): every register as after power-up (13.4.7.1: SVR FFH,
+/// software disabled; every LVT entry masked; IRR, ISR, TMR, ICR, LDR, TPR, the timer and ESR 0; DFR all ones) but the
+/// APIC ID and arbitration ID; IA32_APIC_BASE (with the BSP flag) and the x2APIC mode stay (13.12.5.1). The TPR is the
+/// bank's `cr8`, which `power_on::init` clears. The software-disabled word is published before the IRR and TMR are
+/// cleared, so senders stop accepting fixed interrupts first; one that read the old word may still set an IRR bit after
+/// the clear (initsipi_model A2): it waits there until software enables the APIC (nothing is delivered while disabled), a
+/// delivery latency the SDM allows. The measured counter rate and the lost-tick policy and its counts are not APIC state.
+pub(super) fn init_reset(s: &mut State) {
+    let l = lapic();
+    *l = Lapic {
+        frequency: l.frequency,
+        reinject: l.reinject,
+        missed: l.missed,
+        reinjected: l.reinjected,
+        ..apic::RESET
+    };
+    publish(s);
+    (0..4).for_each(|w| {
+        irr_word(s.vcpu, w).store(0, SeqCst);
+        tmr_word(s.vcpu, w).store(0, SeqCst);
+    });
+    cntv(None);
 }

@@ -22,7 +22,8 @@
 - `cost` (not in the default set): microseconds per iteration of an xAPIC EOI, TPR write and register read, an x2APIC
   EOI and TPR WRMSR, and a NOP loop, as K2's slope method.
 - `cases`: natemu-only driver cases (SDM): xAPIC widths and alignment, a disabled APIC's page, re-enable resets,
-  relocation (to a device page: works; onto RAM: typed stop), INIT/start-up (X4's typed hook), SMI, illegal vectors
+  relocation (to a device page: works; onto RAM: typed stop), INIT/start-up selecting no CPU (no effect) and INIT to self
+  (the reset state, at the interpreter's entry), SMI (a typed stop), illegal vectors
   and the ESR, a software-disabled APIC, unimplemented xAPIC registers.
 
 Writes DIR/x3.json; exit status 1 on any failure."""
@@ -431,13 +432,20 @@ def cases():
     case('relocate-device', reloc, reached(rbx=0x50014), extra='mmio 0xfed00000 0xfed00000 unassigned\n')
     ram = 'mov ecx, 0x1b\nrdmsr\nmov eax, 0x200900\nnop\n'
     case('relocate-ram', ram + 'wrmsr\n', stopped('unsupported_system', at(ram)))
-    # INIT, start-up (X4's hook) and SMI: typed stops before any effect; INIT level de-assert: no effect.
-    for name, low in (('init', 0x4500), ('startup', 0x4608), ('smi', 0x4200)):
-        pre = X2_ON + SVR_ON + f'mov ecx, 0x830\nmov eax, {low:#x}\nmov edx, 1\n'
-        case(f'ipi-{name}', pre + 'wrmsr\n', stopped('unsupported_system', at(pre)))
+    # INIT and start-up (M2 Part 2) to APIC ID 1, absent at one vCPU: no CPU is selected, so nothing happens and the next
+    # instruction runs (they stopped `unsupported_system` before INIT and SIPI were built); a SIPI to self finds the
+    # sender neither INIT-pending nor waiting (discarded); INIT to self restarts the BSP at the reset vector, where the
+    # boot-time interpreter would run (its entry: `unsupported_mode` with the reset state, RIP FFF0H). SMI: a typed stop
+    # before any effect; INIT level de-assert: no effect.
+    for name, low in (('init', 0x4500), ('startup', 0x4608), ('startup-self', 0x44608)):
+        case(f'ipi-{name}', X2_ON + SVR_ON + f'mov ecx, 0x830\nmov eax, {low:#x}\nmov edx, 1\nwrmsr\nmov ebx, 1\n', reached(rbx=1))
+    case('ipi-init-self', X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0x44500\nxor edx, edx\nwrmsr\nmov ebx, 1\n',
+         stopped('unsupported_mode', 0xfff0))
+    pre = X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0x4200\nmov edx, 1\n'
+    case('ipi-smi', pre + 'wrmsr\n', stopped('unsupported_system', at(pre)))
     case('ipi-init-deassert', X2_ON + SVR_ON + 'mov ecx, 0x830\nmov eax, 0xc8500\nxor edx, edx\nwrmsr\nmov ebx, 1\n', reached(rbx=1))
-    xpre = 'mov eax, 0x1000000\n' + mmio_st(0x310) + 'mov eax, 0x4500\nnop\n'
-    case('ipi-init-xapic', xpre + mmio_st(0x300), stopped('unsupported_system', at(xpre)), svr=0x1ff)
+    xpre = 'mov eax, 0x1000000\n' + mmio_st(0x310) + 'mov eax, 0x4500\n'
+    case('ipi-init-xapic', xpre + mmio_st(0x300) + 'mov ebx, 1\n', reached(rbx=1), svr=0x1ff)
     # Illegal vectors (11.5.3): a fixed IPI or SELF IPI with vector 0..15 sets "send illegal vector" (bit 5) and sends
     # nothing; an LVT timer vector 3 expiring sets "receive illegal vector" (bit 6). The ESR shows them after a write.
     esr = 'mov ecx, 0x828\nxor eax, eax\nxor edx, edx\nwrmsr\nrdmsr\n'
