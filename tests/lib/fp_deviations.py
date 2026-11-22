@@ -30,6 +30,22 @@ CLASSES = {
                      'a runner case: +-0 with UE and PE where x86 gives +-MIN_NORMAL with PE (run_i5c `daz-ftz-band-*`)'),
     'ftz-band': ('C', 'with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm\'s denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right)',
                  'the smallest-normal result (no tagged case yet)'),
+    'x87-nan-results': ('X', "an x87 NaN result can differ from x86 in sign or choice: an invalid operation (0/0, infinity minus infinity, infinity times 0, the square root of a negative number) gives the positive default NaN where x86 gives the negative one, and an operation on a signalling NaN from memory and a quiet NaN in ST(0) returns the signalling one quieted where x86 keeps ST(0)'s (the flags are right)",
+                        "a runner case: the documented NaN in the register, everything else exact"),
+    'masked-x87-de': ('X', 'with DE masked, an x87 instruction on a denormal m32 or m64 operand does not set the status word\'s DE flag (the result is right)',
+                      'a runner case: the exact status word with DE cleared, everything else exact'),
+}
+
+
+# The x87 deviations that do not depend on the mode (docs/floating-point.md, "x87 deviations on every Mac" and the lists after it):
+# registered here by name so a runner or a known-bugs entry can cite them; no runner case is judged by them today (the doubles
+# items are the campaigns' expected failures; the two flag items lie outside what the x87 runners compare: UE and PE are not
+# judged there, and no case computes on a register that holds a denormal double).
+# name: (where it applies, description)
+X87_OTHER = {
+    'x87-doubles': ('every Mac, both modes', 'x87 registers hold 64-bit doubles, not the 80-bit format: `long double` has the precision and range of `double` (the list above)'),
+    'x87-band-ue-flag': ('Macs without FEAT_AFP, both modes', 'with UE masked, an x87 result just below the smallest normal double that rounds up to it sets the status word\'s UE flag (Arm judges tininess before rounding)'),
+    'x87-register-de': ('Macs with FEAT_AFP, both modes', 'an x87 instruction on a register that holds a denormal double sets the status word\'s DE flag; on x86 the register holds a normal 80-bit number and DE stays clear'),
 }
 
 
@@ -38,7 +54,9 @@ CLASSES = {
 FIXED_BY = {'masked-sse-de': 'accurate (chunk 2)', 'nan-results': 'accurate (chunk 4: IOE trap, the handler patches NaN lanes; the FMA NaN check)',
             'fma-invalid-flag': 'accurate (chunk 4: the handler removes the IOC of infinity times zero beside a QNaN addend)',
             'band-ue-flag': 'accurate (chunk 3: UFE trap, handler)', 'daz-ftz-band': 'accurate (chunk 5: FZ = 0 with UFE under DAZ + FTZ, row 4\'s input flush, the handler gives x86\'s flushed result)',
-            'ftz-band': 'accurate (chunk 3: the handler flushes the band lane under FTZ alone)'}
+            'ftz-band': 'accurate (chunk 3: the handler flushes the band lane under FTZ alone)',
+            'x87-nan-results': 'accurate (the per-operation x87 wrapper and its NaN fix-up)',
+            'masked-x87-de': 'accurate (the per-operation x87 wrapper and its software test of the memory operand)'}
 assert FIXED_BY.keys() == CLASSES.keys()
 
 
@@ -89,6 +107,16 @@ def verdict(tag, report, got, exact, deviated):
         if got == exact: return 'fail', f'tagged {tag} but exact: fast-mode code changed (documented deviation expected)'
         return 'fail', f'tagged {tag}: not the documented deviated result'
     return ('ok', None) if got == exact else ('fail', None)
+
+
+def x87_verdict(tag, report, exact, deviated):
+    """(kind, problems) of an x87 runner case with a class: `exact` and `deviated` are the problem lists of the case judged against
+    x86's result and against the documented deviated one. The rule is `verdict`'s: where it applies only the deviated result passes."""
+    if tag and applies(report):
+        if not deviated: return 'deviated', []
+        if not exact: return 'fail', [f'tagged {tag} but exact: fast-mode code changed (documented deviation expected)']
+        return 'fail', [f'tagged {tag}: not the documented deviated result'] + list(deviated)
+    return ('fail', list(exact)) if exact else ('ok', [])
 
 
 def mxcsr_verdict(mx, report, got):

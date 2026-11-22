@@ -108,6 +108,8 @@ def cases():
                     'setup': [f'memory {D + 0x200:#x} {value.to_bytes(8, "little").hex()}'], 'want': None, 'cpl': 3, 'mem_check': None,
                     'x87': None, 'insn': 'fxam',
                     'check': lambda vm, mem, fsw=fsw: (vm['gpr'][0] & 0xffff == fsw or f"fsw {vm['gpr'][0] & 0xffff:#x}, want {fsw:#x}",)})
+        # (the FLD's DE: fast mode on a host without AFP does not set it, fp_deviations `masked-x87-de`)
+        if fsw & 2: out[-1]['dev'] = ('masked-x87-de', lambda vm, mem, fsw=fsw & ~2: (vm['gpr'][0] & 0xffff == fsw or f"fsw {vm['gpr'][0] & 0xffff:#x}, want {fsw:#x} (deviated)",))
     out.append({'name': 'fxam-empty', 'lines': ['fninit', 'fxam', 'fnstsw ax'] + AFTER, 'setup': [], 'want': None, 'cpl': 3,
                 'mem_check': None, 'x87': None, 'insn': 'fxam',
                 'check': lambda vm, mem: (vm['gpr'][0] & 0xfdff == 0x4100 or f"fsw {vm['gpr'][0] & 0xffff:#x}, want 4100H (C1: the stale sign)",)})
@@ -226,6 +228,9 @@ def cases():
         rc(tag, ['fninit'] + lines + ['fnstsw ax'], [f'memory {D + 0x208:#x} {setup_bits}'],
            lambda vm, m, wb=want_bits, wf=want_fsw: (m8(m, 0x240) == wb or f'stored {m8(m, 0x240):#x}, want {wb:#x}',
                                                      vm['gpr'][0] & 0xffff == wf or f"fsw {vm['gpr'][0] & 0xffff:#x}, want {wf:#x}"))
+        if tag == 'denormal-fld-m64':   # (`masked-x87-de`: no DE in fast mode on a host without AFP)
+            out[-1]['dev'] = ('masked-x87-de', lambda vm, m, wb=want_bits: (m8(m, 0x240) == wb or f'stored {m8(m, 0x240):#x}, want {wb:#x}',
+                                                                              vm['gpr'][0] & 0xffff == 0 or f"fsw {vm['gpr'][0] & 0xffff:#x}, want 0 (deviated)"))
     rc('fcomi-clears-osa', ['lea rsp, [rsi]', 'fninit', 'fld1', 'fldz', 'mov eax, 0x7fffffff', 'add eax, 0x7fffffff', 'mov al, 0x0f', 'add al, 1',
                             'fcomi st(0), st(1)', 'pushfq', 'pop rax'], [],
        lambda vm, m: (vm['gpr'][0] & 0x8d5 == 0x01 or f"rflags {vm['gpr'][0]:#x}: want CF only (OF SF AF ZF PF cleared)",))
@@ -371,8 +376,12 @@ def main():
         (work / 'stdout').write_text(run.stdout)
         (work / 'stderr').write_text(run.stderr)
         problems = [f'driver: {run.stderr.strip()[-300:]}'] if run.returncode else judge(c, code, json.loads(run.stdout), offsets, regs)
+        kind = 'fail' if problems else 'ok'
+        if c.get('dev') and not run.returncode:   # a documented deviation of fast mode without AFP: judged by the one rule
+            kind, problems = dev.x87_verdict(c['dev'][0], json.loads(run.stdout), problems,
+                                             judge({**c, 'check': c['dev'][1]}, code, json.loads(run.stdout), offsets, regs))
         bad += bool(problems)
-        results.append({'name': c['name'], 'insn': c['insn'], 'ok': not problems, 'problems': problems})
+        results.append({'name': c['name'], 'insn': c['insn'], 'ok': not problems, 'outcome': kind, 'tag': c.get('dev', (None,))[0], 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
     dev.write_results(a.out / 'results.json', results)
     print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')

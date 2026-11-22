@@ -333,8 +333,9 @@ constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
 // A stack fault drops its instruction's own flags; inside a run they stay in FPSR, but with AFP the only flag such an
 // instruction's ops can raise is IOC (an SNaN beside the substituted QNaN, a compare or integer conversion of it), and the
 // stack fault itself sets IE, so nothing changes. An instruction converting an m32 operand has a DE fix-up that reads its
-// own ops' DZC and IDC: it clears FPSR first when the run left one of them set. Kept per op, as before: hosts without AFP
-// (their NaN and DE fix-ups read each op's flags) and unmasked exceptions.
+// own ops' DZC and IDC: it clears FPSR first when the run left one of them set. Kept per op, as before: unmasked exceptions,
+// and accurate mode on a host without AFP (its NaN and DE fix-ups read each op's flags; fast mode there runs in runs and
+// does without them: FexcX87Exact below, docs/restructure/m2-fast-x87-findings.md).
 // 64-bit code: a run ends at its IR block's end (every block of SSE code is entered with FPSR holding MXCSR's flags, as
 // before, and no SSE code changes). 32-bit code, where x87 is the usual floating point: a run stays open across blocks (links
 // and the dispatcher's hits keep FPSR, FPCR and the byte), each IR block's first x87 op asking the byte whether to start one

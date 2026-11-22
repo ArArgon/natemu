@@ -39,12 +39,14 @@ E30, E100 = 0x30800000, 0x0d800000                    # 2^-30, 2^-100
 lanes = lambda *v: (v[0] | v[1] << 32, v[2] | v[3] << 32) if len(v) == 4 else (v[0] | (v[1] if len(v) > 1 else 0) << 32, 0)
 
 
-def case(name, lines, setup=(), want=None, at=None, check=None, cpl=3, ne=True, mx=None):
+def case(name, lines, setup=(), want=None, at=None, check=None, cpl=3, ne=True, mx=None, xdev=None):
     """`want`: None (reach the hlt), ('fault', vector) at line `at` (default the last of `lines`), ('stop', reason).
     `mx`: the structured expected MXCSR of a SIMD case (`mxc`): judged by `judge` through tests/lib/fp_deviations.py, which tags a case
-    with a documented deviation of fast mode on a host without AFP; `check` keeps everything that is not MXCSR."""
+    with a documented deviation of fast mode on a host without AFP; `check` keeps everything that is not MXCSR.
+    `xdev`: (class, check) of an x87 case with a documented deviation of that mode (`x87-nan-results`, `masked-x87-de`): the check
+    of the deviated result, `check` being x86's (judged by fp_deviations `x87_verdict`)."""
     return {'name': name, 'lines': list(lines) + AFTER, 'setup': list(setup) + (['ne 1'] if ne else []), 'want': want,
-            'at': len(lines) - 1 if at is None else at, 'check': check, 'cpl': cpl, 'mx': mx}
+            'at': len(lines) - 1 if at is None else at, 'check': check, 'cpl': cpl, 'mx': mx, 'xdev': xdev}
 
 
 def mxc(want, start=MX):
@@ -545,7 +547,8 @@ def x87_cases():
         out.append(case(tag, ['fninit', FLDCW, 'fld qword ptr [rdi + 0x100]', ins, 'fwait'], cw(fcw_) + data(val, 0x1111111111111111), ('fault', 16),
                         check=expect(fsw=0x8080 | fl | 7 << 11, top=7, st={7: val}, mem=(D + 0x308, struct.pack('<Q', 0x1111111111111111)))))
         out.append(case(tag + '-masked', ['fninit', 'fld qword ptr [rdi + 0x100]', ins, 'fwait'], data(val, 0x1111111111111111), None,
-                        check=expect(fsw=fl | 0x20 if 'exact' not in tag else 0x2, mask=0x7f)))
+                        check=expect(fsw=fl | 0x20 if 'exact' not in tag else 0x2, mask=0x7f),
+                        xdev=('masked-x87-de', expect(fsw=0, mask=0x7f)) if 'exact' in tag else None))   # (the FLD m64's DE)
     # Invalid operands with IE unmasked: FIST out of range, FST m64 of an SNaN, FSQRT(-1), FCOM QNaN, FCOMI QNaN: no write,
     # condition codes and EFLAGS unchanged, no pop.
     IM = 0x37e
@@ -631,7 +634,7 @@ def x87_cases():
                                        ('fmul', 'fmul', ['fld1'], 0), ('fdiv', 'fdiv', ['fldz'], 0), ('fdivr', 'fdivr', ['fld1'], 0),
                                        ('fcom', 'fcom', ['fld1'], 0), ('fcomp', 'fcomp', ['fld1'], 1)):
             out.append(case(f'{name}-m{w}-denormal-masked-de', ['fninit'] + setup + [f'{ins} {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None,
-                            check=expect(fsw=DE | dtop(pops) << 11, mask=MK)))
+                            check=expect(fsw=DE | dtop(pops) << 11, mask=MK), xdev=('masked-x87-de', expect(fsw=dtop(pops) << 11, mask=MK))))
         # DE-free: a NaN in ST0 (IE for an SNaN, nothing for a QNaN); a memory dividend over a zero ST0 is ZE.
         for name, ins in (('fadd', 'fadd'), ('fmul', 'fmul'), ('fdiv', 'fdiv'), ('fsub', 'fsub')):
             out.append(case(f'{name}-m{w}-denormal-st0-qnan-masked-no-de', ['fninit', 'fld qword ptr [rdi + 0x108]', f'{ins} {ptr} ptr [rdi + 0x100]', 'fwait'],
@@ -642,7 +645,8 @@ def x87_cases():
                         data(den, QN64), None, check=expect(fsw=IE | 7 << 11, mask=MK)))
         out.append(case(f'fdivr-m{w}-denormal-st0-zero-masked-ze-not-de', ['fninit', 'fldz', f'fdivr {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None,
                         check=expect(fsw=ZE | 7 << 11, mask=MK, st={7: INF64})))
-        out.append(case(f'fld-m{w}-denormal-masked-de', ['fninit', f'fld {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None, check=expect(fsw=DE | 7 << 11, mask=MK)))
+        out.append(case(f'fld-m{w}-denormal-masked-de', ['fninit', f'fld {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None, check=expect(fsw=DE | 7 << 11, mask=MK),
+                        xdev=('masked-x87-de', expect(fsw=7 << 11, mask=MK))))
     out.append(case('fld-m64-snan-masked-ie-quieted', ['fninit', 'fld qword ptr [rdi + 0x100]', 'fwait'], data(SN64), None, check=expect(fsw=IE | 7 << 11, mask=MK, st={7: SN64Q})))
     out.append(case('fld-m32-snan-masked-ie-quieted', ['fninit', 'fld dword ptr [rdi + 0x100]', 'fwait'], data(SN32), None, check=expect(fsw=IE | 7 << 11, mask=MK, st={7: SN32D})))
     out.append(case('fld-m64-qnan-masked-clean', ['fninit', 'fld qword ptr [rdi + 0x100]', 'fwait'], data(QN64), None, check=expect(fsw=7 << 11, mask=MK, st={7: QN64})))
@@ -656,13 +660,15 @@ def x87_cases():
                ('0-over-0-m32', ['fldz'], 'fdiv dword ptr [rdi + 0x110]'), ('inf-times-0-m64', ['fld qword ptr [rdi + 0x100]'], 'fmul qword ptr [rdi + 0x110]'))
     for name, setup, ins in invalid:
         out.append(case(f'nan-{name}-indefinite', ['fninit'] + setup + [ins, 'fwait'], data(INF64, NINF64, 0), None,
-                        check=expect(fsw=IE | 7 << 11, mask=MK, st={7: INDEF})))
+                        check=expect(fsw=IE | 7 << 11, mask=MK, st={7: INDEF}),
+                        xdev=('x87-nan-results', expect(fsw=IE | 7 << 11, mask=MK, st={7: INDEF & ~(1 << 63)}))))   # the positive default NaN
     # NaN operands (an SNaN can only reach an operation from memory: FLD quiets it): the SNaN is quieted (IE); beside a QNaN in ST0 the QNaN
     # (also the M4's first-operand rule); of two QNaNs the one with the larger significand when it is the first operand (natemu keeps the M4's
     # first-operand rule for x87 where x86 takes the larger one in either order: COR-09, not judged here). Memory is ST0's second operand
     # except FDIVR/FSUBR's first.
-    nan = lambda name, lines, mem, fsw, st: out.append(case(f'nan-{name}', ['fninit'] + lines + ['fwait'], data(*mem), None, check=expect(fsw=fsw | 7 << 11, mask=MK, st={7: st})))
-    nan('qnan-st0-snan-mem-fadd', ['fld qword ptr [rdi + 0x108]', 'fadd qword ptr [rdi + 0x100]'], (SN64, QN64), IE, QN64)
+    nan = lambda name, lines, mem, fsw, st, arm=None: out.append(case(f'nan-{name}', ['fninit'] + lines + ['fwait'], data(*mem), None, check=expect(fsw=fsw | 7 << 11, mask=MK, st={7: st}),
+                                                                      xdev=arm and ('x87-nan-results', expect(fsw=fsw | 7 << 11, mask=MK, st={7: arm}))))
+    nan('qnan-st0-snan-mem-fadd', ['fld qword ptr [rdi + 0x108]', 'fadd qword ptr [rdi + 0x100]'], (SN64, QN64), IE, QN64, arm=SN64Q)   # (Arm: the signalling NaN first)
     nan('snan-mem-fdivr-one', ['fld1', 'fdivr qword ptr [rdi + 0x100]'], (SN64,), IE, SN64Q)
     nan('two-qnans-larger-mem-first-fsubr', ['fld qword ptr [rdi + 0x108]', 'fsubr qword ptr [rdi + 0x100]'], (QN64 | 0x1234, QN64), 0, QN64 | 0x1234)
     nan('two-qnans-larger-st0-first-fmul', ['fld qword ptr [rdi + 0x108]', 'fmul qword ptr [rdi + 0x100]'], (QN64, QN64 | 0x1234), 0, QN64 | 0x1234)
@@ -727,7 +733,8 @@ def judge(c, vm, offsets):
         problems.append(f"did not reach hlt: {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}")
     kind = 'ok'
     if not problems:
-        if c['check']: problems += c['check'](vm)
+        if c['xdev']: kind, problems = dev.x87_verdict(c['xdev'][0], vm, c['check'](vm), c['xdev'][1](vm))
+        elif c['check']: problems += c['check'](vm)
         if c['mx']:
             kind, why = dev.mxcsr_verdict(c['mx'], vm, int(vm['mxcsr'], 0))
             if why: problems.append(why)
@@ -814,7 +821,7 @@ def main():
             vm = json.loads(run.stdout)
             reports.add((vm.get('afp'), vm.get('fp')))
             problems, kind = judge(c, vm, offsets)
-        tag = (c['mx'] and c['mx']['tag']) or (c.get('value') or {}).get('tag')
+        tag = (c['mx'] and c['mx']['tag']) or (c.get('value') or {}).get('tag') or (c['xdev'] and c['xdev'][0])
         counts.add(kind, tag)
         results.append({'name': c['name'], 'ok': not problems, 'outcome': kind, 'tag': tag, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
