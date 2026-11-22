@@ -17,8 +17,9 @@ Results, all framework cases on the M2 Max:
   to SEC from both entries (`ovmf-natemu`);
 - no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case;
   M2 Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
-  [interp-transitions.md](interp-transitions.md)); and the system-call bench cases are no slower: `guest-hackbench32`
-  is faster beyond the noise, `guest-hackbench` and `guest-hackbench32-int80` within it ([benchmarks](../benchmarks.md)).
+  [interp-transitions.md](interp-transitions.md)); and the system-call bench cases are no slower: at the final tip
+  against 78f60965, `guest-hackbench32` −4.5% and `guest-hackbench32-int80` −5.1%, beyond the noise and from the
+  plumbing commits (d7bc0885 to be626aa8), `guest-hackbench` −0.8%, within it ([benchmarks](../benchmarks.md)).
 
 Design notes of the build: [interp-integration.md](interp-integration.md), [initsipi-resident.md](initsipi-resident.md),
 [interp-transitions.md](interp-transitions.md), [firmware-mode.md](firmware-mode.md); test contracts:
@@ -524,7 +525,7 @@ against the parent commit: the full gate; the replay check; the hackbench cases 
 beyond noise explained before merge. Built: the full gate ran at B1 (b) (8b022e58, on the branch 0624b341: its three
 failures as at the parent) and on the final tip (section 12); B2 had no gate of its own (its author ran its CPU start-up
 cases; the system, smp, interp and unit families ran at e21b0209, after the interpreter's merge); the hackbench cases
-ran at 78f60965, 75cfdd22 and e21b0209 and on the final tip ([benchmarks](../benchmarks.md)).
+ran at be626aa8, e21b0209 and the final tip, each against 78f60965 ([benchmarks](../benchmarks.md)).
 
 ## 10. Order of work
 
@@ -634,7 +635,7 @@ INIT/SIPI and interpreter together (ready; the INIT-before-TF order fixed), and 
 stop; TLB-flush tests added). The test pieces (reference rig, exit-test firmware, real-code suites) and INIT/SIPI were
 also reviewed by reviewers their authors briefed.
 
-**Commit ids.** Some commit messages on `boot-interp` (and [benchmarks](../benchmarks.md)) cite the commit an agent made
-on its own branch, which is not on `boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
+**Commit ids.** Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
+`boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
 cb7cd541 → d4bf265d; 8b022e58 → 0624b341; f29042cf → ce8cea18; bdb5dc09 → 40a888db; 315860f3 → d7bc0885;
 75cfdd22 → be626aa8. A number measured at one of those ids was measured on the agent's tree, not on `boot-interp`'s.
