@@ -3,7 +3,7 @@
 //! F4H-F7H (QEMU `-device isa-debug-exit,iobase=0xf4,iosize=0x4`, as kvm-unit-tests' `x86/run` adds it). A write of any
 //! width at any of its ports with value V ends the run as QEMU's process does with exit status (V << 1) | 1: the writing
 //! vCPU's run ends with the typed stop `Stop::Power(pm::DEBUG_EXIT)` after the write, and [`DebugExit::status`] gives the
-//! status. Reads answer all-ones, as an unassigned port (QEMU's device has no read callback).
+//! status. Reads answer 0, as QEMU's `debug_exit_read` does.
 use crate::devices::Device;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
@@ -37,8 +37,8 @@ impl DebugExit {
     }
 }
 impl Device for DebugExit {
-    fn read(&mut self, _vcpu: usize, _offset: u64, size: u64) -> Option<u64> {
-        Some(u64::MAX >> (64 - 8 * size))
+    fn read(&mut self, _vcpu: usize, _offset: u64, _size: u64) -> Option<u64> {
+        Some(0)
     }
     fn write(&mut self, _vcpu: usize, _offset: u64, _size: u64, value: u64) -> bool {
         // The first write ends the run; a second (another vCPU's, before the run ends) keeps the first's value.
@@ -55,7 +55,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// kvm-unit-tests' `outl(code, 0xf4)`: the value and QEMU's status ((0 << 1) | 1 = 1 is its pass), the power request
-    /// made; a byte write at F6H too; reads all-ones; nothing outside F4H-F7H.
+    /// made; a byte write at F6H too; reads 0 (QEMU's); nothing outside F4H-F7H.
     #[test]
     fn a_write_ends_the_run_with_qemus_status() {
         for (port, size, data) in [(0xf4u16, 4u64, 0u64), (0xf4, 4, 1), (0xf6, 1, 0x40 | 13)] {
@@ -64,8 +64,13 @@ mod tests {
             devices
                 .register_ports(PORT.into(), PORTS, Arc::new(Mutex::new(device)))
                 .unwrap();
-            assert_eq!(devices.port(0, 0xf4, 4, None), Ok(0xffff_ffff));
-            assert_eq!(devices.port(0, 0xf5, 2, None), Ok(0xffff));
+            assert_eq!(devices.port(0, 0xf4, 4, None), Ok(0));
+            assert_eq!(devices.port(0, 0xf5, 2, None), Ok(0));
+            assert_eq!(
+                devices.port(0, 0xf8, 1, None),
+                Ok(0xff),
+                "unassigned past F7H"
+            );
             assert_eq!((devices.power(), value.load(SeqCst)), (0, NONE));
             assert_eq!(devices.port(0, port, size, Some(data)), Ok(0));
             assert_eq!(devices.power(), crate::pm::DEBUG_EXIT);

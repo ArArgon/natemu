@@ -35,8 +35,10 @@
 //! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
 //!
 //! M2 Part 2 (boot-interpreter plan sections 6, 7): `--no-mailbox` leaves the multiprocessor wakeup mailbox out of the
-//! MADT, and each AP starts in the INIT state waiting for a SIPI (`Boot::mailbox`; the resident does not take INIT and
-//! SIPI yet, so such an AP halts at its first entry). An image without the bzImage magic but with a Multiboot header is
+//! MADT, and each AP starts in the INIT state (`Boot::mailbox`). Nothing marks it as waiting for a SIPI yet (the CPU
+//! start-up work adds that state), and the resident stops a vCPU outside 64-bit mode at its first entry
+//! (`unsupported_mode`), which ends the whole run: until then `--no-mailbox` with 2 or more vCPUs, and every Multiboot
+//! boot, ends at once. An image without the bzImage magic but with a Multiboot header is
 //! loaded by Multiboot (`boot::multiboot`: `--initrd` its one module, the command line QEMU's `-kernel` gives, the image's
 //! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the
 //! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V

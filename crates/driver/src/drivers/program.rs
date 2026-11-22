@@ -123,8 +123,10 @@
 //! (repeatable: the run ends when the vCPU is about to execute that linear address, stop ids 0.. in order, the first
 //! instruction included); `window GPA LEN` (repeatable; LEN in hex, as every number here: bytes read back at the end).
 //! The only address-space item is `memory GPA HEX`, bytes written at that guest-physical address (inside guest RAM);
-//! code is memory too. LDTR and TR are the reset values, DR0-DR7 too; the x87 state is FNINIT's (as every
-//! driver-started vCPU's). The vCPU's output gains `machine`: the fields `tests/interp/interp_rig.py`'s `fields()`
+//! code is memory too. LDTR and TR are the reset values, DR0-DR7 too, FCW 0040H as the SDM says (QEMU and KVM start
+//! with 037FH; no first-version instruction reads it; the rest of the x87 state, in the guest-state page, is FNINIT's).
+//! The MSRs are the firmware's, as for every driver-started vCPU (`execution::set_cpu`: `reset_msrs`, the MTRRs on),
+//! not power-on's (`cpu::power_on_msrs`). The vCPU's output gains `machine`: the fields `tests/interp/interp_rig.py`'s `fields()`
 //! reads from its capture record, `stop` (the id of the stop reached, null when the run ended otherwise:
 //! then `stop` and `reason` say why), `eax`..`edi` (the low 32 bits), `eflags`, `es`..`gs` (selectors), `cr0`, `cr3`,
 //! `cr4` (low 32 bits), `efer`, `gdtr` and `idtr` ([limit, low 32 bits of the base]) and `window0`.. (hex). A stop is
@@ -284,8 +286,6 @@ impl MachineState {
         let (_, mut cpu) = MachineState::power_on();
         (cpu.gpr, cpu.rip, cpu.rflags, cpu.cpl) = (c.gpr, c.rip, c.rflags | 2, c.cpl);
         (cpu.xmm, cpu.mxcsr) = (c.xmm, c.mxcsr);
-        // The x87 state as after FNINIT, as every driver-started vCPU's (the guest-state page holds FNINIT's), not RESET's.
-        cpu.fcw = exec::FCW_INIT;
         (cpu.cr0, cpu.cr3, cpu.cr4, cpu.efer) = (self.cr0, self.cr3, self.cr4, self.efer);
         (cpu.seg, cpu.gdtr, cpu.idtr) = (self.seg, self.gdtr, self.idtr);
         cpu
@@ -3628,13 +3628,12 @@ mod tests {
         assert_eq!(cpu.seg[exec::SREG_GS].base, 0x50000);
         assert_eq!((cpu.gdtr.base, cpu.gdtr.limit, cpu.idtr.limit), (0x1000, 0x67, 0x3ff));
         assert_eq!((cpu.ldtr, cpu.tr, cpu.dr), (exec::LDTR_RESET, exec::TR_RESET, exec::DR_RESET));
-        // An empty machine section is the power-on state (FCW but FNINIT's): the reset vector, EDX the signature.
+        // An empty machine section is the power-on state: the reset vector, EDX the signature, FCW 0040H.
         let d = parse("machine\n").unwrap();
         let cpu = d.cpus[0].machine.as_ref().unwrap().cpu(&d.cpus[0]);
         let mut want = cpu;
         natemu_abi::power_on::power_on(&mut want);
-        want.fcw = exec::FCW_INIT;
-        assert_eq!(cpu, want);
+        assert_eq!((cpu, cpu.fcw), (want, 0x40));
         assert_eq!((cpu.rip, cpu.seg[exec::SREG_CS].base, cpu.gpr[2]), (0xfff0, 0xffff_0000, 0x306c3));
         // Sections, each with its own state; the memory shared.
         let d = parse("machine\nmemory 0x10000 90\ncpu\nrip 1\ncpu\nrip 2\ncr0 0x11\n").unwrap();

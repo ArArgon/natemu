@@ -50,6 +50,7 @@ pub const DATA_RESET: Segment = Segment {
     base: 0,
 };
 /// The x87 FPU control word at power-on and RESET (Table 12-1: 0040H; FNINIT's is [`crate::execution::FCW_INIT`]).
+/// QEMU and KVM start a CPU with 037FH instead (FNINIT's); no instruction of the interpreter's first version reads it.
 pub const FCW_RESET: u64 = 0x40;
 /// EDX after power-on, RESET and INIT: the processor signature, the profile's CPUID.1:EAX (`cpu_profile.json`'s
 /// `identity.signature`).
