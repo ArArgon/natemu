@@ -24,7 +24,9 @@ off at CPL 0 (CR0 10011H, CS a flat 32-bit segment). Profiles 22-38 are the 32-b
 Profiles 39-47 cover the boot-time transitions: PE cleared and set (P32 -> P16 -> real mode -> P16 -> P32, the SDM's
 12.9.2 order), the invalid CR0 combinations, EFER.LME cleared and set under PG = 0 between two activations, CS.L under
 LMA = 0 (ignored by a far JMP, refused by activation), MOV CR4 with Linux's feature bits and PAE under PG = 0, and PG
-enabled without LME (legacy paging). Every record carries `imode`, the interpreted classification of
+enabled without LME (legacy paging). Profiles 48 and 49 run LIDT (m16&32: a 16-bit limit, a 32-bit base) and a 32-bit
+near RET in compatibility mode (OVMF, kvm-unit-tests; Vol. 2 "LGDT/LIDT", "RET"), and LIDT's #PF there; RET checks the
+popped EIP against the CS limit (#GP(0)) on a flat stack at STACK. Every record carries `imode`, the interpreted classification of
 `segment_model.interpreted_mode` at the instruction ('R', 'P16', 'P32', 'C16', 'C32', or None for 64-bit code).
 
 Model choices:
@@ -66,6 +68,7 @@ def programs(profile):
     cr0,cr3,cr4=[bytes.fromhex(s) for s in ('0f22c0','0f22d8','0f22e0')]
     wr=b'\x0f\x30';load=b'\x8b\x03';wide=b'\x48\x8b\x03'
     far=b'\xea'+bytes(4)+b'\x18\0';pointer=b'\x48\xff\x2e'
+    lidt=lambda a:b'\x0f\x01\x1d'+a.to_bytes(4,'little')          # LIDT [disp32] (32-bit code: m16&32)
     start=[mov(0x620),cr4,mov(0x100),wr,mov(0x6000),cr3,mov(0x80010011),cr0]
     cases=[
         [*start,far,wide,pointer,load,mov(0x10011),cr0,load],
@@ -99,6 +102,8 @@ def programs(profile):
         [*start,mov(0x80010010),cr0],                            # 45: PE cleared with PG = 1 (compatibility mode)
         [mov(0x80010011),cr0,load],                              # 46: PG without LME, PAE = 0: legacy paging
         None,                                                    # 47: assembled below
+        [*start,lidt(IDT_POINTER),b'\xc3',load],                 # 48: LIDT and near RET in compatibility mode
+        [*start,lidt(DATA+0x1000)],                              # 49: LIDT's operand not mapped: #PF
     ]
     if profile in (39,47):
         return _assemble(_real_programs(profile))
@@ -113,6 +118,8 @@ def programs(profile):
     return result
 
 
+IDT_POINTER=DATA+0x110               # profile 48: LIDT's operand (limit FFFH, base 12345678H)
+STACK=DATA+0x300                     # ESP at the start: profile 48's RET pops the next instruction's address there
 CODE16=0x20                          # profiles 39-47: a 16-bit code segment, base CODE16_BASE, limit FFFFH
 CODE16_BASE=0x100000
 LONG_D=0x30                          # profiles 39-47: L = D = 1, a 32-bit code segment while LMA = 0
@@ -182,6 +189,12 @@ def data(profile,memory):
         if instruction==b'\x48\xff\x2e':target=SOURCE+offset;break
     if profile==38:target=0x800000000000
     memory[0x100:0x10a]=target.to_bytes(8,'little')+(0x18 if profile==38 else 8).to_bytes(2,'little')
+    if profile>=48:
+        offset=0
+        for instruction in programs(profile):
+            offset+=len(instruction)
+            if instruction==b'\xc3':memory[STACK-DATA:STACK-DATA+4]=list((SOURCE+offset).to_bytes(4,'little'))
+        memory[IDT_POINTER-DATA:IDT_POINTER-DATA+6]=list((0xFFF).to_bytes(2,'little')+(0x12345678).to_bytes(4,'little'))
     return memory
 
 
@@ -225,7 +238,7 @@ def model(profile,initial_eax,memory,edx=0,stale=()):
     table=tables();pt=pae.tables(13);ps=pae.empty_state();ms=empty_state()
     ms.update(gdtr=[DATA+0x200,0x37],tr=[0x28,0,0x67,0x83 if profile==36 else 0x8b],pointer=DATA+0x100)
     cr0,cr3,cr4,efer=0x10011,0x6000 if profile==24 else 0x1020,0x620 if profile==24 else 0x600,0x100 if profile==24 else 0
-    cs=list(CS32);eax=initial_eax;generation=1;index=0;completed=0
+    cs=list(CS32);eax=initial_eax;generation=1;index=0;completed=0;esp=STACK
     records=[];mapping=None;walks=0;cleared=set();hits=iter(stale)
 
     def route(linear,write=False):
@@ -296,6 +309,20 @@ def model(profile,initial_eax,memory,edx=0,stale=()):
                         rec['stop']='paging without long mode'                    # M2
                     cr0,cr3,cr4=proposed;efer=pefer;generation+=1;mapping=None;cleared.clear()
         elif instruction[:1]==b'\xe9':pass
+        elif instruction[:3]==b'\x0f\x01\x1d':                                 # LIDT m16&32 (32-bit operand size)
+            addr=int.from_bytes(instruction[3:],'little')
+            gpa,error=route(addr)
+            if error is not None:rec.update(vector=14,error=error,linear=addr)
+            else:
+                raw=bytes(memory[gpa-DATA:gpa-DATA+6])
+                ms['idtr']=[int.from_bytes(raw[2:],'little'),int.from_bytes(raw[:2],'little')];rec['idtr_after']=ms['idtr']
+        elif instruction==b'\xc3':                                             # RET near, 32-bit (flat SS)
+            gpa,error=route(esp)
+            if error is not None:rec.update(vector=14,error=error,linear=esp)
+            else:
+                ret=int.from_bytes(bytes(memory[gpa-DATA:gpa-DATA+4]),'little')
+                if ret>cs[2]:rec.update(vector=13,error=0)                     # beyond the CS limit
+                else:esp+=4;rec.update(far_target=ret,esp_after=esp)
         else:
             target=selector=None
             if far_pointer(instruction,cs):
@@ -362,7 +389,7 @@ def seglimit(desc):
     return limit<<12|0xfff if desc>>55&1 else limit
 
 
-PROFILES=range(22,48)
+PROFILES=range(22,50)
 
 
 def ending(result):
