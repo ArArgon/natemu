@@ -48,6 +48,8 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
                                 when set, replaces it for the run: `SUITE:ARGS` entries, `;`-separated, for their suite
                                 (`stress:scale=1,timeout=240`, a full-size run on request), a bare `ARGS` for every
                                 suite no entry names; an empty ARGS means none (part_args() below)
+    perf_parts = ["part-1"]     parts that run on performance cores only (`needs` with perf, case_needs()): a part whose
+                                guest cap is wall-clock time and would not finish on an efficiency core
 
 The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-cases.txt`, every test the
 image runs, one `PART TEST` line each, PART being the kernel's `part=` word for that boot (`0/4`, `mem1`, `7/1`). The
@@ -492,6 +494,10 @@ class Campaign:
         """Room for every boot a part may take (a flaky rerun is a second one)."""
         boots = 2 if suite.extra.get('flaky') or suite.extra.get('verdict_flaky') else 1
         return boots * (float(suite.extra.get('cap', 3600)) + AFTER_END + 30) + 120
+
+    def case_needs(self, fam, suite, case):
+        """The suite's needs, with `perf` (performance cores only) for a part named in `perf_parts`."""
+        return dataclasses.replace(suite.needs, perf=True) if case in suite.extra.get('perf_parts', ()) else suite.needs
 
     def requirements(self, fam, suite, variant):
         return [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'),

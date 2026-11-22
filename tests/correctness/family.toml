@@ -1228,6 +1228,8 @@ cap = 450
 verdict = "verdicts:public"
 matrix = { "machine.vcpus" = [1, 4] }
 needs = { cores = 4 }
+# rseq basic_percpu_ops (~170 s at 1 vCPU): the guest's 300 s cap is wall-clock time, and efficiency cores are about 4.5x slower (M4).
+perf_parts = ["part-1", "part-2"]
 # One part per kind, to show the campaign works end to end (`run --tier campaign ... -k "public and smoke"`):
 # rseq-basic_test (selftest), qemu-cmpxchg (QEMU tests/tcg), ltp-mmap01 (LTP), kunit-memcpy_kunit (KUnit on the test
 # kernel), kernel-test_bitmap (a test module), locktorture-spin_lock (a torture module), lkmm-SB+poonceonces (an LKMM

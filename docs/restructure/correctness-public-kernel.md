@@ -177,7 +177,9 @@ to `ubuntu@192.168.12.10` failed with `No route to host` before authentication.
 Independent source review confirms that the first two rseq programs completed
 on both emulators at both CPU counts. The larger test performs one million
 spinlock iterations and twenty million list iterations containing sched_yield;
-its longer N1 execution was not a stall.
+its longer N1 execution was not a stall. It is a performance gap: at one vCPU
+natemu took 210 s in these runs (about 170 s in campaign case
+`public/part-1[vcpus=1]`, M4 performance core, November 22) against QEMU's 68 s, while at four vCPUs the two are close (24.5 s and 18.8 s).
 
 Preparation records are separate from test outcomes. `kernel-01` was rejected
 before execution because module dependency metadata still named compressed files
