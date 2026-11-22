@@ -461,6 +461,9 @@ SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push
            (0x7fff_ffff_fffc, 'pop', 'pop rcx'), (0xffff_7fff_ffff_fffc, 'pop', 'pop rcx')]
 # E3 (no address guard): every class of the former private window and both holes, each a hardware fault at the access
 # site that must give #GP(0), or #SS(0) for a stack access, with the exact state. (name, page; abi `PRIVATE` layout.)
+# For the next re-seed of this family's QEMU answers (a new page is a new program): since M2 Part 2 the resident's text is a
+# 2 MiB block at PRIVATE + 0x20_0000 (abi `resident::TEXT_OFFSET`), so `text` below probes an unmapped window page; move it
+# there then (as `guest-ram` and `global`, which lag the alias at PRIVATE + 2 GiB and the global area at PRIVATE + 1 GiB).
 WINDOW = [('tables', PRIVATE + 0x1_0000), ('shared', PRIVATE + 0x2_0000), ('state', PRIVATE + 0x2_2000), ('frame', PRIVATE + 0x2_3000),
           ('stack', PRIVATE + 0x5_3000), ('exception-stack', PRIVATE + 0x6_3000), ('staging', PRIVATE + 0x7_0000),
           ('text', PRIVATE + 0xa_0000), ('pool', PRIVATE + 0xe_0000), ('guest-ram', PRIVATE + 0x4000_0000 + D), ('ram-tables', PRIVATE + 0x2_5000), ('pool-high', PRIVATE + 0x1f_f000),
