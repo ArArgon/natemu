@@ -55,7 +55,7 @@ needs = { cores = 4, perf = true }
 # -qemu the pinned QEMU 11.1.2 under TCG, -kvm real hardware (the x86 reference machine under KVM). Their answers are
 # locked in tests.lock: a run checks that the lock's answer for the image as built now is the expected report, without
 # QEMU or the x86 machine; seeding (TESTKIT_SEED_ANSWERS=1, and NATEMU_X86_HOST=user@host for -kvm) runs them. The
-# natemu cases come with the slices that make them pass (the CPU start-up slice, the firmware boot mode).
+# natemu cases: the program variant's (the CPU start-up slice) and the firmware's (the firmware boot mode).
 [[suite]]
 name = "exit-fw"
 kind = "judged"
@@ -86,6 +86,14 @@ timeout = 2400
 # their SIPI in the boot-time interpreter (16 -> 32 -> compatibility mode) to 64-bit code and are counted from there.
 [suite.cases."exit-ap-natemu"]
 argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+smoke = true
+
+# The firmware under natemu's firmware boot mode (docs/restructure/firmware-mode.md), at 1, 2 and 4 CPUs, the BSP from the
+# reset vector: COM1's report and the power-off, decode exits and shootdowns bounded (tests/boot/run_exit_fw.py --variant
+# firmware --backend natemu).
+[suite.cases."exit-fw-natemu"]
+argv = ["tests/boot/run_exit_fw.py", "--variant", "firmware", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
 smoke = true
 
@@ -138,3 +146,9 @@ needs = { cores = 1 }
 argv = ["tests/boot/run_ovmf.py", "--backend", "kvm", "--out", "{out}"]
 needs = { cores = 1 }
 timeout = 2400
+
+# OVMF in natemu's firmware boot mode from both entries to SEC's entry, judged as the references and compared with KVM's
+# locked registers (tests/boot/run_ovmf.py --backend natemu).
+[suite.cases."ovmf-natemu"]
+argv = ["tests/boot/run_ovmf.py", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 1, perf = true }

@@ -10,12 +10,16 @@ interpreter asks at CS.base + EIP before each decode, and the host never makes a
     tools/natemu-test run tests/interp -k natemu      # the corpus (case `natemu`) and the self-tests (`natemu-machine`)
 
 The corpus case runs every case, `--jobs` at a time; every one must match its answers. `--selftest` runs machine
-descriptions with the fields each must leave: in 64-bit mode (translated code), and in the interpreted modes (the
+descriptions with the fields each must leave: in 64-bit mode (translated code), in the interpreted modes (the
 interpreter's own rules: an unaligned LOCK inside and across 16 bytes, an instruction ending at a page end or at the CS
 limit and one running past it, unassigned and device pages, self-modifying code, the typed stops' records, HLT, the
-order of an INIT before TF, and on two CPUs a SIPI that leaves an interpreted HLT as it is where an INIT ends it).
-`--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop and record the model
-gives with nothing committed, or the state it reaches; modes_model's programs to where the model ends them).
+order of an INIT before TF, and on two CPUs a SIPI that leaves an interpreted HLT as it is where an INIT ends it), and
+with a firmware image (`firmware HEX`, docs/restructure/firmware-mode.md: the reset vector fetched from it, stores to it
+dropped by the interpreter, by translated code and by the resident's `copy`, the resident's reads of it, code run from
+it while a RAM page holding translations is written, the same above 3 GiB of RAM, and a LOCKed access to it refused, the
+recorded deviation). `--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop
+and record the model gives with nothing committed, or the state it reaches; modes_model's programs to where the model
+ends them).
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402,E702
 import argparse
@@ -23,6 +27,7 @@ import concurrent.futures
 import fnmatch
 import json
 import subprocess
+import tempfile
 
 import interp_cases as G
 import interp_rig as R
@@ -35,7 +40,7 @@ def description(case: dict, common: list) -> str:
     """The case as a machine description: the common blocks, the case's memory and code (physical: linear = physical in
     every case), its whole starting state, every stop's linear address (ids in order) and every compared window."""
     st = case['state']
-    lines = ['machine']
+    lines = ['machine'] + ([f"firmware {case['firmware']}"] if case.get('firmware') else [])
     blocks = [*common, *case['memory'], case['code']]
     lines += [f"memory {num(b['addr']):#x} {b['data']}" for b in blocks if b['data']]
     lines.append(f"rip {num(st['eip']):#x}")
@@ -70,12 +75,13 @@ def judge(case: dict, natemu: dict, locked: dict) -> list:
     return diffs
 
 
-def run(host, runtime, fexc, text: str, work: pathlib.Path) -> dict:
-    """One machine description through the program driver: its one state object (`machine` among it), or a failure."""
+def run(host, runtime, fexc, text: str, work: pathlib.Path, ram: int | None = None) -> dict:
+    """One machine description through the program driver (`ram`: its guest RAM, else the driver's default): its one state
+    object (`machine` among it), or a failure."""
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
-    r = subprocess.run([str(host), str(runtime), 'run-program', str(fexc), str(work / 'program.txt'), str(work)],
-                       capture_output=True, text=True, timeout=300)
+    r = subprocess.run([str(host), str(runtime), 'run-program', str(fexc), str(work / 'program.txt'), str(work),
+                        *(['--ram', hex(ram)] if ram else [])], capture_output=True, text=True, timeout=300)
     (work / 'stderr.txt').write_text(r.stderr)
     try: out = json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError): return {'stop': 'driver', 'reason': f'exit {r.returncode}: {r.stderr.strip()[-600:]}'}
@@ -254,6 +260,109 @@ def two_cpu_selftests() -> list:
     return [('smp-hlt-sipi-init', '\n'.join(text) + '\n', want)]
 
 
+# --- the firmware boot mode's self-tests: a firmware image (`firmware HEX`) read, fetched, its stores dropped ---
+
+ROM = 0xFFFFF000        # a 4 KiB image: code at its start, data at ROM_DATA, the reset vector at FFFFFFF0H
+ROM_DATA = ROM + 0x800
+ROM_GDT = ROM + 0x880   # a GDT in the image: null, 64-bit code (08H), flat data with its accessed bit clear (10H)
+ROM_BYTES = {0x800: 0x0123456789ABCDEF.to_bytes(8, 'little'), 0x810: bytes([0xA5] * 16), 0x820: (0xC0FFEE00).to_bytes(4, 'little'),
+             0x828: (0x10).to_bytes(4, 'little'), 0x840: (0x17).to_bytes(2, 'little') + ROM_GDT.to_bytes(8, 'little'),
+             0x880: b''.join(d.to_bytes(8, 'little') for d in (0, 0x00AF9B000000FFFF, 0x00CF92000000FFFF))}
+ROM_PD = 0x98000        # a page directory for 3-4 GiB (PDPT entry 3 of the common tables): its last entry the 2 MiB leaf FFE00000H
+
+
+def nasm(bits: int, org: int, lines: list) -> bytes:
+    """`lines` assembled at `org` (absolute addresses, unlike `G.assemble`'s position-independent snippets)."""
+    with tempfile.TemporaryDirectory() as d:
+        src = pathlib.Path(d) / 'a.asm'
+        src.write_text('\n'.join([f'bits {bits}', f'org {org:#x}', *lines]) + '\n')
+        r = subprocess.run(['nasm', '-f', 'bin', '-O9', str(src), '-o', str(src.with_suffix('.bin'))], capture_output=True, text=True)
+        if r.returncode: raise RuntimeError(f'nasm: {r.stderr[-2000:]}')
+        return src.with_suffix('.bin').read_bytes()
+
+
+def rom_image(code: bytes, reset: bytes = b'') -> str:
+    """The image's hex: `code` at its start, ROM_BYTES, `reset` at FFFFFFF0H, 0xCC elsewhere."""
+    img = bytearray([0xCC] * 0x1000)
+    img[:len(code)] = code
+    for o, b in ROM_BYTES.items(): img[o:o + len(b)] = b
+    img[0xFF0:0xFF0 + len(reset)] = reset
+    return bytes(img).hex()
+
+
+def rom_state(regs: dict, eip: int, segs: dict, ctl: dict, idtr) -> dict:
+    return {'gpr': {r: G.h(regs.get(r, 0)) for r in G.GPRS}, 'eip': G.h(eip), 'eflags': G.h(0x2), 'cpl': 0,
+            'seg': {s: {k: G.h(v) for k, v in segs[s].items()} for s in G.SREGS}, **{k: G.h(v) for k, v in ctl.items()},
+            'gdtr': {'base': G.h(G.GDT), 'limit': G.h(G.GDT_LIMIT)}, 'idtr': {'base': G.h(idtr[0]), 'limit': G.h(idtr[1])}}
+
+
+def firmware_selftests() -> list:
+    """(name, case, want) with a firmware image: `want` as interp_selftests'; `rip` and `gpr` ({index: value}) compare the
+    driver's final RIP and 64-bit registers."""
+    out = []
+    # Real mode from the power-on state: the reset vector's near JMP fetched from the image, then stores to it dropped (MOV,
+    # LOCK BTS of a clear bit: CF 0, the word unchanged), each read back; to a stop, and on to a form outside the first
+    # version (its typed stop there).
+    r16 = nasm(16, 0xF000, ['mov al, [cs:0xF800]', 'mov byte [cs:0xF800], 0x5A', 'mov bl, [cs:0xF800]',
+                            'mov word [cs:0xF820], 0x1234', 'mov cx, [cs:0xF820]', 'lock bts word [cs:0xF828], 0',
+                            'mov dx, [cs:0xF828]', 'out 0x80, al'])
+    end16 = 0xF000 + len(r16) - 2                                   # the OUT's IP
+    reset = nasm(16, 0xFFF0, ['jmp near 0xF000'])
+    power_on = {s: {'sel': 0, 'base': 0, 'limit': 0xffff, 'attr': 0x93} for s in G.SREGS}
+    power_on['cs'] = {'sel': 0xF000, 'base': 0xFFFF0000, 'limit': 0xffff, 'attr': 0x9b}
+    ctl0 = dict(cr0=0x60000010, cr3=0, cr4=0, efer=0)
+    r_regs = {'eax': 0xEF, 'ebx': 0xEF, 'ecx': 0xEE00, 'edx': 0x10, 'eflags': 0x2, 'cs': 0xF000}
+    for name, stops, want in (('r-rom-reset', [0xFFFF0000 + end16], {'stop': 0, **r_regs, 'rip': end16}),
+                              ('r-rom-typed-stop', [], {'resident': 'interp_unsupported', 'stop': None, **r_regs, 'rip': end16})):
+        out.append((name, {'name': name, 'firmware': rom_image(r16, reset), 'state': rom_state({}, 0xFFF0, power_on, ctl0, (0, 0x3ff)),
+                           'code': {'addr': G.h(G.CODE), 'data': ''}, 'memory': [],
+                           'stops': [{'id': k, 'linear': G.h(s)} for k, s in enumerate(stops)], 'compare': {'windows': []}}, want))
+    # P32, flat, code in the image: its reads, a MOV store and LOCK XADD to it dropped (ECX gets the old value), a RAM store.
+    p32 = nasm(32, ROM, [f'mov eax, [{ROM_DATA:#x}]', f'mov dword [{ROM_DATA:#x}], 0', f'mov ebx, [{ROM_DATA:#x}]', 'mov ecx, 5',
+                         f'lock xadd [{ROM_DATA + 0x28:#x}], ecx', f'mov edx, [{ROM_DATA + 0x28:#x}]', f'mov byte [{G.DATA:#x}], 0x77'])
+    flat = G.start_segments('P32')
+    out.append(('p32-rom', {'name': 'p32-rom', 'firmware': rom_image(p32), 'code': {'addr': G.h(G.CODE), 'data': ''},
+                            'state': rom_state({'esp': G.STACK}, ROM, flat, {k: G.MODES['P32'][k] for k in ctl0}, G.MODES['P32']['idtr']),
+                            'memory': [{'addr': G.h(G.DATA), 'data': '00' * 16}], 'stops': [{'id': 0, 'linear': G.h(ROM + len(p32))}],
+                            'compare': {'windows': [{'addr': G.h(G.DATA), 'len': 16}]}},
+                {'stop': 0, 'eax': 0x89ABCDEF, 'ebx': 0x89ABCDEF, 'ecx': 0x10, 'edx': 0x10, 'eflags': 0x2, 'window0': '77' + '00' * 15}))
+    # 64-bit mode at CPL 0 over the common tables, the image mapped by a 2 MiB leaf: from RAM, a translated MOV store and SGDT
+    # (the resident's `copy`) to the image, each read back; the resident's reads of it (LGDT of a GDT in it, a MOV DS
+    # through a descriptor there whose accessed bit stays clear: `atomic_byte`'s write dropped, read back); then twice
+    # into code run from the image, which stores to the
+    # image, to the RAM page holding the RAM code's translations (the code-write protocol while the image's page holds
+    # translations: past the per-page tables below 3 GiB of RAM, inside them above) and to the data window, and returns.
+    back = G.CODE + 0x40
+    rom64 = nasm(64, ROM, ['mov dword [rsi + 0x20], 0x22222222', 'mov edi, [rsi + 0x20]', 'mov byte [0x10ff0], 0x90',
+                           'inc r10d', f'mov [{G.DATA:#x}], r10d', f'mov edx, {back:#x}', 'jmp rdx'])
+    ram64 = nasm(64, G.CODE, [f'mov esi, {ROM_DATA:#x}', 'mov rax, [rsi]', 'mov dword [rsi], 0x11111111', 'mov rbx, [rsi]',
+                              'sgdt [rsi + 0x10]', 'mov rcx, [rsi + 0x10]', 'lgdt [rsi + 0x40]', 'mov eax, 0x10', 'mov ds, ax',
+                              'movzx r11d, byte [rsi + 0x95]', 'mov rax, [rsi]', 'mov r9d, 2', 'again:', f'mov edx, {ROM:#x}', 'jmp rdx',
+                              f'times {back - G.CODE} - ($ - $$) nop', 'dec r9d', 'jnz again'])
+    segs64 = {'es': G.loaded(0x10), 'cs': G.loaded(0x28), 'ss': G.loaded(0x10), 'ds': G.loaded(0x10), 'fs': G.loaded(0x40),
+              'gs': G.loaded(0x48)}
+    ctl64 = dict(cr0=G.CR0_PG | G.CR0_ET | G.CR0_PE, cr3=G.PML4, cr4=G.CR4_PAE, efer=G.EFER_LME | G.EFER_LMA)
+    rom_map = [{'addr': G.h(G.PML4 + 0x1000 + 3 * 8), 'data': (ROM_PD | 0x23).to_bytes(8, 'little').hex()},
+               {'addr': G.h(ROM_PD), 'data': bytes(511 * 8).hex() + (0xFFE00000 | 0xE3).to_bytes(8, 'little').hex()}]
+    l64 = {'state': rom_state({'esp': G.STACK}, G.CODE, segs64, ctl64, (G.IDT64, 0x1ff)), 'firmware': rom_image(rom64),
+           'code': {'addr': G.h(G.CODE), 'data': ram64.hex()},
+           'memory': [*rom_map, {'addr': G.h(G.DATA), 'data': '00' * 16}],
+           'stops': [{'id': 0, 'linear': G.h(G.CODE + len(ram64))}], 'compare': {'windows': [{'addr': G.h(G.DATA), 'len': 16}]}}
+    want64 = {'stop': 0, 'eax': 0x89ABCDEF, 'ebx': 0x89ABCDEF, 'ecx': 0xA5A5A5A5, 'edi': 0xC0FFEE00, 'eflags': 0x46,
+              'window0': '02' + '00' * 15, 'ds': 0x10, 'gdtr': [0x17, ROM_GDT],
+              'gpr': {0: 0x0123456789ABCDEF, 3: 0x0123456789ABCDEF, 1: 0xA5A5A5A5A5A5A5A5, 7: 0xC0FFEE00, 9: 0, 10: 2, 11: 0x92},
+              'rip': G.CODE + len(ram64)}
+    out.append(('l64-rom', {'name': 'l64-rom', **l64}, want64))
+    out.append(('l64-rom-high', {'name': 'l64-rom-high', 'ram': (4 << 30) + (2 << 20), **l64}, want64))
+    # A LOCKed access to the image from translated code: refused before any effect (`unsupported_mmio`, the recorded
+    # deviation: docs/restructure/boot-handoff.md, "Typed refusals").
+    lock64 = nasm(64, G.CODE, [f'mov esi, {ROM_DATA:#x}', 'lock add dword [rsi], 1'])
+    out.append(('l64-rom-lock', {'name': 'l64-rom-lock', **l64, 'code': {'addr': G.h(G.CODE), 'data': lock64.hex()},
+                                 'stops': [{'id': 0, 'linear': G.h(G.CODE + len(lock64))}]},
+                {'resident': 'unsupported_mmio', 'stop': None, 'rip': G.CODE + 5}))
+    return out
+
+
 def typed_stop(out: dict, want: dict) -> list:
     """The differences of how a run ended from `want`: a typed stop (`resident`, its name; `fault`, the record's first
     three words) or none."""
@@ -319,7 +428,7 @@ def main(argv=None):
     common = doc['common']
     results = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.jobs))
-    go = lambda name, case: run(a.host, a.runtime, a.fexc, description(case, common), a.out / 'work' / name)
+    go = lambda name, case: run(a.host, a.runtime, a.fexc, description(case, common), a.out / 'work' / name, case.get('ram'))
     if a.faults:
         import interp_faults
         tests = interp_faults.all_cases(sys.modules[__name__])
@@ -327,13 +436,18 @@ def main(argv=None):
             diffs = judge_fault(case, out, want)
             results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
     elif a.selftest:
-        tests = selftests() + interp_selftests()
+        tests = selftests() + interp_selftests() + firmware_selftests()
         for (name, case, want), out in zip(tests, pool.map(lambda t: go(t[0], t[1]), tests)):
             got = out.get('machine')
-            fields = {k: v for k, v in want.items() if k not in ('resident', 'fault')}
+            fields = {k: v for k, v in want.items() if k not in ('resident', 'fault', 'rip', 'gpr')}
             diffs = typed_stop(out, want) + ([f'no machine output: {out.get("reason")}'] if got is None else
                                              [f'{k}: natemu {R._show(got.get(k))}, want {R._show(v)}'
                                               for k, v in fields.items() if got.get(k) != v])
+            if 'rip' in want and num(out.get('rip', '0x0')) != want['rip']:
+                diffs.append(f'rip: natemu {out.get("rip")}, want {want["rip"]:#x}')
+            gpr = out.get('gpr') or []
+            diffs += [f'r{k}: natemu {gpr[k] if k < len(gpr) else None}, want {v:#x}' for k, v in want.get('gpr', {}).items()
+                      if k >= len(gpr) or num(gpr[k]) != v]
             results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
         for name, text, want in two_cpu_selftests():
             out = run(a.host, a.runtime, a.fexc, text, a.out / 'work' / name)

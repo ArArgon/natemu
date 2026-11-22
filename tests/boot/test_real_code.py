@@ -126,6 +126,31 @@ def test_ovmf_judge_passes_the_pass_and_refuses_each_fault(entry):
     assert ovmf.judge(entry, good, SEC + 1, BFV) and ovmf.judge(entry, good, SEC, BFV - 0x1000)
 
 
+def natemu_report(entry, stop='reached', reason='', rip=SEC, ports=(), pages=(), native=0):
+    """The test driver's `boot-linux` report of a natemu run of `entry`, with its registers those of the pass."""
+    r = ovmf.expected_registers(entry, SEC, BFV)
+    gpr = [r[k] for k in ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi')] + [r[f'r{k}'] for k in range(8, 16)]
+    state = {'gpr': [hex(x) for x in gpr], 'rip': hex(rip), 'rflags': hex(0x56 | 0x10000),
+             'seg': [hex(r[k]) for k in ('es', 'cs', 'ss', 'ds', 'fs', 'gs')],
+             **{k: hex(r[k]) for k in ('fs_base', 'gs_base', 'cr0', 'cr3', 'cr4', 'efer')}}
+    return {'stop': stop, 'reason': reason, 'state': state, 'ports': list(ports), 'unassigned_pages': list(pages),
+            'vcpus': [{'native': [hex(native), '0x0', '0x0']}]}
+
+
+@pytest.mark.parametrize('entry', ovmf.ENTRIES)
+def test_ovmf_natemu_answer_and_judge(entry):
+    """natemu's answer from the driver's report passes the judge without its debug-port line (natemu stops before SEC
+    writes it) and fails it with a device access, another stop or another RIP; with the line required it fails."""
+    a = ovmf.natemu_answer(natemu_report(entry), SEC)
+    assert a['stop'] == 'breakpoint' and a['regs']['eflags'] == 0x46 and a['devices'] == [] and a['debugcon'] == []
+    assert ovmf.judge(entry, a, SEC, BFV, debugcon=False) == []
+    assert ovmf.judge(entry, a, SEC, BFV), 'the debug-port line is required by default'
+    for bad in (natemu_report(entry, ports=[{'port': '0x402', 'reads': 1, 'writes': 0, 'unassigned': True}]),
+                natemu_report(entry, pages=[{'page': '0xfe000000', 'reads': 1, 'writes': 0}]),
+                natemu_report(entry, stop='watchdog', reason='guest pc=0x1'), natemu_report(entry, rip=SEC + 2)):
+        assert ovmf.judge(entry, ovmf.natemu_answer(bad, SEC), SEC, BFV, debugcon=False), bad
+
+
 QEMU10 = "818@{t:.6f}:memory_region_ops_{op} cpu {cpu} mr 0x60a24df041b0 addr 0x{a:x} value 0x0 size 1 name '{name}'"
 QEMU11 = "{iso}Z memory_region_ops_{op} cpu {cpu} mr 0x10485d240 addr 0x{a:x} value 0x0 size 1 name '{name}'"
 
