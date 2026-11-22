@@ -57,6 +57,14 @@ Perf chunk 8 (links kept across TLB events):
   reload: the block is revalidated as large, and an INVLPG of another page of LP cuts it (r9 = 2).
 - `large-64`, `large-65` (natemu only, perf chunk 19): large blocks in 64 and 65 regions (as many as `Control::large_list`
   holds, and one more): an INVLPG of another page of the last region cuts its block (r8 = 64 or 65, r9 = 2).
+- `pf-relist` (natemu only; linear chains hold only current blocks): B on V run, made stale by a CR3 reload and called
+  (revalidated while still on its chain: it must not be pushed again), stale again; an INVLPG of V drops it from its linear
+  chain without cutting it; B called again (revalidated: back on its chain); then `pf-remap`'s sequence: the #PF must still
+  reach B, so the call runs F2's bytes (r8 = r12 = r10 = 1, r14 = 1, r9 = 2). `pf-relist-cross`: the
+  crossing block of `cross`, the INVLPG and the #PF on its second page (its second chain); `pf-relist-straddle` the same at
+  0x1ffffe; `pf-relist-global`: V global under PGE, stale by a global flush, and a CR3 reload before the #PF (the block stays
+  current through it: the #PF must cut it, not drop it); `pf-relist-large`: the block of `pf-large`, the INVLPG and the #PF
+  at another 4 KiB page of its 2 MiB page.
 - `cross-link`: `cross` through a direct jump from the first page into the crossing instruction: the link is not local (its
   target has a page its source lacks) and goes at the INVLPG of the second page alone.
 - `local-gpa` (natemu only): a link from S into T on S's page made after the page was remapped with no INVLPG (S from F1,
@@ -417,6 +425,14 @@ def links_bodies(k, i, n):
     rounds = lambda tag, off, reg: ''.join(jump(f'{tag}{r}', off) + f'    add {reg}, rax\n' for r in range(3))
     loop = lambda tag, reg: f'    mov ecx, 3\n.{tag}:\n    call .sub\n    add {reg}, rax\n    dec ecx\n    jnz .{tag}\n'
     pde = lambda frame, j=0, present=1: f'    mov rax, {frame | 0x80 | P.LEAF & ~(1 - present):#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * ((LP >> 21) + j):#x}], rax\n'
+    put_raw = lambda va, pte: f'    mov rax, {pte:#x}\n    mov [{leaf(va):#x}], rax\n'
+    def relist(at, stale, invlpg, np, load, fix, mid, pre=''):
+        # (r8: the first run; r12: the run revalidating it while it is still on its chains (no second push); r10: the run after the
+        # INVLPG (relisted); r9: after the #PF; r14: the #PFs.)
+        c = lambda tag: call(tag, f'{at:#x}')
+        return (pre + adv_idt(d) + c('q0') + '    mov r8, rax\n' + stale + c('qa') + '    mov r12, rax\n' + stale + invlpg + c('q1') + '    mov r10, rax\n'
+                + mid + np + f'    mov rbx, [{load:#x}]\n' + c('q2') + '    mov r9, rax\n    jmp .end\n'
+                + '.h:\n' + fix + '    inc r14\n    add rsp, 8\n    iretq\n.end:\n')
     j = (i + 1) % n
     hand = lambda at: (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
             f'    mov byte [{P.SYS_D(j) + F1 + at:#x}], 3\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
@@ -454,6 +470,15 @@ def links_bodies(k, i, n):
                           f'    cmp edx, {m}\n    jb .m\n' + pde(LF2, m - 1) + inv(LP + (m - 1 << 21) + 0x5000)
                           + call('m1', f'{LP + (m - 1 << 21) + LX:#x}') + '    mov r9, rax\n') for m in LM},
         'cross-link': rounds('x0', 0x3f00, 'r8') + put(d + 0x4000, d + XB) + inv(d + 0x4000) + rounds('x1', 0x3f00, 'r9'),
+        # Linear chains hold only current blocks (module docstring): run, made stale, dropped by an INVLPG, relisted by a call,
+        # then a #PF whose walk must find it.
+        **{name: relist(at, stale, inv(page), np, page, fix, mid, pge(True) if name == 'pf-relist-global' else '')
+           for name, at, stale, page, np, fix, mid in (
+               ('pf-relist', d, cr3, d, put_raw(d, (d + F1) | P.LEAF & ~1), put(d, d + F2), ''),
+               ('pf-relist-cross', d + 0x3ffe, cr3, d + 0x4000, put_raw(d + 0x4000, (d + XA) | P.LEAF & ~1), put(d + 0x4000, d + XB), ''),
+               ('pf-relist-straddle', 0x1ffffe, cr3, 0x200000, put_raw(0x200000, (d + XA) | P.LEAF & ~1), put(0x200000, d + XB), ''),
+               ('pf-relist-global', d, cr3 + pge(False) + pge(True), d, put_raw(d, (d + F1) | (P.LEAF | G) & ~1), put_g(d, d + F2), cr3),
+               ('pf-relist-large', LP + LX, cr3, LP + 0x5000, pde(LF2, present=0), pde(LF2), ''))},
         'local-gpa': ('    xor r14d, r14d\n' + call('a0', f'{d + LS:#x}') + put(d, d + F2) + '    mov r14d, 1\n' + call('a1', f'{d + LS:#x}')
                       + '    mov r9, rax\n' + put(d, d + F1) + cr3 + call('a2', f'{d + LS:#x}') + '    mov r10, rax\n'),
         # One jump site (`.sub`) in every phase, so a link kept into a dead block would be taken.
@@ -478,6 +503,11 @@ LS = 0x100                       # `local-gpa`: S at V + LS (`test r14, r14; jnz
 LW = 0x200                       # `local-write`: S at V + LW (`jmp T`), T at V + LW + 0x40 (`mov eax, 1; jmp r13`)
 FLAGS = P.SYS_D(0) + 0xe000      # `local-write`, `kill-out`: per CPU a ready word, then (+ 0x40) a written word
 NO_SWEEP = ('kill-out',)         # programs that kill blocks and must make no pass over the link records (`k1.scanned` = 0)
+RELIST = ('pf-relist', 'pf-relist-cross', 'pf-relist-straddle', 'pf-relist-global', 'pf-relist-large')
+LINEAR_BUCKETS = 1 << 16          # natemu_abi::execution::cache::LINEAR_BUCKETS
+lbucket = lambda page: (page * 0x9e37_79b9_7f4a_7c15 & (1 << 64) - 1) >> 64 - LINEAR_BUCKETS.bit_length() + 1   # cache.rs `lbucket`
+# (`-cross` and `-straddle` test a block's second chain only if its two pages' buckets differ.)
+assert all(lbucket(P.SYS_D(i) + 0x3000 >> 12) != lbucket(P.SYS_D(i) + 0x4000 >> 12) for i in range(4)) and lbucket(0x1ff) != lbucket(0x200)
 
 
 def links_memory(name, i, n):
@@ -494,7 +524,7 @@ def links_memory(name, i, n):
                     code(LF2 + LX, 'mov eax, 2\njmp r13\ntimes 0x800-($-$$) nop\ndq 0x22')] if i == 0 else []))
     q = lambda at, values: {'addr': f'0x{at:x}', 'data': b''.join(v.to_bytes(8, 'little') for v in values).hex(), 'capture': False}
     pd, large = P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21), LF1 | 0x80 | P.LEAF
-    if name == 'pf-large':
+    if name in ('pf-large', 'pf-relist-large'):
         return links_memory('invlpg-large', i, n) + [dict(P.zero(d + IDT, 0x1000), capture=False)]
     if name == 'large-alias':
         # LA's GiB (PDPT entry 2) through a page directory of its own at table A + 0x5000.
@@ -1535,6 +1565,7 @@ EITHER = {
     'local-gpa': {'r9': {2}, 'r10': {1}},
     'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
     'pf-large': {'r8': {1}, 'r14': {1}, 'r9': {2}},
+    **{n: {'r8': {v}, 'r12': {v}, 'r10': {v}, 'r14': {1}, 'r9': {2 * v}} for n in RELIST for v in [0x100 if n in ('pf-relist-cross', 'pf-relist-straddle') else 1]},
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
@@ -1555,10 +1586,10 @@ def program(name, n, k):
     out = {'format': 'natemu-smp-v1', 'name': f'k1-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': [], 'cpus': [], 'memory': [], 'params': {}}
     for i in range(n):
         d = P.SYS_D(i)
-        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write', 'page-global') else 0), d + 0x4000: (d + XA) | P.LEAF}
+        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write', 'page-global', 'pf-relist-global') else 0), d + 0x4000: (d + XA) | P.LEAF}
         if name == 'place-global':
             a[d + 0x3000] = (d + 0x3000) | P.LEAF | G
-        if name == 'straddle':
+        if name in ('straddle', 'pf-relist-straddle'):
             a[0x200000] = (d + XA) | P.LEAF
         b = {d: (d + F2) | P.LEAF}
         ca, cb = chunk_tables(name, i)
@@ -1581,10 +1612,10 @@ def program(name, n, k):
             extra.append({'addr': f'0x{q:x}', 'data': page.hex()})
         else:
             extra += [{'addr': f'0x{d + x:x}', 'data': TAIL(k).hex()} for k, x in ((1, XA), (2, XB), (3, XC))]
-        if name == 'straddle':
+        if name in ('straddle', 'pf-relist-straddle'):
             extra += [{'addr': f'0x{P.sys_leaf(i, 0, 0x1ff000):x}', 'data': (0x1ff000 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
             extra += [{'addr': '0x1ffffe', 'data': 'b800', 'capture': False}] if i == 0 else []   # shared by every CPU
-        if name == 'pf-remap':
+        if name == 'pf-remap' or name in RELIST and name != 'pf-relist-large':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False)]
         if name == 'contexts':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + CX:x}', 'data': P.asm('addss xmm0, xmm1\nmov eax, 1\njmp r13').hex()},

@@ -9,7 +9,7 @@ in a `finally`, checked clean at the end).
 
 The result of each is `red` (the programs failed, as required), `GREEN` (they passed: the mutation survived, a defect of the tests),
 `build failed` or `pattern not found` (the sources changed: update the table). The baseline (the same programs unmutated, in the same
-build modes) must be green first (`--only baseline`). A mutation marked `lc` runs on a `link-check` resident. Exit status 1 when any
+build modes) must be green first (`--only baseline,baseline-lc`). A mutation marked `lc` runs on a `link-check` resident. Exit status 1 when any
 mutation is not red."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, os, pathlib, subprocess, sys
@@ -18,6 +18,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 CACHE = 'crates/runtime/src/cache.rs'
 HOST = 'crates/host/src/execution.rs'
 SOURCES = (CACHE, HOST)
+PFCHAIN = 'pf-relist,pf-relist-cross,pf-relist-straddle,pf-relist-global,pf-relist-large'
 NEW = 'relink-rot0,relink-rot1,relink-rot2,relink-rot3,cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-global,relink-many,relink-reclaim,relink-invlpg,relink-global-many'
 
 # name: ([(file, old, new)], programs that must go red, link-check resident?)
@@ -50,7 +51,17 @@ MUTATIONS = {
     # ---- the batch (step 1's synchronization, now `suspend`'s): a word left unrestored goes unnoticed until a link is taken
     'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named', '    for i in from..to.saturating_sub(1) {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named')], 'cr3-relink,relink-many', False),
     # ---- the host check's other rules
+    # ---- linear chains hold only current blocks (a walk drops the rest, a revalidation relists): run on a `link-check` resident,
+    # whose `check_chains` halts on a chain that lost a current block or holds a cycle, and whose walks halt rather than loop
+    'pfchain-no-relist': ([(CACHE, '                relist(n);\n', '')], PFCHAIN, True),
+    'pfchain-no-off-guard': ([(CACHE, '        if b.flags & off != 0 {', '        if true {')], PFCHAIN, True),
+    # (A global block stays current across a CR3 load with `checked` behind the epoch: the walk must cut it by `current`.)
+    'pfchain-cut-by-epoch': ([(CACHE, '        if b.flags & DEAD == 0 && current(&b) && pages.contains(&page) {',
+                               '        if b.flags & DEAD == 0 && b.checked == control().epoch && pages.contains(&page) {')], 'pf-relist-global', False),
 }
+# The baselines: the programs unmutated, in a plain resident (`baseline`) and in a `link-check` one (`baseline-lc`: the chain checks
+# after every INVLPG, #PF and TLB flush).
+BASELINES = {'baseline': False, 'baseline-lc': True}
 # (Drain fix: a block's death undoes its links out by its outbound slots, `unlink_outbound`. A suspended record is named by no slot (its
 # point may hold another link), so a dead source's suspended records are dropped by the target's next relink, a reclaim or the target's
 # death.)
@@ -73,7 +84,7 @@ def build_resident(target, features):
 
 
 def run_one(name, a):
-    edits, programs, lc = MUTATIONS[name] if name != 'baseline' else ([], a.baseline, False)
+    edits, programs, lc = MUTATIONS[name] if name not in BASELINES else ([], a.baseline, BASELINES[name])
     saved = {}
     try:
         for path, old, new in edits:
@@ -98,7 +109,7 @@ def run_one(name, a):
         r = sh([sys.executable, 'tests/system/run_k1.py', '--fexc', str(a.fexc), '--out', str(out), '--cpus', '1',
                 '--programs', programs, '--host', str(host), '--runtime', str(target / 'aarch64-unknown-none/release/natemu-runtime')])
         (a.out / f'{name}.log').write_text(r.stdout[-6000:] + r.stderr[-2000:])
-        if name == 'baseline':
+        if name in BASELINES:
             return 'green' if r.returncode == 0 else 'RED (the baseline fails)'
         return 'red' if r.returncode != 0 else 'GREEN'
     finally:
@@ -113,7 +124,7 @@ def main():
     ap.add_argument('--host', type=pathlib.Path, default=ROOT / 'target/release/natemu-host')
     ap.add_argument('--only', type=lambda s: s.split(','))
     ap.add_argument('--list', action='store_true')
-    ap.add_argument('--baseline', default=NEW + ',cr3-link,remap-link,cross-link,local-gpa,global,place-global,local-write,link-full')
+    ap.add_argument('--baseline', default=NEW + ',' + PFCHAIN + ',pf-remap,pf-large,pf-fetch,cross,straddle,cr3-link,remap-link,cross-link,local-gpa,global,place-global,local-write,link-full')
     a = ap.parse_args()
     if a.list:
         for n, (edits, programs, lc) in MUTATIONS.items():

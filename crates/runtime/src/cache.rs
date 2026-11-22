@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
     ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_BYTES, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL,
-    INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_LEAD,
+    INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, OFF0, OFF1, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
     PIC_TEST_STR, PIC_TEST_SVC, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
     STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
@@ -411,14 +411,28 @@ fn lpages(b: &Block) -> [u64; 2] {
         b.rip.wrapping_add(u64::from(b.guest_bytes).max(1) - 1) >> 12,
     ]
 }
-/// Calls `f` with every live block with a guest byte on linear page `page`, from the page's bucket chain; dead blocks met
-/// leave the chain (each once: the chain's cost follows the blocks placed). `f` must not kill blocks.
+/// Calls `f` with every current block ([`current`]) with a guest byte on linear page `page`, from the page's bucket chain.
+/// Every block met that is dead or not current, `f`'s cuts included, leaves the chain, marked [`OFF0`] or [`OFF1`] for it
+/// ([`relist`] puts a live one back when a revalidation makes it current), so a chain holds the current blocks and those
+/// that stopped being current since its last walk. Exact: a block not current is entered only after a fetch walk, which
+/// revalidates it (and relists it) or places another, so nothing an invalidation must reach is off its chains (invariant I:
+/// every live current block is on each of its chains). `f` must not kill blocks.
 fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
     let c = control();
     let h = lbucket(page);
     let mut prev: Option<(usize, usize)> = None;
     let mut cur = unsafe { lhead(h).read() };
+    #[cfg(feature = "link-check")]
+    let mut steps = 0;
     while cur != 0 {
+        // (`link-check`: a chain holds each block at most once, so a longer walk is a cycle: halt rather than hang.)
+        #[cfg(feature = "link-check")]
+        {
+            steps += 1;
+            if steps > c.blocks {
+                crate::execution::halt_native([u64::from(line!()), h as u64, u64::from(cur)], natemu_abi::execution::stop::LINK_CHECK)
+            }
+        }
         let n = cur as usize - 1;
         let b = *block(n);
         let pages = lpages(&b);
@@ -428,20 +442,118 @@ fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
         #[cfg(feature = "perf")]
         {
             c.scanned_instances += u64::from(b.flags & INSTANCE != 0);
-            c.scanned_stale += u64::from(b.flags & DEAD == 0 && b.checked != c.epoch);
+            c.scanned_stale += u64::from(b.flags & DEAD == 0 && !current(&b));
         }
-        if b.flags & DEAD != 0 {
+        if b.flags & DEAD == 0 && current(&b) && pages.contains(&page) {
+            f(n);
+        }
+        // (Read again: `f` may have cut it.)
+        let now = block(n);
+        if now.flags & DEAD == 0 && current(now) {
+            prev = Some((n, k));
+        } else {
             match prev {
                 None => unsafe { lhead(h).write(next) },
                 Some((m, j)) => unsafe { (*block_ptr(m)).lnext[j] = next },
             }
-        } else {
-            if pages.contains(&page) {
-                f(n);
+            unsafe { (*block_ptr(n)).flags |= [OFF0, OFF1][k] };
+            #[cfg(feature = "perf")]
+            {
+                c.chain_dropped += 1;
             }
-            prev = Some((n, k));
         }
         cur = next;
+    }
+}
+/// Puts block `n`, just made current by a revalidation, back on each linear chain a walk dropped it from ([`OFF0`],
+/// [`OFF1`]; [`on_linear_page`]), at the bucket's head. The bit guards the push: a block pushed onto a chain it is on would
+/// make a cycle.
+fn relist(n: usize) {
+    let b = unsafe { &mut *block_ptr(n) };
+    let pages = lpages(b);
+    for (k, off) in [OFF0, OFF1].into_iter().enumerate() {
+        if b.flags & off != 0 {
+            let h = lbucket(pages[k]);
+            b.lnext[k] = unsafe { lhead(h).read() };
+            unsafe { lhead(h).write(n as u32 + 1) };
+            b.flags &= !off;
+            #[cfg(feature = "perf")]
+            {
+                control().relisted += 1;
+            }
+        }
+    }
+}
+/// `link-check` builds, after every INVLPG or #PF cut and at the start and end of every TLB flush: the linear chains hold
+/// exactly the (block, chain) pairs whose [`OFF0`]/[`OFF1`] bit is clear (dead blocks included, translations never), each
+/// chain ending within [`Control::blocks`] steps; no live current block has a bit set (invariant I); and a live block off a
+/// chain has no L1 entry and no active link from another page into it (invariant L: none outside the suspended segment).
+/// Halts `stop::LINK_CHECK` otherwise (the line, then what failed).
+#[cfg(feature = "link-check")]
+#[track_caller]
+fn check_chains() {
+    let line = u64::from(core::panic::Location::caller().line());
+    let halt = |a: u64, b: u64| -> ! { crate::execution::halt_native([line, a, b], natemu_abi::execution::stop::LINK_CHECK) };
+    let c = control();
+    // (A finite chain holds each pair once: its successor follows from the pair. So pairs met, all with a clear bit, and as many as the
+    // index's pairs with a clear bit, are those pairs.)
+    let mut met = 0;
+    for h in 0..area::LINEAR_BUCKETS {
+        let (mut cur, mut steps) = (unsafe { lhead(h).read() }, 0);
+        while cur != 0 {
+            let n = cur as usize - 1;
+            steps += 1;
+            if steps > c.blocks || n as u64 >= c.blocks {
+                halt(h as u64, u64::from(cur))
+            }
+            let b = block(n);
+            let pages = lpages(b);
+            let k = usize::from(lbucket(pages[0]) != h);
+            if lbucket(pages[k]) != h || b.flags & ([OFF0, OFF1][k] | TRANSLATION) != 0 {
+                halt(h as u64, n as u64)
+            }
+            met += 1;
+            cur = b.lnext[k];
+        }
+    }
+    let mut pairs = 0;
+    for n in 0..c.blocks as usize {
+        let b = block(n);
+        if b.flags & TRANSLATION != 0 {
+            continue;
+        }
+        let [b0, b1] = lpages(b).map(lbucket);
+        if b0 == b1 && b.flags & OFF1 != 0 {
+            halt(1 << 32 | n as u64, u64::from(b.flags))
+        }
+        pairs += u64::from(b.flags & OFF0 == 0) + u64::from(b0 != b1 && b.flags & OFF1 == 0);
+        if b.flags & DEAD != 0 || b.flags & (OFF0 | OFF1) == 0 {
+            continue;
+        }
+        if current(b) {
+            halt(2 << 32 | n as u64, u64::from(b.flags))
+        }
+        let (w0, w1) = area::l1_slots_of(b.rip);
+        if (0..area::L1_TABLES).any(|t| [w0, w1].iter().any(|&i| l1_block(t, i) == b.number + 1)) {
+            halt(3 << 32 | n as u64, 0)
+        }
+        let mut at = b.inbound;
+        for _ in 0..=area::MAX_LINKS {
+            if at == 0 {
+                break;
+            }
+            let i = u64::from(at) - 1;
+            if i >= c.links_susp && i < c.links_tlb {
+                halt(4 << 32 | n as u64, i)
+            }
+            at = unsafe { record(i as usize).read() }.next_in;
+        }
+        if at != 0 {
+            halt(5 << 32 | n as u64, u64::from(at))
+        }
+    }
+    if met != pairs {
+        halt(6 << 32 | met, pairs)
     }
 }
 /// The reverse map's head of guest-physical page `page` ([`area::PAGE_BLOCKS`]).
@@ -810,6 +922,9 @@ pub fn lookup(
                     (*block_ptr(n)).flags =
                         (*block_ptr(n)).flags & !(GLOBAL | LARGE) | walked & (GLOBAL | LARGE)
                 };
+                // (Current again: back on the linear chains a walk dropped it from, so the next invalidation of its pages
+                // finds it.)
+                relist(n);
                 if walked & LARGE != 0 {
                     mark_large(&b);
                 }
@@ -838,6 +953,7 @@ pub fn tlb(global: bool) -> Option<u64> {
     {
         check_l1_lists();
         check_out_slots();
+        check_chains();
     }
     let c = control();
     c.epoch += 1;
@@ -896,7 +1012,10 @@ pub fn tlb(global: bool) -> Option<u64> {
     {
         let undone = suspend(scope);
         #[cfg(feature = "link-check")]
-        check_out_slots();
+        {
+            check_out_slots();
+            check_chains();
+        }
         return undone;
     }
     #[cfg(feature = "pic-count")]
@@ -2782,13 +2901,14 @@ fn large_held(c: &Control, r: u64) -> bool {
             || c.large_list[..c.large_count as usize].contains(&r))
 }
 /// A guest INVLPG of `address`, or a #PF at it (K1; SDM Vol.3 4.10.4.1: the TLB entries for its page, global ones too,
-/// and all of them for a page larger than 4 KiB): every live block of this vCPU with guest bytes on its 4 KiB page, and
+/// and all of them for a page larger than 4 KiB): every current block of this vCPU with guest bytes on its 4 KiB page, and
 /// every [`LARGE`] one with bytes in its 2 MiB region, is no longer current (`checked` 0, global or not): out of L1, every
 /// link from another page into it undone; it stays in L2 and is found again only after a fetch walk ([`lookup`]). Other
 /// blocks keep their translations (a 4 KiB TLB entry of another page is not one for this page). Its code-page bits
 /// stay: they only say it may hold translations. Blocks are looked for only when the address's 2 MiB region may hold
 /// one ([`Control::regions`]; for large blocks [`large_held`]), then on the linear map's chains of the pages
-/// ([`area::LINEAR_HEADS`]).
+/// ([`area::LINEAR_HEADS`]), which the walks leave holding current blocks only ([`on_linear_page`]): a block not current is
+/// already unreachable without a fetch walk.
 pub fn invlpg(address: u64) -> Option<u64> {
     // Page-currency plan: the record of fetch-walk results loses the entries of the page and of its 2 MiB region, both classes.
     crate::execution::page_record::invalidated(address);
@@ -2822,6 +2942,8 @@ pub fn invlpg(address: u64) -> Option<u64> {
             });
         }
     }
+    #[cfg(feature = "link-check")]
+    check_chains();
     undone
 }
 /// Takes block `n`'s entry out of L2 (linear probing's backward-shift deletion), so probes never pass dead blocks: a

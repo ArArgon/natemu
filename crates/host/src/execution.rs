@@ -804,6 +804,8 @@ pub struct K1 {
     page_fault_scanned: u64,
     scanned_instances: u64,
     scanned_stale: u64,
+    chain_dropped: u64,
+    relisted: u64,
 }
 fn writers_empty(w: &[u64; natemu_abi::writers::count::COUNT]) -> bool {
     w.iter().all(|&n| n == 0)
@@ -1086,6 +1088,8 @@ impl K1 {
             page_fault_scanned: c.page_fault_scanned,
             scanned_instances: c.scanned_instances,
             scanned_stale: c.scanned_stale,
+            chain_dropped: c.chain_dropped,
+            relisted: c.relisted,
         }
     }
 }
@@ -4805,7 +4809,7 @@ mod tests {
         assert_eq!(now.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         now.as_object_mut().unwrap().remove("segments");
         // (So are the page-fault scan's counters, `perf` builds only.)
-        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale"] {
+        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale", "chain_dropped", "relisted"] {
             assert_eq!(now.as_object_mut().unwrap().remove(k), Some(serde_json::json!(0)), "{k}");
         }
         assert_eq!(empty, now);
@@ -4869,7 +4873,7 @@ mod tests {
         // (So is the code-size record: no block record exists here, so every count is 0.)
         assert_eq!(new.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         new.as_object_mut().unwrap().remove("segments");
-        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale"] {
+        for k in ["page_fault_scanned", "scanned_instances", "scanned_stale", "chain_dropped", "relisted"] {
             assert_eq!(new.as_object_mut().unwrap().remove(k), Some(serde_json::json!(0)), "{k}");
         }
         assert_eq!(old, new);

@@ -932,10 +932,14 @@ pub mod cache {
         pub stack_checks: u64,
         /// `perf` resident builds (zero otherwise): block records visited on linear chains while delivering a #PF (its page's
         /// blocks cut, [`Self::scanned`]'s share there), and, of all chain visits, those of instances (PIC study stage 3) and
-        /// of blocks not current (`checked` 0 or an earlier epoch). Appended.
+        /// of blocks not current (dead ones not counted). Appended.
         pub page_fault_scanned: u64,
         pub scanned_instances: u64,
         pub scanned_stale: u64,
+        /// `perf` resident builds (zero otherwise): (block, chain) pairs a linear chain's walk dropped ([`OFF0`], [`OFF1`]: dead
+        /// or not current), and pushed back on their chain by a revalidation. Appended.
+        pub chain_dropped: u64,
+        pub relisted: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1298,6 +1302,12 @@ pub mod cache {
     /// currency, L1 and L2 entries, linear and frame chains and link-point targets; no code (`code` the fill point,
     /// `code_size` 0, as a [`SYSTEM`] record), no sites (its translation's).
     pub const INSTANCE: u32 = 4096;
+    /// K1, linear chains hold only current blocks: a walk of its page's [`LINEAR_HEADS`] chain (a #PF or INVLPG) dropped it
+    /// from its first (`OFF0`) or last byte's (`OFF1`) page's chain, as dead or not current; a revalidation puts a live one
+    /// back on each chain it is off and clears the bit (the bit stops a second push, which would make a cycle). Set on no
+    /// record a placement files.
+    pub const OFF0: u32 = 8192;
+    pub const OFF1: u32 = 16384;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
     /// design's 16-byte shift of FEX's body.
