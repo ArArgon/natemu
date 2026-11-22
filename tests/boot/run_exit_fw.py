@@ -5,10 +5,10 @@
     tests/boot/run_exit_fw.py --variant program --backend natemu --fexc FEXC [--cpus 1 2 4] --out DIR
 
 natemu (M2 Part 2, the program variant only): the program driver runs exit_prog.asm's body with CPU 0 at its start and
-every other vCPU waiting for a SIPI (`wait-for-sipi`): the description of docs/restructure/m2-exit-firmware.md. Pass:
-CPU 0 reaches the body's end with `expected_registers(N)`. While the boot-time interpreter is the stop at its entry, a
-run with APs ends when the first AP reaches it: that pass is up to the SIPI landing (every AP that stopped did so at the
-SIPI's state for vector 08H, CS 0800H base 8000H IP 0; the other vCPUs cancelled by that stop).
+every other vCPU waiting for a SIPI (`wait-for-sipi`): the description of docs/restructure/m2-exit-firmware.md. Each AP
+runs the stub from its SIPI in the boot-time interpreter (real mode, the far JMP to 32-bit code, compatibility mode)
+until its far JMP to the 64-bit CS hands it to the translator, which counts it on the stub page. Pass: CPU 0 reaches the
+body's end with `expected_registers(N)` (every AP arrived exactly once, from 64-bit code).
 
 Both images are assembled here with nasm from tests/boot (exit_fw.asm, exit_prog.asm and the shared exit_ap.inc).
 - firmware: the 64 KiB image QEMU maps below 4 GiB with `-bios` (machine pc, 64 MiB, isa-debug-exit at F4H, COM1 into a
@@ -234,17 +234,14 @@ def natemu_description(image, n):
 
 def run_natemu(n, images, work, fexc):
     """One run of the program variant under natemu: the answer `judge` reads (`exit` 'reached' when CPU 0 reached the
-    program's end), or, while the boot-time interpreter is the stop at its entry, the APs' stops (`entry`)."""
+    program's end), with each AP's end (`aps`) for the report."""
     import run_slice1_vm as vm                  # tests/lib
     host, runtime = vm.build()
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(natemu_description(images['program']['bytes'], n))
     try:
-        # (Until the interpreter runs the AP stub, its MOV CR0 and far JMPs: NATEMU_INTERPRETER=off keeps the stop at the
-        # interpreter's entry this judges, as before the interpreter ran.)
         r = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(),
-                            *vm.CODE_SHAPE], capture_output=True, text=True, timeout=QEMU_TIMEOUT,
-                           env={**os.environ, 'NATEMU_INTERPRETER': 'off'})
+                            *vm.CODE_SHAPE], capture_output=True, text=True, timeout=QEMU_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {'exit': 'timeout'}
     if r.returncode:
@@ -255,23 +252,8 @@ def run_natemu(n, images, work, fexc):
     bsp = cpus[0]
     aps = [{'stop': c['stop'], 'reason': c.get('reason', ''), **{k: (c.get('startup') or {}).get(k) for k in ('cs', 'cs_base', 'rip')}}
            for c in cpus[1:]]
-    if bsp['stop'] != 'reached' and any(a['reason'].startswith('unsupported_mode') for a in aps):
-        return {'exit': 'entry', 'bsp': bsp['stop'], 'aps': aps}
     return {'exit': bsp['stop'], 'gpr': [smp.num(x) for x in bsp['gpr']], 'rflags': smp.num(bsp['rflags']) & smp.FLAG_MASK,
             'fault': None if bsp['stop'] == 'reached' else f"{bsp['stop']} {bsp.get('reason')}", 'aps': aps}
-
-
-def judge_entry(ans):
-    """Differences of a natemu run that ended at an AP's interpreter entry (the boot-time interpreter is not built): every
-    AP that stopped did so at the SIPI's state for vector 08H (CS 0800H, base 8000H, IP 0), the others were cancelled by
-    that stop, as was CPU 0. Up to the SIPI landing; once the interpreter runs the stub, `judge` applies."""
-    d = [] if ans.get('bsp') == 'cancelled' else [f"CPU 0 {ans.get('bsp')} (want cancelled by the AP's stop)"]
-    for i, a in enumerate(ans['aps'], 1):
-        if a['stop'] == 'cancelled':
-            continue
-        if not a['reason'].startswith('unsupported_mode') or (a['cs'], a['cs_base'], a['rip']) != (0x800, 0x8000, 0):
-            d.append(f'CPU {i}: {a}')
-    return d
 
 
 def main():
@@ -290,10 +272,11 @@ def main():
         results = []
         for n in a.cpus:
             ans = run_natemu(n, images, a.out / 'natemu', a.fexc)
-            diffs = judge_entry(ans) if ans['exit'] == 'entry' else judge('program', n, ans, want_exit='reached')
-            stage = ' (up to the SIPI landing: the interpreter is not built)' if ans['exit'] == 'entry' else ''
+            diffs = judge('program', n, ans, want_exit='reached')
+            if diffs and ans.get('aps'):
+                diffs.append(f"APs: {ans['aps']}")
             results.append({'name': f'program-natemu N={n}', 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
-            print(f"program natemu N={n}: {'pass' + stage if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
+            print(f"program natemu N={n}: {'pass' if not diffs else 'FAIL ' + '; '.join(diffs)}", flush=True)
         (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
         return 1 if any(r['diffs'] for r in results) else 0
     img = boot_image(a.variant, images, a.out)

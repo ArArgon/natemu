@@ -73,8 +73,8 @@ argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "kvm",
 needs = { cores = 1 }
 timeout = 2400
 
-# The program variant under natemu (CPU start-up slice): at 1 CPU the pass; at 2 and 4, while the boot-time interpreter is
-# the stop at its entry, the pass up to the SIPI landing (tests/boot/run_exit_fw.py --backend natemu).
+# The program variant under natemu (tests/boot/run_exit_fw.py --backend natemu): at 1, 2 and 4 CPUs the APs climb from
+# their SIPI in the boot-time interpreter (16 -> 32 -> compatibility mode) to 64-bit code and are counted from there.
 [suite.cases."exit-ap-natemu"]
 argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
