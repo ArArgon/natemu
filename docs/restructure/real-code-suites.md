@@ -105,7 +105,7 @@ version's list):
 - 64-bit code from then on (translated): IDT, `ltr`, xAPIC reset and enable, PIC masking, serial, and the start-up.
 
 **What natemu must provide** (built on `boot-interp`: `crates/host` `boot::multiboot` and `--debug-exit`, a500625b and
-cdff642c; CPU start-up, B2, 95c43a21; cf40d9ee, ac111723 and ce8cea18 before the branch's rebase onto main):
+cdff642c; CPU start-up, B2, 93bff2bc; cf40d9ee, ac111723 and ce8cea18 before the branch's rebase onto main):
 
 - The Multiboot v1 loader: the ELF32 image at its physical addresses, the information structure with `mem_upper`, the
   memory map, the command line (the image's path first) and exactly one module, the environment text; EAX 2BADB002H,

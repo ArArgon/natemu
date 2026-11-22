@@ -653,24 +653,26 @@ bench cases against 78f60965, as in the status above ([benchmarks](../benchmarks
 **The rebase onto main (November 22).** The branch's 87 commits moved from 78f60965 (the old base: `m2-32bit` before its
 own rebase; main holds the same tree as 6388d04e, not 78f60965 itself) onto main a6d03605. The commits before the rebase
 are tag `boot-interp-prerebase` and its ancestors; [the commit map](commit-map-boot-interp-2026-11-22.txt) pairs each
-with its new id (matched by subject). No commit was dropped or emptied. As before the rebase, four commits do not build
-alone: 95c43a21 and 84d018d4 (a driver test lacks `CpuResult::startup` until c7f2ee35) and eb588db1 and 0cb05371 (the
-resident: `Next::Init` unmatched until 4c31966f). Conflicts, all in two commits of B1 (b) and two of the interpreter
-(`Control`'s appended fields, the record flag), against main's K1 chain fix: both sides' appended `Control` fields kept,
-main's first; main's `OFF0` and `OFF1` took flag bits 13 and 14, so `INTERPRETED` moved from 13 to 15
-([interp-integration.md](interp-integration.md), "Records": an interpreter record is dropped from the linear chains for
-good once a walk finds it not current, which nothing reads). Main's shared probes and page-crossing stores leave the
-firmware image's checks as they were (`split` still refuses a page-crossing store with the image on either side,
-`unsupported_mmio`). Experiment (not a framework case; M2 Max): the release residents of main a6d03605 and the rebased
-tip, disassembled (`llvm-objdump`; addresses, symbol hashes, anonymous symbols and literal pools aside), and the same of
-78f60965 and the pre-rebase tip 8f42fd6a: `find_from`, `sys_fast`, `miss_fast` (with `sys_commit` and `events::none`'s
-call sites), both `lookup` instances, `far_transfer`, `far_return`, `load_data`, `translate`, `segments::pages`,
-`access_aborted`, `events::held` and the page walker (which inlined its table read before the rebase) are identical to
-main's; `system` (CR4.MCE), `commit`, `set_cpl`, `refuse_compatibility`, `trap_due`, `events::next` and `take`,
-`fetch_walk`, `segments::copy`, `atomic_byte` and `split_lock` differ from main's exactly as they differed from 78f60965
-before the rebase (the cold arms above). New against main, from the code-generation units' partitioning, with no source
-change: `helpers::x87` inlines `x87::helper` (one call fewer per `svc #X87` than main), `gather::transaction` inlines
-`set_ymm`, `compat::execute` calls `rotate::memory` out of line, `block_at`'s per-candidate test is out of line,
+with its new id. No commit was dropped or emptied. Every commit builds alone (the resident, and the host with its
+tests); six did not before the rebase, and two edits make them build: the driver JSON test's `startup: None` moved from
+5d5594c0 (now e689d332, which keeps its initsipi change under a reworded subject) into the INIT and SIPI commit
+93bff2bc, and dea88ae4's `events::undelivered` gained a `Next::Init` arm (kind 0), gone with the function in f56904eb as
+before. From f56904eb on, every tree is the one before these edits. Conflicts, all in two commits of B1 (b) and two of
+the interpreter (`Control`'s appended fields, the record flag), against main's K1 chain fix: both sides' appended
+`Control` fields kept, main's first; main's `OFF0` and `OFF1` took flag bits 13 and 14, so `INTERPRETED` moved from 13
+to 15 ([interp-integration.md](interp-integration.md), "Records": an interpreter record is dropped from the linear
+chains for good once a walk finds it not current, which nothing reads). Main's shared probes and page-crossing stores
+leave the firmware image's checks as they were (`split` still refuses a page-crossing store with the image on either
+side, `unsupported_mmio`). Experiment (not a framework case; M2 Max): the release residents of main a6d03605 and the
+rebased tip, disassembled (`llvm-objdump`; addresses, symbol hashes, anonymous symbols and literal pools aside), and the
+same of 78f60965 and the pre-rebase tip 8f42fd6a: `find_from`, `sys_fast`, `miss_fast` (with `sys_commit` and
+`events::none`'s call sites), both `lookup` instances, `far_transfer`, `far_return`, `load_data`, `translate`,
+`segments::pages`, `access_aborted`, `events::held` and the page walker (which inlined its table read before the rebase)
+are identical to main's; `system` (CR4.MCE), `commit`, `set_cpl`, `refuse_compatibility`, `trap_due`, `events::next` and
+`take`, `fetch_walk`, `segments::copy`, `atomic_byte` and `split_lock` differ from main's exactly as they differed from
+78f60965 before the rebase (the cold arms above). New against main, from the code-generation units' partitioning, with
+no source change: `helpers::x87` inlines `x87::helper` (one call fewer per `svc #X87` than main), `gather::transaction`
+inlines `set_ymm`, `compat::execute` calls `rotate::memory` out of line, `block_at`'s per-candidate test is out of line,
 `maskmov::transaction`'s frame is 32 bytes larger, `fptrap::patch_flush` allocates other registers. Resident text
 245,268 (main) -> 274,176 bytes. Checks on the rebased tip (M2 Max): `tools/natemu-test run --base origin/main` (every
 family's smoke cases and unit tests, and the families boot, diag, faults, interp, io, programs, smp, static and system
@@ -684,6 +686,6 @@ b1c84a0d, whose FEX pin the checkout's submodule does not hold; the branch chang
 stack bound) are the pre-rebase commits it ran on, kept as they were; ids that say where something was built are the
 rebased ones. Some commit messages on `boot-interp` cite the commit an agent made on its own branch, which is not on
 `boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as (agent's, before the rebase, after it):
-cb7cd541 → d4bf265d → 9965ceb4; 8b022e58 → 0624b341 → 974d4b8a; f29042cf → ce8cea18 → 95c43a21; bdb5dc09 → 40a888db →
-f0acfaf3; 315860f3 → d7bc0885 → 31564a06; 75cfdd22 → be626aa8 → a2449f26. A number measured at one of the agents' ids
+cb7cd541 → d4bf265d → 4bc62f52; 8b022e58 → 0624b341 → 974d4b8a; f29042cf → ce8cea18 → 93bff2bc; bdb5dc09 → 40a888db →
+b52c6e43; 315860f3 → d7bc0885 → 31564a06; 75cfdd22 → be626aa8 → a2449f26. A number measured at one of the agents' ids
 was measured on the agent's tree, not on `boot-interp`'s.

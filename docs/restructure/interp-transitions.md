@@ -1,6 +1,6 @@
 # The interpreter's resident operations and mode transitions
 
-Status: built, November 22, 2026 (M2 Part 2, on `boot-interp` 897f201c, e21b0209 before the branch's rebase onto main;
+Status: built, November 22, 2026 (M2 Part 2, on `boot-interp` 0d8fde39, e21b0209 before the branch's rebase onto main;
 plan sections 5 and 6 are the spec). It completes [the interpreter in the resident](interp-integration.md): the
 protected-mode far JMP and far RET, MOV Sreg, MOV to CR0/CR2/CR3/CR4 with the mode transitions, HLT, and the hand-off to
 the translator; and the translator's way into the interpreter from 64-bit kernel code (`refuse_compatibility`'s CPL-0

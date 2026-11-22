@@ -1,6 +1,6 @@
 # natemu's firmware boot mode (boot-time interpreter plan, section 7)
 
-Status: November 22, 2026, built (`boot-interp` commits a8993801 to 1ac78362, on cc63f385, with the interpreter's
+Status: November 22, 2026, built (`boot-interp` commits 6009e072 to f765119e, on d3f919e7, with the interpreter's
 resident operations; 0e41c122 to d8049820 on 73aa5b52 before the branch's rebase onto main). Spec: [the
 plan](m2-boot-interpreter-plan.md) sections 4, 6 and 7, and the contracts [m2-exit-firmware.md](m2-exit-firmware.md)
 (the exit test's firmware), [real-code-suites.md](real-code-suites.md) (OVMF) and
