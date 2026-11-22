@@ -68,6 +68,16 @@
 //! vCPUs run concurrently over shared guest RAM, each until its own stop. A vCPU that stops for any other reason than
 //! reaching its end, a guest fault, code it cannot compile, a split lock or a refused device access (`unsupported_atomic`,
 //! `unsupported_mmio`: precise stops before the instruction, like a guest fault) cancels the others (another resident halt, the watchdog).
+//! The end rule's stops (`halted`, `wait_for_sipi`) are each vCPU's own end too. `--entry-ends` (test only, M2 Part 2):
+//! a stop at the boot-time interpreter's entry (`unsupported_mode` or `unsupported_code_mode` with the vCPU in a state only
+//! the interpreter runs, `Cpu::interpreted_mode`: the stop that stands for the interpreter until it is built) is the
+//! vCPU's own end as well, so every AP a SIPI started reports its start state while the others run on.
+//!
+//! M2 Part 2: a vCPU of a `wait-for-sipi` section, one with INIT or SIPI state in its pending word at the end, and one
+//! that ended in a state the interpreter runs, gains `startup`: its pending word as its run ended (`pending`: NMI 1, INIT
+//! 2, wait-for-SIPI 4, SIPI latched 8, the vector in bits 15:8) and at the run's end (`pending_after`: IPIs sent to it
+//! since), where it waited (`waiting`: `sipi`, `mailbox`, `halted`, or null), its
+//! IRR (`irr`, four words), and its final `cs` (selector), `cs_base`, `rip`, `rflags`, `cr0`, `efer`, `edx`.
 //!
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1)
@@ -84,6 +94,12 @@
 //!     section's paging and segments, RIP replaced by the mailbox's wakeup vector when a Wakeup command
 //!     for its APIC ID (its vCPU number) arrives; the report's `stats.mailbox` is [GPA still waited on (0: woken),
 //!     sleeps while waiting, the guest TSC at the acknowledgement or 0, us spent marking the page])
+//!   | wait-for-sipi (M2 Part 2: the vCPU starts as an AP the firmware did not start, in the wait-for-SIPI state: the SDM's
+//!     power-on state (`natemu_abi::power_on::power_on`), the local APIC at its reset values (software disabled),
+//!     published as waiting before any vCPU runs (`execution::wait_for_sipi`); every other state item and code of its own
+//!     are refused, and so is the item on vCPU 0. A SIPI starts it at the SIPI's state (CS VV00H, base VV000H, IP 0),
+//!     which the boot-time interpreter runs; ended by the end rule while it still waits, its stop is `resident`
+//!     `wait_for_sipi`)
 //!   | svr VALUE (X3: the local APIC's spurious-interrupt vector register at the start, default its reset value 0xff,
 //!     software disabled; e.g. 0x1ff lets `post` items reach the core without guest APIC set-up)
 //!   | post ADDR VECTOR | nmi ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`, makes the host
@@ -222,6 +238,8 @@ struct Section {
     mailbox: u64,
     /// A `machine` description's state: set as given, no driver fixture (module doc).
     machine: Option<MachineState>,
+    /// M2 Part 2: the vCPU starts waiting for a SIPI (`wait-for-sipi`, module doc).
+    wait_sipi: bool,
 }
 /// M2 Part 2: a `machine` section's control registers, segments, tables, stops and windows (module doc).
 #[derive(Debug, PartialEq, Clone)]
@@ -354,6 +372,7 @@ fn parse(text: &str) -> Result<Description> {
         svr: natemu_abi::lapic::SVR_RESET,
         mailbox: 0,
         machine: machine.then(|| reset.clone()),
+        wait_sipi: false,
     };
     let mut d = Description {
         spaces: vec![Space::default()],
@@ -380,8 +399,19 @@ fn parse(text: &str) -> Result<Description> {
         read(&chunks[0], &mut d.spaces[0], Some(&mut cpu))?;
         d.cpus.push(cpu);
     }
-    for c in d.cpus.iter().filter(|_| !machine) {
-        if bodies(&d.spaces[c.space], c.rip).all(|(_, code)| code.is_empty()) {
+    for (v, c) in d.cpus.iter().enumerate() {
+        if c.wait_sipi {
+            // Its state is the power-on state, its code what a SIPI starts: nothing of a running section's.
+            let alone = Section {
+                wait_sipi: true,
+                ..new(0)
+            };
+            if v == 0 || machine || *c != alone {
+                return Err(format!(
+                    "cpu {v}: wait-for-sipi with other items, its own space, on vCPU 0 or in a machine description"
+                ));
+            }
+        } else if !machine && bodies(&d.spaces[c.space], c.rip).all(|(_, code)| code.is_empty()) {
             return Err("no code".into());
         }
     }
@@ -446,6 +476,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("mailbox", [g]) if number(g)? % 4096 == 0 && number(g)? != 0 => {
                 state(&mut cpu, line)?.mailbox = number(g)?
             }
+            ("wait-for-sipi", []) => state(&mut cpu, line)?.wait_sipi = true,
             ("wp" | "smep" | "nxe" | "sse" | "fsgsbase" | "ne", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
@@ -1282,6 +1313,8 @@ struct Ran {
     /// K2: the host's system decodes by kind, and entropy refills.
     decodes: std::collections::BTreeMap<u32, u64>,
     entropy: u64,
+    /// M2 Part 2: its pending word as its run ended (read at once: later IPIs to it change the word but not its run).
+    pending: u64,
 }
 /// L4b: a power stop's name (`pm::POWEROFF`, `pm::RESET`).
 pub(crate) fn power_name(p: u8) -> &'static str {
@@ -1303,11 +1336,28 @@ fn finished(stop: &Stop) -> bool {
                 stop: exec::stop::SHUTDOWN
                     | exec::stop::UNSUPPORTED_ATOMIC
                     | exec::stop::HALTED
+                    | exec::stop::WAIT_FOR_SIPI
                     | exec::stop::UNSUPPORTED_MMIO
                     | exec::stop::UNSUPPORTED_PORT,
                 ..
             }
     )
+}
+
+/// `--entry-ends`: the vCPU stopped at the boot-time interpreter's entry (the stop that stands for the interpreter until it
+/// is built, `stop::UNSUPPORTED_MODE`'s doc), in a state only the interpreter runs.
+fn interpreter_entry(stop: &Stop, area: Area) -> bool {
+    matches!(
+        stop,
+        Stop::Resident {
+            stop: exec::stop::UNSUPPORTED_MODE | exec::stop::UNSUPPORTED_CODE_MODE,
+            ..
+        }
+    ) && area
+        .read_record::<State>(exec::STATE_OFFSET)
+        .cpu
+        .interpreted_mode()
+        .is_some()
 }
 
 /// Run a program description in the VM, one program per vCPU, and print the final state as JSON. ADDR, GPA and PORT
@@ -1343,6 +1393,9 @@ pub(crate) struct Args {
     fp: bool,
     #[arg(long = "strict-unassigned")]
     strict: bool,
+    /// Test only (M2 Part 2): a stop at the boot-time interpreter's entry is the vCPU's own end (module doc)
+    #[arg(long)]
+    entry_ends: bool,
     /// A test device's page (repeatable)
     #[arg(long, value_name = "GPA", value_parser = number)]
     device_at: Vec<u64>,
@@ -1692,6 +1745,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         page_currency,
         fp,
         strict,
+        entry_ends,
         device_at,
         irq_source,
         lost,
@@ -1987,6 +2041,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
     let mut ends = Vec::new();
     for c in &d.cpus {
+        // A wait-for-SIPI section shares the space of an earlier one (`parse`) and has no end of its own.
+        if c.wait_sipi {
+            ends.push(None);
+            continue;
+        }
         if spaces[c.space].is_none() {
             spaces[c.space] = Some(match &c.machine {
                 Some(m) => Tables::physical(
@@ -2103,9 +2162,14 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 },
                 mov_ss: 0,
             };
+        let start = match &c.machine {
+            Some(m) => m.cpu(c),
+            None if c.wait_sipi => MachineState::power_on().1,
+            None => driver_cpu(),
+        };
         execution::set_cpu(
             backing.vcpu(v),
-            c.machine.as_ref().map_or_else(driver_cpu, |m| m.cpu(c)),
+            start,
             false, // the program driver's slice tests never run the speculation barriers
         )?;
         execution::set_lapic(
@@ -2124,6 +2188,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             state.cpu.rip = c.rip;
         }
         backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
+        if c.wait_sipi {
+            execution::wait_for_sipi(backing.vcpu(v));
+        }
     }
 
     let machine = Machine::create(backing.memory().clone())?;
@@ -2220,6 +2287,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
         started[v].store(true, SeqCst);
         let ran = run_vcpu(v, cpu, cancelled);
+        let pending = execution::pending_word(backing.memory(), v);
         if let Some(control) = &pending_compiler {
             control.abort();
         }
@@ -2231,7 +2299,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         }
         stops.end(v);
         let (stop, compiler, requests, hook) = ran?;
-        if !finished(&stop) {
+        if !finished(&stop) && !(entry_ends && interpreter_entry(&stop, backing.vcpu(v))) {
             owners::cancel_owners(cancelled);
         }
         Ok(Ran {
@@ -2243,6 +2311,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             tampered: hook.tampered,
             decodes: requests.decodes,
             entropy: requests.entropy,
+            pending,
         })
     };
     // HVF's GIC calls never race vCPU create/destroy (`vm.rs`, one lock).
@@ -2653,6 +2722,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let tampering = v == target && (tamper.is_some() || tamper_after.is_some());
         let tampering = tampering || (v == target && forged_entry.is_some());
         let log = log_base(d.spaces[d.cpus[v].space].identity);
+        let pending = ran.pending;
         let mut result = report(
             backing.vcpu(v),
             &d.spaces[d.cpus[v].space],
@@ -2665,6 +2735,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         if let Some(m) = &d.cpus[v].machine {
             result.machine = Some(machine_result(backing.vcpu(v), m, tables, &result));
         }
+        result.startup = startup_result(backing.vcpu(v), d.cpus[v].wait_sipi, pending);
         let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
         result.kicks = Some(kick_report(backing.vcpu(v), &stops));
         // With test devices, or once the vCPU made a device access (X3: its xAPIC page) or had one refused.
@@ -3114,7 +3185,26 @@ fn report(
         kicks: None,
         mmio: None,
         machine: None,
+        startup: None,
     })
+}
+/// M2 Part 2: a vCPU's `startup` output (module doc), for a `wait-for-sipi` section, a pending word with INIT or SIPI state,
+/// or a final state only the interpreter runs; else `None`.
+fn startup_result(area: Area, wait_sipi: bool, word: u64) -> Option<Value> {
+    use exec::cache::pending;
+    let s: State = area.read_record(exec::STATE_OFFSET);
+    let c = s.cpu;
+    let after = execution::pending_word(area.memory(), area.vcpu());
+    if !wait_sipi && (word | after) & !pending::NMI == 0 && c.interpreted_mode().is_none() {
+        return None;
+    }
+    let cs = c.seg[exec::SREG_CS];
+    Some(json!({
+        "pending": word, "pending_after": after, "waiting": execution::waiting(area),
+        "irr": execution::irr(area.memory(), area.vcpu()),
+        "cs": cs.selector, "cs_base": cs.base, "rip": c.rip, "rflags": c.rflags, "cr0": c.cr0, "efer": c.efer,
+        "edx": c.gpr[2],
+    }))
 }
 /// A machine section's `machine` output (module doc): `interp_rig.fields()`'s names and widths.
 fn machine_result(area: Area, m: &MachineState, space: &Tables, result: &CpuResult) -> Value {
@@ -3198,6 +3288,9 @@ struct CpuResult {
     /// A machine section's final state in `interp_rig.fields()`'s form (module doc).
     #[serde(skip_serializing_if = "Option::is_none")]
     machine: Option<Value>,
+    /// M2 Part 2: INIT and SIPI (module doc).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup: Option<Value>,
 }
 /// Guest bytes at `addr`, as lowercase hex.
 #[derive(Serialize)]

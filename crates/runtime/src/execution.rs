@@ -40,6 +40,7 @@ mod rotate;
 mod segments;
 mod sse;
 mod stack;
+mod startup;
 mod syscalls;
 mod watch;
 mod x87;
@@ -187,9 +188,18 @@ pub unsafe fn start() -> ! {
              "mov {t}, #1", "msr S3_0_C12_C12_7, {t}", "isb",                                // ICC_IGRPEN1_EL1
              t = out(reg) _);
     }
-    // X4: an AP waits for the ACPI mailbox before it first runs.
+    // X4: an AP waits for the ACPI mailbox before it first runs; M2 Part 2: an INIT ends that wait (the INIT state, then the
+    // wait for a SIPI), and an AP the host left waiting for a SIPI waits for it (each then starts at the SIPI's state).
     if s.mailbox != 0 {
-        events::wait_mailbox(&mut s);
+        if !events::wait_mailbox(&mut s) {
+            startup::init(&mut s);
+        }
+    } else if startup::waiting(&s) {
+        startup::wait(&mut s);
+        // (An INIT that came after the SIPI, before the start's first boundary: taken there, as `startup::init` does.)
+        if startup::init_pending(&s) {
+            startup::init(&mut s);
+        }
     }
     if s.cpu.interpreted_mode().is_some() {
         interpret::run(&mut s)
@@ -499,7 +509,9 @@ fn trap_due(s: &mut State) -> bool {
         return interpret::boundary(s);
     }
     let hits = s.debug & debug::TRAP;
-    if hits == 0 {
+    // M2 Part 2: a pending INIT comes before a trap the last instruction owes (Table 7-2: class 3 before class 4) and
+    // discards it: `events::take` takes the INIT next.
+    if hits == 0 || startup::init_pending(s) {
         return false;
     }
     if s.cpu.mov_ss != 0 {

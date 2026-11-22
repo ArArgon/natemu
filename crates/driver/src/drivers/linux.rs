@@ -35,10 +35,11 @@
 //! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
 //!
 //! M2 Part 2 (boot-interpreter plan sections 6, 7): `--no-mailbox` leaves the multiprocessor wakeup mailbox out of the
-//! MADT, and each AP starts in the INIT state (`Boot::mailbox`). Nothing marks it as waiting for a SIPI yet (the CPU
-//! start-up work adds that state), and the resident stops a vCPU outside 64-bit mode at its first entry
-//! (`unsupported_mode`), which ends the whole run: until then `--no-mailbox` with 2 or more vCPUs, and every Multiboot
-//! boot, ends at once. An image without the bzImage magic but with a Multiboot header is
+//! MADT, and each AP starts in the INIT state waiting for a SIPI (`Boot::mailbox`). The SIPI's state is the boot-time
+//! interpreter's, not built yet: the AP stops there (`unsupported_mode`), which ends the whole run: until then
+//! `--no-mailbox` with 2 or more vCPUs ends when the kernel starts its first AP, and every Multiboot boot (its BSP
+//! starts in 32-bit protected mode) at once. Each vCPU's report says where it waited at the end (`waiting`: `sipi`,
+//! `mailbox` or `halted`; absent while it ran). An image without the bzImage magic but with a Multiboot header is
 //! loaded by Multiboot (`boot::multiboot`: `--initrd` its one module, the command line QEMU's `-kernel` gives, the image's
 //! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the
 //! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V
@@ -390,6 +391,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 .read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
             VcpuReport {
                 stop,
+                waiting: execution::waiting(backing.vcpu(v)),
                 rip: Hex(s.cpu.rip),
                 blocks: s.blocks,
                 compiles,
@@ -625,6 +627,9 @@ struct EndedFirst {
 #[derive(Serialize)]
 struct VcpuReport {
     stop: String,
+    /// M2 Part 2: where it waited at the end (`execution::waiting`: `sipi`, `mailbox`, `halted`), absent while it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    waiting: Option<&'static str>,
     rip: Hex,
     blocks: u64,
     compiles: u64,
@@ -824,6 +829,7 @@ mod tests {
     fn vcpu_new(stop: &str, c: &Cpu, fault: [u64; 4]) -> VcpuReport {
         VcpuReport {
             stop: stop.into(),
+            waiting: None,
             rip: Hex(c.rip),
             blocks: 11,
             compiles: 12,

@@ -553,7 +553,11 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
         return false;
     }
     match event {
-        NMI => event_word(memory, v, std::mem::offset_of!(cache::Events, nmi)).store(1, SeqCst),
+        // The pending word's NMI bit (the word holds INIT and SIPI state too: an OR, not a store).
+        NMI => {
+            event_word(memory, v, std::mem::offset_of!(cache::Events, pending))
+                .fetch_or(cache::pending::NMI, SeqCst);
+        }
         _ => {
             let w = 8 * (event as usize / 64 % 4);
             let tmr = event_word(memory, v, std::mem::offset_of!(cache::Events, tmr) + w);
@@ -630,7 +634,42 @@ pub fn idle((halted, posts): (u64, u64)) -> bool {
     halted & 0xff == 1
         && halted >> cache::HALTED_SEEN_SHIFT == posts & (u64::MAX >> cache::HALTED_SEEN_SHIFT)
 }
-/// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`); the caller rings it.
+/// M2 Part 2: vCPU `area.vcpu` starts in the wait-for-SIPI state (an AP the firmware did not start: a boot without the ACPI
+/// mailbox, Multiboot, a program driver's `wait-for-sipi` section; its state the INIT or power-on state the caller set).
+/// Published in its pending word before any vCPU runs, so a SIPI sent before this one first enters the guest is latched
+/// (`cache::pending::WAIT`; the resident's `startup::wait` takes it).
+pub fn wait_for_sipi(area: Area) {
+    event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, pending))
+        .store(cache::pending::WAIT, SeqCst);
+}
+/// Where vCPU `area.vcpu` waited when its run ended, for the run reports: `sipi` (the wait-for-SIPI state: never started,
+/// or parked by an INIT; never reported as halted), `mailbox` (the ACPI wakeup mailbox, never woken), `halted` (HLT), or
+/// `None` (it was running).
+pub fn waiting(area: Area) -> Option<&'static str> {
+    let word = |field| event_word(area.memory, area.vcpu, field).load(SeqCst);
+    let state: State = area.read_record(exec::STATE_OFFSET);
+    if word(std::mem::offset_of!(cache::Events, pending)) & cache::pending::WAIT != 0 {
+        Some("sipi")
+    } else if state.mailbox != 0 {
+        Some("mailbox")
+    } else if word(std::mem::offset_of!(cache::Events, halted)) != 0 {
+        Some("halted")
+    } else {
+        None
+    }
+}
+/// M2 Part 2: vCPU `v`'s pending word (`cache::Events::pending`: NMI, INIT, wait-for-SIPI, a latched SIPI), for reports.
+pub fn pending_word(memory: &Memory, v: usize) -> u64 {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, pending)).load(SeqCst)
+}
+/// vCPU `v`'s IRR (`cache::Events::vectors`), for reports.
+pub fn irr(memory: &Memory, v: usize) -> [u64; 4] {
+    std::array::from_fn(|w| {
+        event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + 8 * w).load(SeqCst)
+    })
+}
+/// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`), or waits for a SIPI with
+/// none latched (`stop::WAIT_FOR_SIPI`); the caller rings it.
 pub fn end_when_halted(memory: &Memory, v: usize) {
     event_word(memory, v, std::mem::offset_of!(cache::Events, end)).store(1, SeqCst);
 }

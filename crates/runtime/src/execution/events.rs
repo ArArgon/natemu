@@ -24,11 +24,16 @@
 //! shadow reset or page drop) and wakes only for an event it can take (an enabled interrupt or an unblocked NMI, model A10). While
 //! parked its record says so (`Events::halted`): the host's watchdog treats it as idle, and the host may end its run
 //! ([`Events::end`], [`stop::HALTED`]) when no source could wake it.
+//!
+//! M2 Part 2: the NMI bit shares its word with INIT and SIPI ([`Events::pending`], [`super::startup`]). A pending INIT
+//! comes first at every boundary ([`next`]: not masked by IF, NMI blocking or a shadow; SDM Vol.3 Table 7-2 class 3) and
+//! wakes HLT; [`take`] takes it ([`super::startup::init`]) and has the interpreter entered; the interpreter loop's event
+//! point is [`interpreted`].
 use super::lapic;
 use super::segments::{Exception, linear};
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use natemu_abi::execution::cache::Events;
+use natemu_abi::execution::cache::{Events, pending};
 
 const IF: u64 = 1 << 9;
 const TF: u64 = 1 << 8;
@@ -55,6 +60,8 @@ fn word(s: &State, field: usize) -> &'static AtomicU64 {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Next {
+    /// M2 Part 2: an INIT (it outranks every other event and is masked by none).
+    Init,
     Nmi,
     Interrupt(u64),
     /// L4a: an ExtINT at LINT0 (its vector comes from the PIC when taken).
@@ -64,7 +71,15 @@ enum Next {
 }
 /// The event this boundary may take (Table 7-2), if any.
 fn next(s: &State) -> Option<Next> {
-    let nmi = s.nmi_blocked == 0 && word(s, core::mem::offset_of!(Events, nmi)).load(SeqCst) != 0;
+    // One load of the pending word: 0 on a running vCPU with no NMI or INIT pending (W is never set while it runs, S only
+    // with I). An NMI is seen exactly as before (its bit, while NMIs are not blocked); an INIT before anything else.
+    let p = word(s, core::mem::offset_of!(Events, pending)).load(SeqCst);
+    let nmi = p != 0 && {
+        if p & pending::INIT != 0 {
+            return Some(Next::Init);
+        }
+        p & pending::NMI != 0 && s.nmi_blocked == 0
+    };
     // L4a: an ExtINT ignores the APIC's priority and comes before the IRR (QEMU's `apic_get_interrupt`).
     let interrupt = match s.cpu.rflags & IF {
         0 => None,
@@ -97,7 +112,7 @@ pub(super) fn held(s: &State) -> bool {
     use core::mem::offset_of;
     let w = |field: usize| word(s, field).load(core::sync::atomic::Ordering::Relaxed);
     let v = offset_of!(Events, vectors);
-    let nmi = s.nmi_blocked == 0 && w(offset_of!(Events, nmi)) != 0;
+    let nmi = s.nmi_blocked == 0 && w(offset_of!(Events, pending)) != 0;
     nmi || (w(v) | w(v + 8) | w(v + 16) | w(v + 24) | w(offset_of!(Events, lint0)) != 0
         && (lapic::extint(s) || lapic::deliverable(s).is_some()))
 }
@@ -109,8 +124,21 @@ pub(super) fn take(s: &mut State) -> bool {
         let event = match next(s) {
             None => return false,
             Some(Next::Step) => return true,
+            // M2 Part 2: the INIT state (an AP then waits for its SIPI), then the interpreter at the next pass of `find`'s
+            // loop: the record is the trap test's ([`debug::INTERPRET`]), as after a transaction that made such a state.
+            Some(Next::Init) => {
+                super::startup::init(s);
+                s.debug |= debug::INTERPRET;
+                return false;
+            }
             Some(Next::Nmi) => {
-                word(s, core::mem::offset_of!(Events, nmi)).store(0, SeqCst);
+                // Its bit alone, while no INIT is pending: one sent since the look dropped the NMI and is taken first.
+                if word(s, core::mem::offset_of!(Events, pending))
+                    .fetch_update(SeqCst, SeqCst, natemu_abi::lapic::startup::nmi_taken)
+                    .is_err()
+                {
+                    continue;
+                }
                 s.nmi_blocked = 1; // before delivery, and kept if it faults (SDM Vol.3 7.7.2; model A8)
                 s.nmis += 1;
                 2
@@ -138,6 +166,49 @@ pub(super) fn take(s: &mut State) -> bool {
         if s.debug & debug::TRAP != 0 {
             return false;
         }
+    }
+}
+
+/// An event the interpreter loop does not deliver ([`interpreted`]): the boot-time interpreter's typed stop names it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[expect(dead_code, reason = "M2 Part 2: `interpret::events` (the interpreter loop) matches on it when the branches meet")]
+pub(super) enum Undelivered {
+    /// An NMI (not blocked).
+    Nmi,
+    /// With RFLAGS.IF: the local APIC's highest deliverable vector (left in the IRR).
+    Interrupt(u64),
+    /// With RFLAGS.IF: the ExtINT at LINT0 (not acknowledged: the PIC keeps it).
+    ExtInt,
+}
+
+/// M2 Part 2: the interpreter loop's event point (boot-interpreter plan section 5), for `interpret::events` at every
+/// boundary in interpreted state, before its instruction and after the steps of `find`'s prologue that come before
+/// events there (the I/O checkpoint, the invalidations, the LAPIC poll, the debug state).
+///
+/// Contract: a pending INIT is taken here ([`super::startup::init`]: the INIT state; an AP then waits for its SIPI and
+/// leaves with the SIPI's state, the BSP at the reset vector) and `None` is returned, as when nothing is pending: the
+/// caller goes on with the instruction at the bank's state, which may be a new one, so it reads its mode and CS again.
+/// Nothing else is taken or acknowledged: `Some` names the event that would be delivered at this boundary (an NMI not
+/// blocked; with RFLAGS.IF, the ExtINT at LINT0 or the APIC's highest deliverable vector, Table 7-2's order), left
+/// pending for the caller's typed stop (no event is delivered in interpreted modes). Shadows are not consulted (the MOV
+/// SS shadow is ignored there, and STI is not interpreted). A fixed vector can be in the IRR of a vCPU started by a SIPI
+/// (a send that raced its INIT, `lapic::init_reset`): it is reported only once software enables the APIC, as delivery.
+/// Interpreted HLT may wait in [`park`]: an INIT ends it (this point then takes it), an NMI or an enabled interrupt ends it
+/// for the typed stop, a SIPI does not (it changes nothing in a vCPU that is neither INIT-pending nor waiting).
+#[expect(dead_code, reason = "M2 Part 2: `interpret::events` (the interpreter loop) calls it when the branches meet")]
+pub(super) fn interpreted(s: &mut State) -> Option<Undelivered> {
+    let p = word(s, core::mem::offset_of!(Events, pending)).load(SeqCst);
+    if p & pending::INIT != 0 {
+        super::startup::init(s);
+        return None;
+    }
+    if p & pending::NMI != 0 && s.nmi_blocked == 0 {
+        return Some(Undelivered::Nmi);
+    }
+    match s.cpu.rflags & IF {
+        0 => None,
+        _ if lapic::extint(s) => Some(Undelivered::ExtInt),
+        _ => lapic::deliverable(s).map(Undelivered::Interrupt),
     }
 }
 
@@ -313,7 +384,7 @@ pub(super) fn park(s: &mut State) {
 }
 /// Doorbells that woke a waiting vCPU count as one stop taken at a resident entry (the others merged into it): the host's
 /// kickers wait for one, so it is made visible at once.
-fn doorbells(s: &mut State) {
+pub(super) fn doorbells(s: &mut State) {
     let n = acknowledge();
     if n > 0 {
         taken(s);
@@ -339,7 +410,11 @@ fn doorbells(s: &mut State) {
 /// host's end rule (`Events::halted` state 1, every post seen: no post wakes it, the APIC's events stay pending for
 /// after the wakeup); the host's end request is read before the mailbox, so a command written before the decision to
 /// end (by a vCPU that then halted) is still served.
-pub(super) fn wait_mailbox(s: &mut State) {
+///
+/// M2 Part 2: an INIT ends the wait (false: the caller takes it, [`super::startup::init`]): it is looked at after the posts
+/// seen are read and before `halted` is published (an AP with an INIT pending never looks idle), and once more after the
+/// end request is read (initsipi_model: the INIT a peer sent before the host's decision is taken, not ended). True: woken.
+pub(super) fn wait_mailbox(s: &mut State) -> bool {
     let from = crate::perf::enter(crate::perf::MAILBOX);
     let gpa = s.mailbox;
     let Some(p) = guest_ram().range(gpa, 16).filter(|_| gpa % 4096 == 0) else {
@@ -355,11 +430,20 @@ pub(super) fn wait_mailbox(s: &mut State) {
         // As in HLT, never consume the only I/O wake after checking the window request.
         super::io_checkpoint(s);
         take_invalidations(s);
+        let seen = posts.load(SeqCst);
+        if super::startup::init_pending(s) {
+            crate::perf::leave(from);
+            return false;
+        }
         halted.store(
-            1 | posts.load(SeqCst) << natemu_abi::execution::cache::HALTED_SEEN_SHIFT,
+            1 | seen << natemu_abi::execution::cache::HALTED_SEEN_SHIFT,
             SeqCst,
         );
         let ending = end.load(SeqCst) != 0;
+        if ending && super::startup::init_pending(s) {
+            crate::perf::leave(from);
+            return false;
+        }
         // The re-mark's cost (the review's item): it may spin until a writer that holds a writable shadow of the page
         // drops it (a writer in the host answers only when it next enters the VM); each such writer drops the page's
         // writable shadows, or all its shadows when its reverse map or drop slots fall short (docs/writable-drop.md;
@@ -388,7 +472,7 @@ pub(super) fn wait_mailbox(s: &mut State) {
             unsafe { core::sync::atomic::AtomicU16::from_ptr(p.cast()) }.store(0, SeqCst);
             cache::rechecked(gpa);
             crate::perf::leave(from);
-            return;
+            return true;
         }
         if ending {
             halt(s, stop::HALTED)

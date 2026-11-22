@@ -1442,13 +1442,17 @@ pub mod cache {
     pub struct Events {
         /// The IRR: pending interrupt vectors (bit v % 64 of word v / 64).
         pub vectors: [u64; 4],
-        /// 1: an NMI is pending (one pending bit: NMIs posted while one is pending merge, SDM Vol.3 7.7.2 / M64).
-        pub nmi: u64,
-        /// 1: the host ends the vCPU's run if it is halted with no event it can take ([`crate::execution::stop::HALTED`]).
+        /// The pending word ([`pending`]): an NMI pending (one bit: NMIs posted while one is pending merge, SDM Vol.3 7.7.2 /
+        /// M64) and, M2 Part 2, an INIT pending, the wait-for-SIPI state and a latched SIPI with its vector, so that the
+        /// no-event test at every boundary stays one load and every INIT and SIPI decision is one atomic update.
+        pub pending: u64,
+        /// 1: the host ends the vCPU's run if it is halted with no event it can take ([`crate::execution::stop::HALTED`]),
+        /// or waiting for a SIPI ([`crate::execution::stop::WAIT_FOR_SIPI`]).
         pub end: u64,
-        /// While the vCPU is halted (HLT, parked in `wfi` in the VM; the host's watchdog treats it as idle): bits 7:0 are 1,
-        /// or 2 when its own LAPIC timer can interrupt it (X3: it wakes itself); bits 63:8 hold the `posts` count it read
-        /// before it last found no event to take ([`HALTED_SEEN_SHIFT`]). 0 while it runs.
+        /// While the vCPU is halted (HLT, parked in `wfi` in the VM; the host's watchdog treats it as idle), or waits on the
+        /// ACPI mailbox or for a SIPI: bits 7:0 are 1, or 2 when its own LAPIC timer can interrupt it (X3: it wakes
+        /// itself; HLT only); bits 63:8 hold the `posts` count it read before it last found no event to take
+        /// ([`HALTED_SEEN_SHIFT`]). 0 while it runs.
         pub halted: u64,
         /// X3: what senders match an IPI's destination against, written by the owner only ([`crate::lapic::published`]).
         pub apic: u64,
@@ -1468,6 +1472,26 @@ pub mod cache {
     }
     /// `Events::halted`: the shift of the `posts` count the vCPU had seen.
     pub const HALTED_SEEN_SHIFT: u32 = 8;
+    /// [`Events::pending`]'s bits (M2 Part 2: INIT and SIPI, boot-interpreter plan section 6; the protocol is natemu's in
+    /// `tools/models/initsipi_model.py`, its updates [`crate::lapic::startup`]'s, each one atomic read-modify-write).
+    /// On a running vCPU the word is 0, [`NMI`](pending::NMI), or holds [`INIT`](pending::INIT) (with a latched SIPI
+    /// perhaps): [`WAIT`](pending::WAIT) is set only while it waits for a SIPI, and [`SIPI`](pending::SIPI) only with INIT
+    /// or WAIT.
+    pub mod pending {
+        /// N: an NMI is pending (senders and the host's NMI input set it; the resident clears it as it takes the NMI;
+        /// an INIT discards it).
+        pub const NMI: u64 = 1;
+        /// I: an INIT is pending (senders set it; the resident clears it as it takes the INIT).
+        pub const INIT: u64 = 2;
+        /// W: the vCPU is in the wait-for-SIPI state (set by its resident as it takes an INIT, or by the host before an AP
+        /// first runs; cleared by its resident as a SIPI starts it).
+        pub const WAIT: u64 = 4;
+        /// S: a SIPI is latched (with its vector in [`VECTOR`]): sent while INIT was pending or the vCPU waited.
+        pub const SIPI: u64 = 8;
+        /// The latched SIPI's vector (bits 15:8).
+        pub const VECTOR_SHIFT: u32 = 8;
+        pub const VECTOR: u64 = 0xff << VECTOR_SHIFT;
+    }
 
     // The window's 2 MiB (its pages and the shadow pool) and the text block precede the areas in a vCPU's block.
     const _: () = assert!(
@@ -3546,6 +3570,10 @@ pub mod stop {
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
     /// HLT.
     pub const HALTED: u64 = 32;
+    /// (M2 Part 2.) The vCPU waited for a start-up IPI (the wait-for-SIPI state: after an INIT, or as an AP the host left
+    /// there, never started) with none latched, and the host ended its run as for [`HALTED`]. The bank holds the INIT
+    /// state; the vCPU is reported as waiting for a SIPI, never as halted.
+    pub const WAIT_FOR_SIPI: u64 = 33;
     /// (M3, numbered apart.) A device access the resident does not complete ([`super::Mmio`]: its `status` says why):
     /// a precise stop with the state at the instruction, nothing of it done (the device untouched).
     pub const UNSUPPORTED_MMIO: u64 = 48;
@@ -3590,6 +3618,7 @@ pub mod stop {
             UNSUPPORTED_FERR => "unsupported_ferr",
             UNSUPPORTED_CODE_MODE => "unsupported_code_mode",
             HALTED => "halted",
+            WAIT_FOR_SIPI => "wait_for_sipi",
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
             REUSE_MISMATCH => "reuse_mismatch",

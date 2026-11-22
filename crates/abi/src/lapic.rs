@@ -71,6 +71,58 @@ pub mod icr {
     }
 }
 
+/// M2 Part 2: INIT and start-up IPIs (boot-interpreter plan section 6), natemu's protocol of
+/// `tools/models/initsipi_model.py`: the updates of a vCPU's pending word ([`crate::execution::cache::Events::pending`],
+/// its bits [`crate::execution::cache::pending`]), each of which the resident applies as one atomic read-modify-write
+/// of the word (a compare-and-swap loop). A sender posts (`Events::posts` + 1, then the doorbell) only when its update
+/// changed the word. The invariants (the model's J1, J2): a SIPI is latched only with an INIT pending or the vCPU waiting;
+/// INIT pending and waiting never together; the BSP never waits.
+pub mod startup {
+    use crate::execution::cache::pending::{INIT, NMI, SIPI, VECTOR, VECTOR_SHIFT, WAIT};
+
+    /// An INIT (level assert) sent: to a vCPU waiting for a SIPI, it drops a latched SIPI and a held NMI and leaves it
+    /// waiting (model W1: as if a SIPI had started it and the INIT stopped it before its first instruction); to any other
+    /// vCPU it is pending, and it drops a SIPI latched since an earlier INIT and a pending NMI (A4, A6: INIT clears
+    /// pending events).
+    pub const fn init_sent(word: u64) -> u64 {
+        let dropped = word & !(SIPI | VECTOR | NMI);
+        if word & WAIT != 0 { dropped } else { dropped | INIT }
+    }
+    /// A start-up IPI with `vector` sent: latched when an INIT is pending (W2: kvm-unit-tests sends them back to back) or
+    /// the vCPU waits, and none is latched yet (W3: the first one starts it); otherwise discarded (A3: a vCPU running, or in
+    /// HLT, ignores it; A8: Linux's second one).
+    pub const fn sipi_sent(word: u64, vector: u8) -> u64 {
+        if word & (INIT | WAIT) != 0 && word & SIPI == 0 {
+            word | SIPI | (vector as u64) << VECTOR_SHIFT
+        } else {
+            word
+        }
+    }
+    /// The vCPU takes its pending INIT (at a boundary, in HLT or in the mailbox wait): an AP enters the wait-for-SIPI
+    /// state, keeping a SIPI latched while the INIT was pending and an NMI sent after the INIT (held there, A1); the BSP
+    /// restarts at the reset vector, so a latched SIPI goes (A5: it never waits).
+    pub const fn init_taken(word: u64, bsp: bool) -> u64 {
+        if bsp {
+            word & !(INIT | SIPI | VECTOR)
+        } else {
+            word & !INIT | WAIT
+        }
+    }
+    /// A waiting vCPU's start: with a SIPI latched, the word without it and the wait, and its vector; `None` without one.
+    pub const fn started(word: u64) -> Option<(u64, u8)> {
+        if word & SIPI != 0 {
+            Some((word & !(SIPI | WAIT | VECTOR), (word >> VECTOR_SHIFT) as u8))
+        } else {
+            None
+        }
+    }
+    /// The vCPU takes its pending NMI: the word without it, while no INIT is pending (INIT outranks NMI, SDM Vol.3 Table
+    /// 7-2; an INIT sent meanwhile has dropped it); `None` otherwise.
+    pub const fn nmi_taken(word: u64) -> Option<u64> {
+        if word & (NMI | INIT) == NMI { Some(word & !NMI) } else { None }
+    }
+}
+
 /// One vCPU's local APIC state, private to its resident (a record in its state page, [`crate::execution::LAPIC_OFFSET`]).
 /// The IRR and TMR are the vCPU's shared [`crate::execution::cache::Events`] `vectors` and `tmr` (senders set bits there,
 /// L4a: the TMR with the IRR bit, as the I/O APIC's level-triggered messages need), the TPR is the
@@ -421,5 +473,88 @@ mod tests {
         assert_eq!(lint(0xfee0_0800, 0x700, 0x400), 0b011);
         assert_eq!(lint(0xfee0_0800, 0x31, MASKED), 0x31 << 5 | 0b100);
         assert_eq!(lint(0xfee0_0800, 0x8031, 0x431), 0b010);
+    }
+
+    /// The pending word's updates are the model's natemu protocol (`tools/models/initsipi_model.py`: "NATEMU'S
+    /// PROTOCOL"), written here as its set operations on (I, W, S with its vector, N).
+    #[test]
+    fn startup_rules_are_the_models() {
+        use crate::execution::cache::pending::{INIT, NMI, SIPI, VECTOR_SHIFT, WAIT};
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct M {
+            i: bool,
+            w: bool,
+            s: Option<u8>,
+            n: bool,
+        }
+        let word = |m: M| {
+            u64::from(m.i) * INIT
+                | u64::from(m.w) * WAIT
+                | u64::from(m.n) * NMI
+                | m.s.map_or(0, |v| SIPI | u64::from(v) << VECTOR_SHIFT)
+        };
+        for bits in 0..16u32 {
+            for vector in [0u8, 0x87, 0x9a, 0xff] {
+                let m = M {
+                    i: bits & 1 != 0,
+                    w: bits & 2 != 0,
+                    s: (bits & 4 != 0).then_some(vector),
+                    n: bits & 8 != 0,
+                };
+                let w = word(m);
+                // INIT: in W, clear S and N; else set I, clear S and N.
+                let init = M { i: m.i || !m.w, s: None, n: false, ..m };
+                assert_eq!(startup::init_sent(w), word(init), "{m:?}");
+                // SIPI: if I or W and no S, set S and the vector, else nothing.
+                let sipi = if (m.i || m.w) && m.s.is_none() { M { s: Some(0x42), ..m } } else { m };
+                assert_eq!(startup::sipi_sent(w, 0x42), word(sipi), "{m:?}");
+                // Taking INIT: one update clearing I and setting W (the BSP: clearing I and S).
+                assert_eq!(startup::init_taken(w, false), word(M { i: false, w: true, ..m }));
+                assert_eq!(startup::init_taken(w, true), word(M { i: false, s: None, ..m }));
+                // The start: one update clearing S and W, the vector taken.
+                assert_eq!(
+                    startup::started(w),
+                    m.s.map(|v| (word(M { s: None, w: false, ..m }), v))
+                );
+                // An NMI is taken only while no INIT is pending (the model's `_event`: I first).
+                assert_eq!(
+                    startup::nmi_taken(w),
+                    (m.n && !m.i).then(|| word(M { n: false, ..m }))
+                );
+            }
+        }
+    }
+
+    /// Every word a vCPU's pending word can reach (from running, or from the host's wait-for-SIPI at power-on) keeps the
+    /// model's J1 and J2: a SIPI latched only with INIT pending or waiting, a vector only with a SIPI, never INIT pending
+    /// and waiting, never waiting on the BSP. The target takes INIT and NMI only while it runs (not waiting) and starts only
+    /// while it waits.
+    #[test]
+    fn startup_words_keep_the_invariants() {
+        use crate::execution::cache::pending::{INIT, NMI, SIPI, VECTOR, WAIT};
+        for bsp in [false, true] {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut todo: std::vec::Vec<u64> = if bsp { std::vec![0] } else { std::vec![0, WAIT] };
+            while let Some(w) = todo.pop() {
+                if !seen.insert(w) {
+                    continue;
+                }
+                assert!(w & SIPI == 0 || w & (INIT | WAIT) != 0, "J1 {w:#x}");
+                assert!(w & VECTOR == 0 || w & SIPI != 0, "vector without SIPI {w:#x}");
+                assert!(w & (INIT | WAIT) != INIT | WAIT, "J2 {w:#x}");
+                assert!(!bsp || w & WAIT == 0, "J2 BSP {w:#x}");
+                let mut next = std::vec![startup::init_sent(w), startup::sipi_sent(w, 0x9a), startup::sipi_sent(w, 0), w | NMI];
+                if w & WAIT == 0 {
+                    next.extend(startup::nmi_taken(w));
+                    if w & INIT != 0 {
+                        next.push(startup::init_taken(w, bsp));
+                    }
+                } else {
+                    next.extend(startup::started(w).map(|(n, _)| n));
+                }
+                todo.extend(next);
+            }
+            assert!(seen.len() > 4, "{seen:?}");
+        }
     }
 }
