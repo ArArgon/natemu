@@ -2,8 +2,8 @@
 
 Status: November 22, 2026, built (M2 Part 2, after B1 (b); plan sections 3-5 are the spec). Scope: everything
 `natemu_abi::interp::exec::step` executes, plus CPUID, RDMSR, WRMSR, WBINVD, LGDT, LIDT and MOV from CR0/CR2/CR3/CR4
-(CLI and CLD are the core's). Typed stops for now, the next step's: protected-mode far JMP/RET and MOV Sreg, MOV to
-CR, HLT, the hand-off to 64-bit code. INIT and SIPI are the parallel CPU start-up work's. Code:
+(CLI and CLD are the core's). The protected-mode far JMP/RET and MOV Sreg, MOV to CR with the mode transitions, HLT and
+the hand-off to 64-bit code are [the interpreter's transitions](interp-transitions.md). Code:
 `crates/runtime/src/execution/interpret.rs`.
 
 ## The loop (`interpret::run`)
@@ -12,7 +12,8 @@ One instruction per pass, until `Cpu::interpreted_mode()` is `None`; it then ret
 `boundary`), or `start` dispatches.
 
 1. `rip &= 0xffff_ffff`; `io_checkpoint`, `take_invalidations`, `lapic::poll`: `find`'s order.
-2. A pending trap (`State::debug & TRAP` but `INTERPRET`), RFLAGS.TF or any DR7 enable: typed stop `interp_debug`.
+2. A pending trap (`State::debug & TRAP` but `INTERPRET`), RFLAGS.TF or any DR7 enable: typed stop `interp_debug`,
+   unless an INIT is pending (it comes first, SDM Table 7-2: the next step takes it).
 3. Events: `interpret::events` is the one place they are read, through the CPU start-up's event point
    `events::interpreted`: it takes a pending INIT itself (the bank is then the INIT or SIPI state, which the rest of the
    pass reads afresh) and returns any other event as an `Undelivered`, which `event_stop` turns into the typed stop
@@ -30,7 +31,7 @@ their AP stub (its MOV CR0 and far JMPs, the next step).
 Resident operations: CPUID, RDMSR, WRMSR, WBINVD through the existing `transaction` (`#[inline(always)]` now: out of
 line it put a call on the fast system-call path, `system`; with it `system` is unchanged), its `Err` a fault stop with
 nothing committed, its `commit`'s `debug::INTERPRET` cleared; LGDT/LIDT set GDTR/IDTR from the core's operands; MOV from
-CR writes the register (other CR numbers #UD). The rest: `interp_unsupported` with the operation's detail.
+CR writes the register (other CR numbers #UD). The rest: [the transitions](interp-transitions.md).
 
 ## Fetch
 
@@ -92,7 +93,8 @@ read-compare-write under `cache::split_begin`/`split_end`, as `split_lock`.
 << 16 | detail << 24, `native[1..3]` the bytes; `State::fault` = [vector, CR2, error code, RIP] for a fault, [0, linear,
 page, RIP] for memory, [vector, ...] for an event or the DR6/DR7 bits. Nothing is committed (RIP at the instruction). The
 program driver reports `fault` for these stops; the host's report (`diag::report`) adds a line naming the mode, bytes,
-operation and record.
+operation and record. `interp_bug` (86) is not one of them: the interpreter found its own invariant broken (an access
+no check covered, a state it cannot key), a halt with no record.
 
 `debug::INTERPRET` (DR6 bit 12) stays out of the guest: DR6 is written from `State::debug` only in `debug_exception`,
 reached through `trap_due` after its INTERPRET test returns and through `code_break` with no bits; MOV to DR6 masks the
@@ -107,22 +109,17 @@ the 25% reserve); boot 11,056 of 24,576.
 
 ## Cases
 
-Case `natemu` (M2 Max, run 20261122-052809-a4eb): 1,574 of the 1,716 corpus cases match their answers; the other 142
-stop at a resident operation not built yet (far JMP 25, far RET 11, segment loads 38, MOV to CR 68), listed in
-`tests/interp/natemu-pending.txt`. Case `natemu-machine` adds 12 interpreted-mode self-tests: an unaligned LOCK XADD and
+Case `natemu` (M2 Max): all 1,716 corpus cases match their answers (the resident operations of
+[the transitions](interp-transitions.md) built). Case `natemu-machine` adds 12 interpreted-mode self-tests (and the
+transitions' four): an unaligned LOCK XADD and
 LOCK BTS inside 16 bytes (FEAT_LSE2 at EL1: no alignment fault) and a LOCK XADD across 16 bytes; an instruction ending
 at a page end before an unmapped page, one crossing into it (#PF, CR2 the page, error 0); an instruction ending at the CS
 limit, the byte after it and one crossing it (#GP(0)); unassigned and device pages; self-modifying code; three typed
 stops. Each of these checks was shown to fail when it should (a temporary mutation, run 20261122-053853-a162).
 
 CPU start-up (`tests/system`, the INIT/SIPI work's): `initsipi` and `initsipi-1` (the entry regime, each start state
-observed at the interpreter's entry) and `tests/boot` `exit-ap-natemu` run with `NATEMU_INTERPRETER=off` and pass as
-before. `initsipi-interpreter` (the interpreter regime) runs the six scenarios whose outcome does not need the AP stub
-past its MOV CR0: sipi-then-init, nmi-in-wfs (the held NMI is the first boundary's event: `interp_event`), nmi-held,
-park-with-init, never-started, one-cpu. Not yet: linux, sipi-sipi, kvm-unit-tests, edk2, edk2-back-to-back,
-sipi-before-init-taken, sipi-during-host-request, init-in-mailbox, init-in-translated-hlt, nmi-init-in-wfs and
-fixed-in-wfs (each AP stops at the stub's MOV CR0), and init-sipi-init (its second INIT races the stub to that MOV CR0);
-the five scenarios the runner leaves out (interpreted HLT, events in interpreted code) wait for interpreted HLT.
+observed at the interpreter's entry) run with `NATEMU_INTERPRETER=off`; `initsipi-interpreter` and `tests/boot`
+`exit-ap-natemu` with the interpreter: [the transitions](interp-transitions.md)' cases.
 
 ## Review
 

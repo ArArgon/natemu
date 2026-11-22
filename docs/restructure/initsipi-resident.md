@@ -1,9 +1,10 @@
 # INIT and SIPI in the resident (boot-interpreter plan B2)
 
 Status: built, November 22, 2026, on `boot-interp` ac111723 (with `natemu_abi::power_on`, `--no-mailbox`, Multiboot,
-the program driver's machine sections); the interpreter itself is not merged yet, so a SIPI's start reaches today's
-stop at the interpreter's entry. The spec is natemu's protocol in `tools/models/initsipi_model.py`; plan sections 6 and
-9c.
+the program driver's machine sections). The interpreter is merged and runs a SIPI's start: the stub climbs to 64-bit
+code ([the interpreter's transitions](interp-transitions.md)); the entry regime of the cases below still stops at the
+interpreter's entry on purpose (`NATEMU_INTERPRETER=off`). The spec is natemu's protocol in
+`tools/models/initsipi_model.py`; plan sections 6 and 9c.
 
 ## The pending word
 
@@ -68,12 +69,11 @@ Where it is taken:
   changes nothing there (S needs I or W), so it neither posts nor wakes.
 - **The mailbox wait:** looks at I after reading `posts`, before publishing `halted`, and again after reading `end`; on
   I it leaves (`start()` then runs `init`).
-- **The interpreter loop:** a hook, `events::interpreted(s) -> Option<Undelivered>` (its contract in its doc), for
-  `interpret::events` to call at each interpreted boundary once the two branches meet: it takes INIT, then looks at the
-  new state's boundary again, and returns an NMI, an interrupt with IF = 1 or an ExtINT, left pending, for the
-  interpreter's typed stop (`None`: go on). Interpreted HLT can use `park` (INIT wakes it, an NMI ends it for the typed
-  stop, a SIPI does not). Until then nothing calls it: a start reaches the stub through `debug::INTERPRET`, and an NMI
-  still pending there is seen in the program driver's report (`startup.pending`).
+- **The interpreter loop:** `events::interpreted(s) -> Option<Undelivered>` (its contract in its doc), which
+  `interpret::events` calls at each interpreted boundary, after the debug state's look (an INIT pending there comes
+  first even with TF or a breakpoint armed, Table 7-2): it takes INIT, then looks at the new state's boundary again, and
+  returns an NMI, an interrupt with IF = 1 or an ExtINT, left pending, for the interpreter's typed stop (`None`: go on).
+  Interpreted HLT waits in `park` (INIT wakes it, an NMI ends it for the typed stop, a SIPI does not).
 
 ## The wait for a SIPI (`startup::wait`, a `wfi` loop like `wait_mailbox`)
 
@@ -113,18 +113,22 @@ others run on.
   back to back), `edk2` and `edk2-back-to-back` (rounds), `init-sipi-init`, `sipi-then-init`, `sipi-before-init-taken`,
   `sipi-during-host-request`, `init-in-mailbox`, `init-in-translated-hlt`, `nmi-in-wfs`, `nmi-held`,
   `nmi-init-in-wfs`, `park-with-init`, `never-started`, `bsp-init`, `fixed-in-wfs`, and two added to the model:
-  `sipi-sipi` (two vectors: the second ignored) and `one-cpu` (INIT and SIPI to all-but-self at one vCPU). Left until
-  the interpreter runs (they need interpreted boot programs, or a translated NMI or interrupt delivery, which the
-  driver's logging IDT ends): `hlt-init-not-sipi`, `nmi-in-interpreted-hlt`, `init-in-interpreted-code`,
-  `nmi-around-init`, `fixed-around-init`.
+  `sipi-sipi` (two vectors: the second ignored) and `one-cpu` (INIT and SIPI to all-but-self at one vCPU). Not run (they
+  need boot programs that start in interpreted code, which the runner's descriptions cannot state beside a translated
+  BSP, or a translated NMI or interrupt delivery, which the driver's logging IDT ends): `hlt-init-not-sipi`,
+  `nmi-in-interpreted-hlt`, `init-in-interpreted-code`, `nmi-around-init`, `fixed-around-init`; interpreted HLT woken by
+  an INIT and by an NMI is `tests/interp` case `natemu-machine`'s (`r-hlt-init`, `p32-hlt-nmi`).
+  Case `initsipi-interpreter` (the interpreter regime): every scenario but `bsp-init`, the interpreter running each AP's
+  stub from its SIPI to 64-bit code (a start counts at its arrival); `fixed-in-wfs`'s own start program (the climb, the
+  APIC enabled, STI, an idle HLT) is the stub with a jump the BSP patches at its 64-bit code.
   The judge reads each CPU's pending word as its own run ended (the driver's `startup.pending`): an entry stop with an
   NMI pending is the model's NMI stop there, one with an INIT pending is open (the interpreter's first boundary would
   take it).
 - `x3-cases`: `ipi-init`, `ipi-startup`, `ipi-init-xapic` (to APIC ID 1 at one vCPU) now reach their end with no effect
   (they stopped `unsupported_system`); `ipi-startup-self` (discarded), `ipi-init-self` (the BSP's reset state at the
   interpreter's entry) are new.
-- `exit-ap-natemu` (tests/boot, `exit_prog.asm` with the wait item): at one vCPU the pass; at 2 and 4 up to the SIPI
-  landing (every AP that stopped did so at its entry with CS 0800H, base 8000H, IP 0).
+- `exit-ap-natemu` (tests/boot, `exit_prog.asm` with the wait item): the pass at 1, 2 and 4 vCPUs (every AP climbs in the
+  interpreter and arrives once, counted from 64-bit code).
 - Debian with `--no-mailbox`: the next slice, once the interpreter is merged.
 
 ## Files
