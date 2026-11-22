@@ -564,6 +564,52 @@ FS_BASE_USER = USER + """    mov rbx, [fs:0]
 """
 
 
+# M2 Part 2: what the boot-time interpreter's mode transitions leave for translated code (docs/restructure/
+# interp-transitions.md, "What the resident resets"). 64-bit code reads V (natemu's shadow of it is made, as x86's TLB
+# entry), goes to the CPL-0 32-bit segment 38H, changes V's translation there and comes back to read V again: (1) CR3 :=
+# table B, where V maps F2 (A: F1); (2) V's PTE rewritten to F2 without INVLPG before going, there CR0.PG cleared and set
+# (IA-32e mode off and on, 32-bit protected mode with paging off between); (3) the same with CR4.PGE set and cleared.
+# Each read after must give F2's word (SDM Vol.3 4.10.4.1: each of those MOVs invalidates the TLB entries), each through
+# its own flush alone (the interpreter's CR3, CR0 and CR4 ones). CR0, CR4 and EFER are read back in 64-bit code. IF is
+# clear meanwhile: an interrupt with paging off would read the 64-bit IDT as a 32-bit one.
+def compat_tlb():
+    d = P.SYS_D(0)
+    v, f1, f2 = d + P.V, d + P.F1, d + P.F2
+    la, ta, tb = P.sys_leaf(0, 0, v), P.SYS_T(0, 0), P.SYS_T(0, 1)
+
+    def trip(k, c32):
+        return (f'    lea rax, [rel .b{k}]\n    mov [{{p:#x}}+0xa0], eax\n    mov word [{{p:#x}}+0xa4], 0x08\n'
+                f'    lea rax, [rel .c{k}]\n    mov [{{p:#x}}+0x90], rax\n    mov word [{{p:#x}}+0x98], 0x38\n'
+                f'    jmp far [{{p:#x}}+0x90]\nbits 32\n.c{k}:\n{c32}    jmp far dword [{{p:#x}}+0xa0]\nbits 64\n.b{k}:\n')
+    body = (SETUP + f"""    pushfq
+    cli
+    mov dword [{f1:#x}], 0x11111111
+    mov dword [{f2:#x}], 0x22222222
+    mov qword [{la:#x}], {f1 | P.LEAF:#x}
+    invlpg [{v:#x}]
+    mov ebx, [{v:#x}]
+""" + trip(1, f'    mov eax, {tb:#x}\n    mov cr3, eax\n') + f"""    mov r8d, [{v:#x}]
+    mov rax, {ta:#x}
+    mov cr3, rax
+    mov esi, [{v:#x}]
+    mov qword [{la:#x}], {f2 | P.LEAF:#x}
+""" + trip(2, '    mov eax, cr0\n    and eax, 0x7fffffff\n    mov cr0, eax\n    or eax, 0x80000000\n    mov cr0, eax\n')
+            + f"""    mov r9d, [{v:#x}]
+    mov qword [{la:#x}], {f1 | P.LEAF:#x}
+    invlpg [{v:#x}]
+    mov edi, [{v:#x}]
+    mov qword [{la:#x}], {f2 | P.LEAF:#x}
+""" + trip(3, '    mov eax, cr4\n    xor eax, 0x80\n    mov cr4, eax\n    xor eax, 0x80\n    mov cr4, eax\n')
+            + f"""    mov r10d, [{v:#x}]
+    mov r12, cr0
+    mov r13, cr4
+""" + rdmsr(0xc0000080, 'r14') + '    popfq\n' + RESTORE_GS)
+    prog = program('seg-compat-tlb@1', body)
+    prog['memory'] += P.sys_tables(0, 1, 1, {d + P.R: (d + P.R) | P.P | P.US | P.A, v: f2 | P.LEAF}) + [
+        dict(P.zero(f1, 0x1000), capture=False), dict(P.zero(f2, 0x1000), capture=False)]
+    return prog
+
+
 def ltr_race(n):
     """Every CPU loads TR from one TSS descriptor (CPU 0's GDT) after a start barrier: LTR's busy write is a
     compare-exchange, so exactly one CPU succeeds and every other takes #GP(0x70) at its LTR (natemu only: QEMU's LTR is
@@ -594,5 +640,6 @@ def programs(cpus=(1, 2, 4)):
     body, user = to_user('lret', tail=VIF_TAIL)
     ps.append(program('seg-iret-vif-cpl3@1', body, user))
     ps.append(program('seg-fs-gs-base-cpl3@1', FS_BASE_BODY, FS_BASE_USER))
+    ps.append(compat_tlb())
     ps += [ltr_race(n) for n in (2, 4)]
     return ps + fault_programs()
