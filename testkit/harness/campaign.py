@@ -31,6 +31,9 @@ and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (nati
                                 writes `<suite>-reference.txt` beside the suite: the machine, kernel, QEMU and image
     answers = ["file", ...]     answer files in the family folder (`NAME ...` lines): part-0 reports an answer for a
                                 test the image does not list as a stale-entry
+    check_reuse = true          boots with NATEMU_CHECK_REUSE=1: every translated block natemu reuses (a kept answer at
+                                another address, a copy made inside the guest) is compiled again and compared, and a
+                                mismatch stops the boot, so its tests go missing (the 32-bit suites: torture32, libm32)
     "engine.fp" in the matrix   boots with NATEMU_FP set to the variant's value (fast, accurate); a verdict that takes
                                 `mode` gets {'afp': AFP present and not hidden, 'fp': the mode}. A verdict may return
                                 `changed` (a test that failed otherwise than recorded): a failure, expected or not
@@ -522,7 +525,9 @@ class Campaign:
         fp = variant.get('engine.fp') or os.environ.get('NATEMU_FP') or 'fast'   # an engine.fp variant sets NATEMU_FP
         accurate = fp == 'accurate'
         mode = {'afp': bool(have.get('afp')), 'fp': fp}
-        fp_env = {'env': {'NATEMU_FP': fp}} if variant.get('engine.fp') else {}
+        env = {'NATEMU_FP': fp} if variant.get('engine.fp') else {}
+        if ex.get('check_reuse'): env['NATEMU_CHECK_REUSE'] = '1'
+        fp_env = {'env': env} if env else {}
         for f, d in without.items():
             if f in have and not have[f]:
                 expected.update({t: why for t, why in d.items() if not (f == 'afp' and accurate) or kept_in_accurate(why)})

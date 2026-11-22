@@ -471,6 +471,7 @@ ct = "torture"
 parts = 1
 cap = 3600
 verdict = "verdicts:torture32"
+check_reuse = true     # 32-bit code reuse (docs/restructure/m2-reuse32-findings.md): every reused block is compiled again and compared
 matrix = { "machine.vcpus" = [4] }
 needs = { cores = 4, perf = true }
 
@@ -503,6 +504,7 @@ ct = "libm"
 parts = 1
 cap = 3600
 verdict = "verdicts:libm32"
+check_reuse = true     # 32-bit code reuse (docs/restructure/m2-reuse32-findings.md): every reused block is compiled again and compared
 answers = ["libm32.txt", "libm32-fails-afp.txt", "libm32-fails-noafp.txt", "libm32-fails-noafp-accurate.txt"]
 matrix = { "machine.vcpus" = [4], "host.afp" = [true, false], "engine.fp" = ["fast", "accurate"] }
 needs = { cores = 4, perf = true }

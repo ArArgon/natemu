@@ -1135,6 +1135,18 @@ pub mod cache {
     pub const PIC_OFF: u64 = 0;
     pub const PIC_USER: u64 = 1;
     pub const PIC_ALL: u64 = 2;
+    /// PIC study stage 3: whether templates of `context` are shared under [`Control::pic`] `pic`: user code, or every
+    /// privilege level; never 32-bit code (M2 reuse: its address moves are one or two words where the rewrite needs more,
+    /// its addresses wrap at 4 GiB where an instance's are built by a 64-bit add, and no rule of an instance checks
+    /// that: it is copied, [`super::relocate_code_mode`]).
+    pub fn shares(pic: u64, context: u64) -> bool {
+        !super::context_bits32(context)
+            && match pic {
+                PIC_USER => context & 3 == 3,
+                PIC_ALL => true,
+                _ => false,
+            }
+    }
     pub const CLAIMED_PAGES: usize = 8;
     impl Control {
         #[inline(always)]
@@ -2042,6 +2054,12 @@ pub fn run_test_end(word: impl Fn(u64) -> u32, size: u64) -> Option<u64> {
     (e > entry + 8 && e + 40 <= size && (0..9).all(|k| word(e + 4 * k) == RUN_END[k as usize]) && word(e + 36) >> 26 == 5)
         .then_some(e)
 }
+/// M2 task 4: the last word of the run's end at `e` ([`run_test_end`]) as fexc emits it: `b` to the block's third word.
+/// The resident re-points it at the hot copy's third word when it splits the block, so a copy of the block restores it
+/// (M2 reuse) and the reuse check takes the re-pointed word for it.
+pub fn run_return_word(e: u64) -> u32 {
+    0x1400_0000 | ((u64::from(ENTRY_OFFSET) + 8).wrapping_sub(e + 36) >> 2) as u32 & 0x03ff_ffff
+}
 /// Hot/cold layout: the word `w` can be followed by the next (not `b`, `brk` or a zero word: [`body_end`]'s rule).
 pub fn falls_through(w: u32) -> bool {
     !(w & 0xfc00_0000 == 0x1400_0000 || w & 0xffe0_001f == 0xd420_0000 || w >> 16 == 0)
@@ -2161,6 +2179,10 @@ pub fn relocate_code(
     guest_bytes: u32,
 ) -> Result<(), usize> {
     relocate_code_mode(code, relocs, links, from, to, guest_bytes, false)
+}
+/// M2 reuse: the code context ([`Cpu::code_context`]) is 32-bit code's (its mode field, bits 4:2).
+pub fn context_bits32(context: u64) -> bool {
+    context >> 2 & 7 == CodeMode::Compat32 as u64
 }
 /// A guest address range of 32-bit code that relocation moves: `[at, at + guest_bytes]` below 4 GiB (the block's end may
 /// be 4 GiB itself only as a wrapped 0, which fexc decides: refused).

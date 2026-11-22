@@ -2092,10 +2092,14 @@ pub(crate) const GATING: usize = 15;
 /// M2 reuse: the kept answers' RIP of 32-bit code, tagged in its upper half, which a 32-bit address leaves free, with
 /// everything of the request that 64-bit code has not: bit 62 (32-bit code; with bit 63 clear, so no canonical address:
 /// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35) and the x87
-/// guess (from bit 36; 13 bits). The answers table alone sees it ([`Answers::find`], [`Answers::insert`], an entry's
+/// guess (from bit 36; 13 bits): the request's for an answer whose compile read it, [`GUESS_FREE`] for one that did
+/// not (a unit without x87 instructions: one entry, and one publication, under every guess). The answers table alone sees it ([`Answers::find`], [`Answers::insert`], an entry's
 /// fingerprint): an answer of another tag is under another key, never a hit; every address use (relocation's distance,
 /// admission, fexc's request, the persistent cache's key, the pool) has the plain RIP.
 const TAG32: u64 = 1 << 62;
+/// The guess field of a 32-bit answer that did not read the guess: no guess's value (a guess is 0 or has bit 12 set and
+/// bit 11 clear: 0x1000 | TOP << 8 | tags).
+const GUESS_FREE: u64 = 0x800;
 fn tag32(null_segments: [bool; 4], x87_guess: u64) -> Result<u64> {
     if x87_guess >> 13 != 0 {
         return Err(format!("x87 guess {x87_guess:#x}: more than 13 bits").into());
@@ -2273,7 +2277,8 @@ impl Entry {
     /// fexc gives the same answer for `bytes` under `gating`: it reads nothing that differs (tools/fexc/fexc.cpp, `Extent`
     /// and `FexcArg`).
     fn matches(&self, bytes: &[u8], gating: &[u64; GATING]) -> bool {
-        self.read >> GATING == 0
+        // (Bit `GATING`, the x87 guess: 32-bit code's, matched by the entry's tag.)
+        self.read >> (GATING + 1) == 0
             && (0..GATING).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
             && if self.whole {
                 bytes == self.prefix
@@ -2638,6 +2643,9 @@ pub struct Compiler {
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
     /// halving retry made it ([`Compiler::compile`]); the template rule of reuse inside the resident (perf chunk 10).
     read: usize,
+    /// M2 reuse: the last request's answer read the x87 guess (32-bit code with x87 instructions): it is no template
+    /// ([`translation`]), since the pool and the resident's templates are found without the guess.
+    guess_read: bool,
     halved: bool,
     /// The template pool's writer (the run's; [`Backing::pool`]) and, with it set, the answer the last request used and the
     /// (context, gating values) pairs this vCPU already told it about ([`Compiler::note_gating`]).
@@ -2826,6 +2834,7 @@ impl Compiler {
             null_segments: [false; 4],
             perf: None,
             read: 0,
+            guess_read: false,
             halved: false,
             pool: None,
             last: None,
@@ -2897,21 +2906,22 @@ impl Compiler {
             self.push_run.into(),
         ]
     }
-    /// `rip` as the answers table holds it: 32-bit code's with the request's null segments and x87 guess, as
-    /// [`Compiler::body_with`] sends them ([`tag32`]).
-    fn at(&self, rip: u64) -> Result<u64> {
+    /// `rip` as the answers table holds it: 32-bit code's with the request's null segments, as [`Compiler::body_with`]
+    /// sends them, and `guess` ([`tag32`]): the request's x87 guess for an answer that read it, [`GUESS_FREE`] for one that
+    /// did not.
+    fn at(&self, rip: u64, guess: u64) -> Result<u64> {
         if !self.bits32 {
             // (No such RIP is compiled: fexc refuses a non-canonical one.)
             return if tagged(rip) { Err(format!("RIP {rip:#x} is not canonical").into()) } else { Ok(rip) };
         }
-        if rip >> 32 != 0 {
-            return Err(format!("32-bit code at {rip:#x}").into());
+        if rip >> 32 != 0 || self.x87_guess & GUESS_FREE != 0 {
+            return Err(format!("32-bit code at {rip:#x}, x87 guess {:#x}", self.x87_guess).into());
         }
-        Ok(rip | tag32(self.null_segments, self.x87_guess)?)
+        Ok(rip | tag32(self.null_segments, guess)?)
     }
-    /// fexc's `args_read` as a kept answer's `read`: its gating arguments. The x87 guess's bit is dropped for 32-bit code,
-    /// whose tag holds the guess whether read or not. Any other argument is an error, and the guess for 64-bit code,
-    /// which is sent none: an answer that read it would be served to a request with another value of it (M2 task 4's
+    /// fexc's `args_read` as a kept answer's `read`: its gating arguments and, for 32-bit code, the x87 guess's bit, which
+    /// says under which tag the answer is kept ([`Compiler::at`]). Any other argument is an error, and the guess for 64-bit
+    /// code, which is sent none: an answer that read it would be served to a request with another value of it (M2 task 4's
     /// review: the guess, then outside the key).
     fn keyed_read(&self, args_read: u32) -> Result<u32> {
         if args_read >> (GATING + usize::from(self.bits32)) != 0 {
@@ -2921,7 +2931,7 @@ impl Compiler {
             )
             .into());
         }
-        Ok(args_read & ((1 << GATING) - 1))
+        Ok(args_read)
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
@@ -2934,9 +2944,15 @@ impl Compiler {
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
-        let at = self.at(rip)?;
-        let (found, waited) = self.answers.find(bytes, at, limit, &gating);
+        // 32-bit code: an answer that read no guess first (most: code without x87 instructions), then one for this guess.
+        let at = [self.at(rip, GUESS_FREE)?, self.at(rip, self.x87_guess)?];
+        let (mut found, waited) = self.answers.find(bytes, at[0], limit, &gating);
         self.waited(waited);
+        if found.is_none() && self.bits32 {
+            let waited;
+            (found, waited) = self.answers.find(bytes, at[1], limit, &gating);
+            self.waited(waited);
+        }
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
             if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
@@ -2946,6 +2962,7 @@ impl Compiler {
                 self.hits += 1;
                 self.hits_by_source[usize::from(e.owner)] += 1;
                 self.read = e.prefix.len();
+                self.guess_read = e.read >> GATING != 0;
                 if let Some(r) = &mut self.perf {
                     r.sources[0] += 1;
                     r.read = (hash(&e.prefix), e.prefix.len() as u32);
@@ -2970,6 +2987,7 @@ impl Compiler {
                 bytes.len().min(reply.extent as usize),
             );
             let (read, prefix) = (self.keyed_read(reply.read)?, bytes[..end].to_vec());
+            let at = at[usize::from(read >> GATING != 0)];
             let entry = Arc::new(Entry {
                 rip: from,
                 tag: at ^ rip,
@@ -2998,6 +3016,7 @@ impl Compiler {
                 }
             }
             self.read = end;
+            self.guess_read = read >> GATING != 0;
             self.charge(crate::perf::KEEP, t);
             if let Some(r) = &mut self.perf {
                 r.read = (hash(&entry.prefix), entry.prefix.len() as u32);
@@ -3011,7 +3030,7 @@ impl Compiler {
             };
             match self.reuse(&entry, bytes, rip, limit, hook, Some(origin))? {
                 Some(code) => {
-                    if self.pool.is_some() && !self.bits32 {
+                    if self.pool.is_some() {
                         self.last = Some(entry);
                     }
                     return Ok(code);
@@ -4475,9 +4494,11 @@ fn translation(
     // same bytes at any RIP of this half and page offset (the relocation proof) when it depended only on bytes of the
     // block's own pages before their end (so the frames say which), no limit cut them and no halving retry made it.
     let last = rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12;
+    // (M2 reuse: 32-bit code's too, but for a unit compiled for an x87 guess: the resident's templates and the pool are found
+    // by the code context, which holds the code mode and the null segments and no guess.)
     let template = !step
         && !cut
-        && !compiler.bits32
+        && !compiler.guess_read
         && !compiler.halved
         && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
         && compiler.read < bytes_len
@@ -5490,7 +5511,8 @@ mod tests {
         insns(&mut c, &fwd, 0x5655_5340);
         insns(&mut c, &fwd, 0xffff_f340); // the target wraps past 4 GiB
         assert_eq!(c.relocation_refused, refused + 3);
-        // The null segments and the x87 guess are the answer's: another value is another answer.
+        // The null segments are the answer's, and the x87 guess where the compile read it (x87 code): another value is
+        // another answer. An answer that read no guess is one entry under every guess, and says so (`guess_read`).
         let fld = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc1, 0xdd, 0x1b, 0xc3]; // fld1; fld1; faddp; fstp qword [ebx]; ret
         let same = |c: &mut super::Compiler, code: &[u8], rip| {
             let n = c.compiles;
@@ -5499,7 +5521,8 @@ mod tests {
         };
         c.x87_guess = 0x1000;
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
-        assert!(!same(&mut c, &code, 0x4000) && same(&mut c, &code, 0x5000), "the guess is the answer's tag, read or not");
+        assert!(c.guess_read);
+        assert!(same(&mut c, &code, 0x4000) && !c.guess_read, "no x87: one answer under every guess");
         c.x87_guess = 0x1701;
         assert!(!same(&mut c, &fld, 0x5655_5800) && same(&mut c, &fld, 0xf7c5_6800));
         c.x87_guess = 0;
@@ -5512,20 +5535,24 @@ mod tests {
         assert!(same(&mut c, &code, 0x4000));
         c.x87_guess = 0;
         // The tag is the table's alone: an entry's RIP is its address, and no tagged RIP is a canonical one.
-        let at = c.at(0x5655_5340).unwrap();
+        let at = c.at(0x5655_5340, 0).unwrap();
         assert!(super::tagged(at) && !exec::canonical(at) && super::untagged(at) == 0x5655_5340);
         assert_eq!(at, 0x4000_0000_5655_5340);
+        assert_eq!(c.at(0x5655_5340, super::GUESS_FREE).unwrap(), 0x4000_8000_5655_5340);
         c.null_segments = [true, false, false, true];
         c.x87_guess = 0x17ff;
-        assert_eq!(c.at(0xffff_ffff).unwrap(), 0x4001_7ff9_ffff_ffff);
-        assert!(c.at(1 << 32).is_err());
+        assert_eq!(c.at(0xffff_ffff, c.x87_guess).unwrap(), 0x4001_7ff9_ffff_ffff);
+        assert!(c.at(1 << 32, 0).is_err());
+        // (No guess has the bit that marks an answer without one.)
+        c.x87_guess = 0x1800;
+        assert!(c.at(0x1000, 0).is_err());
         (c.null_segments, c.x87_guess, c.bits32) = ([false; 4], 0, false);
-        assert_eq!(c.at(0x40_0000).unwrap(), 0x40_0000);
-        assert!(c.at(at).is_err() && c.at(0xffff_8000_0000_0000).is_ok());
+        assert_eq!(c.at(0x40_0000, 0).unwrap(), 0x40_0000);
+        assert!(c.at(at, 0).is_err() && c.at(0xffff_8000_0000_0000, 0).is_ok());
         // An argument beyond the key: the guess is 32-bit code's (in its tag), nothing above it is anyone's.
         assert_eq!((c.keyed_read(0x7fff), c.keyed_read(0x8000).is_err(), c.keyed_read(0x1_0000).is_err()), (Ok(0x7fff), true, true));
         c.bits32 = true;
-        assert_eq!((c.keyed_read(0x8081), c.keyed_read(0x1_0000).is_err()), (Ok(0x81), true));
+        assert_eq!((c.keyed_read(0x8081), c.keyed_read(0x1_0000).is_err()), (Ok(0x8081), true));
         c.check_reuse = false;
         // M2 task 3a: system cuts are decoded in 32-bit mode (40 is INC EAX before the INT, not a REX prefix), and an
         // access through a null FS or GS is the #GP cut; the other segment's, and 64-bit code's, are translated.
@@ -7200,6 +7227,34 @@ mod tests {
         request(&mut c, 0x40_1000, false, None);
         request(&mut c, 0x50_1000, false, None);
         assert_eq!((published(&p), c.hits), (1, 1));
+        // M2 reuse: 32-bit code's templates are published too, under their own context (the code mode is in it), once for
+        // every x87 guess; a unit compiled for a guess (x87 code, whatever the guess) is no template.
+        let request32 = |c: &mut Compiler, code: &[u8], rip: u64, guess: u64| {
+            let mut bytes = code.to_vec();
+            bytes.resize(64, 0x90);
+            assert!(ram.copy_in(0x6000, &bytes));
+            let mut cpu = test_cpu(rip);
+            let cs = &mut cpu.seg[exec::SREG_CS].attributes;
+            *cs = *cs & !exec::ATTR_L | exec::ATTR_D;
+            let mut s = State::new(0, cpu);
+            (s.fetch, s.x87_guess) = ([0x6000, u64::MAX], guess);
+            let reply = translation(area, c, &mut s, false, None, &mut Requests::default(), &mut ());
+            assert_eq!(reply.unwrap().unwrap(), exec::REPLY_ADMITTED);
+            (s.cpu.code_context(), s.relocatable)
+        };
+        let (mut c, p) = fresh();
+        let plain = [0x40, 0x01, 0xd8, 0xc3]; // inc eax; add eax, ebx; ret
+        let x87 = [0xd9, 0xe8, 0xdd, 0x1b, 0xc3]; // fld1; fstp qword [ebx]; ret
+        let (context32, template) = request32(&mut c, &plain, 0x5655_6000, 0x1000);
+        assert_eq!((published(&p), template, c.compiles), (1, 1, 1));
+        assert_ne!(context32, test_context());
+        assert_eq!(request32(&mut c, &plain, 0xf7c5_6000, 0x1701).1, 1);
+        assert_eq!((published(&p), c.compiles, c.relocated), (1, 1, 1));
+        for guess in [0x1000, 0] {
+            assert_eq!(request32(&mut c, &x87, 0x5655_6000, guess).1, 0, "guess {guess:#x}");
+        }
+        assert_eq!((published(&p), c.compiles), (1, 3));
+        assert!(p.gating_of(context32).is_some() && !p.is_off(), "one gating vector for the context under every guess");
         // Another vector under a context the pool knows: off (the reply is still the block); a host error under the check.
         let (mut c, p) = fresh();
         let (_, context) = request(&mut c, 0x40_1000, false, None);

@@ -18,9 +18,9 @@ use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
     ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
-    INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD,
+    INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
-    PIC_TEST_STR, PIC_TEST_SVC, PIC_USER, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
+    PIC_TEST_STR, PIC_TEST_SVC, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
     STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
@@ -152,12 +152,25 @@ fn split(b: &mut Block) -> bool {
     synchronize_code(area::CODE_WRITE_VA + from, area::CODE_VA + from, (body + h + 4 - from) as usize);
     // M2 task 4: the run's end of a top x87 run test is cold; its return goes to the hot copy's third word, not the cold
     // code's (whose exits no link patches: each arrival with a run open, x87 code jumping or returning to SSE code,
-    // would leave through the linker). The one word of a block's code the resident changes besides its link points; a
-    // block that begins with the test is never copied ([`copy`]).
+    // would leave through the linker). The one word of a block's code the resident changes besides its link points
+    // ([`run_return`]: a copy restores it, the reuse check knows it).
     if let Some(e) = natemu_abi::execution::run_test_end(|o| word(code + o), u64::from(b.code_size)) {
-        rewrite(code + e + 36, branch(code + e + 36, body + u64::from(natemu_abi::execution::ENTRY_OFFSET) + 8));
+        // (Only the word fexc emits there: any other stays, and the block is then no source of a copy, [`copy`].)
+        if word(code + e + 36) == natemu_abi::execution::run_return_word(e) {
+            rewrite(code + e + 36, branch(code + e + 36, body + u64::from(natemu_abi::execution::ENTRY_OFFSET) + 8));
+        }
     }
     true
+}
+/// M2 task 4 and reuse: for a block that begins with the test for an open x87 run, the offset of its run end's return
+/// word, the word as admitted (`b` to the block's third word) and, if the block is split, the word [`split`] put there
+/// (`b` to its hot copy's third word).
+pub fn run_return(b: &Block) -> Option<(u64, u32, Option<u32>)> {
+    let code = u64::from(b.code);
+    let e = natemu_abi::execution::run_test_end(|o| word(code + o), u64::from(b.code_size))?;
+    let at = code + e + 36;
+    let hot = (b.hot_size != 0).then(|| branch(at, b.hot_body() + u64::from(natemu_abi::execution::ENTRY_OFFSET) + 8));
+    Some((e + 36, natemu_abi::execution::run_return_word(e), hot))
 }
 fn link_at(b: &Block, offset: u64) -> u64 {
     b.link_at(offset as u32)
@@ -1080,6 +1093,7 @@ fn counted(k: usize) {
     control().pic_counts[k] += 1;
 }
 /// A user (CPL 3) context ([`natemu_abi::execution::Cpu::code_context`]'s CPL bits).
+#[cfg_attr(not(feature = "pic-count"), allow(dead_code))]
 pub(crate) fn user(context: u64) -> bool {
     context & 3 == 3
 }
@@ -1109,11 +1123,7 @@ fn placed_pic(b: &Block, admitted: &[u8]) {
 }
 /// PIC study stage 3: whether templates of `context` are shared ([`Control::pic`]: user code, or every privilege level).
 pub fn shares(context: u64) -> bool {
-    match control().pic {
-        PIC_USER => user(context),
-        PIC_ALL => true,
-        _ => false,
-    }
+    natemu_abi::execution::cache::shares(control().pic, context)
 }
 /// PIC study stage 3, the lazy rewrite: the shared translation of the template `t` (absolute, live, not [`UNSHAREABLE`]),
 /// made when a second address first needs its code (a template with no position-independent form, or a global mapping, is
@@ -1125,8 +1135,8 @@ pub fn shares(context: u64) -> bool {
 /// `None` (nothing filed): the code area or the arena is full, or the rewrite or its proof refused (counted
 /// [`count::UNPROVED`], a resident fault the check halts on).
 pub fn share(t: &Block) -> Option<&'static Block> {
-    // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return: as [`copy`]. 32-bit code, not
-    // relocatable today, so not reached.)
+    // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return. 32-bit code, which is never
+    // shared ([`shares`]), so not reached.)
     if run_tested(t) {
         unsafe { (*block_ptr(t.number as usize)).flags |= UNSHAREABLE };
         return None;
@@ -1408,8 +1418,14 @@ pub fn copy(
     if b.flags & PIC != 0 {
         return Err(natemu_abi::execution::refusal::PLACE); // a translation is shared, not copied ([`instance`])
     }
-    // (M2 task 4: a block whose code the resident changed, [`split`]: 32-bit code, which is not relocatable today.)
-    if run_tested(b) {
+    // M2 task 4 and reuse: a block that begins with the test for an open x87 run has one word the resident may have
+    // changed besides its link points, its run end's return ([`split`]): the copy gets it as admitted ([`run_return`]).
+    // Any other word there is no block the resident made: not copied.
+    let run = run_return(b);
+    if run.is_some_and(|(o, admitted, split)| {
+        let w = word(u64::from(b.code) + o);
+        w != admitted && Some(w) != split
+    }) {
         return Err(natemu_abi::execution::refusal::PLACE);
     }
     let (h_at, want) = split_point(|o| word(u64::from(b.code) + o), &b.links, b.dispatch_exit, b.code_size, |o| {
@@ -1436,7 +1452,11 @@ pub fn copy(
             let o = svc_slot(b, p) as usize;
             at[o..o + 4].copy_from_slice(&pic::SVC_LINK.to_le_bytes());
         }
-        natemu_abi::execution::relocate_code(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes)?;
+        if let Some((o, admitted, _)) = run {
+            at[o as usize..o as usize + 4].copy_from_slice(&admitted.to_le_bytes());
+        }
+        let bits32 = natemu_abi::execution::context_bits32(b.context);
+        natemu_abi::execution::relocate_code_mode(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes, bits32)?;
         relocate(code, u64::from(b.dispatch_exit), dispatcher_for(b.context));
         synchronize_code(
             area::CODE_WRITE_VA + code,
@@ -1545,7 +1565,8 @@ pub fn copy_pooled(
             len,
         );
         let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, len);
-        natemu_abi::execution::relocate_code(at, &relocs[..count], &mut links, e.rip, rip, e.guest_bytes)?;
+        let bits32 = natemu_abi::execution::context_bits32(context);
+        natemu_abi::execution::relocate_code_mode(at, &relocs[..count], &mut links, e.rip, rip, e.guest_bytes, bits32)?;
         relocate(code, u64::from(e.dispatch_exit), dispatcher_for(context));
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, len);
     }

@@ -619,6 +619,45 @@ mod tests {
         }
     }
 
+    /// M2 reuse inside the resident: 32-bit code's templates are copied by the 32-bit rule and never shared as
+    /// position-independent translations, whatever the block (here: one ending in `ret`, which has no address move at
+    /// all, so nothing else would refuse it); a block on the last page below 4 GiB that runs to 4 GiB is refused by the
+    /// rule both copy routines call; and a copy of a block with the x87 run test restores its run end's return.
+    #[test]
+    fn templates_of_32_bit_code_are_copied_never_shared() {
+        use natemu_abi::execution::cache::{PIC_ALL, PIC_OFF, PIC_USER, shares};
+        use natemu_abi::execution::{CodeMode, ENTRY_OFFSET, RUN_END, context_bits32, frame, relocate_code_mode, run_return_word, run_test_end};
+        // The code context's mode field (bits 4:2) and CPL (bits 1:0).
+        let context = |mode: CodeMode, cpl: u64| (mode as u64) << 2 | cpl | 1 << 11;
+        let (user64, kernel64, user32) = (context(CodeMode::Bits64, 3), context(CodeMode::Bits64, 0), context(CodeMode::Compat32, 3));
+        assert!(!context_bits32(user64) && !context_bits32(kernel64) && context_bits32(user32));
+        assert!(!context_bits32(context(CodeMode::Compat16, 3)));
+        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, user64)), [false, true, true]);
+        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, kernel64)), [false, false, true]);
+        assert_eq!([PIC_OFF, PIC_USER, PIC_ALL].map(|p| shares(p, user32)), [false; 3]);
+        // A block with no relocation (inc eax; ret) on the last page: moved below it, refused where it would end at 4 GiB
+        // or come from there, in 32-bit code only.
+        let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+        let mut code = [0u8; 16];
+        assert_eq!(relocate_code_mode(&mut code, &[], &mut links, 0x5655_5ffe, 0xffff_fffe, 2, true), Err(refusal::PLACE));
+        assert_eq!(relocate_code_mode(&mut code, &[], &mut links, 0xffff_fffe, 0x5655_5ffe, 2, true), Err(refusal::PLACE));
+        assert_eq!(relocate_code_mode(&mut code, &[], &mut links, 0x5655_5ffd, 0xffff_fffd, 2, true), Ok(()));
+        assert_eq!(relocate_code_mode(&mut code, &[], &mut links, 0x5655_5ffe, 0xffff_fffe, 2, false), Ok(()));
+        // The run test: `ldrb w0, [x28, #X87_RUN]; cbnz w0, E`, a body, then at E the run's end and its return to the third
+        // word, which is the word a copy restores.
+        let entry = ENTRY_OFFSET as usize / 4;
+        let e = entry + 6;
+        let mut words = vec![0xd503_201fu32; e + 10];
+        words[entry] = 0x3940_0380 | frame::X87_RUN << 10;
+        words[entry + 1] = 0x3500_0000 | ((e - entry - 1) as u32) << 5;
+        words[e..e + 9].copy_from_slice(&RUN_END);
+        words[e + 9] = run_return_word(4 * e as u64);
+        let word = |o: u64| words[o as usize / 4];
+        assert_eq!(run_test_end(word, 4 * words.len() as u64), Some(4 * e as u64));
+        // (`b` back to the third word: 9 + 6 - 2 words before it.)
+        assert_eq!(words[e + 9], 0x1400_0000 | (0u32.wrapping_sub(13) & 0x03ff_ffff));
+    }
+
     /// Every logical immediate the decoder knows encodes back to one that decodes to it, and nothing else encodes.
     #[test]
     fn logical_immediates_round_trip() {

@@ -1609,9 +1609,13 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                         t.dispatch_exit,
                     )
             } else {
+                // (M2 reuse: a split block's run end returns to its hot copy, [`cache::run_return`]: the one word the
+                // resident changed, compared as the word it stands for.)
+                let run = cache::run_return(t);
                 (0..u64::from(cache::placed_size(&h)) / 4).all(|k| {
                     (t.dispatch_exit != 0 && 4 * k == u64::from(t.dispatch_exit))
                         || code(k) == staged(k)
+                        || run.is_some_and(|(o, admitted, split)| 4 * k == o && staged(k) == admitted && Some(code(k)) == split)
                 })
             };
             // (A shared translation's link points hold the rewritten moves' first word.)
