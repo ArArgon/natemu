@@ -5,7 +5,7 @@
 [family]
 name = "interp"
 covers = ["tests/interp/**", "tests/lib/testenv.py", "tools/reference/answers.py", "tools/correctness/recipes/common.sh",
-          "crates/**", "third_party/FEX"]
+          "tools/models/**", "crates/**", "third_party/FEX"]
 
 [[suite]]
 name = "interp"
