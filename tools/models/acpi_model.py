@@ -1,6 +1,7 @@
 """Independent checker for the ACPI tables the natemu loader writes (boot-features plan L2; replaces `iasl -d`).
 
     check(dump_bytes, n) -> dict(violations=[...], not_fixed=[...], listing=str, info=dict)
+    check(dump_bytes, n, mailbox=False)   # tables built without the wakeup mailbox (boot-linux --no-mailbox)
 
 Inputs are the driver's `--dump` records ([u64 gpa][u64 length][bytes], later records override earlier ones; guest RAM is
 zero elsewhere) and the vCPU count N. Expectations are derived from: ACPI 6.6 ch. 5 snapshot (layouts; the plan targets
@@ -559,7 +560,9 @@ def fmt_gas(g):
     return f"space {g['space']} width {g['width']} offset {g['offset']} access {g['access']} addr {g['addr']:#x}"
 
 
-def check(dump, n, profile=None, corrupt=None):
+def check(dump, n, profile=None, corrupt=None, mailbox=True):
+    """`mailbox`: the MADT has exactly one version-0 multiprocessor wakeup structure (the default), or, False, none
+    (boot-interpreter plan section 6: the OS starts its APs with INIT and SIPI)."""
     img = Image(dump)
     if corrupt:
         corrupt(img)
@@ -971,9 +974,9 @@ def check(dump, n, profile=None, corrupt=None):
             else:
                 nf(f'MADT NMI source at +{o:#x}', raw, 'NMI source structure', 'FLAG: QEMU emits none')
 
-        # mailbox (ACPI 6.5 §5.2.12.19 version 0; CLM-03-03-69)
-        if len(wake) != 1:
-            viol('MADT-WAKEUP', f'{len(wake)} multiprocessor wakeup structures (exactly one)')
+        # mailbox (ACPI 6.5 §5.2.12.19 version 0; CLM-03-03-69), or none when built without it
+        if len(wake) != int(mailbox):
+            viol('MADT-WAKEUP', f'{len(wake)} multiprocessor wakeup structures ({"exactly one" if mailbox else "none"})')
         for w in wake:
             if w['len'] != 16 or w['version'] != 0:
                 viol('MADT-WAKEUP', f'at MADT+{w["off"]:#x}: length {w["len"]} version {w["version"]} '

@@ -67,6 +67,11 @@ class Controls(unittest.TestCase):
     def test_madt_apic_id(self):
         self.assertIn('MADT-APIC', self.run_with('madt', 44 + 8 + 3, b'\x05'))   # second LAPIC's APIC ID
 
+    def test_mailbox_expected_or_not(self):
+        # Tables with the mailbox judged as built without it: the wakeup structure is a violation (and only that).
+        got = {v.split(':')[0] for v in am.check(self.dump, 2, mailbox=False)['violations']}
+        self.assertEqual(got, {'MADT-WAKEUP'})
+
     def test_mailbox_alignment(self):
         r = am.check(self.dump, 2)['info']['MADT_structures']['wake'][0]
         self.assertIn('MAILBOX', self.run_with('madt', r['off'] + 8, struct.pack('<Q', r['mailbox'] + 0x800)))

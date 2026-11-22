@@ -44,6 +44,8 @@ const SLP_EN: u16 = 1 << 13;
 /// The run's power request ([`crate::devices::Devices::power`]).
 pub const POWEROFF: u8 = 1;
 pub const RESET: u8 = 2;
+/// A test option's exit port was written ([`crate::debug_exit`]).
+pub const DEBUG_EXIT: u8 = 3;
 /// Offsets from B000H.
 pub(crate) const CNT: u64 = 4;
 pub(crate) const TIMER: u64 = 8;

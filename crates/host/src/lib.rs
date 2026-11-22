@@ -13,6 +13,7 @@ pub use admission::corpus as admit_corpus;
 pub mod boot;
 pub mod clock;
 pub mod compile_cache;
+pub mod debug_exit;
 pub mod devices;
 mod disk;
 pub mod execution;

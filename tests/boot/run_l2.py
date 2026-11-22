@@ -5,7 +5,8 @@
 
 For N = 1..4 runs `natemu-host unused boot-linux unused BZIMAGE --ram 0x8000000 --load-only --vcpus N --dump`, checks
 the dump (table validity, AML decode, MADT/CPUID/mailbox/e820/device agreement) and writes DIR/l2.json plus the DSDT
-listing DIR/dsdt-nN.dsl. `--dumps DIR` judges existing nN.dump files instead of running the driver.
+listing DIR/dsdt-nN.dsl; then again with `--no-mailbox` (`nN-no-mailbox`: the MADT without the wakeup structure, M2
+Part 2). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump) files instead of running the driver.
 Prints one pass/fail line per N; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, pathlib, subprocess, sys
@@ -31,26 +32,28 @@ def main():
                        cwd=ROOT, check=True)
     host = o.host or ROOT / 'target/release/natemu-host'
     report, fail = {}, False
-    for n in range(1, 5):
+    for mailbox, n in [(m, n) for m in (True, False) for n in range(1, 5)]:
+        name = f'n{n}' if mailbox else f'n{n}-no-mailbox'
         if o.dumps:
-            dump = o.dumps / f'n{n}.dump'
+            dump = o.dumps / f'{name}.dump'
             r = None
         else:
-            dump = o.out / f'n{n}.dump'
+            dump = o.out / f'{name}.dump'
             r = subprocess.run([host, 'unused', 'boot-linux', 'unused', o.kernel, '--ram', '0x8000000', '--load-only',
-                                '--vcpus', str(n), '--dump', dump], capture_output=True, text=True, timeout=300)
+                                '--vcpus', str(n), '--dump', dump, *([] if mailbox else ['--no-mailbox'])],
+                               capture_output=True, text=True, timeout=300)
         if r is not None and r.returncode:
             res = dict(violations=[f'DRIVER: exit {r.returncode}: {r.stderr.strip()[-400:]}'], not_fixed=[], info={})
         else:
-            res = acpi_model.check(dump.read_bytes(), n)
-            (o.out / f'dsdt-n{n}.dsl').write_text(res.pop('listing') + '\n')
+            res = acpi_model.check(dump.read_bytes(), n, mailbox=mailbox)
+            (o.out / f'dsdt-{name}.dsl').write_text(res.pop('listing') + '\n')
         if not o.dumps:
             dump.unlink(missing_ok=True)
-        report[f'n{n}'] = res
+        report[name] = res
         bad = res['violations']
         fail |= bool(bad)
         flags = sum(x['judgement'].startswith('FLAG') for x in res['not_fixed'])
-        print(f'N={n}: {"FAIL" if bad else "pass"} ({len(bad)} violations, {flags} flagged unfixed values)')
+        print(f'{name}: {"FAIL" if bad else "pass"} ({len(bad)} violations, {flags} flagged unfixed values)')
         for v in bad:
             print('  ', v)
     (o.out / 'l2.json').write_text(json.dumps(report, indent=1, default=str))
