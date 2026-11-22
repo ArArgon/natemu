@@ -91,6 +91,39 @@ pub fn power_on(cpu: &mut Cpu) {
     cpu.xcr0 = profile::XCR0_RESET;
 }
 
+/// A processor at power-on ([`power_on`]), the fields Table 12-1 does not name zero (the host's own: [`Cpu::no_afp`],
+/// [`Cpu::accurate_fp`], [`Cpu::stack_traps`]): the firmware boot mode's start (docs/restructure/firmware-mode.md).
+pub fn reset() -> Cpu {
+    let mut cpu = Cpu {
+        gpr: [0; 16],
+        rip: 0,
+        rflags: 0,
+        cr0: 0,
+        cr3: 0,
+        cr4: 0,
+        efer: 0,
+        cpl: 0,
+        cr2: 0,
+        cr8: 0,
+        dr: [0; 6],
+        seg: [Segment::NULL; 6],
+        ldtr: Segment::NULL,
+        tr: Segment::NULL,
+        gdtr: TABLE_RESET,
+        idtr: TABLE_RESET,
+        mov_ss: 0,
+        xmm: [[0; 2]; 16],
+        mxcsr: 0,
+        fcw: 0,
+        xcr0: 0,
+        no_afp: 0,
+        accurate_fp: 0,
+        stack_traps: 0,
+    };
+    power_on(&mut cpu);
+    cpu
+}
+
 /// Puts `cpu` into the INIT state (Table 12-1, INIT column): as [`power_on`], but CR0.CD and CR0.NW, the x87 and SSE state
 /// and XCR0 kept.
 pub fn init(cpu: &mut Cpu) {
@@ -253,6 +286,16 @@ mod tests {
             ([[0; 2]; 16], 0x1F80, 0x40, 1)
         );
         assert_eq!((c.no_afp, c.accurate_fp), (1, 1));
+    }
+
+    /// `reset` is `power_on` over any state, with the host's own fields zero.
+    #[test]
+    fn reset_is_power_on() {
+        let mut c = busy();
+        power_on(&mut c);
+        (c.no_afp, c.accurate_fp, c.stack_traps) = (0, 0, 0);
+        assert_eq!(reset(), c);
+        assert_model(&reset(), 0x60000000, None);
     }
 
     #[test]

@@ -76,6 +76,13 @@ fn dispatcher() -> &'static [u8] {
 pub(crate) fn guest_ram() -> GuestRam {
     unsafe { natemu_abi::execution::guest_ram(cache::control().ram_bytes, GUEST_RAM_VA) }
 }
+/// Guest RAM and the firmware image (M2 Part 2, docs/restructure/firmware-mode.md: `Control::firmware_bytes`, none when 0),
+/// for the boot-time interpreter, which reads and fetches both as memory (and drops its stores to the image itself). The
+/// translator's paths keep [`guest_ram`] and reach the image only where a page is not RAM ([`mmio::rom`]).
+pub(crate) fn ram_and_rom() -> GuestRam {
+    let c = cache::control();
+    unsafe { natemu_abi::execution::guest_memory(c.ram_bytes, c.firmware_bytes, GUEST_RAM_VA) }
+}
 /// EL0t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
 const BLOCK_SPSR: u64 = 0x340;
 /// SPSR.M of generated code (EL0t): every exception the resident serves came from there.
@@ -1728,8 +1735,9 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
             Access::Fetch,
             cache::control().speculation_barriers != 0,
         ) {
-            // M2: guest RAM of any memory type (code may run from UC memory, SDM Vol.3 14.3.3).
-            Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() => {
+            // M2: guest RAM of any memory type (code may run from UC memory, SDM Vol.3 14.3.3); M2 Part 2: or the firmware
+            // image (docs/restructure/firmware-mode.md), asked out of line only for a page that is not RAM.
+            Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() || rom_page(t.gpa & !4095) => {
                 let flags = if t.global { cache::GLOBAL } else { 0 }
                     | if t.leaf_bytes > 4096 { cache::LARGE } else { 0 };
                 return Ok((t.gpa & !4095, flags));
@@ -1739,6 +1747,14 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
             Err(f) => return Err(fetch::encode(f)),
         }
     }
+}
+/// [`fetch_walk`]: page `gpa`, which is not RAM, is in the firmware image ([`mmio::rom`]). Out of line, so the RAM path is
+/// as without a firmware. The image's pages lie past the per-page tables below 3 GiB of RAM, which the cache reads as
+/// holding no code to invalidate: the image is never written.
+#[cold]
+#[inline(never)]
+fn rom_page(gpa: u64) -> bool {
+    mmio::rom(gpa)
 }
 /// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
 /// after a TLB miss: A bits set, any fault meaning no): `Some(flags)` ([`leaves`]). The walk's A writes may invalidate
@@ -3675,7 +3691,8 @@ fn translate(
     );
     match walk {
         // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
-        // shadowed; the caller completes the access through the device path ([`mmio::device`]).
+        // shadowed; the caller completes the access through the device path ([`mmio::device`]). (M2 Part 2: the firmware
+        // image too, whose reads [`mmio::ones`] then shadows and whose stores [`mmio::device`] drops.)
         Ok(t) if !mmio::ram(t.gpa) => Some((t.gpa, false)),
         // M2: WB, WT, WP and WC RAM run natively under TSO (Apple silicon is coherent, and HVF's stage 2 maps RAM Normal
         // write-back): WT, WP and WB have x86's processor ordering (SDM Vol.3 Table 14-2), and WC's weak ordering allows
@@ -4569,6 +4586,21 @@ fn install_ones(s: &mut State, va: u64) {
     reset_shadows(s);
     s.evictions += 1;
     if tables::install_ones(s.cpu.cpl, va).is_err() {
+        halt(s, stop::SHADOW)
+    }
+}
+
+/// M2 Part 2: shadows linear page `va` read-only with page `gpa` of the firmware image ([`mmio::ones`]: x86 reads ROM as
+/// memory; its stores never reach the shadow). Whatever the memory type: the image never changes, so the order of its reads
+/// cannot be seen. No writable bit or code mark is involved. On table capacity exhaustion, as [`install`].
+fn install_rom(s: &mut State, va: u64, gpa: u64, global: bool) {
+    let image = mmio::firmware();
+    if tables::install(s.cpu.cpl, va, &image, gpa, false, global).is_ok() {
+        return;
+    }
+    reset_shadows(s);
+    s.evictions += 1;
+    if tables::install(s.cpu.cpl, va, &image, gpa, false, global).is_err() {
         halt(s, stop::SHADOW)
     }
 }
