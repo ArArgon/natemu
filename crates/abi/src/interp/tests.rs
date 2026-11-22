@@ -727,7 +727,7 @@ fn locked_read_modify_writes() {
     assert_eq!((m.read(0x1000, 4), c.rflags as u32 & CF), (8, 0));
     run(&mut c, P32, &bts, &mut m).unwrap();
     assert_eq!((m.read(0x1000, 4), c.rflags as u32 & CF), (8, CF));
-    // A register destination, CMP, BT, MOV: #UD.
+    // A register destination, CMP, TEST, BT, a shift, MOV, PUSH: #UD. Every other lockable form commits.
     let lock = |mut i: Insn| {
         i.lock = 1;
         i
@@ -735,11 +735,34 @@ fn locked_read_modify_writes() {
     for i in [
         insn(op::ADD, 4, &[reg(0, 4), reg(1, 4)]),
         insn(op::CMP, 4, &[mem(4), reg(1, 4)]),
+        insn(op::TEST, 4, &[mem(4), reg(1, 4)]),
         insn(op::BT, 4, &[mem(4), imm(1)]),
+        insn(op::SHL, 4, &[mem(4), imm(1)]),
+        insn(op::SAR, 4, &[mem(4), reg(1, 1)]),
         insn(op::MOV, 4, &[mem(4), reg(1, 4)]),
         insn(op::PUSH, 4, &[reg(1, 4)]),
     ] {
         assert_eq!(faults(&c, P32, &lock(i), &m), UD);
+    }
+    for o in [
+        op::ADD,
+        op::OR,
+        op::ADC,
+        op::SBB,
+        op::AND,
+        op::SUB,
+        op::XOR,
+        op::INC,
+        op::DEC,
+        op::BTR,
+        op::BTC,
+    ] {
+        let source = if matches!(o, op::INC | op::DEC) {
+            Operand::NONE
+        } else {
+            imm(1)
+        };
+        run(&mut c, P32, &lock(insn(o, 4, &[mem(4), source])), &mut m).unwrap();
     }
 }
 

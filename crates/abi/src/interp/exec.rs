@@ -319,8 +319,10 @@ pub fn step<M: Memory>(cpu: &mut Cpu, ctx: Context, i: &Insn, m: &mut M) -> Resu
     };
     let writes =
         a.kind == kind::MEM && !matches!(o, op::CMP | op::TEST | op::BT | op::MOVZX | op::LEA);
-    // LOCK only on a read-modify-write of memory (the host decodes the rest as #UD records).
-    if i.lock != 0 && o < op::UD && !(writes && o <= op::XADD) {
+    // LOCK only on a lockable read-modify-write of memory (SDM Vol.2 LOCK: not CMP, TEST, BT, the shifts or MOV; the host
+    // decodes the rest as #UD records).
+    let lockable = matches!(o, op::ADD..=op::XOR | op::INC | op::DEC | op::BTS..=op::XADD);
+    if i.lock != 0 && o < op::UD && !(writes && lockable) {
         return Err(UD);
     }
     let rip = match o {
