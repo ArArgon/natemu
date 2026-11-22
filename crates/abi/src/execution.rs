@@ -210,6 +210,12 @@ const _: () = assert!(FRAME_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
 const _: () = assert!(RAM_TABLES_END <= GUEST_STATE_TABLES[0]);
 const _: () =
     assert!(GUEST_STATE_TABLES[2] + 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
+/// The exception stack's 80 KiB (the host's span, `crate::EXCEPTION_STACK_TOP`) lie above the boot stack, with an unmapped
+/// guard page between them, and end where the staging area begins.
+const _: () = assert!(
+    (crate::STACK_TOP - PRIVATE) as usize + 4096 <= (crate::EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x1_4000
+        && (crate::EXCEPTION_STACK_TOP - PRIVATE) as usize <= STAGING_OFFSET
+);
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
 /// alias, a metadata arena (block records and their access sites) and the lookup

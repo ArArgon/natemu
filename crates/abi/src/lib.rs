@@ -13,7 +13,11 @@ pub const PRIVATE: u64 = 0x0000_8000_4000_0000;
 pub const RAM_SIZE: usize = 0x10_0000;
 pub const SHARED_OFFSET: usize = 0x2_0000;
 pub const STACK_TOP: u64 = PRIVATE + 0x5_4000;
-pub const EXCEPTION_STACK_TOP: u64 = PRIVATE + 0x6_4000;
+/// The exception stack (SP_EL1, every gate entry) is the 80 KiB below this top (0x5c000-0x70000), its reservation the
+/// host's span: M2 Part 2 grew it from 32 KiB (top 0x64000) into the free pages below the staging area, for the boot-time
+/// interpreter, which runs under the deepest gate path (a step after a split lock's code write) and calls a system
+/// transaction (tests/static/check_resident_stack.py's bound).
+pub const EXCEPTION_STACK_TOP: u64 = PRIVATE + 0x7_0000;
 pub mod clock;
 pub mod code_object;
 pub mod cpu;

@@ -296,7 +296,7 @@ fn prepare_at_alias(
                 (STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES,
                 exec::STACK_BYTES,
             ),
-            own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
+            own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x1_4000, 0x1_4000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
             Span::data(
                 (exec::GUEST_RAM_VA - PRIVATE) as usize,
