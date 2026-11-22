@@ -162,7 +162,7 @@ fn interpreted(s: &State) -> Option<String> {
     let what = match s.stop {
         stop::INTERP_FAULT => format!("exception {a} error code {c:#x} cr2 {b:#x}, nothing committed"),
         stop::INTERP_UNSUPPORTED => match detail {
-            interp::GATE => "a far JMP through a call gate, a task gate or a TSS (not in the first version)".into(),
+            interp::GATE => "a far JMP through a call gate, a task gate or an available TSS (not in the first version)".into(),
             interp::OUTER => "a far RET to an outer privilege level (not in the first version)".into(),
             interp::TABLE => "a descriptor-table entry above 4 GiB in compatibility mode".into(),
             _ => "an instruction outside the first version".into(),

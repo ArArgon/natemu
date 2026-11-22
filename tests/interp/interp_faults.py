@@ -5,7 +5,7 @@ result the model gives. Run by run_interp_natemu.py --faults (case `natemu-fault
 - **Segment cases** (`tools/models/segment_model.py`: `jmp_far_interp`, `ret_far_interp`, `load_interp`): far JMP (ptr16:16,
   ptr16:32, m16:32), far RET (16- and 32-bit, with an imm16) and MOV Sreg in R, P16, P32 and C32 at CPL 0, over a GDT of
   their own (`FDESC`, at `FGDT`) whose descriptors cover every check: null, the table's limit, TI = 1 (the INIT state's LDT
-  at base 0), data, system descriptors (call gate, TSS, task gate, LDT), DPL and RPL, conforming code, not present, L = D
+  at base 0), data, system descriptors (call gate, TSS available and busy, task gate, LDT), DPL and RPL, conforming code, not present, L = D
   = 1, a small limit, the accessed bit, read-only and execute-only segments; the operand's and the stack's segment
   limits; in C32 a not-present page under the operand, the stack or the descriptor, and a read-only GDT page under
   CR0.WP. The model runs on the case's own state (its memory, the hidden segment parts, the paging of C32 as present and
@@ -55,8 +55,10 @@ FDESC = {
     0x98: 0x00CF99000000FFFF,     # code, execute-only
     0xA0: 0x00CF92000000FFFF,     # data32 flat, accessed bit clear
     0xA8: 0x00CF93040000FFFF,     # data32, base 40000H
+    0xB0: 0x00008B0030000067,     # 32-bit TSS, busy
+    0xB8: 0x0000830030000067,     # 16-bit TSS, busy
 }
-FGDT_LIMIT = 0xAF
+FGDT_LIMIT = 0xBF
 FGDT_BYTES = b''.join(FDESC.get(s, 0).to_bytes(8, 'little') for s in range(0, FGDT_LIMIT + 1, 8))
 PT = G.PML4 + 0x3000             # the common tables' 4 KiB page table of 0-2 MiB (supervisor, writable, A and D set)
 TARGET32, TARGET16 = G.LAND, 0x5000
@@ -154,10 +156,10 @@ def segment_cases(N):
     for mode in ('P16', 'P32', 'C32'):
         lma = mode == 'C32'
         b = 'bx' if mode == 'P16' else 'ebx'
-        targets = [(0x00, TARGET32), (0x03, TARGET32), (0xB0, TARGET32), (0x0C, TARGET32), (0x10, TARGET32), (0x60, TARGET32),
-                   (0x68, TARGET32), (0x70, TARGET32), (0x78, TARGET32), (0x38, TARGET32), (0x0B, TARGET32), (0x43, TARGET32),
-                   (0x48, TARGET32), (0x50, TARGET32), (0x58, TARGET32), (0x80, 0x1000), (0x80, 0xFFF), (0x30, TARGET32),
-                   (0x18, TARGET32), (0x20, TARGET16), (0x20, 0x10000)]
+        targets = [(0x00, TARGET32), (0x03, TARGET32), (0xC0, TARGET32), (0x0C, TARGET32), (0x10, TARGET32), (0x60, TARGET32),
+                   (0x68, TARGET32), (0xB0, TARGET32), (0xB8, TARGET32), (0x70, TARGET32), (0x78, TARGET32), (0x38, TARGET32),
+                   (0x0B, TARGET32), (0x43, TARGET32), (0x48, TARGET32), (0x50, TARGET32), (0x58, TARGET32), (0x80, 0x1000),
+                   (0x80, 0xFFF), (0x30, TARGET32), (0x18, TARGET32), (0x20, TARGET16), (0x20, 0x10000)]
         for sel, off in targets:
             tag = f'{sel:02x}-{off:x}'
             out.append((f'{mode}-jmp_far_ptr16:32-{tag}', mode, [f'jmp dword {sel:#x}:{off:#x}'], {}, [],
@@ -174,8 +176,8 @@ def segment_cases(N):
         out.append((f'{mode}-retf_imm-08', mode, ['o32 retf 8'], {}, [(G.STACK, TARGET32.to_bytes(4, 'little') + (8).to_bytes(4, 'little'))],
                     ('ret', dict(osize=32, release=8)), (), ()))
         # MOV Sreg.
-        for sreg, sels in (('ss', (0x00, 0x10, 0x13, 0x88, 0x08, 0x90, 0x28, 0xA0, 0xB0, 0x60)),
-                           ('ds', (0x00, 0x03, 0x10, 0x08, 0x98, 0x13, 0x43, 0x28, 0xB0, 0x60, 0x0C, 0xA0)),
+        for sreg, sels in (('ss', (0x00, 0x10, 0x13, 0x88, 0x08, 0x90, 0x28, 0xA0, 0xC0, 0x60)),
+                           ('ds', (0x00, 0x03, 0x10, 0x08, 0x98, 0x13, 0x43, 0x28, 0xC0, 0x60, 0x0C, 0xA0)),
                            ('fs', (0xA8, 0x00)), ('es', (0x88, 0x48))):
             for sel in sels:
                 out.append((f'{mode}-mov_{sreg}-{sel:02x}', mode, [f'mov {sreg}, ax'], {'eax': sel}, [],

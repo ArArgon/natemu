@@ -3878,7 +3878,7 @@ pub mod stop {
     /// Interpreted modes deliver nothing (plan section 6).
     pub const INTERP_FAULT: u64 = 80;
     /// An instruction decoded but not in the first version (`op` `OTHER`, detail 0), or a first-version form at what the
-    /// first version does not do (detail [`interp::GATE`]: a far JMP through a call gate, a task gate or a TSS;
+    /// first version does not do (detail [`interp::GATE`]: a far JMP through a call gate, a task gate or an available TSS;
     /// [`interp::OUTER`]: a far RET to an outer privilege level; [`interp::TABLE`]: a descriptor-table entry above 4 GiB in
     /// compatibility mode).
     pub const INTERP_UNSUPPORTED: u64 = 81;
