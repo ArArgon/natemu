@@ -207,7 +207,7 @@ natemu's counters asserted (`STAT_EXACT`, `UC_STEPS`); `fa-ro` (natemu only, CPL
 NATEMU_WRITABLE_ON_READ=off the exact counts are skipped and the switch itself is checked (an upgrade abort must appear).
 Writes DIR/k1.json; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import argparse, json, os, pathlib, subprocess, sys
+import argparse, fcntl, hashlib, json, os, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
@@ -1808,19 +1808,48 @@ def perf_runtime(a):
     return out
 
 
+HOOKS_SOURCES = ('crates', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo')   # (testkit's NATEMU_SOURCES)
+
+
+def sources_key(commands):
+    """The identity of a build: its commands and the bytes of every file under HOOKS_SOURCES."""
+    h = hashlib.sha256(repr(commands).encode())
+    for rel in HOOKS_SOURCES:
+        p = ROOT / rel
+        for f in sorted(p.rglob('*')) if p.is_dir() else [p]:
+            if f.is_file():
+                b = f.read_bytes()
+                h.update(f'{f.relative_to(ROOT)} {len(b)}\n'.encode() + b)
+    return h.hexdigest()
+
+
 def hooks_build(a):
     """The io-test-hooks host and resident (`--hooks-host`/`--hooks-runtime`, else built here into target/hooks): the hold cases' (the host is
-    signed like `run_slice1_vm.build`'s)."""
+    signed like `run_slice1_vm.build`'s). Under the framework (NATEMU_PREBUILT=1) a build there is reused only if it was made from the
+    sources as they are now (the key file written after its signing): one left by an older checkout gave the hold cases another build's
+    admission (it refused fexc's probing split stubs: "check stub at native offset 0x2c"). The runners that need it at once (k1-c1 and
+    the pic-* modes) take turns under a lock in its folder: a build links the host afresh, and a runner signing it meanwhile found none."""
     if a.hooks_host and a.hooks_runtime:
         return a.hooks_host, a.hooks_runtime
     target = ROOT / 'target' / 'hooks'
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
+    builds = [cargo + ['-p', 'natemu-host', '--features', 'io-test-hooks'],
+              cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'io-test-hooks']]
     host, runtime = target / 'release/natemu-host', target / 'aarch64-unknown-none/release/natemu-runtime'
-    if not (os.environ.get('NATEMU_PREBUILT') == '1' and host.exists() and runtime.exists()):
-        subprocess.run(cargo + ['-p', 'natemu-host', '--features', 'io-test-hooks'], cwd=ROOT, env=env, check=True)
-        subprocess.run(cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'io-test-hooks'], cwd=ROOT, env=env, check=True)
-        subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/host/entitlements.plist', host], check=True)
+    stamp = target / 'natemu-hooks.key'
+    target.mkdir(parents=True, exist_ok=True)
+    with open(target / 'natemu-hooks.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        key = sources_key(builds)
+        made = stamp.read_text() if stamp.exists() else None
+        if not (os.environ.get('NATEMU_PREBUILT') == '1' and host.exists() and runtime.exists() and made == key):
+            stamp.unlink(missing_ok=True)
+            for command in builds:
+                subprocess.run(command, cwd=ROOT, env=env, check=True)
+            subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/host/entitlements.plist', host], check=True)
+            if sources_key(builds) == key:   # (sources changed while it built: the next runner builds again)
+                stamp.write_text(key)
     a.hooks_host, a.hooks_runtime = host, runtime
     return host, runtime
 
