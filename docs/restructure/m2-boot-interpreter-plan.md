@@ -4,18 +4,21 @@ Status: built, November 22, 2026, on branch `boot-interp` (from `m2-32bit` at 78
 [the M2 design notes](m2-32bit-design.md) and takes the 32-bit survey of [the S3g plan](s3g-plan.md) as input. Two
 independent reviews, three rechecks and an independent replication of the upstream census were folded in before the
 build (section 12); the results of the build are folded into each section ("Built"), and the decisions taken are in
-section 11. B0-B5 are done; B6 stays deferred. Results, all framework cases on the M2 Max:
+section 11. B0-B5 are built; B5's full gate and benchmark round on the final tip: see section 12. B6 stays deferred.
+Results, all framework cases on the M2 Max:
 
 - the interpreter matches QEMU 11.1.2 and KVM on all 1,716 per-instruction cases in R, P16, P32 and C32 (`tests/interp`
-  `natemu`), and the models on 288 segment and 21 mode-transition fault cases (`natemu-faults`);
+  `natemu`), and the models on 306 segment and 21 mode-transition fault cases (`natemu-faults`);
 - CPU start-up by INIT and SIPI: the model's scenarios (`tests/system` `initsipi*`), Debian's kernel with the wake-up
   mailbox left out at 2 and 4 vCPUs through CPU offline/online and shutdown (`tests/boot` `boot-startup`),
   kvm-unit-tests' smptest and dummy at 1-4 vCPUs (`kut-natemu`), the exit test's AP program at 1, 2 and 4 CPUs
   (`exit-ap-natemu`);
 - the M2 exit test, our firmware from the reset vector at 1, 2 and 4 CPUs (`exit-fw-natemu`), and OVMF's reset vector
   to SEC from both entries (`ovmf-natemu`);
-- no cost to a running 64-bit OS: the hot paths are identical by disassembly, and the system-call benchmarks are 3-6%
-  faster after the code window's move ([benchmarks](../benchmarks.md)).
+- no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case;
+  M2 Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
+  [interp-transitions.md](interp-transitions.md)); and the system-call bench cases are no slower: `guest-hackbench32`
+  is faster beyond the noise, `guest-hackbench` and `guest-hackbench32-int80` within it ([benchmarks](../benchmarks.md)).
 
 Design notes of the build: [interp-integration.md](interp-integration.md), [initsipi-resident.md](initsipi-resident.md),
 [interp-transitions.md](interp-transitions.md), [firmware-mode.md](firmware-mode.md); test contracts:
@@ -87,7 +90,8 @@ events, the CPU start-up wait (`events::wait_mailbox`), the software page walk a
 (`segments::linear`/`copy`, `GUEST_RAM_VA`). It already caches host-decoded system instructions as `SYSTEM` records keyed
 like blocks and runs them with no host exit (`cache::place_system`; `find` → `system()` → `transaction()` →
 `commit()`), and it runs under Apple's TSO bit (set by the host, `crates/host/src/vm.rs:445`; checked at EL1,
-`crates/runtime/src/main.rs:76`; that it orders the resident's own accesses is **Inferred**: B0's litmus test).
+`crates/runtime/src/main.rs:76`; that it orders the resident's own accesses is **Inferred**: no case checks it, since
+the litmus test of section 8 was not built).
 
 What does not carry over:
 
@@ -208,7 +212,7 @@ because nothing faults natively mid-instruction and no mapping state needs keepi
    and registers as they were (and is reported in a typed stop, section 6). Commit performs the accesses in program
    order and updates registers, flags and IP.
 5. **Between CPUs:** the same physical memory translated code uses, with the same guarantees:
-   - order: the TSO bit (B0's litmus test confirms it covers EL1);
+   - order: the TSO bit (**Inferred** that it covers the resident's accesses at EL1; not checked by a case);
    - single-copy atomicity: aligned 2/4/8-byte accesses as single Arm accesses, and a misaligned one inside 16 bytes as
      one unaligned Arm access, atomic within 16 bytes on Apple's cores (FEAT_LSE2; an unaligned `casal` inside 16 bytes runs at EL1: self-test `p32-lock-unaligned`),
      not `copy_in`'s byte-by-byte fallback; crossing 16 bytes may tear, the deviation translated code already has;
@@ -223,8 +227,8 @@ resident uses for 32-bit user code (`segments::address`, `linear_of`, `outside`,
 in place would make a 32-bit program with a small-limit FS fault in resident-executed instructions while the same
 access in translated code succeeds. They keep today's behaviour.
 
-Per access the cost is a few calls, a walk in compatibility mode and `copy_in`'s barrier after each store; B0 checks
-whether that `dsb ish` is needed for RAM under the TSO bit (**Inferred** not).
+Per access the cost is a few calls, a walk in compatibility mode and `copy_in`'s barrier after each store; whether that
+`dsb ish` is needed for RAM under the TSO bit was not checked (**Inferred** not; the barrier stays).
 
 **Memory type at power-on (decided by the session; the owner asked for "whatever reasonable", November 22): unchanged
 in M2.** With IA32_MTRR_DEF_TYPE.E = 0, the reset value, `mtrr_type` makes all RAM UC (`crates/abi/src/cpu.rs:109`),
@@ -424,11 +428,11 @@ the repository; every number from a framework case (or labelled an experiment).
   loads the image; port I/O, MMIO, CPUID, MSRs and task switches are KVM's code there). Vendor differences from the Intel
   CPU natemu presents are masked per case or answered by QEMU. QEMU's TCG does not set a code descriptor's accessed bit
   on far transfers, so KVM answers those windows. B0 showed that the AMD machine runs real-mode and P16 code natively
-  under KVM (spike: 0 instruction emulations over 470M instructions; the machine is itself a KVM guest, so this is
-  nested SVM). Built: the `interp` family, its format in [interp-cases.md](interp-cases.md).
+  under KVM (experiment, not a framework case, B0's spike on the x86 reference machine: 0 instruction emulations over
+  470M instructions; the machine is itself a KVM guest, so this is nested SVM). Built: the `interp` family, its format in [interp-cases.md](interp-cases.md).
 - **Fault cases** against the SDM models: the typed stop names the exception and error code the model gives, with
   nothing committed (`segment_model.py` extended to far JMP and far RET in real and 16/32-bit protected mode at CPL 0,
-  `modes_model.py`'s parked 32-bit programs). Built: `tests/interp` `natemu-faults` (`interp_faults.py`: 288 segment
+  `modes_model.py`'s parked 32-bit programs). Built: `tests/interp` `natemu-faults` (`interp_faults.py`: 306 segment
   cases, 21 `modes_model` programs).
 - **The interpreter-versus-translator cross-check:** flat 32-bit programs, already answered, run through the interpreter
   (a debug switch forcing it) and must agree. **Dropped (session, November 22):** the interpreter runs only CPL-0 code and the first version's
@@ -448,6 +452,8 @@ the repository; every number from a framework case (or labelled an experiment).
   in the framework (roadmap P3).
 - **The M2 exit test** (section 7) at 1, 2, 4 and more vCPUs, asserting bounds on decode exits and shootdowns with N APs
   both in and past the 16-bit part; and a litmus test between an interpreting CPU and one running translated code.
+  Built: `exit-fw-natemu` at 1, 2 and 4 vCPUs with those bounds. Not built (later): the runs at more vCPUs and the
+  litmus test.
 - **No effect on a running 64-bit OS** (section 9c): the gate, the compiler's replay check (`static/fexc/fexc-replay`)
   and the benchmark cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (system-call paths), with a
   benchmark round, at the end of every slice that touches a hot path, against the parent commit.
@@ -515,7 +521,10 @@ stopped being inlined (`controls()`, fixed in `ec84a1e6`; [checkpoint A findings
 
 Checks, all framework cases, at the end of every slice that touches a hot path (B1's commits, B2) and again at B5,
 against the parent commit: the full gate; the replay check; the hackbench cases and a benchmark round, each difference
-beyond noise explained before merge.
+beyond noise explained before merge. Built: the full gate ran at B1 (b) (8b022e58, on the branch 0624b341: its three
+failures as at the parent) and on the final tip (section 12); B2 had no gate of its own (its author ran its CPU start-up
+cases; the system, smp, interp and unit families ran at e21b0209, after the interpreter's merge); the hackbench cases
+ran at 78f60965, 75cfdd22 and e21b0209 and on the final tip ([benchmarks](../benchmarks.md)).
 
 ## 10. Order of work
 
@@ -524,7 +533,7 @@ plumbing, so the risky integration is proven on real code before the breadth wor
 
 | Slice | What runs at the end | Agent hours (guess, low confidence) |
 | --- | --- | --- |
-| **B0 spike** | As framework cases or labelled experiments: the resident's size and stack headroom, and the constants the window move changes with the replay result; the cost of an iced-only decode request; a system-call cost baseline (the hackbench cases) and a benchmark baseline of the parent commit; TSO at EL1 (litmus); unaligned single-copy atomicity within 16 bytes at EL1; whether `copy_in`'s `dsb ish` is needed for RAM; ~~the SDM's wait-for-SIPI NMI rule~~ (answered, section 6); ~~KVM real mode on the AMD machine; gcc `-m16` in the amd64 container~~ (answered, section 8). Replaces the estimates below. | 8-12 |
+| **B0 spike** | As framework cases or labelled experiments: the resident's size and stack headroom, and the constants the window move changes with the replay result; the cost of an iced-only decode request; a system-call cost baseline (the hackbench cases) and a benchmark baseline of the parent commit; TSO at EL1 (litmus); unaligned single-copy atomicity within 16 bytes at EL1; whether `copy_in`'s `dsb ish` is needed for RAM; ~~the SDM's wait-for-SIPI NMI rule~~ (answered, section 6); ~~KVM real mode on the AMD machine; gcc `-m16` in the amd64 container~~ (answered, section 8). Replaces the estimates below. Built: TSO at EL1 and the `dsb ish` were not spiked (both stay **Inferred**, section 4); unaligned atomicity within 16 bytes at EL1 is self-test `p32-lock-unaligned`. | 8-12 |
 | **B1 plumbing** (three commits, each with the section 9c checks) | (a) The resident's code window moved and grown. (b) The interpreted classification and the entry plumbing (the halting arms of `controls()`, the test on `system()`'s exit, `start()`, `find_from`'s flag test for the new record kind), the paging-off walk variant, and the CPL-3 deviation lock cases. (c) New code only: `REQUEST_DECODE` and the record; the abi executor core skeleton with host unit tests; byte-validated records; driver start states in each mode; a handful of instructions with QEMU-locked cases. | 16-26 |
 | **B2 vertical slice: CPU start-up** | INIT/SIPI state machine (model first), wait-for-SIPI, power-on/INIT state; the instructions the Linux trampoline and the exit-test AP stub use; INIT and SIPI taken by the interpreter loop, every other event while interpreting a typed stop; real mode → P32 → long mode → hand-off to the translator (the interpreter's far JMP from C32 to the 64-bit CS); Debian with the mailbox left out at 2 vCPUs, then 4, through shutdown (built, `boot-startup`: no typed stop; its warm-reset writes, CMOS 0x0F = 0AH and the vector at 0x467, made and restored at every AP start, mailbox or not, are benign: a plain CMOS byte and guest RAM); the exit test's program variant (its AP part, a shared counter on the stub page) at 1, 2 and 4 vCPUs through a new wait-for-SIPI driver item. | 20-30 |
 | **B3 the rest of the list** | The remaining forms of section 1's list in R/P32/C32, exact segmentation and the typed stops' exception reports; generated cases against QEMU and hardware; the interpreter-versus-translator cross-check. | 8-15 |
@@ -565,7 +574,8 @@ By the session, under that delegation:
 - Power-on memory type: unchanged exact UC in M2; the write-back alternative decided in M3 against OVMF.
 - Legacy two-level and PAE paging without long mode: a typed stop.
 - CR4.MCE writes are accepted as a no-op without presenting MCE in CPUID (a recorded deviation; OVMF's reset vector
-  sets it unconditionally, and natemu never raises a machine check).
+  sets it unconditionally, and natemu never raises a machine check). Decided by the session, under the owner's
+  delegation; the owner later confirmed minor deviations are fine as long as OS boots are unaffected.
 - Platform reset that restarts the machine: M3.
 - kvm-unit-tests' debug-exit port behind a test option only.
 
@@ -623,3 +633,8 @@ INIT/SIPI and interpreter together (ready; the INIT-before-TF order fixed), and 
 `refuse_compatibility`'s common path: made a tail call; a far RET into compatibility code past the CS limit: a typed
 stop; TLB-flush tests added). The test pieces (reference rig, exit-test firmware, real-code suites) and INIT/SIPI were
 also reviewed by reviewers their authors briefed.
+
+**Commit ids.** Some commit messages on `boot-interp` (and [benchmarks](../benchmarks.md)) cite the commit an agent made
+on its own branch, which is not on `boot-interp`. Each is the same change (equal `git patch-id`), cherry-picked as:
+cb7cd541 → d4bf265d; 8b022e58 → 0624b341; f29042cf → ce8cea18; bdb5dc09 → 40a888db; 315860f3 → d7bc0885;
+75cfdd22 → be626aa8. A number measured at one of those ids was measured on the agent's tree, not on `boot-interp`'s.
