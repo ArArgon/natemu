@@ -1,19 +1,29 @@
-//! M2 Part 2: the boot-time interpreter's plumbing in the resident (docs/restructure/m2-boot-interpreter-plan.md
-//! sections 4 and 5). A vCPU reaches a state only the interpreter runs ([`Cpu::interpreted_mode`]: real mode, protected
-//! mode outside IA-32e mode, compatibility mode at CPL 0) only at a cold point: the end of a system transaction (its
-//! `commit`, or `set_cpl` inside it), where the resident halted before, records it ([`record`]: [`debug::INTERPRET`] in
-//! `State::debug`), and the next boundary enters the interpreter once the transaction has completed ([`boundary`], from
-//! `find_from`'s loop, before a trap-class #DB). Every path out of a system transaction reaches that loop, and none needs a
-//! test of its own: the fast system-call path declines when `State::debug` is nonzero, and the loop's first look at the
-//! debug state is at its trap bits, which hold the record. The interpreter returns to that loop when the state is one the
-//! translator runs again (no cycle through `dispatch`). The vCPU's start enters directly ([`run`]). The interpreter itself is
-//! not built yet: [`run`] stops the vCPU as it stopped before (`unsupported_mode`, `unsupported_code_mode`), so a guest
-//! sees the same stop, now after the transaction that made the state.
+//! M2 Part 2: the boot-time interpreter in the resident (docs/restructure/m2-boot-interpreter-plan.md sections 3-6;
+//! docs/restructure/interp-integration.md). A vCPU reaches a state only the interpreter runs ([`Cpu::interpreted_mode`]:
+//! real mode, protected mode outside IA-32e mode, compatibility mode at CPL 0) only at a cold point: the end of a system
+//! transaction (its `commit`, or `set_cpl` inside it), where the resident halted before, records it ([`record`]:
+//! [`debug::INTERPRET`] in `State::debug`), and the next boundary enters the interpreter once the transaction has completed
+//! ([`boundary`], from `find_from`'s loop, before a trap-class #DB). Every path out of a system transaction reaches that
+//! loop, and none needs a test of its own: the fast system-call path declines when `State::debug` is nonzero, and the
+//! loop's first look at the debug state is at its trap bits, which hold the record. The vCPU's start enters directly
+//! ([`run`]). [`run`] returns to that loop when the state is one the translator runs again (no cycle through `dispatch`).
 //!
-//! The paging-off walk ([`unpaged_pages`], [`fetch_unpaged`], [`revalidated_unpaged`]) is the variant of
-//! [`segments::pages`], [`fetch_walk`] and [`revalidated`] for the interpreter's accesses, fetches and records with CR0.PG =
-//! 0; those three keep their mode check (translatable state only: a halt otherwise, an assertion).
+//! [`run`] executes one instruction per pass, after `find`'s boundary prologue: the record at CS.base + EIP (the host's
+//! decode, `natemu_abi::interp`, cached by linear address and [`interpreted_key`] and validated by its bytes at every
+//! execution, [`cache::place_interpreted`]) through the abi's executor core (`natemu_abi::interp::exec`) over [`Mem`], the
+//! memory layers; CPUID, RDMSR, WRMSR and WBINVD through the system transactions, LGDT, LIDT and MOV from CR here. What it
+//! does not run is a typed stop (`stop::INTERP_FAULT` ..), precise, with nothing committed: exceptions (interpreted modes
+//! deliver none), events, TF and breakpoints, device pages, the forms outside the first version and the resident
+//! operations not built yet (protected-mode far transfers and segment loads, MOV to CR, HLT).
 use super::*;
+use core::ptr::{addr_of, addr_of_mut};
+use natemu_abi::execution::stop::interp as detail;
+use natemu_abi::interp::{
+    DECODE_OFFSET, DECODED_OFFSET, Decode, Decoded, Insn, MAX_FETCH, MAX_RUN, REPLY_DECODE,
+    REQUEST_DECODE,
+    exec::{self, Exit, Memory, Outcome, Resident},
+    op,
+};
 
 /// [`ends_in_mode`]'s arms where [`controls`] halts with `reason`: a state the interpreter runs is recorded for the next
 /// boundary; any other halts as [`controls`] does (`unsupported_mode` for the paging mode or CPL, `unsupported_code_mode`
@@ -41,73 +51,666 @@ pub(super) fn boundary(s: &mut State) -> bool {
     true
 }
 
-/// The interpreter from the bank's state ([`Cpu::interpreted_mode`]), returning once the state is one the translator runs.
-/// Not built yet: the stop natemu made before there was one.
-pub(super) fn run(s: &mut State) {
-    halt(s, stopped(s))
+/// A typed stop: its code (`stop::INTERP_FAULT` ..), its detail (`State::native[0]` bits 31:24) and the first three words
+/// of `State::fault` (the fourth is RIP).
+#[derive(Clone, Copy)]
+struct Stop {
+    code: u64,
+    detail: u64,
+    fault: [u64; 3],
 }
-
-/// The stop [`controls`] makes for a state it does not run.
-fn stopped(s: &State) -> u64 {
-    if s.cpu.paging().is_none() {
-        stop::UNSUPPORTED_MODE
-    } else {
-        stop::UNSUPPORTED_CODE_MODE
+impl Stop {
+    const fn new(code: u64, detail: u64, fault: [u64; 3]) -> Self {
+        Self { code, detail, fault }
+    }
+    /// An exception the instruction raises: its vector, error code and (#PF) CR2.
+    const fn exception(vector: u64, error: u64, cr2: u64) -> Self {
+        Self::new(stop::INTERP_FAULT, 0, [vector, cr2, error])
+    }
+    /// A memory stop (`detail::DEVICE` ..) at linear `va` on guest-physical page `page`.
+    const fn memory(detail: u64, va: u64, page: u64) -> Self {
+        Self::new(stop::INTERP_MEMORY, detail, [0, va, page])
+    }
+    const fn unsupported(detail: u64) -> Self {
+        Self::new(stop::INTERP_UNSUPPORTED, detail, [0; 3])
     }
 }
+const GP0: Stop = Stop::exception(13, 0, 0);
+const UD: Stop = Stop::exception(6, 0, 0);
 
-/// [`segments::pages`] with paging off (CR0.PG = 0, interpreted state only: R, P16, P32), for an access the interpreter
-/// has checked against its segment: the guest-physical pages are the linear ones ([`paging::unpaged`]: wrapping at 4
-/// GiB), reached through the guest-RAM alias as [`segments::pages`]' are. Nothing faults; as there, a page of UC RAM, or a
-/// UC access made since the last boundary, puts a barrier before the caller's access, and the access waits while a peer
-/// holds a split lock on its pages. The memory type is the MTRRs' alone (without paging the PAT is not used).
-#[expect(dead_code, reason = "M2 Part 2: the interpreter's memory layer (B1 (c) on) calls it")]
-pub(super) fn unpaged_pages(s: &mut State, va: u64, n: u64) -> ([u64; 2], usize) {
-    let (first, next) = paging::unpaged(va, n);
-    let (gpa, count) = match next {
-        Some(page) => ([first, page], 2),
-        None => ([first, 0], 1),
+/// What a typed stop names of the instruction: its operation (0xff: none decoded) and its bytes as far as they are known
+/// (the record's, or those fetched).
+struct At {
+    op: u8,
+    count: u8,
+    bytes: [u8; 16],
+}
+impl At {
+    const NONE: Self = Self {
+        op: 0xff,
+        count: 0,
+        bytes: [0; 16],
     };
-    let c = cache::control();
-    let owed = c.uncached_count != 0 || c.uncached_fence != 0;
-    let mut uncached = false;
-    for &g in &gpa[..count] {
-        if mmio::ram(g) && cpu::mtrr_type(msrs(), g) == cpu::memory_type::UC {
-            (c.uncached_fence, c.uncached_resident) = (1, c.uncached_resident + 1);
-            uncached = true;
-        }
-    }
-    if owed || uncached {
-        // SAFETY: a barrier; no other effect.
-        unsafe { asm!("dmb ish") };
-    }
-    split_wait(s, &gpa[..count]);
-    (gpa, count)
 }
 
-/// [`fetch_walk`] with paging off (interpreted state only): the page `va` is fetched from is its linear page (wrapping at
-/// 4 GiB), when it is guest RAM; no leaf, so neither [`cache::GLOBAL`] nor [`cache::LARGE`].
-pub(super) fn fetch_unpaged(va: u64) -> Result<(u64, u32), [u64; 3]> {
-    let page = paging::unpaged(va, 1).0 & !4095;
-    if guest_ram().range(page, 4096).is_some() {
-        Ok((page, 0))
+/// The interpreter from the bank's state ([`Cpu::interpreted_mode`]), one instruction per pass, returning once the state
+/// is one the translator runs. Each pass starts with `find`'s boundary prologue in its order ([`find_from`]); a pass that
+/// cannot run its instruction stops the vCPU ([`stopped`]).
+pub(super) fn run(s: &mut State) {
+    loop {
+        s.cpu.rip &= 0xffff_ffff;
+        io_checkpoint(s);
+        take_invalidations(s);
+        lapic::poll(s);
+        if s.cpu.interpreted_mode().is_none() {
+            return;
+        }
+        let mut at = At::NONE;
+        if let Err(why) = pass(s, &mut at) {
+            stopped(s, &at, why)
+        }
+    }
+}
+
+/// One instruction at a boundary: the debug state, the events and the mode first (each a typed stop when it asks for
+/// what the interpreter does not do), then the record at CS.base + EIP and its execution.
+fn pass(s: &mut State, at: &mut At) -> Result<(), Stop> {
+    // The interpreter sets neither shadow and honours none (no event is delivered here; plan section 5).
+    (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
+    debugging(s)?;
+    events(s)?;
+    let paging = walks(s)?;
+    let Some(key) = interpreted_key(&s.cpu) else {
+        halt(s, stop::BAD_REPLY)
+    };
+    let linear = (s.cpu.seg[SREG_CS].base as u32).wrapping_add(s.cpu.rip as u32);
+    let i = match cache::interpreted_at(u64::from(linear), key).map(|b| cache::interpreted_of(b)) {
+        Some(i) if current(s, paging, &i) => i,
+        _ => decode(s, paging, linear, key, at)?,
+    };
+    (at.op, at.count, at.bytes) = (i.op, i.length, i.bytes);
+    execute(s, paging, &i)
+}
+
+/// A pending trap-class #DB, RFLAGS.TF or an armed breakpoint (DR7): the interpreter delivers no #DB and checks no
+/// breakpoint, so each is a typed stop (plan section 5). (Not [`debug::INTERPRET`], which [`boundary`] cleared.)
+fn debugging(s: &State) -> Result<(), Stop> {
+    let trap = s.debug & debug::TRAP & !debug::INTERPRET;
+    let (d, value) = if trap != 0 {
+        (detail::TRAP, trap)
+    } else if s.cpu.rflags & RFLAGS_TF != 0 {
+        (detail::TF, 0)
+    } else if s.cpu.dr[5] & DR7_ENABLES != 0 {
+        (detail::BREAKPOINT, s.cpu.dr[5])
     } else {
-        Err([fetch::NOT_RAM, 0, 0])
+        return Ok(());
+    };
+    Err(Stop::new(stop::INTERP_DEBUG, d, [value, 0, 0]))
+}
+
+/// The events this boundary would take: the one place the interpreter reads them (`find` takes them with
+/// `events::take`). No event is delivered in an interpreted mode (plan section 6): each is a typed stop naming it
+/// ([`event_stop`]), left pending. (INIT and SIPI are the CPU start-up work's: its reading of the events, which takes INIT
+/// itself, replaces the call below and keeps the stop.)
+fn events(s: &mut State) -> Result<(), Stop> {
+    match events::undelivered(s) {
+        None => Ok(()),
+        Some((kind, vector)) => Err(event_stop(kind, vector)),
+    }
+}
+/// The typed stop for an event an interpreted mode does not deliver: its kind (`stop::interp::NMI` ..) and vector.
+fn event_stop(kind: u64, vector: u64) -> Stop {
+    Stop::new(stop::INTERP_EVENT, kind, [vector, 0, 0])
+}
+
+/// The walk controls of the state's paging (`None`: paging off, the identity), or the typed stop of a state the
+/// interpreter does not run: protected mode at CPL > 0, paging outside IA-32e mode (legacy and PAE paging), or paging
+/// controls the walker has none for ([`Cpu::paging`]).
+fn walks(s: &State) -> Result<Option<paging::Control>, Stop> {
+    let c = &s.cpu;
+    let refused = Err(Stop::new(stop::INTERP_MODE, 0, [0; 3]));
+    if c.cr0 & CR0_PE != 0 && c.cpl != 0 {
+        return refused;
+    }
+    if c.cr0 & CR0_PG == 0 {
+        return Ok(None);
+    }
+    match c.paging() {
+        Some(p) if c.efer & EFER_LMA != 0 => Ok(Some(p)),
+        _ => refused,
     }
 }
 
-/// [`revalidated`] with paging off (interpreted state only), for a record keyed by its linear address: its source pages
-/// are where its linear pages are fetched from now ([`fetch_unpaged`]); its flags as [`leaves`] makes them.
-#[expect(dead_code, reason = "M2 Part 2: the interpreter's records (B1 (c) on) are revalidated through it")]
-pub(super) fn revalidated_unpaged(s: &State, b: &Block) -> Option<u32> {
-    let mut flags = [cache::GLOBAL; 2];
-    for (k, &gpa) in b.source_gpa.iter().enumerate() {
-        if gpa != u64::MAX {
-            flags[k] = fetch_unpaged((b.rip & !4095).wrapping_add(4096 * k as u64))
-                .ok()
-                .filter(|&(page, _)| page == gpa)?
-                .1;
+/// The page walk of `va` for `access` at CPL 0 (the interpreter's only CPL with paging): A and D set as the CPU sets them,
+/// a walk that lost a race to a peer made again; a #PF with its error code. No block of this vCPU runs, so an A or D write
+/// into a page holding translations just invalidates them ([`FetchWrites`]).
+fn walk(
+    s: &mut State,
+    c: paging::Control,
+    va: u64,
+    access: Access,
+) -> Result<paging::Translation, (u64, u64)> {
+    loop {
+        match paging::walk(
+            &mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))),
+            c,
+            va,
+            access,
+            cache::control().speculation_barriers != 0,
+        ) {
+            Ok(t) => return Ok(t),
+            Err(Fault::Page { address, error }) => return Err((error, address)),
+            Err(Fault::Contended) => {}
+            Err(_) => halt(s, stop::UNSUPPORTED_MODE),
         }
     }
-    Some(leaves(s, flags))
+}
+
+/// The guest-physical page linear `va` is fetched from (paging off: its own, wrapping at 4 GiB; else a fetch walk), when
+/// it is guest RAM (the only fetchable memory yet; the firmware region is M2's B5).
+fn fetch_page(s: &mut State, paging: Option<paging::Control>, va: u64) -> Result<u64, Stop> {
+    let gpa = match paging {
+        None => paging::unpaged(va, 1).0,
+        Some(c) => walk(s, c, va, Access::Fetch)
+            .map_err(|(error, cr2)| Stop::exception(14, error, cr2))?
+            .gpa,
+    } & !4095;
+    match guest_ram().range(gpa, 4096) {
+        Some(_) => Ok(gpa),
+        None => Err(Stop::memory(detail::FETCH, va, gpa)),
+    }
+}
+
+/// Fetches `out.len()` bytes of the instruction stream from EIP + `from` (plan section 4): each inside the CS limit
+/// (#GP(0) past it; CS's execute right is its load's to check), through the current translation, from guest RAM, one page
+/// at a time (a page's walk only when a byte of it is wanted). Short: how many bytes came, and the stop the first one not
+/// fetched raises.
+fn fetch(
+    s: &mut State,
+    paging: Option<paging::Control>,
+    from: usize,
+    out: &mut [u8],
+) -> Result<(), (usize, Stop)> {
+    let cs = s.cpu.seg[SREG_CS];
+    let (eip, limit) = (s.cpu.rip as u32, u64::from(cs.limit));
+    let mut done = 0;
+    while done < out.len() {
+        let offset = u64::from(eip) + (from + done) as u64;
+        if offset > limit {
+            return Err((done, GP0));
+        }
+        let linear = (cs.base as u32).wrapping_add(offset as u32);
+        let n = (out.len() - done)
+            .min(4096 - (linear & 4095) as usize)
+            .min((limit - offset + 1).min(4096) as usize);
+        let page = fetch_page(s, paging, u64::from(linear)).map_err(|why| (done, why))?;
+        let Some(p) = guest_ram().range(page | u64::from(linear & 4095), n as u64) else {
+            halt(s, stop::BAD_REPLY)
+        };
+        // SAFETY: `p` is `n` bytes of guest RAM in the resident's alias; `out` holds them.
+        unsafe { guest_memory::copy_volatile(out[done..].as_mut_ptr(), p, n) };
+        done += n;
+    }
+    Ok(())
+}
+
+/// Whether the cached record `i` holds the bytes at EIP now (byte validation, plan section 5: fetched as for its decode,
+/// through the current translation and inside the CS limit): equivalent to fetching every time. A fetch that fails is a
+/// no: the decode raises what it raises.
+fn current(s: &mut State, paging: Option<paging::Control>, i: &Insn) -> bool {
+    let mut bytes = [0u8; 16];
+    let n = usize::from(i.length);
+    fetch(s, paging, 0, &mut bytes[..n]).is_ok() && bytes[..n] == i.bytes[..n]
+}
+
+/// The request's bytes in the staging area (`Decode::bytes`).
+fn request_bytes() -> *mut u8 {
+    // SAFETY: the staging area is this vCPU's, EL1 read/write; only an address is formed.
+    unsafe { addr_of_mut!((*((STAGING_VA + DECODE_OFFSET as u64) as *mut Decode)).bytes).cast() }
+}
+
+/// The host's decode at EIP (`REQUEST_DECODE`, the contract in `natemu_abi::interp`): the bytes to the end of RIP's page
+/// (at most [`MAX_FETCH`]; short where a byte cannot be fetched, that byte's stop kept), and only when the first
+/// instruction needs more, its bytes on the next page, up to 15 in all: a fault there, or past the CS limit, is raised
+/// only when the instruction reaches it. The host answers a stop at CS.base + EIP first (its `Hook::at`), and ends the run
+/// before the next one, so no record is ever cached at a stop. Each record is checked against the bytes sent and cached
+/// but stop records; the first is returned, its bytes the snapshot just fetched (not validated again: no livelock under a
+/// peer rewriting them).
+fn decode(
+    s: &mut State,
+    paging: Option<paging::Control>,
+    linear: u32,
+    key: u64,
+    at: &mut At,
+) -> Result<Insn, Stop> {
+    let bytes = request_bytes();
+    let first = (4096 - (linear & 4095) as usize).min(MAX_FETCH);
+    // SAFETY: `first` <= MAX_FETCH bytes of the request's buffer.
+    let (mut available, mut short) = match fetch(s, paging, 0, unsafe {
+        core::slice::from_raw_parts_mut(bytes, first)
+    }) {
+        Ok(()) => (first, None),
+        Err((n, why)) => (n, Some(why)),
+    };
+    let mut extended = false;
+    let count = loop {
+        let n = available.min(15);
+        // SAFETY: `n` bytes of the request's buffer, written above.
+        unsafe { core::ptr::copy_nonoverlapping(bytes, at.bytes.as_mut_ptr(), n) };
+        at.count = n as u8;
+        let count = request(s, available);
+        if count != 0 {
+            break count;
+        }
+        // Truncated: the first instruction needs a byte past `available`.
+        if let Some(why) = short {
+            return Err(why);
+        }
+        if extended || available >= 15 {
+            halt(s, stop::BAD_REPLY)
+        }
+        extended = true;
+        // SAFETY: bytes `available..15` of the request's buffer.
+        let rest = unsafe { core::slice::from_raw_parts_mut(bytes.add(available), 15 - available) };
+        match fetch(s, paging, available, rest) {
+            Ok(()) => available = 15,
+            Err((n, why)) => (available, short) = (available + n, Some(why)),
+        }
+    };
+    let reply = (STAGING_VA + DECODED_OFFSET as u64) as *const Decoded;
+    let (mut offset, mut first_record, mut flushed) = (0, Insn::NONE, false);
+    for k in 0..count {
+        // SAFETY: record `k` < MAX_RUN of the reply, in the staging area, read in place.
+        let i = unsafe { addr_of!((*reply).records[k]).read_volatile() };
+        let n = usize::from(i.length);
+        // SAFETY: `available` bytes of the request's buffer.
+        let sent = unsafe { core::slice::from_raw_parts(bytes, available) };
+        if !i.well_formed()
+            || offset + n > available
+            || i.bytes[..n] != sent[offset..offset + n]
+            || i.bytes[n..].iter().any(|&b| b != 0)
+        {
+            halt(s, stop::BAD_REPLY)
+        }
+        if k == 0 {
+            first_record = i;
+        }
+        // Stop records end the run: never cached.
+        if i.op < op::UD {
+            let va = u64::from(linear.wrapping_add(offset as u32));
+            while cache::place_interpreted(va, key, &i).is_none() {
+                if flushed {
+                    halt(s, stop::BAD_REPLY)
+                }
+                cache::control().capacity_flushes += 1;
+                flush(s);
+                flushed = true;
+            }
+        }
+        offset += n;
+    }
+    Ok(first_record)
+}
+
+/// Asks the host to decode the first `available` bytes of the request's buffer (16- or 32-bit code: CS.D) into at most
+/// [`MAX_RUN`] records: the count it replied with, the records in place. A stop the host's hook answers parks the vCPU.
+fn request(s: &mut State, available: usize) -> usize {
+    let q = (STAGING_VA + DECODE_OFFSET as u64) as *mut Decode;
+    let bits = if s.cpu.seg[SREG_CS].attributes & ATTR_D != 0 { 32 } else { 16 };
+    // SAFETY: the request's fields in the staging area; the host reads them while this vCPU waits in `hvc`.
+    unsafe {
+        addr_of_mut!((*q).bits).write_volatile(bits);
+        addr_of_mut!((*q).max).write_volatile(MAX_RUN as u32);
+        addr_of_mut!((*q).available).write_volatile(available as u32);
+        s.request = REQUEST_DECODE;
+        s.reply = NONE;
+        write_record(super::record(), s);
+        let p = crate::perf::enter(crate::perf::HOST);
+        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        crate::perf::leave(p);
+        *s = super::load();
+    }
+    s.request = NONE;
+    match s.reply {
+        REPLY_DECODE => {}
+        REPLY_PARK => halt(s, stop::PARKED),
+        _ => halt(s, stop::BAD_REPLY),
+    }
+    // SAFETY: the reply's count, in the staging area.
+    let count = unsafe {
+        addr_of!((*((STAGING_VA + DECODED_OFFSET as u64) as *const Decoded)).count).read_volatile()
+    } as usize;
+    if count > MAX_RUN {
+        halt(s, stop::BAD_REPLY)
+    }
+    count
+}
+
+/// Executes `i` at EIP: the core on a copy of the bank (the memory layer borrows the record), written back once it
+/// committed; a resident operation; or the typed stop of what stopped it, nothing committed.
+fn execute(s: &mut State, paging: Option<paging::Control>, i: &Insn) -> Result<(), Stop> {
+    let ctx = exec::Context::of(&s.cpu);
+    let mut cpu = s.cpu;
+    let mut m = Mem {
+        s,
+        paging,
+        pages: [[0; 2]; 4],
+        count: 0,
+        stopped: [0; 2],
+    };
+    let done = exec::step(&mut cpu, ctx, i, &mut m);
+    let stopped = m.stopped;
+    match done {
+        Ok(Outcome::Done) => {
+            s.cpu = cpu;
+            s.cpu.rflags &= !RFLAGS_RF; // the instruction completed
+            Ok(())
+        }
+        Ok(Outcome::Resident(r)) => resident(s, i, r),
+        Err(Exit::Fault {
+            vector,
+            error,
+            address,
+        }) => Err(Stop::exception(
+            u64::from(vector),
+            u64::from(error),
+            u64::from(address),
+        )),
+        Err(Exit::Unsupported) => Err(Stop::unsupported(0)),
+        Err(Exit::Stop(d)) => Err(Stop::memory(u64::from(d), stopped[0], stopped[1])),
+    }
+}
+
+/// A resident operation the core returned with its operands read and checked (CPL 0: [`walks`]). CPUID, RDMSR, WRMSR and
+/// WBINVD through the system transaction (its commit moves EIP past the instruction, wrapping at 32 bits as the core
+/// does, and records the interpreted state, [`ends_in_mode`], which goes: this is the interpreter); an exception it raises
+/// is a typed stop, nothing committed. The rest are not built yet (the next step's: far transfers and segment loads in
+/// protected mode, MOV to CR and the transitions, HLT).
+fn resident(s: &mut State, i: &Insn, r: Resident) -> Result<(), Stop> {
+    let kind = match r {
+        Resident::LoadTable { idt, base, limit } => {
+            let table = Table {
+                base: u64::from(base),
+                limit: u64::from(limit),
+            };
+            *if idt { &mut s.cpu.idtr } else { &mut s.cpu.gdtr } = table;
+            return Ok(complete(s, i));
+        }
+        // CR8 is 64-bit mode's; the other numbers are #UD (SDM Vol.2 MOV CR). Upper bits of a 64-bit CR3: gone at 32 bits.
+        Resident::MovFromCr { cr, reg } => {
+            let v = match cr {
+                0 => s.cpu.cr0,
+                2 => s.cpu.cr2,
+                3 => s.cpu.cr3,
+                4 => s.cpu.cr4,
+                _ => return Err(UD),
+            };
+            s.cpu.gpr[usize::from(reg & 7)] = v & 0xffff_ffff;
+            return Ok(complete(s, i));
+        }
+        Resident::Cpuid => system::CPUID,
+        Resident::Rdmsr => system::RDMSR,
+        Resident::Wrmsr => system::WRMSR,
+        Resident::Wbinvd => system::WBINVD,
+        Resident::FarJump { .. } => return Err(Stop::unsupported(detail::FAR_JUMP)),
+        Resident::FarReturn { .. } => return Err(Stop::unsupported(detail::FAR_RETURN)),
+        Resident::LoadSegment { .. } => return Err(Stop::unsupported(detail::LOAD_SEGMENT)),
+        Resident::MovToCr { .. } => return Err(Stop::unsupported(detail::MOV_TO_CR)),
+        Resident::Hlt => return Err(Stop::unsupported(detail::HLT)),
+    };
+    let done = transaction(
+        s,
+        System {
+            kind,
+            length: u32::from(i.length),
+            ..System::NONE
+        },
+    );
+    s.debug &= !debug::INTERPRET;
+    done.map_err(|[vector, error, cr2]| Stop::exception(vector, error, cr2))
+}
+/// A resident operation's completion: EIP past it (wrapping at 32 bits), RF cleared.
+fn complete(s: &mut State, i: &Insn) {
+    exec::complete(&mut s.cpu, i);
+    s.cpu.rflags &= !RFLAGS_RF;
+}
+
+/// Stops the vCPU with the typed stop `why` at the instruction `at` names, nothing of it committed: the record of
+/// `stop::INTERP_FAULT`'s documentation (`State::native`, `State::fault`).
+#[cold]
+#[inline(never)]
+fn stopped(s: &mut State, at: &At, why: Stop) -> ! {
+    let mode = s.cpu.interpreted_mode().map_or(0, |m| m as u8);
+    let word = |k: usize| u64::from_le_bytes(at.bytes[k..k + 8].try_into().unwrap());
+    s.native = [detail::word(mode, at.op, at.count, why.detail), word(0), word(8)];
+    s.fault = [why.fault[0], why.fault[1], why.fault[2], s.cpu.rip];
+    halt(s, why.code)
+}
+
+/// The interpreter's memory for one instruction (plan section 4, layers 2-5), at linear addresses the core has checked
+/// against their segments (layer 1). [`Memory::check`] translates every page an access touches (paging off: the identity,
+/// wrapping at 4 GiB; compatibility mode: the 4-level walk at CPL 0, A and D set, #PF with its error code), classifies it
+/// (guest RAM; unassigned, the legacy hole among them: reads all-ones, writes ignored; a device's: a typed stop) and makes
+/// the access wait for a peer's split lock; the core makes every check before it commits anything. RAM of type UC is
+/// accessed in program order as the resident's own accesses are (`segments::pages`). Accesses: one Arm access for 1, 2 or
+/// 4 bytes inside 16 (single-copy atomic, aligned or not: FEAT_LSE2), byte by byte across 16 bytes (the tearing deviation
+/// translated code has too); a store into a page holding translations goes through the code-write protocol first. LOCK:
+/// one `casal` inside 16 bytes, else under the VM's split lock as translated code's locked accesses crossing 16 bytes.
+struct Mem<'a> {
+    s: &'a mut State,
+    paging: Option<paging::Control>,
+    /// The pages the instruction's checks found: [linear page, guest-physical page | 1 for RAM] (at most two checks of two
+    /// pages: far RET's slots).
+    pages: [[u64; 2]; 4],
+    count: usize,
+    /// A memory stop's linear address and guest-physical page.
+    stopped: [u64; 2],
+}
+impl Mem<'_> {
+    /// The guest-physical page of `linear`'s page and whether it is RAM, from the checks made.
+    fn page(&self, linear: u32) -> (u64, bool) {
+        let p = u64::from(linear & !4095);
+        match self.pages[..self.count].iter().find(|e| e[0] == p) {
+            Some(e) => (e[1] & !1, e[1] & 1 != 0),
+            None => halt(self.s, stop::BAD_REPLY), // an access no check covered: an interpreter bug
+        }
+    }
+    /// The resident's pointer to `n` bytes of guest RAM at `gpa`.
+    fn pointer(&self, gpa: u64, n: u8) -> *mut u8 {
+        match guest_ram().range(gpa, u64::from(n)) {
+            Some(p) => p,
+            None => halt(self.s, stop::BAD_REPLY),
+        }
+    }
+    /// One Arm access suffices: `size` bytes at `linear` lie inside one 16-byte block (so inside a page).
+    fn single(linear: u32, size: u8) -> bool {
+        (linear & 15) + u32::from(size) <= 16
+    }
+    fn byte(&self, linear: u32) -> u32 {
+        match self.page(linear) {
+            (g, true) => {
+                let p = self.pointer(g | u64::from(linear & 4095), 1);
+                // SAFETY: a guest RAM byte in the alias.
+                u32::from(unsafe { p.read_volatile() })
+            }
+            (_, false) => 0xff,
+        }
+    }
+    /// A store to RAM page `page` made by `store`: the code-write protocol around it, as `segments::copy`'s.
+    fn stored(&mut self, page: u64, store: impl FnOnce()) {
+        if cache::translated(page) {
+            FetchWrites(self.s).code_write(page);
+        }
+        store();
+        // SAFETY: a barrier; no other effect.
+        unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+        cache::rechecked(page);
+    }
+}
+impl Memory for Mem<'_> {
+    fn check(&mut self, linear: u32, size: u32, write: bool) -> Result<(), Exit> {
+        let (first, next) = paging::unpaged(u64::from(linear), u64::from(size));
+        let touched = [Some(first), next];
+        let access = if write { Access::Write } else { Access::Read };
+        // Both pages translated before either is classified: a #PF comes before a device's stop.
+        let mut found = [(0u64, None); 2];
+        for (k, va) in touched.into_iter().flatten().enumerate() {
+            found[k] = match self.paging {
+                None => (va, None),
+                Some(c) => {
+                    let t = walk(self.s, c, va, access).map_err(|(error, cr2)| Exit::Fault {
+                        vector: 14,
+                        error: error as u32,
+                        address: cr2 as u32,
+                    })?;
+                    (t.gpa, Some(t.pat))
+                }
+            };
+        }
+        let n = 1 + usize::from(next.is_some());
+        let c = cache::control();
+        let owed = c.uncached_count != 0 || c.uncached_fence != 0;
+        let mut uncached = false;
+        let mut gpa = [0u64; 2];
+        for (k, va) in touched.into_iter().flatten().enumerate() {
+            let (g, pat) = found[k];
+            let page = g & !4095;
+            let ram = mmio::ram(page);
+            if ram {
+                let kind = match pat {
+                    None => cpu::mtrr_type(msrs(), page), // without paging the PAT is not used
+                    Some(p) => cpu::memory_type(msrs(), g, p),
+                };
+                if kind == cpu::memory_type::UC {
+                    let c = cache::control();
+                    (c.uncached_fence, c.uncached_resident) = (1, c.uncached_resident + 1);
+                    uncached = true;
+                }
+            } else if let Err(d) = mmio::unassigned(self.s, page) {
+                self.stopped = [va, page];
+                return Err(Exit::Stop(d as u32));
+            }
+            gpa[k] = page;
+            if self.count == self.pages.len() {
+                halt(self.s, stop::BAD_REPLY)
+            }
+            self.pages[self.count] = [va & !4095, page | u64::from(ram)];
+            self.count += 1;
+        }
+        if owed || uncached {
+            // SAFETY: a barrier; no other effect.
+            unsafe { asm!("dmb ish") };
+        }
+        split_wait(self.s, &gpa[..n]);
+        Ok(())
+    }
+    fn read(&mut self, linear: u32, size: u8) -> u32 {
+        if Self::single(linear, size) {
+            return match self.page(linear) {
+                (g, true) => {
+                    let p = self.pointer(g | u64::from(linear & 4095), size);
+                    // SAFETY: `size` bytes of guest RAM in the alias.
+                    unsafe { load_word(p, size) }
+                }
+                (_, false) => exec::mask(size),
+            };
+        }
+        (0..u32::from(size))
+            .rev()
+            .fold(0, |v, k| v << 8 | self.byte(linear.wrapping_add(k)))
+    }
+    fn write(&mut self, linear: u32, size: u8, value: u32) {
+        if Self::single(linear, size) {
+            if let (g, true) = self.page(linear) {
+                let p = self.pointer(g | u64::from(linear & 4095), size);
+                // SAFETY: `size` bytes of guest RAM in the alias.
+                self.stored(g, || unsafe { store_word(p, size, value) });
+            }
+            return;
+        }
+        for k in 0..u32::from(size) {
+            let at = linear.wrapping_add(k);
+            if let (g, true) = self.page(at) {
+                let p = self.pointer(g | u64::from(at & 4095), 1);
+                // SAFETY: a guest RAM byte in the alias.
+                self.stored(g, || unsafe { p.write_volatile((value >> (8 * k)) as u8) });
+            }
+        }
+    }
+    fn compare_exchange(&mut self, linear: u32, size: u8, old: u32, new: u32) -> u32 {
+        let m = exec::mask(size);
+        let (g, ram) = self.page(linear);
+        if ram && Self::single(linear, size) {
+            let p = self.pointer(g | u64::from(linear & 4095), size);
+            let mut was = 0;
+            // SAFETY: `size` bytes of guest RAM in the alias, inside one 16-byte block.
+            self.stored(g, || was = unsafe { cas(p, size, old & m, new & m) });
+            return was;
+        }
+        // Crossing 16 bytes, or not RAM: under the VM's split lock, as translated code's (`split_lock`).
+        let last = self.page(linear.wrapping_add(u32::from(size) - 1)).0;
+        let s = &mut *self.s;
+        s.splits += 1;
+        cache::split_begin([g, last], s.vcpus as usize, || {
+            let bits = cache::take_shadows();
+            if bits != 0 {
+                serve_peers(s, bits)
+            }
+        });
+        let was = self.read(linear, size);
+        if was == old & m {
+            self.write(linear, size, new);
+        }
+        cache::split_end();
+        was
+    }
+}
+
+/// One Arm load of `size` (1, 2, 4) bytes at `p`, aligned or not (the resident runs with SCTLR_EL1.A clear; inside 16
+/// bytes it is single-copy atomic, FEAT_LSE2). Not a Rust unaligned read: the target's strict alignment would split it.
+///
+/// # Safety
+/// `p` points to `size` bytes of Normal memory.
+unsafe fn load_word(p: *const u8, size: u8) -> u32 {
+    let v: u32;
+    // SAFETY: as the caller says.
+    unsafe {
+        match size {
+            1 => asm!("ldrb {v:w}, [{p}]", v = out(reg) v, p = in(reg) p, options(nostack, preserves_flags, readonly)),
+            2 => asm!("ldrh {v:w}, [{p}]", v = out(reg) v, p = in(reg) p, options(nostack, preserves_flags, readonly)),
+            _ => asm!("ldr {v:w}, [{p}]", v = out(reg) v, p = in(reg) p, options(nostack, preserves_flags, readonly)),
+        }
+    }
+    v
+}
+/// One Arm store of `size` bytes of `v` at `p`, as [`load_word`].
+///
+/// # Safety
+/// As [`load_word`].
+unsafe fn store_word(p: *mut u8, size: u8, v: u32) {
+    // SAFETY: as the caller says.
+    unsafe {
+        match size {
+            1 => asm!("strb {v:w}, [{p}]", v = in(reg) v, p = in(reg) p, options(nostack, preserves_flags)),
+            2 => asm!("strh {v:w}, [{p}]", v = in(reg) v, p = in(reg) p, options(nostack, preserves_flags)),
+            _ => asm!("str {v:w}, [{p}]", v = in(reg) v, p = in(reg) p, options(nostack, preserves_flags)),
+        }
+    }
+}
+/// LOCK's compare-and-exchange of `size` bytes at `p`: an LSE `casal` (acquire and release), aligned or not inside 16 bytes
+/// (FEAT_LSE2); returns what the bytes held.
+///
+/// # Safety
+/// As [`load_word`], and the bytes lie inside one 16-byte block.
+unsafe fn cas(p: *mut u8, size: u8, old: u32, new: u32) -> u32 {
+    let mut v = old;
+    // SAFETY: as the caller says.
+    unsafe {
+        match size {
+            1 => asm!("casalb {v:w}, {n:w}, [{p}]", v = inout(reg) v, n = in(reg) new, p = in(reg) p, options(nostack, preserves_flags)),
+            2 => asm!("casalh {v:w}, {n:w}, [{p}]", v = inout(reg) v, n = in(reg) new, p = in(reg) p, options(nostack, preserves_flags)),
+            _ => asm!("casal {v:w}, {n:w}, [{p}]", v = inout(reg) v, n = in(reg) new, p = in(reg) p, options(nostack, preserves_flags)),
+        }
+    }
+    v
 }

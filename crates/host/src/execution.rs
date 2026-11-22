@@ -4247,8 +4247,31 @@ fn serve(
                 continue;
             }
             // M2 Part 2: the interpreter's decode of the bytes the resident sent (iced alone: no fexc, cache or admission).
+            // The run's stops come first, at the instruction's linear address (CS.base + EIP): the caller's stop and the
+            // hook's (a stop parks the vCPU, as at a translation request); the run ends before the next one, so the
+            // resident caches no record at a stop and asks again there.
             natemu_abi::interp::REQUEST_DECODE => {
-                crate::interp::serve(area, &mut state)?;
+                let linear = crate::interp::linear_ip(&state);
+                let stop = if Some(linear) == stop_at {
+                    Some(Stop::Reached)
+                } else {
+                    match hook.at(area, linear)? {
+                        Some(At::Stop(code)) => Some(Stop::Hooked(code)),
+                        #[cfg(feature = "testing")]
+                        Some(At::System(_)) => {
+                            return Err(format!("a test hook's system answer at {linear:#x}, in interpreted code").into());
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(stop) = stop {
+                    parked = Some(stop);
+                    state.reply = exec::REPLY_PARK;
+                    area.write_record(exec::STATE_OFFSET, state);
+                    continue;
+                }
+                let next = hook.boundary(linear).into_iter().chain(stop_at).filter(|&l| l > linear).min();
+                crate::interp::serve(area, &mut state, next)?;
                 requests.interpreted += 1;
                 area.write_record(exec::STATE_OFFSET, state);
                 lap(compiler, crate::perf::INTERPRET);

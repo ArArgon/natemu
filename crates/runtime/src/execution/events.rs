@@ -100,6 +100,20 @@ pub(super) fn none(s: &State) -> bool {
     next(s).is_none()
 }
 
+/// M2 Part 2, for the boot-time interpreter, which delivers no event (each is its typed stop, `interpret::events`): the
+/// event [`take`] would take at this boundary, as `stop::interp`'s kind and the vector (an interrupt's; 2 for an NMI; 0
+/// for an ExtINT, whose vector the PIC gives only when it is taken). Nothing is taken: it stays pending. The interpreter
+/// clears both shadows before it asks (it sets neither), so the kind 0 of an event a shadow holds does not occur.
+pub(super) fn undelivered(s: &State) -> Option<(u64, u64)> {
+    use natemu_abi::execution::stop::interp;
+    Some(match next(s)? {
+        Next::Nmi => (interp::NMI, 2),
+        Next::Interrupt(v) => (interp::INTERRUPT, v),
+        Next::ExtInt => (interp::EXTINT, 0),
+        Next::Step => (0, 0),
+    })
+}
+
 /// Perf chunk 15: an event is pending that would be taken at a boundary with RFLAGS.IF set and no shadow (an NMI not blocked,
 /// the ExtINT or an APIC interrupt [`next`] takes): the resident's event-pending byte, which an inline STI reads. The common
 /// case (no vector, ExtINT or unblocked NMI posted) is one relaxed look at the record's words: a post this misses rings the

@@ -1280,10 +1280,12 @@ pub mod cache {
     /// currency, L1 and L2 entries, linear and frame chains and link-point targets; no code (`code` the fill point,
     /// `code_size` 0, as a [`SYSTEM`] record), no sites (its translation's).
     pub const INSTANCE: u32 = 4096;
-    /// M2 Part 2, reserved (none is placed yet): the boot-time interpreter's record of an instruction, validated by its bytes
-    /// at every execution instead of by write-watching (no source page marked). Always with [`SYSTEM`] (no code, never in L1,
-    /// never entered or linked), keyed by an [`super::interpreted_context`], which no code context equals: the resident's
-    /// lookups in translatable state (`find_from`) never find one, and the interpreter's own lookup parts the two kinds.
+    /// M2 Part 2: the boot-time interpreter's record of an instruction (its `natemu_abi::interp::Insn` right after the
+    /// record), keyed by its linear address and an [`super::interpreted_key`], validated by its bytes at every execution
+    /// instead of by write-watching: no source page (on no page chain, no code-write mark), currency never looked at.
+    /// Always with [`SYSTEM`] (no code, never in L1, never entered or linked). No code context equals its key (bit 63,
+    /// [`super::INTERPRETED_CONTEXT`]): the resident's lookups in translatable state never find one, and the interpreter's
+    /// own (the runtime's `cache::interpreted_at`) finds only these.
     pub const INTERPRETED: u32 = 8192;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
@@ -2778,6 +2780,13 @@ pub const fn interpreted_context(mode: InterpretedMode, cpl: u64) -> u64 {
     INTERPRETED_CONTEXT | (mode as u64) << 2 | cpl & 3
 }
 const _: () = assert!(interpreted_context(InterpretedMode::Compat32, 3) != cache::NO_CONTEXT);
+/// M2 Part 2: the key an interpreter record of `cpu`'s code is cached under: [`interpreted_context`] and CS.D in bit 5,
+/// which decides the decode and which real mode's classification does not hold (a 32-bit code segment loaded before PE
+/// was cleared); `None` when the state is not interpreted.
+pub fn interpreted_key(cpu: &Cpu) -> Option<u64> {
+    let d = u64::from(cpu.seg[SREG_CS].attributes & ATTR_D != 0);
+    Some(interpreted_context(cpu.interpreted_mode()?, cpu.cpl) | d << 5)
+}
 
 impl Cpu {
     /// M2 Part 2: the mode the boot-time interpreter runs this state in, from CR0.PE, EFER.LMA, the hidden CS.L and CS.D
@@ -3604,6 +3613,53 @@ pub mod stop {
     /// (AFP accurate plan chunk 3.) An FP trap in admitted code at an Arm word the handler's table does not know (`fptrap::classify`):
     /// the guest stops rather than being patched wrongly. `State::native` holds ESR, the word and ELR (as an offset in its block).
     pub const FP_WORD: u64 = 68;
+    /// (M2 Part 2, numbered apart: the boot-time interpreter's typed stops, [`super::Cpu::interpreted_mode`].) Each is
+    /// precise: the bank is the state at the instruction, nothing of it committed (RIP at it). `State::native[0]` holds the
+    /// interpreted mode (bits 7:0, [`super::InterpretedMode`]), the record's operation (15:8, `natemu_abi::interp::op`,
+    /// 0xff for none: a fetch or a boundary's stop), the count of instruction bytes known (23:16) and the stop's detail
+    /// (31:24, each code's own); `native[1]` and `native[2]` those bytes (the record's, or those fetched), little endian.
+    /// `State::fault` as each code says.
+    ///
+    /// An exception the instruction raises (fetch faults included): `fault` = [vector, CR2 (#PF; else 0), error code, RIP].
+    /// Interpreted modes deliver nothing (plan section 6).
+    pub const INTERP_FAULT: u64 = 80;
+    /// An instruction decoded but not in the first version (`op` `OTHER`), or a first-version form whose resident
+    /// operation is not built yet (detail: [`interp::FAR_JUMP`] ..).
+    pub const INTERP_UNSUPPORTED: u64 = 81;
+    /// A device page (detail [`interp::DEVICE`]: the local APIC's, or one the host's registry claims), an unassigned page
+    /// under the strict switch ([`interp::UNASSIGNED`]), or a fetch from a page that is not guest RAM
+    /// ([`interp::FETCH`]): `fault` = [0, the linear address, the guest-physical page, RIP].
+    pub const INTERP_MEMORY: u64 = 82;
+    /// An event the boundary would deliver (detail [`interp::NMI`], [`interp::INTERRUPT`], [`interp::EXTINT`]): `fault` =
+    /// [the vector (2 for an NMI, the PIC's for an ExtINT: 0, not yet asked), 0, 0, RIP]. It stays pending.
+    pub const INTERP_EVENT: u64 = 83;
+    /// RFLAGS.TF set, a breakpoint armed in DR7, or a trap-class #DB pending (detail [`interp::TRAP`], `fault[0]` its DR6
+    /// bits).
+    pub const INTERP_DEBUG: u64 = 84;
+    /// A state the interpreter does not run: protected mode at CPL > 0, paging without IA-32e mode, or paging controls
+    /// the walker has none for (`super::Cpu::paging`).
+    pub const INTERP_MODE: u64 = 85;
+    /// The details of the interpreter's stops (`State::native[0]` bits 31:24).
+    pub mod interp {
+        pub const FAR_JUMP: u64 = 1;
+        pub const FAR_RETURN: u64 = 2;
+        pub const LOAD_SEGMENT: u64 = 3;
+        pub const MOV_TO_CR: u64 = 4;
+        pub const HLT: u64 = 5;
+        pub const DEVICE: u64 = 1;
+        pub const UNASSIGNED: u64 = 2;
+        pub const FETCH: u64 = 3;
+        pub const NMI: u64 = 1;
+        pub const INTERRUPT: u64 = 2;
+        pub const EXTINT: u64 = 3;
+        pub const TRAP: u64 = 1;
+        pub const TF: u64 = 2;
+        pub const BREAKPOINT: u64 = 3;
+        /// The value of `State::native[0]`.
+        pub const fn word(mode: u8, op: u8, bytes: u8, detail: u64) -> u64 {
+            mode as u64 | (op as u64) << 8 | (bytes as u64) << 16 | (detail & 0xff) << 24
+        }
+    }
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -3632,6 +3688,12 @@ pub mod stop {
             PAGE_CHECK => "page_check",
             FP_TRAP => "fp_trap",
             FP_WORD => "fp_word",
+            INTERP_FAULT => "interp_fault",
+            INTERP_UNSUPPORTED => "interp_unsupported",
+            INTERP_MEMORY => "interp_memory",
+            INTERP_EVENT => "interp_event",
+            INTERP_DEBUG => "interp_debug",
+            INTERP_MODE => "interp_mode",
             _ => "none",
         }
     }
@@ -5464,6 +5526,31 @@ mod tests {
         for mode in [InterpretedMode::Real, InterpretedMode::Compat32] {
             assert_ne!(interpreted_context(mode, 0) & INTERPRETED_CONTEXT, 0);
         }
+    }
+
+    /// M2 Part 2: an interpreter record's key tells the modes, the CPL and the code segment's D bit apart (real mode with a
+    /// 32-bit CS decodes as 32-bit code), and is no code context and never `cache::NO_CONTEXT`.
+    #[test]
+    fn interpreted_keys_hold_mode_cpl_and_cs_d() {
+        // SAFETY: `Cpu` is plain integers.
+        let mut c: Cpu = unsafe { core::mem::zeroed() };
+        c.seg[SREG_CS].attributes = 0x9b;
+        let real16 = interpreted_key(&c).unwrap();
+        c.seg[SREG_CS].attributes = 0x409b;
+        let real32 = interpreted_key(&c).unwrap();
+        c.cr0 = CR0_PE;
+        let p32 = interpreted_key(&c).unwrap();
+        c.cpl = 3;
+        let p32_cpl3 = interpreted_key(&c).unwrap();
+        (c.cr0, c.efer, c.cr4, c.cpl, c.seg[SREG_CS].attributes) = (CR0_PE | CR0_PG, EFER_LME | EFER_LMA, CR4_PAE, 0, 0xc09b);
+        let c32 = interpreted_key(&c).unwrap();
+        let keys = [real16, real32, p32, p32_cpl3, c32];
+        for (i, k) in keys.iter().enumerate() {
+            assert!(k & INTERPRETED_CONTEXT != 0 && *k != cache::NO_CONTEXT, "{k:#x}");
+            assert!(keys[i + 1..].iter().all(|o| o != k), "{keys:x?}");
+        }
+        c.seg[SREG_CS].attributes = 0xa09b; // 64-bit code: translated
+        assert_eq!(interpreted_key(&c), None);
     }
 
     /// M2 Part 2: the interpretable predicate (EFER.LMA = 0, or CPL 0 with CS.L = 0), and that no interpretable state is

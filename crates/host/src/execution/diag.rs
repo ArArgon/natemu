@@ -135,7 +135,65 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
         cpu.seg[exec::SREG_GS].base
     );
     out += &format!("{p}: code identity {:#x}\n", cpu.code_context());
+    if let Some(line) = interpreted(&state) {
+        out += &format!("{p}: {line}\n");
+    }
     out
+}
+
+/// M2 Part 2: what an interpreter's typed stop names (`exec::stop::INTERP_FAULT`'s record): the interpreted mode, the
+/// instruction's bytes and operation, and the exception, address or event; `None` for any other stop.
+fn interpreted(s: &State) -> Option<String> {
+    use exec::stop::{self, interp};
+    if !(stop::INTERP_FAULT..=stop::INTERP_MODE).contains(&s.stop) {
+        return None;
+    }
+    let w = s.native[0];
+    let (mode, op, count, detail) = (w & 0xff, w >> 8 & 0xff, (w >> 16 & 0xff).min(16) as usize, w >> 24 & 0xff);
+    let mode = ["none", "real mode", "16-bit protected mode", "32-bit protected mode", "compatibility mode, 16-bit",
+        "compatibility mode, 32-bit"]
+        .get(mode as usize)
+        .copied()
+        .unwrap_or("?");
+    let bytes: Vec<u8> = s.native[1].to_le_bytes().into_iter().chain(s.native[2].to_le_bytes()).take(count).collect();
+    let bytes: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let op = if op == 0xff { "none decoded".to_string() } else { format!("operation {op}") };
+    let [a, b, c, _] = s.fault;
+    let what = match s.stop {
+        stop::INTERP_FAULT => format!("exception {a} error code {c:#x} cr2 {b:#x}, nothing committed"),
+        stop::INTERP_UNSUPPORTED => match detail {
+            interp::FAR_JUMP => "a protected-mode far JMP (not built yet)".into(),
+            interp::FAR_RETURN => "a protected-mode far RET (not built yet)".into(),
+            interp::LOAD_SEGMENT => "a protected-mode segment load (not built yet)".into(),
+            interp::MOV_TO_CR => "MOV to a control register (not built yet)".into(),
+            interp::HLT => "HLT (not built yet)".into(),
+            _ => "an instruction outside the first version".into(),
+        },
+        stop::INTERP_MEMORY => format!(
+            "{} at linear {b:#x}, guest-physical page {c:#x}",
+            match detail {
+                interp::DEVICE => "a device page",
+                interp::UNASSIGNED => "an unassigned page (strict)",
+                _ => "a fetch from memory that is not guest RAM",
+            }
+        ),
+        stop::INTERP_EVENT => format!(
+            "{} (vector {a}), not delivered in interpreted modes",
+            match detail {
+                interp::NMI => "an NMI",
+                interp::INTERRUPT => "an external interrupt",
+                interp::EXTINT => "an ExtINT",
+                _ => "an event",
+            }
+        ),
+        stop::INTERP_DEBUG => match detail {
+            interp::TRAP => format!("a pending debug trap (DR6 bits {a:#x})"),
+            interp::TF => "RFLAGS.TF set".into(),
+            _ => format!("a breakpoint armed (DR7 {a:#x})"),
+        },
+        _ => "a state the interpreter does not run (CPL > 0, or paging other than IA-32e's)".into(),
+    };
+    Some(format!("interpreted, {mode}: instruction {} ({op}): {what}", bytes.join(" ")))
 }
 
 /// The processor mode the bank describes.
@@ -297,5 +355,26 @@ mod tests {
             assert!(rip == low && note.contains(&format!("[{low:#x}, {high:#x})")), "{o:#x}: {note}");
         }
         assert!(locate(area, pc(0x100)).is_none());
+    }
+
+    /// M2 Part 2: an interpreter's typed stop is reported with its mode, bytes, operation and record; other stops add no
+    /// line.
+    #[test]
+    fn interpreter_stops_name_mode_bytes_and_record() {
+        let mut s = State::new(0, unsafe { std::mem::zeroed() });
+        s.stop = exec::stop::INTERP_FAULT;
+        s.native = [exec::stop::interp::word(5, 0xff, 3, 0), 0x56_78b8, 0];
+        s.fault = [14, 0x11000, 0, 0x10ffd];
+        let line = interpreted(&s).unwrap();
+        assert!(line.contains("compatibility mode, 32-bit") && line.contains("instruction b8 78 56 (none decoded)"), "{line}");
+        assert!(line.contains("exception 14 error code 0x0 cr2 0x11000"), "{line}");
+        s.stop = exec::stop::INTERP_UNSUPPORTED;
+        s.native[0] = exec::stop::interp::word(3, 37, 1, exec::stop::interp::FAR_JUMP);
+        assert!(interpreted(&s).unwrap().contains("operation 37): a protected-mode far JMP"));
+        s.stop = exec::stop::INTERP_MEMORY;
+        (s.native[0], s.fault) = (exec::stop::interp::word(1, 19, 0, exec::stop::interp::DEVICE), [0, 0xfee0_00b0, 0xfee0_0000, 0]);
+        assert!(interpreted(&s).unwrap().contains("a device page at linear 0xfee000b0, guest-physical page 0xfee00000"));
+        s.stop = exec::stop::HALTED;
+        assert_eq!(interpreted(&s), None);
     }
 }
