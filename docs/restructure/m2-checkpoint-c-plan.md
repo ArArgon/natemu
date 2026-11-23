@@ -160,10 +160,12 @@ with these notes.
 - The three pages are the first three of the old pool (`COMPAT_LOWER_ROOT`, `COMPAT_UPPER_ROOT`, `COMPAT_L1` in
   `crates/abi/src/shadow.rs`). `shadow::asids` holds the ASID arithmetic for `tables::space` and `tables::select`.
   `select_guest_space` stays as the one-line caller of `tables::select` at the four entry points.
-- For 49 addressing, stack and unchecked FS/GS forms at both block sizes (those `fexc-address32` held, and absolute
-  addresses, a 16 KiB displacement and plain PUSH and POP) the compiler's code is byte for byte `main` `035b243e`'s;
-  only SHLD and SHRD by CL differ. `fexc-address32` pins the native operand of each access and the digests of the
-  unchecked FS/GS forms.
+- An experiment, not a kept check: a one-off script on the M4 compiled 49 single instructions (the addressing, stack
+  and unchecked FS/GS forms `fexc-address32` held, absolute addresses, a 16 KiB displacement, plain PUSH and POP) as
+  32-bit code, as an ordinary unit and alone, with this compiler (FEX `13a1bfc`) and with the framework's `fexc_base`
+  build of `main` `035b243e` (FEX `4eba851`), and compared the code bytes: all equal. SHLD and SHRD by CL, compiled
+  the same way, differ. What is kept: `fexc-address32` pins the native operand of each access and the digests of the
+  unchecked FS/GS forms as this compiler emits them.
 - Failing first, M4, `tests/system` `compat32-resident-limits`: on `5e028c91` the two SHLD programs fail at `[eax]`
   in the whole-block run. On a throwaway build of `5e028c91` with FEX `10ff87f` (folding, the old runtime)
   `mixed-user-wrap-far`, `mixed-user-fold` (the 16-bit write step in the whole-block run), `mixed-user-shld`
@@ -172,9 +174,19 @@ with these notes.
 - PUSH at ESP = 0 against a user page at the top of the address space is not a case: the fixture's table entry for
   that page lies in the bytes the push writes. `[ebp-16]` with EBP = 4 covers the top of the address space, and
   `mixed-user-wrap` keeps PUSH at ESP = 0.
-- The scan for 64-bit writes of 32-bit guest registers is part of `static/fexc-asm32` (`run_asm.py` `wide_writes`):
-  it follows a temporary to its last write, checks itself on the old SHLD sequence, and finds nothing else in FEX's
-  245 32-bit tests.
+- The scan for 64-bit writes of 32-bit guest registers (`tools/fexc/verify_precision.py` `upper_half_writes`) reads
+  each unit's disassembly. A temporary is wide unless its last write is a recognised 32-bit one; a select or OR of
+  narrow values is narrow; a forward branch carries the state to its target, where arrivals intersect, and a backward
+  branch's target starts from nothing; a word it does not know fails. It runs in `static/fexc-asm32` over FEX's 245
+  32-bit tests, which hold no SHLD, MUL or CMPXCHG, and in `static/fexc-address32` over 168 single instructions that
+  do (double shifts, multiplies and divides, CMPXCHG, XADD, BMI, shifts and rotates, 8- and 16-bit writes, CMOV, moves
+  from vector registers, stack forms). It checks itself on the old compiler's real SHLD sequence, and run on that
+  compiler it reports `shld`/`shrd eax, ebx, cl` at the move into EAX's register. One transient is allowed: MULX
+  holds a 64-bit product in the destination's register for one word (`mul x4, x0, x1; lsr x4, x4, #32`), with no
+  access or exit between.
+- `mixed-user-fold` and `mixed-user-shld` also assert the number of translations of their whole-block run, so a unit
+  cut between the step that leaves an upper half and the access that would use it fails instead of passing vacuously
+  (shown by inserting a jump there: 24 translations for 23).
 - FXSAVE, XSAVE, FNSAVE and m80 past 4 GiB were already exact: the resident's handlers test the operand's extent
   (`operand_range(..).outside`, `xsave.rs`, `x87.rs`), and `c32` has `fxsave-limit`. Nothing was built.
 - Not measured yet: the A/B against `main` (bench cases `io5-solo`, `io5-solo32`, `guest-hackbench32`,

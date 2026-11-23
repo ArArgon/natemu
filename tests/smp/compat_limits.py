@@ -1428,6 +1428,7 @@ def mixed_user_fold():
     int 0x80
 """
     prog = C.program('mixed-user-fold', C.ENTER(cs=0x23) + C.handlers(), user, memory)
+    prog['requests'] = 23   # (the 32-bit code is one unit: see run_slice3_vm.py cmd_compat_limits)
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 128, 0),
                   C.REC + 0x40: struct.pack('<4Q', 0x10ad0008, 0x70b0fff4, 0x70b0fff4, 0xffffe000),
                   C.REC + 0x68: struct.pack('<2Q', 0xfffff7f4, 0x10ad0008),
@@ -1460,6 +1461,7 @@ def mixed_user_shld():
     int 0x80
 """
     prog = C.program('mixed-user-shld', C.ENTER(cs=0x23) + C.handlers(), user, C.WRAP + FAR + [C.P.zero(C.XPAGE, 12)])
+    prog['requests'] = 23   # (the 32-bit code is one unit: see run_slice3_vm.py cmd_compat_limits)
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 128, 0), C.REC + 0x40: struct.pack('<Q', 0x1000),
                   C.REC + 0x50: struct.pack('<Q', 0x10ad0000), C.REC + 0x68: struct.pack('<3Q', 0x10ad0008, 0x10ad0008, 0x10ad0000),
                   C.XPAGE: struct.pack('<3I', 0x5eed0000, 0, 0x5eed0008)}

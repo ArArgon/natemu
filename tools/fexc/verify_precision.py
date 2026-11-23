@@ -137,6 +137,106 @@ def effects(text):
     return mn, {d for d in dests if d}, nzcv, acc, known
 
 
+# M2 checkpoint C: 32-bit code keeps the upper half of EAX..EDI's registers (x4..x11) zero, but for the two exceptions the
+# resident's address repair and the stack writeback make (docs/restructure/m2-checkpoint-c-plan.md, "Folded displacements
+# behind a 4 GiB translation root": the 4 GiB roots make an upper half harmless to addressing; this keeps new ones from
+# arising, which the scan cannot prove of a repaired one).
+GUEST32 = range(4, 12)
+BRANCHES = ('b', 'cbz', 'cbnz', 'tbz', 'tbnz')
+
+
+def rebased(dis, lo, hi, base):
+    """The words of `dis` in [lo, hi) with offsets, and branch targets, relative to `base` (units disassembled back to back)."""
+    is_branch = lambda t: t.partition(' ')[0] in BRANCHES or t.startswith('b.')
+    move = lambda t: t.rsplit(' ', 1)[0] + f' {int(t.rsplit(" ", 1)[1], 16) - base:#x}' if is_branch(t) else t
+    return {o - base: move(t) for o, t in dis.items() if lo <= o < hi}
+
+
+def upper_half_writes(dis):
+    """The native words of one unit of 32-bit code ({offset: text}) that may leave a new nonzero upper half in x4..x11, as
+    (offset, text, why). A register is `narrow` when its last write is known to leave bits 63:32 zero: a 32-bit (w)
+    write, or one of the 64-bit forms below whose sources are narrow. Everything else is wide: a temporary nothing here
+    wrote, an unrecognised 64-bit write, a general register a SIMD or system word fills. x4..x11 themselves count as
+    narrow sources (their upper halves are what is being kept zero) and every write of one must be narrow or leave bits
+    63:32 as they were (an 8/16-bit insert, a low MOVK, the writeback of a load or store: PUSH and POP, also through a
+    copy of ESP). A wide value may pass through one only between words that neither access memory nor leave the path
+    (MULX: `mul x4, x0, x1; lsr x4, x4, #32`): it is reported at the first such word, or at the unit's end.
+    Control flow: a forward branch carries the narrow set to its target, where the sets of all arrivals intersect; the
+    word after an unconditional branch starts from its arrivals alone; a backward branch's target starts from nothing."""
+    order = sorted(dis)
+    target = lambda t: int(t.rsplit(' ', 1)[1], 16)
+    is_branch = lambda mn: mn in BRANCHES or mn.startswith('b.')
+    back = {target(dis[o]) for o in order if is_branch(dis[o].partition(' ')[0]) and target(dis[o]) <= o}
+    narrow, pending, dead, found, dirty = set(), {}, False, [], {}
+    ok = lambda r: r is None or (r[1] not in dirty if r[1] in GUEST32 else r[1] in narrow)      # (None: xzr/wzr)
+    num = lambda t: int(t.strip().lstrip('#'), 0)
+    for o in order:
+        text = dis[o]
+        if o in pending:
+            arrived = pending.pop(o)
+            narrow = arrived if dead else narrow & arrived
+        elif dead:
+            narrow = set()
+        dead = False
+        if o in back:
+            narrow = set()
+        mn, dests, _, acc, known = effects(text)
+        known = known or mn.startswith('crc32')
+        if dirty and (acc or is_branch(mn) or mn in ('br', 'ret', 'bl', 'blr', 'svc', 'brk')):
+            found += [(at, t, 'a 64-bit write of a 32-bit guest register') for at, t in dirty.values()]
+            dirty = {}
+        if is_branch(mn):
+            if target(text) > o:
+                pending[target(text)] = pending.get(target(text), narrow) & narrow
+            dead = mn == 'b'
+            continue
+        if mn in ('br', 'ret'):
+            dead = True
+            continue
+        if not known:
+            found.append((o, text, 'a word the scan does not know'))
+            continue
+        toks = [t.strip() for t in text.partition(' ')[2].split('[')[0].split(',') if t.strip()]
+        for kind, n in dests:
+            if kind != 'x':
+                continue
+            keep = False   # (the register keeps the upper half it had)
+            if acc and acc[5] != 'none' and reg(acc[2]) == ('x', n):
+                keep = fine = True                     # writeback: PUSH and POP, on ESP's register or a copy of it
+            elif acc or mn in PAIR_LOADS:
+                fine = any(t.startswith('w') and reg(t) == ('x', n) for t in toks)    # the transfer register's own width
+            elif toks[0].startswith('w'):
+                fine = True
+            elif mn == 'mov':
+                fine = ok(reg(toks[1])) and toks[1] != 'sp' if not toks[1].startswith('#') else 0 <= num(toks[1]) < 1 << 32
+            elif mn == 'movk':
+                keep = fine = len(toks) == 2 or num(toks[2].replace('lsl', '')) < 32
+            elif mn in ('bfxil', 'bfi', 'bfc'):
+                keep = fine = (num(toks[-1]) if mn == 'bfxil' else num(toks[-2]) + num(toks[-1])) <= 32
+            elif mn == 'lsr' and toks[2].startswith('#'):
+                fine = num(toks[2]) >= 32 or ok(reg(toks[1]))
+            elif mn == 'ubfx':
+                fine = num(toks[3]) <= 32 or ok(reg(toks[1]))
+            elif mn == 'and' and len(toks) == 3:
+                fine = ok(reg(toks[1])) or (ok(reg(toks[2])) if not toks[2].startswith('#') else num(toks[2]) < 1 << 32)
+            elif mn in ('orr', 'eor') and len(toks) == 3 and not toks[2].startswith('#'):
+                fine = ok(reg(toks[1])) and ok(reg(toks[2]))
+            elif mn == 'csel':
+                fine = ok(reg(toks[1])) and ok(reg(toks[2]))
+            else:
+                fine = False
+            if n in GUEST32:
+                if not fine:
+                    dirty[n] = (o, text)
+                elif not keep:
+                    dirty.pop(n, None)
+            elif fine and not keep:
+                narrow.add(n)
+            elif not fine:
+                narrow.discard(n)
+    return found + [(at, t, 'a 64-bit write of a 32-bit guest register') for at, t in dirty.values()]
+
+
 def loaded_regs(text):
     """Registers a disassembled load transfers into (all transfer registers before the address; the base is not one)."""
     return {r for r in map(reg, text.partition(' ')[2].split('[')[0].split(',')) if r}

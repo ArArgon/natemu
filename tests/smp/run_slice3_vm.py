@@ -1706,6 +1706,10 @@ def cmd_compat_limits(a, host, runtime):
                         diffs.append(f"cpu{i} resident operand checks {cpu.get('segment_checks')}, expected {prog['segment_checks'][i]}")
                     if 'frame_alias' in prog and smp.num(cpu['guest_state_alias']) != prog['frame_alias']:
                         diffs.append(f"cpu{i} unexpected frame alias {cpu['guest_state_alias']}")
+                    # A program whose point needs its instructions in one unit (a register's upper half, cut at every entry):
+                    # the whole-block run asks for exactly this many translations; a unit cut in two asks for one more.
+                    if 'requests' in prog and not limit and cpu['stats']['requests'] != prog['requests']:
+                        diffs.append(f"cpu{i} asked for {cpu['stats']['requests']} translations, expected {prog['requests']}")
                     if (prog['ncpu'] > 1 or prog.get('require_link')) and not limit and not cpu['stats']['linked']:
                         diffs.append(f'cpu{i} installed no links in the default run')
                 if 'unassigned_fills' in prog:

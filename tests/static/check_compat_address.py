@@ -63,9 +63,10 @@ SEGMENTS = {
 # M2 checkpoint C: 32-bit code whose FS and GS are flat-limit segments (Linux's TLS: no --fs-limited, --gs-limited) has no
 # operand check: its native code is what the compiler made before the checks existed. Guest bytes, then the first 16 hex
 # digits of the SHA-256 of the unit's code (relocation slots zeroed) at 0x401000 with the arguments the host sends for
-# such a unit (HOST below), as an ordinary unit and alone (--max-insts 1). The digests are this compiler's (FEX 13a1bfc)
-# and were equal, form by form, to the code of main 035b243e's compiler (FEX 4eba851, built as the framework's
-# `fexc_base`) when they were written. To regenerate after a deliberate change of that code: hash the same compiles.
+# such a unit (HOST below), as an ordinary unit and alone (--max-insts 1). The digests are this compiler's (FEX 13a1bfc).
+# (An experiment when they were written, not repeated here: a one-off script on the M4 compiled the same forms with main
+# 035b243e's compiler, FEX 4eba851, the framework's `fexc_base` build, and the code was equal form by form.)
+# To regenerate after a deliberate change of that code: hash the same compiles.
 HOST = ['--bitness', '32', '--push-run', '--narrow-cmp', '--ext-conds', '4']
 UNCHECKED = {
     'mov eax,gs:[0x14]': ('65a114000000', '7777ff285dd55f9d', 'ba233807cbc4bb18'),
@@ -97,6 +98,82 @@ UNCHECKED = {
     'mov eax,fs:[0]': ('64a100000000', '6c83adfab9dd5554', 'e949f359bec934e1'),
     'mov fs:[eax],edx': ('648910', 'c5c0cb688e21e897', '7169a1eee24a2841'),
 }
+
+
+# No native word of 32-bit code may leave a new nonzero upper half in the register of EAX..EDI
+# (verify_precision.upper_half_writes; the 4 GiB roots make one harmless to addressing, this keeps them from arising).
+# Single instructions whose FEX lowering computes in 64 bits somewhere or writes part of a register: guest text and bytes
+# (nasm, `bits 32`). tests/static `fexc-asm32` runs the same scan over FEX's 32-bit test corpus.
+NARROW = {
+    'shld eax, ebx, cl': '0fa5d8', 'shld eax, ebx, 5': '0fa4d805', 'shld [ebx], eax, cl': '0fa503',
+    'shrd eax, ebx, cl': '0fadd8', 'shrd eax, ebx, 5': '0facd805', 'shrd [ebx], eax, cl': '0fad03', 'mul ebx': 'f7e3',
+    'mul dword [ebx]': 'f723', 'imul ebx': 'f7eb', 'imul eax, ebx': '0fafc3', 'imul eax, ebx, 100': '6bc364',
+    'imul eax, [ebx]': '0faf03', 'div ebx': 'f7f3', 'idiv ebx': 'f7fb', 'mul bl': 'f6e3', 'mul bx': '66f7e3',
+    'div bl': 'f6f3', 'div bx': '66f7f3', 'idiv bx': '66f7fb', 'cmpxchg ebx, ecx': '0fb1cb',
+    'cmpxchg [ebx], ecx': '0fb10b', 'lock cmpxchg [ebx], ecx': 'f00fb10b', 'cmpxchg bx, cx': '660fb1cb',
+    'cmpxchg bl, cl': '0fb0cb', 'cmpxchg8b [ebx]': '0fc70b', 'xadd eax, ebx': '0fc1d8', 'xadd [ebx], eax': '0fc103',
+    'lock xadd [ebx], eax': 'f00fc103', 'xchg eax, ebx': '93', 'xchg [ebx], eax': '8703', 'xchg ax, bx': '6693',
+    'xchg al, ah': '86c4', 'andn eax, ebx, ecx': 'c4e260f2c1', 'bextr eax, ebx, ecx': 'c4e270f7c3',
+    'blsi eax, ebx': 'c4e278f3db', 'blsr eax, ebx': 'c4e278f3cb', 'blsmsk eax, ebx': 'c4e278f3d3',
+    'bzhi eax, ebx, ecx': 'c4e270f5c3', 'mulx eax, ebx, ecx': 'c4e263f6c1', 'pdep eax, ebx, ecx': 'c4e263f5c1',
+    'pext eax, ebx, ecx': 'c4e262f5c1', 'rorx eax, ebx, 5': 'c4e37bf0c305', 'sarx eax, ebx, ecx': 'c4e272f7c3',
+    'shlx eax, ebx, ecx': 'c4e271f7c3', 'shrx eax, ebx, ecx': 'c4e273f7c3', 'tzcnt eax, ebx': 'f30fbcc3',
+    'lzcnt eax, ebx': 'f30fbdc3', 'popcnt eax, ebx': 'f30fb8c3', 'shl eax, 1': 'd1e0', 'shl eax, 5': 'c1e005',
+    'shl eax, cl': 'd3e0', 'shr eax, 1': 'd1e8', 'shr eax, 5': 'c1e805', 'shr eax, cl': 'd3e8', 'sar eax, 5': 'c1f805',
+    'sar eax, cl': 'd3f8', 'rol eax, 5': 'c1c005', 'rol eax, cl': 'd3c0', 'ror eax, 5': 'c1c805', 'ror eax, cl': 'd3c8',
+    'rcl eax, 1': 'd1d0', 'rcl eax, 5': 'c1d005', 'rcl eax, cl': 'd3d0', 'rcr eax, 1': 'd1d8', 'rcr eax, 5': 'c1d805',
+    'rcr eax, cl': 'd3d8', 'shl ax, cl': '66d3e0', 'shr bl, cl': 'd2eb', 'rol bx, cl': '66d3c3', 'rcl bl, cl': 'd2d3',
+    'mov al, 5': 'b005', 'mov ah, bl': '88dc', 'mov bh, [esi]': '8a3e', 'mov ax, 0x1234': '66b83412',
+    'mov bx, cx': '6689cb', 'mov bx, [esi]': '668b1e', 'inc ax': '6640', 'dec bl': 'fecb', 'add bx, cx': '6601cb',
+    'add bl, ah': '00e3', 'sete bl': '0f94c3', 'setb ah': '0f92c4', 'movzx bx, cl': '660fb6d9',
+    'movsx bx, cl': '660fbed9', 'neg bx': '66f7db', 'not bl': 'f6d3', 'pop bx': '665b', 'lahf': '9f', 'sahf': '9e',
+    'cbw': '6698', 'cwde': '98', 'cdq': '99', 'cwd': '6699', 'cmove eax, ebx': '0f44c3', 'cmovb eax, [ebx]': '0f4203',
+    'cmovg bx, cx': '660f4fd9', 'movd eax, xmm1': '660f7ec8', 'movd eax, mm1': '0f7ec8',
+    'pextrw eax, xmm1, 2': '660fc5c102', 'pextrd eax, xmm1, 1': '660f3a16c801', 'pextrb eax, xmm1, 3': '660f3a14c803',
+    'pmovmskb eax, xmm1': '660fd7c1', 'movmskps eax, xmm1': '0f50c1', 'movmskpd eax, xmm1': '660f50c1',
+    'cvttss2si eax, xmm1': 'f30f2cc1', 'cvtsd2si eax, xmm1': 'f20f2dc1', 'cvttsd2si eax, [ebx]': 'f20f2c03',
+    'mov eax, ebx': '89d8', 'mov eax, [ebx]': '8b03', 'mov eax, 0xfffffff0': 'b8f0ffffff',
+    'lea eax, [ebx+ecx*4+0x7fffffff]': '8d848bffffff7f', 'lea eax, [ebx-1]': '8d43ff', 'lea bx, [eax+ecx]': '668d1c08',
+    'add eax, ebx': '01d8', 'add eax, -1': '83c0ff', 'adc eax, ebx': '11d8', 'sbb eax, [ebx]': '1b03',
+    'sub eax, 1': '83e801', 'neg eax': 'f7d8', 'not eax': 'f7d0', 'inc eax': '40', 'dec eax': '48',
+    'and eax, ebx': '21d8', 'or eax, 0x80000000': '0d00000080', 'xor eax, eax': '31c0', 'bswap eax': '0fc8',
+    'bsf eax, ebx': '0fbcc3', 'bsr eax, ebx': '0fbdc3', 'bt eax, ebx': '0fa3d8', 'bts eax, ebx': '0fabd8',
+    'btr eax, 5': '0fbaf005', 'btc eax, ebx': '0fbbd8', 'movzx eax, bl': '0fb6c3', 'movzx eax, word [ebx]': '0fb703',
+    'movsx eax, bl': '0fbec3', 'movsx eax, word [ebx]': '0fbf03', 'movbe eax, [ebx]': '0f38f003',
+    'crc32 eax, ebx': 'f20f38f1c3', 'crc32 eax, bl': 'f20f38f0c3', 'push eax': '50', 'pop eax': '58',
+    'pop dword [ebx]': '8f03', 'push dword [ebx]': 'ff33', 'leave': 'c9', 'call ebx': 'ffd3', 'ret': 'c3',
+    'ret 8': 'c20800', 'add esp, 16': '83c410', 'sub esp, 16': '83ec10', 'mov esp, ebp': '89ec', 'mov ebp, esp': '89e5',
+    'xchg esp, eax': '94', 'fild dword [ebx]': 'db03', 'fistp dword [ebx]': 'db1b', 'fnstsw ax': 'dfe0',
+    'fnstcw [ebx]': 'd93b', 'stmxcsr [ebx]': '0fae1b', 'lodsd': 'ad', 'stosd': 'ab', 'movsd': 'a5', 'scasd': 'af',
+    'cmpsd': 'a7', 'rep stosd': 'f3ab', 'xlat': 'd7', 'salc': 'd6', 'aaa': '37', 'daa': '27', 'aad': 'd50a',
+}
+# The scan's own check: `shld eax, ebx, cl` as the compiler before FEX 13a1bfc emitted it (the M4 gate's fexc_base build
+# of main 035b243e, FEX 4eba851), whose 64-bit `lsl` and `orr` reach EAX's register through a conditional select and a
+# move. It must be reported at the move, and not once the `orr` is the 32-bit one of the fix.
+OLD_SHLD = ['and x20, x7, #0x1f', 'neg x21, x20', 'lsl x22, x4, x20', 'lsr w21, w6, w21', 'orr x21, x22, x21', 'mrs x22, NZCV',
+            'cmp x20, #0x0', 'csel x21, x4, x21, eq', 'msr NZCV, x22', 'and w0, w20, #0x1f', 'cbz w0, 0x4c', 'ands w26, w21, w21',
+            'neg w0, w20', 'lsr w0, w4, w0', 'mvn x0, x0', 'eor w2, w4, w21', 'rmif', 'rmif',
+            'mov x4, x21', 'ldr w20, [x8]']
+
+
+def check_narrow(compiler):
+    listing = lambda words: {4 + 4 * k: w for k, w in enumerate(words)}
+    fixed = [w.replace('orr x21, x22, x21', 'orr w21, w22, w21') for w in OLD_SHLD]
+    errors = []
+    if [o for o, *_ in verify_precision.upper_half_writes(listing(OLD_SHLD))] != [0x4c] or verify_precision.upper_half_writes(listing(fixed)):
+        errors.append('the scan for 64-bit writes of 32-bit guest registers does not tell the old SHLD sequence from the fixed one')
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, code in NARROW.items():
+            for size in ([], ['--max-insts', '1']):
+                d = verify_precision.compile_(compiler, code, '0x401000', [*HOST, *size])
+                if d['status'] != 'ok' or d['guest']['instructions_translated'] != 1:
+                    errors.append(f'{name}: failed to translate the instruction')
+                    continue
+                layout = d['code']['layout']
+                dis = check_sites.disassemble(bytes.fromhex(d['code']['hex']), layout['code_region_end'], pathlib.Path(tmp))
+                wide = verify_precision.upper_half_writes(verify_precision.rebased(dis, layout['code_region_begin'], layout['code_region_end'], 0))
+                errors += [f'{name}{" (alone)" if size else ""}: {why}: {text} at {o:#x}' for o, text, why in wide]
+    return errors
 
 
 def check_unchecked(compiler):
@@ -176,13 +253,13 @@ def check_inline_registers(compiler):
 
 
 def main(compiler):
-    errors = check_inline_registers(compiler) + check_unchecked(compiler)
+    errors = check_inline_registers(compiler) + check_unchecked(compiler) + check_narrow(compiler)
     for size in ([], ['--max-insts', '1']):
         label = 'single' if size else 'default'
         errors.extend(f'{label}: {message}' for message in check_forms(compiler, size))
     if errors:
         sys.exit('\n'.join(errors))
-    print(f'{len(CASES)} address and stack forms, {len(SEGMENTS)} segment cases and {len(UNCHECKED)} unchecked FS/GS forms passed at both block sizes')
+    print(f'{len(CASES)} address and stack forms, {len(SEGMENTS)} segment cases, {len(UNCHECKED)} unchecked FS/GS forms and {len(NARROW)} forms without a 64-bit write of a 32-bit register passed at both block sizes')
 
 
 if __name__ == '__main__':

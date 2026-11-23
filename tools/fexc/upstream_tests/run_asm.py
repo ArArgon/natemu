@@ -46,6 +46,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'tools'))
 sys.path.insert(0, str(ROOT / 'tests' / 'lib')); import testenv  # noqa: E402,F401 (tests/README.md: the test scripts)
 import run_slice1_vm as vm1  # noqa: E402
+sys.path.insert(0, str(ROOT / 'tools' / 'fexc')); import check_sites, verify_precision  # noqa: E402,E401
 
 CODE = 0x10000
 PAGE = 4096
@@ -455,49 +456,6 @@ def direct_target(insn, end):
     return None, op[0] == 0xff and len(op) > 1 and op[1] >> 3 & 7 == 2   # an indirect call returns to its fall-through
 
 
-# M2 checkpoint C: 32-bit code keeps the upper half of EAX..EDI's registers (x4..x11) zero, but for the two exceptions the
-# resident's address repair and the stack writeback make (docs/restructure/m2-checkpoint-c-plan.md, "Folded displacements
-# behind a 4 GiB translation root"; the 4 GiB roots make an upper half harmless to addressing, this keeps it from arising).
-# A native word may write one of them whole only if it cannot make a new upper half: a move of another of them or of a
-# value last written in 32 bits, an 8- or 16-bit insert (BFM), a constant below 2^32. The scan reads each unit's words in
-# order (no control flow: a temporary's last write above is taken as its definition).
-GUEST32 = range(4, 12)
-def write_of(w):
-    """(register, whether the A64 word `w` may set bits above 31 of it, the register it copies whole or None), or None
-    when the word writes no general register by one of the forms FEX's 32-bit code uses."""
-    rd, sf = w & 31, w >> 31
-    if w >> 26 & 7 == 4:                                    # data processing, immediate
-        kind = w >> 23 & 7
-        if kind < 2: return rd, True, None                  # adr, adrp
-        if kind == 6:                                       # bitfield: BFM (bfi, bfxil) keeps the upper half it finds;
-            opc, immr, imms = w >> 29 & 3, w >> 16 & 63, w >> 10 & 63   # UBFM that ends at or below bit 31 clears it
-            return (rd, False, rd) if opc == 1 else (rd, bool(sf) and not (opc == 2 and (imms < 32 if imms >= immr else imms + 64 - immr < 32)), None)
-        if kind == 5: return rd, bool(sf) and ((w >> 29 & 3) < 2 or (w >> 21 & 3) > 1), rd if (w >> 29 & 3) == 3 else None   # movn; movz/movk above bit 31
-        return rd, bool(sf), None
-    if w >> 25 & 7 == 5:                                    # data processing, register
-        if w >> 21 & 0xff == 0xd2 or (w >> 21 & 0xff == 0xd0 and w >> 10 & 31): return None   # ccmp/ccmn, rmif/setf: flags only
-        return rd, bool(sf), (w >> 16 & 31) if w & 0xffe0ffe0 == 0xaa0003e0 else None   # (mov xD, xM)
-    if w >> 27 & 7 == 7 and not w >> 26 & 1 and w >> 24 & 3 != 2 and w >> 22 & 3:      # load register, general
-        opc = w >> 22 & 3
-        return rd, opc == 2 or (opc == 1 and w >> 30 == 3) or (opc == 3 and w >> 30 == 2), None   # ldrs* to x, ldr x, ldrsw
-    return None
-
-
-def wide_writes(words):
-    """The offsets of the words of `words` ((offset, word) in order) that may leave a new upper half in x4..x11."""
-    wide, found = set(), []
-    for o, w in words:
-        if w >> 27 & 7 == 5 and not w >> 26 & 1 and w >> 22 & 1 and w >> 30 in (1, 2):   # ldp x, ldpsw
-            found += [o] * any(r in GUEST32 for r in (w & 31, w >> 10 & 31)); wide |= {w & 31, w >> 10 & 31}
-            continue
-        if (x := write_of(w)) is None or x[0] == 31: continue
-        reg, may, source = x
-        if source is not None: may = may and source not in GUEST32 and source in wide and source != reg
-        if may and reg in GUEST32: found.append(o)
-        wide = wide | {reg} if may else wide - {reg}
-    return found
-
-
 def compile32(fexc, src, out, path, objects):
     name = str(path.relative_to(src))
     work = out / 'work' / name.replace('/', '__')
@@ -508,7 +466,7 @@ def compile32(fexc, src, out, path, objects):
     n = subprocess.run(['nasm', '-i', str(src / 'Includes') + '/', work / 't.asm', '-o', work / 't.bin'], capture_output=True, text=True)
     if n.returncode: return fail('harness: nasm failed', n.stderr[-500:])
     binary = (work / 't.bin').read_bytes()
-    todo, seen = [0], set()
+    todo, seen, units = [0], set(), []
     while todo:
         at = todo.pop()
         if at in seen or not 0 <= at < len(binary): continue
@@ -523,11 +481,8 @@ def compile32(fexc, src, out, path, objects):
         g = d['guest']; end = g['end']; stop = int(end['rip'], 0) - CODE
         if d['status'] != 'ok': (objects / f'{stem}.src').unlink(); (objects / f'{stem}.obj').unlink(missing_ok=True)
         else: rec['blocks'] += 1; rec['insns'] += g['instructions_translated']
-        if d['status'] == 'ok':
-            code, layout = bytes.fromhex(d['code']['hex']), d['code']['layout']
-            words = [(o, int.from_bytes(code[o:o + 4], 'little')) for o in range(layout['code_region_begin'], layout['code_region_end'], 4)]
-            wide = [f'{o:#x}: {dict(words)[o]:08x}' for o in wide_writes(words)]
-            if wide: return fail('a 64-bit write of a 32-bit guest register', f"block at {CODE + at:#x} ({binary[at:at + 15].hex()}): {', '.join(wide[:4])}")
+        if d['status'] == 'ok':   # (M2 checkpoint C: kept for the scan after the loop)
+            units.append((at, bytes.fromhex(d['code']['hex'])[:d['code']['layout']['code_region_end']], d['code']['layout']['code_region_begin']))
         sizes = {int(i['rip'], 0) - CODE: i['size'] for i in g.get('instructions', [])}
         # (extended blocks: every conditional branch inside the unit leads somewhere too)
         for i in g.get('instructions', []):
@@ -552,15 +507,20 @@ def compile32(fexc, src, out, path, objects):
             dis = subprocess.run(['ndisasm', '-b', '32', '-o', hex(CODE + stop), '-e', str(stop), work / 't.bin'], capture_output=True, text=True).stdout.splitlines()
             length = len(dis[0].split()[1]) // 2 if dis else 1
         todo.append(stop + length)
+    # M2 checkpoint C: no native word of any block may leave a new upper half in the register of EAX..EDI
+    # (verify_precision.upper_half_writes). One disassembly per test: its blocks back to back, scanned one by one.
+    if units:
+        dis = check_sites.disassemble(b''.join(u[1] for u in units), sum(len(u[1]) for u in units), work)
+        base = 0
+        for at, code, begin in units:
+            wide = verify_precision.upper_half_writes(verify_precision.rebased(dis, base + begin, base + len(code), base))
+            if wide: return fail(wide[0][2], f"block at {CODE + at:#x} ({binary[at:at + 15].hex()}): " + '; '.join(f'{o:#x}: {t}' for o, t, _ in wide[:4]))
+            base += len(code)
     shutil.rmtree(work, ignore_errors=True)
     return {**rec, 'cuts': dict(rec['cuts']), 'outcome': 'pass'}
 
 
 def main32(a):
-    # The scan's own check: `lsl x22, x4, x20; orr x21, x22, x21; mov x4, x21` (SHLD by CL before its fix) is found at the
-    # move, and not with the `orr` or the move in 32 bits.
-    shld = [0x9ad42096, 0xaa1502d5, 0xaa1503e4]
-    assert [wide_writes(list(enumerate(w))) for w in (shld, [shld[0], 0x2a1502d5, shld[2]], [*shld[:2], 0x2a1503e4])] == [[2], [], []]
     objects = a.out / 'objects'
     shutil.rmtree(objects, ignore_errors=True); objects.mkdir(parents=True)
     tests = sorted(p for p in a.src.rglob('*.asm') if 'Includes' not in p.parts and header(p.read_text()).get('MODE', '').upper() == '32BIT')
