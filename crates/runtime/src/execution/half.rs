@@ -9,7 +9,7 @@ pub(super) fn store(s: &mut State, i: System) -> Result<(), Exception> {
     if s.cpu.cr0 & CR0_TS != 0 {
         return Err([7, 0, 0]);
     }
-    let va = address(&s.cpu, &i)?;
+    let va = address(&s.cpu, &i, u64::from(i.size), true)?;
     let n = i.size as usize;
     let gpa = pages(s, va, n as u64, true, false, noncanonical(&i))?;
     let head = n.min((4096 - (va & 4095)) as usize);

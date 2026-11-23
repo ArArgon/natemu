@@ -143,8 +143,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     }
     let reg = if i.kind == system::INS { 7 } else { 6 };
     let offset = c.gpr[reg] & wide;
-    segments::usable(&c, i.segment)?;
-    let va = segments::linear_of(&c, i.segment, offset);
+    let va = segments::operand(&c, i.segment, offset, size, i.kind == system::INS)?;
     let mut bytes = [0u8; 4];
     let element = &mut bytes[..size as usize];
     let power;

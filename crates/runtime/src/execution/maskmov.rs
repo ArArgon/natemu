@@ -21,7 +21,7 @@
 //! explicitly permitted by its SDM page), and writes selected bytes. Unlike the SIMD forms it checks pending #MF and
 //! natural alignment under #AC (Vol.3B Table 24-8); canonicality precedes #AC, which precedes page faults as for `linear`.
 //! Only successful completion sets TOP=0 and all tags valid, including a zero mask. CR4.OSFXSR does not gate it.
-use super::segments::{Exception, address, copy, noncanonical, pages};
+use super::segments::{Exception, copy, noncanonical, offset, operand, pages, usable};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;
 
@@ -71,23 +71,28 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             ymm(&s.cpu, (i.cr & 15) as usize),
         )
     };
-    let at = address(&s.cpu, &i)?;
+    let ea = offset(&s.cpu, &i);
+    usable(&s.cpu, i.segment)?;
     let nc = noncanonical(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
-    let element = |j: usize| at.wrapping_add((ew * j) as u64);
-    // The checks: every masked-in element's walk (one 16-byte write for MASKMOVDQU), before any byte moves.
-    if mmx
-        && alignment_check(&s.cpu) != 0
-        && at & 7 != 0
-        && !super::segments::outside(&s.cpu, at, 8)
-    {
-        return Err([17, 0, 0]);
-    }
+    let mut addresses = [0; 16];
     if ew == 1 {
+        // MASKMOVQ and [V]MASKMOVDQU preflight the whole operand, even for an empty mask.
+        let at = operand(&s.cpu, i.segment, ea, n as u64, true)?;
+        if mmx && alignment_check(&s.cpu) != 0 && at & 7 != 0 && !super::segments::outside(&s.cpu, at, 8) {
+            return Err([17, 0, 0]);
+        }
         pages(s, at, n as u64, true, false, nc)?;
+        for (j, va) in addresses[..n].iter_mut().enumerate() {
+            *va = super::segments::wrap(&s.cpu, at.wrapping_add(j as u64));
+        }
     } else {
+        // VMASKMOV and VPMASKMOV check bounds only for active lanes, before any lane moves.
         for j in (0..n).filter(|&j| on(j)) {
-            pages(s, element(j), ew as u64, store, false, nc)?;
+            addresses[j] = operand(&s.cpu, i.segment, ea.wrapping_add((ew * j) as u64), ew as u64, store)?;
+        }
+        for j in (0..n).filter(|&j| on(j)) {
+            pages(s, addresses[j], ew as u64, store, false, nc)?;
         }
     }
     let mut d = [0u8; 32];
@@ -96,7 +101,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         if store {
             bytes.copy_from_slice(&data[ew * j..ew * j + ew]);
         }
-        copy(s, element(j), bytes, store, false, nc)?; // walked above: no fault left
+        copy(s, addresses[j], bytes, store, false, nc)?; // walked above: no fault left
     }
     if !store {
         let r = i.reg as usize;

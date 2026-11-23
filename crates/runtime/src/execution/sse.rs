@@ -95,9 +95,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         // The host cut it as gated under these very controls.
         halt(s, stop::BAD_REPLY)
     }
-    let va = address(&s.cpu, &i)?;
+    let load = matches!(i.kind, system::LDMXCSR | system::VLDMXCSR);
+    let va = address(&s.cpu, &i, 4, !load)?;
     let noncanonical = super::segments::noncanonical(&i);
-    if matches!(i.kind, system::LDMXCSR | system::VLDMXCSR) {
+    if load {
         let mut buf = [0; 4];
         linear(s, va, &mut buf, false, false, noncanonical)?;
         let value = u64::from(u32::from_le_bytes(buf));

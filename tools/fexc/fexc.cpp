@@ -188,7 +188,7 @@ struct Capture {
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
   // seg: the FS/GS override FEX applies (4 fs, 5 gs, 0 none: the last FS/GS prefix; CS/DS/ES/SS are ignored in 64-bit mode).
-  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; };
+  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; int primary_op; };
   struct Block { uint64_t entry, size, count; int status; bool entry_point; };
   std::vector<Inst> insts;
   std::vector<Block> blocks;
@@ -245,14 +245,27 @@ int SegmentOverride(uint32_t flags) {
 // base_reg + imm is the address as it is at the stub); a branch-target guard (no access) has its target register in
 // base_reg and is DS (#GP(0)).
 void JoinSites(uint64_t rip) {
+  uint32_t last_load_instruction = FEXC_NONE32;
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC ||
         s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
-        const bool stack_base = i.mem.base == 4 || i.mem.base == 5;
-        // (M2, 32-bit code: an explicit SS prefix too; ES is reported as 6, its number 0 being "none".)
-        if (!i.mem.present ? i.sets_rip || i.name == "LEAVE" : i.seg ? i.seg == 2 : stack_base) s.segment = 1;
+        if (i.mem.present) {
+          s.segment = i.seg ? i.seg == 2 : i.mem.base == 4 || i.mem.base == 5;
+        } else if (i.sets_rip || i.name == "LEAVE") {
+          s.segment = 1;
+        } else if (i.seg == 2) {
+          // In compatibility code SS can override a moffs, XLAT or string source. String destinations
+          // always use ES. FexcStringOp emits CMPS's destination load first, then its source load.
+          switch (i.primary_op) {
+          case 0xa0: case 0xa1: case 0xa2: case 0xa3: // moffs
+          case 0xac: case 0xad: case 0xd7: s.segment = 1; break; // LODS, XLAT
+          case 0xa4: case 0xa5: s.segment = s.kind == FEXC_SITE_LOAD; break; // MOVS
+          case 0xa6: case 0xa7: s.segment = last_load_instruction == s.insn_native_offset; break; // CMPS
+          }
+        }
+        if (s.kind == FEXC_SITE_LOAD) last_load_instruction = s.insn_native_offset;
         break;
       }
   }
@@ -311,7 +324,7 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
       Cap.insts.push_back({d.PC, d.InstSize, d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?",
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END),
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d),
-                           SegmentOverride(d.Flags)});
+                           SegmentOverride(d.Flags), d.FexcMap == FEXC_MAP_PRIMARY ? d.OPRaw : -1});
     }
   }
 }

@@ -56,7 +56,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             return Ok(c.gpr[i.reg as usize] as u16);
         }
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i)?, &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, noncanonical(&i))?;
         Ok(u16::from_le_bytes(b))
     };
     match i.kind {
@@ -64,7 +64,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         system::LGDT..=system::LIDT => {
             let mut b = [0u8; 10];
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i)?, &mut b[..n], false, false, noncanonical(&i))?;
+            linear(s, address(&c, &i, n as u64, false)?, &mut b[..n], false, false, noncanonical(&i))?;
             let base = u64::from_le_bytes(b[2..].try_into().unwrap());
             let table = Table {
                 base: if i.size == 2 { base & 0xff_ffff } else { base },
@@ -90,7 +90,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             b[..2].copy_from_slice(&(t.limit as u16).to_le_bytes());
             b[2..].copy_from_slice(&t.base.to_le_bytes());
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i)?, &mut b[..n], true, false, noncanonical(&i))?;
+            linear(s, address(&c, &i, n as u64, true)?, &mut b[..n], true, false, noncanonical(&i))?;
         }
         system::SLDT..=system::MOV_FROM_SREG => {
             let v = match i.kind {
@@ -101,7 +101,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             if i.memory == 1 {
                 linear(
                     s,
-                    address(&c, &i)?,
+                    address(&c, &i, 2, true)?,
                     &mut v.to_le_bytes(),
                     true,
                     false,
@@ -175,7 +175,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let mut pointer = [0u8; 6];
             aligned_operand(
                 s,
-                address(&c, &i)?,
+                address(&c, &i, (w + 2) as u64, false)?,
                 &mut pointer[..w + 2],
                 w,
                 if w == 2 { 2 } else { 4 },
@@ -195,10 +195,8 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
     Ok(None)
 }
 
-/// The linear address of `i`'s memory operand: base + index * scale + displacement (I10: truncated to 32 bits with 0x67,
-/// RIP-relative included) at its address size, in its segment ([`linear_of`]; #GP(0) through a null one in 32-bit code,
-/// [`usable`]).
-pub(super) fn address(c: &Cpu, i: &System) -> Result<u64, Exception> {
+/// The effective offset at the instruction's address size, before adding a segment base.
+pub(super) fn offset(c: &Cpu, i: &System) -> u64 {
     let base = match i.base {
         system::RIP => c.rip.wrapping_add(u64::from(i.length)),
         system::NO_REG => 0,
@@ -210,27 +208,32 @@ pub(super) fn address(c: &Cpu, i: &System) -> Result<u64, Exception> {
         c.gpr[i.index as usize] << i.scale
     };
     let ea = base.wrapping_add(index).wrapping_add(i.disp as u64);
-    let ea = match i.prefixes & (system::ADDRESS32 | system::ADDRESS16) {
+    match i.prefixes & (system::ADDRESS32 | system::ADDRESS16) {
         system::ADDRESS32 => ea as u32 as u64,
         system::ADDRESS16 => ea as u16 as u64,
         _ => ea,
-    };
-    if i.memory == 1 {
-        usable(c, i.segment)?;
     }
-    Ok(linear_of(c, i.segment, ea))
 }
-/// The linear address of offset `ea` in segment `sreg`: in 64-bit mode plus the FS or GS base (the others' are ignored);
-/// in 32-bit code (M2 task 3b) plus the segment's base, wrapped at 4 GiB (the limit check is [`pages`]').
-pub(super) fn linear_of(c: &Cpu, sreg: u32, ea: u64) -> u64 {
-    let sreg = sreg as usize;
+/// Check the architectural operand (including bytes a split lowering may access separately)
+/// in its original segment before alignment checks, page walks or any architectural effects.
+pub(super) fn address(c: &Cpu, i: &System, bytes: u64, write: bool) -> Result<u64, Exception> {
+    operand(c, i.segment, offset(c, i), bytes, write)
+}
+pub(super) fn operand(c: &Cpu, sreg: u32, ea: u64, bytes: u64, write: bool) -> Result<u64, Exception> {
+    let reg = sreg as usize;
+    let seg = &c.seg[reg];
     if c.code_mode() == Some(CodeMode::Bits64) {
-        return match sreg {
-            SREG_FS | SREG_GS => ea.wrapping_add(c.seg[sreg].base),
-            _ => ea,
-        };
+        return Ok(if matches!(reg, SREG_FS | SREG_GS) { ea.wrapping_add(seg.base) } else { ea });
     }
-    ea.wrapping_add(c.seg[sreg].base) as u32 as u64
+    usable(c, sreg)?;
+    if matches!(reg, SREG_FS | SREG_GS) {
+        if !seg.allows(ea, bytes, write, true) {
+            return Err(GP0);
+        }
+    } else if ea > u64::from(u32::MAX) || bytes - 1 > u64::from(u32::MAX) - ea {
+        return Err(if reg == SREG_SS { SS0 } else { GP0 });
+    }
+    Ok(ea.wrapping_add(seg.base) as u32 as u64)
 }
 /// M2 task 3b: #GP(0) for an access through a null segment in 32-bit code (SDM Vol.3 3.4.4; translated code's is the
 /// compiler's cut, [`Cpu::null_segment`]).
@@ -694,7 +697,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
         let mut pointer = [0u8; 10];
         aligned_operand(
             s,
-            address(&c, &i)?,
+            address(&c, &i, (w + 2) as u64, false)?,
             &mut pointer[..w + 2],
             w,
             if w == 2 { 2 } else { 4 },
@@ -983,7 +986,7 @@ pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
         c.gpr[i.reg as usize] as u16
     } else {
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i)?, &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, noncanonical(&i))?;
         u16::from_le_bytes(b)
     };
     let found = if selector & 0xfffc == 0 {

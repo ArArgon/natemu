@@ -79,14 +79,9 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 ea
             };
             let mut buf = [0; 8];
-            if let Err(e) = copy(
-                s,
-                super::segments::linear_of(&s.cpu, i.segment, ea),
-                &mut buf[..ew],
-                false,
-                false,
-                nc,
-            ) {
+            let access = super::segments::operand(&s.cpu, i.segment, ea, ew as u64, false)
+                .and_then(|va| copy(s, va, &mut buf[..ew], false, false, nc));
+            if let Err(e) = access {
                 (set_ymm(&mut s.cpu, dst, &d), set_ymm(&mut s.cpu, mask, &m));
                 let hits = s.debug >> debug::HITS & 0xf;
                 if hits == 0 {

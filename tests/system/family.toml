@@ -321,6 +321,10 @@ argv = ["tests/smp/run_slice3_vm.py", "compat", "--fexc", "{fexc}", "--out", "{o
 needs = { perf = true }
 smoke = true
 
+[suite.cases."compat32-resident-limits"]
+argv = ["tests/smp/run_slice3_vm.py", "compat-limits", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
 [suite.cases."x1"]
 argv = ["tests/system/run_x1.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

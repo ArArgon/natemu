@@ -2854,6 +2854,21 @@ impl Segment {
         limit: 0,
         base: 0,
     };
+    /// Whether this operand fits the loaded descriptor before adding the base (SDM Vol.3A 5.3).
+    /// Real mode checks only the cached expand-up limit. Protected mode also checks the type and B bit.
+    pub fn allows(&self, offset: u64, bytes: u64, write: bool, protected: bool) -> bool {
+        let a = self.attributes;
+        if protected && (a & ATTR_P == 0 || if write { a & 0xa != 2 } else { a & 0xa == 8 }) {
+            return false;
+        }
+        let limit = u64::from(self.limit);
+        let (first, last) = if protected && a & 0x1c == 0x14 {
+            (limit + 1, if a & ATTR_D != 0 { u64::from(u32::MAX) } else { 0xffff })
+        } else {
+            (0, limit)
+        };
+        offset >= first && offset <= last && bytes != 0 && bytes - 1 <= last - offset
+    }
     /// `selector` loaded from the 8-byte descriptor `raw` (SDM Vol.3 3.4.5): its attributes, its limit scaled by G, and
     /// the 32-bit base (the low half of a 16-byte system descriptor's).
     pub const fn loaded(selector: u16, raw: u64) -> Self {

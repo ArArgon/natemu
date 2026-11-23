@@ -66,17 +66,22 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     // the AVX part at `avx_end`.
     let xmms = super::sse::held(&s.cpu);
     let (xmm_end, avx_end) = (160 + 16 * xmms, AVX + 16 * xmms);
-    let va = address(&s.cpu, &i)?;
+    // FX* and XSAVE check the entire architectural area, including slots this mode does not transfer.
+    let operand = if fx { 512 } else if xcr0 & 4 != 0 { AREA } else { AVX };
     let nc = noncanonical(&i);
-    if i.memory == 1 && va & if fx { 15 } else { 63 } != 0 {
-        return Err(GP);
-    }
-    // M2 task 3b: in 32-bit code the whole operand (512 bytes, or the XSAVE area XCR0 sizes, CPUID.0DH.0:EBX) must lie
-    // within the 4 GiB limit, though fewer bytes are touched there.
-    let operand: usize = if fx { 512 } else if xcr0 & 4 != 0 { AREA } else { AVX };
-    if i.memory == 1 && xmms == 8 && super::segments::outside(&s.cpu, va, operand as u64) {
-        return Err(nc);
-    }
+    let va = if i.memory == 1 {
+        let write = matches!(i.kind, system::FXSAVE | system::XSAVE | system::XSAVEC);
+        let va = address(&s.cpu, &i, operand as u64, write)?;
+        if va & if fx { 15 } else { 63 } != 0 {
+            return Err(GP);
+        }
+        if xmms == 8 && super::segments::outside(&s.cpu, va, operand as u64) {
+            return Err(nc);
+        }
+        va
+    } else {
+        0
+    };
     // The canonical check (#GP(0), or #SS(0) for an SS-class reference; a range wrapping past 2^64 is non-canonical) is
     // made on each range below before its walk, by `linear` and `pages`: FX* bytes 0..415, XSAVE the span from its first
     // to its last stored byte, XRSTOR first the base through the header's 64 bytes (the base checked though only the header

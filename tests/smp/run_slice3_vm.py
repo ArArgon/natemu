@@ -1663,6 +1663,37 @@ def cmd_compat(a, host, runtime):
     return len(failures)
 
 
+def cmd_compat_limits(a, host, runtime):
+    """Limit faults pinned QEMU omits: compare the exact saved frame, vector progress, CR2 and operand bytes."""
+    import compat_limits
+    report, failures = [], []
+    for prog, expected in compat_limits.cases():
+        name = prog['name']
+        if a.programs and not any(n in name for n in a.programs):
+            continue
+        for limit in ([], [1]):
+            label = f'{name}/{limit[0] if limit else "default"}'
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / label, limit)
+            diffs = []
+            if rc:
+                diffs.append(f'driver {rc}: {err}')
+            else:
+                cpu = out['cpus'][0]
+                if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(prog['cpus'][0]['rip'])):
+                    diffs.append(f'stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
+                captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
+                for addr, want in expected.items():
+                    got = next((data[addr - base:addr - base + len(want)] for base, data in captured.items()
+                                if base <= addr and addr + len(want) <= base + len(data)), b'')
+                    if got != want:
+                        diffs.append(f'{addr:#x}: expected {want.hex()}, got {got.hex()}')
+            failures.extend(f'{label}: {diff}' for diff in diffs)
+            report.append({'name': label, 'diffs': diffs})
+            print(f'{label}: {"FAIL" if diffs else "ok"}' + (' ' + ', '.join(diffs) if diffs else ''), flush=True)
+    write_failure_results(a.out, report_names(report), failures)
+    return len(failures)
+
+
 def cmd_system(a, host, runtime):
     """S3c1: system programs (tools/bench/smp/system.json) against QEMU system mode; fault cases against
     tests/lib/system_fault_model.py at the state QEMU reaches just before the instruction (and modes_model where it covers
@@ -2383,7 +2414,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'compat', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'compat', 'compat-limits', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -2421,7 +2452,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'compat': cmd_compat, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'compat': cmd_compat, 'compat-limits': cmd_compat_limits, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

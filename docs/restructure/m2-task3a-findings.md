@@ -75,7 +75,7 @@ Each is the session's unless marked; all are reversible.
 
 ## Wrapping at 4 GiB
 
-FEX computes most 32-bit addresses with 32-bit arithmetic, including segment base plus offset, so thread-local accesses
+At task 3a, FEX computed most 32-bit addresses with 32-bit arithmetic, including segment base plus offset, so thread-local accesses
 such as `%gs:0xfffffffc` run natively and need nothing. Two forms use 64-bit arithmetic (task 2 found them): a small
 displacement folded into the Arm addressing mode (`[ebp-8]`), and the stack pointer update of PUSH and POP.
 
@@ -90,6 +90,29 @@ displacement folded into the Arm addressing mode (`[ebp-8]`), and the stack poin
   an OS that maps a user page in the 32 KiB just above 4 GiB (or at the very top of the address space): Linux does
   not. Task 2 already put that decision at
   checkpoint C (32-bit address arithmetic for these two forms in translated code, one more instruction each).
+
+### Checkpoint C implementation, November 22
+
+FEX fork `fc4270de` computes compatibility-mode scalar and paired addresses before the native memory instruction.
+A PUSH computes its wrapped ESP before the split check, stores at that address, and commits ESP after the store.
+A POP reads before its 32-bit ESP increment. PUSH and POP retain their stack site kinds for recovery.
+The resident preserves its previous abort fallback. To enforce the flat segment end on a native read, it removes
+the first user shadow page above 4 GiB before entering or resuming compatibility code if a 64-bit access populated it.
+The supervisor has its own shadow. A later 64-bit user access can populate its page again.
+
+The M4 framework case `static/fexc-address32` checks the emitted native operands, their 32-bit address definitions,
+and the increment after a POP. The same check detects the old compiler's folded displacements and stack writeback
+without executing its code. The case also checks which implicit operands yield a stack fault. MOVS reads the
+overridable source before storing through ES. CMPS reads ES first, then the overridable source.
+The linked stubs inherit each access's segment.
+
+In `system/compat32-resident-limits`, the string and moffs fixtures check the saved fault frame, vector state and CR2.
+The mixed-user-wrap fixture uses one vCPU and CR3. A 64-bit user writes low and high pages and enters 32-bit code
+through IRETQ. The 32-bit code uses a wrapped SIB store, pushes a memory operand across the ESP update and
+pops to memory addressed with the incremented ESP. Both block sizes check the low values, the stack word,
+the final ESP and the unchanged high sentinel. This high page has an independent address; a warm mapping
+at exactly the old compiler's unintended address remains outside the guest execution evidence.
+Based FS/GS bounds and legal wrapped linear spans have their own checkpoint C requirements.
 
 ## Tests
 

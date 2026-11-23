@@ -37,7 +37,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<(), Exception> {
         // lies outside them.
         system::BOUND => {
             let mut b = [0u8; 8];
-            aligned_operand(s, address(&c, &i)?, &mut b[..2 * w], w, w as u64, false, noncanonical(&i))?;
+            aligned_operand(s, address(&c, &i, (2 * w) as u64, false)?, &mut b[..2 * w], w, w as u64, false, noncanonical(&i))?;
             let signed = |v: u64| if w == 2 { v as i16 as i64 } else { v as i32 as i64 };
             let word = |k: usize| {
                 let mut v = [0u8; 8];

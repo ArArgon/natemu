@@ -3117,7 +3117,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             let mut buf = (c.cr0 as u16).to_le_bytes();
             segments::linear(
                 s,
-                segments::address(&c, &i)?,
+                segments::address(&c, &i, 2, true)?,
                 &mut buf,
                 true,
                 false,
@@ -3139,7 +3139,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 let mut buf = [0u8; 2];
                 segments::linear(
                     s,
-                    segments::address(&c, &i)?,
+                    segments::address(&c, &i, 2, false)?,
                     &mut buf,
                     false,
                     false,
@@ -3201,7 +3201,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // The profile has no performance counters (CPUID.0AH = 0): every ECX names an invalid counter (SDM Vol.2 RDPMC).
         system::RDPMC => return Err(GP),
         system::INVLPG => {
-            let address = segments::address(&c, &i)?; // INVLPG drops segment overrides (system::decode)
+            let address = segments::offset(&c, &i); // INVLPG drops segment overrides (system::decode)
             // A non-canonical address invalidates nothing.
             if paging::canonical(address) {
                 let t0 = ticks();

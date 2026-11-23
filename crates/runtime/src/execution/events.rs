@@ -287,7 +287,7 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
             .disp
             .wrapping_add((offset >> (size * 8).trailing_zeros()).wrapping_mul(size as i64));
     }
-    let unit = super::segments::address(&s.cpu, &operand)?;
+    let unit = super::segments::address(&s.cpu, &operand, size, i.cr != 0)?;
     // S4: the complete operand-sized unit meets data breakpoints. The following native step now accesses that same
     // unit; duplicate hit bits are harmless and a fault suppresses the pending data-breakpoint trap.
     super::watch::access(s, unit, size, i.cr != 0);

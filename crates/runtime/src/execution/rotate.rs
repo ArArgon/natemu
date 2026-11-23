@@ -35,8 +35,8 @@ pub(super) fn memory(
     i: System,
     update: impl FnOnce(u64) -> (u64, u64),
 ) -> Result<(), segments::Exception> {
-    let va = segments::address(&s.cpu, &i)?;
     let n = u64::from(i.size);
+    let va = segments::address(&s.cpu, &i, n, true)?;
     let nc = segments::noncanonical(&i);
     if segments::outside(&s.cpu, va, n) {
         return Err(nc);

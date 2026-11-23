@@ -357,7 +357,6 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     ) {
         pending(s)?;
     }
-    let va = address(&s.cpu, &i)?;
     let fault = noncanonical(&i);
     // The environment image: FCW, FSW, FTW at 2- or 4-byte strides (the rest: instruction and data pointers, 0 here).
     let (env, stride) = if i.size == 2 { (14, 2) } else { (28, 4) };
@@ -375,6 +374,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             set32(frame::X87_EXCEPTIONS, 0);
         }
         system::FLDCW => {
+            let va = address(&s.cpu, &i, 2, false)?;
             aligned(s, va, 2, 2, &i)?;
             let mut buf = [0; 2];
             linear(s, va, &mut buf, false, false, fault)?;
@@ -387,6 +387,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             } else {
                 env
             };
+            let va = address(&s.cpu, &i, n, true)?;
             aligned(s, va, n, stride as u64, &i)?;
             let mut buf = [0u8; 108];
             for (k, v) in [s.cpu.fcw, fsw(s.cpu.fcw), ftw()].into_iter().enumerate() {
@@ -413,6 +414,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             } else {
                 env
             };
+            let va = address(&s.cpu, &i, n, false)?;
             aligned(s, va, n, stride as u64, &i)?;
             let mut buf = [0u8; 108];
             linear(s, va, &mut buf[..n as usize], false, false, fault)?;
@@ -437,6 +439,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             }
         }
         system::FLD80 => {
+            let va = address(&s.cpu, &i, 10, false)?;
             aligned(s, va, 10, 8, &i)?;
             let mut buf = [0u8; 10];
             linear(s, va, &mut buf, false, false, fault)?;
@@ -466,6 +469,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             set8(frame::X87_TOP, new);
         }
         system::FSTP80 => {
+            let va = address(&s.cpu, &i, 10, true)?;
             aligned(s, va, 10, 8, &i)?;
             // An empty ST(0) is a stack underflow: IE and SF with C1 = 0, the indefinite stored (masked response).
             let underflow = !valid(top());

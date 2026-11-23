@@ -16,7 +16,7 @@
 //! sign XOR CF; SHR: the destination's sign; SAR: 0) and its CF is the last bit shifted out, zeros past the width (SHL
 //! and SHR by the width or more); BT, BTS, BTR and BTC leave OF, SF, AF and PF unchanged.
 use super::{Insn, NO_REG, Operand, kind, op, register, set_register};
-use crate::execution::{ATTR_D, ATTR_P, Cpu, SREG_CS, SREG_GS, SREG_SS};
+use crate::execution::{ATTR_D, Cpu, SREG_CS, SREG_GS, SREG_SS};
 
 pub const CF: u32 = 1;
 pub const PF: u32 = 1 << 2;
@@ -249,20 +249,7 @@ pub fn linear(
     write: bool,
 ) -> Result<u32, Exit> {
     let s = &cpu.seg[sreg.min(SREG_GS)];
-    let a = s.attributes;
-    let (low, high) = if ctx.protected && a & 0x1c == 0x14 {
-        // An expand-down data segment.
-        (
-            u64::from(s.limit) + 1,
-            if a & ATTR_D != 0 { 0xffff_ffff } else { 0xffff },
-        )
-    } else {
-        (0, u64::from(s.limit))
-    };
-    // No write but to a writable data segment, no read of an execute-only code segment (type bits 3 and 1).
-    let denied =
-        ctx.protected && (a & ATTR_P == 0 || if write { a & 0xa != 2 } else { a & 0xa == 8 });
-    if denied || u64::from(offset) < low || u64::from(offset) + u64::from(size) - 1 > high {
+    if !s.allows(u64::from(offset), u64::from(size), write, ctx.protected) {
         return Err(if sreg == SREG_SS { SS } else { GP });
     }
     Ok((s.base as u32).wrapping_add(offset))

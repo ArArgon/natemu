@@ -22,11 +22,27 @@ CASES = {
 }
 
 
-def main(compiler):
+# fexc reports the fault class ("ss" or "ds", the latter stands for every other segment).
+# CMPS reads ES:EDI first and the overridable source second. MOVS reads its source first.
+SEGMENTS = {
+    'ss lodsd': ('36ad', [('load', 'ss')]),
+    'ss rep movsd': ('36f3a5', [('load', 'ss'), ('store', 'ds')]),
+    'ss repe cmpsd': ('36f3a7', [('load', 'ds'), ('load', 'ss')]),
+    'ds cmpsd': ('3ea7', [('load', 'ds'), ('load', 'ds')]),
+    'ss stosd': ('36ab', [('store', 'ds')]),
+    'ss scasd': ('36af', [('load', 'ds')]),
+    'ss xlat': ('36d7', [('load', 'ss')]),
+    'ss mov eax,[moffs32]': ('36a178563412', [('load', 'ss')]),
+    'ss mov [moffs32],eax': ('36a378563412', [('store', 'ss')]),
+    'ds push [ebp]': ('3eff7500', [('load', 'ds'), ('push', 'ss')]),
+}
+
+
+def check_forms(compiler, options):
     errors = []
     with tempfile.TemporaryDirectory() as tmp:
         for name, (code, kinds) in CASES.items():
-            d = verify_precision.compile_(compiler, code, '0x401000', ['--bitness', '32'])
+            d = verify_precision.compile_(compiler, code, '0x401000', ['--bitness', '32', '--push-run', *options])
             if d['status'] != 'ok' or d['guest']['instructions_translated'] != 1:
                 errors.append(f'{name}: failed to translate the instruction')
                 continue
@@ -51,9 +67,23 @@ def main(compiler):
                 else:
                     if dis[pc + 4] != f'add w{base}, w{base}, #{s["width"]:#x}':
                         errors.append(f'{name}: expected a 32-bit stack increment after the read, got {dis[pc + 4]}')
+    for name, (code, expected) in SEGMENTS.items():
+        d = verify_precision.compile_(compiler, code, '0x401000', ['--bitness', '32', '--push-run', *options])
+        sites = d.get('sites', [])
+        actual = [(s['kind'], s['segment']) for s in sites if s['kind'] not in verify_precision.STUBS]
+        if actual != expected:
+            errors.append(f'{name}: expected {expected}, got {actual}')
+    return errors
+
+
+def main(compiler):
+    errors = []
+    for size in ([], ['--max-insts', '1']):
+        label = 'single' if size else 'default'
+        errors.extend(f'{label}: {message}' for message in check_forms(compiler, size))
     if errors:
         sys.exit('\n'.join(errors))
-    print(f'{len(CASES)} compatibility-mode addressing and stack forms passed')
+    print(f'{len(CASES)} address and stack forms and {len(SEGMENTS)} segment cases passed at both block sizes')
 
 
 if __name__ == '__main__':
