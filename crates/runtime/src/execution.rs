@@ -3556,8 +3556,12 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     // M2 task 4: the store of a FISTP m64 that was storing its block's FILD m64's integer: kept for the instruction's rerun
     // ([`frame::X87_INT`]; 32-bit code, where the FISTP that starts a unit looks for it).
     // (At the split stub of such a store, one that crosses a page, the mark is its access's.)
+    // (M2 checkpoint C: at the instruction's operand check, which precedes the store, the mark is the instruction's store's;
+    // the integer is in that store's register since the FILD.)
     let store = if site.kind == object::kind::SPLIT {
         sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset).ok().map(|i| sites[i])
+    } else if site.kind == object::kind::SEGMENT {
+        sites.iter().find(|a| a.guest_offset == site.guest_offset && a.guest_offset2 == object::X87_INT64 && a.kind == object::kind::STORE).copied()
     } else {
         Some(*site)
     };
