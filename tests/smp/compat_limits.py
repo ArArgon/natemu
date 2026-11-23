@@ -1092,7 +1092,7 @@ def cases(*, reference_control=False):
         add(f'es-string-destination-{instruction}', f'ss {instruction}', mapped=C.TOP_ONLY,
             prefix=f'    mov esi, {C.W:#x}\n    mov edi, 0xfffffffe\n')
     add('ss-moffs-load', 'mov eax, [ss:0xfffffffe]', fault=12, mapped=C.TOP_ONLY)
-    cases.append(mixed_user_wrap())
+    cases += [mixed_user_wrap(), mixed_user_wrap_far()]
     return cases
 
 
@@ -1135,3 +1135,47 @@ bits 32
                   C.REC + 0x18: struct.pack('<Q', 0xdb), C.REC + 0x78: struct.pack('<I', 0),
                   C.LOW0 + 0x24: struct.pack('<I', 0x44223312), C.LOW0 + 8: struct.pack('<I', 0x98765432),
                   C.HIGH + 0xffc: struct.pack('<I', 0x98765432), C.XPAGE: struct.pack('<I', 0xabbacd32)}
+
+
+def mixed_user_wrap_far():
+    """Displacements of 4 KiB and more that wrap past 4 GiB, with the wrong page above 4 GiB warm and mapped.
+
+    64-bit code writes sentinels at 1_0000_1000H (a page other than linear 1000H's), which maps that page's user shadow
+    writable, then enters compatibility code. Added in 64 bits, EBX = FFFF_F000H plus 2000H would reach the sentinels
+    without a fault, where 32-bit address arithmetic reaches linear 1000H."""
+    high = 1 << 32 | 0x1000
+    memory = C.WRAP + [C.entry(C.TA + 0x1000 + 4 * 8, C.HI_PD | C.P.P | C.P.RW | C.P.US | C.P.A),
+                       C.entry(C.HI_PD, C.HI_PT | C.P.P | C.P.RW | C.P.US | C.P.A),
+                       C.entry(C.HI_PT + 8, C.XPAGE | C.P.LEAF), C.P.zero(C.XPAGE, 12)]
+    sentinels = (0x5eed0000, 0x5eed0004, 0x5eed0008)
+    user = f"""bits 64
+    mov rax, {high:#x}
+    mov dword [rax], {sentinels[0]:#x}
+    mov dword [rax+4], {sentinels[1]:#x}
+    mov dword [rax+8], {sentinels[2]:#x}
+    mov dword [0x1000], 0x10ad0000
+    mov dword [0x1008], 0x10ad0008
+    push 0x1b
+    push {C.US:#x}
+    push 2
+    push 0xdb
+    mov eax, .in32
+    push rax
+    iretq
+bits 32
+.in32:
+    mov ebx, 0xfffff000
+    mov eax, [ebx+0x2000]
+    mov ecx, 0x5704e000
+    mov [ebx+0x2004], ecx
+    mov esi, 2
+    mov edx, [ebx+esi*4+0x2000]
+    mov esp, {C.US:#x}
+    int 0x80
+"""
+    prog = C.program('mixed-user-wrap-far', C.ENTER(cs=0x23) + C.handlers(), user, memory)
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 128, 0),
+                  C.REC + 0x18: struct.pack('<Q', 0xdb), C.REC + 0x40: struct.pack('<Q', 0x10ad0000),
+                  C.REC + 0x50: struct.pack('<Q', 0x10ad0008),
+                  C.LOW1: struct.pack('<3I', 0x10ad0000, 0x5704e000, 0x10ad0008),
+                  C.XPAGE: struct.pack('<3I', *sentinels)}

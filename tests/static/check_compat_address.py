@@ -21,6 +21,13 @@ CASES = {
     'push esp': ('54', ['push']),
     'pop ax': ('6658', ['pop']),
     'pop [esp+8]': ('8f442408', ['pop', 'store']),
+    # Displacements of 4 KiB and more, below the 16 KiB at which FEX stopped folding them into a 64-bit native operand.
+    'mov eax,[ebx+0x2000]': ('8b8300200000', ['load']),
+    'mov [ebx+0x2004],ecx': ('898b04200000', ['store']),
+    'mov edx,[ebx+esi*4+0x2000]': ('8b94b300200000', ['load']),
+    'mov eax,[ebp-0x2000]': ('8b8500e0ffff', ['load']),
+    'mov al,[ebx+0x1001]': ('8a8301100000', ['load']),
+    'push [ebx+0x1000]': ('ffb300100000', ['load', 'push']),
 }
 
 
