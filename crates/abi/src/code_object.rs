@@ -116,6 +116,8 @@ pub const SEGMENT_NATIVE_LOAD: u8 = 0x80;
 pub const SEGMENT_RMW_ALU: u8 = 0x30;
 /// High nibble of SEGMENT.data_reg[1] for memory XCHG, including the explicit LOCK spelling.
 pub const SEGMENT_XCHG: u8 = 0x40;
+/// High nibble for LOCK CMPXCHG r/m,r. The comparison and result register is implicitly AL/AX/EAX.
+pub const SEGMENT_CMPXCHG: u8 = 0x70;
 
 /// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault

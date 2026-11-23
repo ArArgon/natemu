@@ -1065,6 +1065,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
         j.kv("instruction_length", int(s.data_reg[1] & 15));
         if (s.data_reg[1] & 0x80) j.kv("native_load_continuation", true);
         if ((s.data_reg[1] & 0xf0) == 0x40) j.kv("atomic_exchange", true);
+        else if ((s.data_reg[1] & 0xf0) == 0x70) j.kv("atomic_compare_exchange", true);
         else if ((s.data_reg[1] & 0xf0) == 0x30) {
           j.kv("rmw_alu", int(s.data_reg[0] >> 3));
           if ((s.data_reg[0] >> 3) == 0) j.kv("rmw_add", true);

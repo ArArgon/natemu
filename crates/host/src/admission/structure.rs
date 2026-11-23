@@ -803,6 +803,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let result = match i.code() {
             _ if implicit_group.is_some() => object::SEGMENT_NATIVE_LOAD,
             _ if moffs || store_immediate.is_some() => 0,
+            Code::Cmpxchg_rm8_r8 | Code::Cmpxchg_rm16_r16 | Code::Cmpxchg_rm32_r32 if i.has_lock_prefix() => object::SEGMENT_CMPXCHG,
             _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
             Code::Xchg_rm8_r8 | Code::Xchg_rm16_r16 | Code::Xchg_rm32_r32 => object::SEGMENT_XCHG,
             _ if matches!(i.mnemonic(), Mnemonic::Cmovb | Mnemonic::Cmovae | Mnemonic::Cmovbe | Mnemonic::Cmova
@@ -1082,6 +1083,124 @@ impl<'a> Verifier<'a> {
         .then_some(start..end)
     }
 
+    /// Prove the values flowing into CASAL and its mandatory accumulator/SUB-flag writeback.
+    /// Source copies and extracts may move around effective-address setup; the guard replaces w0.
+    fn checked_cas(&self, op: &ScalarOperand, start: u32, back: u32, at: u32, rs: u8, rt: u8) -> Result<(), String> {
+        let bits = u32::from(op.width) * 8;
+        let acc = super::SRA32[0];
+        let high = bits == 8 && op.data_reg >= 4;
+        let src = super::SRA32[usize::from(if high { op.data_reg - 4 } else { op.data_reg })];
+        let source_shift = if high { 8 } else { 0 };
+        let error = || format!("checked CAS value flow at {at:#x} (guest +{:#x})", op.offset);
+        if op.offset + u32::from(op.result_and_length & 15) != self.c.guest_bytes || back < start + 4 || back > at {
+            return Err(error());
+        }
+
+        // Track just the low operand bits as (original register, source bit), beginning with
+        // the instruction's architectural bank. Unrecognized register definitions lose provenance.
+        // A single-instruction block can close the preceding x87 run inline before the guard.
+        // Its only GPR outputs are w0 and w1; the CBZ skips exactly the nine known words.
+        let x87_skip = (start + 4..back - 4).step_by(4).find(|&j| j + 40 <= back - 4 &&
+            self.word(j - 4) == 0x3950_5380 && self.word(j) == 0x3400_0140 &&
+            RUN_END.iter().take(9).enumerate().all(|(k, &w)| self.word(j + 4 + 4 * k as u32) == w));
+        // All architectural GPR and PF/AF roots must still describe the pre-instruction bank
+        // when a segment or page fault can occur, including when source and accumulator alias.
+        let bank = super::SRA32.iter().fold(0u32, |mask, &r| mask | (1 << r));
+        let mut roots = [None; 32];
+        for &r in &super::SRA32[..8] { roots[usize::from(r)] = Some((r, 0u32, 32u32)); }
+        for insn_at in (start..at).step_by(4) {
+            if x87_skip.is_some_and(|j| (j - 4..j + 40).contains(&insn_at)) {
+                roots[0] = None;
+                roots[1] = None;
+                continue;
+            }
+            let word = self.word(insn_at);
+            let insn = self.insn(insn_at).ok_or_else(error)?;
+            let dst = (word & 31) as usize;
+            let from = ((word >> 5) & 31) as usize;
+            let mov_from = ((word >> 16) & 31) as usize;
+            let copy = if word & 0x7fe0_ffe0 == 0x2a00_03e0 {
+                roots[mov_from]
+            } else if matches!(word & 0xffc0_0000, 0x5300_0000 | 0xd340_0000) {
+                let shift = (word >> 16) & 63;
+                let last = (word >> 10) & 63;
+                // The encountered fields are UXTB/UXTH or extraction of the high byte.
+                if (shift == 0 || shift == 8) && last + 1 == shift + bits {
+                    roots[from].filter(|&(_, _, valid)| shift + bits <= valid).map(|(r, offset, _)| (r, offset + shift, bits))
+                } else { None }
+            } else { None };
+            // Both the descriptor check and CASAL may fault. Their PSTATE is the incoming guest
+            // NZCV: register destinations alone cannot distinguish ADD from ADDS or see CMP.
+            let neutral_setup = word & 0x7fe0_ffe0 == 0x2a00_03e0                    // MOV register
+                || matches!(word & 0xffc0_0000, 0x5300_0000 | 0xd340_0000)          // UBFM
+                || word & 0x3f80_0000 == 0x1100_0000 || word & 0x3f00_0000 == 0x0b00_0000 // ADD/SUB, S=0
+                || word & 0x1f80_0000 == 0x1280_0000 || word & 0x7f80_0000 == 0x3200_0000; // MOV wide, ORR immediate
+            match insn {
+                Insn::Data(_) if neutral_setup => {}
+                Insn::B(_) if insn_at == back - 4 => {}
+                Insn::DmbIsh if insn_at == at - 4 => {}
+                _ => return Err(error()),
+            }
+            let writes = insn.writes();
+            if writes & bank != 0 { return Err(error()); }
+            for (r, root) in roots.iter_mut().enumerate() {
+                if writes & (1 << r) != 0 { *root = if r == dst { copy } else { None }; }
+            }
+            if insn_at == back - 4 { roots[0] = None; roots[1] = None; }
+        }
+        let holds = |reg: u8, guest: u8, shift: u32| {
+            roots[usize::from(reg)].is_some_and(|(origin, offset, valid)| origin == guest && offset == shift && valid >= bits)
+        };
+        if !holds(rs, acc, 0) || !holds(rt, src, source_shift) {
+            return Err(error());
+        }
+
+        // CASAL writes old memory into Rs. When FEX used TMP2 it immediately copies the
+        // result to its allocated register. The following operands are derived from those words.
+        let mut cursor = at + 4;
+        let next = self.insn(cursor).ok_or_else(error).map(|_| self.word(cursor))?;
+        let mut old = rs;
+        if next & !31 == 0x2a00_03e0 | (u32::from(rs) << 16) {
+            old = (next & 31) as u8;
+            cursor += 4;
+        }
+        let eor = self.insn(cursor).ok_or_else(error).map(|_| self.word(cursor))?;
+        let expected = ((eor >> 5) & 31) as u8;
+        // Only the real dword accumulator can be an architectural result register; TMP2 and
+        // the other allocator temporaries must not overwrite another guest root.
+        let temporary = |r: u8| r < 25 && !super::SRA32.contains(&r);
+        if !(temporary(rs) || (bits == 32 && rs == acc)) || !(temporary(old) || (bits == 32 && old == acc)) ||
+            expected == rs || expected == old || !holds(expected, acc, 0) ||
+            (bits == 32 && old != acc) || (bits < 32 && (old == acc || rs == acc || old == 0 || expected == 0)) {
+            return Err(error());
+        }
+        let a = u32::from(expected);
+        let m = u32::from(old);
+        let pair = m << 16 | a << 5;
+        let mut take = |word| {
+            if self.insn(cursor).is_none() || self.word(cursor) != word { return Err(error()); }
+            cursor += 4;
+            Ok(())
+        };
+        take(0xca00_001b | pair)?; // AF root: expected XOR old.
+        if bits == 32 {
+            take(0x6b00_001a | pair)?; // SUBS w26, expected, old: NZCV and parity.
+        } else {
+            // Put the guest sign bit at bit 31 for NZCV; parity uses the unshifted result.
+            take(0x5300_0000 | bits << 16 | (bits - 1) << 10 | a << 5)?;
+            take(0x6b00_001f | m << 16 | (32 - bits) << 10)?;
+            take(0x4b00_001a | pair)?;
+            take(0xb340_0000 | (bits - 1) << 10 | m << 5 | u32::from(acc))?;
+        }
+        let next_rip = self.c.rip.wrapping_add(u64::from(self.c.guest_bytes)) as u32;
+        if !matches!(self.rip_move(cursor, 0), Some((_, rip)) if rip == u64::from(next_rip))
+            || !matches!(self.insn(cursor + 12), Some(Insn::Svc(svc::LINK)))
+            || self.branches_into(start, cursor + 12).any(|edge| Some(edge) != x87_skip.map(|j| (j, j + 40))) {
+            return Err(error());
+        }
+        Ok(())
+    }
+
     /// Every covered scalar compatibility operand through FS/GS reaches a bank check before its one memory access,
     /// including in production admission. The continuation takes its base from w0, reserved for the resident.
     fn inline_dword_guard(&self, back: u32, start: u32, segment: u8) -> Result<u32, String> {
@@ -1159,6 +1278,21 @@ impl<'a> Verifier<'a> {
                         self.swap_word(size, rs, rt, rn, access.native_offset)?;
                     }
                     _ => return Err("checked exchange requires an acquire-release SWPAL with source and result".into()),
+                }
+            }
+            if op.result_and_length & 0xf0 == object::SEGMENT_CMPXCHG {
+                if [site, access].iter().any(|s| s.nzcv != object::NZCV_PSTATE || s.flags_written_before != 0
+                    || s.cf_inverted != p.cf_inverted) {
+                    return Err("checked CAS requires incoming PSTATE at both fault points".into());
+                }
+                let at = access.native_offset;
+                match self.insn(at) {
+                    Some(Insn::Atomic { op: AtomicOp::Cas, size, rs, rt, rn })
+                        if rs != 31 && rt != 31 && rs != rn && rs != rt && at >= 4 && matches!(self.insn(at - 4), Some(Insn::DmbIsh)) => {
+                        self.atomic_word(size, rs, rt, rn, at)?;
+                        self.checked_cas(op, p.native_offset, site.imm as u32, at, rs, rt)?;
+                    }
+                    _ => return Err("locked compare-exchange requires a DMB followed by a single CASAL".into()),
                 }
             }
             let rmw_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ALU {
@@ -3566,6 +3700,77 @@ mod tests {
                 let mut changed = sbb.clone();
                 changed[guard + core::mem::offset_of!(Site, data_reg)] ^= bit;
                 assert!(check(&changed).is_err(), "inconsistent ALU selector or register {bit}");
+            }
+        }
+        let (cas, source) = compile("f0650fb02f", "0x8048000", "32");
+        let h: Header = super::super::record(&cas, 0);
+        let transfer = (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .find(|&at| super::super::record::<Site>(&cas, at).kind == object::kind::ATOMIC).unwrap();
+        let access = super::super::record::<Site>(&cas, transfer);
+        for shape in [false, true] {
+            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+            check(&cas).unwrap();
+            for at in [transfer + core::mem::offset_of!(Site, data_reg), transfer + core::mem::offset_of!(Site, data_reg) + 1,
+                       transfer + core::mem::offset_of!(Site, base_reg), transfer + core::mem::offset_of!(Site, width),
+                       h.code_offset as usize + access.native_offset as usize - 4] {
+                let mut changed = cas.clone();
+                changed[at] ^= 1;
+                assert!(check(&changed).is_err(), "inconsistent CAS operands or ordering at {at}");
+            }
+        }
+        // These are local verifier controls only: same-width native words, unchanged access records.
+        // CH extraction, the expected-value copy, and each consumer of the returned old byte are independent.
+        let native = h.code_offset as usize;
+        let finish = native + h.code_size as usize;
+        for (mask, pattern, change) in [
+            (0xffff_ffe0, 0x5308_3ce0, 1 << 5),   // extract CH from a different guest register
+            (0xffff_ffe0, 0x5308_3ce0, 1 << 16),  // shift by a different amount
+            (0xffff_ffff, 0x2a04_03e1, 1 << 16),  // expected value copied to TMP2
+            (0xffff_ffe0, 0x2a01_03e0, 1 << 16),  // forwarding of the returned old value
+            (0xffe0_001f, 0xca00_001b, 1 << 16),  // AF
+            (0xffe0_001f, 0x6b00_001f, 1 << 10),  // narrow NZCV
+            (0xffe0_001f, 0x4b00_001a, 1 << 16),  // PF
+            (0xffff_fc1f, 0xb340_1c04, 1 << 5),   // AL writeback
+        ] {
+            let off = (native..finish).step_by(4).find(|&n| {
+                u32::from_le_bytes(cas[n..n+4].try_into().unwrap()) & mask == pattern
+            }).expect("emitted byte-CAS data-flow instruction");
+            let mut changed = cas.clone();
+            let word = u32::from_le_bytes(changed[off..off+4].try_into().unwrap());
+            changed[off..off+4].copy_from_slice(&(word ^ change).to_le_bytes());
+            for shape in [false, true] {
+                assert!(super::super::admit_mode(&changed, h.guest_rip, &source, u64::MAX, shape, false, true).is_err());
+            }
+        }
+        // Exercise real compiler setup for a scaled address and displacements. Changing ADD to
+        // ADDS leaves its GPR value and all records identical, but destroys the faulting flags.
+        for hex in ["f064660fb10c77", "f0650fb18c7734120000", "f0640fb14ffc", "f0650fb10d78563412"] {
+            let (obj, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&obj, 0);
+            let sites: Vec<_> = (0..h.sites_count as usize)
+                .map(|i| h.sites_offset as usize + i * size_of::<Site>())
+                .map(|i| (i, super::super::record::<Site>(&obj, i)))
+                .filter(|(_, s)| matches!(s.kind, object::kind::SEGMENT | object::kind::ATOMIC)).collect();
+            assert_eq!(sites.len(), 2);
+            for shape in [false, true] {
+                let check = |o: &[u8]| super::super::admit_mode(o, h.guest_rip, &src, u64::MAX, shape, false, true);
+                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
+                if hex != "f064660fb10c77" { continue; }
+                let start = (h.code_offset + sites[0].1.insn_native_offset) as usize;
+                let guard = sites.iter().find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap().1;
+                let end = h.code_offset as usize + guard.imm as usize - 4;
+                let add = (start..end).step_by(4).find(|&off| {
+                    u32::from_le_bytes(obj[off..off+4].try_into().unwrap()) & 0xff20_0000 == 0x0b00_0000
+                }).expect("scaled address emitted as ADD");
+                let mut changed = obj.clone();
+                changed[add + 3] ^= 0x20;
+                assert!(check(&changed).unwrap_err().contains("checked CAS value flow"));
+                for (offset, _) in &sites {
+                    let mut changed = obj.clone();
+                    changed[offset + core::mem::offset_of!(Site, nzcv)] = object::NZCV_SAVED;
+                    assert!(check(&changed).is_err());
+                }
             }
         }
         let (swap, source) = compile("f065862f", "0x8048000", "32"); // LOCK XCHG [GS:EDI], CH

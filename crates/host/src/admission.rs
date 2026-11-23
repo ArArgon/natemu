@@ -968,7 +968,11 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
         return matches!(s.segment, 4 | 5) && matches!(s.width, 1 | 2 | 4)
             && s.base_reg < 31 && s.index_reg == object::NO_REG && s.writeback == object::WB_NONE
             && s.rmw == object::RMW_NONE && access.is_some_and(|a| {
-                (if s.data_reg[1] & 0xf0 == object::SEGMENT_XCHG { a.kind == SWAP } else { matches!(a.kind, LOAD | STORE) })
+                (match s.data_reg[1] & 0xf0 {
+                    object::SEGMENT_XCHG => a.kind == SWAP,
+                    object::SEGMENT_CMPXCHG => a.kind == ATOMIC,
+                    _ => matches!(a.kind, LOAD | STORE),
+                })
                     && a.guest_offset == s.guest_offset && a.insn_native_offset == s.insn_native_offset
                     && a.width == s.width && a.intent == s.intent
                     && if s.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU {

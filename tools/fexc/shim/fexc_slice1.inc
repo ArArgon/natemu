@@ -950,7 +950,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
   // A REP string instruction (I2) or a LOCK NEG (I3) ends its block: the next instruction starts the next block.
   if (first) fexc_after_rep = 0, fexc_self_exits = 0;
   if (!first && rip == fexc_after_rep) {
-    fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after a self-exiting instruction (REP string, LOCK NEG)"};
+    fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after REP string, LOCK NEG or checked LOCK CMPXCHG"};
     return true;
   }
   const bool failed = last && status != S::SUCCESS;
@@ -999,6 +999,11 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     const bool lock_neg = d.FexcMap == FEXC_MAP_PRIMARY && (op == 0xF6 || op == 0xF7) && ((d.ModRM >> 3) & 7) == 3 &&
                           (d.Flags & DecodeFlags::FLAG_LOCK);
     if (lock_neg) fexc_after_rep = rip + d.InstSize;
+    // Keep the returned accumulator and SUB flags observable at the boundary the verifier proves.
+    const auto segment = d.Flags & DecodeFlags::FLAG_SEGMENTS;
+    if (fexc_bits32 && d.FexcMap == FEXC_MAP_TWO && (op & ~1U) == 0xB0 && d.ModRM < 0xC0 &&
+        (d.Flags & DecodeFlags::FLAG_LOCK) && (segment == DecodeFlags::FLAG_FS_PREFIX || segment == DecodeFlags::FLAG_GS_PREFIX))
+      fexc_after_rep = rip + d.InstSize;
     if (v.align) (v.align32 ? fexc_align32 : fexc_align16).insert(rip);   // I5a/I8: its first access gets the alignment check (#GP(0))
     FexcMmioRecord(d, rip);                  // M3: completion record of a MOV-family device access
     // I5c: the waiting instructions (all but FNSTSW and FNSTCW of the admitted x87 forms; WAIT; MMX-register forms), the

@@ -4087,6 +4087,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     }
     let rmw = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU;
     let exchange = site.data_reg[1] & 0xf0 == object::SEGMENT_XCHG;
+    let compare_exchange = site.data_reg[1] & 0xf0 == object::SEGMENT_CMPXCHG;
     let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
     if native && b.flags & cache::STEP == 0 {
         // The private instruction slot survives page-table A/D writes and delivers data breakpoints
@@ -4116,7 +4117,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     };
     let mixed = gpa.iter().any(|&p| !mmio::ram(p));
     if mixed {
-        if exchange {
+        if exchange || compare_exchange {
             mmio::stop_with(&s, natemu_abi::execution::mmio::ATOMIC)
         }
         // A write-intent RMW load has no scalar MMIO completion, including for an unassigned
@@ -4139,7 +4140,18 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let first = ((1u64 << 32) - va) as usize;
     // The existing split completion orders the transfer before subsequent guest memory operations.
     unsafe { asm!("dmb ish") };
-    if exchange {
+    if compare_exchange {
+        use natemu_abi::interp::{exec, op};
+        let accumulator = s.cpu.gpr[0];
+        let [loaded, _] = split_atomic(&mut s, gpa, width, width, |loaded, _, mask| {
+            [if accumulator & mask == loaded { old } else { loaded }, 0]
+        });
+        let (_, flags) = exec::alu(op::SUB, accumulator as u32, loaded as u32, false, width as u8);
+        s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);
+        if flags & exec::ZF == 0 {
+            s.cpu.gpr[0] = if width == 2 { accumulator & !0xffff | loaded } else { loaded };
+        }
+    } else if exchange {
         // A byte cannot straddle. The old banked word/dword supplies the swap, then receives the old RAM value.
         let [loaded, _] = split_atomic(&mut s, gpa, width, width, |_, _, _| [old, 0]);
         s.cpu.gpr[reg] = if width == 2 { old & !0xffff | loaded } else { loaded };

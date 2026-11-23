@@ -796,6 +796,30 @@ class Slice1Cutting(unittest.TestCase):
             self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']))
             self.assertTrue(any(s['kind'] == 'store' for s in d['sites']))
 
+    def test_compat_locked_cmpxchg_segment(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for width, reg, form in [(1, 5, 'f0650fb02f'), (2, 1, 'f064660fb10c77'), (4, 1, 'f0650fb10f')]:
+                d, rc = run('90' + form + '90', RIP, '--bitness', '32')
+                self.assertEqual(rc, 0)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                cas, = (s for s in d['sites'] if s['kind'] in ('load', 'store', 'swap', 'atomic'))
+                self.assertEqual((guard['atomic_compare_exchange'], guard['data_regs'], guard['intent'], guard['width']),
+                                 (True, [reg], 'write', width))
+                self.assertEqual((cas['kind'], cas['width'], cas['native_offset']), ('atomic', width, guard['access_native_offset']))
+                self.assertNotIn('destination_width', guard)
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+            # Materialize the old value/flags even when the next guest instruction overwrites both.
+            for form in ('f0650fb10f', 'f0640fb027', 'f0650fb107'):
+                d, rc = run('90' + form + '31c0', RIP, '--bitness', '32')
+                self.assertEqual(rc, 0)
+                self.assertEqual(d['guest']['bytes_translated'], 1 + len(form) // 2)
+                self.assertEqual(d['guest']['end']['reason'], 'block_ending_instruction')
+            for form in ('650fb10f', 'f0650fc70f', '650fb1c1'):
+                d, rc = run(form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0, form)
+                self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
+
     def test_compat_xchg_segment_swap(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:

@@ -606,6 +606,46 @@ def cases():
     add('fs-sub-rmw-readonly-limit', 'sub [fs:edi], ecx', access=0xf1, prefix=rmw_seed, ecx=rmw_src, rflags=0x10045)
     add('gs-sbb-rmw-wrapped-apic', 'sbb [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=low_apic,
         prefix=rmw_seed, kernel_setup=init, refuse='form', captured={high: bytes.fromhex('1122')})
+    def cas_seed(expected, replacement=0x12345678):
+        return f'    mov eax, {expected:#x}\n    mov ecx, {replacement:#x}\n    cmp edi, edi\n    stc\n'
+
+    for width, reg in [(1, 'ch'), (2, 'cx'), (4, 'ecx')]:
+        mask = (1 << (8 * width)) - 1
+        source = (0x56 if width == 1 else 0x12345678) & mask
+        for matches in (False, True):
+            for wraps in ((False,) if width == 1 else (False, True)):
+                memory = 0x3322 if wraps and width == 2 else int.from_bytes(VALUE[:width], 'little')
+                expected = ((0x99880000 & ~mask) | memory) if matches else 0x80000000
+                accumulator = (expected & ~mask) | memory
+                written = (source if matches else memory).to_bytes(width, 'little')
+                flags = alu_answer('sub', width, memory, lhs=expected)[1]
+                name = f'gs-cmpxchg-{reg}-' + ('match' if matches else 'miss')
+                args = dict(segment='gs', prefix=cas_seed(expected), success=True, eax=accumulator, ecx=0x12345678, rflags=flags)
+                insn = f'lock cmpxchg [gs:edi], {reg}'
+                if wraps:
+                    chunks = {high: b'\x11' + written[:1], low: written[1:] + b'\x44'} if width == 2 else {high: written[:2], low: written[2:]}
+                    add(name + '-wrap', insn, base=0xffffffff if width == 2 else 0xfffffffe, mapped=C.WRAP, kernel_setup=up,
+                        captured=chunks, **args)
+                    if width == 4:
+                        args.update(success=False, after_trap=True, fault=1)
+                        add(name + '-watch', insn, base=0xfffffffe, mapped=C.WRAP, kernel_setup=up + watch_low, captured=chunks, **args)
+                else:
+                    add(name, insn, memory=written + VALUE[width:], **args)
+    add('fs-cmpxchg-ah-source', 'lock cmpxchg [fs:edi], ah', prefix=cas_seed(0xaa553311),
+        eax=0xaa553311, ecx=0x12345678, success=True, rflags=0x44, memory=b'\x33' + VALUE[1:])
+    add('fs-cmpxchg-ax-source-alias', 'lock cmpxchg [fs:edi], ax', base=0xffffffff, mapped=C.WRAP, kernel_setup=up,
+        prefix=cas_seed(0x99883322), success=True, eax=0x99883322, ecx=0x12345678, rflags=0x44, captured=have)
+    add('fs-cmpxchg-readonly-miss', 'lock cmpxchg [fs:edi], ecx', access=0xf1, prefix=cas_seed(0), eax=0, ecx=0x12345678, rflags=0x10045)
+    for name, expected, mapping, setup, error, chunks in [
+            ('lower-pf-match', 0x44332211, C.TOP_ONLY, init, 6, {high: b'\x11\x22'}),
+            ('lower-readonly-miss', 0, C.WRAP, ro, 7, have)]:
+        add('fs-cmpxchg-' + name, 'lock cmpxchg [fs:edi], ecx', base=0xfffffffe, mapped=mapping, kernel_setup=setup,
+            prefix=cas_seed(expected), fault=14, error=error, cr2=0, eax=expected, ecx=0x12345678, rflags=0x10045, captured=chunks)
+    add('gs-cmpxchg-code-page', 'lock cmpxchg [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=alias,
+        kernel_setup=init, prefix=cas_seed(0x2bb82211, 0x2bb92211), success=True, eax=0x2bb82211, ecx=0x2bb92211, rflags=0x44,
+        captured={high: bytes.fromhex('1122'), C.U: bytes.fromhex('b92b'), C.TA + 0x3000: struct.pack('<Q', C.U | C.P.LEAF)})
+    add('gs-cmpxchg-wrapped-apic', 'lock cmpxchg [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=low_apic,
+        prefix=cas_seed(0), kernel_setup=init, refuse='atomic', captured={high: bytes.fromhex('1122')})
     for seg in ('fs', 'gs'):
         for op in ('cmp', 'xor', 'sub'):
             for width, reg in ((1, 'cl'), (2, 'cx'), (4, 'ecx')):
