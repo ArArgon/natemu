@@ -6,12 +6,15 @@ from compat_limits import descriptor
 
 
 def cases():
-    return [program(n) for n in (2, 4)] + [storage(n, "loaded") for n in (2, 4)] + [
+    return [program(n, flat) for flat in (False, True) for n in (2, 4)] + [storage(n, "loaded") for n in (2, 4)] + [
         storage(1, transition) for transition in ("null", "readonly", "reload", "user64")
     ]
 
 
-def program(n):
+def program(n, flat=False):
+    """`flat`: CPU 0's FS is a flat-limit segment (4 GiB, writable, expand-up: Linux's TLS shape), so its code identity has
+    no FS check while the other CPUs run the same instructions at the same addresses under limited FS segments: a block
+    of one identity must never serve the other (M2 checkpoint C)."""
     P, S = C.P, C.S
     fs_base, gs_base = C.XPAGE, C.XPAGE + 64
     fs_word, gs_word = 0x12345678, 0xabcdef01
@@ -101,11 +104,13 @@ def program(n):
     for i in range(n):
         f = S.fields(i)
         small, roomy = 4 + i, 16 + 4 * i
-        fs_small = i % 2 == 0
+        fs_small = i % 2 == (1 if flat else 0)
         gdt = bytearray(S.gdt_image(i))
         for sel, base, limit in [(0x28, fs_base, small if fs_small else roomy),
                                  (0x30, gs_base, roomy if fs_small else small)]:
             gdt[sel:sel + 8] = descriptor(base, limit).to_bytes(8, 'little')
+        if flat and i == 0:
+            gdt[0x28:0x30] = descriptor(fs_base, 0xfffff, flags=12).to_bytes(8, 'little')
         memory += S.memory(i, n, gdt=gdt)
         enter = f'    mov edi, {f["c"]:#x}\n    mov ebp, {rounds}\n    lea r15, [rel .done]\n'
         # Each private GDT and TSS is visible in table A of CPU 0. All CPUs run under exactly that CR3.
@@ -118,8 +123,9 @@ def program(n):
             addr = f['c'] + k * stride
             expected[addr] = struct.pack('<9I', addr if fs_small else fs_word, gs_word if fs_small else addr,
                                          fs_rip if fs_small else gs_rip, 0, 0xdb, 1, return_rip, 0xdb, 3 * (3 + 7))
-    return dict(name=f'c32-per-cpu-fs-gs@{n}', ncpu=n, system=True, bodies=bodies, cpus=cpus, memory=memory,
-                segment_views=[[0, 0] for _ in cpus]), expected
+    # Each round's one out-of-range access is the only operand check the resident decides: every other passes inline.
+    return dict(name=f'c32-per-cpu-fs-{"flat-limit" if flat else "gs"}@{n}', ncpu=n, system=True, bodies=bodies, cpus=cpus,
+                memory=memory, segment_views=[[0, 0] for _ in cpus], segment_checks=[rounds] * n), expected
 
 def storage(n, transition):
     """The host reads the stopped vCPU's two read-only tags. Guest instructions never read the view."""
