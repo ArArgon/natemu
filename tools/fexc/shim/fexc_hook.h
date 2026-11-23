@@ -173,6 +173,22 @@ inline std::set<uint64_t> fexc_pre_nzcv;
 // Which opcode map produced a decoded instruction (DecodedInst::FexcMap, set by the patched decoder).
 enum FexcMap : uint8_t { FEXC_MAP_PRIMARY = 0, FEXC_MAP_TWO = 1, FEXC_MAP_TWO_F3 = 2, FEXC_MAP_TWO_F2 = 3, FEXC_MAP_TWO_66 = 4,
                          FEXC_MAP_0F38 = 5, FEXC_MAP_0F3A = 6, FEXC_MAP_3DNOW = 7, FEXC_MAP_VEX = 8 };
+// L=0 scalar BMI encodings. The slice allowlist applies the guest feature gate; the
+// compatibility address builder uses the same table only when an operand is actually loaded.
+enum class FexcBmiFamily { None, Bmi1, Bmi2 };
+inline FexcBmiFamily FexcBmiEncoding(uint8_t vex, uint8_t opcode, bool has_modrm, uint8_t group) {
+  const uint8_t map = vex & 3, pp = vex >> 2 & 3;
+  if (vex & 16) return FexcBmiFamily::None;
+  if (map == 2) {
+    if (pp == 0 && (opcode == 0xF2 || (opcode == 0xF3 && has_modrm && group >= 1 && group <= 3) || opcode == 0xF7))
+      return FexcBmiFamily::Bmi1;  // ANDN, BLS group, BEXTR
+    if ((opcode == 0xF5 && pp != 1) || (opcode == 0xF6 && pp == 3) || (opcode == 0xF7 && pp != 0))
+      return FexcBmiFamily::Bmi2;  // BZHI, PEXT/PDEP, MULX, SHLX/SARX/SHRX
+  }
+  if (map == 3 && opcode == 0xF0 && pp == 3) return FexcBmiFamily::Bmi2;  // RORX
+  return FexcBmiFamily::None;
+}
+
 // FEXC_CUT_DECODER: the FIRST instruction hit a decoder end-of-input status (partial_decode, not_executable, bad_relocation):
 // no code, never FEX's NoExec/SIGSEGV block. `status` is the Frontend::Decoder::DecodedBlockStatus value.
 // FEXC_CUT_STRING (I2, I3): the instruction after one that exits to its own RIP (a REP string instruction while RCX is not 0,

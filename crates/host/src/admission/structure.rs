@@ -806,6 +806,10 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
                 | Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovl | Mnemonic::Cmovge | Mnemonic::Cmovle | Mnemonic::Cmovg
                 | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovs | Mnemonic::Cmovns | Mnemonic::Cmovp | Mnemonic::Cmovnp)
                 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory => object::SEGMENT_NATIVE_LOAD,
+            Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Blsr_r32_rm32 | Code::VEX_Blsmsk_r32_rm32 | Code::VEX_Blsi_r32_rm32
+            | Code::VEX_Bzhi_r32_rm32_r32 | Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Pext_r32_r32_rm32 | Code::VEX_Pdep_r32_r32_rm32
+            | Code::VEX_Shlx_r32_rm32_r32 | Code::VEX_Sarx_r32_rm32_r32 | Code::VEX_Shrx_r32_rm32_r32
+            | Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Mulx_r32_r32_rm32 => object::SEGMENT_NATIVE_LOAD,
             Code::Bsf_r16_rm16 | Code::Bsf_r32_rm32 | Code::Bsr_r16_rm16 | Code::Bsr_r32_rm32
             | Code::Tzcnt_r16_rm16 | Code::Tzcnt_r32_rm32 | Code::Lzcnt_r16_rm16 | Code::Lzcnt_r32_rm32
             | Code::Popcnt_r16_rm16 | Code::Popcnt_r32_rm32 | Code::Imul_r16_rm16 | Code::Imul_r32_rm32
@@ -834,13 +838,16 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let first_is_memory = i.op0_kind() == OpKind::Memory;
         let other = u32::from(first_is_memory);
         // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
-        let modrm_reg = if xlat {
-            Register::AL.number() as u8
-        } else if let Some(group) = implicit_group {
-            group
-        } else if i.op_kind(other) == OpKind::Register {
-            i.op_register(other).number() as u8
-        } else if i.mnemonic() == iced_x86::Mnemonic::Cmp { 7 } else { 0 };
+        let modrm_reg = implicit_group.unwrap_or_else(|| match i.code() {
+            // VEX.vvvv names the BLS destination; ModRM.reg is the operation selector.
+            Code::VEX_Blsr_r32_rm32 => 1,
+            Code::VEX_Blsmsk_r32_rm32 => 2,
+            Code::VEX_Blsi_r32_rm32 => 3,
+            _ if xlat => Register::AL.number() as u8,
+            _ if i.op_kind(other) == OpKind::Register => i.op_register(other).number() as u8,
+            _ if i.mnemonic() == iced_x86::Mnemonic::Cmp => 7,
+            _ => 0,
+        });
         let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
@@ -3378,6 +3385,22 @@ mod tests {
                     assert!(check(&altered).is_err(), "{hex}: admitted incorrect divide preparation or remainder at {at}");
                 }
             }
+        }
+        // GS:BLSI ESI,[EDI] has /3 in ModRM and its destination in VEX.vvvv.
+        let (obj, src) = compile("65c4e248f31f", "0x8048000", "32");
+        let h: Header = super::super::record(&obj, 0);
+        let guard_at = (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .find(|&at| super::super::record::<Site>(&obj, at).kind == object::kind::SEGMENT).unwrap();
+        for shape in [false, true] {
+            let check = |o: &[u8], s: &[u8]| super::super::admit_mode(o, h.guest_rip, s, u64::MAX, shape, false, true);
+            check(&obj, &src).unwrap();
+            let mut changed = obj.clone();
+            changed[guard_at + core::mem::offset_of!(Site, data_reg)] = 6;
+            assert!(check(&changed, &src).unwrap_err().contains("differs from its x86 operand"));
+            let mut changed = src.clone();
+            changed[5] = 0x17; // BLSMSK /2.
+            assert!(check(&obj, &changed).unwrap_err().contains("differs from its x86 operand"));
         }
         let (alu, source) = compile("65330f", "0x8048000", "32");
         let h: Header = super::super::record(&alu, 0);

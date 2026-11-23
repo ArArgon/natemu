@@ -665,6 +665,67 @@ def cases():
                 base=(0xffffffff if width == 2 else 0xfffffffe) if wrap else tls, mapped=C.WRAP if wrap else (),
                 prefix=alu_seed, success=True, ecx=result, rflags=0x45, kernel_setup=up if wrap else '')
         add(name + '-limit', insn, segment='gs', limit=width-1, prefix='    mov edi, 1\n' + alu_seed, ecx=alu_initial, rflags=0x10045)
+    # The same dword supplies data, a mask or a multiplier depending on the VEX form.
+    bmi_memory = 0x84332210
+    bmi_data = 0x5a3c12ed
+    multiplier = 0x10203041
+    product = multiplier * bmi_memory
+    set_bits = [bit for bit in range(32) if bmi_memory >> bit & 1]
+    extracted = sum((bmi_data >> bit & 1) << rank for rank, bit in enumerate(set_bits))
+    deposited = sum((bmi_data >> rank & 1) << bit for rank, bit in enumerate(set_bits))
+    count = 5
+    word_mask = 0xffffffff
+    bmi_cases = [
+        # mnemonic, operands, ESI, ECX result, flags, defined flags mask
+        ('andn', 'ecx, esi, MEM', bmi_data, ~bmi_data & bmi_memory, 0x80, 0x8c1),
+        ('blsr', 'ecx, MEM', bmi_data, bmi_memory & (bmi_memory - 1), 0x80, 0x8c1),
+        ('blsmsk', 'ecx, MEM', bmi_data, bmi_memory ^ (bmi_memory - 1), 0, 0x8c1),
+        ('blsi', 'ecx, MEM', bmi_data, bmi_memory & -bmi_memory, 1, 0x8c1),
+        ('bextr', 'ecx, MEM, esi', 0x0804, bmi_memory >> 4 & 255, 0, 0x841),
+        ('bzhi', 'ecx, MEM, esi', 13, bmi_memory & ((1 << 13) - 1), 0, 0x8c1),
+        ('pext', 'ecx, esi, MEM', bmi_data, extracted, 0x45, 0xed5),
+        ('pdep', 'ecx, esi, MEM', bmi_data, deposited, 0x45, 0xed5),
+        ('mulx', 'ecx, ebx, MEM', bmi_data, product >> 32, 0x45, 0xed5),
+        ('shlx', 'ecx, MEM, esi', count, bmi_memory << count & word_mask, 0x45, 0xed5),
+        ('sarx', 'ecx, MEM, esi', count, (bmi_memory - (1 << 32)) >> count & word_mask, 0x45, 0xed5),
+        ('shrx', 'ecx, MEM, esi', count, bmi_memory >> count, 0x45, 0xed5),
+        ('rorx', 'ecx, MEM, 7', bmi_data, (bmi_memory >> 7 | bmi_memory << 25) & word_mask, 0x45, 0xed5),
+    ]
+    bmi_bytes = struct.pack('<I', bmi_memory)
+    bmi_top = f'    mov ebx, 0xfffffffe\n    mov word [rbx], {bmi_memory & 0xffff}\n'
+    bmi_wrap = bmi_top + f'    xor ebx, ebx\n    mov word [rbx], {bmi_memory >> 16}\n'
+    bmi_normal = C.W + 0xa0
+    ebx_seed = 0xa5a5aba5
+
+    for index, (op, operands, esi, result, status, mask) in enumerate(bmi_cases):
+        seg = 'gs' if index % 2 else 'fs'
+        insn = op + ' ' + operands.replace('MEM', f'dword [{seg}:edi]')
+        start = (f'    mov ecx, {alu_initial}\n    mov ebx, {ebx_seed}\n    mov esi, {esi}\n'
+                 f'    mov edx, {multiplier}\n    cmp edi, edi\n    stc\n')
+        registers = {C.REC + 0x50: struct.pack('<I', multiplier), C.REC + 0x70: struct.pack('<I', esi),
+                     C.REC + 0x58: struct.pack('<I', ebx_seed)}
+        finished = dict(registers)
+        if op == 'mulx':
+            finished[C.REC + 0x58] = struct.pack('<I', product & word_mask)
+        addr = {'base': bmi_normal, 'kernel_setup': load_bytes(bmi_normal, bmi_bytes)}
+        # Exercise each opcode, alternate address routes, and run both routes for distinct operand roles.
+        routes = (False, True) if op in ('blsi', 'pext', 'mulx', 'rorx') else (bool(index % 2),)
+        for wrap in routes:
+            loc = dict(base=0xfffffffe, mapped=C.WRAP, kernel_setup=bmi_wrap) if wrap else addr
+            captured = finished | ({high: bmi_bytes[:2], low: bmi_bytes[2:]} if wrap else {bmi_normal: bmi_bytes})
+            add(f'{seg}-bmi-{op}-' + ('wrap' if wrap else 'read'), insn, segment=seg, access=0xf1, prefix=start,
+                success=True, ecx=result, flags_mask=mask, rflags=status, captured=captured, **loc)
+        if op in ('blsi', 'pdep', 'bextr', 'mulx', 'rorx'):
+            add(f'{seg}-bmi-{op}-limit', insn, segment=seg, base=C.XPAGE, limit=2, kernel_setup=absent,
+                prefix=start, ecx=alu_initial, rflags=0x10045, captured=registers)
+            add(f'{seg}-bmi-{op}-second-pf', insn, segment=seg, base=0xfffffffe, mapped=C.TOP_ONLY,
+                kernel_setup=bmi_top, prefix=start, fault=14, error=4, cr2=0, ecx=alu_initial, rflags=0x10045,
+                captured=registers | {high: bmi_bytes[:2]})
+        if op == 'mulx':
+            add('gs-bmi-mulx-alias-wrapped', 'mulx ecx, ecx, dword [gs:edi]', segment='gs',
+                base=0xfffffffe, mapped=C.WRAP, kernel_setup=bmi_wrap, prefix=start, success=True,
+                ecx=product >> 32, rflags=0x45, captured=registers)
+
     def xlat_regs(ebx, al):
         return f'    cmp al, al\n    stc\n    mov ebx, {ebx:#x}\n    mov eax, {0xaabbcc00 | al:#x}\n'
 

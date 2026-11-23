@@ -803,6 +803,28 @@ class Slice1Cutting(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertFalse(any(s['kind'] in ('segment', 'swap', 'load', 'store') for s in d['sites']))
 
+    def test_compat_bmi_scalar_reads(self):
+        import verify_precision
+        # The F3 group takes its destination from VEX.vvvv (ESI), not ModRM.reg (/1../3).
+        forms = [('e248f20f', 1), ('e248f30f', 1), ('e248f317', 2), ('e248f31f', 3),
+                 ('e248f70f', 1), ('e248f50f', 1), ('e24af50f', 1), ('e24bf50f', 1),
+                 ('e263f60f', 1), ('e249f70f', 1), ('e24af70f', 1), ('e24bf70f', 1), ('e37bf00f07', 1)]
+        with tempfile.TemporaryDirectory() as t:
+            for n, (tail, reg) in enumerate(forms):
+                form = ('64' if n % 2 else '65') + 'c4' + tail
+                d, rc = run(form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0, form)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                load, = (s for s in d['sites'] if s['kind'] == 'load')
+                self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation']),
+                                 (4, 'read', [reg], True), form)
+                self.assertEqual((guard['imm'] + 4, guard['access_native_offset']), (load['native_offset'], load['native_offset']), form)
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+        for form, bits in [('c4e248f20f', '32'), ('64c4e248f20f', '64'), ('65c4e248f2cf', '32')]:
+            d, rc = run(form, RIP, '--bitness', bits)
+            self.assertEqual(rc, 0, form)
+            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
+
     def test_compat_alu_segment_pair(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:

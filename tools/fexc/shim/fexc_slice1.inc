@@ -177,22 +177,9 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
 // with it clear the form is not allowed here and `Avx` makes it #UD). `vex` = map_select | pp << 2 | L << 4. VEX.L = 1 is #UD
 // for all of them.
 inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
-  const uint8_t map = vex & 3, pp = vex >> 2 & 3;
   if (vex & 16) return Uns("VEX.L = 1 (BMI forms #UD)");
-  if (map == 2) {
-    switch (op) {
-    case 0xF2: if (GF_BMI1 && pp == 0) return Allow(); break;                           // andn
-    case 0xF3: if (GF_BMI1 && pp == 0 && has_modrm && reg >= 1 && reg <= 3) return Allow(); break; // blsr/blsmsk/blsi
-    case 0xF5:
-      if (GF_BMI2 && pp == 0) return Allow();                                          // bzhi
-      if (GF_BMI2 && pp >= 2) return Allow();                                          // pdep, pext (I9: patch 0024's straight-line lowering)
-      break;
-    case 0xF6: if (GF_BMI2 && pp == 3) return Allow(); break;                          // mulx
-    case 0xF7: if (pp == 0 ? GF_BMI1 : GF_BMI2) return Allow(); break;                 // bextr (BMI1), shlx/sarx/shrx (BMI2)
-    default: break;
-    }
-  }
-  if (GF_BMI2 && map == 3 && op == 0xF0 && pp == 3) return Allow();                    // rorx
+  const auto family = FexcBmiEncoding(vex, op, has_modrm, reg);
+  if ((family == FexcBmiFamily::Bmi1 && GF_BMI1) || (family == FexcBmiFamily::Bmi2 && GF_BMI2)) return Allow();
   return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
 }
 
