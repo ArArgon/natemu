@@ -43,6 +43,91 @@ the access can complete before the resident sees it.
   high pages and prove the unmodified runtime fails the case. Check the selected value and the untouched
   sentinel as appropriate. Test both address formation and the next access after a stack update.
 
+### Folded displacements behind an unmapped window (design, November 23, 2026; not yet built)
+
+**Why.** Forming every displaced 32-bit address with its own 32-bit add (fork commit `fc4270d`, natemu `30793c6b`) cost
+12 to 14% on 32-bit code: bench cases `io5-solo32`, `guest-sqlite32` and `guest-startup32`, Apple M4, three alternating
+rounds against `main` `035b243e` (i386-make 109.0 s to 123.0 s, sqlite 7.97 s to 9.03 s, start-up 7.31 s to 8.21 s;
+64-bit `io5-solo` unchanged). This subsection replaces the first bullet's "form the 32-bit effective offset before
+memory" for the forms listed under "What folds"; the second and third bullets stand.
+
+**The rule.** 32-bit code may use a native address that differs from the x86 address by a whole multiple of 4 GiB only
+if that native address is certain to abort. The resident's task 3a repair (`access_aborted`: move the base register by
+the multiple of 4 GiB, run the word again; `split`: complete the store at the wrapped address) then makes the access
+exact. Task 3a relied on a 32-bit process mapping nothing above 4 GiB. A mixed process does, so the certainty now comes
+from the tables: while 32-bit user code runs, two windows of the native user shadow hold no page.
+
+**The windows.** 64 KiB each: `[4 GiB, 4 GiB + 64 KiB)` and the last 64 KiB of the address space,
+`[2^64 - 64 KiB, 2^64)`. They generalise today's single page at 4 GiB (`enter_compat_user`, `crates/abi/src/shadow.rs`),
+by the same mechanism. `install` notes a user shadow made inside a window in one word of the space's state page, one
+bit per page (32 bits). `select_guest_space`, which every entry and resume of generated code already passes, removes
+the noted pages before 32-bit user code runs and clears the word. A process that never maps there (every pure 32-bit
+process) pays the one word read it pays today. A mixed process pays one unmap for each window page its 64-bit code
+touched since the last 32-bit entry, at most 32. 64-bit code keeps its whole view: its next access to such a page
+faults and shadows it again. The tables are per vCPU, so a sibling vCPU running the process's 64-bit code is not
+affected. Translated 32-bit code runs only at CPL 3 (`controls`), so only the user space needs the windows. Nothing
+maps a window page while 32-bit code runs (the resident walks wrapped addresses only), and if something did, the next
+resume would remove it.
+
+**What folds** (FEX's lowering as on `main`; each is a 64-bit `base + constant`):
+
+| Form | Constant | Native shape |
+| --- | --- | --- |
+| Displacement on a base register, on base + index, or on an FS/GS base that needs no check | -16383 to 16383 | immediate (`ldur`/`stur` -256 to 255; scaled unsigned to 4095 x size), else a constant register added with `sxtx` |
+| The same for vector and x87 memory operands | the same | the same |
+| Paired loads and stores (16- and 32-byte operands) | -64 to 63 elements, at most 1 KiB | `ldp`/`stp` immediate |
+| PUSH, POP, and CALL/RET/ENTER/LEAVE through them | the slot (2, 4, or 8 for a merged pair) | pre- and post-index writeback on ESP's register |
+| Offsets a handler adds to a whole 32-bit address (FXSAVE, XSAVE, FNSAVE, m80) | under 1 KiB | unchanged by this work; today they rely on the one page |
+
+**Why the windows cover every one.** The base is one of three things. (1) A value just formed by a 32-bit add
+(base + index, plus a segment base: `LoadEffectiveAddress`), so below 4 GiB. (2) A guest register, zero-extended at
+every entry (`enter`) and by every 32-bit write. (3) A guest register a repair or a POP left off by 4 GiB, which task
+3a already allows (`bank` and the dispatcher cut it): a repair of `base + d` leaves the base within 16383 of 4 GiB
+above, or of 0 below; a POP at FFFF_FFFCH leaves ESP at exactly 4 GiB. Adding a constant of at most 16383 either way,
+and the widest access (32 bytes), every native address is either the x86 address itself, or lies in
+`[4 GiB, 4 GiB + 32 KiB + 40)`, or in `[2^64 - 32 KiB, 2^64)`. A native address outside the windows is therefore the
+right one; one inside aborts, the base moves by 4 GiB, and the word runs again at the right address, where the usual
+rules apply (page fault, the flat segment's end, a straddle through FS or GS). A repaired base is itself in case (3),
+so the error does not grow. 64 KiB is twice the worst case.
+
+**The paths around the access**, each checked in the code:
+
+- *Split-store check* (`fexc_sites.inc`): it tests page crossing on the same 64-bit sum, whose low 12 bits are the
+  x86 address's. Its probe refuses any address with a bit above 31 and takes the `brk`; `split` masks the address to
+  32 bits before anything else. No probe touches memory above 4 GiB.
+- *Aligned stack stores without a split check* (`--push-run`): the test is on the low two bits.
+- *Alignment faults* (x86 alignment checking, 16-byte atomics): `access_aborted` repairs a high address before it
+  looks at the kind of abort, so the fault is judged at the wrapped address.
+- *LOCK forms, XCHG, CMPXCHG, BT's bit string, XLAT, strings*: FEX forms their whole address in 32 bits; no fold.
+- *Data breakpoints*: an Arm watchpoint is taken only if the access does not abort first, and a window address
+  always does; the retry at the wrapped address meets the watchpoint. The existing straddle test before `watch::hit`
+  already uses the 32-bit address.
+- *Device pages and the all-ones page*: reached from `access_aborted` after the repair, so with the wrapped address.
+- *FS and GS.* A segment that needs a check (a limited-segment bit set) gives the handler the whole 32-bit offset
+  with no displacement left (`DecodeAddress`), so nothing folds and the check sees the true offset. A based 4 GiB
+  segment folds `((registers + base) mod 4 GiB) + d`: its error is again a multiple of 4 GiB, repaired to the wrapped
+  linear address before `straddle` derives the offset from it.
+
+**What stays unfolded** (already 32-bit on `main`, so no cost): base + index without a displacement (FEX uses a
+register-offset operand only in 64-bit code); displacements of 16 KiB and more; an absolute address with no register
+(kept as section 1 made it: a 32-bit constant, never a sign-extended one, which would point into the kernel half);
+16-bit addressing; every operand through a checked FS or GS; the forms listed under LOCK above.
+
+**PUSH and POP** go back to `main`'s lowering. The pre-decrement form costs an instruction per PUSH and per POP and
+loses the paired PUSH; the old form's overrun is the table's fourth row and is covered (PUSH at ESP = 0 stores at
+2^64 - 4, in the upper window; after a POP at FFFF_FFFCH the next access through ESP is at 4 GiB or just above).
+With both restored, 32-bit code with no limited segment should be `main`'s code byte for byte except absolute
+addresses; `fexc-address32` will compare it with `main`'s compiler output rather than pin `fc4270d`'s, and its
+"32-bit definition of the address" checks become "the folded form, within the fold limit".
+
+**Tests.** The VM cases are the proof: `mixed-user-wrap`, `mixed-user-wrap-far` (a warm page at 4 GiB + 4 KiB) and
+the 4 KiB+ displacement cases unchanged. New cases in the same family: a displacement just under 16 KiB from a base
+just under 4 GiB with the last window page warm; the same after a repaired base (the 32 KiB reach); `[ebp-8]` with
+EBP = 4 and PUSH at ESP = 0 with a warm user page at the top of the address space; base + index without a
+displacement (unfolded) wrapping past a warm page. A unit test in `shadow.rs` for the noted-pages word. 64-bit
+objects stay byte-identical (`static/fexc-replay`, which answers one boot's 64-bit requests with `main`'s compiler
+and this one's).
+
 ## 2. Enforce FS and GS limits at the point of access
 
 Use the loaded FS/GS descriptor already in the CPU bank. A write to the GDT or LDT does not change this
