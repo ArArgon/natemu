@@ -62,10 +62,13 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     } else {
         s.cpu.gpr[i.base as usize]
     };
-    super::segments::usable(&s.cpu, i.segment)?;
+    let segment = super::segments::usable(&s.cpu, i.segment);
     let nc = operand_range(&i);
     for j in 0..n {
         if m[ew * j + ew - 1] & 0x80 != 0 {
+            // An empty gather uses no segment. A null selector on the first selected read faults
+            // before either original register is written back.
+            segment?;
             let at = iw * j;
             let ix = if iw == 4 {
                 i64::from(i32::from_le_bytes(x[at..at + 4].try_into().unwrap())) as u64

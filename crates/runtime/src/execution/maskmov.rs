@@ -21,7 +21,7 @@
 //! explicitly permitted by its SDM page), and writes selected bytes. Unlike the SIMD forms it checks pending #MF and
 //! natural alignment under #AC (Vol.3B Table 24-8); canonicality precedes #AC, which precedes page faults as for `linear`.
 //! Only successful completion sets TOP=0 and all tags valid, including a zero mask. CR4.OSFXSR does not gate it.
-use super::segments::{Exception, operand_range, offset, operand, span::Span, usable};
+use super::segments::{Exception, operand_range, offset, operand, span::Span};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;
 
@@ -72,7 +72,6 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         )
     };
     let ea = offset(&s.cpu, &i);
-    usable(&s.cpu, i.segment)?;
     let nc = operand_range(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
     let mut spans = [None; 8];
@@ -84,7 +83,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         }
         spans[0] = Some(Span::walk(s, at, n, true, nc)?);
     } else {
-        // VMASKMOV and VPMASKMOV check bounds only for active lanes, before any lane moves.
+        // SDM Vol.2, VMASKMOV/VPMASKMOV: only selected lanes access memory. operand() checks
+        // selector usability and limits for those lanes before any lane moves.
         let mut addresses = [0; 8];
         for j in (0..n).filter(|&j| on(j)) {
             addresses[j] = operand(&s.cpu, i.segment, ea.wrapping_add((ew * j) as u64), ew as u64, store)?;

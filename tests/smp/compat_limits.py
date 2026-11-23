@@ -130,10 +130,24 @@ def cases():
         prefix=set0, xmm3=bytes(16), xmm1=bytes(16), success=True)
     add('fs-maskmovq-zero', 'fs maskmovq mm1, mm3', prefix='    pxor mm3, mm3\n')
     add('fs-maskmovdqu-zero', 'fs maskmovdqu xmm1, xmm3', prefix=set0, xmm3=bytes(16))
-    add('gs-null-maskstore-zero', 'vpmaskmovd [gs:eax], xmm3, xmm1', segment='gs', selector=0,
-        prefix=set0, xmm3=bytes(16))
-    add('fs-null-gather-zero', 'vpgatherdd xmm1, [fs:eax+xmm2*4], xmm3', selector=0,
-        prefix=set0, xmm3=bytes(16))
+    # An empty VEX lane mask makes no memory access. FS/GS is null; EAX still points at a writable
+    # sentinel so a stray store, a missing #GP on an active lane, or a changed load destination is visible.
+    at_sentinel = f'    mov eax, {tls:#x}\n'
+    off = '    movdqa xmm3, xmm2\n'   # INDEX has nonzero low bits but every dword MSB is clear
+    for segment, name, insn in [
+        ('gs', 'maskstore', 'vpmaskmovd [gs:eax], xmm3, xmm1'),
+        ('fs', 'maskload', 'vmaskmovps xmm1, xmm3, [fs:eax]'),
+        ('fs', 'gather', 'vpgatherdd xmm1, [fs:eax+xmm2*4], xmm3'),
+    ]:
+        null = dict(segment=segment, selector=0, captured={C.REC + (0xd0 if segment == 'fs' else 0xd8): bytes(8)})
+        add(f'{segment}-null-{name}-zero', insn, **null, prefix=set0 + at_sentinel, success=True,
+            xmm1=bytes(16) if name == 'maskload' else INITIAL, xmm3=bytes(16))
+        add(f'{segment}-null-{name}-msbs-clear', insn, **null, prefix=off + at_sentinel, success=True,
+            xmm1=bytes(16) if name == 'maskload' else INITIAL, xmm3=bytes(16) if name == 'gather' else INDEX)
+        add(f'{segment}-null-{name}-first-active', insn, **null, prefix=at_sentinel)
+    add('gs-null-maskstore-avx-disabled', 'vpmaskmovd [gs:eax], xmm3, xmm1', segment='gs', selector=0,
+        prefix='    pxor xmm3, xmm3\n' + at_sentinel, xmm3=bytes(16), fault=6,
+        kernel_setup='    mov rax, cr4\n    btr rax, 18\n    mov cr4, rax\n')
     # Force ModRM encodings (the assembler can select moffs for an absolute EAX operand).
     seed = '    mov ecx, 0x12345678\n'
     add('fs-generated-read-end', 'mov ecx, [fs:edi]', success=True, prefix=seed, ecx=0x44332211)
