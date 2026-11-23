@@ -16,10 +16,10 @@ Results, all framework cases on the M2 Max:
   `natemu`), and the models on 306 segment and 21 mode-transition fault cases (`natemu-faults`);
 - CPU start-up by INIT and SIPI: the model's scenarios (`tests/system` `initsipi*`), Debian's kernel with the wake-up
   mailbox left out at 2 and 4 vCPUs through CPU offline/online and shutdown (`tests/boot` `boot-startup`),
-  kvm-unit-tests' smptest and dummy at 1-4 vCPUs (`kut-natemu`), the exit test's AP program at 1, 2 and 4 CPUs
+  kvm-unit-tests' smptest and dummy at 1-4 vCPUs (`kut-natemu`), the exit test's AP program at 1, 2, 4 and 8 CPUs
   (`exit-ap-natemu`);
-- the M2 exit test, our firmware from the reset vector at 1, 2 and 4 CPUs (`exit-fw-natemu`), and OVMF's reset vector
-  to SEC from both entries (`ovmf-natemu`);
+- the M2 exit test, our firmware from the reset vector at 1, 2, 4 and 8 CPUs (`exit-fw-natemu`), and OVMF's reset
+  vector to SEC from both entries (`ovmf-natemu`);
 - no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case; M2
   Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
   [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
@@ -414,7 +414,7 @@ stacks: the interpreter does not call them (far RET is its own; the rest stay ty
   its one module, since this board has no fw_cfg, and argv[0] first from the command line. Under a test option only
   (decided by the session), isa-debug-exit at F4H-F7H.
 - **The exit test's firmware is ours** (`tests/boot/exit_fw.asm`; contract
-  [m2-exit-firmware.md](m2-exit-firmware.md)), proven at 1, 2 and 4 CPUs on QEMU 11.1.2 and KVM (`exit-fw-*`); its AP
+  [m2-exit-firmware.md](m2-exit-firmware.md)), proven at 1, 2, 4 and 8 CPUs on QEMU 11.1.2 and KVM (`exit-fw-*`); its AP
   part is also a 64-bit program for B2 (`exit_prog.asm`, `exit-ap-*`). It is a small nasm image built by the framework from the repository: 16-bit reset
   code that enables the MTRRs first, a far jump to flat 32-bit code with paging off, page tables, long mode, 64-bit code;
   then INIT-SIPI-SIPI to every other CPU, each AP stub also enabling the MTRRs and climbing on its own past a shared
@@ -461,8 +461,9 @@ the repository; every number from a framework case (or labelled an experiment).
   in the framework (roadmap P3).
 - **The M2 exit test** (section 7) at 1, 2, 4 and more vCPUs, asserting bounds on decode exits and shootdowns with N APs
   both in and past the 16-bit part; and a litmus test between an interpreting CPU and one running translated code.
-  Built: `exit-fw-natemu` at 1, 2 and 4 vCPUs with those bounds. Not built (later): the runs at more vCPUs and the
-  litmus test.
+  Built: `exit-fw-natemu` at 1, 2, 4 and 8 vCPUs with those bounds (per vCPU), and `exit-ap-natemu` and the references
+  (`exit-fw-*`, `exit-ap-*`: QEMU 11.1.2 under TCG, and KVM, which overcommits the reference machine's 4 cores at 8) at
+  the same counts. Not built (later): the litmus test.
 - **No effect on a running 64-bit OS** (section 9c): the gate, the compiler's replay check (`static/fexc/fexc-replay`)
   and the benchmark cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (system-call paths), with a
   benchmark round, at the end of every slice that touches a hot path, against the parent commit.

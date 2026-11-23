@@ -14,10 +14,20 @@ repro = "5e26e2db02f1 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548
 sha256 = "18e780690e2dd2909cd44693f58403af50d1ffd680b700e819ef214230c5833a"
 value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"enabling apic\",\"found 4 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"ipi called, cpu 2\",\"ipi called, cpu 3\",\"setup: CPU 1 online\",\"setup: CPU 2 online\",\"setup: CPU 3 online\",\"smp: waiting for 3 APs\"]}"
 
+[answers.2949a96e377afe9f538876e6173732326aa99bc7aed7562df27fd0efeb4931de]
+repro = "cb25501faa2a image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
+sha256 = "b6159de56b7723338f8bdb88125f5e7b46b1cde981bf946ce8175a294b844e60"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=8 aps=7 ids=1,2,3,4,5,6,7 status=0\\n\"}"
+
 [answers.3b8fb709200ef037afa3431a86bd98df660a4f8f3ebdbc4ba0a43b3ca2cc48a9]
 repro = "f06f765e9c1a image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "df47a3bb259acbebc125f06fe3e6f87254154c9785a46f8a17aaf9798fde81dc"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[1,0,0,0,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.46391451dfcbc8216324d5ad44c7535252e1dba344db1faddeaaf4296ff7dfdf]
+repro = "8e038872c75f image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
+sha256 = "cdfb529db26a190c293ad92f4d7e58e32938c32516b947d92ea07b54fbf54918"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[8,0,254,7,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
 [answers.4a543f63527282c0946b5ddd07f5992a764f4ced82a7c469e6f56b3b8833b219]
 repro = "d8382737be26 image_sha256=80cfaaecaa5ffd48a0f0406a7d0c5132f8912f19cbe9b87b920e8f0675587149"
@@ -79,6 +89,11 @@ repro = "a29bc620debb image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548
 sha256 = "c2d02a0611f4b3f7e132d54767fb36597f8ace787a654fe9330fba732a21c2b0"
 value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\"enabling apic\",\"enabling apic\",\"found 2 cpus\",\"ipi called, cpu 0\",\"ipi called, cpu 1\",\"setup: CPU 1 online\",\"smp: waiting for 1 APs\"]}"
 
+[answers.8c7aa22d21d749aa413b40ecde87afebc07dfc6edc3fb67bae7698732a0ba135]
+repro = "36a6f63ebaf1 image_sha256=846856ac4db4967f2a2f26bcc2431105d0ec0c7704e557abf3bde73312396299"
+sha256 = "b6159de56b7723338f8bdb88125f5e7b46b1cde981bf946ce8175a294b844e60"
+value = "{\"exit\":1,\"serial\":\"EXITFW long mode\\nEXITFW cpus=8 aps=7 ids=1,2,3,4,5,6,7 status=0\\n\"}"
+
 [answers.9b399c5f9786adfe3a9fe3b26bcff19868373946d7e09e1c1ef4749705539bb7]
 repro = "262393282292 image_sha256=dc8449dd84f0dd6a0cb2b739e6cc46a5297f60ec14548fcc90f7f098e3b45c92"
 sha256 = "fe60fac6f6c3bd261a986146a60a8e9345cf7781a2e1be2ff555521c453018cb"
@@ -93,6 +108,11 @@ value = "{\"exit\":1,\"lines\":[\"PASS: IPI to each CPU\",\"SUMMARY: 1 tests\",\
 repro = "204ec1584718 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
 sha256 = "176d33beb3257bb09679fa5f9ea315b06a6717fb7c9aed019fc21d7af57b5a84"
 value = "{\"exit\":1,\"fault\":null,\"gpr\":[4,0,14,3,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
+
+[answers.a9aa5fc7c878d3a19ef5a3ce2749ea9c57a38e5ea584fd40037f5e5e9d7ab170]
+repro = "8cc8075d3687 image_sha256=96b4f0e5aa6adbd6009ffd9102c51d37f432dc3be288ca97cb97066de218db3c"
+sha256 = "cdfb529db26a190c293ad92f4d7e58e32938c32516b947d92ea07b54fbf54918"
+value = "{\"exit\":1,\"fault\":null,\"gpr\":[8,0,254,7,4069376,0,0,0,0,0,0,0,0,0,0,0],\"rflags\":68}"
 
 [answers.b435345d04a7bb181faec39366c225cd3a9a265229df5dc1e3dc93757bbdd148]
 repro = "43d1e8c853f0 image_sha256=aebcf3469bc9b8235b6b4a93af7e96dce43edce6454137326db0dcb4a17262af"
@@ -433,6 +453,39 @@ recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f7
 
 [repro.35b7b69ba477.upstream.sources]
 kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.36a6f63ebaf1]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "8",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-firmware"
+
+[repro.36a6f63ebaf1.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
 
 [repro.3ab23c1da9ce]
 args = [
@@ -810,6 +863,71 @@ recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f7
 
 [repro.86ff49a161bc.upstream.sources]
 kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.8cc8075d3687]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "8",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-program"
+
+[repro.8e038872c75f]
+args = [
+    "-accel",
+    "kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "8",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "none",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-debugcon",
+    "file:OUT",
+    "-kernel",
+    "IMG",
+]
+pin = "kvm: qemu-system-x86 of Debian trixie at snapshot 20260915T000000Z"
+supplier = "kvm"
+test = "exit-program"
+
+[repro.8e038872c75f.reference]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+kernel = "7.0.0-43-generic"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
 
 [repro.8f530a278976]
 args = [
@@ -1194,6 +1312,34 @@ recipe_sha256 = "92d9bc38f017e7a15e25e6898d2f76f4fe40c93bc13b7be88f9e86ebc1870f7
 
 [repro.c7070491f187.upstream.sources]
 kvm-unit-tests-src = "363fdf4499615f6d4ba04248fa79615adbc75b51a59103f375cd000660e7c0a1"
+
+[repro.cb25501faa2a]
+args = [
+    "-accel",
+    "tcg,thread=multi",
+    "-cpu",
+    "max,-pcid,-smap",
+    "-smp",
+    "8",
+    "-m",
+    "64",
+    "-machine",
+    "pc",
+    "-nographic",
+    "-nodefaults",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:OUT",
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-no-reboot",
+    "-bios",
+    "IMG",
+]
+pin = "qemu-system 11.1.2 src"
+supplier = "qemu-system"
+test = "exit-firmware"
 
 [repro.ce917e519f55]
 args = [

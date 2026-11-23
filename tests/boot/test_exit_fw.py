@@ -87,7 +87,7 @@ def test_the_instruction_check_refuses_what_the_first_version_lacks(tmp_path):
         assert refused(text, bits) is None, (line, text)
 
 
-@pytest.mark.parametrize('n', [1, 2, 4])
+@pytest.mark.parametrize('n', fw.CPUS)
 def test_the_judges_pass_the_expected_answers_and_refuse_wrong_ones(n):
     good = {'exit': 1, 'serial': fw.expected_serial(n)}
     assert fw.judge('firmware', n, good) == []
@@ -110,7 +110,7 @@ def test_the_judges_pass_the_expected_answers_and_refuse_wrong_ones(n):
 def test_natemu_firmware_judge_and_bounds():
     """The firmware variant under natemu: a run to the power-off with the report passes `judge` and the bounds; the
     bounds refuse too many decode exits or shootdowns on any vCPU."""
-    for n in (1, 2, 4):
+    for n in fw.CPUS:
         done = {'exit': 'poweroff', 'serial': fw.expected_serial(n), 'vcpus': [{'decodes': 19, 'shootdowns': 1}] * n}
         assert fw.judge('firmware', n, done, want_exit='poweroff') + fw.judge_bounds(done) == []
         assert fw.judge('firmware', n, {**done, 'exit': 'resident'}, want_exit='poweroff')

@@ -51,11 +51,12 @@ argv = ["tests/boot/run_boot_smoke.py", "--only", "startup", "--host", "{natemu_
 needs = { cores = 4, perf = true }
 
 # The M2 exit test's firmware (tests/boot/exit_fw.asm) and its AP part as a 64-bit program (exit_prog.asm), both built
-# here with nasm, on the references at 1, 2 and 4 CPUs (tests/boot/run_exit_fw.py; docs/restructure/m2-exit-firmware.md):
-# -qemu the pinned QEMU 11.1.2 under TCG, -kvm real hardware (the x86 reference machine under KVM). Their answers are
-# locked in tests.lock: a run checks that the lock's answer for the image as built now is the expected report, without
-# QEMU or the x86 machine; seeding (TESTKIT_SEED_ANSWERS=1, and NATEMU_X86_HOST=user@host for -kvm) runs them. The
-# natemu cases: the program variant's (the CPU start-up slice) and the firmware's (the firmware boot mode).
+# here with nasm, on the references at 1, 2, 4 and 8 CPUs (tests/boot/run_exit_fw.py;
+# docs/restructure/m2-exit-firmware.md): -qemu the pinned QEMU 11.1.2 under TCG, -kvm real hardware (the x86 reference
+# machine under KVM). Their answers are locked in tests.lock: a run checks that the lock's answer for the image as built
+# now is the expected report, without QEMU or the x86 machine; seeding (TESTKIT_SEED_ANSWERS=1, and
+# NATEMU_X86_HOST=user@host for -kvm) runs them. The natemu cases: the program variant's (the CPU start-up slice) and the
+# firmware's (the firmware boot mode).
 [[suite]]
 name = "exit-fw"
 kind = "judged"
@@ -82,16 +83,16 @@ argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "kvm",
 needs = { cores = 1 }
 timeout = 2400
 
-# The program variant under natemu (tests/boot/run_exit_fw.py --backend natemu): at 1, 2 and 4 CPUs the APs climb from
-# their SIPI in the boot-time interpreter (16 -> 32 -> compatibility mode) to 64-bit code and are counted from there.
+# The program variant under natemu (tests/boot/run_exit_fw.py --backend natemu): at 1, 2, 4 and 8 CPUs the APs climb
+# from their SIPI in the boot-time interpreter (16 -> 32 -> compatibility mode) to 64-bit code and are counted from there.
 [suite.cases."exit-ap-natemu"]
 argv = ["tests/boot/run_exit_fw.py", "--variant", "program", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
 smoke = true
 
-# The firmware under natemu's firmware boot mode (docs/restructure/firmware-mode.md), at 1, 2 and 4 CPUs, the BSP from the
-# reset vector: COM1's report and the power-off, decode exits and shootdowns bounded (tests/boot/run_exit_fw.py --variant
-# firmware --backend natemu).
+# The firmware under natemu's firmware boot mode (docs/restructure/firmware-mode.md), at 1, 2, 4 and 8 CPUs, the BSP
+# from the reset vector: COM1's report and the power-off, decode exits and shootdowns bounded per vCPU
+# (tests/boot/run_exit_fw.py --variant firmware --backend natemu).
 [suite.cases."exit-fw-natemu"]
 argv = ["tests/boot/run_exit_fw.py", "--variant", "firmware", "--backend", "natemu", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }

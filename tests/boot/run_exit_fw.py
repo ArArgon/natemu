@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The M2 exit test's firmware and its AP part as a 64-bit program, on the references (docs/restructure/m2-exit-firmware.md).
 
-    tests/boot/run_exit_fw.py --variant firmware|program --backend qemu|kvm [--cpus 1 2 4] --out DIR
-    tests/boot/run_exit_fw.py --variant firmware|program --backend natemu --fexc FEXC [--cpus 1 2 4] --out DIR
+    tests/boot/run_exit_fw.py --variant firmware|program --backend qemu|kvm [--cpus 1 2 4 8] --out DIR
+    tests/boot/run_exit_fw.py --variant firmware|program --backend natemu --fexc FEXC [--cpus 1 2 4 8] --out DIR
 
 natemu, the program variant (M2 Part 2): the program driver runs exit_prog.asm's body with CPU 0 at its start and
 every other vCPU waiting for a SIPI (`wait-for-sipi`): the description of docs/restructure/m2-exit-firmware.md. Each AP
@@ -40,7 +40,7 @@ HERE = ROOT / 'tests' / 'boot'
 sys.path[:0] = [str(ROOT / 'tools' / 'bench' / 'smp'), str(ROOT / 'tools' / 'reference')]
 import smp, answers  # noqa: E402
 
-CPUS = (1, 2, 4)
+CPUS = (1, 2, 4, 8)
 AP_BASE = 0x8000                                # exit_ap.inc's stub page (SIPI vector 08H)
 FW_SIZE = 0x10000                               # at 4 GiB - FW_SIZE
 BODY = smp.LOW                                  # the program's body (110000H), its start RIP 1000H further
@@ -48,8 +48,9 @@ START = BODY + 0x1000
 RSP = 0x3E1800                                  # CPU 0's stack in the smp stub's map (never used: no stack)
 FW_RAM = 64 << 20                               # natemu's firmware runs: the references' -m 64
 # Per vCPU (plan section 8): decode exits, the BSP's 49 16- and 32-bit instructions and an AP's 30 in runs of up to 16
-# (19 and 16 at 1, 2 and 4 CPUs, exit-fw-natemu, M2 Max, November 22); shootdowns asked, the APs' counter stores on their
-# stub page while it holds the 64-bit code's translations (plan section 5; at most 2 there).
+# (19 and 16 at 1, 2, 4 and 8 CPUs, exit-fw-natemu, M2 Max, November 22); shootdowns asked, one for each peer holding a
+# writable shadow of the stub page (its counter stores) when a vCPU marks the page for its 64-bit code's translations
+# (plan section 5; at most 3 there at 4 and at 8 CPUs, timing-dependent; one mark asks at most N - 1).
 DECODES_MAX = 32
 SHOOTDOWNS_MAX = 8
 TCG_CPU = smp.SYSTEM_CPU

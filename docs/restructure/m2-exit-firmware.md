@@ -1,11 +1,11 @@
 # M2 exit test: the firmware and its AP part
 
 Status (November 22, 2026, `boot-interp` commits 6e166015 to 943b3f2e, a120f189 to aaa65e74 before the branch's rebase
-onto main): built by the framework from the repository and proven on the pinned QEMU 11.1.2 (TCG) and on real hardware
-through KVM, at 1, 2 and 4 CPUs. natemu runs the program variant whole at 1, 2 and 4 CPUs, each AP's stub in the
-boot-time interpreter (case `exit-ap-natemu`: the CPU start-up slice, B2 of the boot-time interpreter plan); the
-firmware image runs whole in natemu's firmware boot mode at 1, 2 and 4 CPUs ([firmware-mode.md](firmware-mode.md), case
-`exit-fw-natemu`). This page is the contract those slices build to.
+onto main; the runs at 8 CPUs added the same day): built by the framework from the repository and proven on the pinned
+QEMU 11.1.2 (TCG) and on real hardware through KVM, at 1, 2, 4 and 8 CPUs. natemu runs the program variant whole at 1,
+2, 4 and 8 CPUs, each AP's stub in the boot-time interpreter (case `exit-ap-natemu`: the CPU start-up slice, B2 of the
+boot-time interpreter plan); the firmware image runs whole in natemu's firmware boot mode at 1, 2, 4 and 8 CPUs
+([firmware-mode.md](firmware-mode.md), case `exit-fw-natemu`). This page is the contract those slices build to.
 
 ## The pieces
 
@@ -97,7 +97,7 @@ state (the power-on state, no other state items). The description is then:
 
 The driver's tables (placed from `--place`, 1000H by default) are below 4 GiB, as the stub's 32-bit `mov cr3` needs.
 The pass is vCPU 0 reaching its end with the registers above; each AP ends halted in its park loop. `exit-ap-natemu`
-(`run_exit_fw.py --backend natemu`) passes at 1, 2 and 4 CPUs: each AP climbs from its SIPI in the boot-time
+(`run_exit_fw.py --backend natemu`) passes at 1, 2, 4 and 8 CPUs: each AP climbs from its SIPI in the boot-time
 interpreter (16 -> 32 -> compatibility mode) to 64-bit code and arrives once, counted from there; at one CPU the IPIs
 select no CPU.
 
@@ -129,7 +129,7 @@ select no CPU.
 
 ## What runs now
 
-Cases of the `exit-fw` suite in `tests/boot/family.toml`, each at 1, 2 and 4 CPUs (one result per N):
+Cases of the `exit-fw` suite in `tests/boot/family.toml`, each at 1, 2, 4 and 8 CPUs (one result per N):
 
 | Case | Reference | Image | Pass |
 | --- | --- | --- | --- |
@@ -144,13 +144,23 @@ answer for the image as built and checks it is the pass. An image changed since 
 "exit-fw or exit-ap"`, twice, then `tools/natemu-test lock tests/boot --from-run RUN1 RUN2`.
 
 **Results (seeded November 22, 2026, on the M2 Max and the x86 reference machine, AMD Ryzen 7 8845HS, kernel
-7.0.0-43-generic, Debian's QEMU 10.0.13 for KVM; two seeding runs agreed, `tests/boot/tests.lock`):** all twelve pass.
+7.0.0-43-generic, Debian's QEMU 10.0.13 for KVM; two seeding runs agreed, `tests/boot/tests.lock`; the 8-CPU answers
+seeded the same way the same day, the 1, 2 and 4 CPU ones unchanged):** all sixteen pass. At 8 CPUs KVM overcommits the
+reference machine, a KVM guest with 4 cores.
 
 | N | Firmware's COM1 report (TCG and KVM alike) | Program's CPU 0 (TCG and KVM alike) |
 | --- | --- | --- |
 | 1 | `EXITFW cpus=1 aps=0 ids=- status=0` | RAX 1, RBX 0, RCX 0, RDX 0 |
 | 2 | `EXITFW cpus=2 aps=1 ids=1 status=0` | RAX 2, RBX 1, RCX 0, RDX 2H |
 | 4 | `EXITFW cpus=4 aps=3 ids=1,2,3 status=0` | RAX 4, RBX 3, RCX 0, RDX 0EH |
+| 8 | `EXITFW cpus=8 aps=7 ids=1,2,3,4,5,6,7 status=0` | RAX 8, RBX 7, RCX 0, RDX 0FEH |
+
+natemu (`exit-ap-natemu`, `exit-fw-natemu`, M2 Max, November 22) passes at all four counts. In the firmware runs every
+vCPU stays under the bounds `run_exit_fw.judge_bounds` asserts per vCPU (32 decode exits, 8 shootdowns asked): decode
+exits are 19 on the BSP and 16 on each AP at every count, so they do not grow with N; shootdowns asked were at most 3 on
+any vCPU at 4 and at 8 CPUs (8 in all at 8). A vCPU asks one shootdown for each peer holding a writable shadow of the
+stub page when it marks the page for its translations, so one mark asks at most N - 1 (7 at 8 CPUs), and the count
+varies with timing.
 
 Shown to fail when they should: a run with the image changed after seeding fails every case with `ANSWER-MISSING`;
 `test_exit_fw.py` refuses wrong reports and registers, checks its instruction check against forms outside the list
@@ -166,11 +176,11 @@ HLT) does not either. The exit test's APs park in 64-bit code in a `cli; hlt` lo
 
 - Today `lapic.rs` stops `unsupported_system` at any INIT or start-up IPI, before looking at the targets: at 1 vCPU,
   the all-excluding-self INIT has no target and must become a no-op, not a stop.
-- The CPU start-up slice's case: the program at 1, 2 and 4 vCPUs, judged by `run_exit_fw.judge('program', N, answer,
+- The CPU start-up slice's case: the program at 1, 2, 4 and 8 vCPUs, judged by `run_exit_fw.judge('program', N, answer,
   want_exit=...)` on the driver's final registers, with the answer's `exit` set from vCPU 0's stop (its end reached)
-  in place of QEMU's exit status. The firmware boot mode's case: the image at 1, 2, 4 and more vCPUs, judged by
+  in place of QEMU's exit status. The firmware boot mode's case: the image at 1, 2, 4 and 8 vCPUs, judged by
   `judge('firmware', N, answer, want_exit='poweroff')` on natemu's serial output and its `poweroff` stop; the plan's
-  bounds on decode exits and shootdowns (section 8) are asserted there.
+  bounds on decode exits and shootdowns (section 8) are asserted there, per vCPU.
 - The stub page holds the APs' 64-bit code and the counter: once one AP has translated its 64-bit code there, the
   other APs' counter stores go through `code_write` while later APs may still be interpreting their 16-bit code on
   the same page (plan section 5); that is what the case exercises.
