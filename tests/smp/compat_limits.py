@@ -636,6 +636,31 @@ def cases():
                 base=(0xffffffff if width == 2 else 0xfffffffe) if wrap else tls, mapped=C.WRAP if wrap else (),
                 prefix=alu_seed, success=True, ecx=result, rflags=0x45, kernel_setup=up if wrap else '')
         add(name + '-limit', insn, segment='gs', limit=width-1, prefix='    mov edi, 1\n' + alu_seed, ecx=alu_initial, rflags=0x10045)
+    def xlat_regs(ebx, al):
+        return f'    cmp al, al\n    stc\n    mov ebx, {ebx:#x}\n    mov eax, {0xaabbcc00 | al:#x}\n'
+
+    xlat_absent = f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n'
+    add('ds-xlat-ok', 'xlatb', prefix=xlat_regs(tls, 1), success=True, eax=0xaabbcc22, rflags=0x45)
+    for seg in ('fs', 'gs'):
+        insn = f'{seg} xlatb'
+        add(f'{seg}-xlat-ok', insn, segment=seg, prefix=xlat_regs(2, 1),
+            success=True, eax=0xaabbcc44, rflags=0x45)
+        add(f'{seg}-xlat-limit', insn, segment=seg, base=C.XPAGE, prefix=xlat_regs(3, 1),
+            kernel_setup=xlat_absent, eax=0xaabbcc01, rflags=0x10045)
+        add(f'{seg}-xlat-page-fault', insn, segment=seg, base=C.XPAGE, prefix=xlat_regs(2, 1),
+            kernel_setup=xlat_absent, fault=14, error=4, cr2=C.XPAGE + 3, eax=0xaabbcc01, rflags=0x10045)
+        add(f'{seg}-xlat-unsigned-al', insn, segment=seg, base=tls - 0x80, limit=0x83,
+            prefix=xlat_regs(2, 0x81), success=True, eax=0xaabbcc44, rflags=0x45)
+        add(f'{seg}-xlat-offset-wrap', insn, segment=seg, prefix=xlat_regs(0xffffff80, 0x83),
+            success=True, eax=0xaabbcc44, rflags=0x45)
+        # This high segment base and in-range offset sum to the original low test buffer.
+        add(f'{seg}-xlat-base-wrap', insn, segment=seg, base=(tls - 0x400000) & 0xffffffff, limit=0x400, flags=12,
+            prefix=xlat_regs(0x400002, 1), success=True, eax=0xaabbcc44, rflags=0x45)
+        add(f'{seg}-xlat-null', insn, segment=seg, selector=0, prefix=xlat_regs(2, 1), eax=0xaabbcc01, rflags=0x10045)
+    add('fs-xlat-address16-refusal', 'a16 fs xlatb', prefix=xlat_regs(2, 1),
+        fault=6, eax=0xaabbcc01, rflags=0x10045)
+    add('gs-xlat-retry-after-reload', 'gs xlatb', segment='gs', prefix=xlat_regs(3, 1),
+        eax=0xaabbcc55, success=True, reload_limit=4, retry_regs={C.REC + 0x40: struct.pack('<I', 0xaabbcc01)})
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)

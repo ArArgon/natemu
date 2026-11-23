@@ -14,6 +14,8 @@ CASES = {
     'mov eax,[ebp-12]': ('8b45f4', ['load']),
     'mov [ebx+ecx*4+16],eax': ('89448b10', ['store']),
     'mov eax,gs:[eax-8]': ('658b40f8', ['load']),
+    'fs xlat': ('64d7', ['load']),
+    'gs xlat': ('65d7', ['load']),
     'vmovups ymm0,[ebx+32]': ('c5fc104320', ['load_pair']),
     'push [ebx+8]': ('ff7308', ['load', 'push']),
     'push esp': ('54', ['push']),

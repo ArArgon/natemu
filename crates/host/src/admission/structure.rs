@@ -63,7 +63,7 @@ use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
 use natemu_abi::execution::{
-    DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, bitmask, frame, svc,
+    DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, SRA32, bitmask, frame, svc,
 };
 
 /// The 64-bit index forms (LSL, UXTX, SXTX) compute the same address: one extend value.
@@ -742,6 +742,7 @@ struct ScalarOperand {
     store_immediate: Option<u32>,
     result_and_length: u8,
     absolute_offset: Option<u32>,
+    xlat: bool,
 }
 
 fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
@@ -768,6 +769,10 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let moffs = matches!(i.code(), Code::Mov_AL_moffs8 | Code::Mov_AX_moffs16 | Code::Mov_EAX_moffs32
             | Code::Mov_moffs8_AL | Code::Mov_moffs16_AX | Code::Mov_moffs32_EAX);
         if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
+        let xlat = i.code() == Code::Xlat_m8;
+        if xlat && (i.memory_base() != Register::EBX || i.memory_index() != Register::AL) {
+            return Err("unsupported 16-bit XLAT address".into());
+        }
         let store_immediate = match i.code() {
             Code::Mov_rm8_imm8 => Some(u32::from(i.immediate8())),
             Code::Mov_rm16_imm16 => Some(u32::from(i.immediate16())),
@@ -798,7 +803,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             | Code::Imul_r16_rm16_imm8 | Code::Imul_r32_rm32_imm8 | Code::Imul_r16_rm16_imm16 | Code::Imul_r32_rm32_imm32
             | Code::Movbe_r16_m16 | Code::Movbe_r32_m32 | Code::Crc32_r32_rm8 | Code::Crc32_r32_rm16 | Code::Crc32_r32_rm32
                 => object::SEGMENT_NATIVE_LOAD,
-            Code::Add_r8_rm8 | Code::Add_r16_rm16 | Code::Add_r32_rm32
+            Code::Xlat_m8 | Code::Add_r8_rm8 | Code::Add_r16_rm16 | Code::Add_r32_rm32
             | Code::Or_r8_rm8 | Code::Or_r16_rm16 | Code::Or_r32_rm32
             | Code::Adc_r8_rm8 | Code::Adc_r16_rm16 | Code::Adc_r32_rm32
             | Code::Sbb_r8_rm8 | Code::Sbb_r16_rm16 | Code::Sbb_r32_rm32
@@ -820,13 +825,16 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let first_is_memory = i.op0_kind() == OpKind::Memory;
         let other = u32::from(first_is_memory);
         // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
-        let modrm_reg = if i.op_kind(other) == OpKind::Register {
+        let modrm_reg = if xlat {
+            Register::AL.number() as u8
+        } else if i.op_kind(other) == OpKind::Register {
             i.op_register(other).number() as u8
         } else if i.mnemonic() == iced_x86::Mnemonic::Cmp { 7 } else { 0 };
         let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
             data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, result_and_length: result | i.len() as u8,
+            xlat,
         });
     }
     if !guarded.is_empty() {
@@ -1161,10 +1169,40 @@ impl<'a> Verifier<'a> {
             {
                 return Err("scalar segment check continuation".into());
             }
+            if op.xlat {
+                self.xlat_effect(p.native_offset, setup, access, end, site.base_reg)?;
+            }
             self.claim(site.native_offset);
         }
         if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != guarded.len() {
             return Err("extra scalar segment check".into());
+        }
+        Ok(())
+    }
+
+    fn xlat_effect(&self, start: u32, setup: u32, access: &Site, end: u32, offset: u8) -> Result<(), String> {
+        let eax = u32::from(SRA32[0]);
+        let ebx = u32::from(SRA32[3]);
+        // The original roots survive through UXTB AL, ADD (32-bit), the check and the byte load.
+        let add = self.last_write(offset, start, setup).filter(|&at| at >= start + 4)
+            .ok_or("XLAT offset is missing its 32-bit sum")?;
+        let index = (self.word(add - 4) & 31) as u8;
+        if !xlat_allocated_registers([index, offset, access.base_reg, access.data_reg[0]]) {
+            return Err("XLAT temporary is not an allocatable compatibility register".into());
+        }
+        let index = u32::from(index);
+        if self.word(add - 4) != 0x5300_1c00 | eax << 5 | index
+            || self.word(add) != 0x0b00_0000 | index << 16 | ebx << 5 | u32::from(offset)
+            || self.branches_into(add - 4, setup).any(|(from, to)| from <= add || from >= to)
+        {
+            return Err("XLAT offset is not EBX plus unsigned AL".into());
+        }
+        let merge = access.native_offset + 4;
+        if merge >= end || self.word(merge) != 0xb340_1c00 | u32::from(access.data_reg[0]) << 5 | eax
+            || self.written((1 << eax) | (1 << ebx), start, merge)
+            || self.branches_into(access.native_offset, merge).next().is_some()
+        {
+            return Err("XLAT byte load does not preserve and merge AL".into());
         }
         Ok(())
     }
@@ -2637,6 +2675,12 @@ impl<'a> Verifier<'a> {
     }
 }
 
+/// FEX's `x32::RA` excludes the guest's static registers, platform/state registers, WZR and the
+/// emitter's reserved scratch (including w0 used at the bank check).
+fn xlat_allocated_registers(regs: [u8; 4]) -> bool {
+    regs.into_iter().all(|r| matches!(r, 12..=17 | 19..=24 | 29..=30))
+}
+
 /// Whether the floating-point or SIMD word `x` reads v1 (AFP accurate plan chunk 4: the FMA check's stale destination): as Rn, as Rm (the
 /// three-register classes and the by-element, scalar and permute forms), as a scalar FMA's Rm or addend, as the destination of an accumulating
 /// form (fmla, fmls, mla, mls, bsl, bit, bif, ins), or as the data of a SIMD store.
@@ -3190,6 +3234,40 @@ mod tests {
         }
         let e = admit(&compile("4889d8c3", "0x8048000", "64"), true).expect_err("64-bit code admitted as 32-bit code");
         assert!(e.contains("profile or settings"), "{e}");
+        let allocated = [12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 29, 30];
+        for role in 0..4 {
+            for reg in 0..32 {
+                let mut regs = [20; 4];
+                regs[role] = reg;
+                assert_eq!(xlat_allocated_registers(regs), allocated.contains(&reg), "XLAT role {role}, w{reg}");
+            }
+        }
+        for hex in ["64d7", "89c389c865d790"] {
+            let (o, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&o, 0);
+            let guard = (0..h.sites_count as usize)
+                .map(|n| super::super::record::<Site>(&o, h.sites_offset as usize + n * size_of::<Site>()))
+                .find(|s| s.kind == object::kind::SEGMENT).unwrap();
+            let merge = guard.guest_offset2 + 4;
+            let at = (h.code_offset + merge) as usize;
+            let word = u32::from_le_bytes(o[at..at + 4].try_into().unwrap());
+            let (extract, uxtb) = (guard.insn_native_offset..guard.imm as u32 - 8)
+                .step_by(4)
+                .map(|pc| {
+                    let at = (h.code_offset + pc) as usize;
+                    (pc, u32::from_le_bytes(o[at..at + 4].try_into().unwrap()))
+                })
+                .find(|&(_, w)| w & !31 == 0x5300_1c00 | u32::from(SRA32[0]) << 5)
+                .expect("XLAT must extract unsigned AL");
+            for shape in [false, true] {
+                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
+                check(&o).unwrap();
+                let changed = patched((&o, &src), merge, word, word ^ (1 << 10));
+                assert!(check(&changed).unwrap_err().contains("does not preserve and merge AL"));
+                let changed = patched((&o, &src), extract, uxtb, uxtb & !31 | u32::from(SRA32[1]));
+                assert!(check(&changed).unwrap_err().contains("not an allocatable compatibility register"));
+            }
+        }
         let (alu, source) = compile("65330f", "0x8048000", "32");
         let h: Header = super::super::record(&alu, 0);
         let (site_offset, guard) = (0..h.sites_count as usize)
