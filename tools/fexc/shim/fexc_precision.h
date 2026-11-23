@@ -494,7 +494,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
-  case OP_ROTATEFLAGS: case OP_FEXCFLUSH: return false;
+  case OP_ROTATEFLAGS: case OP_FEXCFLUSH: case OP_FEXCSEGMENTBASE: return false;   // (the operand check of a limited FS or GS: a fault point, no effect)
   default: return HasSideEffects(Op);
   }
 }

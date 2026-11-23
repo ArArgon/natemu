@@ -4750,36 +4750,46 @@ mod tests {
                     scope.spawn(move || {
                         let (mut translated, mut refused) = (0, Vec::new());
                         for form in chunk.iter() {
-                            for step in [true, false] {
+                            // (Also with every x87 and SIMD exception unmasked: the code then checks each floating-point
+                            // instruction's flags, with its own rules on what may precede the check.)
+                            for (step, unmasked) in [(true, false), (false, false), (false, true)] {
                                 let source = if step { form.clone() } else { [&form[..], &[0xc3]].concat() };
                                 let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
-                                let object = dir.join(format!("o{n}"));
-                                let _ = std::fs::remove_file(&object);
-                                let mut c = std::process::Command::new(fexc);
-                                c.args(["--hex", &hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run", "--fs-limited"]);
-                                if step {
-                                    c.args(["--max-insts", "1"]);
-                                }
-                                let out = c.arg("--object").arg(&object).arg("--out").arg("/dev/null").output().unwrap();
-                                let Ok(o) = std::fs::read(&object) else { continue };
-                                let h: Header = super::super::record(&o, 0);
-                                // (Cut before the instruction, or after it: only a unit that holds it counts.)
-                                if !out.status.success() || (h.guest_bytes as usize) < form.len() {
-                                    continue;
-                                }
-                                translated += 1;
-                                if let Err(e) = super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, user) {
-                                    // Not the check's doing when the same unit compiled without it is refused too.
-                                    let flat = dir.join(format!("f{n}"));
+                                let label = if step { " (step)" } else if unmasked { " (unmasked)" } else { "" };
+                                // The unit's object when fexc translated the instruction (not cut before it or after it); fexc
+                                // must answer either way.
+                                let compile = |limited: bool| -> Option<Vec<u8>> {
+                                    let object = dir.join(format!("o{n}"));
+                                    let _ = std::fs::remove_file(&object);
                                     let mut c = std::process::Command::new(fexc);
                                     c.args(["--hex", &hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run"]);
+                                    if limited {
+                                        c.arg("--fs-limited");
+                                    }
                                     if step {
                                         c.args(["--max-insts", "1"]);
                                     }
-                                    assert!(c.arg("--object").arg(&flat).arg("--out").arg("/dev/null").output().unwrap().status.success(), "{hex}");
-                                    let f = std::fs::read(&flat).unwrap();
-                                    let also = super::super::admit_mode(&f, h.guest_rip, &source, u64::MAX, true, false, true).is_err();
-                                    refused.push(format!("{hex}{}{}: {e}", if step { " (step)" } else { "" }, if also { " (also without the check)" } else { "" }));
+                                    if unmasked {
+                                        c.args(["--x87-unmasked", "0x3f", "--simd-unmasked", "0x3f"]);
+                                    }
+                                    let out = c.arg("--object").arg(&object).arg("--out").arg("/dev/null").output().unwrap();
+                                    assert!(out.status.code().is_some(), "{hex}{label}: fexc died");
+                                    let o = std::fs::read(&object).ok().filter(|_| out.status.success())?;
+                                    (super::super::record::<Header>(&o, 0).guest_bytes as usize >= form.len()).then_some(o)
+                                };
+                                let Some(o) = compile(true) else {
+                                    // The check must not cost a form: what fexc translates without it, it translates with it.
+                                    if compile(false).is_some() {
+                                        refused.push(format!("{hex}{label}: translated only without the check"));
+                                    }
+                                    continue;
+                                };
+                                let h: Header = super::super::record(&o, 0);
+                                translated += 1;
+                                if let Err(e) = super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, user) {
+                                    // Not the check's doing when the same unit compiled without it is refused too.
+                                    let also = compile(false).is_none_or(|f| super::super::admit_mode(&f, h.guest_rip, &source, u64::MAX, true, false, true).is_err());
+                                    refused.push(format!("{hex}{label}{}: {e}", if also { " (also without the check)" } else { "" }));
                                 }
                                 // The same object is never admitted as a block whose FS is not limited, nor outside CPL 3
                                 // (a form that accesses nothing, a prefetch or a hint NOP, has no check and is).

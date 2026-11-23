@@ -160,11 +160,11 @@ def cases(*, reference_control=False):
         enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23, flags=enter_flags)
         gates = C.gate(12, '.v12')
         vectors = [1, 6, 12, 13, 14, 128]
-        if fault in (0, 1, 7, 17):
+        if fault in (0, 1, 7, 16, 17):
             gates += C.gate(fault, f'.v{fault}')
         if fault == 0:
             vectors.insert(0, 0)
-        elif fault in (7, 17):
+        elif fault in (7, 16, 17):
             vectors.append(fault)
         handlers = C.handlers(saved, xmm=True, vectors=tuple(vectors), flags_mask=flags_mask)
         if fp_controls:
@@ -1192,6 +1192,20 @@ def cases(*, reference_control=False):
     add('fs-generic-address-xlat-in', 'fs xlatb', limit=7, success=True, prefix='    mov ebx, 4\n    mov eax, 0xffffff03\n',
         eax=0xffffff00 | VALUE[7], checks=0)
     add('fs-generic-address-xlat-over', 'fs xlatb', limit=7, prefix='    mov ebx, 4\n    mov eax, 0xffffff04\n', eax=0xffffff04, checks=1)
+    # A pending unmasked x87 exception is reported at the next waiting x87 instruction before that instruction's operand is
+    # judged: #MF, not the segment's #GP, whether the operand is in range or not (CR0.NE: the exception is #MF).
+    pending = (f'    fninit\n    mov word [{C.W + 0x50:#x}], 0x37b\n    fldcw [{C.W + 0x50:#x}]\n'
+               '    fld1\n    fldz\n    fdivp st1, st0\n')
+    ne = '    mov rax, cr0\n    bts rax, 5\n    mov cr0, rax\n'
+    add('fs-generic-pending-mf-over', 'fld dword [fs:edi+1]', limit=3, fault=16, prefix=pending, kernel_setup=ne, checks=0)
+    add('fs-generic-pending-mf-in', 'fld dword [fs:edi+1]', limit=4, fault=16, prefix=pending, kernel_setup=ne, checks=0)
+    # 64-bit code with the same prefixes and forms: limits are ignored and the code has no check.
+    add('fs-generic-ignored-limit64-inc', 'inc dword [fs:rdi+8]', cpl3_mode=64, success=True,
+        memory=VALUE[:8] + (int.from_bytes(VALUE[8:12], 'little') + 1).to_bytes(4, 'little') + VALUE[12:], checks=0)
+    add('gs-generic-ignored-limit64-movss', 'movss [gs:rdi+8], xmm1', segment='gs', cpl3_mode=64, success=True,
+        memory=VALUE[:8] + INITIAL[:4] + VALUE[12:], checks=0)
+    add('fs-generic-ignored-limit64-readonly', 'lock add [fs:rdi+8], eax', access=0xf1, cpl3_mode=64, success=True,
+        prefix='    mov eax, 0x10\n', memory=VALUE[:8] + (int.from_bytes(VALUE[8:12], 'little') + 0x10).to_bytes(4, 'little') + VALUE[12:], checks=0)
     # Segments the record does not model are the resident's on every access: read-only (reads pass, writes fault),
     # expand-down, and a one-byte read at offset 0 under a segment whose record is 0.
     add('fs-generic-readonly-read', 'add ecx, [fs:edi]', access=0xf1, success=True, prefix='    xor ecx, ecx\n',

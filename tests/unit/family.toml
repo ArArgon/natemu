@@ -12,7 +12,7 @@ name = "unit"
 name = "rust"
 kind = "units"
 harness = "units"
-params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp"] }
+params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp", "rust-fs-sweep"] }
 needs = { cores = 4, perf = true }
 
 [[suite]]
@@ -28,6 +28,15 @@ kind = "units"
 harness = "units"
 params = { tool = "nextest", fexc = true, filter = "test(/afp/)" }
 needs = { cores = 1, perf = true }
+
+[[suite]]
+name = "rust-fs-sweep"
+# M2 checkpoint C: admission's sweep of every 32-bit memory form through a limited FS (about 100,000 compiles on eight
+# threads, under three minutes): on its own, so the other Rust tests do not wait for it.
+kind = "units"
+harness = "units"
+params = { tool = "nextest", fexc = true, filter = "test(/every_limited_fs_form/)" }
+needs = { cores = 8, perf = true }
 
 [[suite]]
 name = "rust-afp"
