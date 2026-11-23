@@ -29,7 +29,7 @@ def cases():
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -61,7 +61,7 @@ def cases():
                      f'    mov {segment}, ax\n    jmp .resume\n.done:\n' + saved)
         enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23).replace('    push 2\n', f'    push {enter_flags}\n')
         prog = C.program(name, C.gate(12, '.v12') + (C.gate(1, '.v1') if fault == 1 else '') + setup + kernel_setup + enter
-                         + C.handlers(saved, xmm=True, vectors=(1, 6, 12, 13, 14, 128)), user, memory=mapped)
+                         + C.handlers(saved, xmm=True, vectors=(1, 6, 12, 13, 14, 128), flags_mask=flags_mask), user, memory=mapped)
         # Handler offsets are from compat.handlers, the target memory and CR2 are independent of the recorded frame.
         expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, error, rip,
                                                                      0xdb if cpl3_mode == 32 else 0x23),
@@ -171,6 +171,34 @@ def cases():
     init = '    mov ax, 0x2211\n    mov rbx, 0xfffffffe\n    mov [rbx], ax\n'
     up = init + '    xor ebx, ebx\n    mov word [rbx], 0x4433\n'
     have = {high: bytes.fromhex('1122'), low: bytes.fromhex('3344')}
+    # C6/C7 /0 have no source GPR. In particular the wrapped resident completion must preserve
+    # EAX and use the same immediate bytes as the ordinary native store.
+    imm_regs = '    mov eax, 0x13572468\n    cmp al, al\n    stc\n'
+    imm = dict(prefix=imm_regs, eax=0x13572468)
+    add('fs-generated-imm-byte', 'mov byte [fs:edi+3], 0xfe', success=True,
+        memory=VALUE[:3] + bytes([0xfe]) + VALUE[4:], **imm)
+    add('gs-generated-imm-word', 'mov word [gs:edi+2], 0x81c3', success=True, segment='gs',
+        memory=VALUE[:2] + bytes.fromhex('c381') + VALUE[4:], **imm)
+    add('fs-generated-imm-absolute-zero', 'mov dword [fs:0], 0', success=True,
+        memory=bytes(4) + VALUE[4:], **imm)
+    add('gs-generated-imm-limit-before-page', 'mov dword [gs:edi+1], 0x89abcdef', base=C.XPAGE, segment='gs',
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n',
+        rflags=0x10045, **imm)
+    add('gs-generated-imm-indexed-write-pf', 'mov dword [gs:edi+esi*4+8], 0x89abcdef', base=C.XPAGE - 16,
+        segment='gs', limit=19, fault=14, error=7, cr2=C.XPAGE, eax=0x13572468, rflags=0x10045,
+        prefix=imm_regs + '    mov esi, 2\n',
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -3\n    invlpg [{C.XPAGE:#x}]\n')
+    add('fs-generated-imm-readonly', 'mov byte [fs:edi], 0xa5', access=0xf1, rflags=0x10045, **imm)
+    add('fs-generated-imm-address16-refusal', 'mov byte [fs:bx+si], 0x12', fault=6, **imm)
+    add('gs-generated-imm-wrapped-word', 'mov word [gs:edi], 0x81c3', base=0xffffffff, segment='gs',
+        mapped=C.WRAP, limit=1, success=True, kernel_setup=up, rflags=0x45,
+        captured={high: bytes.fromhex('11c3'), low: bytes.fromhex('8144')}, **imm)
+    add('fs-generated-imm-wrapped-dword', 'mov dword [fs:edi], 0x89abcdef', base=0xfffffffe, mapped=C.WRAP,
+        success=True, kernel_setup=up, rflags=0x45,
+        captured={high: bytes.fromhex('efcd'), low: bytes.fromhex('ab89')}, **imm)
+    add('gs-generated-imm-wrapped-missing', 'mov dword [gs:edi], 0x89abcdef', base=0xfffffffe, segment='gs',
+        mapped=C.TOP_ONLY, fault=14, error=6, cr2=0, kernel_setup=init, rflags=0x10045,
+        captured={high: bytes.fromhex('1122')}, **imm)
     # String source and destination have independent selectors. Inspect the saved element boundary, including
     # both pointers and the count, even when the first element succeeds and the next one faults.
     dest = C.W + 0xc0
@@ -250,6 +278,8 @@ def cases():
         mapped=low_rom, firmware=rom, prefix=seed, success=True, ecx=0x44332211, kernel_setup=init)
     add('fs-generated-wrapped-store-rom-low', 'mov [fs:edi], ecx', base=0xfffffffe, mapped=low_rom,
         firmware=rom, prefix=seed, success=True, kernel_setup=init, captured={high: bytes.fromhex('7856')})
+    add('fs-generated-imm-wrapped-rom', 'mov dword [fs:edi], 0x89abcdef', base=0xfffffffe, mapped=low_rom,
+        firmware=rom, success=True, kernel_setup=init, captured={high: bytes.fromhex('efcd')}, **imm)
     low_apic = [C.entry(C.TA + 0x3000, 0xfee00000 | C.P.LEAF) if n == 3 else mem for n, mem in enumerate(C.WRAP)]
     add('fs-generated-wrapped-claimed-read', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=low_apic,
         prefix=seed, refuse='crossing', kernel_setup=init, captured={high: bytes.fromhex('1122')})
@@ -262,6 +292,45 @@ def cases():
             mapped=C.TOP_ONLY, prefix=seed, ecx=0x12345678, fault=14, error=6 if write else 4, cr2=0,
             kernel_setup=init, captured={high: bytes.fromhex('1122')})
     watch_low = '    xor eax, eax\n    mov dr0, rax\n    mov eax, 0x10001\n    mov dr7, rax\n'
+    add('gs-generated-imm-wrapped-watch', 'mov dword [gs:edi], 0x89abcdef', base=0xfffffffe, segment='gs',
+        mapped=C.WRAP, fault=1, after_trap=True, kernel_setup=up + watch_low,
+        captured={high: bytes.fromhex('efcd'), low: bytes.fromhex('ab89')}, **imm)
+    # Non-LOCK ADD r/m,r. The dword pair sums to zero, setting CF, PF, AF and ZF.
+    rmw_src = 0xbbccddef
+    rmw_seed = f'    mov ecx, {rmw_src:#x}\n    cmp eax, eax\n    stc\n'
+    add('fs-add-rmw-ordinary', 'add [fs:edi], ecx', prefix=rmw_seed, success=True,
+        ecx=rmw_src, rflags=0x55, memory=bytes(4) + VALUE[4:])
+    add('gs-add-rmw-high-byte', 'add [gs:edi], ch', segment='gs', prefix='    mov ecx, 0x7f00\n',
+        success=True, ecx=0x7f00, rflags=0x894, memory=bytes([0x90]) + VALUE[1:])
+    add('fs-add-rmw-readonly-segment', 'add [fs:edi], ecx', access=0xf1, prefix=rmw_seed, ecx=rmw_src, rflags=0x10045)
+    add('gs-add-rmw-limit-before-walk', 'add [gs:edi], cx', segment='gs', base=C.XPAGE, limit=0, prefix=rmw_seed,
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n', ecx=rmw_src, rflags=0x10045)
+    add('fs-add-rmw-wrapped', 'add [fs:edi], ecx', base=0xfffffffe, mapped=C.WRAP, prefix=rmw_seed,
+        kernel_setup=up, success=True, ecx=rmw_src, rflags=0x55, captured={high: bytes(2), low: bytes(2)})
+    add('gs-add-rmw-lower-pf', 'add [gs:edi], ecx', base=0xfffffffe, segment='gs', mapped=C.TOP_ONLY,
+        prefix=rmw_seed, kernel_setup=init, fault=14, error=6, cr2=0, ecx=rmw_src, rflags=0x10045,
+        captured={high: bytes.fromhex('1122')})
+    ro = up + f'    and qword [{C.TA + 0x3000:#x}], -3\n    invlpg [0]\n'
+    add('fs-add-rmw-lower-readonly', 'add [fs:edi], ecx', base=0xfffffffe, mapped=C.WRAP, prefix=rmw_seed,
+        kernel_setup=ro, fault=14, error=7, cr2=0, ecx=rmw_src, rflags=0x10045, captured=have)
+    add('gs-add-rmw-wrapped-watch', 'add [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=C.WRAP,
+        prefix=rmw_seed, kernel_setup=up + watch_low, fault=1, after_trap=True, ecx=rmw_src, rflags=0x55,
+        captured={high: bytes(2), low: bytes(2)})
+    add('gs-add-rmw-word-retry', 'add [gs:edi+esi*2], cx', segment='gs', limit=1, reload_limit=3,
+        prefix=rmw_seed + '    mov esi, 1\n', ecx=rmw_src, success=True,
+        memory=VALUE[:2] + bytes.fromhex('2222') + VALUE[4:], retry_regs={C.REC + 0x48: struct.pack('<I', rmw_src)})
+    # The zero-page half aliases the code that is currently running. Set its A/D bits clear and
+    # check both the final PTE and the modified first byte of the now-invalidated instruction page.
+    alias = list(C.WRAP)
+    alias[3] = dict(C.entry(C.TA + 0x3000, C.U | C.P.LEAF & ~(C.P.A | C.P.D)), capture=True)
+    add('fs-add-rmw-wrapped-code-page', 'add [fs:edi], ecx', base=0xfffffffe, mapped=alias,
+        prefix='    mov ecx, 0x10000\n', kernel_setup=init, ecx=0x10000, success=True, rflags=4,
+        captured={high: bytes.fromhex('1122'), C.U: bytes.fromhex('b92b'),
+                  C.TA + 0x3000: struct.pack('<Q', C.U | C.P.LEAF)})
+    for backing, route in [('hole', low_hole), ('apic', low_apic), ('rom', low_rom)]:
+        add('gs-add-rmw-wrapped-' + backing, 'add [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=route,
+            prefix=rmw_seed, kernel_setup=init, refuse='form', firmware=rom if backing == 'rom' else None,
+            captured={high: bytes.fromhex('1122')})
     add('gs-generated-wrapped-store-watch-low', 'mov [gs:edi], ecx', base=0xfffffffe, segment='gs', mapped=C.WRAP,
         prefix=seed, fault=1, after_trap=True, kernel_setup=up + watch_low,
         captured={high: bytes.fromhex('7856'), low: bytes.fromhex('3412')})
@@ -361,15 +430,24 @@ def cases():
     alu_initial = 0x80000080
     alu_seed = f'    mov ecx, {alu_initial:#x}\n    cmp al, al\n    stc\n'
 
-    def alu_answer(op, width, src):
+    def alu_answer(op, width, src, carry=0, lhs=None):
         sign = 1 << (8 * width - 1)
         mask = 2 * sign - 1
-        lhs = alu_initial & mask
-        value = (lhs ^ src) if op == 'xor' else (lhs - src) & mask
-        flags = int((value & 255).bit_count() % 2 == 0) << 2 | int(value == 0) << 6 | int(bool(value & sign)) << 7
-        if op != 'xor':
-            flags |= int(lhs < src) | ((lhs ^ src ^ value) & 16) | int(bool((lhs ^ src) & (lhs ^ value) & sign)) << 11
-        return (alu_initial if op == 'cmp' else (alu_initial & ~mask) | value), flags
+        lhs = (alu_initial if lhs is None else lhs) & mask
+        src &= mask
+        flags = 0
+        if op in ('add', 'adc'):
+            wide = lhs + src + (carry if op == 'adc' else 0)
+            value = wide & mask
+            flags = int(wide > mask) | ((lhs ^ src ^ value) & 16) | int(bool(~(lhs ^ src) & (lhs ^ value) & sign)) << 11
+        elif op in ('sub', 'sbb', 'cmp'):
+            wide = lhs - src - (carry if op == 'sbb' else 0)
+            value = wide & mask
+            flags = int(wide < 0) | ((lhs ^ src ^ value) & 16) | int(bool((lhs ^ src) & (lhs ^ value) & sign)) << 11
+        else:
+            value = {'xor': lhs ^ src, 'or': lhs | src, 'and': lhs & src, 'test': lhs & src}[op]
+        flags |= int((value & 255).bit_count() % 2 == 0) << 2 | int(value == 0) << 6 | int(bool(value & sign)) << 7
+        return (alu_initial if op in ('cmp', 'test') else (alu_initial & ~mask) | value), flags
 
     for seg in ('fs', 'gs'):
         for op in ('cmp', 'xor', 'sub'):
@@ -390,9 +468,55 @@ def cases():
                 add(name + '-missing', f'{op} {reg}, [{seg}:edi]', segment=seg, base=base, mapped=C.TOP_ONLY,
                     prefix=alu_seed, ecx=alu_initial, rflags=0x10045, fault=14, error=4, cr2=0, kernel_setup=init,
                     captured={high: bytes.fromhex('1122')})
-    alu_result, flags = alu_answer('sub', 4, 0x44332211)
+    wrapped_sub, wrapped_sub_flags = alu_answer('sub', 4, 0x44332211)
     add('gs-alu-wrap-rom', 'sub ecx, [gs:edi]', segment='gs', base=0xfffffffe, mapped=low_rom, firmware=rom,
-        prefix=alu_seed, kernel_setup=init, success=True, ecx=alu_result, rflags=flags)
+        prefix=alu_seed, kernel_setup=init, success=True, ecx=wrapped_sub, rflags=wrapped_sub_flags)
+    # Both incoming carry states influence ADC/SBB; the result and the saved pre-fault
+    # flags are checked separately. A read-only descriptor suffices for all these forms.
+    for op, width, reg in [('add', 2, 'cx'), ('or', 1, 'cl'), ('and', 4, 'ecx'), ('adc', 2, 'cx'), ('sbb', 4, 'ecx')]:
+        for carry in ((0, 1) if op in ('adc', 'sbb') else (1,)):
+            prefix = alu_seed + ('    clc\n' if not carry else '')
+            logical = op in ('or', 'and')
+            prep = f'fs-alu-{op}-{reg}-carry{carry}'
+            result, flags = alu_answer(op, width, int.from_bytes(VALUE[:width], 'little'), carry)
+            add(prep + '-read', f'{op} {reg}, [fs:edi]', access=0xf1, limit=width - 1, prefix=prefix,
+                success=True, ecx=result, rflags=flags, undefined_af=logical)
+            add(prep + '-deny', f'{op} {reg}, [fs:edi+1]', access=0xf1, limit=width - 1,
+                prefix=prefix, ecx=alu_initial, rflags=0x10044 | carry)
+            if width != 1:
+                word = width == 2
+                src = 0x3322 if word else 0x44332211
+                result, flags = alu_answer(op, width, src, carry)
+                add(f'gs-alu-{op}-{reg}-wrap-carry{carry}', f'{op} {reg}, [gs:edi]', segment='gs', access=0xf1,
+                    base=0xffffffff if word else 0xfffffffe, mapped=C.WRAP, kernel_setup=up, prefix=prefix, success=True,
+                    ecx=result, rflags=flags, undefined_af=logical, captured=have)
+                add(f'gs-alu-{op}-{reg}-pf-carry{carry}', f'{op} {reg}, [gs:edi]', segment='gs', access=0xf1,
+                    base=0xffffffff if word else 0xfffffffe, mapped=C.TOP_ONLY, kernel_setup=init, prefix=prefix,
+                    fault=14, error=4, cr2=0, ecx=alu_initial, rflags=0x10044 | carry, captured={high: bytes.fromhex('1122')})
+    # CMP/TEST with memory first leave their non-memory operand and memory unchanged.
+    # Encode the immediate-group forms explicitly, including sign extension for 83 /7.
+    for seg, op, width, encoded, rhs in [
+        ('fs', 'cmp', 1, '380f', alu_initial), ('gs', 'cmp', 2, '390f', alu_initial),
+        ('fs', 'test', 4, '850f', alu_initial), ('gs', 'test', 1, '840f', alu_initial),
+        ('fs', 'cmp', 1, '803f80', 0x80), ('gs', 'cmp', 2, '813f0080', 0x8000),
+        ('fs', 'cmp', 4, '813f00000080', 0x80000000), ('gs', 'cmp', 4, '833fff', -1),
+        ('fs', 'cmp', 2, '833fff', -1), ('gs', 'test', 1, 'f60780', 0x80),
+        ('fs', 'test', 2, 'f707ff00', 0xff), ('gs', 'test', 4, 'f70700000080', 0x80000000),
+    ]:
+        prefix = ('66' if width == 2 else '') + ('64' if seg == 'fs' else '65')
+        insn = 'db ' + ','.join(hex(b) for b in bytes.fromhex(prefix + encoded))
+        name = f'{seg}-alu-{op}-{encoded}-{width}'
+        flags = alu_answer(op, width, rhs, lhs=int.from_bytes(VALUE[:width], 'little'))[1]
+        add(name + '-read', insn, segment=seg, limit=width - 1, access=0xf1, prefix=alu_seed,
+            success=True, ecx=alu_initial, rflags=flags, undefined_af=op == 'test')
+        add(name + '-deny', insn, segment=seg, limit=width - 1, access=0xf1, prefix='    mov edi, 1\n' + alu_seed,
+            ecx=alu_initial, rflags=0x10045)
+        if width != 1:
+            word = width == 2
+            flags = alu_answer(op, width, rhs, lhs=0x3322 if word else 0x44332211)[1]
+            add(name + '-wrap', insn, segment=seg, access=0xf1, base=0xffffffff if word else 0xfffffffe,
+                mapped=C.WRAP, prefix=alu_seed, success=True, ecx=alu_initial, rflags=flags,
+                undefined_af=op == 'test', kernel_setup=up, captured=have)
     # Common i386 TLS spelling: ModRM 00/101 takes the 32-bit literal without a base register.
     add('gs-alu-xor-absolute-tls', 'xor ecx, [gs:0x14]', base=tls - 0x14, segment='gs', limit=0x17, prefix=alu_seed,
         success=True, ecx=alu_answer('xor', 4, 0x44332211)[0], rflags=alu_answer('xor', 4, 0x44332211)[1], undefined_af=True)
@@ -404,7 +528,80 @@ def cases():
     # Read/write DR0 on the low half traps after native subtraction and before the next instruction.
     add('fs-alu-wrap-watch-low', 'sub ecx, [fs:edi]', base=0xfffffffe, mapped=C.WRAP, prefix=alu_seed,
         kernel_setup=up + watch_low.replace('0x10001', '0x30001'), fault=1, after_trap=True,
-        ecx=alu_result, rflags=flags, captured=have)
+        ecx=wrapped_sub, rflags=wrapped_sub_flags, captured=have)
+    # CMOVcc fetches its source with either condition outcome. ZF, CF, PF are set.
+    for op, take, seg, width, reg in [('cmove', True, 'fs', 4, 'ecx'), ('cmovne', False, 'gs', 4, 'ecx'),
+                                      ('cmovp', True, 'gs', 2, 'cx'), ('cmovnp', False, 'fs', 2, 'cx')]:
+        word = width == 2
+        value = (alu_initial & 0xffff0000 | 0x2211) if word else 0x44332211
+        wrapped = (alu_initial & 0xffff0000 | 0x3322) if word else 0x44332211
+        name = f'{seg}-conditional-{op}-{reg}'
+        insn = f'{op} {reg}, [{seg}:edi]'
+        add(name + '-ok', insn, segment=seg, access=0xf1, prefix=alu_seed, success=True, ecx=value if take else alu_initial, rflags=0x45)
+        add(name + '-limit', insn, segment=seg, limit=width - 2, base=C.XPAGE, prefix=alu_seed, ecx=alu_initial, rflags=0x10045)
+        add(name + '-wrap', insn, segment=seg, access=0xf1, base=0xffffffff if word else 0xfffffffe, mapped=C.WRAP,
+            prefix=alu_seed, success=True, ecx=wrapped if take else alu_initial, rflags=0x45, kernel_setup=up, captured=have)
+        add(name + '-pf', insn, segment=seg, base=0xffffffff if word else 0xfffffffe, mapped=C.TOP_ONLY, prefix=alu_seed,
+            fault=14, error=4, cr2=0, ecx=alu_initial, rflags=0x10045, kernel_setup=init)
+    # Both retries of the old hidden descriptor fault. Reloading it makes the very same
+    # CMOV commit according to the original ZF, for both the taken and untaken conditions.
+    for op, value in [('cmove', 0x55443322), ('cmovne', 0x12345678)]:
+        add('gs-conditional-retry-' + op, f'{op} ecx, [gs:edi+1]', segment='gs', prefix=seed + '    cmp al, al\n    stc\n',
+            success=True, ecx=value, reload_limit=7)
+    add('gs-conditional-false-watch-low', 'cmovne ecx, [gs:edi]', segment='gs', base=0xfffffffe, mapped=C.WRAP,
+        prefix=alu_seed, kernel_setup=up + watch_low.replace('0x10001', '0x30001'), fault=1, after_trap=True,
+        ecx=alu_initial, rflags=0x45, captured=have)
+    # Scan/count results at zero differ by instruction; only architecturally defined flags are checked.
+    for op in ('bsf', 'bsr', 'popcnt', 'tzcnt', 'lzcnt'):
+        for width, reg, seg in [(2, 'cx', 'gs'), (4, 'ecx', 'fs')]:
+            bits = width * 8
+            insn = f'{op} {reg}, [{seg}:edi]'
+            source = 0x3322 if width == 2 else 0x44332211
+            mask = 0x40 if op in ('bsf', 'bsr') else 0x8d5 if op == 'popcnt' else 0x41
+            for zero in (False, True):
+                value = 0 if zero else source
+                first = (value & -value).bit_length() - 1 if value else bits
+                answer = {'bsf': first, 'tzcnt': first, 'bsr': value.bit_length() - 1, 'lzcnt': bits - value.bit_length(),
+                          'popcnt': value.bit_count()}[op]
+                flags = (0x40 * int(zero)) if op in ('bsf', 'bsr', 'popcnt') else int(zero) | (int(answer == 0) << 6)
+                result = (alu_initial & 0xffff0000) | answer if width == 2 else answer
+                add(f'{seg}-{op}-{reg}-wrap-{int(zero)}', insn, segment=seg, base=0xffffffff if width == 2 else 0xfffffffe,
+                    mapped=C.WRAP, prefix=alu_seed, success=True, ecx=None if zero and op in ('bsf', 'bsr') else result,
+                    flags_mask=mask, rflags=flags, kernel_setup='' if zero else up)
+            add(f'{seg}-{op}-{reg}-limit', insn, segment=seg, limit=width - 2, prefix=alu_seed, ecx=alu_initial, rflags=0x10045)
+    # Native multiply follows the successful load; CF and OF report signed truncation together.
+    for name, insn, width, multiplier in [('two', 'imul cx, [fs:edi]', 2, alu_initial & 0xffff),
+                                           ('imm8', 'imul ecx, [fs:edi], -3', 4, -3),
+                                           ('fullimm', 'imul cx, [fs:edi], 0x1234', 2, 0x1234)]:
+        source = 0x3322 if width == 2 else 0x44332211
+        bits = 8 * width
+        product = source * multiplier
+        value = product & ((1 << bits) - 1)
+        result = (alu_initial & 0xffff0000 | value) if width == 2 else value
+        overflow = not -(1 << (bits-1)) <= product < (1 << (bits-1))
+        add('fs-imul-' + name + '-wrap', insn, base=0xffffffff if width == 2 else 0xfffffffe, mapped=C.WRAP,
+            kernel_setup=up, prefix=alu_seed, success=True, ecx=result, flags_mask=0x801, rflags=0x801 if overflow else 0)
+        add('fs-imul-' + name + '-limit', insn, limit=width - 2, prefix=alu_seed, ecx=alu_initial, rflags=0x10045)
+    def crc32c(crc, data):
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
+        return crc
+
+    for op, width, reg, size in [('crc32', 1, 'ecx', 'byte'), ('crc32', 2, 'ecx', 'word'), ('crc32', 4, 'ecx', 'dword'),
+                                  ('movbe', 2, 'cx', 'word'), ('movbe', 4, 'ecx', 'dword')]:
+        insn = f'{op} {reg}, {size} [gs:edi]'
+        name = f'gs-{op}-{size}'
+        for wrap in ([False] if width == 1 else [False, True]):
+            data = bytes.fromhex('2233') if wrap and width == 2 else VALUE[:width]
+            result = crc32c(alu_initial, data) if op == 'crc32' else int.from_bytes(data, 'big')
+            if op == 'movbe' and width == 2:
+                result |= alu_initial & 0xffff0000
+            add(name + ('-wrap' if wrap else '-read'), insn, segment='gs', access=0xf1,
+                base=(0xffffffff if width == 2 else 0xfffffffe) if wrap else tls, mapped=C.WRAP if wrap else (),
+                prefix=alu_seed, success=True, ecx=result, rflags=0x45, kernel_setup=up if wrap else '')
+        add(name + '-limit', insn, segment='gs', limit=width-1, prefix='    mov edi, 1\n' + alu_seed, ecx=alu_initial, rflags=0x10045)
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)

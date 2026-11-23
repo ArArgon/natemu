@@ -297,6 +297,12 @@ void Arm64JITCore::FexcX87Begin() {
 // x87 state in the guest-state page: `movz w0, #fn; svc #X87`, fn the D9 opcode's second byte. No register changes (x0 is FEX's
 // TMP1); the resident leaves NZCV and every register as they were, and admission accepts the svc only right after that movz in
 // that very instruction.
+DEF_OP(FexcStoreImmediate) {
+  const uint32_t Value = IROp->C<IR::IROp_FexcStoreImmediate>()->Value;
+  movz(ARMEmitter::Size::i32Bit, GetReg(Node), Value & 0xffff);
+  movk(ARMEmitter::Size::i32Bit, GetReg(Node), Value >> 16, 16);
+}
+
 DEF_OP(FexcSegmentAddress) {
   const auto Op = IROp->C<IR::IROp_FexcSegmentAddress>();
   // Keep the guest roots intact at the stub. Its only native output is w0, which is reserved between IR operations.

@@ -12,6 +12,9 @@ pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
 pub const VERSION: u32 = 4;
 /// Compatibility objects carry the resident scalar FS/GS check contract.
 pub const COMPAT_VERSION: u32 = 5;
+/// SEGMENT.data_reg[0] marks a native store source held live at the descriptor check.
+/// Its low five bits name the ordinary STORE's transfer register.
+pub const SEGMENT_STORE_REGISTER: u8 = 0x40;
 /// "No value" for a u32 offset field.
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
@@ -108,6 +111,8 @@ pub mod kind {
 /// A SEGMENT check whose checked-base move directly precedes its one unsigned GPR load.
 /// On a linear straddle the resident supplies the native transfer and resumes after it.
 pub const SEGMENT_NATIVE_LOAD: u8 = 0x80;
+/// High nibble of SEGMENT.data_reg[1] for a non-LOCK ADD memory destination.
+pub const SEGMENT_RMW_ADD: u8 = 0x30;
 
 /// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault

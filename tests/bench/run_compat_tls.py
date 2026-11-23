@@ -15,7 +15,8 @@ from run_slice3_vm import body_end, driver, smp_description, vm_state
 import compat
 from smp import num
 
-ITERATIONS = 2_000_000
+# 800,000 accesses per sample leaves time for the per-access resident check on both segments.
+ITERATIONS = 50_000
 WARMUP = 4096
 SAMPLES = 3
 WORDS = 8

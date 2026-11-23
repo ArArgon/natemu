@@ -248,9 +248,14 @@ void JoinSites(uint64_t rip) {
   uint32_t last_load_instruction = FEXC_NONE32;
   for (auto& s : Cap.sites) {
     if (s.kind == FEXC_SITE_SEGMENT) {
-      // The cold wrapped-span transaction needs the architectural register, including AH..BH.
+      // The ModRM.reg field names the MOV register (including AH..BH) or the ALU register/opcode extension.
       for (const auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         s.data_reg[0] = i.modrm_reg;
+        if (i.primary_op == 0xc6 || i.primary_op == 0xc7) {
+          // The wrapped transaction uses the same native transfer register as the ordinary STORE.
+          for (const auto& a : Cap.sites) if (a.kind == FEXC_SITE_STORE && a.native_offset == s.access_native_offset)
+            s.data_reg[0] = 0x40 | a.data_reg[0];
+        }
         s.data_reg[1] |= i.size;
         break;
       }
@@ -1057,7 +1062,8 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       if (s.kind == FEXC_SITE_SEGMENT) {
         j.kv("instruction_length", int(s.data_reg[1] & 15));
         if (s.data_reg[1] & 0x80) j.kv("native_load_continuation", true);
-        if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
+        if ((s.data_reg[1] & 0xf0) == 0x30) j.kv("rmw_add", true);
+        else if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
       }
       if (slice1) {
         if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");

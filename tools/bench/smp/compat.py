@@ -80,7 +80,7 @@ ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b, flags=2: f"""    mov eax, {d
 """
 
 
-def handlers(dispatch='    jmp .fin\n', xmm=False, vectors=(6, 13, 14, 128)):
+def handlers(dispatch='    jmp .fin\n', xmm=False, vectors=(6, 13, 14, 128), flags_mask=0x10ed5):
     """The entry stubs and the common handler: the event's record (+0 vector, error code, RIP, CS, RFLAGS under 10ED5H,
     RSP, SS, CR2 for a #PF; +0x40 the 16 general registers, RSP's the frame's; +0xC0 DS, ES, FS, GS; +0x100 XMM0..15
     with `xmm`), then `dispatch` (RBX the record's offset, the frame at RSP; RAX free): `.resume` returns by IRETQ,
@@ -113,7 +113,7 @@ def handlers(dispatch='    jmp .fin\n', xmm=False, vectors=(6, 13, 14, 128)):
     text += ''.join(f'    mov {rec(0x40 + 8 * k)}, {r}\n' for k, r in enumerate(REGS64) if r not in ('rbx', 'rsp'))
     text += f'    pop rax\n    mov {rec(0x58)}, rax\n    mov rax, [rsp+40]\n    mov {rec(0x60)}, rax\n'
     for k in range(7):
-        text += f'    mov rax, [rsp+{8 * k}]\n' + ('    and eax, 0x10ed5\n' if k == 4 else '') + f'    mov {rec(8 * k)}, rax\n'
+        text += f'    mov rax, [rsp+{8 * k}]\n' + (f'    and eax, {flags_mask:#x}\n' if k == 4 else '') + f'    mov {rec(8 * k)}, rax\n'
     text += f'    xor eax, eax\n    cmp qword [rsp], 14\n    jne .n14\n    mov rax, cr2\n.n14:\n    mov {rec(0x38)}, rax\n'
     text += ''.join(f'    xor eax, eax\n    mov ax, {s}\n    mov {rec(0xc0 + 8 * k)}, rax\n' for k, s in enumerate(('ds', 'es', 'fs', 'gs')))
     if xmm:

@@ -4081,6 +4081,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     if alignment_check(&s.cpu) != 0 && va & (width - 1) != 0 {
         guest_fault(s, f, b, site, [17, 0, 0]);
     }
+    let add = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ADD;
     let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
     if native && b.flags & cache::STEP == 0 {
         // The private instruction slot survives page-table A/D writes and delivers data breakpoints
@@ -4091,6 +4092,14 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
         // A MOV store can invalidate its own source block. Own its architectural roots before walking.
         bank_at(&mut s, f, b, site);
     }
+    // For an immediate store the checked native transfer register already holds the exact literal.
+    // Capture it before copying either half; the ordinary store and its split probes use the same register.
+    let [reg, result_and_length] = site.data_reg;
+    let length = result_and_length & 15;
+    let native_store = reg & object::SEGMENT_STORE_REGISTER != 0;
+    let reg = usize::from(reg & !object::SEGMENT_STORE_REGISTER);
+    let old = if native_store { f.x[reg] } else { s.cpu.gpr[reg] };
+    let mut value = if write { old.to_le_bytes() } else { [0; 8] };
     let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
         Ok(pages) => pages,
         Err([vector, error, cr2]) if native => guest_fault(s, f, b, site, [vector, cr2, error]),
@@ -4101,6 +4110,11 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     };
     let mixed = gpa.iter().any(|&p| !mmio::ram(p));
     if mixed {
+        // A write-intent RMW load has no scalar MMIO completion, including for an unassigned
+        // or firmware page. Both write walks have succeeded; nothing of the ADD has executed.
+        if add {
+            mmio::stop_with(&s, natemu_abi::execution::mmio::FORM)
+        }
         let supported = if write {
             gpa.iter().all(|&p| mmio::ram(p) || mmio::rom(p))
         } else {
@@ -4113,16 +4127,21 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
         // Classifying a page or installing its shadow can serve a peer's shadow drop.
         split_wait(&mut s, &gpa);
     }
-    // A byte cannot straddle. These forms name one 16- or 32-bit guest register.
-    let [reg, result_and_length] = site.data_reg;
-    let length = result_and_length & 15;
-    let reg = usize::from(reg);
-    let old = s.cpu.gpr[reg];
-    let mut value = if write { old.to_le_bytes() } else { [0; 8] };
     let first = ((1u64 << 32) - va) as usize;
     // The existing split completion orders the transfer before subsequent guest memory operations.
     unsafe { asm!("dmb ish") };
-    if mixed {
+    if add {
+        // Only word and dword ADD can straddle. The checked ModRM source register is in the
+        // instruction's bank; keep both walked physical spans until the write is complete.
+        // This non-LOCK read and write may tear. The interpreter's ADD supplies CF/PF/AF/ZF/SF/OF.
+        use natemu_abi::interp::{exec, op};
+        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], false);
+        unsafe { asm!("dmb ish") };
+        let (result, flags) = exec::alu(op::ADD, u64::from_le_bytes(value) as u32, old as u32, false, width as u8);
+        value = u64::from(result).to_le_bytes();
+        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], true);
+        s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);
+    } else if mixed {
         segments::copy_mixed(&mut s, gpa, first, &mut value[..width as usize], write);
     } else {
         segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], write);

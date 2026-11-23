@@ -738,13 +738,14 @@ struct ScalarOperand {
     segment: u8,
     width: u8,
     write: u8,
-    register: u8,
+    modrm_reg: u8,
+    store_immediate: Option<u32>,
     result_and_length: u8,
     absolute_offset: Option<u32>,
 }
 
 fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
-    use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
+    use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic, OpKind, Register};
     let src = &c.source[..c.guest_bytes as usize];
     let mut guarded = Vec::new();
     if !c.bits32 || !src.iter().any(|b| matches!(b, 0x64 | 0x65)) {
@@ -767,11 +768,37 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let moffs = matches!(i.code(), Code::Mov_AL_moffs8 | Code::Mov_AX_moffs16 | Code::Mov_EAX_moffs32
             | Code::Mov_moffs8_AL | Code::Mov_moffs16_AX | Code::Mov_moffs32_EAX);
         if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
+        let store_immediate = match i.code() {
+            Code::Mov_rm8_imm8 => Some(u32::from(i.immediate8())),
+            Code::Mov_rm16_imm16 => Some(u32::from(i.immediate16())),
+            Code::Mov_rm32_imm32 => Some(i.immediate32()),
+            _ => None,
+        };
         let result = match i.code() {
-            _ if moffs => 0,
-            Code::Sub_r8_rm8 | Code::Sub_r16_rm16 | Code::Sub_r32_rm32
+            _ if moffs || store_immediate.is_some() => 0,
+            Code::Add_rm8_r8 | Code::Add_rm16_r16 | Code::Add_rm32_r32 if !i.has_lock_prefix() => object::SEGMENT_RMW_ADD,
+            _ if matches!(i.mnemonic(), Mnemonic::Cmovb | Mnemonic::Cmovae | Mnemonic::Cmovbe | Mnemonic::Cmova
+                | Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovl | Mnemonic::Cmovge | Mnemonic::Cmovle | Mnemonic::Cmovg
+                | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovs | Mnemonic::Cmovns | Mnemonic::Cmovp | Mnemonic::Cmovnp)
+                && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory => object::SEGMENT_NATIVE_LOAD,
+            Code::Bsf_r16_rm16 | Code::Bsf_r32_rm32 | Code::Bsr_r16_rm16 | Code::Bsr_r32_rm32
+            | Code::Tzcnt_r16_rm16 | Code::Tzcnt_r32_rm32 | Code::Lzcnt_r16_rm16 | Code::Lzcnt_r32_rm32
+            | Code::Popcnt_r16_rm16 | Code::Popcnt_r32_rm32 | Code::Imul_r16_rm16 | Code::Imul_r32_rm32
+            | Code::Imul_r16_rm16_imm8 | Code::Imul_r32_rm32_imm8 | Code::Imul_r16_rm16_imm16 | Code::Imul_r32_rm32_imm32
+            | Code::Movbe_r16_m16 | Code::Movbe_r32_m32 | Code::Crc32_r32_rm8 | Code::Crc32_r32_rm16 | Code::Crc32_r32_rm32
+                => object::SEGMENT_NATIVE_LOAD,
+            Code::Add_r8_rm8 | Code::Add_r16_rm16 | Code::Add_r32_rm32
+            | Code::Or_r8_rm8 | Code::Or_r16_rm16 | Code::Or_r32_rm32
+            | Code::Adc_r8_rm8 | Code::Adc_r16_rm16 | Code::Adc_r32_rm32
+            | Code::Sbb_r8_rm8 | Code::Sbb_r16_rm16 | Code::Sbb_r32_rm32
+            | Code::And_r8_rm8 | Code::And_r16_rm16 | Code::And_r32_rm32
+            | Code::Sub_r8_rm8 | Code::Sub_r16_rm16 | Code::Sub_r32_rm32
             | Code::Xor_r8_rm8 | Code::Xor_r16_rm16 | Code::Xor_r32_rm32
-            | Code::Cmp_r8_rm8 | Code::Cmp_r16_rm16 | Code::Cmp_r32_rm32 => object::SEGMENT_NATIVE_LOAD,
+            | Code::Cmp_r8_rm8 | Code::Cmp_r16_rm16 | Code::Cmp_r32_rm32
+            | Code::Cmp_rm8_r8 | Code::Cmp_rm16_r16 | Code::Cmp_rm32_r32
+            | Code::Test_rm8_r8 | Code::Test_rm16_r16 | Code::Test_rm32_r32
+            | Code::Cmp_rm8_imm8 | Code::Cmp_rm16_imm8 | Code::Cmp_rm32_imm8 | Code::Cmp_rm16_imm16 | Code::Cmp_rm32_imm32
+            | Code::Test_rm8_imm8 | Code::Test_rm16_imm16 | Code::Test_rm32_imm32 => object::SEGMENT_NATIVE_LOAD,
             Code::Mov_rm8_r8 | Code::Mov_rm16_r16 | Code::Mov_rm32_r32 | Code::Mov_r8_rm8 | Code::Mov_r16_rm16 | Code::Mov_r32_rm32 => 0,
             Code::Movzx_r16_rm8 | Code::Movzx_r16_rm16 => 0x10,
             Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16 => 0x20,
@@ -779,10 +806,16 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             Code::Movsx_r32_rm8 | Code::Movsx_r32_rm16 => 0x60,
             _ => continue,
         };
-        let write = u8::from(i.op0_kind() == OpKind::Memory);
+        let first_is_memory = i.op0_kind() == OpKind::Memory;
+        let other = u32::from(first_is_memory);
+        // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
+        let modrm_reg = if i.op_kind(other) == OpKind::Register {
+            i.op_register(other).number() as u8
+        } else if i.mnemonic() == iced_x86::Mnemonic::Cmp { 7 } else { 0 };
+        let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
-            register: i.op_register(u32::from(write)).number() as u8, result_and_length: result | i.len() as u8,
+            modrm_reg, store_immediate, result_and_length: result | i.len() as u8,
         });
     }
     if !guarded.is_empty() {
@@ -791,6 +824,19 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         if starts != reported { return Err("scalar segment check instruction boundaries".into()); }
     }
     Ok(guarded)
+}
+
+/// A retained 32-bit block can rewrite a guest-RIP literal slot or a complete MOVZ/MOVK/NOP
+/// sequence at another RIP. A guest-independent store literal must keep both of its native words.
+fn overlaps_rip_relocation32(words: Range<u32>, relocs: &[Reloc]) -> bool {
+    relocs.iter().any(|r| {
+        let bytes = match r.kind {
+            object::RELOC_GUEST_RIP_LITERAL => 8,
+            object::RELOC_GUEST_RIP_MOVE => 12,
+            _ => return false,
+        };
+        r.offset < words.end && r.offset.saturating_add(bytes) > words.start
+    })
 }
 
 impl<'a> Verifier<'a> {
@@ -995,13 +1041,30 @@ impl<'a> Verifier<'a> {
             let mut matching = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
             let Some(site) = matching.next() else { return Err("missing scalar segment check".into()); };
             if matching.next().is_some() || site.segment != op.segment || site.intent != op.write || site.width != op.width
-                || site.data_reg != [op.register, op.result_and_length] {
+                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && site.data_reg[0] != op.modrm_reg) {
                 return Err("scalar segment check differs from its x86 operand".into());
             }
             let access = self.c.accesses.iter().find(|a| a.native_offset == site.guest_offset2)
                 .ok_or("scalar segment check without an access")?;
-            if self.c.accesses.iter().filter(|a| a.guest_offset == g).count() != 1 {
-                return Err("scalar segment check needs exactly one memory access".into());
+            let mut effects = self.c.accesses.iter().filter(|a| a.guest_offset == g);
+            if effects.next().map(|a| a.native_offset) != Some(access.native_offset) {
+                return Err("scalar segment check must precede the first memory access".into());
+            }
+            let add_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ADD {
+                let store = effects.next().ok_or("missing second effect of checked ADD")?;
+                if access.base_reg >= 31 || access.kind != object::kind::LOAD || access.rmw != object::RMW_LOAD
+                    || store.kind != object::kind::STORE || store.rmw != object::RMW_STORE
+                    || store.native_offset <= access.native_offset || store.insn_native_offset != access.insn_native_offset
+                    || store.width != op.width || store.intent != object::INTENT_WRITE || store.base_reg != access.base_reg
+                    || store.index_reg != object::NO_REG || store.imm != 0 || store.writeback != object::WB_NONE
+                    || store.data_class != object::CLASS_GPR
+                {
+                    return Err("checked ADD memory effects differ in address, width or intent".into());
+                }
+                Some(store.native_offset)
+            } else { None };
+            if effects.next().is_some() {
+                return Err("extra scalar memory access".into());
             }
             let end = self.c.pcs.get(index).map_or_else(
                 || self.c.stubs.first().map_or(self.c.code.len() as u32, |s| s.native_offset),
@@ -1012,7 +1075,7 @@ impl<'a> Verifier<'a> {
             let run_end = self.run_test().filter(|&e| self.run_end_return(e + 36, ENTRY_OFFSET + 8));
             for at in (p.native_offset..end).step_by(4) {
                 if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
-                if at == access.native_offset { continue; }
+                if at == access.native_offset || Some(at) == add_store { continue; }
                 match self.insn(at) {
                     // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
                     Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
@@ -1053,13 +1116,36 @@ impl<'a> Verifier<'a> {
                     return Err(format!("scalar native load continuation {back:#x} to {:#x}, word {word:#010x}", access.native_offset));
                 }
             }
-            if self.instruction(access.native_offset) != Some((g, p.native_offset))
+            let setup = if let Some(value) = op.store_immediate {
+                let reg = access.data_reg[0];
+                // The descriptor trap and a split probe can use x0/x1. The literal must live in a
+                // temporary, independent of the banked guest roots, all the way to the actual store.
+                if !(2..31).contains(&reg) || super::SRA32.contains(&reg)
+                    || site.data_reg[0] != object::SEGMENT_STORE_REGISTER | reg
+                    || !matches!(self.insn(access.native_offset), Some(Insn::Mem(m)) if !m.load && !m.vector && m.rt == reg && m.rt2.is_none())
+                {
+                    return Err("scalar immediate store transfer register".into());
+                }
+                let [lo, hi] = natemu_abi::execution::guest_rip_move32(u64::from(value), reg.into());
+                let high = self.last_write(reg, p.native_offset, setup).ok_or("missing scalar store immediate")?;
+                if high < p.native_offset + 4 || self.word(high - 4) != lo || self.word(high) != hi
+                    || self.written(1 << reg, high + 4, access.native_offset)
+                {
+                    return Err("scalar store immediate differs from its x86 operand".into());
+                }
+                if overlaps_rip_relocation32(high - 4..high + 4, self.c.relocs) {
+                    return Err("scalar store immediate overlaps a guest-RIP relocation".into());
+                }
+                high - 4
+            } else { setup };
+            let last = add_store.unwrap_or(access.native_offset);
+            if self.instruction(last) != Some((g, p.native_offset)) || self.instruction(access.native_offset) != Some((g, p.native_offset))
                 || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
                 || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
-                || self.written(1 << access.base_reg, back + 4, access.native_offset)
-                || self.branches_into(setup, access.native_offset).any(|(from, to)| {
+                || self.written(1 << access.base_reg, back + 4, last)
+                || self.branches_into(setup, last).any(|(from, to)| {
                     // A successful split probe returns to its store after the segment check already ran.
-                    self.probing(from).is_none_or(|(i, k)| k != 4 || self.c.stubs[i].guest_offset2 != access.native_offset || to != access.native_offset)
+                    self.probing(from).is_none_or(|(i, k)| k != 4 || self.c.stubs[i].guest_offset2 != last || to != last)
                 })
             {
                 return Err("scalar segment check continuation".into());
@@ -3030,6 +3116,22 @@ mod tests {
     }
 
     #[test]
+    fn store_literal_words_are_disjoint_from_guest_rip_relocations() {
+        // The native literal occupies [20, 28). Check one-word intersections on both sides,
+        // complete overlap, and touching endpoints. These are offsets only; no guest is run.
+        for (kind, starts) in [
+            (object::RELOC_GUEST_RIP_MOVE, &[12, 16, 20, 24][..]),
+            (object::RELOC_GUEST_RIP_LITERAL, &[16, 20, 24][..]),
+        ] {
+            for offset in (4..=32).step_by(4) {
+                let r = Reloc { kind, offset, register: 3, size: if kind == object::RELOC_GUEST_RIP_LITERAL { 8 } else { 0 },
+                    reserved: 0, value: 0 };
+                assert_eq!(overlaps_rip_relocation32(20..28, &[r]), starts.contains(&offset), "kind {kind}, offset {offset}");
+            }
+        }
+    }
+
+    #[test]
     fn code_of_32_bit_mode_is_admitted_under_its_mode_only() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
@@ -3095,6 +3197,51 @@ mod tests {
             // Another W register of the same width cannot receive the load on the wrapped path.
             changed[at..at+4].copy_from_slice(&(word ^ 1).to_le_bytes());
             assert!(check(&changed).is_err());
+        }
+        // Mutating either half of the actual STORE's literal or its transfer register is a refusal,
+        // even in production admission. The original instruction and generated code are never executed here.
+        for hex in ["64c607fe", "6566c74702c381", "64c707efcdab89", "65c7057856341200000000"] {
+            let (obj, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&obj, 0);
+            let site = (0..h.sites_count as usize)
+                .map(|i| super::super::record::<Site>(&obj, h.sites_offset as usize + i * size_of::<Site>()))
+                .find(|s| s.kind == object::kind::SEGMENT).expect("immediate store has a descriptor check");
+            for shape in [false, true] {
+                let check = |o: &[u8], s: &[u8]| super::super::admit_mode(o, h.guest_rip, s, u64::MAX, shape, false, true);
+                check(&obj, &src).unwrap_or_else(|e| panic!("{hex}: {e}"));
+                for pos in src.len() - usize::from(site.width)..src.len() {
+                    let mut altered = src.clone();
+                    altered[pos] ^= 0x80;
+                    assert!(check(&obj, &altered).unwrap_err().contains("store immediate"), "{hex} byte {pos}");
+                }
+                let off = h.code_offset as usize + site.guest_offset2 as usize;
+                let mut altered = obj.clone();
+                altered[off] ^= 1;
+                assert!(check(&altered, &src).is_err(), "native STORE register {hex}");
+            }
+        }
+        // A literal equal to this guest instruction's original ending RIP is still an ordinary
+        // literal when the same bytes are compiled elsewhere. Both admission profiles accept it.
+        for rip in ["0x8048000", "0x9048000"] {
+            let (obj, src) = compile("64c70707800408", rip, "32");
+            let h: Header = super::super::record(&obj, 0);
+            for shape in [false, true] {
+                super::super::admit_mode(&obj, h.guest_rip, &src, u64::MAX, shape, false, true).unwrap();
+            }
+        }
+        let (add, source) = compile("65010f", "0x8048000", "32");
+        let h: Header = super::super::record(&add, 0);
+        let store = (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .find(|&at| super::super::record::<Site>(&add, at).kind == object::kind::STORE).unwrap();
+        for shape in [false, true] {
+            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+            check(&add).unwrap();
+            for field in [core::mem::offset_of!(Site, rmw), core::mem::offset_of!(Site, base_reg)] {
+                let mut changed = add.clone();
+                changed[store + field] ^= 1;
+                assert!(check(&changed).is_err(), "inconsistent ADD store field at {field}");
+            }
         }
         let (moffs, source) = compile("65a178563412", "0x8048000", "32");
         let h: Header = super::super::record(&moffs, 0);

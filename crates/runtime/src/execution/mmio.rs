@@ -47,7 +47,7 @@ fn exchange() -> *mut Mmio {
     MMIO_VA as *mut Mmio
 }
 /// A refusal made before any request: the record names no access (its request fields are cleared, the count kept).
-fn stop_with(s: &State, why: u64) -> ! {
+pub(super) fn stop_with(s: &State, why: u64) -> ! {
     unsafe {
         let m = read_record(exchange());
         write_record(

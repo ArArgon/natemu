@@ -970,7 +970,10 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
             && s.rmw == object::RMW_NONE && access.is_some_and(|a| {
                 matches!(a.kind, LOAD | STORE)
                     && a.guest_offset == s.guest_offset && a.insn_native_offset == s.insn_native_offset
-                    && a.width == s.width && a.intent == s.intent && a.rmw == object::RMW_NONE
+                    && a.width == s.width && a.intent == s.intent
+                    && if s.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ADD {
+                        a.kind == LOAD && a.rmw == object::RMW_LOAD
+                    } else { a.rmw == object::RMW_NONE }
                     && a.data_class == object::CLASS_GPR && a.imm == 0 && a.index_reg == object::NO_REG
                     && a.writeback == object::WB_NONE
             });

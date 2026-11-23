@@ -726,7 +726,7 @@ class Slice1Cutting(unittest.TestCase):
     def test_compat_alu_segment_loads(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:
-            for opcode in (0x2a, 0x32, 0x3a):
+            for opcode in (0x02, 0x0a, 0x12, 0x1a, 0x22, 0x2a, 0x32, 0x3a, 0x38, 0x84):
                 for width in (1, 2, 4):
                     form = bytes([0x65] + ([0x66] if width == 2 else []) + [opcode + (width != 1), 0x0f])
                     d, rc = run('90' + form.hex() + '90', RIP, '--bitness', '32')
@@ -738,6 +738,70 @@ class Slice1Cutting(unittest.TestCase):
                     self.assertEqual((guard['imm'] + 4, guard['access_native_offset']),
                                      (load['native_offset'], load['native_offset']), form)
                     self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+
+    def test_compat_alu_immediate_segment_loads(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for form, width, group in [('64803f7f', 1, 7), ('6664813f0080', 2, 7), ('65813f00000080', 4, 7),
+                                       ('6665833fff', 2, 7), ('64833fff', 4, 7), ('65f607ff', 1, 0),
+                                       ('6664f707ffff', 2, 0), ('65f70700000080', 4, 0)]:
+                d, rc = run(form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0, form)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                load, = (s for s in d['sites'] if s['kind'] == 'load')
+                self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation']),
+                                 (width, 'read', [group], True), form)
+                self.assertEqual((guard['imm'] + 4, guard['access_native_offset']), (load['native_offset'], load['native_offset']), form)
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+
+    def test_read_only_alu_guard_excludes_memory_updates(self):
+        # Neighbouring direction bits and immediate-group selectors can instead write memory.
+        for form in ('64290f', '65090f', '64110f', '65190f', '64210f', '64830701', '65f617'):
+            d, rc = run(form, RIP, '--bitness', '32')
+            self.assertEqual(rc, 0, form)
+            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
+            self.assertTrue(any(s['kind'] == 'store' for s in d['sites']), form)
+
+    def test_compat_integer_register_loads(self):
+        import verify_precision
+        forms = [(os + '0f' + f'{0x40 + cc:02x}' + '0f', width)
+                 for cc in range(16) for os, width in [('', 4), ('66', 2)]]
+        for os, width in [('', 4), ('66', 2)]:
+            for opcode in ('0fbc', '0fbd', 'f30fb8', 'f30fbc', 'f30fbd', '0faf', '0f38f0', 'f20f38f1'):
+                forms.append((os + opcode + '0f', width))
+            forms.extend([(os + '6b0ffd', width), (os + '690f' + '34' * width, width)])
+        forms += [('f20f38f00f', 1), ('66f20f38f00f', 1)]
+        with tempfile.TemporaryDirectory() as t:
+            for n, (form, width) in enumerate(forms):
+                d, rc = run(('64' if n % 2 else '65') + form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0, form)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                load, = (s for s in d['sites'] if s['kind'] == 'load')
+                self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation'], guard['imm'] + 4,
+                                  guard['access_native_offset']), (width, 'read', True, load['native_offset'], load['native_offset']), form)
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+            d, rc = run('640f38f10f', RIP, '--bitness', '32')  # MOVBE stores are a separate family.
+            self.assertEqual(rc, 0)
+            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']))
+            self.assertTrue(any(s['kind'] == 'store' for s in d['sites']))
+
+    def test_compat_add_segment_pair(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for width, form in ((1, '650027'), (2, '6466010c77'), (4, '65010f'), (4, '64010f')):
+                d, rc = run('90' + form + '90', RIP, '--bitness', '32')
+                self.assertEqual(rc, 0)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                self.assertTrue(guard['rmw_add'])
+                self.assertNotIn('destination_width', guard)
+                load, store = (s for s in d['sites'] if s['kind'] in ('load', 'store'))
+                self.assertEqual((guard['width'], guard['intent'], guard['access_native_offset']),
+                                 (width, 'write', load['native_offset']))
+                for site, effect in ((load, 'load'), (store, 'store')):
+                    self.assertEqual((site['kind'], site['rmw'], site['width'], site['intent'], site['base_reg']),
+                                     (effect, effect, width, 'write', load['base_reg']))
+                self.assertLess(load['native_offset'], store['native_offset'])
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
 
     def test_max_instructions_still_works(self):
         d, rc = run(PRE + PRE, RIP, '--max-insts', '3')
