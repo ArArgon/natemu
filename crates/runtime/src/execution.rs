@@ -4082,6 +4082,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
         guest_fault(s, f, b, site, [17, 0, 0]);
     }
     let rmw = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU;
+    let exchange = site.data_reg[1] & 0xf0 == object::SEGMENT_XCHG;
     let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
     if native && b.flags & cache::STEP == 0 {
         // The private instruction slot survives page-table A/D writes and delivers data breakpoints
@@ -4111,6 +4112,9 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     };
     let mixed = gpa.iter().any(|&p| !mmio::ram(p));
     if mixed {
+        if exchange {
+            mmio::stop_with(&s, natemu_abi::execution::mmio::ATOMIC)
+        }
         // A write-intent RMW load has no scalar MMIO completion, including for an unassigned
         // or firmware page. Both write walks have succeeded; no ALU effect has committed.
         if rmw {
@@ -4131,7 +4135,11 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let first = ((1u64 << 32) - va) as usize;
     // The existing split completion orders the transfer before subsequent guest memory operations.
     unsafe { asm!("dmb ish") };
-    if rmw {
+    if exchange {
+        // A byte cannot straddle. The old banked word/dword supplies the swap, then receives the old RAM value.
+        let [loaded, _] = split_atomic(&mut s, gpa, width, width, |_, _, _| [old, 0]);
+        s.cpu.gpr[reg] = if width == 2 { old & !0xffff | loaded } else { loaded };
+    } else if rmw {
         // Only word and dword operands can straddle. Both physical spans, the source register
         // and incoming CF belong to this instruction until its non-atomic write commits.
         use natemu_abi::interp::exec;
@@ -4648,44 +4656,8 @@ unsafe fn split_lock(
         halt(&s, stop::SITE_MISMATCH)
     }
     let x = |r: usize| if r == 31 { 0 } else { f.x[r] };
-    let mask = if size == 8 {
-        u64::MAX
-    } else {
-        (1 << (8 * size)) - 1
-    };
-    let head = (4096 - (address & 4095)).min(width) as usize;
-    let parts = [
-        (gpa[0] | address & 4095, head),
-        (gpa[1], width as usize - head),
-    ];
-    let p = crate::perf::enter(crate::perf::SHOOTDOWN);
-    #[cfg(feature = "io-test-hooks")]
-    crate::io_test::point(
-        s.vcpu as usize,
-        natemu_abi::execution::cache::io_test::BEFORE_SPLIT,
-    );
-    cache::split_begin(gpa, s.vcpus as usize, || {
-        let bits = cache::take_shadows();
-        if bits != 0 {
-            serve_peers(&mut s, bits)
-        }
-    });
-    crate::perf::leave(p);
-    let mut old = [0u8; 24];
-    let mut done = 0;
-    for &(g, n) in &parts {
-        if n != 0 && !guest_ram().copy_out(g, &mut old[done..done + n]) {
-            halt(&s, stop::SHADOW)
-        }
-        done += n;
-    }
-    // The old element(s): the low one at the address, CASP's high one `size` bytes on.
-    let element = |at: usize| u64::from_le_bytes(old[at..at + 8].try_into().unwrap()) & mask;
-    let (lo, hi) = (
-        element(0),
-        if kind == 3 { element(size as usize) } else { 0 },
-    );
-    let new: [u64; 2] = match kind {
+    gpa[0] |= address & 4095;
+    let [lo, hi] = split_atomic(&mut s, gpa, width, size, |lo, hi, mask| match kind {
         0 => [x(rs) & mask, 0],
         1 => [
             match word >> 12 & 7 {
@@ -4704,26 +4676,7 @@ unsafe fn split_lock(
                 [lo, hi]
             }
         }
-    };
-    let mut bytes = [0u8; 24];
-    bytes[..8].copy_from_slice(&new[0].to_le_bytes());
-    if kind == 3 {
-        bytes[size as usize..size as usize + 8].copy_from_slice(&new[1].to_le_bytes());
-    }
-    let mut done = 0;
-    for &(g, n) in &parts {
-        if n != 0 {
-            if cache::translated(g) {
-                FetchWrites(&mut s).code_write(g);
-            }
-            if !guest_ram().copy_in(g, &bytes[done..done + n]) {
-                halt(&s, stop::SHADOW)
-            }
-            cache::rechecked(g);
-        }
-        done += n;
-    }
-    cache::split_end();
+    });
     // The Arm results: SWP and LD<op> Rt := the old value, CAS Rs := it, CASP Rs, Rs+1 := the old pair (XZR discards).
     let frame = unsafe { &raw mut (*shared()).captured };
     let set = |r: usize, v: u64| {
@@ -4736,11 +4689,79 @@ unsafe fn split_lock(
         2 => set(rs, lo),
         _ => (set(rs, lo), set(rs + 1, hi)).0,
     }
-    s.splits += 1;
     unsafe {
         write_record(record(), &s);
         resume(&s, frame, elr + 4, spsr)
     }
+}
+
+/// Atomically update preflighted physical RAM: the first address includes its page offset.
+fn split_atomic(
+    s: &mut State,
+    gpa: [u64; 2],
+    width: u64,
+    size: u64,
+    update: impl FnOnce(u64, u64, u64) -> [u64; 2],
+) -> [u64; 2] {
+    let mask = if size == 8 {
+        u64::MAX
+    } else {
+        (1 << (8 * size)) - 1
+    };
+    let head = (4096 - (gpa[0] & 4095)).min(width) as usize;
+    let parts = [
+        (gpa[0], head),
+        (gpa[1], width as usize - head),
+    ];
+    let p = crate::perf::enter(crate::perf::SHOOTDOWN);
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(
+        s.vcpu as usize,
+        natemu_abi::execution::cache::io_test::BEFORE_SPLIT,
+    );
+    cache::split_begin(gpa, s.vcpus as usize, || {
+        let bits = cache::take_shadows();
+        if bits != 0 {
+            serve_peers(s, bits)
+        }
+    });
+    crate::perf::leave(p);
+    let mut old = [0u8; 24];
+    let mut done = 0;
+    for &(g, n) in &parts {
+        if n != 0 && !guest_ram().copy_out(g, &mut old[done..done + n]) {
+            halt(s, stop::SHADOW)
+        }
+        done += n;
+    }
+    // The old element(s): the low one at the address, CASP's high one `size` bytes on.
+    let element = |at: usize| u64::from_le_bytes(old[at..at + 8].try_into().unwrap()) & mask;
+    let (lo, hi) = (
+        element(0),
+        if width != size { element(size as usize) } else { 0 },
+    );
+    let new = update(lo, hi, mask);
+    let mut bytes = [0u8; 24];
+    bytes[..8].copy_from_slice(&new[0].to_le_bytes());
+    if width != size {
+        bytes[size as usize..size as usize + 8].copy_from_slice(&new[1].to_le_bytes());
+    }
+    let mut done = 0;
+    for &(g, n) in &parts {
+        if n != 0 {
+            if cache::translated(g) {
+                FetchWrites(s).code_write(g);
+            }
+            if !guest_ram().copy_in(g, &bytes[done..done + n]) {
+                halt(s, stop::SHADOW)
+            }
+            cache::rechecked(g);
+        }
+        done += n;
+    }
+    cache::split_end();
+    s.splits += 1;
+    [lo, hi]
 }
 
 /// Protects all pages of a resident access from split locks. Serving a shadow-drop request clears our holding bit:

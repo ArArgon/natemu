@@ -785,6 +785,24 @@ class Slice1Cutting(unittest.TestCase):
             self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']))
             self.assertTrue(any(s['kind'] == 'store' for s in d['sites']))
 
+    def test_compat_xchg_segment_swap(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for lock in ('', 'f0'):
+                for width, source, form in ((1, 5, '65862f'), (2, 1, '6466870c77'), (4, 1, '65870f')):
+                    d, rc = run('90' + lock + form + '90', RIP, '--bitness', '32')
+                    self.assertEqual(rc, 0, form)
+                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                    swap, = (s for s in d['sites'] if s['kind'] in ('load', 'store', 'swap', 'atomic'))
+                    self.assertEqual((guard['atomic_exchange'], guard['data_regs'], guard['intent'], guard['width']),
+                                     (True, [source], 'write', width))
+                    self.assertEqual((swap['kind'], swap['intent'], swap['width'], swap['native_offset']),
+                                     ('swap', 'write', width, guard['access_native_offset']))
+                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+            d, rc = run('6487c1', RIP, '--bitness', '32')
+            self.assertEqual(rc, 0)
+            self.assertFalse(any(s['kind'] in ('segment', 'swap', 'load', 'store') for s in d['sites']))
+
     def test_compat_alu_segment_pair(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:

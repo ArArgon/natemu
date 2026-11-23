@@ -793,6 +793,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let result = match i.code() {
             _ if moffs || store_immediate.is_some() => 0,
             _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
+            Code::Xchg_rm8_r8 | Code::Xchg_rm16_r16 | Code::Xchg_rm32_r32 => object::SEGMENT_XCHG,
             _ if matches!(i.mnemonic(), Mnemonic::Cmovb | Mnemonic::Cmovae | Mnemonic::Cmovbe | Mnemonic::Cmova
                 | Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovl | Mnemonic::Cmovge | Mnemonic::Cmovle | Mnemonic::Cmovg
                 | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovs | Mnemonic::Cmovns | Mnemonic::Cmovp | Mnemonic::Cmovnp)
@@ -1068,6 +1069,14 @@ impl<'a> Verifier<'a> {
             let mut effects = self.c.accesses.iter().filter(|a| a.guest_offset == g);
             if effects.next().map(|a| a.native_offset) != Some(access.native_offset) {
                 return Err("scalar segment check must precede the first memory access".into());
+            }
+            if op.result_and_length & 0xf0 == object::SEGMENT_XCHG {
+                match self.insn(access.native_offset) {
+                    Some(Insn::Swap { size, rs, rt, rn }) if rt != 31 && rs != 31 => {
+                        self.swap_word(size, rs, rt, rn, access.native_offset)?;
+                    }
+                    _ => return Err("checked exchange requires an acquire-release SWPAL with source and result".into()),
+                }
             }
             let rmw_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ALU {
                 let store = effects.next().ok_or("missing second effect of checked ALU update")?;
@@ -3331,6 +3340,23 @@ mod tests {
                 let mut changed = sbb.clone();
                 changed[guard + core::mem::offset_of!(Site, data_reg)] ^= bit;
                 assert!(check(&changed).is_err(), "inconsistent ALU selector or register {bit}");
+            }
+        }
+        let (swap, source) = compile("f065862f", "0x8048000", "32"); // LOCK XCHG [GS:EDI], CH
+        let h: Header = super::super::record(&swap, 0);
+        let site_at = |kind| (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .find(|&at| super::super::record::<Site>(&swap, at).kind == kind).unwrap();
+        let guard = site_at(object::kind::SEGMENT);
+        let transfer = site_at(object::kind::SWAP);
+        for shape in [false, true] {
+            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+            check(&swap).unwrap();
+            for pos in [guard + core::mem::offset_of!(Site, data_reg), transfer + core::mem::offset_of!(Site, data_reg),
+                        transfer + core::mem::offset_of!(Site, data_reg) + 1, transfer + core::mem::offset_of!(Site, base_reg)] {
+                let mut changed = swap.clone();
+                changed[pos] ^= 1;
+                assert!(check(&changed).is_err(), "inconsistent XCHG operand at {pos}");
             }
         }
         let (add, source) = compile("65010f", "0x8048000", "32");

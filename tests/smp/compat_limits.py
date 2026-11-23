@@ -295,6 +295,36 @@ def cases():
     add('gs-generated-imm-wrapped-watch', 'mov dword [gs:edi], 0x89abcdef', base=0xfffffffe, segment='gs',
         mapped=C.WRAP, fault=1, after_trap=True, kernel_setup=up + watch_low,
         captured={high: bytes.fromhex('efcd'), low: bytes.fromhex('ab89')}, **imm)
+    ro = up + f'    and qword [{C.TA + 0x3000:#x}], -3\n    invlpg [0]\n'
+    exchange_seed = '    mov ecx, 0x12345678\n    cmp eax, eax\n    stc\n'
+    add('fs-xchg-high-byte', 'xchg [fs:edi], ch', prefix=exchange_seed, success=True, ecx=0x12341178, rflags=0x45,
+        memory=bytes.fromhex('56') + VALUE[1:])
+    add('gs-xchg-word-index', 'lock xchg [gs:edi+esi*2], cx', segment='gs', prefix=exchange_seed + '    mov esi, 1\n',
+        success=True, ecx=0x12344433, rflags=0x45, memory=VALUE[:2] + bytes.fromhex('7856') + VALUE[4:])
+    add('gs-xchg-dword', 'xchg ecx, [gs:edi]', segment='gs', prefix=exchange_seed, success=True, ecx=0x44332211,
+        rflags=0x45, memory=bytes.fromhex('78563412') + VALUE[4:])
+    add('fs-xchg-register', 'db 0x64,0x87,0xc1', selector=0, prefix=exchange_seed, success=True,
+        eax=0x12345678, ecx=0, rflags=0x45)
+    add('fs-xchg-readonly', 'xchg [fs:edi], ecx', access=0xf1, prefix=exchange_seed, ecx=0x12345678, rflags=0x10045)
+    add('gs-xchg-before-unmapped', 'lock xchg [gs:edi], ecx', segment='gs', base=C.XPAGE, limit=2,
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n',
+        prefix=exchange_seed, ecx=0x12345678, rflags=0x10045)
+    exchange_chunks = {high: bytes.fromhex('7856'), low: bytes.fromhex('3412')}
+    add('fs-xchg-wrapped-word', 'xchg [fs:edi], cx', mapped=C.WRAP, base=0xffffffff, kernel_setup=up,
+        prefix=exchange_seed, success=True, ecx=0x12343322, rflags=0x45,
+        captured={high: bytes.fromhex('1178'), low: bytes.fromhex('5644')})
+    add('gs-xchg-wrapped-lock', 'lock xchg [gs:edi], ecx', segment='gs', mapped=C.WRAP, base=0xfffffffe, kernel_setup=up,
+        prefix=exchange_seed, success=True, ecx=0x44332211, rflags=0x45, captured=exchange_chunks)
+    add('fs-xchg-wrapped-watch', 'xchg [fs:edi], ecx', mapped=C.WRAP, base=0xfffffffe, kernel_setup=up + watch_low,
+        prefix=exchange_seed, fault=1, after_trap=True, ecx=0x44332211, rflags=0x45, captured=exchange_chunks)
+    add('gs-xchg-lower-pf', 'xchg [gs:edi], ecx', segment='gs', mapped=C.TOP_ONLY, base=0xfffffffe, kernel_setup=init,
+        prefix=exchange_seed, fault=14, error=6, cr2=0, ecx=0x12345678, rflags=0x10045, captured={high: bytes.fromhex('1122')})
+    add('gs-xchg-lower-readonly', 'lock xchg [gs:edi], ecx', segment='gs', mapped=C.WRAP, base=0xfffffffe,
+        kernel_setup=ro, prefix=exchange_seed, fault=14, error=7, cr2=0, ecx=0x12345678, rflags=0x10045, captured=have)
+    for backing, route in [('hole', low_hole), ('apic', low_apic), ('rom', low_rom)]:
+        add('fs-xchg-wrapped-' + backing, 'xchg [fs:edi], ecx', base=0xfffffffe, mapped=route,
+            prefix=exchange_seed, kernel_setup=init, refuse='atomic', firmware=rom if backing == 'rom' else None,
+            captured={high: bytes.fromhex('1122')})
     # Non-LOCK ADD r/m,r. The dword pair sums to zero, setting CF, PF, AF and ZF.
     rmw_src = 0xbbccddef
     rmw_seed = f'    mov ecx, {rmw_src:#x}\n    cmp eax, eax\n    stc\n'
@@ -310,7 +340,6 @@ def cases():
     add('gs-add-rmw-lower-pf', 'add [gs:edi], ecx', base=0xfffffffe, segment='gs', mapped=C.TOP_ONLY,
         prefix=rmw_seed, kernel_setup=init, fault=14, error=6, cr2=0, ecx=rmw_src, rflags=0x10045,
         captured={high: bytes.fromhex('1122')})
-    ro = up + f'    and qword [{C.TA + 0x3000:#x}], -3\n    invlpg [0]\n'
     add('fs-add-rmw-lower-readonly', 'add [fs:edi], ecx', base=0xfffffffe, mapped=C.WRAP, prefix=rmw_seed,
         kernel_setup=ro, fault=14, error=7, cr2=0, ecx=rmw_src, rflags=0x10045, captured=have)
     add('gs-add-rmw-wrapped-watch', 'add [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=C.WRAP,
