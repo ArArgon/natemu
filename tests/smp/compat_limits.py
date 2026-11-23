@@ -1123,7 +1123,8 @@ def cases(*, reference_control=False):
         add(f'es-string-destination-{instruction}', f'ss {instruction}', mapped=C.TOP_ONLY,
             prefix=f'    mov esi, {C.W:#x}\n    mov edi, 0xfffffffe\n')
     add('ss-moffs-load', 'mov eax, [ss:0xfffffffe]', fault=12, mapped=C.TOP_ONLY)
-    cases += [mixed_user_wrap(), mixed_user_wrap_far(), identity_switch(False), identity_switch(True)]
+    cases += [mixed_user_wrap(), mixed_user_wrap_far(), mixed_user_fold(), mixed_user_shld(), mixed_user_shld_6g(),
+              identity_switch(False), identity_switch(True)]
     # M2 checkpoint C, the generic operand check: one in-range and one out-of-range case per instruction class the
     # per-opcode checks left unchecked, under a writable expand-up segment. In range the inline check passes (the
     # resident decides none: checks=0) and the effect is the instruction's; out of range the fault is at the instruction
@@ -1369,3 +1370,116 @@ bits 32
                   C.REC + 0x50: struct.pack('<Q', 0x10ad0008),
                   C.LOW1: struct.pack('<3I', 0x10ad0000, 0x5704e000, 0x10ad0008),
                   C.XPAGE: struct.pack('<3I', *sentinels)}
+
+
+# 32-bit code runs under translation roots that map nothing above 4 GiB (docs/restructure/m2-checkpoint-c-plan.md, "Folded
+# displacements behind a 4 GiB translation root"), so a native address with any bit above 31 set aborts and the access is
+# made at the wrapped address. In each program below 64-bit code of the same process first writes sentinels through the
+# address the native instruction would reach without that (which shadows the wrong page writable), and the 32-bit code
+# must read and write the low pages instead.
+FAR = [C.entry(C.TA + 0x1000 + 4 * 8, C.HI_PD | C.P.P | C.P.RW | C.P.US | C.P.A),
+       C.entry(C.HI_PD, C.HI_PT | C.P.P | C.P.RW | C.P.US | C.P.A), C.entry(C.HI_PT + 8, C.XPAGE | C.P.LEAF)]
+ENTER32 = f"""    push 0x1b
+    push {C.US:#x}
+    push 2
+    push 0xdb
+    mov eax, .in32
+    push rax
+    iretq
+bits 32
+.in32:
+"""
+
+
+def mixed_user_fold():
+    """Folded displacements whose 64-bit sum is wrong: the far end of the fold, below zero, and under an upper half that a
+    repair left and a 16-bit write kept (EBP = FFFF_F800H plus 1000H is made again with the register moved down by 4 GiB;
+    `mov bp` keeps that upper half, and FFFF_F7F4H plus 800H is then 2^64 - 12 natively); base + index without a
+    displacement beside them.
+
+    The last page of the address space maps XPAGE for user code: the top table entry links table B's first page as its
+    level-3 table, whose last entry links its second (the level-2 table here), whose last entry is linear FFFF_F000H's
+    page, read as a page table: its last eight bytes map XPAGE. So FFFF_FFF4H is HIGH + FF4H and 2^64 - 12 is XPAGE + FF4H."""
+    memory = C.WRAP[:-1] + FAR + [C.entry(C.TA + 511 * 8, C.HI_PD | C.P.P | C.P.RW | C.P.US | C.P.A),
+                                  C.P.zero(C.HIGH, 0xff8), C.entry(C.HIGH + 0xff8, C.XPAGE | C.P.LEAF), C.P.zero(C.XPAGE, 0x1000)]
+    user = f"""bits 64
+    mov rax, {1 << 32 | 0x1000:#x}
+    mov dword [rax], 0x5eed0000
+    mov dword [rax+8], 0x5eed0008
+    mov rax, -16
+    mov dword [rax+4], 0x5eed0ff4
+    mov dword [0x1000], 0x10ad0000
+    mov dword [0x1008], 0x10ad0008
+    mov eax, 0xfffffff4
+    mov dword [rax], 0x70b0fff4
+""" + ENTER32 + f"""    mov ebx, 0xffffe000
+    mov eax, [ebx+0x3008]
+    mov ebp, 4
+    mov ecx, [ebp-16]
+    mov ebp, 0xfffff800
+    mov edx, [ebp+0x1000]
+    mov bp, 0xf7f4
+    mov edx, [ebp+0x800]
+    mov esi, 0xfffff000
+    mov edi, 0x2008
+    mov esi, [esi+edi]
+    mov [ebx+0x3004], ecx
+    mov esp, {C.US:#x}
+    int 0x80
+"""
+    prog = C.program('mixed-user-fold', C.ENTER(cs=0x23) + C.handlers(), user, memory)
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 128, 0),
+                  C.REC + 0x40: struct.pack('<4Q', 0x10ad0008, 0x70b0fff4, 0x70b0fff4, 0xffffe000),
+                  C.REC + 0x68: struct.pack('<2Q', 0xfffff7f4, 0x10ad0008),
+                  C.LOW1: struct.pack('<3I', 0x10ad0000, 0x70b0fff4, 0x10ad0008),
+                  C.XPAGE: struct.pack('<3I', 0x5eed0000, 0, 0x5eed0008), C.XPAGE + 0xff4: struct.pack('<I', 0x5eed0ff4)}
+
+
+def mixed_user_shld():
+    """SHLD and SHRD by CL whose 64-bit intermediate has bit 32 set: the 32-bit result addresses linear 1000H, with and
+    without a displacement, not the warm page at 1_0000_1000H."""
+    user = f"""bits 64
+    mov rax, {1 << 32 | 0x1000:#x}
+    mov dword [rax], 0x5eed0000
+    mov dword [rax+8], 0x5eed0008
+    mov dword [0x1000], 0x10ad0000
+    mov dword [0x1008], 0x10ad0008
+""" + ENTER32 + f"""    mov eax, 0x80000800
+    xor ebx, ebx
+    mov cl, 1
+    shld eax, ebx, cl
+    mov edx, [eax]
+    mov esi, [eax+8]
+    xor eax, eax
+    mov ebx, 0x80000800
+    mov cl, 31
+    shrd eax, ebx, cl
+    mov edi, [eax]
+    mov ebp, [eax+8]
+    mov esp, {C.US:#x}
+    int 0x80
+"""
+    prog = C.program('mixed-user-shld', C.ENTER(cs=0x23) + C.handlers(), user, C.WRAP + FAR + [C.P.zero(C.XPAGE, 12)])
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 128, 0), C.REC + 0x40: struct.pack('<Q', 0x1000),
+                  C.REC + 0x50: struct.pack('<Q', 0x10ad0000), C.REC + 0x68: struct.pack('<3Q', 0x10ad0008, 0x10ad0008, 0x10ad0000),
+                  C.XPAGE: struct.pack('<3I', 0x5eed0000, 0, 0x5eed0008)}
+
+
+def mixed_user_shld_6g():
+    """The same with the wrong page at 6 GiB: `shld eax, ebx, cl` of 6000_0400H by 2 is 8000_1000H, in 64 bits
+    1_8000_1000H. Nothing is mapped at linear 8000_1000H: the load is a page fault there, not a read of the warm page."""
+    memory = C.WRAP + FAR + [C.entry(C.TA + 0x1000 + 6 * 8, C.HI_PD | C.P.P | C.P.RW | C.P.US | C.P.A),
+                             C.entry(C.TA + 0x1000 + 2 * 8, 0), C.P.zero(C.XPAGE, 12)]
+    user = f"""bits 64
+    mov rax, {6 << 30 | 0x1000:#x}
+    mov dword [rax], 0x5eed0000
+""" + ENTER32 + """    mov eax, 0x60000400
+    xor ebx, ebx
+    mov cl, 2
+    shld eax, ebx, cl
+    mov edx, [eax]
+    int 0x80
+"""
+    prog = C.program('mixed-user-shld-6g', C.ENTER(cs=0x23) + C.handlers(), user, memory)
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 14, 4), C.REC + 0x38: struct.pack('<Q', 0x80001000),
+                  C.XPAGE: struct.pack('<I', 0x5eed0000)}

@@ -63,6 +63,8 @@ argv = ["tests/static/check_compat_address.py", "{fexc}"]
 
 # M2: FEX's 32-bit ASM suite (245 tests), offline: every reachable block compiled for 32-bit code and admitted by the
 # host with the code-shape check. Running them waits for 32-bit code in the VM (M2 task 3).
+# M2 checkpoint C: each block's native words are also scanned for a write that could leave bits above 31 in the register of
+# EAX..EDI (run_asm.py `wide_writes`): none may.
 [suite.cases."fexc-asm32"]
 argv = ["tools/fexc/upstream_tests/run_asm.py", "--compile32", "--jobs", "4", "--fexc", "{fexc}", "--host", "{natemu_host}", "--out", "{out}",
         "--src", "{fex_asm}/../32Bit_ASM"]
