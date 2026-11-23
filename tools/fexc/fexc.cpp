@@ -253,7 +253,7 @@ void JoinSites(uint64_t rip) {
         s.data_reg[0] = i.modrm_reg;
         if ((s.data_reg[1] & 0xf0) == 0x30) {
           s.data_reg[0] |= i.primary_op & 0x38; // Primary ALU operation, independent of the source register.
-        } else if (i.primary_op == 0xc6 || i.primary_op == 0xc7) {
+        } else if (i.primary_op == 0xc6 || i.primary_op == 0xc7 || (i.name == "MOVBE" && s.intent == 1)) {
           // The wrapped transaction uses the same native transfer register as the ordinary STORE.
           for (const auto& a : Cap.sites) if (a.kind == FEXC_SITE_STORE && a.native_offset == s.access_native_offset)
             s.data_reg[0] = 0x40 | a.data_reg[0];
@@ -341,7 +341,8 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END),
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d),
                            SegmentOverride(d.Flags), d.FexcMap == FEXC_MAP_PRIMARY ? d.OPRaw : -1,
-                           uint8_t(d.Flags & X86Tables::DecodeFlags::FLAG_DECODED_MODRM ? (d.ModRM >> 3) & 7 : 0)});
+                           uint8_t(d.FexcMap == FEXC_MAP_TWO && (d.OPRaw & 0xf0) == 0x90 ? d.OPRaw & 15 :  // SETcc ignores ModRM.reg.
+                                   d.Flags & X86Tables::DecodeFlags::FLAG_DECODED_MODRM ? (d.ModRM >> 3) & 7 : 0)});
     }
   }
 }

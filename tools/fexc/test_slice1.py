@@ -791,10 +791,24 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation'], guard['imm'] + 4,
                                   guard['access_native_offset']), (width, 'read', True, load['native_offset'], load['native_offset']), form)
                 self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-            d, rc = run('640f38f10f', RIP, '--bitness', '32')  # MOVBE stores are a separate family.
-            self.assertEqual(rc, 0)
-            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']))
-            self.assertTrue(any(s['kind'] == 'store' for s in d['sites']))
+
+    def test_compat_integer_stores(self):
+        import verify_precision
+        forms = [('640f' + f'{0x90 + cc:02x}' + '2f', 1, cc) for cc in range(16)] # ignored ModRM.reg = 5
+        forms += [('65660f38f10f', 2, None), ('640f38f10f', 4, None), ('650fc30f', 4, 1)]
+        with tempfile.TemporaryDirectory() as t:
+            for form, width, role in forms:
+                d, rc = run(form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0, form)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                store, = (s for s in d['sites'] if s['kind'] == 'store')
+                self.assertEqual((guard['width'], guard['intent'], guard['access_native_offset'], store['width']),
+                                 (width, 'write', store['native_offset'], width), form)
+                self.assertEqual(guard['data_regs'], [role if role is not None else 0x40 | store['data_regs'][0]], form)
+                self.assertLess(guard['imm'], store['native_offset'], form)
+                if form == '650fc30f':
+                    self.assertEqual(store['ordering'], 'plain')
+                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
 
     def test_compat_locked_cmpxchg_segment(self):
         import verify_precision

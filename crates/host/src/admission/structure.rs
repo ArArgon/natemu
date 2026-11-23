@@ -735,6 +735,9 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
 
 /// Decode the complete source stream independently of the producer's PC table. A matching prefix
 /// byte inside a displacement or immediate is ordinary data.
+#[derive(Clone, Copy, PartialEq)]
+enum IntegerStore { Setcc, Reverse, NonTemporal }
+
 struct ScalarOperand {
     offset: u32,
     segment: u8,
@@ -743,6 +746,7 @@ struct ScalarOperand {
     data_reg: u8,
     store_immediate: Option<u32>,
     inline_dword: bool,
+    integer_store: Option<IntegerStore>,
     result_and_length: u8,
     absolute_offset: Option<u32>,
     xlat: bool,
@@ -782,6 +786,15 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             Code::Mov_rm32_imm32 => Some(i.immediate32()),
             _ => None,
         };
+        let integer_store = match i.code() {
+            Code::Seto_rm8 | Code::Setno_rm8 | Code::Setb_rm8 | Code::Setae_rm8 | Code::Sete_rm8 | Code::Setne_rm8
+            | Code::Setbe_rm8 | Code::Seta_rm8 | Code::Sets_rm8 | Code::Setns_rm8 | Code::Setp_rm8 | Code::Setnp_rm8
+            | Code::Setl_rm8 | Code::Setge_rm8 | Code::Setle_rm8 | Code::Setg_rm8 =>
+                Some(IntegerStore::Setcc),
+            Code::Movbe_m16_r16 | Code::Movbe_m32_r32 => Some(IntegerStore::Reverse),
+            Code::Movnti_m32_r32 => Some(IntegerStore::NonTemporal),
+            _ => None,
+        };
         use natemu_abi::interp::op;
         let rmw_alu = match i.code() {
             Code::Add_rm8_r8 | Code::Add_rm16_r16 | Code::Add_rm32_r32 => Some(op::ADD),
@@ -802,7 +815,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         };
         let result = match i.code() {
             _ if implicit_group.is_some() => object::SEGMENT_NATIVE_LOAD,
-            _ if moffs || store_immediate.is_some() => 0,
+            _ if moffs || store_immediate.is_some() || integer_store.is_some() => 0,
             Code::Cmpxchg_rm8_r8 | Code::Cmpxchg_rm16_r16 | Code::Cmpxchg_rm32_r32 if i.has_lock_prefix() => object::SEGMENT_CMPXCHG,
             _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
             Code::Xchg_rm8_r8 | Code::Xchg_rm16_r16 | Code::Xchg_rm32_r32 => object::SEGMENT_XCHG,
@@ -843,6 +856,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let other = u32::from(first_is_memory);
         // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
         let modrm_reg = implicit_group.unwrap_or_else(|| match i.code() {
+            _ if integer_store == Some(IntegerStore::Setcc) => i.condition_code() as u8 - iced_x86::ConditionCode::o as u8,
             // VEX.vvvv names the BLS destination; ModRM.reg is the operation selector.
             Code::VEX_Blsr_r32_rm32 => 1,
             Code::VEX_Blsmsk_r32_rm32 => 2,
@@ -859,7 +873,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         }
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
-            data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, result_and_length: result | i.len() as u8,
+            data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, integer_store, result_and_length: result | i.len() as u8,
             xlat, inline_dword,
         });
     }
@@ -1263,7 +1277,7 @@ impl<'a> Verifier<'a> {
             let mut matching = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
             let Some(site) = matching.next() else { return Err("missing scalar segment check".into()); };
             if matching.next().is_some() || site.segment != op.segment || site.intent != op.write || site.width != op.width
-                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && site.data_reg[0] != op.data_reg) {
+                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && op.integer_store != Some(IntegerStore::Reverse) && site.data_reg[0] != op.data_reg) {
                 return Err("scalar segment check differs from its x86 operand".into());
             }
             let access = self.c.accesses.iter().find(|a| a.native_offset == site.guest_offset2)
@@ -1387,6 +1401,9 @@ impl<'a> Verifier<'a> {
                 }
                 high - 4
             } else { setup };
+            if let Some(form) = op.integer_store {
+                self.integer_store(form, op, site, access, p.native_offset, setup)?;
+            }
             let last = rmw_store.unwrap_or(access.native_offset);
             let sealed_end = if inline.is_some() {
                 let commit = self.inline_dword_transfer(op, access, p.native_offset, end)?;
@@ -1421,6 +1438,65 @@ impl<'a> Verifier<'a> {
             return Err("extra scalar segment check".into());
         }
         Ok(())
+    }
+
+    fn integer_store(&self, form: IntegerStore, op: &ScalarOperand, site: &Site, access: &Site, start: u32, setup: u32) -> Result<(), String> {
+        let reg = access.data_reg[0];
+        let word = self.word(access.native_offset);
+        let size = u32::from(op.width.trailing_zeros()) << 30;
+        let regs = u32::from(access.base_reg) << 5 | u32::from(reg);
+        let plain = word == size | 0x3900_0000 | regs || word == size | 0x3800_0000 | regs;
+        let release = word == size | 0x089f_fc00 | regs;
+        if access.kind != object::kind::STORE || access.width != op.width || access.intent != object::INTENT_WRITE
+            || access.rmw != object::RMW_NONE || access.data_class != object::CLASS_GPR || !((plain && access.ordering == object::ORD_PLAIN) || (release && access.ordering == object::ORD_RELEASE))
+        {
+            return Err("checked integer store width, ordering or transfer".into());
+        }
+        // A false SETcc still writes zero. Wider writes may take their own split stub,
+        // while all three forms can close an incoming x87 run before their address check.
+        for &(from, to) in &self.branches {
+            if !(start..access.native_offset).contains(&from) || (from == site.imm as u32 - 4 && to == site.native_offset)
+                || self.inline_run_close(from, to, start, setup) { continue; }
+            if op.width > 1 && from >= site.imm as u32 + 4 && self.c.stubs.iter().any(|s|
+                s.kind == object::kind::SPLIT && s.native_offset == to && s.guest_offset2 == access.native_offset) { continue; }
+            return Err("branch skips or changes the checked integer store".into());
+        }
+        if form == IntegerStore::Setcc { return Ok(()); }
+        let root = SRA32[usize::from(op.data_reg)];
+        if form == IntegerStore::NonTemporal {
+            if !plain || reg != root || self.written(1 << root, start, access.native_offset) {
+                return Err("MOVNTI must store its source register with plain ordering".into());
+            }
+            return Ok(());
+        }
+        // Both the bank trap and native store must see the already-reversed source.
+        if !(2..31).contains(&reg) || SRA32.contains(&reg) || site.data_reg[0] != object::SEGMENT_STORE_REGISTER | reg {
+            return Err("MOVBE captured transfer register".into());
+        }
+        let last = self.last_write(reg, start, setup).ok_or("missing MOVBE byte reversal")?;
+        let rev = if op.width == 2 {
+            if last < start + 4 || self.word(last) != 0x5310_7c00 | u32::from(reg) << 5 | u32::from(reg) {
+                return Err("MOVBE word store must take the reversed low word".into());
+            }
+            last - 4
+        } else { last };
+        if self.word(rev) != 0x5ac0_0800 | u32::from(root) << 5 | u32::from(reg)
+            || self.written(1 << root, start, rev) || self.written(1 << reg, last + 4, access.native_offset)
+            || self.branches_into(rev, setup).any(|(from, to)| !self.inline_run_close(from, to, last + 4, setup))
+        {
+            return Err("MOVBE native store does not retain the reversed x86 source".into());
+        }
+        Ok(())
+    }
+
+    /// Only the CBZ over the exact inline x87 run close. Both paths rejoin at or before
+    /// the checked address setup, and neither can change a prepared store register.
+    fn inline_run_close(&self, from: u32, to: u32, earliest: u32, limit: u32) -> bool {
+        from >= earliest + 4 && to == from + 40 && to <= limit
+            && self.word(from - 4) == 0x3940_0380 | frame::X87_RUN << 10
+            && self.word(from) == 0x3400_0140
+            && RUN_END.iter().enumerate().all(|(i, &w)| self.word(from + 4 + 4 * i as u32) == w)
+            && self.branches_into(from - 4, to - 4).next().is_none()
     }
 
     fn xlat_effect(&self, start: u32, setup: u32, access: &Site, end: u32, offset: u8) -> Result<(), String> {
@@ -3504,10 +3580,11 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("natemu-admit32-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let compile = |hex: &str, rip: &str, bits: &str| -> (Vec<u8>, Vec<u8>) {
+        let compile_with = |hex: &str, rip: &str, bits: &str, extra: &[&str]| -> (Vec<u8>, Vec<u8>) {
             let object = dir.join("o");
             let out = std::process::Command::new(&fexc)
                 .args(["--hex", hex, "--rip", rip, "--profile", "slice1", "--bitness", bits, "--narrow-cmp", "--ext-conds", "4"])
+                .args(extra)
                 .arg("--object")
                 .arg(&object)
                 .output()
@@ -3516,6 +3593,7 @@ mod tests {
             let source = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
             (std::fs::read(&object).unwrap(), source)
         };
+        let compile = |hex: &str, rip: &str, bits: &str| compile_with(hex, rip, bits, &[]);
         let admit = |(object, source): &(Vec<u8>, Vec<u8>), bits32: bool| {
             let h: Header = super::super::record(object, 0);
             super::super::admit_mode(object, h.guest_rip, source, u64::MAX, true, false, bits32).map(|a| a.links.len())
@@ -3636,6 +3714,57 @@ mod tests {
             let mut changed = src.clone();
             changed[5] = 0x17; // BLSMSK /2.
             assert!(check(&obj, &changed).unwrap_err().contains("differs from its x86 operand"));
+        }
+        for hex in ["650f942f", "640f38f10f", "65660f38f10f", "650fc30f"] {
+            let (obj, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&obj, 0);
+            let (at, guard) = (0..h.sites_count as usize)
+                .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+                .map(|at| (at, super::super::record::<Site>(&obj, at)))
+                .find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap();
+            for shape in [false, true] {
+                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
+                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
+                let mut different_role = obj.clone();
+                different_role[at + core::mem::offset_of!(Site, data_reg)] ^= 1;
+                assert!(check(&different_role).is_err(), "{hex}: changed store source or condition");
+                let word_at = (h.code_offset + guard.guest_offset2) as usize;
+                let mut wrong_size = obj.clone();
+                wrong_size[word_at + 3] ^= 0x40;
+                assert!(check(&wrong_size).is_err(), "{hex}: changed native store width");
+                if hex.contains("38f1") {
+                    let reversal = (guard.insn_native_offset..guard.imm as u32 - 8).step_by(4)
+                        .map(|pc| (h.code_offset + pc) as usize)
+                        .find(|&pc| u32::from_le_bytes(obj[pc..pc+4].try_into().unwrap()) & !1023 == 0x5ac0_0800)
+                        .expect("MOVBE store must reverse the guest source before its descriptor check");
+                    let mut other_gpr = obj.clone();
+                    other_gpr[reversal] ^= 1 << 5;
+                    assert!(check(&other_gpr).is_err(), "{hex}: reversed another source register");
+                }
+            }
+        }
+        for hex in ["650f952f", "64660f38f10f"] {
+            let (obj, src) = compile_with(hex, "0x8048000", "32", &["--max-insts", "1"]);
+            let h: Header = super::super::record(&obj, 0);
+            let guard = (0..h.sites_count as usize)
+                .map(|n| super::super::record::<Site>(&obj, h.sites_offset as usize + n * size_of::<Site>()))
+                .find(|s| s.kind == object::kind::SEGMENT).unwrap();
+            let body = (guard.insn_native_offset..guard.imm as u32 - 8).step_by(4)
+                .find(|&pc| {
+                    let at = (h.code_offset + pc) as usize;
+                    u32::from_le_bytes(obj[at..at+4].try_into().unwrap()) == 0x3400_0140
+                }).expect("one-instruction unit checks the incoming x87 run");
+            let at = (h.code_offset + body) as usize;
+            for shape in [false, true] {
+                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
+                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
+                let mut skips_offset = obj.clone();
+                skips_offset[at] ^= 1 << 5;
+                assert!(check(&skips_offset).is_err(), "{hex}: run-close branch skips offset setup");
+                let mut different_root = obj.clone();
+                different_root[at - 4] ^= 1;
+                assert!(check(&different_root).is_err(), "{hex}: run-close reads another register");
+            }
         }
         let (alu, source) = compile("65330f", "0x8048000", "32");
         let h: Header = super::super::record(&alu, 0);

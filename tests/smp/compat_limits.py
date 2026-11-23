@@ -859,6 +859,32 @@ def cases():
             add('gs-bmi-mulx-alias-wrapped', 'mulx ecx, ecx, dword [gs:edi]', segment='gs',
                 base=0xfffffffe, mapped=C.WRAP, kernel_setup=bmi_wrap, prefix=start, success=True,
                 ecx=product >> 32, rflags=0x45, captured=registers)
+    # SETcc writes a byte for both condition outcomes. ModRM.reg is ignored even
+    # when nonzero. The condition comes from NZCV or PF and all flags survive.
+    store_regs = '    mov ecx, 0x12345678\n    cmp edi, edi\n    stc\n'
+    for cc, opcode, val in [('e', 0x94, 1), ('ne', 0x95, 0), ('p', 0x9a, 1), ('np', 0x9b, 0)]:
+        seg = 'gs' if val else 'fs'
+        insn = f'db {0x65 if val else 0x64},0x0f,{opcode},0x2f'
+        add(f'{seg}-set{cc}-write', insn, segment=seg, prefix=store_regs, success=True, rflags=0x45,
+            ecx=0x12345678, memory=bytes([val]) + VALUE[1:])
+        add(f'{seg}-set{cc}-readonly', insn, segment=seg, access=0xf1, prefix=store_regs, rflags=0x10045, ecx=0x12345678)
+    add('gs-setne-false-write-page-fault', 'setne [gs:edi]', segment='gs', base=C.XPAGE, kernel_setup=absent,
+        prefix=store_regs, fault=14, error=6, cr2=C.XPAGE, rflags=0x10045, ecx=0x12345678)
+    for opname, insn, data, seg in [('movbe-word', 'movbe [fs:edi], cx', bytes.fromhex('5678'), 'fs'),
+                                     ('movbe-dword', 'movbe [gs:edi], ecx', bytes.fromhex('12345678'), 'gs'),
+                                     ('movnti', 'movnti [fs:edi], ecx', bytes.fromhex('78563412'), 'fs')]:
+        width = len(data)
+        base = (1 << 32) - width // 2
+        old = {high: b'\x11' + data[:1], low: data[1:] + b'\x44'} if width == 2 else {high: data[:2], low: data[2:]}
+        prefix = dict(segment=seg, prefix=store_regs, ecx=0x12345678)
+        add(f'{seg}-{opname}-ordinary', insn, success=True, rflags=0x45, memory=data + VALUE[width:], **prefix)
+        add(f'{seg}-{opname}-wrap', insn, base=base, limit=width-1, mapped=C.WRAP, kernel_setup=up,
+            success=True, rflags=0x45, captured=old, **prefix)
+        add(f'{seg}-{opname}-before-page', insn, base=C.XPAGE, limit=width-2, kernel_setup=absent, rflags=0x10045, **prefix)
+        add(f'{seg}-{opname}-second-pf', insn, base=base, mapped=C.TOP_ONLY, kernel_setup=init, fault=14,
+            error=6, cr2=0, rflags=0x10045, captured={high: have[high]}, **prefix)
+        add(f'{seg}-{opname}-wrap-rom', insn, base=base, mapped=low_rom, firmware=rom, kernel_setup=init,
+            success=True, rflags=0x45, captured={high: old[high]}, **prefix)
 
     def xlat_regs(ebx, al):
         return f'    cmp al, al\n    stc\n    mov ebx, {ebx:#x}\n    mov eax, {0xaabbcc00 | al:#x}\n'
