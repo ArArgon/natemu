@@ -253,6 +253,18 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-stric
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
+# The same compatibility user loop and linear addresses via flat DS, finite-limit FS, and finite-limit GS. The guest TSC
+# times each warmed loop within the VM, with its final words checked before recording the results.
+[[suite]]
+name = "compat-tls"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 60 }
+
+[suite.cases.compat-tls-natemu]
+argv = ["python3", "tests/bench/run_compat_tls.py", "--out", "{out}", "--natemu", "{host}", "{runtime}", "{fexc}"]
+
 # The Debian cloud-image workload (tests/io/run_io5.py, docs/benchmarks.md "Context-switch-heavy Debian workload") with its
 # build timed alone (--solo-build: configure and make -j4 again after the run, without the download and disk loops):
 # result.json's steps solo-configure and solo-make. Always 4 vCPUs, mitigations=off, as m1-perf's IO5 runs. About 15 minutes
