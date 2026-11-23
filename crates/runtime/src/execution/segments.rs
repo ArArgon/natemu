@@ -916,7 +916,23 @@ pub(super) fn aligned_operand(
     write: bool,
     range: impl Into<OperandRange>,
 ) -> Result<(), Exception> {
-    let range = range.into();
+    ordered_operand(s, at, bytes, slot, alignment, write, range.into(), |s, _, _, _, _| mmio::system_access(s))
+}
+
+/// One compatibility string element. Preserve the translated path's ROM and unassigned reads
+/// and its typed refusal of device strings after both pages have been walked.
+pub(super) fn string_element(
+    s: &mut State, at: u64, bytes: &mut [u8], write: bool, range: OperandRange,
+) -> Result<(), Exception> {
+    ordered_operand(s, at, bytes, bytes.len(), bytes.len() as u64, write, range, |s, gpa, first, bytes, write| {
+        mmio::string_operand(s, at, gpa, first, bytes, write)
+    })
+}
+
+fn ordered_operand(
+    s: &mut State, at: u64, bytes: &mut [u8], slot: usize, alignment: u64, write: bool, range: OperandRange,
+    nonram: impl FnOnce(&mut State, [u64; 2], usize, &mut [u8], bool),
+) -> Result<(), Exception> {
     if range.outside(&s.cpu, at, bytes.len() as u64) {
         return Err(range.fault());
     }
@@ -929,7 +945,9 @@ pub(super) fn aligned_operand(
     let gpa = pages(s, at, bytes.len() as u64, write, false, range)?;
     let head = bytes.len().min((4096 - (at & 4095)) as usize);
     if !mmio::ram(gpa[0]) || (head < bytes.len() && !mmio::ram(gpa[1])) {
-        mmio::system_access(s);
+        nonram(s, gpa, head, bytes, write);
+        watch::access(s, at, bytes.len() as u64, write);
+        return Ok(());
     }
     if write {
         for (pa, count) in [(gpa[0], head), (gpa[1], bytes.len() - head)] {

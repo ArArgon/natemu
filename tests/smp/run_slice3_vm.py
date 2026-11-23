@@ -1695,6 +1695,10 @@ def cmd_compat_limits(a, host, runtime):
                         diffs.append(f'cpu{i} stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
                     if prog['ncpu'] > 1 and not limit and not cpu['stats']['linked']:
                         diffs.append(f'cpu{i} installed no links in the default run')
+                if 'unassigned_fills' in prog:
+                    counts = {smp.num(e['page']): (e['reads'], e['writes']) for e in out.get('unassigned_pages', [])}
+                    if counts != prog['unassigned_fills']:
+                        diffs.append(f"unassigned reads/writes {counts}, expected {prog['unassigned_fills']}")
                 captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
                 for addr, want in expected.items():
                     got = next((data[addr - base:addr - base + len(want)] for base, data in captured.items()

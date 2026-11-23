@@ -29,7 +29,7 @@ def cases():
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -58,7 +58,7 @@ def cases():
                      f'    cmp qword [{C.LOG:#x}], 2\n    jne .done\n    mov ax, {selector:#x}\n'
                      f'    mov {segment}, ax\n    jmp .resume\n.done:\n' + saved)
         enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23).replace('    push 2\n', f'    push {enter_flags}\n')
-        prog = C.program(name, C.gate(12, '.v12') + (C.gate(1, '.v1') if after_trap else '') + setup + kernel_setup + enter
+        prog = C.program(name, C.gate(12, '.v12') + (C.gate(1, '.v1') if fault == 1 else '') + setup + kernel_setup + enter
                          + C.handlers(saved, xmm=True, vectors=(1, 6, 12, 13, 14, 128)), user, memory=mapped)
         # Handler offsets are from compat.handlers, the target memory and CR2 are independent of the recorded frame.
         expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, error, rip,
@@ -77,8 +77,11 @@ def cases():
             expected.update({addr + 0x400: data for addr, data in expected.items() if C.REC <= addr < C.REC + 0x200})
             for delta in (0, 0x200):
                 expected[C.REC + delta] = struct.pack('<QQQQ', 13, 0, fault_rip, 0xdb)
-                expected[C.REC + delta + 0x48] = struct.pack('<I', 0x12345678)
+                for addr, value in (retry_regs or {C.REC + 0x48: struct.pack('<I', 0x12345678)}).items():
+                    expected[addr + delta] = value
             expected[C.LOG] = struct.pack('<Q', 3)
+        if fills is not None:
+            prog['unassigned_fills'] = fills
         if firmware is not None:
             prog['firmware'] = firmware.hex()
             expected[C.W + 0x48] = firmware[:2] + bytes(2)
@@ -152,6 +155,67 @@ def cases():
     init = '    mov ax, 0x2211\n    mov rbx, 0xfffffffe\n    mov [rbx], ax\n'
     up = init + '    xor ebx, ebx\n    mov word [rbx], 0x4433\n'
     have = {high: bytes.fromhex('1122'), low: bytes.fromhex('3344')}
+    # String source and destination have independent selectors. Inspect the saved element boundary, including
+    # both pointers and the count, even when the first element succeeds and the next one faults.
+    dest = C.W + 0xc0
+
+    def indices(si, di):
+        return {C.REC + 0x70: struct.pack('<II', si, 0), C.REC + 0x78: struct.pack('<II', di, 0)}
+
+    def regs(si, di, count):
+        return f'    mov esi, {si:#x}\n    mov edi, {di:#x}\n    mov ecx, {count}\n'
+
+    add('fs-string-movs-word', 'fs movsw', success=True, prefix=regs(1, dest, 7),
+        ecx=7, captured=indices(3, dest + 2) | {dest: VALUE[1:3]})
+    add('gs-string-rep-lods-backward', 'gs rep lodsb', segment='gs', success=True,
+        prefix=regs(1, dest, 2) + '    mov eax, 0xaabbccdd\n    std\n', ecx=0,
+        captured=indices(0xffffffff, dest) | {C.REC + 0x40: struct.pack('<I', 0xaabbcc11)})
+    add('fs-string-lods-wrapped', 'fs lodsd', success=True, base=0xfffffffe, mapped=C.WRAP,
+        kernel_setup=up, prefix=regs(0, dest, 1), captured=indices(4, dest) |
+        {C.REC + 0x40: struct.pack('<I', 0x44332211)})
+    add('fs-string-repe-mismatch', 'fs repe cmpsb', success=True, prefix=regs(0, tls + 1, 3),
+        ecx=2, rflags=0x91, captured=indices(1, tls + 2))
+    add('gs-string-repne-equal', 'gs repne cmpsd', segment='gs', success=True, prefix=regs(0, tls, 3),
+        ecx=2, rflags=0x44, captured=indices(4, tls + 4))
+    add('fs-string-repe-fault-flags', 'fs repe cmpsb', limit=0, prefix=regs(0, tls, 3) + '    stc\n',
+        ecx=2, rflags=0x10045, captured=indices(1, tls + 1))
+    # DR0 observes the second operand of the first completed compare. The #DB frame has that
+    # iteration's new flags and indices, RF set, and RIP at the unfinished string. A subsequent
+    # access fault would instead restore the entry flags (the preceding test sets CF to distinguish).
+    watch_dest = f'    mov eax, {dest:#x}\n    mov dr0, rax\n    mov eax, 0x30001\n    mov dr7, rax\n'
+    add('fs-string-repe-watch-completed', 'fs repe cmpsb', prefix=regs(0, dest, 3) + '    stc\n',
+        fault=1, ecx=2, rflags=0x10044, kernel_setup=f'    mov byte [{dest:#x}], 0x11\n' + watch_dest,
+        captured=indices(1, dest + 1))
+    add('gs-string-rep-movs-progress', 'gs rep movsd', segment='gs', prefix=regs(0, dest, 2), ecx=1,
+        captured=indices(4, dest + 4) | {dest: VALUE[:4] + bytes(4)})
+    add('gs-string-rep-movs-reload', 'gs rep movsd', segment='gs', success=True, reload_limit=7,
+        prefix=regs(0, dest, 2), ecx=0, captured=indices(8, dest + 8) | {dest: VALUE[:8]},
+        retry_regs=indices(4, dest + 4) | {C.REC + 0x48: struct.pack('<I', 1)})
+    hole = 0x90000000
+    add('gs-string-unassigned-lods', 'gs rep lodsd', segment='gs', success=True, base=C.XPAGE, limit=11,
+        prefix=regs(0, dest, 3), ecx=0, captured=indices(12, dest) | {C.REC + 0x40: bytes([255]) * 4},
+        kernel_setup=f'    mov eax, {hole | C.P.LEAF:#x}\n    mov [{C.PTE(C.XPAGE):#x}], rax\n    invlpg [{C.XPAGE:#x}]\n',
+        fills={hole: (1, 0)})
+    # MOVS reads its source in RAM. An unaligned destination straddles RAM and an APIC page.
+    # Preloading the last RAM bytes independently makes any partial write observable after the refusal.
+    first = C.XPAGE + 0xffe
+    map_dest = (f'    mov eax, {C.HIGH | C.P.LEAF:#x}\n    mov [{C.PTE(C.XPAGE):#x}], rax\n'
+                f'    mov eax, {0xfee00000 | C.P.LEAF:#x}\n    mov [{C.PTE(C.XPAGE + 0x1000):#x}], rax\n'
+                f'    invlpg [{C.XPAGE:#x}]\n    invlpg [{C.XPAGE + 0x1000:#x}]\n')
+    for name, di, reason in [('cross-page', first, 'crossing'), ('single-page', C.XPAGE + 0x1000, 'form')]:
+        add('fs-string-device-store-' + name, 'fs rep movsd', prefix=regs(0, di, 2), refuse=reason,
+            mapped=[{'addr': hex(C.HIGH + 0xffe), 'data': 'c1d2', 'capture': True}], kernel_setup=map_dest,
+            captured={C.HIGH + 0xffe: bytes.fromhex('c1d2')})
+    absent = f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n'
+    add('fs-string-movs-source-first', 'fs movsd', prefix=regs(4, C.XPAGE, 1), kernel_setup=absent,
+        ecx=1, captured=indices(4, C.XPAGE))
+    add('gs-string-cmps-destination-first', 'gs cmpsd', segment='gs', prefix=regs(4, C.XPAGE, 1),
+        fault=14, cr2=C.XPAGE, error=4, kernel_setup=absent, ecx=1, captured=indices(4, C.XPAGE))
+    for op in ('rep movsb', 'repe cmpsw', 'rep lodsd'):
+        add('fs-string-zero-' + op.replace(' ', '-'), 'fs ' + op, selector=0, success=True,
+            prefix='    xor eax, eax\n    mov es, ax\n' + regs(7, dest, 0), ecx=0, captured=indices(7, dest))
+    add('gs-string-null-es', 'gs movsw', segment='gs', prefix='    mov es, ax\n' + regs(0, dest, 3),
+        ecx=3, captured=indices(0, dest) | {dest: bytes(2)})
     add('fs-generated-wrapped-load', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=C.WRAP, prefix=seed,
         success=True, ecx=0x44332211, kernel_setup=up, captured=have)
     for op, loaded in [('movzx', 0x00008022), ('movsx', 0xffff8022)]:

@@ -41,6 +41,7 @@ mod segments;
 mod sse;
 mod stack;
 mod startup;
+mod strings;
 mod syscalls;
 mod watch;
 mod x87;
@@ -2748,7 +2749,10 @@ fn system(s: &mut State, i: System) {
     // A shadow covers this instruction and ends with it (X2: MOV SS and STI set theirs again in the transaction); the
     // boundary is not between REP iterations. A BT* form under alignment checking does not complete here (it is stepped).
     if i.kind != system::BT_ALIGNED {
-        (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
+        (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
+        if i.kind != system::CMPS {
+            s.mid_string = 0;
+        }
     }
     #[cfg(feature = "perf")]
     let t0 = perf_ticks();
@@ -2976,6 +2980,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // L3: port I/O ([`ports`]): each checks its own privilege (IOPL, the TSS I/O bitmap) and commits itself (a REP
         // INS/OUTS stays at the instruction between elements).
         system::IN..=system::OUTS => return ports::transaction(s, i),
+        system::MOVS | system::CMPS | system::LODS => return strings::transaction(s, i),
         // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP. Perf chunk 12: each
         // makes every check before its first write, so an exception leaves the bank as it was, but LAR..VERW, which
         // `segments::inspect` may fail after a write: only they keep a copy of the bank to restore.

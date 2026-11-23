@@ -5782,10 +5782,14 @@ mod tests {
         c.null_segments = [false, true, true, true];
         assert_eq!(kind(&mut c, &load), None);
         assert_eq!(kind(&mut c, &load[1..]), Some((exec::system::NULL_SEGMENT, 0))); // mov eax, [ebx]: DS
-        // (A REP string instruction is marked, with its length: it completes when ECX is 0.)
+        // The resident checks the based source and implicit ES destination after testing ECX.
         match c.compile(&[0x65, 0xf3, 0xa5, 0x90], 0x1000, false, &mut ()).unwrap() {
-            Code::System(s) => assert_eq!((s.kind, s.cr, s.length), (exec::system::NULL_SEGMENT, 1, 3)),
-            _ => panic!("rep movsd through a null ES"),
+            Code::System(s) => {
+                assert_eq!((s.kind, s.length, s.size), (exec::system::MOVS, 3, 4));
+                assert_eq!(s.segment, exec::SREG_GS as u32);
+                assert_eq!((s.prefixes, s.cr), (exec::system::ADDRESS32 | exec::system::REP, 0));
+            }
+            _ => panic!("rep movsd with a GS source must use the resident string path"),
         }
         assert_eq!(kind(&mut c, &[0xa5, 0x90]), Some((exec::system::NULL_SEGMENT, 0)));
         c.null_segments = [true, false, false, false];

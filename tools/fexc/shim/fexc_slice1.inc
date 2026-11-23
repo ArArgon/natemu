@@ -764,6 +764,15 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // ES whatever the prefix; the stack's own accesses through SS, which is never null at CPL 3 (nor is CS). (0x67 is refused
   // above, so the ModRM form is the 32-bit one. An instruction the resident runs is cut before this: its null check is the
   // resident's.)
+  // The resident checks the selected source and ES in access order, after the REP zero-count test.
+  if (fexc_bits32 && d.FexcMap == FEXC_MAP_PRIMARY &&
+      ((op >= 0xA4 && op <= 0xA7) || op == 0xAC || op == 0xAD)) {
+    const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
+    const bool repne = f & DecodeFlags::FLAG_REPNE_PREFIX;
+    if ((seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX) &&
+        (!repne || ((op == 0xA6 || op == 0xA7) && !(f & DecodeFlags::FLAG_REP_PREFIX))))
+      return Sys("compatibility string with a based source");
+  }
   if (fexc_bits32 && fexc_null_segments) {
     const bool one = d.FexcMap == FEXC_MAP_PRIMARY, two = d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66;
     const bool modrm = has_modrm && mod != 3 && !(one && op == 0x8D) && !(two && (op == 0x0D || (op >= 0x18 && op <= 0x1F)));

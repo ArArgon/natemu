@@ -3470,6 +3470,10 @@ pub mod system {
     pub const POPA: u32 = 0x57;
     /// AAM imm8 (`d4`): `cr` the immediate; #DE for 0.
     pub const AAM: u32 = 0x58;
+    // One element of a compatibility string with an FS/GS source. CMPS.cr = 1 means REPNE.
+    pub const MOVS: u32 = 0x59;
+    pub const CMPS: u32 = 0x5a;
+    pub const LODS: u32 = 0x5b;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -3635,7 +3639,7 @@ pub mod system {
                 || (self.kind == NOP_RUN && (1..=MAX_NOP_RUN).contains(&self.length)))
                 && self.lock <= 1
                 && (self.prefixes == 0
-                    || matches!(self.kind, INS | OUTS)
+                    || matches!(self.kind, INS | OUTS | MOVS | CMPS | LODS)
                     || (self.memory == 1 && matches!(self.prefixes, ADDRESS32 | ADDRESS16)))
                 && match self.kind {
                     MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => {
@@ -3770,6 +3774,13 @@ pub mod system {
                         self.memory == 0
                             && matches!(self.size, 1 | 2 | 4)
                             && (self.reg == 2 || (self.reg == NO_REG && self.cr < 256))
+                    }
+                    MOVS | CMPS | LODS => {
+                        self.lock == 0 && self.memory == 0
+                            && matches!(self.size, 1 | 2 | 4)
+                            && matches!(self.segment as usize, super::SREG_FS | super::SREG_GS)
+                            && (self.prefixes == ADDRESS32 || self.prefixes == (ADDRESS32 | REP))
+                            && (self.cr == 0 || (self.kind == CMPS && self.cr == 1 && self.prefixes & REP != 0))
                     }
                     INS => {
                         self.memory == 0
@@ -4085,8 +4096,8 @@ pub struct State {
     /// 1 after an STI that set IF (SDM Vol.3 7.8.1, Vol.2 STI): maskable interrupts and NMIs are blocked until the next
     /// instruction completes (`Cpu::mov_ss` is the MOV SS shadow). Both end where the resident sees an instruction complete.
     pub sti_shadow: u64,
-    /// 1 at a resident entry made at a REP string's self-exit (between iterations, elements done): an interrupt or NMI
-    /// delivered there pushes RF = 1 (SDM Vol.3 "RF").
+    /// Nonzero between REP elements: an interrupt or NMI delivered there pushes RF = 1. A resident REP CMPS
+    /// stores bit 1 plus its initial arithmetic flags, which a subsequent iteration restores if it faults.
     pub mid_string: u64,
     /// The entry of the block entered right after a shadow-setting instruction with no event pending (X2), else 0: the
     /// shadow is cleared at that entry (the next resident entry follows a completed instruction), and a doorbell at that

@@ -56,6 +56,20 @@ pub(crate) fn cut_matches(bytes: &[u8], bitness: u32, (map, opcode): (u8, u8)) -
     }
 }
 
+/// String instructions with an implicit based source; ES is fixed for their destination.
+pub(crate) fn based_string(i: &Instruction) -> Option<u32> {
+    use Code::*;
+    if !matches!(i.segment_prefix(), Register::FS | Register::GS) {
+        return None;
+    }
+    match i.code() {
+        Movsb_m8_m8 | Movsw_m16_m16 | Movsd_m32_m32 => Some(system::MOVS),
+        Cmpsb_m8_m8 | Cmpsw_m16_m16 | Cmpsd_m32_m32 => Some(system::CMPS),
+        Lodsb_AL_m8 | Lodsw_AX_m16 | Lodsd_EAX_m32 => Some(system::LODS),
+        _ => None,
+    }
+}
+
 /// An instruction that reads past the bytes supplied, or whose verdict depends on bytes past them: the caller fetches the
 /// next page first (its fetch fault comes before any #UD).
 #[derive(Debug, PartialEq)]
@@ -324,6 +338,17 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Result<Option<System>, Trunc
         Out_DX_AL | Out_DX_AX | Out_DX_EAX => {
             s.reg = 2;
             (OUT, width(1))
+        }
+        _ if bitness == 32 && based_string(&i).is_some() => {
+            let kind = based_string(&i).unwrap();
+            if address_size(&i) != ADDRESS32 || (i.has_repne_prefix() && kind != CMPS) {
+                return Ok(None);
+            }
+            rep = true;
+            s.cr = u32::from(i.has_repne_prefix());
+            s.prefixes = ADDRESS32 | u32::from(i.has_rep_prefix() || i.has_repne_prefix()) * REP;
+            s.segment = i.segment_prefix().number() as u32;
+            (kind, i.memory_size().size() as u32)
         }
         Insb_m8_DX | Insw_m16_DX | Insd_m32_DX | Outsb_DX_m8 | Outsw_DX_m16 | Outsd_DX_m32 => {
             let ins = matches!(i.code(), Insb_m8_DX | Insw_m16_DX | Insd_m32_DX);

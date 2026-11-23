@@ -85,8 +85,14 @@ pub(super) fn ones(
     b: &Block,
     site: &Site,
     touched: [Option<u64>; 2],
-    mut device: [Option<u64>; 2],
+    device: [Option<u64>; 2],
 ) -> bool {
+    readable_pages(s, touched, device).unwrap_or_else(|why| refuse(*s, f, b, site, why))
+}
+
+/// Share the native read-shadow classification with resident operations whose CPU bank already
+/// describes the instruction. A strict unassigned stop is reported to the caller at its own fault root.
+fn readable_pages(s: &mut State, touched: [Option<u64>; 2], mut device: [Option<u64>; 2]) -> Result<bool, u64> {
     // M2 Part 2: a page of the firmware image is shadowed read-only onto the image (no host request; not global, so a CR3
     // load drops it and the next read shadows it again); the caller retries the read, which then runs natively.
     if device.iter().flatten().any(|&g| rom(g)) {
@@ -99,11 +105,11 @@ pub(super) fn ones(
             }
         }
         if device == [None; 2] {
-            return true;
+            return Ok(true);
         }
     }
     if device.iter().flatten().any(|&g| super::lapic::claims(g)) {
-        return false;
+        return Ok(false);
     }
     // A page already shadowed onto the all-ones page (the access aborted on its other page) is not asked about again.
     let ones = |va: Option<u64>| {
@@ -126,19 +132,19 @@ pub(super) fn ones(
                 cache::control().remember_claim(gpa);
                 claimed = true;
             }
-            status::UNASSIGNED => refuse(*s, f, b, site, status::UNASSIGNED),
+            status::UNASSIGNED => return Err(status::UNASSIGNED),
             _ => halt(s, stop::BAD_REPLY),
         }
     }
     if claimed {
-        return false;
+        return Ok(false);
     }
     for (va, gpa) in touched.into_iter().zip(fresh) {
         if let (Some(va), Some(_)) = (va, gpa) {
             super::install_ones(s, va);
         }
     }
-    true
+    Ok(true)
 }
 /// M2 Part 2, the boot-time interpreter's access to non-RAM page `gpa` (layer 3 of its memory model): `Ok` for an
 /// unassigned page (reads all-ones, writes ignored), else the typed stop's detail: a device's page
@@ -159,6 +165,29 @@ pub(super) fn unassigned(s: &mut State, gpa: u64) -> Result<(), u64> {
         status::UNASSIGNED => Err(stop::interp::UNASSIGNED),
         _ => halt(s, stop::BAD_REPLY),
     }
+}
+/// A based string has no scalar MMIO completion. The native path accepts a read of ROM or an
+/// unassigned page (all ones), including adjacent RAM. All other device forms stop before transfer.
+pub(super) fn string_operand(s: &mut State, va: u64, gpa: [u64; 2], first: usize, bytes: &mut [u8], write: bool) {
+    let crosses = first < bytes.len();
+    if write {
+        // Native split stores refuse a non-RAM half before either write. A single-page string
+        // store has no device completion record.
+        stop_with(s, if crosses { status::CROSSING } else { status::FORM })
+    }
+    let touched = [Some(va), crosses.then(|| segments::wrap(&s.cpu, va + first as u64))];
+    let device = [0, 1].map(|k| touched[k].and_then(|_| (!ram(gpa[k])).then_some(gpa[k])));
+    match readable_pages(s, touched, device) {
+        Ok(true) => {}
+        Ok(false) => stop_with(s, status::FORM),
+        Err(why) => stop_with(s, why),
+    }
+    // Classifying or installing a shadow may service a peer's shadow drop. Recheck split-lock
+    // exclusion before the physical read, just as for the wrapped generated operand.
+    split_wait(s, &gpa[..1 + usize::from(crosses)]);
+    unsafe { asm!("dmb ish") };
+    segments::copy_mixed(s, gpa, first, bytes, false);
+    unsafe { asm!("dmb ish") };
 }
 /// Asks the host about non-RAM page `gpa` ([`REQUEST_PAGE`]): its status.
 unsafe fn page(s: &mut State, gpa: u64) -> u64 {

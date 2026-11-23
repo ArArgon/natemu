@@ -758,6 +758,9 @@ fn scalar_movs(c: &Code) -> Result<Vec<ScalarMov>, String> {
         if i.is_invalid() {
             return Err("invalid compatibility source instruction".into());
         }
+        if crate::system::based_string(&i).is_some() {
+            return Err("based compatibility string must be a system transaction".into());
+        }
         starts.push(g);
         if !i.op_kinds().any(|k| k == OpKind::Memory) { continue; }
         let seg = match i.memory_segment() { Register::FS => 4, Register::GS => 5, _ => continue };

@@ -444,11 +444,18 @@ class Slice1Cutting(unittest.TestCase):
         pre, post = '01d8' + '31c9', '40'
         run32 = lambda hexs, *extra: run(hexs, 0x8048000, '--bitness', '32', *extra)
         access = {'mov r, m': '8b03', 'mov m, r': '8903', 'moffs load': 'a110000000', 'moffs store': 'a310000000', 'add m, imm': '830301',
-                  'push m': 'ff33', 'pop m': '8f03', 'call m': 'ff13', 'movsd': 'a5', 'cmpsb': 'a6', 'lodsd': 'ad', 'xlat': 'd7', 'rep movsb': 'f3a4',
+                  'push m': 'ff33', 'pop m': '8f03', 'call m': 'ff13', 'xlat': 'd7',
                   'movzx': '0fb603', 'cmpxchg8b': '0fc70b', 'movups': '0f1003', 'fld m32': 'd903', 'lock inc': 'f0ff03', 'bt m, r': '0fa303'}
         none = {'lea': '8d03', 'mov r, r': '89c8', 'stosd': 'ab', 'scasb': 'ae', 'push r': '50', 'ret': 'c3', 'prefetcht0': '0f180b', 'nop m': '0f1f00',
                 'inc r': '40'}
         for prefix, arg, other in (('64', '--fs-null', '--gs-null'), ('65', '--gs-null', '--fs-null')):
+            # The based strings test null selectors themselves, in operand order and after the count check.
+            for x in ('a5', 'a6', 'ad', 'f3a4', 'f3a7', 'f2a6'):
+                for flags in ((), (arg,), (other,), ('--es-null',)):
+                    d, rc = run32(pre + prefix + x + post, *flags)
+                    end = d['guest']['end']
+                    self.assertEqual((rc, d['guest']['instructions_translated'], end['rip'], end['reason'], end.get('cut_gated')),
+                                     (0, 2, hex(0x8048004), 'system_instruction', None), (prefix, x, flags))
             for name, x in access.items():
                 with self.subTest(name=name, prefix=prefix):
                     lock, x = ('f0', x[2:]) if x.startswith('f0') else ('', x)
