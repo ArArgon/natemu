@@ -1062,6 +1062,12 @@ verdict_flaky = true
 matrix = { "machine.vcpus" = [4] }
 needs = { cores = 4, perf = true }
 
+[suite.expected]
+# The image, not the CPU: Debian's ensurepip-disabled patch makes ensurepip._bootstrap print "ensurepip is disabled in
+# Debian/Ubuntu for the system python" and raise SystemExit(1) unless sys.prefix != sys.base_prefix (a venv); the build
+# tree's ./python is no venv, so every case that calls bootstrap() errors (15 of 31), on every Mac (M2 Max and M4 alike).
+"test_ensurepip" = "Debian's ensurepip-disabled patch: bootstrap() exits with SystemExit(1) outside a venv, and run-cpy.sh runs the build tree's python, which is none: TestBootstrap's 13 cases and TestBootstrappingMainFunction's 2 error, the same on every host"
+
 [[suite]]
 name = "cpyb"
 kind = "judged"
