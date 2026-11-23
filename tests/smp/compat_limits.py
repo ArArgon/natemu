@@ -338,6 +338,9 @@ def cases(*, reference_control=False):
         ecx=2, rflags=0x91, captured=indices(1, tls + 2))
     add('gs-string-repne-equal', 'gs repne cmpsd', segment='gs', success=True, prefix=regs(0, tls, 3),
         ecx=2, rflags=0x44, captured=indices(4, tls + 4))
+    # Intel SDM Vol. 2B, REP/REPE/REPZ/REPNE/REPNZ: "When a fault occurs during the execution of a CMPS or SCAS
+    # instruction that is prefixed with REPE or REPNE, the EFLAGS value is restored to the state prior to the execution
+    # of the instruction" (0x45 here, CF from STC). AMD keeps the last comparison's flags (0x44; compat-kvm records it).
     add('fs-string-repe-fault-flags', 'fs repe cmpsb', limit=0, prefix=regs(0, tls, 3) + '    stc\n',
         ecx=2, rflags=0x10045, captured=indices(1, tls + 1))
     if reference_control:
