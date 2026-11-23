@@ -151,10 +151,9 @@ weeks for a first demonstration.
   with a performance expectation (flat 32-bit code under the current 64-bit kernel
   and four-level paging), 32-bit syscalls and signals, thread-local storage, 32-bit
   floating point and SIMD.
-- **P1** Mixed 32/64 execution in one process (what the Linux IA32 layer does).
-- **P1** The far-transfer and segment-switch path done properly, not only flat segments:
-  Windows' 32-bit layer switches between 32- and 64-bit code with far jumps, so a
-  flat-only shortcut becomes rework in M4.
+- **P1** [Checkpoint C](restructure/m2-checkpoint-c-plan.md) covers mixed 32/64 user execution in one process,
+  including far transfers between flat code segments and FS/GS limit checks in 32-bit code.
+  Windows' 32-bit layer needs the mode-switch path. General non-flat default segments are deferred until a workload needs them.
 - **P1** Narrow boot-time 16- and 32-bit execution, only the sequences that must run:
   the firmware's reset-vector climb to 64-bit mode, the start-up stubs firmware and
   Windows use to bring up extra CPUs, and the short protected-mode stretch before the

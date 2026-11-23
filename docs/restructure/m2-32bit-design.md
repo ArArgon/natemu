@@ -172,10 +172,10 @@ the combination FEX tests upstream.
   must allow the CS/DS/ES/SS base loads (held at 0 while flat-only) from task 2, or every MOVS/STOS block is refused.
 - **To test in task 3 (checkpoint A needs it):** base plus offset wraps at 32 bits (static i386 programs reach thread-local data at `%gs:`
   with negative offsets), and the reported fault address is 32-bit.
-- **Windows' 32-bit layer (later, not M2):** the FS segment holds the thread information block with a 4 KiB limit. A
-  limit check on FS- and GS-prefixed accesses to size-limited segments, about two instructions on those accesses only,
-  if Windows turns out to need it.
-- **Non-flat default segments: deferred (owner), scheduled after checkpoint C and before Part 2** (task 6). Until then
+- **FS and GS limits (owner, checkpoint C):** check the operand's offset and size against the loaded segment in
+  32-bit user code. This covers the limited FS segment used for Windows thread data when Windows work starts.
+  The [checkpoint C plan](m2-checkpoint-c-plan.md) owns the design and tests.
+- **Non-flat default segments: deferred (owner), on workload demand** (task 6). Until then
   they raise #GP at CPL 3. Who uses them: Win16 programs under Wine, DOS emulators, rare old software with based LDT
   segments; 32-bit Linux and 32-bit Windows programs do not. Deferred because they are uncommon and costly in
   translated code: FEX adds a base only for prefixed accesses, so every memory access changes in the fork, the segment
@@ -423,17 +423,17 @@ D. **Diagnostics first (owner: yes, better for diagnostics).** Today a Linux boo
 
    **Checkpoint B, flat and fast:** the roadmap's exit measured here: a stock i386 userland including a 32-bit toolchain
    build, performance recorded against QEMU.
-5. **Segments done properly:** translated code using real CS/DS/ES/SS bases (already kept since task 1), the segment
-   reference model extended to far jump, call and return and SYSEXIT, far jump, call and return between 32-bit and 64-bit user code with limit checks, SYSEXIT
-   to 32-bit code. Test: a program that far-jumps 64 -> 32 -> 64 in one process, takes an exact fault in each mode and
-   returns, locked against QEMU.
+5. **Mixed-mode transfers and FS/GS limits:** fix 32-bit address wrapping before opening mixed address spaces.
+   Extend the segment model and implement far JMP/CALL/RET between flat 32-bit and 64-bit user code and SYSEXIT
+   to 32-bit code. Enforce FS/GS limits in 32-bit user code. The
+   [checkpoint C plan](m2-checkpoint-c-plan.md) defines the order and acceptance cases.
 
    **Checkpoint C, mixed 32/64 in one process:** what the roadmap's far-transfer item asks for, and what Windows' 32-bit
    layer will need later.
-6. **Non-flat 32-bit segments (deferred; after C, before Part 2):** translated code adds the base of a non-flat
+6. **Non-flat default 32-bit segments (deferred):** translated code adds the base of a non-flat
    default segment on every access and checks its limit, with the segment shape in the code identity; about 15-23
    agent hours. The trigger to start it is a workload that needs it (Win16 under Wine, DOS emulators). 16-bit code
-   segments still wait for Part 2.
+   user segments remain deferred. [Part 2](m2-boot-interpreter-plan.md) covers boot-time code.
 
 Checkpoints A and B use only what the kernel does to switch modes; Linux's 32-bit programs never far-jump between
 modes themselves, so the far-transfer path can wait until C without blocking them.
