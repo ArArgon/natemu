@@ -23,3 +23,7 @@ three round medians. The ranges show their spread.
 The inline path removes the resident transition from each eligible FS or GS access in this dword MOV
 loop. Whole-workload and M4 measurements remain separate from this experiment. The six raw framework
 records are retained locally under `natemu-checkpoint-c-inline-mov-wload/.natemu/m3/`.
+
+Both builds were replaced on November 23, 2026 by the generic operand check ([the plan](m2-checkpoint-c-plan.md#generated-code-one-generic-check-and-two-identity-bits)),
+whose inline sequence is three instructions shorter than B's and applies to every form; its numbers will come from the
+bench case `compat-tls-natemu`.

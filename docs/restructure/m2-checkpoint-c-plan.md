@@ -138,8 +138,8 @@ offending instruction with the proper saved state and error code. #GP does not w
 
 ### Generated code: one generic check and two identity bits
 
-**Design, November 23, 2026, revised the same day after the first independent review (the changes are listed at the
-end of this subsection); not yet built. It supersedes "Generated code" above** (owner's decision after the
+**Design of November 23, 2026, revised after its independent review, and built the same day ("As built" at the end of
+this subsection says where the implementation differs from the reviewed text and what remains). It supersedes "Generated code" above** (owner's decision after the
 independent review of the per-opcode work). Paths below are in the `m2-checkpoint-c` worktree; `FEX/` is
 `third_party/FEX/FEXCore/Source/Interface/Core/`, `rt/` is `crates/runtime/src/`, `host/` is `crates/host/src/`.
 
@@ -251,14 +251,13 @@ ldr  x1, [x1, #48 | #80]    ; (limit + 1) << 32 | base; 0 = decided by the resid
 lsr  x2, x1, #32
 sub  x2, x2, #W
 sub  x2, x2, wOffset, uxtw  ; (limit + 1) - W - offset, 64-bit, no overflow (all terms < 2^33)
-tbnz x2, #63, cold          ; negative: out of range, or record 0 (-W - offset < 0 for every W >= 1)
+tbnz x2, #63, stub          ; negative: out of range, or record 0 (-W - offset < 0 for every W >= 1)
 mov  wBase, w1              ; continuation: the stub resumes here with x1 = base
-...
-cold: mov w0, wOffset       ; out of line as today (fexc_sites.inc:341-343): a stub can be beyond tbnz's range
-      b   stub
 ```
 
-(A literal offset, moffs, is materialised with `movz`/`movk` first, as today.)
+(When the stub is beyond `tbnz`'s range the compile restarts with the far form, `tbz x2, #63, +8; b stub`. The stub is
+a bare `brk #14`: the resident reads the offset from its register, which the site names. A literal offset, moffs, is an
+ordinary constant in a register.)
 
 - Width: any `W` from 1 to 32; `offset + W <= limit + 1` is the SDM's expand-up test with a widened last byte.
 - Read versus write, expand-down, code segments, a 4 GiB read-only segment (whose `limit + 1` does not fit): record 0,
@@ -266,7 +265,7 @@ cold: mov w0, wOffset       ; out of line as today (fexc_sites.inc:341-343): a s
 - Flags: no flag-setting instruction. Registers: x0-x2 only (FEX's temporaries, dead between IR operations, as the
   existing guard assumes, `fexc_sites.inc:322-323`) and the allocated result. The guest roots are intact at the stub
   (`FexcStub(FEXC_SITE_SEGMENT, true)`).
-- Stub protocol, kept (`brk #14`, site kind `SEGMENT`, `rt/execution.rs:3865, 3940-3953`): w0 holds the offset; the
+- Stub protocol, kept (`brk #14`, site kind `SEGMENT`): the site's `base_reg` names the offset's register; the
   resident calls `segments::operand(cpu, site.segment, offset, site.width, write)`; `Err` is the guest fault at the
   instruction; `Ok` resumes at `site.imm` with `x1 = base`. The call to `wrapped_segment_access` goes away.
 - No straddle test inline (today's `add x3, x2, #3; tbnz x3, #32`): see "Linear straddles".
@@ -279,58 +278,42 @@ cold: mov w0, wOffset       ; out of line as today (fexc_sites.inc:341-343): a s
 
 #### Where the check is emitted, and where the width comes from
 
-- **Emission**: in the instruction loop, immediately before the handler is invoked (`FEX/Core.cpp:730`), after the
-  backend's own start-of-instruction checks (the pending-x87 check is emitted at the instruction's `GuestOpcode`,
-  `tools/fexc/shim/fexc_sites.inc:1219`). The dispatcher keeps the offset and the base for the current instruction.
-- **One computation of the offset** (the fork has no CSE pass, so two computations would be two independent values
-  that nothing proves equal). For a plain ModRM operand the hook computes the 32-bit effective offset once
-  (`DecodeAddress` and `LoadEffectiveAddress` without the base). When the handler then calls `DecodeAddress`
-  (`FEX/OpcodeDispatcher.cpp:4602`) for that operand, it gets `{Base = that offset, Segment = the checked base}`
-  instead of decoding again (only for the memory operand: `DecodeAddress` also runs for literal and register
-  operands and sets their `Segment`, `:4606`, which must stay as they are, or `add fs:[x], imm` would get the offset
-  as its immediate), so the address every access uses is the checked offset plus the checked base by
-  construction. `GetSegment` (`:4330-4377`), the only place FEX reads `fs_cached`/`gs_cached` for 32-bit code
-  (`:4365-4369`), returns the checked base for a limited segment, which covers `AppendSegmentOffset` (`:4379`), the
-  roughly 45 `MakeSegmentAddress` callers (the operand form, `FEX/OpcodeDispatcher.h:1658-1665`, loads the
-  address through `LoadSource`, so through `DecodeAddress`, and then appends the base; the register form, `:1667-1670`,
-  is used by strings and MASKMOV, which are the resident's) and XLAT (`:3039`).
-- **Hand-written offsets**, four forms only: moffs (the literal), XLAT (EBX + AL), BT/BTS/BTR/BTC with a register bit
-  index (the signed word/dword displacement added to the hook's offset; the handler's own address stays, and the
-  per-form cases below compare the two), and POP m (next item). FS/GS string sources stay the resident's cut
-  (`fexc_slice1.inc:755-761`).
-- **POP m is checked after its stack read.** x86 reads the stack first, so a stack #PF or #SS comes before the
-  destination's #GP. For POP m alone the check is not emitted in the loop but at the handler's `DecodeAddress` call
-  for the destination, after its stack load, from the address that call computes (section 1 already made it use the
-  updated ESP). `Pop()` writes the new ESP to FEX's register cache before the destination is decoded
-  (`FEX/OpcodeDispatcher.cpp:430-433`, `OpcodeDispatcher.h:2691-2699`), but fexc's precision passes keep every state
-  commit of an instruction after its last site, and the check is a site (`tools/fexc/shim/fexc_precision.h:53`): in
-  the emitted code of `pop dword [eax]` the ESP register is written after the store. So a #GP at the check banks
-  the ESP from before the pop, as a #PF at the store does today; `verify_precision.py` checks it on the code and the
-  POP case checks it at run time. Admission's placement rule names this exception.
-- **Same IR block.** FEX's register allocation is block-local, so the base must be used in the IR block that holds
-  the check. If `GetSegment` or `DecodeAddress` is asked for a limited segment with no checked base for this
-  instruction, or from another IR block than the check's, the compile fails (the dispatcher's `DecodeFailure`,
-  `FEX/OpcodeDispatcher.h:316-320`; the unit is refused). The sweep lists every form that hits this; each is then
-  cut to the resident or given its check in the block that uses it, before checkpoint C closes. With both bits clear
-  none of the new code is reached.
-- **Width and intent**: a property of the x86 instruction, not of each FEX access, so they come from the decode, in
-  one function in fexc (`FexcSegmentAccess(d) -> none | (W, write) | unknown`, beside the null-segment
-  classification, `fexc_slice1.inc:763-775`, which already decides generically whether an instruction accesses memory
-  through its segment). Not from arguments threaded through FEX's callers, for three reasons: `LoadSource` of a
-  read-modify-write destination does not know a store follows (x86 needs write permission before the read, LOCK forms
-  included); FEX sometimes touches fewer bytes than the operand (BT reads one byte, x86 checks the unit); and it
-  would edit about 60 call sites in the fork. Rules: integer maps use the operand size with a short exception list
-  (MOVZX/MOVSX source, SETcc, CMPXCHG8B, MOVNTI, near CALL/JMP); x87 by opcode and ModRM.reg; MMX, SSE and AVX by
-  row. `none` is LEA, prefetches, hint NOPs. `unknown` under a set bit is a refusal (`Uns`, the loud unsupported
-  stop) before anything runs.
-- **This table is not trusted.** Admission compares every record with iced's operand size and access (below), so a
-  wrong or missing row is a refused block, and an offline sweep finds all of them before any VM runs.
-- **x87.** A stop at the check banks through `bank_at`, which applies the instruction's x87 map for any site kind
-  (`rt/execution.rs:3541-3547`), so TOP, tags and the registers of an x87 run are right at a segment #GP; a case
-  proves it. The FILD m64 / FISTP m64 pair keeps its integer only when the FISTP's *store* faults (`:3548-3560`, the
-  store site's mark, `fexc_sites.inc:1403`); a segment #GP at the FISTP would lose values above 2^53 on the retry.
-  So the pair is not formed (`FEX/OpcodeDispatcher/X87F64.cpp:134-136`) when either instruction's operand is through
-  a limited segment.
+- **Emission**: at the handler's first decode of the memory operand. The instruction loop only says, before the handler
+  runs (`FEX/Core.cpp`, `FexcSegBegin`), whether this instruction accesses memory through a limited FS or GS (fexc's
+  `FexcSegLimited`, the generic "does it access memory through its segment" decision the null-segment cut already made:
+  a ModRM memory operand that is not LEA's, a prefetch's or a hint NOP's; moffs; XLAT). `DecodeAddress`
+  (`FEX/OpcodeDispatcher.cpp`) then, for that operand (a ModRM memory form, or moffs's literal; never a register or
+  immediate operand, whose `Segment` stays empty), forms the 32-bit effective offset without a base, emits the check
+  on it (`FexcSegmentCheck`: the `FexcSegmentBase` op) and returns `{Base = offset, Segment = checked base}`. A second
+  decode of the operand in the same instruction (the store of a read-modify-write) returns the same pair, so the offset
+  is computed once, as x86 computes one effective address, and every access adds the checked base to the checked
+  offset by construction (the fork has no CSE pass that could merge two computations).
+- **The base comes from nowhere else.** `GetSegment`, the only place FEX reads `fs_cached`/`gs_cached` for 32-bit code,
+  returns the checked base for a limited segment (`FexcSegCheckedBase`): nothing for an instruction that accesses
+  nothing through it; the check's result in the check's own IR block (FEX's register allocation is block-local);
+  otherwise the compile fails (the dispatcher's `DecodeFailure`). That covers `AppendSegmentOffset` and every
+  `MakeSegmentAddress` caller without touching them. The sweep found no admitted form that fails this way.
+- **Hand-written offsets**, two forms: XLAT (EBX + AL) and BT/BTS/BTR/BTC (the effective address plus the signed
+  bit-string displacement; this fork already accesses the whole operand-sized unit there). Each computes its offset,
+  calls `FexcSegmentCheck` and adds the base itself. FS/GS string sources stay the resident's cut.
+- **POP m needs nothing special.** Its handler reads the stack and then decodes its destination, so the check follows
+  the stack read, as x86 orders the faults, and uses the ESP the pop leaves. `Pop()` writes the new ESP to FEX's
+  register cache before that, but fexc's precision passes keep every state commit of an instruction after its last
+  site, and the check is a site (`tools/fexc/shim/fexc_precision.h`): in the emitted code ESP's register is written
+  after the store. A #GP at the check banks the ESP from before the pop (`fs-generic-pop-over`,
+  `fs-generic-pop-esp-base-over` assert it).
+- **Width and intent come from the instruction's own accesses**, not from a table and not from arguments threaded
+  through FEX's callers. fexc's `JoinSites` (`tools/fexc/fexc.cpp`) gives the check the widest access of the
+  instruction through that segment and write intent if any of them writes (a read-modify-write's and a LOCK form's
+  load is recorded with write intent), and writes the width into the check's `sub x2, x2, #W`. This is what FEX
+  really accesses, for every form at once. **It is not trusted**: admission compares both with iced's operand size
+  and access for the instruction, so a form where FEX touches fewer bytes than the operand, or forgets a write, is a
+  refused block. The offline sweep (below) found none among the 22,197 translated units: there is no table to keep.
+- **x87.** A stop at the check banks through `bank_at`, which applies the instruction's x87 map for any site kind, so
+  TOP, tags and the registers of an x87 run are right at a segment #GP. The FILD m64 / FISTP m64 pair stays formed
+  under a limited segment; the resident keeps the pair's integer at the FISTP's operand check as it does at its
+  store's fault (the store's register holds the integer since the FILD), so a retried FISTP stores it exactly
+  (`fs-generic-fild-fistp-retried`).
 
 #### Linear straddles across 4 GiB
 
@@ -376,16 +359,18 @@ at the level of the *native access*, replacing the per-form `wrapped_segment_acc
   completed. (b) bit clear: no check ran; the same abort; the rule passes for a nonzero base and fails for base 0.
   Both exact, both off the hot path.
 
-**Two deviations are recorded, each with a test that pins it.**
+**One deviation is recorded, with a test that pins it (`fs-generic-flat-limit-offset-overrun-deviation`), and one
+ordering note.**
 
 - With the bit clear nothing tests the offset, so an operand that starts in the last `W - 1` bytes of a 4 GiB based
   segment (`mov eax, gs:[0xfffffffe]`) runs past the limit and x86 gives #GP, while natemu accesses the wrapped
   bytes, as `main` and QEMU do. Closing it means the inline check on every TLS access, which the owner's decision
   excludes. The pinning case uses a base of at least 32: with a base below `W` the access also straddles 4 GiB
   linearly and the abort path gives the exact #GP.
-- Every form but POP m is checked at the start of the instruction. No other admitted form makes an access before
-  its explicit operand's (CALL and PUSH read the operand first; strings are the resident's), so this is exact as far
-  as the form inventory shows; a form found otherwise by the sweep is treated as POP m is.
+- An instruction's check comes where its handler first decodes the operand. No admitted handler has an effect or
+  another access before that except POP m's stack read, which x86 also makes first (the AMD answers of the 85
+  generic cases agree on every fault's state), so no deviation is known here; it is listed because the order is
+  FEX's, not enforced by admission beyond "before every access through the segment".
 
 #### Admission's rule (`host/admission/structure.rs`, replacing `scalar_operands` and `scalar_segment_checks`)
 
@@ -399,14 +384,15 @@ Mandatory for every 32-bit object, with or without the optional shape check (as 
    there is an access and the block is not CPL 3: refuse.
 3. If that segment's bit is set: require exactly one `SEGMENT` site for the instruction with that segment,
    `width == memory_size`, `intent ==` the class above, its native words exactly the sequence above (W, slot offset,
-   the out-of-line `mov w0; b` to a `brk #14` stub, `site.imm` at the final `mov`), and placed before every access
-   site and stub site of the instruction except its pending-x87 site and, for POP m, its stack pop. A `SEGMENT` site
-   with no such instruction is refused.
+   the test's branch to a `brk #14` stub, `site.imm` at the final `mov`), inside its instruction, with no branch into
+   it and no relocation in it, and placed before every access of the instruction through that segment (the stack
+   accesses of PUSH, POP and CALL are SS's and may precede it). A `SEGMENT` site with no such instruction is refused.
 4. In a block with the FS (GS) bit set, any load of `frame::FS_BASE` (`GS_BASE`) is refused (the frame-field rule at
    `:2082-2104`; fixtures at `:5670-5682`). So a FEX path that adds the base the plain way is refused whatever its
    opcode. The read-only record is loaded only inside the verified sequence (today's `segment_view_reads`).
 5. With the bit clear: no `SEGMENT` site may exist.
-6. Bit set or clear: every access site's segment tag equals iced's segment for the instruction ("Linear straddles").
+6. Bit set or clear: an access site says FS or GS exactly when its instruction's operand is through that segment
+   by iced's decode (push and pop kinds never do). The DS/SS choice of the other sites is fexc's, as before.
 
 Admission still cannot prove that the offset register of the sequence holds the operand's effective address; the
 single computation above removes the two-values risk, and the per-addressing-form cases cover the rest.
@@ -500,7 +486,7 @@ not share either, and the resident's pool is keyed by the whole context anyway; 
 | Tests: sweep, classes, addressing forms, straddles, stale bits; rewriting the cases that named the cold path | 11-16 |
 | AMD reference answers for about 20 classes, in and out of range | 3-5 |
 | Review rounds and fixes | 7-10 |
-| **Total** | **52-77**, plus queue time for the gate and the benchmark round |
+| **Total** | **52-77**, plus queue time for the gate and the benchmark round (the build took far less: no width table, no per-form resident code) |
 
 Largest uncertainty: the width function's SSE/AVX rows and the forms that fail the same-block rule (the sweep bounds
 both), and the native load words the new completion must decode (sign-extending loads, vector element loads).
@@ -516,6 +502,42 @@ both), and the native load words the new completion must decode (sign-extending 
 - POP m is checked after its stack read; the offset deviation's test uses a base of at least 32.
 - Straddles stay exact (the reviewer's alternative, keeping `main`'s #GP as a deviation, was not taken).
 - Estimate 37-57 -> 52-77 agent hours.
+
+#### As built (November 23, 2026)
+
+Built on `m2-checkpoint-c` (natemu) and the fork's `m2-checkpoint-c` (FEX `b9e9add`, `3ef751a`, `2cf6c8e`). Where the
+implementation differs from the reviewed text, the text above has been corrected; the differences were:
+
+- The check is emitted at the operand's decode, not in the instruction loop (so POP m needs no exception and no handler
+  sees a base before its operand is decoded); the offset is still computed once.
+- Width and intent are derived from the instruction's accesses and verified by admission, instead of a decode table
+  in fexc: nothing to keep per opcode, and the sweep shows no form where the two disagree.
+- The stub is a bare `brk`; the resident reads the offset from its register (12 instructions on the passing path).
+- The FILD/FISTP m64 pair is kept under a limited segment and its integer is kept at the check.
+- fexc ended a block at a LOCK CMPXCHG through FS or GS (a rule of the per-opcode check): removed, which made the
+  bit-clear code of all 28 pinned forms byte-identical to the fexc of FEX `fc4270d`.
+- A wrapped store that meets only RAM and firmware pages is made in the split path; a read-modify-write's wrapped
+  load is walked for writing; data breakpoints see both spans.
+
+Results (M-series Mac, through `tools/natemu-test`, narrow selections only; the gate and the benchmarks wait for the
+code review):
+
+- The sweep (`crates/host` `every_limited_fs_form_is_checked_or_refused`): 35,861 encodings, 22,197 units translated
+  with a limited FS, all admitted with their check except VPCMPESTRI/VPCMPESTRM with VEX.W = 1, which admission
+  refuses with or without the check (16 encodings; their helper call's shape, not this work). No form is translated
+  only without the check.
+- `tests/system` `compat32-resident-limits` 1,423 passed, `compat32-smp-limits` 21 passed; `tests/static`
+  `fexc-address32` and `fexc-precision-32` passed; `tests/smp` `compat-kvm` `amd-generic`: the 85 generic cases have
+  the fixture's expectations on an AMD Ryzen 7 8845HS under KVM.
+
+Not done, or not verified:
+
+- The case "pending #MF before the segment #GP" was not written (it needs a #MF gate and CR0.NE in the fixture). The
+  order holds by construction: the backend's pending check is emitted at the instruction's start, before the handler
+  decodes the operand.
+- A straddle through a site kind the completion does not handle (vector element loads, if any reach an abort) stops
+  loudly (`SITE_MISMATCH`); no case exercises one.
+- `compat-tls-natemu`'s new variants assemble but have not been run.
 
 ## 3. Admit mixed-mode transfers
 
@@ -619,8 +641,8 @@ Use that pin when preparing the first slice.
 ## State of the work
 
 Built on branch `m2-checkpoint-c` (natemu and the FEX fork): section 1, section 3, the resident rule of section 2,
-and generated checks for part of the FS/GS forms, built per opcode; [the generic check](#generated-code-one-generic-check-and-two-identity-bits)
-replaces them and is designed, not built. [The form inventory](m2-checkpoint-c-fs-gs-forms.md) lists every
+and [the generic FS/GS operand check](#generated-code-one-generic-check-and-two-identity-bits), which replaced the
+per-opcode checks built first (the inventory below is the record of that state). [The form inventory](m2-checkpoint-c-fs-gs-forms.md) lists every
 previously admitted form and says which are checked and which remain open; checkpoint C needs all of them.
 [The inline A/B note](m2-checkpoint-c-inline-ab.md) is the one measurement so far, an experiment on an M3.
 The checkpoint gate and the benchmark round of "Execution and acceptance" step 4 have not run.

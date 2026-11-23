@@ -1,5 +1,9 @@
 # Checkpoint C compatibility FS and GS operand checks
 
+**Superseded (November 23, 2026):** the per-opcode checks this inventory tracks were replaced by one generic operand
+check ([the plan](m2-checkpoint-c-plan.md#generated-code-one-generic-check-and-two-identity-bits)); every "Open" and
+"In implementation" row of the generated table is covered by it. Kept as the record of the forms and their paths.
+
 **Frozen snapshot, not current status.** The inventory was written part-way through checkpoint C, at the build
 that had the checked scalar MOV family and the resident cut for based string sources (Codex's working commit
 `0730558e`; FEX `fba5d0f0` on the fork's `m2-checkpoint-c` branch, then `a228fd8`). The line-number links are to that
