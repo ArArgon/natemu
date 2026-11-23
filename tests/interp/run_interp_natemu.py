@@ -19,7 +19,8 @@ dropped by the interpreter, by translated code and by the resident's `copy`, the
 it while a RAM page holding translations is written, the same above 3 GiB of RAM, and a LOCKed access to it refused, the
 recorded deviation). `--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop
 and record the model gives with nothing committed, or the state it reaches; modes_model's programs to where the model
-ends them).
+ends them). `--litmus` runs litmus patterns between an interpreting vCPU and a translated one (interp_litmus.py: every
+outcome in ordering_model's allowed set, each pattern's overlap outcomes seen), `--runs` runs of `--k` iterations each.
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402,E702
 import argparse
@@ -75,13 +76,13 @@ def judge(case: dict, natemu: dict, locked: dict) -> list:
     return diffs
 
 
-def run(host, runtime, fexc, text: str, work: pathlib.Path, ram: int | None = None) -> dict:
-    """One machine description through the program driver (`ram`: its guest RAM, else the driver's default): its one state
-    object (`machine` among it), or a failure."""
+def run(host, runtime, fexc, text: str, work: pathlib.Path, ram: int | None = None, extra=()) -> dict:
+    """One machine description through the program driver (`ram`: its guest RAM, else the driver's default; `extra`: more
+    driver options): its one state object (`machine` among it), or a failure."""
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     r = subprocess.run([str(host), str(runtime), 'run-program', str(fexc), str(work / 'program.txt'), str(work),
-                        *(['--ram', hex(ram)] if ram else [])], capture_output=True, text=True, timeout=300)
+                        *(['--ram', hex(ram)] if ram else []), *extra], capture_output=True, text=True, timeout=300)
     (work / 'stderr.txt').write_text(r.stderr)
     try: out = json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError): return {'stop': 'driver', 'reason': f'exit {r.returncode}: {r.stderr.strip()[-600:]}'}
@@ -433,6 +434,10 @@ def main(argv=None):
     ap.add_argument('--out', required=True, type=pathlib.Path)
     ap.add_argument('--selftest', action='store_true', help='the machine descriptions with their expected fields only')
     ap.add_argument('--faults', action='store_true', help='the fault and transition cases against the models')
+    ap.add_argument('--litmus', action='store_true', help='ordering between an interpreting and a translated vCPU')
+    ap.add_argument('--k', type=int, default=25_000, help='litmus: iterations per run (at most 131,072)')
+    ap.add_argument('--runs', type=int, default=4, help='litmus: runs per pattern')
+    ap.add_argument('--patterns', type=lambda t: t.split(','), help='litmus: these patterns only (interp_litmus.CELLS)')
     ap.add_argument('--cases', default='*', help='a glob over case names (the corpus)')
     ap.add_argument('--jobs', type=int, default=1, help='runs at once')
     a = ap.parse_args(argv)
@@ -442,7 +447,12 @@ def main(argv=None):
     results = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.jobs))
     go = lambda name, case: run(a.host, a.runtime, a.fexc, description(case, common), a.out / 'work' / name, case.get('ram'))
-    if a.faults:
+    if a.litmus:
+        import interp_litmus
+        results, report = interp_litmus.run_cells(lambda text, work, extra: run(a.host, a.runtime, a.fexc, text, work, extra=extra),
+                                                  a.out / 'work', a.k, a.runs, a.patterns)
+        (a.out / 'litmus.json').write_text(json.dumps({'k': a.k, 'runs': a.runs, 'report': report}, indent=1) + '\n')
+    elif a.faults:
         import interp_faults
         tests = interp_faults.all_cases(sys.modules[__name__])
         for (name, case, want), out in zip(tests, pool.map(lambda t: go(t[0], t[1]), tests)):

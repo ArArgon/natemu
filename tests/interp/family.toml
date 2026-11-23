@@ -42,3 +42,12 @@ needs = { cores = 4 }
 argv = ["tests/interp/run_interp_natemu.py", "--jobs", "4", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}",
         "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4 }
+
+# x86 ordering between an interpreting vCPU and a translated one (interp_litmus.py): message passing both ways, store
+# buffering and load buffering, A in P32 (the interpreter's memory layer at EL1) and B in 64-bit code (translated, EL0),
+# 100,000 iterations each; every outcome in tools/models/ordering_model.py's allowed set, and each pattern's overlap
+# outcomes seen (the control: B landed between A's two accesses). Performance cores: an M1's efficiency cores lack TSO.
+[suite.cases."natemu-litmus"]
+argv = ["tests/interp/run_interp_natemu.py", "--litmus", "--k", "25000", "--runs", "4", "--host", "{natemu_host}",
+        "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 2, perf = true }
