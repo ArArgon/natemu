@@ -738,7 +738,7 @@ struct ScalarOperand {
     segment: u8,
     width: u8,
     write: u8,
-    modrm_reg: u8,
+    data_reg: u8,
     store_immediate: Option<u32>,
     result_and_length: u8,
     absolute_offset: Option<u32>,
@@ -774,9 +774,20 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             Code::Mov_rm32_imm32 => Some(i.immediate32()),
             _ => None,
         };
+        use natemu_abi::interp::op;
+        let rmw_alu = match i.code() {
+            Code::Add_rm8_r8 | Code::Add_rm16_r16 | Code::Add_rm32_r32 => Some(op::ADD),
+            Code::Or_rm8_r8 | Code::Or_rm16_r16 | Code::Or_rm32_r32 => Some(op::OR),
+            Code::Adc_rm8_r8 | Code::Adc_rm16_r16 | Code::Adc_rm32_r32 => Some(op::ADC),
+            Code::Sbb_rm8_r8 | Code::Sbb_rm16_r16 | Code::Sbb_rm32_r32 => Some(op::SBB),
+            Code::And_rm8_r8 | Code::And_rm16_r16 | Code::And_rm32_r32 => Some(op::AND),
+            Code::Sub_rm8_r8 | Code::Sub_rm16_r16 | Code::Sub_rm32_r32 => Some(op::SUB),
+            Code::Xor_rm8_r8 | Code::Xor_rm16_r16 | Code::Xor_rm32_r32 => Some(op::XOR),
+            _ => None,
+        };
         let result = match i.code() {
             _ if moffs || store_immediate.is_some() => 0,
-            Code::Add_rm8_r8 | Code::Add_rm16_r16 | Code::Add_rm32_r32 if !i.has_lock_prefix() => object::SEGMENT_RMW_ADD,
+            _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
             _ if matches!(i.mnemonic(), Mnemonic::Cmovb | Mnemonic::Cmovae | Mnemonic::Cmovbe | Mnemonic::Cmova
                 | Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovl | Mnemonic::Cmovge | Mnemonic::Cmovle | Mnemonic::Cmovg
                 | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovs | Mnemonic::Cmovns | Mnemonic::Cmovp | Mnemonic::Cmovnp)
@@ -815,7 +826,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
-            modrm_reg, store_immediate, result_and_length: result | i.len() as u8,
+            data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, result_and_length: result | i.len() as u8,
         });
     }
     if !guarded.is_empty() {
@@ -1041,7 +1052,7 @@ impl<'a> Verifier<'a> {
             let mut matching = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
             let Some(site) = matching.next() else { return Err("missing scalar segment check".into()); };
             if matching.next().is_some() || site.segment != op.segment || site.intent != op.write || site.width != op.width
-                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && site.data_reg[0] != op.modrm_reg) {
+                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && site.data_reg[0] != op.data_reg) {
                 return Err("scalar segment check differs from its x86 operand".into());
             }
             let access = self.c.accesses.iter().find(|a| a.native_offset == site.guest_offset2)
@@ -1050,8 +1061,8 @@ impl<'a> Verifier<'a> {
             if effects.next().map(|a| a.native_offset) != Some(access.native_offset) {
                 return Err("scalar segment check must precede the first memory access".into());
             }
-            let add_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ADD {
-                let store = effects.next().ok_or("missing second effect of checked ADD")?;
+            let rmw_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ALU {
+                let store = effects.next().ok_or("missing second effect of checked ALU update")?;
                 if access.base_reg >= 31 || access.kind != object::kind::LOAD || access.rmw != object::RMW_LOAD
                     || store.kind != object::kind::STORE || store.rmw != object::RMW_STORE
                     || store.native_offset <= access.native_offset || store.insn_native_offset != access.insn_native_offset
@@ -1059,7 +1070,7 @@ impl<'a> Verifier<'a> {
                     || store.index_reg != object::NO_REG || store.imm != 0 || store.writeback != object::WB_NONE
                     || store.data_class != object::CLASS_GPR
                 {
-                    return Err("checked ADD memory effects differ in address, width or intent".into());
+                    return Err("checked ALU memory effects differ in address, width or intent".into());
                 }
                 Some(store.native_offset)
             } else { None };
@@ -1075,7 +1086,7 @@ impl<'a> Verifier<'a> {
             let run_end = self.run_test().filter(|&e| self.run_end_return(e + 36, ENTRY_OFFSET + 8));
             for at in (p.native_offset..end).step_by(4) {
                 if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
-                if at == access.native_offset || Some(at) == add_store { continue; }
+                if at == access.native_offset || Some(at) == rmw_store { continue; }
                 match self.insn(at) {
                     // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
                     Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
@@ -1138,7 +1149,7 @@ impl<'a> Verifier<'a> {
                 }
                 high - 4
             } else { setup };
-            let last = add_store.unwrap_or(access.native_offset);
+            let last = rmw_store.unwrap_or(access.native_offset);
             if self.instruction(last) != Some((g, p.native_offset)) || self.instruction(access.native_offset) != Some((g, p.native_offset))
                 || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
                 || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
@@ -3227,6 +3238,21 @@ mod tests {
             let h: Header = super::super::record(&obj, 0);
             for shape in [false, true] {
                 super::super::admit_mode(&obj, h.guest_rip, &src, u64::MAX, shape, false, true).unwrap();
+            }
+        }
+        // The RMW selector, high-byte register and immediate-store bit are all independently checked.
+        let (sbb, source) = compile("65182f", "0x8048000", "32");
+        let h: Header = super::super::record(&sbb, 0);
+        let guard = (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .find(|&at| super::super::record::<Site>(&sbb, at).kind == object::kind::SEGMENT).unwrap();
+        for shape in [false, true] {
+            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+            check(&sbb).unwrap();
+            for bit in [1, 8, object::SEGMENT_STORE_REGISTER] {
+                let mut changed = sbb.clone();
+                changed[guard + core::mem::offset_of!(Site, data_reg)] ^= bit;
+                assert!(check(&changed).is_err(), "inconsistent ALU selector or register {bit}");
             }
         }
         let (add, source) = compile("65010f", "0x8048000", "32");

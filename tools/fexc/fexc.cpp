@@ -251,7 +251,9 @@ void JoinSites(uint64_t rip) {
       // The ModRM.reg field names the MOV register (including AH..BH) or the ALU register/opcode extension.
       for (const auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         s.data_reg[0] = i.modrm_reg;
-        if (i.primary_op == 0xc6 || i.primary_op == 0xc7) {
+        if ((s.data_reg[1] & 0xf0) == 0x30) {
+          s.data_reg[0] |= i.primary_op & 0x38; // Primary ALU operation, independent of the source register.
+        } else if (i.primary_op == 0xc6 || i.primary_op == 0xc7) {
           // The wrapped transaction uses the same native transfer register as the ordinary STORE.
           for (const auto& a : Cap.sites) if (a.kind == FEXC_SITE_STORE && a.native_offset == s.access_native_offset)
             s.data_reg[0] = 0x40 | a.data_reg[0];
@@ -1062,7 +1064,10 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       if (s.kind == FEXC_SITE_SEGMENT) {
         j.kv("instruction_length", int(s.data_reg[1] & 15));
         if (s.data_reg[1] & 0x80) j.kv("native_load_continuation", true);
-        if ((s.data_reg[1] & 0xf0) == 0x30) j.kv("rmw_add", true);
+        if ((s.data_reg[1] & 0xf0) == 0x30) {
+          j.kv("rmw_alu", int(s.data_reg[0] >> 3));
+          if ((s.data_reg[0] >> 3) == 0) j.kv("rmw_add", true);
+        }
         else if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
       }
       if (slice1) {

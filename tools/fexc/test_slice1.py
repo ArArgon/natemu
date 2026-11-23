@@ -756,7 +756,7 @@ class Slice1Cutting(unittest.TestCase):
 
     def test_read_only_alu_guard_excludes_memory_updates(self):
         # Neighbouring direction bits and immediate-group selectors can instead write memory.
-        for form in ('64290f', '65090f', '64110f', '65190f', '64210f', '64830701', '65f617'):
+        for form in ('64830701', '65f617', '64f71f'):
             d, rc = run(form, RIP, '--bitness', '32')
             self.assertEqual(rc, 0, form)
             self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
@@ -785,14 +785,18 @@ class Slice1Cutting(unittest.TestCase):
             self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']))
             self.assertTrue(any(s['kind'] == 'store' for s in d['sites']))
 
-    def test_compat_add_segment_pair(self):
+    def test_compat_alu_segment_pair(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:
-            for width, form in ((1, '650027'), (2, '6466010c77'), (4, '65010f'), (4, '64010f')):
+            forms = [(group, width, prefix + f'{8 * group + (width > 1):02x}' + memory, source)
+                     for group in range(7)
+                     for width, prefix, memory, source in [(1, '65', '27', 4), (2, '6466', '0c77', 1), (4, '65', '0f', 1)]]
+            for group, width, form, source in [*forms, (0, 4, '64010f', 1)]:
                 d, rc = run('90' + form + '90', RIP, '--bitness', '32')
                 self.assertEqual(rc, 0)
                 guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                self.assertTrue(guard['rmw_add'])
+                self.assertEqual((guard['rmw_alu'], guard['data_regs']), (group, [(group << 3) | source]))
+                self.assertIsNone(guard.get('native_load_continuation'))
                 self.assertNotIn('destination_width', guard)
                 load, store = (s for s in d['sites'] if s['kind'] in ('load', 'store'))
                 self.assertEqual((guard['width'], guard['intent'], guard['access_native_offset']),

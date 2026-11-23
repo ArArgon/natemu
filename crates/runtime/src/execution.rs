@@ -4081,7 +4081,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     if alignment_check(&s.cpu) != 0 && va & (width - 1) != 0 {
         guest_fault(s, f, b, site, [17, 0, 0]);
     }
-    let add = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ADD;
+    let rmw = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU;
     let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
     if native && b.flags & cache::STEP == 0 {
         // The private instruction slot survives page-table A/D writes and delivers data breakpoints
@@ -4097,7 +4097,8 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let [reg, result_and_length] = site.data_reg;
     let length = result_and_length & 15;
     let native_store = reg & object::SEGMENT_STORE_REGISTER != 0;
-    let reg = usize::from(reg & !object::SEGMENT_STORE_REGISTER);
+    let alu = reg >> 3;
+    let reg = usize::from(if rmw { reg & 7 } else { reg & !object::SEGMENT_STORE_REGISTER });
     let old = if native_store { f.x[reg] } else { s.cpu.gpr[reg] };
     let mut value = if write { old.to_le_bytes() } else { [0; 8] };
     let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
@@ -4111,8 +4112,8 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let mixed = gpa.iter().any(|&p| !mmio::ram(p));
     if mixed {
         // A write-intent RMW load has no scalar MMIO completion, including for an unassigned
-        // or firmware page. Both write walks have succeeded; nothing of the ADD has executed.
-        if add {
+        // or firmware page. Both write walks have succeeded; no ALU effect has committed.
+        if rmw {
             mmio::stop_with(&s, natemu_abi::execution::mmio::FORM)
         }
         let supported = if write {
@@ -4130,14 +4131,13 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let first = ((1u64 << 32) - va) as usize;
     // The existing split completion orders the transfer before subsequent guest memory operations.
     unsafe { asm!("dmb ish") };
-    if add {
-        // Only word and dword ADD can straddle. The checked ModRM source register is in the
-        // instruction's bank; keep both walked physical spans until the write is complete.
-        // This non-LOCK read and write may tear. The interpreter's ADD supplies CF/PF/AF/ZF/SF/OF.
-        use natemu_abi::interp::{exec, op};
+    if rmw {
+        // Only word and dword operands can straddle. Both physical spans, the source register
+        // and incoming CF belong to this instruction until its non-atomic write commits.
+        use natemu_abi::interp::exec;
         segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], false);
         unsafe { asm!("dmb ish") };
-        let (result, flags) = exec::alu(op::ADD, u64::from_le_bytes(value) as u32, old as u32, false, width as u8);
+        let (result, flags) = exec::alu(alu, u64::from_le_bytes(value) as u32, old as u32, s.cpu.rflags & 1 != 0, width as u8);
         value = u64::from(result).to_le_bytes();
         segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], true);
         s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);

@@ -449,6 +449,40 @@ def cases():
         flags |= int((value & 255).bit_count() % 2 == 0) << 2 | int(value == 0) << 6 | int(bool(value & sign)) << 7
         return (alu_initial if op in ('cmp', 'test') else (alu_initial & ~mask) | value), flags
 
+    # The wrapped write captures the same source register and incoming CF as the normal ALU.
+    # Mask AF in the interrupt handler only for completed logic operations, where AF is undefined.
+    for op in ('or', 'adc', 'sbb', 'and', 'sub', 'xor'):
+        source = 0xbbccddee if op == 'adc' else 0x44332211
+        logical = op in ('or', 'and', 'xor')
+        for carry in ((0, 1) if op in ('adc', 'sbb') else (1,)):
+            seed_rmw = f'    mov ecx, {source:#x}\n    cmp eax, eax\n' + ('    stc\n' if carry else '')
+            options = dict(prefix=seed_rmw, ecx=source, flags_mask=0x10ec5 if logical else 0x10ed5)
+            for width, reg in [(1, 'ch'), (2, 'cx'), (4, 'ecx')]:
+                nbits = (1 << (8 * width)) - 1
+                rhs = source >> 8 if reg == 'ch' else source
+                result, flags = alu_answer(op, width, rhs, carry, lhs=int.from_bytes(VALUE[:width], 'little'))
+                written = (result & nbits).to_bytes(width, 'little')
+                add(f'fs-{op}-rmw-{reg}-carry{carry}', f'{op} [fs:edi], {reg}', success=True,
+                    rflags=flags, memory=written + VALUE[width:], **options)
+                if width == 1:
+                    continue
+                lhs = 0x3322 if width == 2 else 0x44332211
+                result, flags = alu_answer(op, width, rhs, carry, lhs=lhs)
+                written = (result & nbits).to_bytes(width, 'little')
+                chunks = {high: b'\x11' + written[:1], low: written[1:] + b'\x44'} if width == 2 else {high: written[:2], low: written[2:]}
+                add(f'gs-{op}-rmw-wrap-{reg}-carry{carry}', f'{op} [gs:edi], {reg}', segment='gs', mapped=C.WRAP,
+                    base=0xffffffff if width == 2 else 0xfffffffe, kernel_setup=up, success=True, rflags=flags, captured=chunks, **options)
+                if width == 4:
+                    add(f'gs-{op}-rmw-watch-carry{carry}', f'{op} [gs:edi], ecx', segment='gs', mapped=C.WRAP,
+                        base=0xfffffffe, fault=1, after_trap=True, kernel_setup=up + watch_low,
+                        rflags=flags, captured=chunks, **options)
+            # A failed write walk preserves all flags, including AF, and the complete source register.
+            add(f'fs-{op}-rmw-missing-carry{carry}', f'{op} [fs:edi], ecx', mapped=C.TOP_ONLY, base=0xfffffffe,
+                prefix=seed_rmw, ecx=source, kernel_setup=init, fault=14, error=6, cr2=0,
+                rflags=0x10044 | carry, captured={high: b'\x11\x22'})
+    add('fs-sub-rmw-readonly-limit', 'sub [fs:edi], ecx', access=0xf1, prefix=rmw_seed, ecx=rmw_src, rflags=0x10045)
+    add('gs-sbb-rmw-wrapped-apic', 'sbb [gs:edi], ecx', segment='gs', base=0xfffffffe, mapped=low_apic,
+        prefix=rmw_seed, kernel_setup=init, refuse='form', captured={high: bytes.fromhex('1122')})
     for seg in ('fs', 'gs'):
         for op in ('cmp', 'xor', 'sub'):
             for width, reg in ((1, 'cl'), (2, 'cx'), (4, 'ecx')):
