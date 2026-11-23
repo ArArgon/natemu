@@ -157,7 +157,8 @@ agent that ran the gate hands the choice to the user and then runs the command f
 The other way round, a gate can count another machine's run of the same commit:
 `--gate --with-run .natemu/runs/<id-from-the-M4>` counts the variants this Mac cannot run as covered where they passed
 in that run. `--require-real afp` places "AFP absent" variants only on a Mac that really lacks AFP instead of hiding it
-on one that has it.
+on one that has it. Such a mosaic is for correctness runs only, whose pass and fail do not depend on the machine;
+timings do, so a benchmark never combines runs from different machines.
 
 ## Writing tests
 

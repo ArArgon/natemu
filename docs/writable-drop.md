@@ -113,7 +113,12 @@ for peers) and `slots_full` (requests that fell back to `SHADOWS`).
 
 Effect on a Paper start (per vCPU): full resets about 33 k to about 1.1 k, shadow misses about 16 M to 4-5.6 M; a traced
 start 55.2 to 41.45 s. These numbers come from a scratch driver and a hand-prepared disk that no longer exist, so they cannot be
-repeated; the bench case `guest-paper` (tests/bench/run_paper.py) is how a Paper start is measured now.
+repeated; the bench case `guest-paper` (tests/bench/run_paper.py) is how a Paper start is measured now. Its first
+numbers, on the same M2 Max (natemu 41e78e44, November 21, median of 3 boots): the first start of a boot 29.7 s (the
+boots 29.4, 30.4 and 29.7 s; Paper's own "Done" 26.6 s), the second 29.0 s (29.3, 28.9 and 29.0 s; 26.5 s). The
+[benchmarks page](benchmarks.md) has the M4's current ones. Experiment (an earlier version of the case: 8 GiB and Java's
+default heap, one boot, with internet, November 20, M2 Max): without `--speculation-barriers`, so with PTI on, the two
+starts took 191.7 s and 170.8 s, against 32.6 s and 35.1 s with it.
 
 An independent review of stage 2 found no soundness problem; it listed stale comments, now fixed.
 

@@ -157,8 +157,8 @@ waits, the hook), `execution/startup.rs` (new), `execution.rs` (`start`, `trap_d
 ## Risks for a running 64-bit OS
 
 - `next` runs at every boundary and in `sys_commit`: still one load of the word; the common path loses one load. Checked
-  by the disassembly (below, an experiment) and the hackbench cases at e21b0209 ([benchmarks](../benchmarks.md); this
-  item's ids are the commits before the branch's rebase onto main, tag `boot-interp-prerebase`). B2 had no gate run of
+  by the disassembly (below, an experiment) and the hackbench cases at e21b0209 ([the plan](m2-boot-interpreter-plan.md),
+  section 12; this item's ids are the commits before the branch's rebase onto main, tag `boot-interp-prerebase`). B2 had no gate run of
   its own: its author ran the CPU start-up cases (`initsipi`, `initsipi-1`, `x3-cases`, `exit-ap-natemu`); after the
   interpreter's merge the system, smp, interp and unit families ran at e21b0209 (M2 Max), and the full gate on the final
   tip ([the plan](m2-boot-interpreter-plan.md), section 12).

@@ -7,8 +7,8 @@ Mac's hardware do most of the work: guest page tables become real page tables, A
 keeps multithreaded code correct without extra barriers, and system calls, page faults and interrupts are handled inside
 the VM. QEMU TCG does all of these in software.
 
-natemu runs 11 benchmarks about 4.5× faster than QEMU TCG (1.4× to 41× per benchmark), and a Debian package-install and
-build workload 1.7× faster. See [benchmarks](docs/benchmarks.md).
+On an M4 Mac, natemu runs 12 benchmark programs about 5.8× faster than QEMU TCG (1.5× to 41× per program), and a Debian
+package-install and build workload 1.7× faster. See [benchmarks](docs/benchmarks.md).
 
 The x86 translator is [FEX](https://github.com/FEX-Emu/FEX)'s compiler, extended to run whole systems; the changes live in
 [natemu-fex](https://github.com/ArArgon/natemu-fex).

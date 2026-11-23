@@ -47,11 +47,23 @@ Done when deleting every machine's caches and scratch folders loses nothing but 
 
 ### Benchmark numbers
 
-[docs/benchmarks.md](docs/benchmarks.md) is natemu's performance record, and it stays current: a change that adds a
-benchmark, or moves one by more than its noise, updates the page in the same change. Its numbers come from the
-framework's bench cases, and each table says which: the case, the machine, the natemu commit and the date. An
-experiment (a profile, a prototype, an A/B of two builds, a case run with other options) may show its numbers where it
-is discussed, labelled as an experiment; they become the page's numbers once a bench case measures them.
+[docs/benchmarks.md](docs/benchmarks.md) shows each benchmark's latest numbers, not their history, and it stays current:
+a change that adds a benchmark, or moves one by more than its noise, updates the page in the same change, replacing the
+numbers it moved rather than adding a row or a section. Its numbers come from the framework's bench cases, and each
+table says which: the case, the machine, the natemu commit and the date.
+
+The method is an experiment's. A number is compared only with numbers from the same machine: no table or ratio mixes
+machines, because timings depend on the machine. (A gate may run as a mosaic, its families on different machines at one
+commit, since pass and fail do not; a benchmark never may.) QEMU, on the same Mac as natemu, and the real-x86 reference
+are the control group, measured under natemu's conditions (nothing else running, the same inputs and options); a control
+older than natemu's numbers says when it was measured. The page's numbers come from the machine that holds the control
+group (today the M4). A change's effect is an A/B: both commits on one machine, alternating, over at least three rounds,
+the noise the spread across rounds and a difference counted only beyond it; a comparison with older page numbers does
+not measure a change. The A/B and what caused the difference go in the commit message, or in the plan or findings page
+of the work; an A/B on another machine is evidence there, never the page's numbers. The page may say in a sentence what
+moved a number, without the old value. An experiment (a profile, a prototype, an A/B of two builds, a case run with
+other options) may show its numbers where it is discussed, labelled as an experiment; they become the page's numbers
+once a bench case measures them.
 
 ## README
 

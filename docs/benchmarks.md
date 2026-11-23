@@ -1,47 +1,48 @@
 # natemu benchmarks
 
-natemu compared with QEMU TCG, both running the same x86-64 Linux guest on
-the same Mac.
+natemu compared with QEMU TCG, both running the same x86 Linux guest on the same Mac, an Apple M4.
 
 | | natemu speed-up over QEMU |
 | --- | --- |
-| 64-bit programs, 12 items, 1 vCPU | **5.3×** (geometric mean; c-ray's two builds count as one item, SciMark as one) |
-| 64-bit, the same with the CPython configure and build (4 vCPUs), 14 items | **4.8×** |
-| 32-bit programs, 8 items | **5.1×** (geometric mean; **4.1×** without the x87 builds; c-ray and SciMark one item each) |
-| Context-switch-heavy Debian workload (cloud image), 4 vCPUs | **1.7×** |
+| 64-bit programs, 12 items, 1 vCPU | **5.8×** (geometric mean; 1.5× to 41×) |
+| 64-bit programs, 11 items, 4 vCPUs | **5.1×** (1.7× to 41×) |
+| 64-bit, the 1-vCPU items with the CPython configure and build (4 vCPUs), 14 items | **5.2×** |
+| 32-bit programs, 8 items, 1 vCPU (the CPython build at 4) | **5.1×** (geometric mean; 0.97× to 83×; **4.1×** without the x87 builds) |
+| Context-switch-heavy Debian workload (cloud image), 4 vCPUs, November 14 | **1.7×** |
 
-32-bit and 64-bit code are summarised separately, and a program measured in several builds or kernels (c-ray's
-variants, SciMark's five kernels) counts as one item, the geometric mean of its ratios. The 64-bit items are those of
-[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md#64-bit-code-against-qemu) (its table says which
-row is from which date). The 32-bit items are that page's too, except the CPython configure and build, which are this
-page's [32-bit CPython build](#32-bit-i386-cpython-build) at eb4ef43b (configure 0.30× at checkpoint B, 1.9× now; build
-2.1×, now 4.3×). The tables below are the November 14 round, one item per row.
+32-bit and 64-bit code are summarised separately. A program measured in several builds or kernels (c-ray's builds,
+SciMark's five kernels) counts as one item, the geometric mean of its ratios. At 4 vCPUs the c-ray item is `cray`
+alone and SciMark, a 1-vCPU program, is not counted. The 32-bit items are the CPython configure and build, `hackbench32`,
+`hackbench32-int80`, `sqlite32`, `startup32`, c-ray (its three small scenes, the ones QEMU ran) and SciMark (ten kernels:
+the x87 and the SSE2 build); without the x87 builds, the c-ray and SciMark items are their SSE2 builds alone. Every item
+is a row of a table below.
 
-Where the numbers come from: each table names its bench case (`tests/bench/family.toml`, run by
-`tools/natemu-test run --tier bench`), the machine, the natemu commit and the date. The tables from November 14
-were measured before the bench cases existed (with `tools/bench/run.py` directly) and are to be measured again
-through them; numbers from experiments elsewhere in `docs/` are labelled as such and are not this page's numbers.
-
-32-bit (i386) programs: [32-bit CPython build](#32-bit-i386-cpython-build) below; 32-bit programs against QEMU are in
-[the M2 checkpoint B findings](restructure/m2-checkpoint-b-findings.md).
+This page shows each benchmark's latest numbers. Each table names its bench case (`tests/bench/family.toml`, run by
+`tools/natemu-test run --tier bench`), the machine, the natemu commit and the date. QEMU and real x86 are the control
+group: QEMU was measured on the same M4 and real x86 on an x86 reference machine, at the dates the tables give. Numbers
+are compared only within one machine, so every emulator number here is from the M4. What moved a number, and by how
+much, is in the commit messages and the pages of the work that moved it.
 
 ## Setup
 
-- **Host:** Apple M4, macOS 26. One emulator ran at a time, with no other VM on the machine.
-- **natemu:** the main branch as of November 14, 2026.
-- **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`. Its CPU model is matched to the
-  features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9
-  of 10 tests we compared, so it is not used.
+- **Host:** Apple M4 (4 performance cores, 16 GiB), macOS 26. Each case ran alone on the machine, with no other VM.
+- **natemu:** 9f35eb96, measured November 22, 2026, in every natemu column below unless a table says otherwise.
+- **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`, on the same M4. Its CPU model is matched to the
+  features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9 of 10 tests we
+  compared, so it is not used. Its numbers are older than natemu's; each table says when they were measured.
+- **Real x86:** a Ryzen 7 8845HS (4 cores), the same binaries run natively, or the same guest under KVM for the CPython
+  build.
 - **Guest:** Debian 13 kernel 6.12.107 with `mitigations=off nokaslr` on both emulators. See
   [mitigations](#cpu-vulnerability-mitigations) for their cost.
 
-## Benchmarks
+## 64-bit programs
 
 Every program is an existing, unmodified open-source program, run from a RAM-only Debian userland.
 Each is timed on the host between markers it prints on the serial console, so boot time is
-excluded, and its output is checked. Times are the median of 3 boots, from the first run in each
-boot with natemu's translation cache off. A second run in the same boot is usually 1–5% faster on
-natemu, and up to 30% faster for `build`.
+excluded, and its output is checked. A bench case boots the guest once and runs its program twice; its time here is
+the median of the first runs of 3 boots, with natemu's translation cache off (`--compile-cache off`), so the first
+run translates everything it runs. A second run in the same boot is up to 6% faster on natemu at 1 vCPU and up
+to 13% at 4 vCPUs, and 20% and 40% faster for `build`.
 
 | Program | What it runs |
 | --- | --- |
@@ -57,22 +58,41 @@ natemu, and up to 30% faster for `build`.
 | `7zip` | 7-Zip 25.01 LZMA2 compression of 12 MiB of Silesia, then a test pass |
 | `sqlite` | SQLite 3.46.1 `speedtest1 --memdb --size 160` (single-threaded) |
 | `avx` | x264 0.164 encoding 300 CIF frames on its AVX2 paths |
+| `scimark` | SciMark 2.0's five kernels (FFT, SOR, Monte Carlo, sparse matrix multiply, LU), each for at least 2 s, in Mflops |
 
-Seconds, lower is better:
+Bench cases `guest-build` to `guest-scimark` (at 4 vCPUs with `TESTKIT_BENCH_VCPUS=4`); Apple M4; natemu 9f35eb96;
+November 22, 2026. QEMU 11.1.2 on the same M4: November 14, 2026, the median of 3 boots' first runs
+(`tools/bench/run.py`, the script the bench cases run, before they existed); `cray-strict` and SciMark November 21-22,
+2026, one boot's first run (cases `guest-cray-strict-qemu` and `guest-scimark-qemu`, 1 vCPU). Seconds, lower is better:
 
 | Program | natemu, 1 vCPU | QEMU, 1 vCPU | speed-up | natemu, 4 vCPUs | QEMU, 4 vCPUs | speed-up |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `build` | 9.47 | 29.34 | 3.1× | 4.66 | 12.35 | 2.7× |
-| `zstd` | 3.06 | 29.78 | 9.7× | 1.47 | 11.09 | 7.5× |
-| `hackbench` | 11.90 | 16.34 | 1.4× | 3.40 | 5.39 | 1.6× |
-| `locks` | 3.90 | 11.08 | 2.8× | 7.72 | 27.55 | 3.6× |
-| `luajit` | 3.60 | 18.38 | 5.1× | 1.33 | 5.32 | 4.0× |
-| `luajit-interp` | 4.08 | 30.34 | 7.4× | 1.22 | 9.05 | 7.4× |
-| `mem` | 7.87 | 16.64 | 2.1× | 2.60 | 4.99 | 1.9× |
-| `cray` | 3.17 | 130.35 | 41.1× | 1.12 | 42.14 | 37.6× |
-| `7zip` | 3.91 | 20.80 | 5.3× | 1.73 | 6.44 | 3.7× |
-| `sqlite` | 7.31 | 22.82 | 3.1× | 7.33 | 22.76 | 3.1× |
-| `avx` | 8.54 | 45.12 | 5.3× | 3.35 | 16.56 | 4.9× |
+| `build` | 7.325 | 29.34 | 4.0× | 3.769 | 12.35 | 3.3× |
+| `zstd` | 2.617 | 29.78 | 11.4× | 1.287 | 11.09 | 8.6× |
+| `hackbench` | 10.910 | 16.34 | 1.5× | 3.201 | 5.39 | 1.7× |
+| `locks` | 3.359 | 11.08 | 3.3× | 5.812 | 27.55 | 4.7× |
+| `luajit` | 2.957 | 18.38 | 6.2× | 1.087 | 5.32 | 4.9× |
+| `luajit-interp` | 3.400 | 30.34 | 8.9× | 1.030 | 9.05 | 8.8× |
+| `mem` | 7.316 | 16.64 | 2.3× | 2.432 | 4.99 | 2.1× |
+| `cray` | 3.072 | 130.35 | 42.4× | 1.035 | 42.14 | 40.7× |
+| `cray-strict` | 3.276 | 132.40 | 40.4× | 1.141 | not run | |
+| `7zip` | 3.502 | 20.80 | 5.9× | 1.564 | 6.44 | 4.1× |
+| `sqlite` | 5.972 | 22.82 | 3.8× | 6.036 | 22.76 | 3.8× |
+| `avx` | 7.973 | 45.12 | 5.7× | 3.244 | 16.56 | 5.1× |
+
+SciMark (`guest-scimark`, 1 vCPU) times its own kernels, each for at least 2 s, so its result is the Mflops it prints,
+not its run time: higher is better, per kernel the median of the 3 boots' first runs. QEMU's is one boot's first run;
+real x86's is the same binary on the Ryzen (November 20-21, 2026):
+
+| SciMark, 64-bit | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| natemu | 1228 | 4136 | 846 | 3089 | 3671 |
+| QEMU | 167 | 293 | 80 | 322 | 458 |
+| speed-up | 7.4× | 14.1× | 10.6× | 9.6× | 8.0× |
+| real x86 | 4213 | 2877 | 983 | 5499 | 11639 |
+
+FFT varies from run to run: its first runs read 1083, 1432 and 1228 Mflops in the three boots, and its second runs up
+to 3073.
 
 The gap is largest for floating-point and vector code (`cray`, `zstd`, `luajit-interp`), which
 natemu runs as native ARM64 instructions. It is smallest where the guest kernel does most of the
@@ -81,12 +101,63 @@ through its in-VM runtime. `sqlite` is single-threaded, so it does not speed up 
 `locks` slows down with more vCPUs on both emulators, as it does on real hardware: it measures
 lock hand-off between cores.
 
+## 32-bit programs
+
+Some of the same programs built as 32-bit code (i686), the way Debian builds its i386 packages, with x87 floating point
+unless the case says SSE2, run by the same 64-bit kernel at 1 vCPU:
+
+| Program | What it runs |
+| --- | --- |
+| `hackbench32` | `hackbench`, making its system calls through the kernel's 32-bit vDSO (SYSENTER) |
+| `hackbench32-int80` | the same, booted with `vdso32=0`, so every system call is an INT 0x80, as in Go's 386 runtime |
+| `sqlite32` | speedtest1, as `sqlite` |
+| `startup32` | speedtest1 at `--size 5` run 40 times, one process each: mostly program start |
+| `cray32`, `cray32-strict`, `cray32-sse2` | c-ray built as `cray` and as `cray-strict` (x87), and for SSE2; `-small`: the scene at 320×240, 1/16 of the pixels |
+| `scimark32`, `scimark32-sse2` | SciMark, the x87 and the SSE2 build |
+
+Bench cases `guest-hackbench32` to `guest-scimark32-sse2`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds, the
+median of 3 boots' first runs. QEMU 11.1.2 on the same M4 (the cases with `-qemu`): November 21-22, 2026, one boot's
+first run, the small c-ray scenes only. Real x86: the same binary on the Ryzen, November 20-21, 2026, where measured:
+
+| Program | natemu | QEMU | speed-up | real x86 |
+| --- | ---: | ---: | ---: | ---: |
+| `hackbench32` | 10.733 | 17.79 | 1.7× | |
+| `hackbench32-int80` | 25.278 | 24.48 | 0.97× | |
+| `sqlite32` | 7.887 | 33.70 | 4.3× | |
+| `startup32` | 7.140 | 29.15 | 4.1× | |
+| `cray32-small` | 0.657 | 80.92 | 123× | 0.58 |
+| `cray32-strict-small` | 0.644 | 86.50 | 134× | 0.61 |
+| `cray32-sse2-small` | 0.302 | 10.27 | 34.0× | 0.25 |
+| `cray32` | 9.249 | not run | | 9.19 |
+| `cray32-strict` | 8.795 | not run | | 9.63 |
+| `cray32-sse2` | 3.912 | not run | | 3.91 |
+
+QEMU runs x87 code in software, which is why the x87 rows are so large; they say more about QEMU than about natemu.
+`hackbench32-int80` is level with QEMU: natemu has no fast path yet for system calls made by INT 0x80.
+
+SciMark, as for 64-bit code (Mflops, higher is better; per kernel the median of the 3 boots' first runs; QEMU's one
+boot's first run; real x86 the same binaries on the Ryzen, November 20-21, 2026):
+
+| SciMark, 32-bit | FFT | SOR | Monte Carlo | sparse | LU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| x87: natemu | 1037 | 1653 | 292 | 1187 | 1939 |
+| x87: QEMU | 10.9 | 30.6 | 15.9 | 26.2 | 21.6 |
+| x87: speed-up | 95× | 54× | 18× | 45× | 90× |
+| x87: real x86 | 1869 | 1226 | 852 | 4378 | 4571 |
+| SSE2: natemu | 2624 | 3897 | 256 | 2875 | 4241 |
+| SSE2: QEMU | 149 | 312 | 33 | 297 | 434 |
+| SSE2: speed-up | 18× | 12× | 7.8× | 9.7× | 9.8× |
+| SSE2: real x86 | 4098 | 2887 | 796 | 5541 | 10276 |
+
 ## Context-switch-heavy Debian workload
 
 The stock Debian 13 nocloud image (20260914-2601), unchanged, with 4 vCPUs, 8 GiB, a disk, the
 network and `mitigations=off`. The first boot installs packages with apt, grows the root filesystem,
 then configures, builds (`make -j4`) and tests CPython 3.13. While the build runs, one loop downloads
 the Linux source from kernel.org and another writes, drops from cache and re-reads 2 GiB of data.
+
+Apple M4; natemu's main branch as of November 14, 2026; QEMU the same day; one run each (`tests/io/run_io5.py`, before
+the bench cases existed):
 
 | | Time |
 | --- | ---: |
@@ -99,21 +170,22 @@ identical between the two emulators.
 ## 32-bit (i386) CPython build
 
 The same CPython 3.13 source as the context-switch workload, configured and built (`make -j4`) first by the 64-bit
-Debian userland and then by a Debian i386 userland in a chroot (bench case `io5-solo32`, 4 vCPUs, 8 GiB). Times in
-seconds; each natemu row is one timed run on an Apple M4, November 22, 2026.
+Debian userland and then by a Debian i386 userland in a chroot, in one boot of the cloud image (bench case `io5-solo32`,
+4 vCPUs, 8 GiB). Apple M4; natemu 9f35eb96; November 22, 2026; one run. QEMU: case `io5-solo32-qemu` on the same M4,
+one run, November 21-22, 2026. Real x86: case `io5-solo32-reference`, the same disk and kernel under KVM on the Ryzen,
+November 21-22, 2026 (three runs within 0.3 s). Seconds:
 
-| natemu | i386 configure | i386 make | 64-bit configure | 64-bit make |
+| | i386 configure | i386 make | 64-bit configure | 64-bit make |
 | --- | ---: | ---: | ---: | ---: |
-| Checkpoint B (213e3566) | 374.2 | 223.2 | 58.8 | 89.6 |
-| 32-bit code reused across addresses, pool inside the guest (72114fb1) | 106.7 | 114.7 | 57.5 | 90.0 |
-| 32-bit library code shared between processes (44d480e2) | 82.5 | 108.1 | 58.0 | 89.5 |
-| page faults walk only current blocks (eb4ef43b, in main) | **59.5** | **107.0** | 54.5 | 89.0 |
-| QEMU 11.1.2 TCG, same M4 (1 run, Checkpoint B) | 110.9 | 464.0 | 94.9 | 357.6 |
-| real x86-64, Ryzen 7 8845HS (1 run, Checkpoint B) | 17.5 | 38.2 | 13.3 | 33.0 |
+| natemu | 58.3 | 107.1 | 53.1 | 88.6 |
+| QEMU 11.1.2 TCG | 110.9 | 464.0 | 94.9 | 357.6 |
+| speed-up | 1.9× | 4.3× | 1.8× | 4.0× |
+| real x86-64, Ryzen 7 8845HS | 17.5 | 38.2 | 13.3 | 33.0 |
 
-The 64-bit steps moved within the spread of single runs. How each change works and what its profile shows:
-[the 32-bit reuse findings](restructure/m2-reuse32-findings.md), [the 32-bit sharing
-findings](restructure/m2-pic32-findings.md), [the page-fault chain findings](restructure/m2-pfchain-findings.md).
+The i386 steps come this close to the 64-bit ones because natemu reuses translated 32-bit code across processes and
+addresses, shares it between processes, and walks only current blocks on a page fault ([32-bit
+reuse](restructure/m2-reuse32-findings.md), [sharing](restructure/m2-pic32-findings.md), [page-fault
+chains](restructure/m2-pfchain-findings.md)).
 
 ## Paper (Minecraft server) start
 
@@ -126,95 +198,19 @@ the same files. A start is timed from `java -jar` to Paper's "Done" line, after 
 has no internet at any point it is measured, and Paper needs none: its launcher finds Mojang's server jar already in
 place. `tests/bench/run_paper.py` describes the case in full.
 
-Bench case `guest-paper`; Apple M2 Max; natemu 41e78e44; November 21, 2026; median of 3 boots:
+Bench case `guest-paper`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds, the median of 3 boots:
 
-| Start in the boot | Time | The 3 boots | Paper's own "Done" |
-| --- | ---: | ---: | ---: |
-| first | 29.7 s | 29.4, 30.4, 29.7 s | 26.6 s |
-| second | 29.0 s | 29.3, 28.9, 29.0 s | 26.5 s |
-
-Experiment (an earlier version of the case: 8 GiB and Java's default heap, one boot, with internet, November 20, M2 Max): without
-`--speculation-barriers`, so with PTI on, the two starts took 191.7 s and 170.8 s, against 32.6 s and 35.1 s with it.
-
-## System calls: hackbench through the boot-time interpreter's branch
-
-`hackbench` (above) makes its system calls by SYSCALL. `hackbench32` is the same program built as 32-bit code (i686),
-which makes them through the kernel's 32-bit vDSO (SYSENTER); `hackbench32-int80` boots with `vdso32=0`, so every system
-call is an INT 0x80. All at 1 vCPU.
-
-Bench cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (`TESTKIT_BENCH_AT=<commit>
-tools/natemu-test run --tier bench -k "guest-hackbench and not profile and not qemu"`); Apple M2 Max; November 22,
-2026. Seconds, the mean of 3 boots of two runs each (`wall_s`, `wall2_s`), the two commits of a table booted
-alternately; the spread is the largest minus the smallest of the 3 boots' means, as a share of the mean.
-
-### After the rebase onto main
-
-`boot-interp` rebased onto main a6d03605 (November 22): its tip, 5113ba57, against main a6d03605, before the boot-time
-interpreter:
-
-| Case | a6d03605 | spread | 5113ba57 | spread | change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `hackbench` | 13.67 | 4.6% | 13.08 | 3.7% | −4.3% |
-| `hackbench32` | 13.38 | 2.3% | 12.77 | 3.1% | −4.6% |
-| `hackbench32-int80` | 31.42 | 2.0% | 30.11 | 2.0% | −4.2% |
-
-All three gains are larger than the noise: no boot of one commit comes near the other's (`hackbench` 13.36 to 14.00 s
-against 12.81 to 13.29 s; `hackbench32` 13.27 to 13.57 s against 12.60 to 12.99 s; `hackbench32-int80` 31.08 to 31.72 s
-against 29.90 to 30.51 s). `hackbench32`'s and `hackbench32-int80`'s match their gains before the rebase (below);
-`hackbench`'s is beyond the noise here for the first time (before the rebase, −0.8% to −3.3%, within it). They look
-like the same gains, which arrived with the plumbing commits (now 31564a06 to a2449f26), probably through the code's
-move to its own 2 MiB block (below); this set does not separate the commits either.
-
-### Before the rebase
-
-Measured before `boot-interp` was rebased onto main (November 22), on its pre-rebase commits (tag
-`boot-interp-prerebase` and its ancestors), so the ids below are theirs; [the commit
-map](restructure/commit-map-boot-interp-2026-11-22.txt) gives each one's id after the rebase. The commits: 78f60965, the
-old base (`m2-32bit`, before the rebase), before the boot-time interpreter; be626aa8, after its plumbing (d7bc0885 moved
-the resident's code into its own 2 MiB block, 0624b341 and be626aa8 added the interpreter's classification and entry);
-e21b0209, after CPU start-up (INIT and SIPI) and the interpreter itself; 9fd9f346, the branch's final tip (the mode
-transitions, the firmware boot mode, the real-code suites).
-
-The final tip, 9fd9f346, against 78f60965:
-
-| Case | 78f60965 | spread | 9fd9f346 | spread | change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `hackbench` | 13.34 | 2.8% | 13.24 | 1.7% | −0.8% |
-| `hackbench32` | 13.27 | 0.8% | 12.67 | 1.3% | −4.5% |
-| `hackbench32-int80` | 31.51 | 2.5% | 29.89 | 2.2% | −5.1% |
-
-The plumbing, be626aa8, against 78f60965 (a later set):
-
-| Case | 78f60965 | spread | be626aa8 | spread | change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `hackbench` | 13.41 | 5.7% | 13.30 | 1.5% | −0.8% |
-| `hackbench32` | 13.20 | 4.4% | 12.73 | 2.3% | −3.6% |
-| `hackbench32-int80` | 31.83 | 4.2% | 30.54 | 0.2% | −4.1% |
-
-An earlier set, e21b0209 against 78f60965:
-
-| Case | 78f60965 | spread | e21b0209 | spread | change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `hackbench` | 13.57 | 5.3% | 13.13 | 3.9% | −3.3% |
-| `hackbench32` | 13.43 | 1.1% | 12.66 | 3.3% | −5.7% |
-| `hackbench32-int80` | 31.41 | 3.8% | 30.63 | 0.9% | −2.5% |
-
-`hackbench32`'s and `hackbench32-int80`'s gains at the final tip are larger than the noise: no boot of one commit comes
-near the other's (`hackbench32` 13.21 to 13.31 s against 12.58 to 12.74 s; `hackbench32-int80` 31.00 to 31.78 s against
-29.63 to 30.30 s). `hackbench`'s change is within the spread between boots (in the earlier set, only `hackbench32`'s
-gain was beyond it). The same gains are there at be626aa8, so they arrive with the plumbing (d7bc0885 to be626aa8), and
-the later slices add nothing beyond the noise: separate sets of the same commit differ by about 1% (78f60965's
-`hackbench32-int80` took 31.51 s in one set and 31.83 s in the other). Their likely source is the code move (d7bc0885):
-the resident's code is now mapped by one 2 MiB block entry instead of 4 KiB pages, and its instructions stayed the same
-(an experiment in that commit's message: the same instructions in all 449 functions but one literal). The classification
-and entry are meant to leave the fast system-call path's instructions as they were. This is likely, not shown: d7bc0885
-was not measured alone.
+| Start in the boot | Time | The 3 boots | Paper's own "Done" | The 3 boots |
+| --- | ---: | ---: | ---: | ---: |
+| first | 23.86 | 24.20, 23.86, 23.82 | 21.37 | 21.62, 21.37, 21.34 |
+| second | 23.77 | 23.77, 23.67, 24.22 | 21.76 | 21.76, 21.60, 22.12 |
 
 ## CPU vulnerability mitigations
 
-The numbers above use `mitigations=off`. On a default kernel command line natemu reports its virtual
+The numbers above use `mitigations=off`, except the Paper start, which keeps the default kernel command line and turns
+PTI off with `--speculation-barriers`. On a default kernel command line natemu reports its virtual
 CPU as affected by Meltdown, so Linux turns on page table isolation (PTI). natemu has no fast path
-for PTI's page-table switches yet. The cloud-image workload above, measured on an earlier natemu build
+for PTI's page-table switches yet. The cloud-image workload above, on the M4 with an earlier natemu build
 (November 13, 2026):
 
 | Guest configuration | Time |
