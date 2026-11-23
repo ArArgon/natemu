@@ -1668,9 +1668,12 @@ def cmd_compat(a, host, runtime):
 
 def cmd_compat_limits(a, host, runtime):
     """Limit faults pinned QEMU omits: compare the exact saved frame, vector progress, CR2 and operand bytes."""
-    import compat_limits
+    if a.mode == 'compat-smp-limits':
+        from compat_smp_limits import cases
+    else:
+        from compat_limits import cases
     report, failures = [], []
-    for prog, expected in compat_limits.cases():
+    for prog, expected in cases():
         name = prog['name']
         if a.programs and not any(n in name for n in a.programs):
             continue
@@ -1681,15 +1684,18 @@ def cmd_compat_limits(a, host, runtime):
             if rc:
                 diffs.append(f'driver {rc}: {err}')
             else:
-                cpu = out['cpus'][0]
-                if (refusal := prog.get('limit_refusal')):
-                    why, rip = refusal
-                    got = cpu['stop'], cpu['reason'].split()[0], smp.num(cpu['rip']), cpu['mmio']['status']
-                    if got != ('resident', 'unsupported_mmio', rip, why):
-                        diffs.append(f'expected {why} at {rip:#x}, got {got}')
-                elif cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(prog['cpus'][0]['rip'])):
-                    diffs.append(f'stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
-                captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
+                for i, initial in enumerate(prog['cpus']):
+                    cpu = out['cpus'][i]
+                    if (refusal := prog.get('limit_refusal')):
+                        why, rip = refusal
+                        got = cpu['stop'], cpu['reason'].split()[0], smp.num(cpu['rip']), cpu['mmio']['status']
+                        if got != ('resident', 'unsupported_mmio', rip, why):
+                            diffs.append(f'expected {why} at {rip:#x}, got {got}')
+                    elif cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(initial['rip'])):
+                        diffs.append(f'cpu{i} stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
+                    if prog['ncpu'] > 1 and not limit and not cpu['stats']['linked']:
+                        diffs.append(f'cpu{i} installed no links in the default run')
+                captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
                 for addr, want in expected.items():
                     got = next((data[addr - base:addr - base + len(want)] for base, data in captured.items()
                                 if base <= addr and addr + len(want) <= base + len(data)), b'')
@@ -2422,7 +2428,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'compat', 'compat-limits', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'compat', 'compat-limits', 'compat-smp-limits', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -2460,7 +2466,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'compat': cmd_compat, 'compat-limits': cmd_compat_limits, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'compat': cmd_compat, 'compat-limits': cmd_compat_limits, 'compat-smp-limits': cmd_compat_limits, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 
