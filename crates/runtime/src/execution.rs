@@ -2472,17 +2472,10 @@ unsafe fn division(signed: bool, f: &NativeFrame, elr: u64, spsr: u64) -> ! {
     }
 }
 
-/// Every entry or resume selects the current privilege's shadows. A mixed process can leave the first
-/// page above 4 GiB mapped for its 64-bit code. Drop that one user shadow before running 32-bit code:
-/// native loads can then report a flat segment straddle even if the guest maps both pages.
+/// Every entry or resume selects the roots of the current privilege and code mode ([`tables::select`]): user code that
+/// is not 64-bit code, the condition under which [`access_aborted`] wraps an address, runs under the compat root.
 fn select_guest_space(s: &State) {
-    if s.cpu.cpl == 3
-        && s.cpu.code_mode() == Some(CodeMode::Compat32)
-        && tables::space(true).enter_compat_user().is_err()
-    {
-        halt(s, stop::SHADOW)
-    }
-    tables::select(s.cpu.cpl);
+    tables::select(s.cpu.cpl, s.cpu.code_mode() != Some(CodeMode::Bits64));
 }
 
 /// Resumes generated code mid-block at `pc` (a division, a retried access, a split store): a stop still wanted is

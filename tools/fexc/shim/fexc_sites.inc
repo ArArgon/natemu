@@ -1541,8 +1541,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     break;
   }
   case IROps::OP_PUSH: {
-    const auto Op = IROp->C<IR::IROp_Push>(); Addr = &Op->Addr; W = IR::OpSizeToSize(Op->ValueSize);
-    Imm = Op->Predecremented ? 0 : -int64_t(W); Store = true;
+    const auto Op = IROp->C<IR::IROp_Push>(); Addr = &Op->Addr; W = IR::OpSizeToSize(Op->ValueSize); Imm = -int64_t(W); Store = true;
     break;
   }
   case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
@@ -1597,7 +1596,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   if (fexc_push_run && !fexc_step_unit && Split && !Index && !Pair && !Align && W <= FexcSlot() && Imm % int64_t(W) == 0) {
     const uint32_t R = Base.Idx();
     if (R > 1 && R < 31 && (FexcAlignedMask >> R & 1)) return;
-    if ((StaticRegisters.size() > 4 && Base == StaticRegisters[4]) || (fexc_bits32 && IROp->Op == IROps::OP_PUSH)) {   // RSP or the wrapped PUSH address
+    if (StaticRegisters.size() > 4 && Base == StaticRegisters[4]) {   // the guest RSP
       auto* L = Stub(Base, 0, FEXC_SITE_STACK);
       and_(ARMEmitter::Size::i64Bit, TMP1, Base, FexcSlot() - 1);
       cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, L);

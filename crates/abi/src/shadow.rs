@@ -49,14 +49,37 @@ const LIST: usize = 4;
 /// such shadows a vCPU, a few per CR3 load, made 58-68% of the loads reset the kept half whole. Listed, a load removes
 /// only them (what the load must drop); past this many it resets everything, as before.
 const LIST_MAX: usize = 64;
-/// A user shadow of the first page above the 32-bit address space may exist.
-const COMPAT_EDGE_MAPPED: usize = LIST + LIST_MAX;
-const COMPAT_END: u64 = 1 << 32;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
 /// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
 /// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
-pub const POOL_OFFSET: usize = 0xe0000;
-pub const POOL_PAGES: usize = 288;
+pub const POOL_OFFSET: usize = COMPAT_L1 + 4096;
+pub const POOL_PAGES: usize = 285;
+/// M2 checkpoint C: the roots 32-bit user code runs under (three pages before the pool, never pool pages), with an ASID
+/// of their own. They map the first 4 GiB and nothing else of the guest: [`COMPAT_LOWER_ROOT`]'s entry 0 links
+/// [`COMPAT_L1`] and its entry 256 the resident's private region (the host writes both); [`COMPAT_UPPER_ROOT`] holds
+/// only the guest-state alias's entry. `COMPAT_L1`'s entries 0 to 3 are copies of the user space's level-1 entries of
+/// the same range ([`Space::leaf`] writes a copy with each link, the resets clear them), so both roots share every
+/// table below and a shadow of a page under 4 GiB is one leaf entry. Any native address with a bit above 31 set then
+/// aborts under these roots, whatever a generated 64-bit sum or a register's upper half made it.
+pub const COMPAT_LOWER_ROOT: usize = 0xe0000;
+pub const COMPAT_UPPER_ROOT: usize = 0xe1000;
+pub const COMPAT_L1: usize = 0xe2000;
+/// Level-1 entries (GiB) the compat root shares with the user space.
+pub const COMPAT_GIBS: usize = 4;
+/// `[lower, upper]` roots by class: supervisor, user, compat.
+pub const CLASS_ROOTS: [[usize; 2]; 3] = [ROOTS[0], ROOTS[1], [COMPAT_LOWER_ROOT, COMPAT_UPPER_ROOT]];
+/// ASIDs are 8 bits: vCPU `v` has 2v + 2 (supervisor, the host's, loaded at boot), 2v + 3 (user) and, clear of both for
+/// 64 vCPUs, `COMPAT_ASID + v` for the compat root.
+pub const COMPAT_ASID: u64 = 130;
+/// From the loaded ASID (TTBR0_EL1[55:48]): the loaded class ([`CLASS_ROOTS`]' index) and the owner's three ASIDs.
+pub const fn asids(loaded: u64) -> (usize, [u64; 3]) {
+    let (class, supervisor) = if loaded >= COMPAT_ASID {
+        (2, 2 * (loaded - COMPAT_ASID) + 2)
+    } else {
+        ((loaded & 1) as usize, loaded & !1)
+    };
+    (class, [supervisor, supervisor + 1, COMPAT_ASID - 1 + supervisor / 2])
+}
 pub const TCR_BOTH: u64 =
     16 | 1 << 8 | 1 << 10 | 3 << 12 | 16 << 16 | 1 << 24 | 1 << 26 | 3 << 28 | 2 << 30 | 2 << 32;
 /// Valid page, AF, inner shareable, normal memory (MAIR index 0), EL0 read/write (AP 01: generated code runs at EL0),
@@ -123,6 +146,7 @@ const LOWER_TABLES: [usize; 3] = [0x11000, 0x15000, LOWER_LEAF];
 const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
 /// Window pages holding the owner's tables and shadow state: never a target.
 const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
+const COMPAT_TABLES: core::ops::Range<usize> = COMPAT_LOWER_ROOT..POOL_OFFSET;
 /// G1: the frame page (the guest-state page, also reached by its EL0 alias) and the alias's tables: never a target.
 const GUEST_STATE: [core::ops::Range<usize>; 3] = [
     crate::execution::FRAME_OFFSET..crate::execution::FRAME_OFFSET + 4096,
@@ -234,6 +258,10 @@ impl<M: Maintenance> Space<M> {
                     // The zeroed table is complete before the walker can reach it.
                     self.tlb.publish();
                     self.set(table, index, (self.ipa + next as u64) | TABLE);
+                    // The compat root's copy of a user level-1 entry below 4 GiB ([`COMPAT_L1`]).
+                    if self.user && level == 1 && va >> 32 == 0 {
+                        self.set(COMPAT_L1, index, (self.ipa + next as u64) | TABLE);
+                    }
                     next
                 }
                 None => return Ok(None),
@@ -258,6 +286,7 @@ impl<M: Maintenance> Space<M> {
         }
         let own = target.wrapping_sub(self.ipa) as usize;
         if PRIVATE_TABLES.contains(&own)
+            || COMPAT_TABLES.contains(&own)
             || GUEST_STATE.iter().any(|r| r.contains(&own))
             || self.pool(own, POOL_PAGES)
         {
@@ -276,9 +305,6 @@ impl<M: Maintenance> Space<M> {
                 }
             }
         }
-        if self.user && va == COMPAT_END {
-            self.set(STATE_OFFSET, COMPAT_EDGE_MAPPED, 1);
-        }
         let new = target | PAGE | NOT_GLOBAL | if writable { 0 } else { READ_ONLY };
         let old = self.get(table, index);
         if old == new {
@@ -290,16 +316,6 @@ impl<M: Maintenance> Space<M> {
         }
         self.set(table, index, new);
         self.tlb.publish();
-        Ok(())
-    }
-    /// With the first page above 4 GiB absent from the user space, a native load beginning below the
-    /// flat segment limit and extending past it must fault. The resident checks the range before paging.
-    /// A later 64-bit access can fill the page normally. An unrelated eviction may leave the hint set.
-    pub fn enter_compat_user(&mut self) -> Result<(), Error> {
-        if self.user && self.get(STATE_OFFSET, COMPAT_EDGE_MAPPED) != 0 {
-            self.unmap(COMPAT_END)?;
-            self.set(STATE_OFFSET, COMPAT_EDGE_MAPPED, 0);
-        }
         Ok(())
     }
     /// Remove `va`'s shadow, if any, and invalidate it.
@@ -342,6 +358,7 @@ impl<M: Maintenance> Space<M> {
                 self.set(root, index, 0);
             }
         }
+        self.unlink_compat();
         for word in [BOTTOM, TOP, NOT_ALL_GLOBAL, LISTED] {
             self.set(STATE_OFFSET, word, 0);
         }
@@ -377,9 +394,16 @@ impl<M: Maintenance> Space<M> {
                 self.set(root, index, 0);
             }
         }
+        self.unlink_compat();
         self.set(STATE_OFFSET, BOTTOM, 0);
         self.tlb.invalidate_all();
         false
+    }
+    /// The compat root's copies go with the user root's entries: the tables they link return to the pool.
+    fn unlink_compat(&mut self) {
+        for index in 0..COMPAT_GIBS {
+            self.set(COMPAT_L1, index, 0);
+        }
     }
 }
 
@@ -429,33 +453,52 @@ mod tests {
         memory[offset / 8]
     }
 
+    /// M2 checkpoint C: the compat root's level-1 table holds exactly the user space's level-1 entries below 4 GiB, through
+    /// links and both resets, and its three pages are never a shadow's target.
     #[test]
-    fn compatibility_entry_removes_only_the_boundary_leaf_in_the_user_space() {
+    fn every_asid_names_its_class_and_its_owners_three() {
+        let mut seen = std::collections::BTreeSet::new();
+        for v in 0..64 {
+            let own = [2 * v + 2, 2 * v + 3, COMPAT_ASID + v];
+            for (class, asid) in own.into_iter().enumerate() {
+                assert_eq!(asids(asid), (class, own));
+                assert!(asid != 0 && asid < 256 && seen.insert(asid));
+            }
+        }
+    }
+    #[test]
+    fn compat_root_copies_the_user_links_below_4_gib() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
         let target = 0x4007_0000;
-        s.map(COMPAT_END, target, true).unwrap();
+        let copies = |m: &[u64]| [0, 1, 2, 3, 4].map(|i| word(m, COMPAT_L1 + i * 8));
+        let user_l1 = |m: &[u64], i: usize| word(m, (word(m, USER_LOWER_ROOT) & OUTPUT) as usize - IPA as usize + i * 8);
+        // A supervisor shadow below 4 GiB links nothing under the compat root.
+        space(&mut m, POOL_PAGES).map(0x1000, target, true).unwrap();
+        assert_eq!(copies(&m), [0; 5]);
+        let mut s = space(&mut m, POOL_PAGES);
         s.user = true;
-        for va in [COMPAT_END - 4096, COMPAT_END, COMPAT_END + 4096] {
+        for va in [0x1000, 0xffff_f000, 1 << 32, 0x7fff_ffff_f000, u64::MAX & !4095] {
             s.map(va, target, true).unwrap();
         }
-        s.tlb.0.clear();
-        s.enter_compat_user().unwrap();
-        s.enter_compat_user().unwrap();
-        assert_eq!(s.tlb.0, [COMPAT_END]);
-        assert_eq!(s.descriptor(COMPAT_END), 0);
-        assert_ne!(s.descriptor(COMPAT_END - 4096), 0);
-        assert_ne!(s.descriptor(COMPAT_END + 4096), 0);
-        s.user = false;
-        assert_ne!(s.descriptor(COMPAT_END), 0);
+        let got = copies(&m);
+        assert_eq!(got, [user_l1(&m, 0), 0, 0, user_l1(&m, 3), 0]);
+        assert!(got[0] & 3 == TABLE && got[3] & 3 == TABLE && got[0] != got[3]);
+        for full in [true, false] {
+            let mut s = space(&mut m, POOL_PAGES);
+            s.user = true;
+            s.map(0x4000_0000, target, false).unwrap();
+            assert_ne!(copies(&m)[1], 0);
+            assert!(if full { s.reset(); true } else { !s.reset_cr3() });
+            assert_eq!(copies(&m), [0; 5]);
+        }
+        let mut s = space(&mut m, POOL_PAGES);
         s.user = true;
-        s.map_global(COMPAT_END, target, false).unwrap();
-        assert_ne!(s.descriptor(COMPAT_END), 0);
-        s.enter_compat_user().unwrap();
-        assert_eq!(s.descriptor(COMPAT_END), 0);
+        for table in [COMPAT_LOWER_ROOT, COMPAT_UPPER_ROOT, COMPAT_L1] {
+            assert_eq!(s.map(0x1000, IPA + table as u64, true), Err(Error::Private));
+        }
+        assert_eq!(COMPAT_L1 + 4096, POOL_OFFSET);
     }
 
-    /// K1: `unmap_large` removes and invalidates exactly the shadows of the 2 MiB region holding its address.
     #[test]
     fn unmap_large_clears_one_region() {
         let mut m = window();

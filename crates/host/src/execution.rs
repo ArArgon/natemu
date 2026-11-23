@@ -570,7 +570,9 @@ fn refill_entropy(area: Area) {
 /// doorbell enabled (`doorbell`; disabled only by a test driver's never-answering peer).
 pub fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
     // 8-bit ASIDs, never 0.
-    const _: () = assert!(2 * cache::MAX_VCPUS + 1 <= 255);
+    // (M2 checkpoint C: the resident's third, for the compat root, lies above both: `shadow::asids`.)
+    const _: () = assert!(2 * cache::MAX_VCPUS + 1 < natemu_abi::shadow::COMPAT_ASID as usize);
+    const _: () = assert!(natemu_abi::shadow::COMPAT_ASID as usize + cache::MAX_VCPUS - 1 <= 255);
     cpu.doorbell(area.vcpu, doorbell)?;
     cpu.enter_resident_with_asid(
         area.base,

@@ -271,6 +271,10 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
     word(shadow::LOWER_ROOT, table(0x11000));
     word(shadow::LOWER_ROOT + 256 * 8, table(0x12000));
     word(shadow::USER_LOWER_ROOT + 256 * 8, table(0x12000));
+    // M2 checkpoint C: the compat root (32-bit user code): the private region, and its level-1 table of the first 4 GiB,
+    // whose entries the runtime copies from the user space's.
+    word(shadow::COMPAT_LOWER_ROOT + 256 * 8, table(0x12000));
+    word(shadow::COMPAT_LOWER_ROOT, table(shadow::COMPAT_L1));
     // Low alias exists only for MMU enable and is removed by startup.
     let identity = IPA + window as u64;
     word(
@@ -309,7 +313,7 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
                 shadow::USER_LOWER_ROOT,
                 shadow::USER_UPPER_ROOT + 4096 - shadow::USER_LOWER_ROOT,
             ),
-            own(shadow::POOL_OFFSET, shadow::POOL_PAGES * 4096),
+            own(shadow::COMPAT_LOWER_ROOT, shadow::POOL_OFFSET - shadow::COMPAT_LOWER_ROOT + shadow::POOL_PAGES * 4096),
         ],
     );
 }
@@ -366,6 +370,8 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
     let table = |offset: usize| IPA + (window + offset) as u64 + 3;
     let i = (va >> 21 & 511) as usize;
     let at = if cache::dl1_after(va) { i + 1 } else { i - 1 };
+    // (The compat root's slot is the user space's: 32-bit code is user code.)
+    word(shadow::COMPAT_UPPER_ROOT + index(0), table(user_l1));
     for (k, (root, l1, l2)) in [(shadow::UPPER_ROOT, l1, l2), (shadow::USER_UPPER_ROOT, user_l1, user_l2)]
         .into_iter()
         .enumerate()
@@ -567,7 +573,7 @@ pub(crate) mod tests {
                     unreachable!()
                 };
                 assert!((va >> 39 & 511) < 256);
-                for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
+                for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT, shadow::COMPAT_UPPER_ROOT] {
                     assert_eq!(
                         walk(root, va),
                         (IPA + (window + FRAME_OFFSET) as u64) | PAGE | EL0_DATA | PXN | UXN
@@ -726,6 +732,9 @@ pub(crate) mod tests {
             shadow::STATE_OFFSET,
             shadow::USER_LOWER_ROOT,
             shadow::USER_UPPER_ROOT,
+            shadow::COMPAT_LOWER_ROOT,
+            shadow::COMPAT_UPPER_ROOT,
+            shadow::COMPAT_L1,
         ]
         .into_iter()
         .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
@@ -736,10 +745,15 @@ pub(crate) mod tests {
             );
         }
         // Both spaces' TTBR0 roots reach the private region through the same table.
-        for root in [shadow::LOWER_ROOT, shadow::USER_LOWER_ROOT] {
+        for root in [shadow::LOWER_ROOT, shadow::USER_LOWER_ROOT, shadow::COMPAT_LOWER_ROOT] {
             let entry = u64::from_le_bytes(memory.read::<8>(window + root + 256 * 8));
             assert_eq!(entry, IPA + (window + 0x12000) as u64 + 3);
         }
+        // The compat root's only guest entry links its own level-1 table, which starts empty.
+        let compat = |at: usize| u64::from_le_bytes(memory.read::<8>(window + at));
+        assert_eq!(compat(shadow::COMPAT_LOWER_ROOT), IPA + (window + shadow::COMPAT_L1) as u64 + 3);
+        assert!((1..256).all(|i| compat(shadow::COMPAT_LOWER_ROOT + i * 8) == 0));
+        assert!((0..512).all(|i| compat(shadow::COMPAT_L1 + i * 8) == 0));
         let mut space = shadow::Space {
             window: unsafe { memory.0.add(window) },
             ipa: IPA + window as u64,
