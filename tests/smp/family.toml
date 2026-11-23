@@ -129,3 +129,8 @@ params = { timeout = 2100 }
 
 [suite.cases."amd-reference"]
 argv = ["tests/smp/run_compat_kvm.py", "--out", "{out}"]
+
+# M2 checkpoint C: the generic FS/GS operand-check cases of compat_limits.py (every `*-generic-*` case but the recorded
+# deviation), whose expectations must be the AMD processor's.
+[suite.cases."amd-generic"]
+argv = ["tests/smp/run_compat_kvm.py", "--generic", "--out", "{out}"]

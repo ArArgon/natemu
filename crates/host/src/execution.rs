@@ -5790,6 +5790,7 @@ mod tests {
         c.bits32 = true;
         assert_eq!((c.keyed_read(0x8081), c.keyed_read(0x1_0000).is_err()), (Ok(0x8081), true));
         c.check_reuse = false;
+        c.cpl3 = true; // (32-bit code is user code: admission refuses an FS or GS operand of any other request)
         // M2 task 3a: system cuts are decoded in 32-bit mode (40 is INC EAX before the INT, not a REX prefix), and an
         // access through a null FS or GS is the #GP cut; the other segment's, and 64-bit code's, are translated.
         let kind = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {

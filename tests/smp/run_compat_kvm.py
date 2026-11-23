@@ -20,6 +20,10 @@ from testkit.harness.campaign import REFERENCE_CPU, REF_HOST, _reference, _snap
 
 SELECTED = {'fs-resident-wrapped-word', 'gs-before-unmapped-page', 'fs-string-repe-fault-flags', 'fs-string-repe-page-flags',
             'gs-maskstore-zero', 'gs-null-maskstore-zero', 'fs-null-gather-zero', 'fs-maskmovdqu-zero'}
+# M2 checkpoint C, the `amd-generic` case: every generic operand-check case of compat_limits (`fs-generic-*`, `gs-generic-*`)
+# but the one that pins natemu's recorded deviation: the fixture's expectations are the processor's.
+GENERIC = ('fs-generic-', 'gs-generic-')
+DEVIATIONS = {'fs-generic-flat-limit-offset-overrun-deviation'}
 ARGS = ['-enable-kvm', '-cpu', REFERENCE_CPU, '-m', '64', '-machine', 'pc', '-nodefaults', '-display', 'none',
         '-serial', 'none', '-monitor', 'none', '-no-reboot', '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04']
 
@@ -78,11 +82,12 @@ def projection(program, expected, dump):
     return got
 
 
-def main(out):
+def main(out, generic=False):
     out.mkdir(parents=True, exist_ok=True)
     stub = smp.build_stub(out)
-    cases = {p['name']: (p, e) for p, e in compat_limits.cases(reference_control=True) if p['name'] in SELECTED}
-    assert cases.keys() == SELECTED
+    cases = {p['name']: (p, e) for p, e in compat_limits.cases(reference_control=True)
+             if (p['name'].startswith(GENERIC) and p['name'] not in DEVIATIONS if generic else p['name'] in SELECTED)}
+    assert len(cases) > 100 if generic else cases.keys() == SELECTED
     keys = {}
     for name, (program, expected) in cases.items():
         img = smp.build_image(program, stub)
@@ -107,12 +112,12 @@ def main(out):
     # The original fixture remains the Intel-oriented comparison. These AMD exceptions to it
     # are explicit, with the observed fields retained next to both verdicts in the report.
     controls = {}
-    for name in ('gs-null-maskstore-zero', 'fs-null-gather-zero'):
+    for name in () if generic else ('gs-null-maskstore-zero', 'fs-null-gather-zero'):
         program, _ = cases[name]
         code = next(bytes.fromhex(r['data']) for r in program['memory'] if smp.num(r['addr']) == compat_limits.C.U)
         assert code.endswith(bytes.fromhex('cd80'))
         controls[name] = {compat_limits.C.REC: struct.pack('<4Q', 128, 0, compat_limits.C.U + len(code), 0xdb)}
-    for name in ('fs-string-repe-fault-flags', 'fs-string-repe-page-flags'):
+    for name in () if generic else ('fs-string-repe-fault-flags', 'fs-string-repe-page-flags'):
         controls[name] = {compat_limits.C.REC + 0x20: struct.pack('<Q', 0x10044)}
     results = []
     for name, (_, expected) in cases.items():
@@ -132,4 +137,6 @@ if __name__ == '__main__':
     testenv.require_framework(__file__)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', required=True, type=pathlib.Path)
-    sys.exit(main(parser.parse_args().out))
+    parser.add_argument('--generic', action='store_true', help='the generic operand-check cases instead of the selected ones')
+    a = parser.parse_args()
+    sys.exit(main(a.out, a.generic))

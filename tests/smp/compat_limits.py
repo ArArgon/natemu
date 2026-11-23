@@ -89,6 +89,30 @@ def inline_base_refresh(segment):
     return prog, expected
 
 
+def identity_switch(faults):
+    """M2 checkpoint C: one instruction at one address under FS segments of both code identities, reloaded between
+    passes: a flat-limit one (no operand check in its code) and a limited one. `faults`: the limited segment is too small,
+    so the pass after the flat one must fault there (a block of the flat identity must not serve it); else it is roomy and
+    five alternating passes all run, the resident deciding no check."""
+    tls = C.W + 0x80
+    word = int.from_bytes(VALUE[4:8], 'little')
+    setup = (f'    mov rax, {descriptor(tls, 3 if faults else 0xff):#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
+             f'    mov rax, {descriptor(tls, 0xfffff, flags=12):#x}\n    mov [{C.F["g"] + 0x30:#x}], rax\n')
+    for offset, data in [(0x80, VALUE)]:
+        setup += load_bytes(C.W + offset, data)
+    head = f'    mov edx, {0x33 if faults else 0x2b:#x}\n    mov esi, 5\n    xor edi, edi\n    xor ecx, ecx\n.again:\n    mov fs, dx\n'
+    insn = '    add ecx, [fs:edi+4]\n'
+    tail = '    xor edx, 0x18\n    dec esi\n    jnz .again\n    int 0x80\n'
+    fault_rip = C.U + len(C.user32(head))
+    end_rip = C.U + len(C.user32(head + insn + tail))
+    prog = C.program(f'fs-identity-switch-{"fault" if faults else "run"}', setup + C.ENTER() + C.handlers('    jmp .fin\n'), head + insn + tail)
+    prog['segment_checks'] = [int(faults)]
+    prog['require_link'] = not faults
+    rip, ecx = (fault_rip, word) if faults else (end_rip, 5 * word & 0xffffffff)
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 13 if faults else 128, 0, rip, 0xdb),
+                  C.REC + 0x48: struct.pack('<I', ecx), tls: VALUE}
+
+
 def cases(*, reference_control=False):
     # Each instruction follows a successful load of a real descriptor. A separate register selects the
     # control segment, so mixing the two segments or validating a based linear address fails the case.
@@ -1099,7 +1123,7 @@ def cases(*, reference_control=False):
         add(f'es-string-destination-{instruction}', f'ss {instruction}', mapped=C.TOP_ONLY,
             prefix=f'    mov esi, {C.W:#x}\n    mov edi, 0xfffffffe\n')
     add('ss-moffs-load', 'mov eax, [ss:0xfffffffe]', fault=12, mapped=C.TOP_ONLY)
-    cases += [mixed_user_wrap(), mixed_user_wrap_far()]
+    cases += [mixed_user_wrap(), mixed_user_wrap_far(), identity_switch(False), identity_switch(True)]
     # M2 checkpoint C, the generic operand check: one in-range and one out-of-range case per instruction class the
     # per-opcode checks left unchecked, under a writable expand-up segment. In range the inline check passes (the
     # resident decides none: checks=0) and the effect is the instruction's; out of range the fault is at the instruction

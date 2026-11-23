@@ -4797,7 +4797,7 @@ mod tests {
     /// `l1_fill` modelled as the resident drives it (owner words with the flags, the set's next-victim bit in way 0's
     /// word): the empty way first, fill order after, a block never in both ways, the flags kept.
     #[test]
-    fn compatibility_dword_view_covers_only_loaded_expand_up_rw_data() {
+    fn segment_records_cover_only_limited_expand_up_rw_data() {
         let mut c = crate::power_on::reset();
         c.cpl = 3;
         c.efer |= EFER_LMA;
@@ -4814,7 +4814,7 @@ mod tests {
             assert_eq!(c.compat_segment_records()[0], expected, "access byte {a:#x}");
             // Present and not flat-limit: limited, whatever the type; the record models only the writable expand-up data segment.
             assert_eq!(c.limited_segment(SREG_FS), a & ATTR_P != 0, "access byte {a:#x}");
-            assert_eq!(c.code_context() >> 34 & 3, u64::from(a & ATTR_P != 0));
+            assert_eq!(c.code_context() >> 34 & 1, u64::from(a & ATTR_P != 0));
             if data {
                 assert!(d.allows(0x0fff_fffc, 4, true, true));
                 assert!(!d.allows(0x0fff_fffd, 4, false, true));
