@@ -64,7 +64,7 @@ HEAD = (S.SETUP + '    mov eax, 0x70\n    ltr ax\n').format(**F) + f'    sidt [{
 # The user's flat data segments (`data`; 0: null) and null FS/GS (an outer IRETQ nulls a DPL 0 one), then IRETQ to
 # `cs`:U on the user stack with RFLAGS = 2. RAX is free until the frame is built: `regs` then sets what the 32-bit code
 # starts with.
-ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b: f"""    mov eax, {data:#x}
+ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b, flags=2: f"""    mov eax, {data:#x}
     mov ds, eax
     mov es, eax
     xor eax, eax
@@ -73,7 +73,7 @@ ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b: f"""    mov eax, {data:#x}
     push 0x1b
     mov rax, {rsp:#x}
     push rax
-    push 2
+    push {flags:#x}
     push {cs:#x}
     push {U:#x}
 {regs}    iretq
@@ -1191,8 +1191,61 @@ bits 32
 """
 
 
+def mixed_roundtrip(iterations=12):
+    # The same 40h 90h C3h at .shared is INC EAX; NOP; RET in 32-bit code and REX; NOP; RET in 64-bit code.
+    # Both entries go through it repeatedly. Each mode's first visit also retries a load after the kernel maps it.
+    body = f"""
+        and qword [{PTE(VPAGE):#x}], -2
+        invlpg [{VPAGE:#x}]
+        and qword [{PTE(XPAGE):#x}], -2
+        invlpg [{XPAGE:#x}]
+    """ + XMMS + ENTER(HIGH_REGS, cs=0x23) + handlers(f"""
+        cmp qword [rsp], 14
+        jne .fin
+        mov rax, cr2
+        cmp rax, {VPAGE:#x}
+        je .map
+        cmp rax, {XPAGE:#x}
+        jne .fin
+    .map:
+        invlpg [rax]
+        shr rax, 12
+        or qword [{PTE(0):#x} + rax*8], 3
+        jmp .resume
+    """, xmm=True)
+    user = f"""bits 64
+        xor eax, eax
+        mov ecx, {iterations}
+    .long:
+        mov edx, [{VPAGE:#x}]
+        call .shared
+        ; A dword far CALL pushes two dwords, so the 32-bit RETF below consumes exactly that frame.
+        call dword far [abs .p32]
+        loop .long
+        int 0x80
+    .shared:
+        db 0x40, 0x90, 0xc3
+    bits 32
+    .compat:
+        mov edx, [{XPAGE:#x}]
+        call .shared
+        call dword 0x23:.callback
+        retf
+    bits 64
+    .callback:
+        call .shared
+        o32 retf
+    .p32: dd .compat
+        dw 0xdb
+    """
+    # The driver counts distinct RIPs. Both contexts translate .shared, and with one-instruction blocks
+    # they also translate its trailing RET at the same RIP.
+    return program('c32-mixed-roundtrip@1', body, user, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)],
+                   params={'extra_contexts': (1, 2)})
+
+
 def positive():
-    return [program('c32-roundtrip@1', ROUND_BODY, ROUND_USER), program('c32-null-ds@1', NULL_BODY, NULL_USER),
+    return [mixed_roundtrip(), program('c32-roundtrip@1', ROUND_BODY, ROUND_USER), program('c32-null-ds@1', NULL_BODY, NULL_USER),
             program('c32-iret-cpl3@1', USER_IRET_BODY, USER_IRET_USER),
             program('c32-fault@1', FAULT_BODY, FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)] + NOT_MAPPED),
             program('c32-sysenter@1', SYSENTER_BODY, SYSENTER_USER),
@@ -1242,18 +1295,18 @@ def cases():
         ('fxsave-limit', '    mov ebx, 0xffffff00\n', 'fxsave [ebx]', lambda s: sm.flat_access(s, 0xFFFF_FF00, 512), TOP_ONLY),
         ('popfd-limit', '    mov esp, 0xfffffffe\n', 'popfd', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
         ('pop-ds-limit', '    mov esp, 0xfffffffe\n', 'pop ds', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
-        # natemu's deviation until task 5: a far jump, a far call and a far return from 32-bit to 64-bit code: #GP(20H) at
-        # it, before the call's pushes (M2 Part 2 keeps these: the interpreter runs none of it, plan section 8).
-        ('jmp-far-64', f'    mov ebx, {XPAGE:#x}\n', 'jmp far [ebx]', lambda s: sm.far(_at(s, XPAGE, FAR64), 'jmp', XPAGE, width=4),
-         [{'addr': f'0x{XPAGE:x}', 'data': FAR64.hex()}]),
-        ('call-far-64', f'    mov ebx, {XPAGE:#x}\n', 'call far [ebx]', lambda s: sm.far(_at(s, XPAGE, FAR64), 'call', XPAGE, width=4),
-         [{'addr': f'0x{XPAGE:x}', 'data': FAR64.hex()}]),
-        ('retf-64', '    push 0x23\n    push 0x1000\n', 'retf',
-         lambda s: sm.ret(_at(dict(s, rsp=US - 8), US - 8, FAR64[:4] + bytes([0x23, 0, 0, 0])), width=4), []),
+        # A 32-bit pointer or frame names 64-bit user code. The fault is the target's first instruction.
+        ('jmp-far-64', f'    mov ebx, {XPAGE:#x}\n', 'jmp far [ebx]',
+         lambda s: S.target_ud(sm.far(_at(s, XPAGE, FAR64), 'jmp', XPAGE, width=4)), FAR_MEMORY),
+        ('call-far-64', f'    mov ebx, {XPAGE:#x}\n', 'call far [ebx]',
+         lambda s: S.target_ud(sm.far(_at(s, XPAGE, FAR64), 'call', XPAGE, width=4)), FAR_MEMORY),
+        ('retf-64', f'    push 0x23\n    push {S.USER_UD:#x}\n', 'retf',
+         lambda s: S.target_ud(sm.ret(_at(dict(s, rsp=US - 8), US - 8, FAR64 + bytes(2)), width=4)), FAR_MEMORY),
     ]
 
 
-FAR64 = (0x1000).to_bytes(4, 'little') + (0x23).to_bytes(2, 'little')     # m16:32 pointer to 23H:1000H, 64-bit user code
+FAR64 = S.USER_UD.to_bytes(4, 'little') + (0x23).to_bytes(2, 'little')
+FAR_MEMORY = [{'addr': hex(XPAGE), 'data': FAR64.hex()}, {'addr': hex(S.USER_UD), 'data': '0f0b'}]
 
 
 def _at(s, addr, data):

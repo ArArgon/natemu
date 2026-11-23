@@ -149,6 +149,25 @@ def sysret(state, width=8):
     return _run(state, body)
 
 
+def sysexit(state, width=4):
+    """Intel SDM Vol. 2B SYSEXIT in IA-32e mode. No descriptor-table read and no flags load."""
+    def body(s, bus, alts):
+        sel = s['msrs']['sysenter_cs'] & 0xFFFF
+        if s['cpl'] != 0 or sel & 0xFFFC == 0:
+            raise Fault(GP, 0)
+        mask = (1 << (8 * width)) - 1
+        sp, ip = s['gpr']['rcx'] & mask, s['gpr']['rdx'] & mask
+        if not canonical(sp) or not canonical(ip):
+            raise Fault(GP, 0)
+        cs = ((sel + (32 if width == 8 else 16)) & 0xFFFF) | 3
+        ss = (cs + 8) & 0xFFFF
+        s.update(cs=cs, ss=ss, cpl=3, rsp=sp, rip=ip)
+        s['seg'].update(cs=(cs, 0xA0FB if width == 8 else 0xC0FB), ss=(ss, 0xC0F3))
+        s.setdefault('shape', {}).update(cs=(0, 0xFFFFFFFF), ss=(0, 0xFFFFFFFF))
+        _refuse_shape(s, ip)
+    return _run(state, body)
+
+
 def swapgs(state):
     """Vol. 2B SWAPGS: #UD outside 64-bit mode, #GP(0) at CPL != 0; exchange gs_base and IA32_KERNEL_GS_BASE.
     Reads/writes gs_base, msrs['kernel_gs_base']."""

@@ -53,6 +53,22 @@ class FastCalls(unittest.TestCase):
         self.assertEqual((u['rip'], u['rflags'], u['cpl'], u['seg']['cs'], u['seg']['ss']),
                          (0x40_0002, 0x40E46, 3, (0x33, 0xA0FB), (0x2B, 0xC0F3)))
 
+    def test_sysexit_synthetic_segments(self):
+        s = machine()
+        s['msrs']['sysenter_cs'] = 8
+        s['gpr'].update(rcx=(1 << 48) + 0x1234, rdx=(1 << 48) + 0x4000)
+        s['rflags'] = 0xED7
+        s['gdtr'] = (0, 0)   # Synthetic loads require no GDT.
+        s['shape'] = {'cs': (0x800, 0x1000), 'ss': (0x400, 0x6000)}
+        u = done(self, m.sysexit(s))
+        self.assertEqual((u['rip'], u['rsp'], u['rflags'], u['cpl']), (0x4000, 0x1234, 0xED7, 3))
+        self.assertEqual((u['seg']['cs'], u['seg']['ss']), ((0x1B, 0xC0FB), (0x23, 0xC0F3)))
+        self.assertEqual(u['shape'], {'cs': (0, 0xFFFFFFFF), 'ss': (0, 0xFFFFFFFF)})
+        self.assertEqual(m.sysexit(s, 8)['fault'], GP)
+        self.assertEqual(m.sysexit(dict(s, cpl=3))['fault'], GP)
+        s['msrs']['sysenter_cs'] = 3
+        self.assertEqual(m.sysexit(s)['fault'], GP)
+
     def test_syscall_faults_and_quirks(self):
         s = machine(cpl=3)
         s['efer'] = 0xD00

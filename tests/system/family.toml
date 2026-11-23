@@ -325,6 +325,9 @@ smoke = true
 argv = ["tests/smp/run_slice3_vm.py", "compat-limits", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 
+[suite.cases."mixed-far"]
+argv = ["tests/system/run_x1.py", "--only", "mixed-far", "--fexc", "{fexc}", "--out", "{out}"]
+
 [suite.cases."x1"]
 argv = ["tests/system/run_x1.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

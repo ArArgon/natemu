@@ -455,8 +455,6 @@ smoke = ["part-34"]    # sysret_rip_64: one quick program that passes
 "ldt_gdt_32" = "natemu runs 32-bit code only with flat DS and ES (M2 design, Segments; task 6): the last test loads DS with a read-only expand-down thread-area segment, which takes #GP(selector) at the next instruction; the test's SIGSEGV handler, left from an earlier test, then jumps back there for ever and the runner's 60 s timeout for this program ends it, exit 137 (docs/restructure/m2-checkpoint-a-findings.md)"
 "sigreturn_32" = "natemu runs no 16-bit code segment (M2 design, Part 2): the sigreturns into 64-bit and 32-bit code pass, the third, into a 16-bit code segment, takes #GP(selector) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
 "sigreturn_64" = "natemu runs no 16-bit code segment (M2 design, Part 2): the sigreturns into 64-bit and 32-bit code pass, the third, into a 16-bit code segment, takes #GP(selector) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
-"sysret_ss_attrs_64" = "no far transfer between 32-bit and 64-bit code until M2 task 5: call32_from_64's far return to a 32-bit CS takes #GP and the process gets SIGSEGV, exit 139 (docs/restructure/correctness-x86-litmus.md:193; docs/restructure/m2-task3b-findings.md)"
-"test_syscall_vdso_32" = "no far transfer between 32-bit and 64-bit code until M2 task 5: the test's far jump from 32-bit code to the 64-bit code segment takes #GP(30H) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
 "test_shadow_stack_64" = "natemu's CPU profile has no CET shadow stacks: exit 1 after [SKIP] Could not enable Shadow stack, as on QEMU (docs/restructure/correctness-x86-litmus.md:61)"
 
 [[suite]]

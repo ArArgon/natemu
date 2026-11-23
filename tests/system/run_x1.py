@@ -382,9 +382,228 @@ def cases():
     return out
 
 
-def cmd_cases(a, report):
+def mixed_far_cases():
+    """Both code modes at CPL 3. Fixed addresses let the oracle check the failing instruction and CALL frame."""
+    base, source, target, stack, pointer = 0x8000, 0x8140, 0x8200, 0x500800, 0x500100
+    cs32, cs64 = 0x2b, 0x23
+    gdt = [0, 0xAF9B000000FFFF, 0xCF93000000FFFF, 0xCFF3000000FFFF,
+           0xAFFB000000FFFF, 0xCFFB000000FFFF,
+           0xCF7B000000FFFF,                 # 33h: non-present user code
+           0x40FA0000008200]                 # 3bh: user CS limit 8200h, A initially clear
+    def setup(src, rsp, table='gdt'):
+        return f"""org {base}
+            mov esp, 0x500f00
+            lgdt [rel gdtr]
+            mov eax, 0x1b
+            mov ds, eax
+            mov es, eax
+            mov rsi, {pointer}
+            mov r8, 0x1122334455667788
+            push 0x1b
+            mov rax, {rsp}
+            push rax
+            push 0x47
+            push {src}
+            push {source}
+            iretq
+        gdtr: dw {8 * len(gdt) - 1}
+            dq {table}
+        gdt: dq {','.join(hex(x) for x in gdt)}
+        """
+    def check(at, vector, error, cr2, sp, frame=b'', cs=None, flags=None):
+        def judge(out):
+            actual = fault(out)
+            problems = [] if actual == [vector, cr2, error, at] else [f'fault {actual}, expected {[vector, cr2, error, at]}']
+            reg = lambda r: smp.num(out['gpr'][P.REGS.index(r)])
+            if reg('rsp') != sp:
+                problems.append(f'RSP {reg("rsp"):#x}, expected {sp:#x}')
+            if reg('r8') != 0x1122334455667788:
+                problems.append('R8 changed')
+            if cs is not None and reg('rax') != cs:
+                problems.append(f'CS {reg("rax"):#x}, expected {cs:#x}')
+            if flags is not None and smp.num(out['rflags']) & 0x8D5 != flags:
+                problems.append(f'RFLAGS {out["rflags"]}, expected arithmetic bits {flags:#x}')
+            if frame:
+                memory = next(bytes.fromhex(r['data']) for r in out['memory'] if smp.num(r['addr']) == sp)
+                if memory[:len(frame)] != frame:
+                    problems.append(f'frame {memory[:len(frame)].hex()}, expected {frame.hex()}')
+            return problems
+        return judge
+
+    for bits in (32, 64):
+        src, dst = (cs32, cs64) if bits == 32 else (cs64, cs32)
+        for width in ((2, 4) if bits == 32 else (2, 4, 8)):
+            for op in ('jmp', 'call', 'ret'):
+                for high in ((0, 1 << 32) if width == 8 else (0,)):
+                    addr = target | high
+                    release = 6
+                    slot = lambda x: x.to_bytes(width, 'little')
+                    prefix = {2: b'\x66', 4: b'', 8: b'\x48'}[width]
+                    imm = (op != 'ret' and bits == 32)
+                    if op == 'ret':
+                        insn = prefix + b'\xca' + release.to_bytes(2, 'little')
+                        data = slot(addr) + slot(dst)
+                        extra = f'memory {stack:#x} {data.hex()}\n'
+                    elif imm:
+                        insn = prefix + bytes([0xEA if op == 'jmp' else 0x9A]) + slot(addr) + dst.to_bytes(2, 'little')
+                        extra = ''
+                    else:
+                        insn = prefix + bytes([0xFF, 0x2E if op == 'jmp' else 0x1E])  # [rsi]
+                        extra = f'memory {pointer:#x} {(slot(addr) + dst.to_bytes(2, "little")).hex()}\n'
+                    code = setup(src, stack) + f'times {source} - ($-$$+{base}) db 0x90\n' + \
+                        'db ' + ','.join(hex(b) for b in insn) + f'\ntimes {target} - ($-$$+{base}) db 0x90\n'
+                    body = P.asm(code + f'bits {96 - bits}\nmov eax, cs\nud2')
+                    expected_sp = stack
+                    frame = b''
+                    if op == 'call':
+                        expected_sp -= 2 * width
+                        marker = bytes([0xA5]) * (2 * width)
+                        extra += f'memory {expected_sp:#x} {marker.hex()}\n'
+                        frame = slot(source + len(insn)) + slot(src)
+                    elif op == 'ret':
+                        expected_sp += 2 * width + release
+                    judge = check(source, 13, 0, 0, stack) if high and op != 'call' else \
+                        check(base + len(body) - 2, 6, 0, 0, expected_sp, frame, dst, 0x45)
+                    yield f'mixed-{bits}-{op}{width * 8}-{"high" if high else "low"}', body, extra, judge, base
+
+    # A fault reading either pointer/frame page precedes the descriptor load. A descriptor or stack
+    # fault leaves the instruction restartable. In-bounds entry to a non-flat CS commits first.
+    descriptor = base + len(P.asm(setup(cs64, stack))) - 8 * len(gdt) + 0x38
+    for name, opcode, rsp, ptr, suffix, vector, error, cr2, at, after_sp in (
+            ('selector-np', 'call far [rsi]', stack, 0x33, '', 11, 0x30, 0, source, stack),
+            ('selector-type', 'call far [rsi]', stack, 0x1b, '', 13, 0x18, 0, source, stack),
+            ('stack-ss', 'call far [rsi]', 0x800000000008, cs32, '', 12, 0, 0, source, 0x800000000008),
+            ('stack-pf', 'call far [rsi]', 0x500008, cs32, '', 14, 6, 0x4ffff8, source, 0x500008),
+            ('ret-split-pf', 'o64 retf', 0x500ff8, cs32, '', 14, 4, 0x501000, source, 0x500ff8),
+            ('pointer-split-pf', 'jmp far [rsi]', stack, cs32, 'mov esi, 0x500ff8', 14, 4, 0x501000, source + 5, stack),
+            ('accessed-bit-pf', 'call far [rsi]', stack, 0x3b, '', 14, 3, descriptor + 5, source, stack),
+            ('limit-gp', 'call far [rsi]', stack, 0x3b, '', 13, 0, 0, source, stack),
+            ('shape-after-call', 'call far [rsi]', stack, 0x3b, '', 13, 0x38, 0, target, stack - 16),
+            ('first-user-fetch', 'jmp far [rsi]', stack, cs32, '', 14, 20, 0x700000, 0x700000, stack)):
+        offset = target + 1 if name == 'limit-gp' else 0x700000 if name == 'first-user-fetch' else target
+        extra = f'memory {pointer:#x} {(offset.to_bytes(8, "little") + ptr.to_bytes(2, "little")).hex()}\n'
+        table = 'gdt'
+        if name == 'shape-after-call':
+            table = 0x500300
+            descriptors = b''.join(raw.to_bytes(8, 'little') for raw in gdt)
+            extra += f'memory {table:#x} {descriptors.hex()}\n'
+        if name in ('pointer-split-pf', 'ret-split-pf'):
+            extra += f'memory 0x500ff8 {target.to_bytes(8, "little").hex()}\n'
+        code = setup(cs64, rsp, table) + f'times {source} - ($-$$+{base}) db 0x90\n{suffix}\n{opcode}\nud2'
+        body = P.asm(code)
+        frame = b''
+        if name == 'shape-after-call':
+            frame = (base + len(body) - 2).to_bytes(8, 'little') + cs64.to_bytes(8, 'little')
+            extra += f'memory {after_sp:#x} {bytes(16).hex()}\n'
+        yield 'mixed-' + name, body, extra, check(at, vector, error, cr2, after_sp, frame), base
+
+    # Narrow SYSEXIT ignores both register high halves and installs its synthetic segments without a GDT load.
+    sysexit = f"""org {base}
+        mov esp, 0x500f00
+        mov ecx, 0x174
+        mov eax, 8
+        xor edx, edx
+        wrmsr
+        mov r8, 0x1122334455667788
+        mov rcx, {1 << 48 | stack}
+        mov rdx, {1 << 48 | target}
+        push 0x47
+        popfq
+        sysexit
+        times {target} - ($-$$+{base}) db 0x90
+        bits 32
+        mov eax, cs
+        mov ebx, ss
+        ud2"""
+    body = P.asm(sysexit)
+    def sysexit_check(out):
+        problems = check(base + len(body) - 2, 6, 0, 0, stack, cs=0x1b, flags=0x45)(out)
+        if smp.num(out['gpr'][P.REGS.index('rbx')]) != 0x23:
+            problems.append('SYSEXIT loaded wrong SS')
+        return problems
+    yield 'mixed-sysexit', body, '', sysexit_check, base
+
+
+def cmd_mixed_far(a, report):
+    import compat as c
+    failures = cmd_cases(a, report, mixed_far_cases)
+    # IRET loads TF. The first user instruction is the far CALL, the first 32-bit instruction its RET.
+    # Leave TF set on the first return from #DB so both transfers trap at their destination.
+    at32 = c.U + 0x40
+    call = f'call dword far [abs {c.W:#x}]'
+    back = c.U + len(P.asm(call))
+    user = f"""bits 64
+        {call}
+        inc dword [abs {c.W + 0x30:#x}]
+        int 0x80
+        times 0x40 - ($ - $$) db 0x90
+        bits 32
+        retf
+    """
+    kernel = c.gate(1, '.v1') + c.XMMS + f'mov dword [{c.W:#x}], {at32:#x}\nmov word [{c.W+4:#x}], 0xdb\n'
+    kernel += c.ENTER(c.HIGH_REGS, cs=0x23, flags=0x103) + c.handlers(f"""
+        cmp qword [rsp], 1
+        jne .fin
+        cmp qword [{c.LOG:#x}], 2
+        ja .fin
+        mov rax, [rsp+32]
+        and eax, 0x101
+        test rbx, rbx
+        jnz .return_trap
+        mov [{c.W+0x10:#x}], rax
+        mov rax, [rsp+40]
+        mov rax, [rax]
+        mov [{c.W+8:#x}], rax
+        jmp .resume
+    .return_trap:
+        mov [{c.W+0x18:#x}], rax
+        btr qword [rsp+32], 8
+        jmp .resume
+    """, xmm=True, vectors=(1, 6, 13, 14, 128))
+    prog = c.program('mixed-step-call-ret', kernel, user)
+    entry = {'name': prog['name'], 'runs': []}
+    for limit in (None, 1):
+        rc, out, err = driver(a.host, a.runtime, a.fexc, smp_description(prog), a.out / 'work' / f'mixed-step-{limit}',
+                              [limit] if limit else [])
+        problems = []
+        if rc:
+            problems.append(f'driver {rc}: {err}')
+        else:
+            cpu = out['cpus'][0]
+            if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(prog['cpus'][0]['rip'])):
+                problems.append(f'stopped {cpu["stop"]} at {cpu["rip"]}')
+            captured = {smp.num(r['addr']): bytes.fromhex(r['data']) for r in cpu['memory']}
+            words, log = captured[c.W], captured[c.LOG]
+            def qword(data, at):
+                return int.from_bytes(data[at:at + 8], 'little')
+
+            def expect(label, got, want):
+                if got != want:
+                    problems.append(f'{label}: got {got}, expected {want}')
+
+            expect('events', qword(log, 0), 3)
+            expect('CALL return CS:EIP', qword(words, 8), (0x23 << 32) | back)
+            expect('saved TF/CF', [qword(words, 0x10), qword(words, 0x18)], [0x101, 0x101])
+            expect('continuation executions', qword(words, 0x30), 1)
+            frames = ((1, 0xdb, c.US - 8), (1, 0x23, c.US), (0x80, 0x23, c.US))
+            for k, (vec, cs, sp) in enumerate(frames):
+                start = 0x100 + 0x200 * k
+                frame = [qword(log, start + slot) for slot in (0, 8, 24, 40)]
+                expect(f'event {k} vector/error/CS/RSP', frame, [vec, 0, cs, sp])
+                if k < 2:
+                    expect(f'trap {k} RIP', qword(log, start + 16), (at32, back)[k])
+                regs = [qword(log, start + 0x40 + 8 * r) for r in range(8, 16)]
+                expect(f'event {k} R8..15', regs, [c.UPPER(r) for r in range(8, 16)])
+                expect(f'event {k} XMM8..15', log[start + 0x180:start + 0x200], bytes(range(0x80, 0x100)))
+        entry['runs'].append({'max_block': limit, 'problems': problems})
+        failures += [f'{entry["name"]} (max-block {limit}): {p}' for p in problems]
+    report.append(entry)
+    return failures
+
+
+def cmd_cases(a, report, items=cases):
     failures = []
-    for name, text, extra, check, *rip in cases():
+    for name, text, extra, check, *rip in items():
         e = {'name': name, 'runs': []}
         for limit in (None, 1):
             out, problems = run(a, text, a.out / 'work' / f"{name}-{limit or 'd'}", limit, extra, *rip)
@@ -405,7 +624,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     a.host, a.runtime = vm.build()
     report, failures = {}, []
-    for mode, fn in (('qemu', cmd_qemu), ('cases', cmd_cases)):
+    for mode, fn in (('qemu', cmd_qemu), ('cases', cmd_cases), ('mixed-far', cmd_mixed_far)):
         if mode in a.only:
             report[mode] = []
             failures += fn(a, report[mode])

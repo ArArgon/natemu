@@ -171,11 +171,11 @@ class Transfers(unittest.TestCase):
                          ('refused', 1 << 32 | 0x2000, (dm.GP, 0, 0), STACK + 0x810))
         self.assertEqual(m.ret(push(machine(), 1 << 47, 0x38))['fault'][:2], (dm.GP, 0))       # not canonical: #GP(0)
         self.assertEqual(m.iret(push(machine(), 0x40_2000, 0x38, 2, STACK, 0x10))['outcome'], 'refused')   # IRET: refused
-        # The compatibility-mode deviation: a return to RPL 3 compatibility-mode code is #GP(selector), at CPL 0 too.
+        # An outer far return loads a flat user CS and switches stacks.
         s = machine()
         dm.place(s['memory'], GDT + 0x48, m.code(3, l=0, d=1).to_bytes(8, 'little'))
         r = m.ret(push(s, 0x40_2000, 0x4B, 0x7000, 0x1B))
-        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x48), True))
+        self.assertEqual((r['outcome'], r['state']['cs'], r['state']['rsp']), ('done', 0x4B, 0x7000))
         self.assertEqual(m.ret(push(machine(), 1 << 47, 0x08))['fault'][:2], (dm.GP, 0))
 
     def compat(self, cs=None, **over):
@@ -210,8 +210,7 @@ class Transfers(unittest.TestCase):
         s = self.compat()
         dm.place(s['memory'], GDT + 0x50, m.data(3, base=0x1234_5678).to_bytes(8, 'little'))
         self.assertEqual(deviation(m.iret(push(s, 0x40_2000, 0x4B, 0x202, 0x7000, 0x53)))[:3], ((dm.GP, 0x50), True, 0x40_2000))
-        # RET far to it is still not built (task 5), and L = D = 1 is never loaded.
-        self.assertEqual(m.ret(push(self.compat(), 0x40_2000, 0x4B, 0x7000, 0x1B))['fault'][:2], (dm.GP, 0x48))
+        # L = D = 1 is never loaded.
         self.assertEqual(m.iret(push(self.compat(cs=m.code(3, l=1, d=1)), *frame))['fault'][:2], (dm.GP, 0x48))
 
     def test_32_bit_code(self):
@@ -235,8 +234,7 @@ class Transfers(unittest.TestCase):
         self.assertEqual(m.flat_access(s, 0xFFFF_FFFD, 4, stack=True)['fault'][:2], (dm.SS, 0))
 
     def test_32_bit_far_transfers(self):
-        # M2 task 3b, in 32-bit code at CPL 3: far transfers to 32-bit code run, with 4-byte slots and ESP wrapping; to
-        # 64-bit code they are natemu's deviation (task 5); IRET pops three words at the same level.
+        # A 32-bit source uses four-byte slots, including when it returns to 64-bit code.
         s = self.compat()
         s.update(cpl=3, cs=0x4B, ss=0x1B, rip=0x40_0000, length=6, rsp=0)
         s['seg'].update(cs=(0x4B, 0xC0FB), ss=(0x1B, 0xC0F3))
@@ -248,7 +246,7 @@ class Transfers(unittest.TestCase):
         r = m.far(self.pointer(dict(s, rsp=4), 0x40_1000, 0x4B, 4), 'call', PTR, 4)
         self.assertEqual(r['fault'][:2], (dm.SS, 0))                                  # the frame across 4 GiB
         r = m.far(self.pointer(s, 0x1000, 0x23, 4), 'jmp', PTR, 4)
-        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x20), True))
+        self.assertEqual((r['outcome'], r['state']['cs']), ('done', 0x23))
         frame = lambda *w: b''.join(x.to_bytes(4, 'little') for x in w)
         s = dict(s, rsp=0x5800)
         dm.place(s['memory'], 0x5800, frame(0x40_2000, 0x4B, 0x8D7))
@@ -258,9 +256,59 @@ class Transfers(unittest.TestCase):
         r = m.iret(s, 4)
         self.assertEqual((r['outcome'], r['state']['rsp'], r['state']['cs']), ('done', 0x580C, 0x23))   # to 64-bit code: no SS:ESP
         r = m.ret(s, 4)
-        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x20), True))
+        self.assertEqual((r['outcome'], r['state']['cs']), ('done', 0x23))
         dm.place(s['memory'], 0x5800, frame(0x40_2000, 0x4B))
         self.assertEqual(m.ret(s, 4, release=8)['state']['rsp'], 0x5810)
+
+    def test_mixed_target_offset_and_source_frame(self):
+        s = machine(cpl=3)
+        flat = m.code(3, l=0, d=1, accessed=False)
+        dm.place(s['memory'], GDT + 0x48, flat.to_bytes(8, 'little'))
+        for width in (2, 4, 8):
+            for op in ('jmp', 'call', 'ret'):
+                for high in ((0, 1 << 32, 1 << 47) if width == 8 else (0,)):
+                    with self.subTest(op=op, width=width, high=high):
+                        target = high + 0xABCD
+                        if op == 'ret':
+                            frame = target.to_bytes(width, 'little') + (0x4B).to_bytes(width, 'little')
+                            dm.place(s['memory'], s['rsp'], frame)
+                            r = m.ret(s, width, release=7)
+                        else:
+                            r = m.far(self.pointer(s, target, 0x4B, width), op, PTR, width)
+                        if high and op != 'call':
+                            self.assertEqual((r['fault'], r['diff'], r['state']['rsp']), ((dm.GP, 0, 0), {}, s['rsp']))
+                            continue
+                        delta = {'jmp': 0, 'call': -2 * width, 'ret': 2 * width + 7}[op]
+                        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['rsp']),
+                                         ('done', 0xABCD, s['rsp'] + delta))
+                        self.assertIn(GDT + 0x48 + 5, r['diff'])
+                        if op == 'call':
+                            frame = (s['rip'] + s['length']).to_bytes(8, 'little')[:width] + (0x23).to_bytes(width, 'little')
+                            self.assertEqual(r['diff'][s['rsp'] + delta], frame)
+        # A smaller destination limit faults at the transfer. An in-bounds target commits the CALL first,
+        # then takes the documented non-flat-CS refusal at that target with the frame visible.
+        dm.place(s['memory'], GDT + 0x48, m.segment(0, 0x1FFF, 0xFA, 4).to_bytes(8, 'little'))
+        for target, completed in ((0x1FFF, True), (0x2000, False)):
+            r = m.far(self.pointer(s, target + (1 << 32), 0x4B), 'call', PTR)
+            self.assertEqual((r['deviation'], r['fault_rip'], r['fault'], r['state']['rsp']),
+                             (completed, target if completed else None, (dm.GP, 0x48 if completed else 0, 0),
+                              s['rsp'] - (16 if completed else 0)))
+            self.assertEqual(bool(r['diff']), completed)
+
+    def test_compat_immediate_pointer_and_split_frames(self):
+        s = machine(cpl=3)
+        s['cs'], s['seg']['cs'] = 0x4B, (0x4B, 0xC0FB)
+        for width in (2, 4):
+            for op in ('jmp', 'call'):
+                r = m.far(s, op, width=width, immediate=(0x23, 0xABCD))
+                self.assertEqual((r['outcome'], r['state']['cs'], r['state']['rip']), ('done', 0x23, 0xABCD))
+        s['rsp'] = STACK + 4
+        r = m.far(s, 'call', width=4, immediate=(0x23, 0xABCD))
+        self.assertEqual((r['fault'], r['state']['rsp'], r['diff']), ((dm.PF, 6, STACK - 4), STACK + 4, {}))
+        s['rsp'] = (1 << 32) + STACK + 0xFFC
+        del s['memory'][(STACK >> 12) + 1]
+        r = m.ret(s, 4)
+        self.assertEqual((r['fault'], r['state']['rsp']), ((dm.PF, 4, STACK + 0x1000), s['rsp']))
 
     def test_iretq_agrees_with_the_delivery_model(self):
         frames = [(0x40_2000, 0x08, 0x246, STACK + 0x100, 0x10), (0x40_2000, 0x23, 0x3246, 0x7000, 0x1B),

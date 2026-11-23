@@ -36,7 +36,7 @@ mod transitions;
 ///
 /// In compatibility mode, RIP above the CS limit halts `unsupported_code_mode` with `native[0]` =
 /// `stop::code_mode::PAST_LIMIT`: only a far JMP, CALL or RET of 64-bit kernel code ([`kernel_compatibility`]'s) gets
-/// here that way, for `far_transfer` and `far_return` check only that the target is canonical (and stay as they are),
+/// here that way, because that CPL-0 route checks only that the target is canonical,
 /// where x86 raises #GP(0) at the instruction when it lies outside the new CS limit (a RIP at or above 4 GiB among
 /// them). The transfer has completed (`commit`, before it cuts RIP to 32 bits): the recorded deviation, a loud stop in
 /// place of the code running at the wrong address. Any other transaction ending in compatibility mode is at an
@@ -69,7 +69,7 @@ pub(super) fn boundary(s: &mut State) -> bool {
     true
 }
 
-/// `segments::refuse_compatibility`'s CPL-0 arm (plan section 5, B4): a far JMP, CALL or RET of 64-bit kernel code whose
+/// `segments::target_mode`'s CPL-0 arm (plan section 5, B4): a far JMP, CALL or RET of 64-bit kernel code whose
 /// target is not 64-bit code, checked before any effect. A compatibility-mode code segment (L = 0) at CPL 0 is the
 /// interpreter's: this returns, the transfer completes in `far_transfer`/`far_return`, and its commit records the state
 /// for the next boundary ([`record`], through `ends_in_mode`). Anything else halts `unsupported_code_mode` as the arm did

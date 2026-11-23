@@ -5,23 +5,11 @@
 //! through the guest walker (never a shadow: the walk is made at CPL 0 whatever the CPL, so a #PF has U/S = 0 and
 //! CR0.WP decides writes to read-only pages); operand and stack accesses are explicit, at the CPL. The SDM's
 //! accessed-bit write on a segment load and LTR's busy-bit write are real guest writes: a clear A bit in a read-only
-//! GDT page faults, as on hardware. Flat 64-bit only (plan D1, owner decision 3): every load keeps the descriptor's
-//! base and limit (M2 task 1), of which 64-bit mode uses the FS and GS bases alone. Compatibility mode (M2 task 3a):
-//! IRET to a compatibility-mode code segment (CS.L = 0) with RPL 3 is a real load: the frame's RIP must lie within 4
-//! GiB (#GP(0): the limit of the flat segment that runs; a segment that does not run takes its #GP before its first
-//! instruction, `Cpu::compat_refused`, the recorded deviation) and RSP is loaded zero-extended from its low half. The
-//! other transfers to one are not built (task 5): JMP/CALL far at CPL 3 and RET far whose new CS has RPL 3, and any
-//! transfer to L = D = 1, raise #GP(that selector) at the instruction before any change (owner decision, November 6: a
-//! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program); one that would run
-//! CPL 0 compatibility-mode code completes and is the boot-time interpreter's (M2 Part 2, [`refuse_compatibility`]; with
-//! a RIP outside the new CS limit, where x86 raises #GP(0) at the instruction, it stops `unsupported_code_mode` once it
-//! has completed, `interpret::record`: also a recorded deviation, no known code does this); L = D = 1, CPL 1 or 2, or an
-//! IRET there stops `unsupported_code_mode` with that CS in the record and RIP at the instruction, nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
-//! CPL-3 transfer stops the machine). M2 task 3b, executed in 32-bit code: operands at 32-bit addresses in their segment
-//! ([`address`]), the stack at 32 bits (ESP wraps, 4-byte slots), JMP/CALL/RET far within 32-bit code (to 64-bit code:
-//! #GP(selector), task 5), IRET's three pops at the same level, the 32-bit-only far-pointer loads. `tools/models/segment_model.py`
-//! (and `delivery_model.py`'s IRETQ) is the oracle; the check order follows it where the SDM lists several conditions
-//! without a priority.
+//! GDT page faults, as on hardware. A far transfer reads operands and stack slots in the source mode.
+//! The destination descriptor selects the target limit or canonicality check. In user compatibility code,
+//! `Cpu::compat_refused` checks for a supported flat CS/SS/DS/ES before fetching the first instruction.
+//! CPL-0 compatibility code retains the boot interpreter route. Call gates stop at CPL 0 and raise
+//! #GP(selector) at CPL 3. See `tools/models/segment_model.py` for transaction order and the IRET rules.
 use super::*;
 
 /// An exception a transaction raises: vector, error code, CR2.
@@ -650,38 +638,21 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     }
     Ok((va, raw))
 }
-/// Loads CS with `selector` (RPL as given) from `raw` (a segment that runs: [`refuse_compatibility`], and the commit's
-/// and [`set_cpl`]'s mode check). M2 Part 2: the boot-time interpreter's far transfers load their CS with it too.
+/// Commit the checked descriptor. The boot-time interpreter uses the same hidden CS representation.
 pub(super) fn load_cs(s: &mut State, selector: u16, raw: u64) {
     s.cpu.seg[SREG_CS] = Segment::loaded(selector, raw | 1 << 40);
 }
-/// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
-/// at CPL 3 (`cpl`, the new CPL); else (M2 Part 2) compatibility-mode code at CPL 0 is the boot-time interpreter's and
-/// the transfer goes on, and any other halts `unsupported_code_mode` (module doc; out of line,
-/// [`super::interpret::kernel_compatibility`], a tail call: the common path has no frame). Out of line, as the compiler
-/// left it before that arm became a call: so `far_transfer` and `far_return` stay the same code.
+/// User compatibility code is checked by `Cpu::compat_refused` after the transfer commits.
+/// Supervisor compatibility code stays on the boot-time interpreter's existing route.
 #[inline(never)]
-fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
-    if raw >> 53 & 3 != 1 {
-        if cpl == 3 {
-            return Err(gp(selector));
-        }
-        return super::interpret::kernel_compatibility(s, selector, raw, cpl);
+fn target_mode(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
+    if raw >> 53 & 3 == 1 || (cpl == 3 && raw >> 53 & 1 == 0) {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// M2 task 3b: a far transfer that keeps the code's mode: from 64-bit code [`refuse_compatibility`]; from 32-bit code
-/// (CPL 3 only) a target that is not compatibility-mode code (L = 1) is #GP(`selector`) before any change (between 32-
-/// and 64-bit code: task 5, the deviation of the module doc).
-fn same_mode(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
-    if s.cpu.code_mode() == Some(CodeMode::Bits64) {
-        refuse_compatibility(s, selector, raw, cpl)
-    } else if raw >> 53 & 1 != 0 {
-        Err(gp(selector))
-    } else {
-        Ok(())
+    if cpl == 3 {
+        return Err(gp(selector));
     }
+    super::interpret::kernel_compatibility(s, selector, raw, cpl)
 }
 
 /// JMP/CALL far through an m16:`size` pointer to a code segment at the same CPL (SDM Vol.2 JMP, CALL): the target checks
@@ -690,7 +661,7 @@ fn same_mode(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Excepti
 fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let w = i.size as usize;
-    let (rip, selector) = if i.memory == 0 {
+    let (mut rip, selector) = if i.memory == 0 {
         // M2 task 3b: the immediate pointer of 32- and 16-bit code (`9a`, `ea`).
         (i.disp as u64, i.cr as u16)
     } else {
@@ -710,11 +681,20 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
         (u64::from_le_bytes(offset), u16::from_le_bytes(word))
     };
     let (va, raw) = far_target(s, selector)?;
-    same_mode(s, selector, raw, c.cpl)?;
+    target_mode(s, selector, raw, c.cpl)?;
     let call = i.kind == system::CALL_FAR;
     let rsp = wrap(&c, c.gpr[4].wrapping_sub(if call { 2 * w as u64 } else { 0 }));
-    if call && (!paging::canonical(rsp) || !paging::canonical(c.gpr[4].wrapping_sub(1))) {
+    if call && outside(&c, rsp, 2 * w as u64) {
         return Err(SS0);
+    }
+    if c.cpl == 3 && raw >> 53 & 1 == 0 {
+        // SDM Vol. 2A: same-level CALL masks the offset before the limit check. JMP checks the full pointer.
+        if call {
+            rip = u64::from(rip as u32);
+        }
+        if rip > u64::from(Segment::loaded(selector, raw).limit) {
+            return Err(GP0);
+        }
     }
     if !paging::canonical(rip) {
         return Err(GP0);
@@ -734,8 +714,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
 /// RET far (`size`-byte pops, imm16 `disp` released) and IRET (SDM Vol.2 RET, IRET, IA-32e mode): IRET #GP(0) with
 /// RFLAGS.NT; the pops (#SS(0) when not canonical); the return CS: #GP(0) null, #GP(selector) outside the table, not
 /// code, RPL < CPL, conforming with DPL > RPL, nonconforming with DPL != RPL, #NP(selector) not present; a
-/// compatibility-mode CS with RPL 3 is loaded by IRET (module doc) and #GP(selector) for RET, else refused
-/// ([`refuse_compatibility`]); then, for IRET and for a return to an outer level, SS:RSP from the stack: a null SS
+/// user compatibility target may follow either return. For IRET and for an outer return, SS:RSP from the stack: a null SS
 /// only for a new CPL < 3 with RPL = the new CPL (SDM IRET/RET 64-bit mode #GP(0)), else #GP(selector) unless RPL = DPL =
 /// the new CPL and a writable data segment, #SS(selector) not present; #GP(0) for a non-canonical RIP, checked before SS
 /// for IRET (delivery_model's order) and after it for RET (its pseudocode; segment_model B4). A return to CPL 1 or 2 is
@@ -764,7 +743,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     // Vol.2 IRET, IA-32e mode: RETURN-TO-SAME-PRIVILEGE-LEVEL outside 64-bit mode); from 64-bit code all five.
     let bits64 = c.code_mode() == Some(CodeMode::Bits64);
     let frame = if !iret { 2 } else if bits64 { 5 } else { 3 };
-    let words = pops(s, c.gpr[4], frame)?;
+    let words = pops(s, wrap(&c, c.gpr[4]), frame)?;
     let (rip, selector) = (words[0], words[1] as u16);
     if selector & 0xfffc == 0 {
         return Err(GP0);
@@ -775,6 +754,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     let (cpl, rpl) = (c.cpl, u64::from(selector & 3));
     if !code_or_data
         || kind & 8 == 0
+        || (!iret && rpl == 3 && raw >> 53 & 3 == 3)
         || rpl < cpl
         || if kind & 4 != 0 { dpl > rpl } else { dpl != rpl }
     {
@@ -783,16 +763,15 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if !present {
         return Err(np(selector));
     }
-    // IRET to 32-bit or 16-bit code at CPL 3 (M2 task 3a), and RET far within 32-bit code (task 3b); its RIP is checked
-    // against the 4 GiB limit. RET far from 32-bit to 64-bit code is #GP(selector) (task 5: [`same_mode`]).
-    let compat = (iret || !bits64) && rpl == 3 && raw >> 53 & 1 == 0;
-    if !compat {
-        if !iret && !bits64 {
-            return Err(gp(selector));
-        }
-        refuse_compatibility(s, selector, raw, rpl)?;
-    }
-    let bad_rip = if compat { rip >> 32 != 0 } else { !paging::canonical(rip) };
+    target_mode(s, selector, raw, rpl)?;
+    let compat = rpl == 3 && raw >> 53 & 1 == 0;
+    let bad_rip = if compat && !iret {
+        rip > u64::from(Segment::loaded(selector, raw).limit)
+    } else if compat {
+        rip > u64::from(u32::MAX)
+    } else {
+        !paging::canonical(rip)
+    };
     if iret && bad_rip {
         return Err(GP0);
     }

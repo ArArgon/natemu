@@ -273,6 +273,63 @@ def cmd_litmus(a):
     (out / 'litmus-results.json').write_text(json.dumps(res, indent=1) + '\n')
 
 
+def cmd_mixed_cost(a):
+    """Process-wall slope for four same-CPL far transfers in one 64→32→64 user iteration."""
+    import statistics
+    sys.path.insert(0, str(HERE.parents[2] / 'tests' / 'lib'))
+    import testenv
+    testenv.require_framework(__file__)
+    import compat
+    from run_slice3_vm import driver, smp_description, vm_state, body_end
+
+    out = pathlib.Path(a.out)
+    stub = build_stub(out / 'build')
+    levels = (a.iterations, 2 * a.iterations)
+    if a.iterations <= 0 or levels[1] > 0xffffffff:
+        raise ValueError('N and 2N must fit positive 32-bit loop counters')
+    programs = {n: compat.mixed_roundtrip(n) for n in levels}
+    inputs = {n: smp_description(p) if a.natemu else build_image(p, stub) for n, p in programs.items()}
+    samples = []
+    for rep in range(4):                 # Discard the first pair to warm the host.
+        pair = {}
+        for n in (levels if rep % 2 else reversed(levels)):
+            prog, work = programs[n], out / 'work' / str(n)
+            start = time.perf_counter()
+            if a.natemu:
+                host, runtime, fexc = a.natemu
+                rc, record, err = driver(host, runtime, fexc, inputs[n], work, ['--watchdog-ms', '120000'],
+                                         timeout=150, shape=False)
+                if rc:
+                    raise RuntimeError(f'natemu N={n}: {rc} {err}')
+                cpu = record['cpus'][0]
+                end = body_end(prog, num(prog['cpus'][0]['rip']))
+                if cpu['stop'] != 'reached' or num(cpu['rip']) != end:
+                    raise RuntimeError(f'natemu N={n}: {cpu["stop"]} {cpu["reason"]} at {cpu["rip"]}')
+                state = vm_state(prog, record)
+            else:
+                rc, err, dump, _ = _run_image(prog, inputs[n], work, 'multi', timeout=150)
+                if rc != 1:
+                    raise RuntimeError(f'QEMU N={n}: {rc} {err}')
+                state = parse_dump(prog, dump)
+            pair[n] = time.perf_counter() - start
+            log = next(r['data'] for r in state['memory'] if r['addr'] == compat.LOG)
+            def qword(off):
+                return int.from_bytes(log[off:off + 8], 'little')
+            events = [(qword(0x100 + k * 0x200), qword(0x118 + k * 0x200)) for k in range(3)]
+            if state['cpus'][0]['fault'] or qword(0) != 3 or events != [(14, 0x23), (14, 0xdb), (0x80, 0x23)] or qword(0x540) != n:
+                raise RuntimeError(f'bad N={n} completion: {events}, eax={qword(0x540)}, fault={state["cpus"][0]["fault"]}')
+        if rep:
+            samples.append(pair)
+    # Differencing removes the fixed setup, two retried faults, code translation, and final capture/teardown.
+    slopes = [(pair[levels[1]] - pair[levels[0]]) * 1e9 / a.iterations for pair in samples]
+    if min(slopes) <= 0:
+        raise RuntimeError(f'timing noise exceeded the N-to-2N work: {slopes}')
+    result = dict(iterations=levels, transfers_per_iteration=4, wall_seconds=samples,
+                  ns_per_iteration=slopes, median_ns_per_iteration=statistics.median(slopes))
+    (out / 'mixed-cost.json').write_text(json.dumps(result, indent=2) + '\n')
+    print(json.dumps(result))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__); sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('build'); s.add_argument('--k', type=int, default=32768); s.set_defaults(f=cmd_build)
@@ -281,6 +338,8 @@ def main():
     s.add_argument('--cpus', default='2,3,4'); s.add_argument('--programs'); s.add_argument('--modes', default='multi,single'); s.set_defaults(f=cmd_det)
     s = sub.add_parser('litmus'); s.add_argument('--out', required=True); s.add_argument('--runs', type=int, default=20); s.add_argument('--k', type=int, default=32768)
     s.add_argument('--single-runs', type=int, default=3); s.add_argument('--single-k', type=int, default=4096); s.add_argument('--tests'); s.set_defaults(f=cmd_litmus)
+    s = sub.add_parser('mixed-cost'); s.add_argument('--out', required=True); s.add_argument('--iterations', type=int, default=1_000_000)
+    s.add_argument('--natemu', nargs=3, metavar=('HOST', 'RUNTIME', 'FEXC')); s.set_defaults(f=cmd_mixed_cost)
     a = ap.parse_args(); a.f(a)
 
 if __name__ == '__main__':

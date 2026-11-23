@@ -220,15 +220,15 @@ def places(ks):
     return {p: sum(k[f'stops_{p}'] for k in ks) for p in ('entry', 'dispatch', 'l1', 'exit', 'resident')}
 
 
-def per_vcpu_checks(out):
+def per_vcpu_checks(out, extra_contexts=0):
     """Checks every vCPU's output must pass whatever it ran."""
     problems = []
     if not out.get('tso'): problems.append('EnTSO not read back')
     if not out.get('frame_intact'): problems.append('FEX frame changed')
     st = out['stats']
     # (K1: a RIP whose linear page maps other bytes now, `remapped`, is translated again from those.)
-    if st['flushes'] == 1 and st['invalidations'] == 0 and st['steps'] == 0 and not st.get('k1', {}).get('remapped') and st['host_requests'] != st['distinct']:
-        problems.append(f"host requests {st['host_requests']} != distinct blocks {st['distinct']}")
+    if st['flushes'] == 1 and st['invalidations'] == 0 and st['steps'] == 0 and not st.get('k1', {}).get('remapped') and st['host_requests'] != st['distinct'] + extra_contexts:
+        problems.append(f"host requests {st['host_requests']} != {st['distinct']} distinct RIPs + {extra_contexts} additional code contexts")
     return problems
 
 
@@ -1614,7 +1614,8 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
                     done = faults[v_] is None if permitted is None else vm_fault(cpu) is None
                     if done and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
                         diffs.append(f"cpu{v_} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
-                    diffs += [f'cpu{v_} ' + d for d in per_vcpu_checks(cpu)]
+                    extra_contexts = prog['params'].get('extra_contexts', (0, 0))[bool(limit)]
+                    diffs += [f'cpu{v_} ' + d for d in per_vcpu_checks(cpu, extra_contexts)]
                 got = vm_state(prog, out)
                 g = got['cpus'][0]['fault']
                 if permitted is not None and g not in permitted:

@@ -15,6 +15,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {fio_prep} {block_inputs} {io5_inputs}   writable clones, in the case folder, of inputs.fio_prep(),
                         inputs.block_inputs() and inputs.io5_inputs() (APFS clones: no space until written)
     {paper_inputs}      inputs.paper_inputs(), read-only: the Paper and Mojang jars and the guest's Debian packages
+    {qemu_system}       the pinned qemu-system-x86_64 binary
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
     {resume_dir}        a results folder kept across runs, the same while the case and what it names are (resume_dir())
 """
@@ -132,7 +133,7 @@ class Bench:
             if _uses(spec, 'runtime_perf'): reqs.append(Requirement('artifact', 'perf-runtime'))
             if _uses(spec, 'natemu_baseline'): reqs.append(Requirement('natemu-at', spec['baseline']))
             reqs += [Requirement('input', n) for p, n in INPUTS.items() if _uses(spec, p)]
-            if _uses(spec, 'qemu_img'): reqs.append(Requirement('artifact', 'qemu-system'))
+            if _uses(spec, 'qemu_img') or _uses(spec, 'qemu_system'): reqs.append(Requirement('artifact', 'qemu-system'))
         return list(dict.fromkeys(reqs))
 
     def resolve(self, req):
@@ -152,6 +153,7 @@ class Bench:
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry
         if _uses(spec, 'runtime_perf'): vals['runtime_perf'] = artifacts.perf_runtime()
         if _uses(spec, 'natemu_baseline'): vals['natemu_baseline'] = artifacts.natemu_at(spec['baseline']).entry
+        if _uses(spec, 'qemu_system'): vals['qemu_system'] = artifacts.qemu_system() / 'qemu-system-x86_64'
         if _uses(spec, 'qemu_img'): vals['qemu_img'] = artifacts.qemu_system() / 'qemu-img'
         ident = {k: str(v) for k, v in vals.items() if k not in ('out', 'raw') and _uses(spec, k)}
         for p, name in INPUTS.items():

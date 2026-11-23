@@ -349,3 +349,18 @@ argv = ["python3", "tests/bench/run_paper.py", "run", "--inputs", "{io5_inputs}"
         "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}", "--vcpus", "4", "--ram", "2", "--starts", "2",
         "--boots", "1", "--speculation-barriers", "--perf-log"]
 env = { NATEMU_FEXC_FEATURE_OFF = "afp" }
+
+# Four same-CPL far transfers per 64→32→64 user iteration. Both engines run identical program bytes.
+[[suite]]
+name = "mixed-far"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 1500 }
+
+[suite.cases.mixed-far-natemu]
+argv = ["python3", "tools/bench/smp/smp.py", "mixed-cost", "--out", "{out}", "--natemu", "{host}", "{runtime}", "{fexc}"]
+
+[suite.cases.mixed-far-qemu]
+argv = ["python3", "tools/bench/smp/smp.py", "mixed-cost", "--out", "{out}"]
+env = { NATEMU_QEMU_SYSTEM = "{qemu_system}" }

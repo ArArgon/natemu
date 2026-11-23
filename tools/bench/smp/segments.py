@@ -356,6 +356,16 @@ def model_state(i=0, cpl=0, ro_gdt=False, ldt=False):
 
 # Fault cases: (name, prefix setting registers, the instruction under test, model call on the state, CPL, options).
 # The instruction under test is the body's last (CPL 0) or the user code's last (CPL 3).
+USER_UD = fields(0)['u'] + 0x400       # A separate user-code region, paired with the model's completed transfer.
+
+
+def target_ud(result):
+    """A completed transfer followed by the fixture's UD2 at its destination."""
+    assert result['outcome'] == 'done' and result['state']['rip'] == USER_UD
+    fault = (6, 0, 0)
+    return dict(result, outcome='fault', fault=fault, fault_rip=USER_UD, permitted={('fault', fault)})
+
+
 def cases():
     d = P.SYS_D(0)
     c = []
@@ -414,14 +424,11 @@ def cases():
     c.append(('lret-compat-rip',) + ret([high, 0x38]))
     c.append(('call-far-compat-limit', f'    mov rax, {small:#x}\n    mov [{{g:#x}}+0xc0], rax\n' + far(0xc0)[0],
               '    call far [{p:#x}+0x90]\n', lambda s: sm.far(_ptr(_gdt(s, 0xc0, small), 0x110000, 0xc0), 'call', d + PTR + 0x90), {}))
-    # Compatibility-mode code at CPL 3 that natemu does not run is its recorded deviation, judged by segment_model alone
-    # (x86 runs the code). From CPL 0: IRETQ to the 16-bit DPL 3 code segment (0xd3) completes and takes #GP(0xd0) at its
-    # target (M2 task 3a; IRETQ to the 32-bit one runs the code: compat.py); an outer RET to the 32-bit one (0xdb) is
-    # #GP(selector) at the RET with nothing changed (owner decision, November 6; far transfers are task 5).
+    # A transfer into a valid 16-bit user CS commits before the documented refusal at the target.
     c.append(('iret-compat16-cpl3',) + iret([0x110000, 0xd3, 2, d + USTACK, 0x1b]))
     # The frame's RIP beyond the 4 GiB limit of the 32-bit code segment: #GP(0) at the IRETQ.
     c.append(('iret-compat-rip',) + iret([1 << 32 | 0x110000, 0xdb, 2, d + USTACK, 0x1b]))
-    c.append(('lret-compat-cpl3',) + ret([0x110000, 0xdb, d + USTACK, 0x1b]))
+    c.append(('lret-compat-cpl3',) + ret([USER_UD, 0xdb, d + USTACK, 0x1b], target_ud=True))
     # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tests/system/run_s4.py `s4-popf-iret`.)
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
     c.append(('iret-dpl3-ss',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x18]))
@@ -433,19 +440,18 @@ def cases():
                              ('lgdt', '    lgdt [rsp]\n', lambda s: sm.lgdt(s, d + USTACK)),
                              ('ltr', '    mov eax, 0x70\n    ltr ax\n', lambda s: sm.ltr(s, 0x70)),
                              ('lret-to-cpl0', '    push 0x08\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0x08]))),
-                             # The compatibility-mode deviation at CPL 3 (above): far JMP and CALL and RET far at the
-                             # instruction (IRETQ to 32-bit code runs it: compat.py's c32-null-ds); a call gate.
-                             ('jmp-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    jmp far [rsp-16]\n',
-                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
+                             # These distinct user transfers land on an explicit UD2. The 16-bit CS
+                             # instead takes the unsupported-shape fault at its target after CALL pushes.
+                             ('jmp-far-compat', f'    mov rax, {USER_UD:#x}\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    jmp far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, USER_UD, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
                              ('call-far-compat16', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xd3\n    call far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xd3), 'call', s['rsp'] - 16, stack=True)),
-                             # (M2 Part 2's lock: a far call to the 32-bit CS as well, 64 -> 32 at CPL 3, plan section 8.)
-                             ('call-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    call far [rsp-16]\n',
-                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'call', s['rsp'] - 16, stack=True)),
-                             ('lret-compat', '    push 0xdb\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0xdb]))),
+                             ('call-far-compat', f'    mov rax, {USER_UD:#x}\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    call far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, USER_UD, 0xdb), 'call', s['rsp'] - 16, stack=True)),
+                             ('lret-compat', f'    push 0xdb\n    push {USER_UD:#x}\n    o64 retf\n', lambda s: sm.ret(_stack(s, [USER_UD, 0xdb]))),
                              ('jmp-far-call-gate', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xb3\n    jmp far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xb3), 'jmp', s['rsp'] - 16, stack=True))):
-        c.append((f'cpl3-{name}', None, insn, call, {'cpl': 3}))
+        c.append((f'cpl3-{name}', None, insn, call, {'cpl': 3, 'target_ud': name in ('jmp-far-compat', 'call-far-compat', 'lret-compat')}))
     return c
 
 
@@ -490,6 +496,9 @@ def fault_programs():
             tail = P.asm((insn + P.RESTORE + '\n    cmp r11, r11').format(**f))
             at = P.SYS_CODE(0) + len(P.asm(full)) - len(tail)
         r = call(state)
+        if o.get('target_ud'):
+            prog['memory'].append({'addr': hex(USER_UD), 'data': '0f0b'})
+            r = target_ud(r)
         prog['params'] = {'model': {'outcome': r['outcome'], 'fault': r['fault'], 'at': r.get('fault_rip') or at, 'reason': r['reason'],
                                     'deviation': r.get('deviation', False), 'rsp': r['state']['rsp'],
                                     'permitted': sorted(([o, list(f) if f else None] for o, f in r['permitted']), key=str)}}
