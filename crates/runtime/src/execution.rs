@@ -4248,6 +4248,15 @@ fn straddle(c: &Cpu, site: &Site, address: u64, width: u64, write: bool) -> Resu
     segments::operand(c, u32::from(site.segment), u64::from(offset), width, write).map(|_| ())
 }
 
+/// [`data_hits`] of an access of 32-bit code whose bytes may wrap to linear 0 ([`straddle`]).
+fn compat_hits(c: &Cpu, address: u64, width: u64, write: bool) -> u64 {
+    if c.code_mode() == Some(CodeMode::Bits64) || address + width <= 1 << 32 {
+        return data_hits(&c.dr, address, width, write);
+    }
+    let first = (1 << 32) - address;
+    data_hits(&c.dr, address, first, write) | data_hits(&c.dr, 0, width - first, write)
+}
+
 /// [`pages`], with the second page of an access that [`straddle`] allowed at linear 0.
 fn compat_pages(c: &Cpu, address: u64, width: u64) -> Option<[Option<u64>; 2]> {
     let wrap = |va: u64| if c.code_mode() == Some(CodeMode::Bits64) { va } else { va & 0xffff_ffff };
@@ -4275,13 +4284,16 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
         guest_fault(s, f, b, site, [17, 0, 0])
     }
     let first = ((1u64 << 32) - address) as usize;
-    let hits = data_hits(&s.cpu.dr, address, first as u64, false) | data_hits(&s.cpu.dr, 0, (width - first) as u64, false);
+    // (The load half of a read-modify-write is walked for writing, as x86 does; its breakpoint is a read's here and a
+    // write's at its store.)
+    let rmw = site.intent == object::INTENT_WRITE;
+    let hits = compat_hits(&s.cpu, address, width as u64, false);
     if s.cpu.dr[5] & DR7_ENABLES != 0 && hits != 0 && b.flags & cache::STEP == 0 {
         step_from(s, f, b, site)
     }
     let mut gpa = [0; 2];
     for (k, va) in [address, 0].into_iter().enumerate() {
-        let Some((pa, _)) = translate(&mut s, f, b, site, va, Access::Read) else {
+        let Some((pa, _)) = translate(&mut s, f, b, site, va, if rmw { Access::Write } else { Access::Read }) else {
             unsafe {
                 write_record(record(), &s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
@@ -4291,6 +4303,11 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
     }
     let mixed = gpa.iter().any(|&p| !mmio::ram(p));
     if mixed {
+        // A read-modify-write has no device completion, on any page that is not RAM (both write walks have succeeded;
+        // nothing is committed).
+        if rmw {
+            mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::FORM)
+        }
         let device = gpa.map(|p| (!mmio::ram(p)).then_some(p));
         if !mmio::ones(&mut s, f, b, site, [Some(address), Some(0)], device) {
             mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::CROSSING)
@@ -4509,11 +4526,11 @@ unsafe fn split(
     }
     // S4: a page-crossing store meeting a data breakpoint traps after its instruction: run alone (its step block's split
     // records the bits).
-    if s.cpu.dr[5] & DR7_ENABLES != 0 && data_hits(&s.cpu.dr, address, width as u64, true) != 0 {
+    if s.cpu.dr[5] & DR7_ENABLES != 0 && compat_hits(&s.cpu, address, width as u64, true) != 0 {
         if b.flags & cache::STEP == 0 {
             step_from(s, f, b, stub)
         }
-        s.debug |= data_hits(&s.cpu.dr, address, width as u64, true) << debug::HITS;
+        s.debug |= compat_hits(&s.cpu, address, width as u64, true) << debug::HITS;
     }
     let Some([Some(first), Some(second)]) = compat_pages(&s.cpu, address, width as u64) else {
         match compat_pages(&s.cpu, address, width as u64) {
@@ -4539,8 +4556,12 @@ unsafe fn split(
         }
     };
     // M3: a page-crossing store with a device page on either side is refused (both pages walked first).
-    if !mmio::ram(gpa0) || !mmio::ram(gpa1) {
-        mmio::refuse(s, f, b, stub, natemu_abi::execution::mmio::CROSSING)
+    // (M2 checkpoint C: a store that wraps to linear 0 through FS or GS and meets only RAM and firmware pages is made, the
+    // bytes for the image dropped, as the resident's own stores there.)
+    let wrapped = address + width as u64 > 1 << 32 && s.cpu.code_mode() != Some(CodeMode::Bits64);
+    let rom = wrapped && access.rmw == object::RMW_NONE && [gpa0, gpa1].iter().all(|&p| mmio::ram(p) || mmio::rom(p));
+    if (!mmio::ram(gpa0) || !mmio::ram(gpa1)) && !rom {
+        mmio::refuse(s, f, b, stub, if wrapped && access.rmw != object::RMW_NONE { natemu_abi::execution::mmio::FORM } else { natemu_abi::execution::mmio::CROSSING })
     }
     let gpa = [gpa0, gpa1];
     split_wait(&mut s, &gpa);
@@ -4562,11 +4583,15 @@ unsafe fn split(
         (_, r) => bytes[..16].copy_from_slice(&u128::from(x(r)).to_le_bytes()),
     }
     let head = (4096 - (address & 4095)) as usize;
-    let (Some(to0), Some(to1)) = (
-        guest_ram().range(gpa[0], head as u64),
-        guest_ram().range(gpa[1], (width - head) as u64),
-    ) else {
-        halt(&s, stop::SHADOW)
+    let targets = if rom {
+        unsafe { asm!("dmb ish") };
+        segments::copy_mixed(&mut s, gpa, head, &mut bytes[..width], true);
+        None
+    } else {
+        let (Some(to0), Some(to1)) = (guest_ram().range(gpa[0], head as u64), guest_ram().range(gpa[1], (width - head) as u64)) else {
+            halt(&s, stop::SHADOW)
+        };
+        Some((to0, to1))
     };
     unsafe {
         // M2 (UC): a store to UC RAM is made after every earlier access is globally visible (and, by the `dsb` after it,
@@ -4575,12 +4600,16 @@ unsafe fn split(
             cache::control().uncached_resident += 1;
             asm!("dmb ish");
         }
-        guest_memory::copy_volatile(to0, bytes.as_ptr(), head);
-        guest_memory::copy_volatile(to1, bytes[head..].as_ptr(), width - head);
+        if let Some((to0, to1)) = targets {
+            guest_memory::copy_volatile(to0, bytes.as_ptr(), head);
+            guest_memory::copy_volatile(to1, bytes[head..].as_ptr(), width - head);
+        }
         asm!("dsb ish");
         // A peer may have marked either page since its code bits were cleared (or found clear) in `translate`.
-        cache::rechecked(gpa[0]);
-        cache::rechecked(gpa[1]);
+        if !rom {
+            cache::rechecked(gpa[0]);
+            cache::rechecked(gpa[1]);
+        }
         // Writeback: the access's base becomes what the store would have left in it, derived from the
         // address checked at the stub (base + imm), never from the base register's value at the stub, which
         // need not hold the access's base yet. Pre-index (imm = delta): the address; post-index (imm = 0):
@@ -4628,11 +4657,11 @@ unsafe fn split_lock(
     elr: u64,
     spsr: u64,
 ) -> ! {
-    if s.cpu.dr[5] & DR7_ENABLES != 0 && data_hits(&s.cpu.dr, address, width, true) != 0 {
+    if s.cpu.dr[5] & DR7_ENABLES != 0 && compat_hits(&s.cpu, address, width, true) != 0 {
         if b.flags & cache::STEP == 0 {
             step_from(s, f, b, site)
         }
-        s.debug |= data_hits(&s.cpu.dr, address, width, true) << debug::HITS;
+        s.debug |= compat_hits(&s.cpu, address, width, true) << debug::HITS;
     }
     let mut gpa = [u64::MAX; 2];
     let touched = compat_pages(&s.cpu, address, width).into_iter().flatten().flatten();

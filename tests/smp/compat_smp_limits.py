@@ -169,7 +169,7 @@ def storage(n, transition):
         bodies.append(P.body(P.SYS_CODE(i), P.sys_text(i, kernel)))
         cpus.append(dict(P.cpu(i, C.U, rdx=P.SYS_CODE(i)), cpl=0))
         def packed(seg):
-            return seg[1] << 32 | seg[0]
+            return seg[1] + 1 << 32 | seg[0]   # the record: (limit + 1) << 32 | base
         views.append([0, 0] if transition == 'user64' else [
             0 if transition in ('null', 'readonly') else packed(gs if transition == 'reload' else fs), packed(gs)])
         expected[fields['c']] = struct.pack('<I', 0x12345678)

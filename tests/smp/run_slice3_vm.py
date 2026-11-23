@@ -1698,9 +1698,12 @@ def cmd_compat_limits(a, host, runtime):
                     elif cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(initial['rip'])):
                         diffs.append(f'cpu{i} stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
                     if 'segment_views' in prog:
-                        tags = cpu.get('compat_dword_segments')
+                        tags = cpu.get('compat_segment_records')
                         if tags is None or [smp.num(v) for v in tags] != prog['segment_views'][i]:
                             diffs.append(f"cpu{i} segment tags {tags}, expected {prog['segment_views'][i]}")
+                    # M2 checkpoint C: how many operand checks the resident decided (0: every check passed inline).
+                    if 'segment_checks' in prog and cpu.get('segment_checks') != prog['segment_checks'][i]:
+                        diffs.append(f"cpu{i} resident operand checks {cpu.get('segment_checks')}, expected {prog['segment_checks'][i]}")
                     if 'frame_alias' in prog and smp.num(cpu['guest_state_alias']) != prog['frame_alias']:
                         diffs.append(f"cpu{i} unexpected frame alias {cpu['guest_state_alias']}")
                     if (prog['ncpu'] > 1 or prog.get('require_link')) and not limit and not cpu['stats']['linked']:
