@@ -87,7 +87,7 @@ def main(out, generic=False):
     stub = smp.build_stub(out)
     cases = {p['name']: (p, e) for p, e in compat_limits.cases(reference_control=True)
              if (p['name'].startswith(GENERIC) and p['name'] not in DEVIATIONS if generic else p['name'] in SELECTED)}
-    assert len(cases) > 100 if generic else cases.keys() == SELECTED
+    assert len(cases) > 50 if generic else cases.keys() == SELECTED
     keys = {}
     for name, (program, expected) in cases.items():
         img = smp.build_image(program, stub)

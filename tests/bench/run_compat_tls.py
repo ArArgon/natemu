@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Time hot, aligned loads and stores in a 32-bit compatibility-mode user loop."""
+"""Time hot, aligned accesses in a 32-bit compatibility-mode user loop: through flat DS, through a limited FS or GS (each
+instruction's operand is checked inline) and through a flat-limit FS (Linux's TLS shape: no check), as dword MOV loads and
+stores and as a mix of other forms (read-modify-write, compare with an immediate, a byte load, a scalar SSE load)."""
 
 import argparse
 import json
@@ -24,16 +26,24 @@ TSC_HZ = 1_000_000_000  # natemu's virtual TSC rate
 FIRST_WORD = 0x40  # offset from TLS, with a byte-granular segment limit of 0xfff
 
 
-def program(segment):
+# The mixed loop's instructions per word: each adds 2 to the word in all.
+MIXED = ('inc dword [{s}:esi+offset]', 'add [{s}:esi+offset], ebx', 'cmp dword [{s}:esi+offset], 0',
+         'movzx eax, byte [{s}:esi+offset]', 'movss xmm0, [{s}:esi+offset]')
+
+
+def program(segment, flat_limit=False, mixed=False):
     # Use the same linear addresses, operand encodings and loop for all modes.
     # DS is flat. Load the nonzero-base descriptor only into the segment being timed.
     selector = 0x1b if segment == 'ds' else 0x2b
     base = compat.TLS if segment == 'ds' else 0
+    work = ('\n'.join('    ' + i.format(s=segment) for i in MIXED) if mixed else
+            f'    mov eax, [{segment}:esi+offset]\n    add eax, offset\n    mov [{segment}:esi+offset], eax')
     user = f'''    mov eax, {selector:#x}
     mov {segment}, ax
     mov esi, {base:#x}
     mov edi, {compat.W:#x}
     mov ebp, {SAMPLES + 1}
+    mov ebx, 1
     mov ecx, {WARMUP}
 .sample:
     lfence
@@ -56,9 +66,7 @@ def program(segment):
 .work:
     %assign offset {FIRST_WORD}
     %rep {WORDS}
-    mov eax, [{segment}:esi+offset]
-    add eax, offset
-    mov [{segment}:esi+offset], eax
+{work}
     %assign offset offset+4
     %endrep
     dec ecx
@@ -66,15 +74,16 @@ def program(segment):
     ret
 '''
     descriptor = compat.F['g'] + 0x28
-    kernel = f'''    mov word [{descriptor:#x}], 0xfff
-    and byte [{descriptor + 6:#x}], 0x70
-''' + compat.ENTER() + compat.handlers()
-    return compat.program(f'compat-tls-{segment}', kernel, user)
+    # A byte-granular limit of 0xfff (a limited segment), or 4 GiB (flat-limit: page-granular, limit 0xfffff).
+    limit = (f'    mov word [{descriptor:#x}], 0xffff\n    or byte [{descriptor + 6:#x}], 0x8f\n' if flat_limit else
+             f'    mov word [{descriptor:#x}], 0xfff\n    and byte [{descriptor + 6:#x}], 0x70\n')
+    kernel = limit + compat.ENTER() + compat.handlers()
+    return compat.program(f'compat-tls-{segment}{"-flat-limit" if flat_limit else ""}{"-mixed" if mixed else ""}', kernel, user)
 
 
-def measure(segment, host, runtime, fexc, out):
-    prog = program(segment)
-    rc, record, err = driver(host, runtime, fexc, smp_description(prog), out / segment,
+def measure(label, segment, flat_limit, mixed, host, runtime, fexc, out):
+    prog = program(segment, flat_limit, mixed)
+    rc, record, err = driver(host, runtime, fexc, smp_description(prog), out / label,
                              ['--watchdog-ms', '10000'], timeout=15, shape=False)
     if rc:
         raise RuntimeError(f'{segment}: VM exit {rc}: {err}')
@@ -93,7 +102,7 @@ def measure(segment, host, runtime, fexc, out):
     data = memory[compat.W]
     words = struct.unpack_from(f'<{WORDS}I', data, compat.TLS - compat.W + FIRST_WORD)
     total = WARMUP + SAMPLES * ITERATIONS
-    want = tuple((total * (FIRST_WORD + 4 * i)) & 0xffffffff for i in range(WORDS))
+    want = tuple((total * (2 if mixed else FIRST_WORD + 4 * i)) & 0xffffffff for i in range(WORDS))
     if words != want:
         raise RuntimeError(f'{segment}: final words {words} != {want}')
     times = list(struct.iter_unpack('<QQ', data[:16 * (SAMPLES + 1)]))
@@ -110,14 +119,17 @@ def main():
     parser.add_argument('--out', type=pathlib.Path, required=True)
     parser.add_argument('--natemu', nargs=3, metavar=('HOST', 'RUNTIME', 'FEXC'), required=True)
     args = parser.parse_args()
-    accesses = 2 * WORDS * ITERATIONS
     variants = {}
-    for label, segment in (('flat', 'ds'), ('fs', 'fs'), ('gs', 'gs')):
-        ticks = measure(segment, *args.natemu, args.out)
+    # flat, fs, gs: the dword MOV loop through flat DS and through a limited FS, GS. The others: the same loop through a
+    # flat-limit FS (no check in its code), and the mixed loop through each kind of segment.
+    for label, segment, flat_limit, mixed in (('flat', 'ds', False, False), ('fs', 'fs', False, False), ('gs', 'gs', False, False),
+                                              ('fs-flat-limit', 'fs', True, False), ('mixed-flat', 'ds', False, True),
+                                              ('mixed-fs', 'fs', False, True), ('mixed-fs-flat-limit', 'fs', True, True)):
+        accesses = (len(MIXED) if mixed else 2) * WORDS * ITERATIONS
+        ticks = measure(label, segment, flat_limit, mixed, *args.natemu, args.out)
         costs = [dt * 1e9 / TSC_HZ / accesses for dt in ticks]
-        variants[label] = dict(tsc_ticks=ticks, ns_per_access=costs, median_ns_per_access=statistics.median(costs))
-    result = dict(tsc_hz=TSC_HZ, warmup_iterations=WARMUP, iterations_per_sample=ITERATIONS,
-                  accesses_per_sample=accesses, variants=variants)
+        variants[label] = dict(tsc_ticks=ticks, accesses_per_sample=accesses, ns_per_access=costs, median_ns_per_access=statistics.median(costs))
+    result = dict(tsc_hz=TSC_HZ, warmup_iterations=WARMUP, iterations_per_sample=ITERATIONS, variants=variants)
     text = json.dumps(result, indent=2)
     (args.out / 'compat-tls.json').write_text(text + '\n')
     print(text)

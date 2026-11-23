@@ -253,14 +253,17 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-stric
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "scimark",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--cap", "600"]
 
-# The same compatibility user loop and linear addresses via flat DS, finite-limit FS, and finite-limit GS. The guest TSC
-# times each warmed loop within the VM, with its final words checked before recording the results.
+# The same compatibility user loop and linear addresses via flat DS, a limited FS and GS (variants flat, fs, gs: dword MOV
+# loads and stores; each instruction's operand is checked inline), a flat-limit FS (fs-flat-limit: Linux's TLS shape, no
+# check in the code), and a mix of other forms (mixed-flat, mixed-fs, mixed-fs-flat-limit: inc, add m,r, cmp m,imm, a byte
+# load, a scalar SSE load). The guest TSC times each warmed loop within the VM, with its final words checked before
+# recording the results.
 [[suite]]
 name = "compat-tls"
 kind = "bench"
 harness = "bench"
 tier = "bench"
-params = { timeout = 60 }
+params = { timeout = 120 }
 
 [suite.cases.compat-tls-natemu]
 argv = ["python3", "tests/bench/run_compat_tls.py", "--out", "{out}", "--natemu", "{host}", "{runtime}", "{fexc}"]
