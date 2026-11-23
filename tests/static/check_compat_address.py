@@ -49,11 +49,12 @@ SEGMENTS = {
 
 # M2 checkpoint C: 32-bit code whose FS and GS are flat-limit segments (Linux's TLS: no --fs-limited, --gs-limited) has no
 # operand check: its native code is what the compiler made before the checks existed. Guest bytes, then the first 16 hex
-# digits of the SHA-256 of the unit's code (relocation slots zeroed) at 0x401000 with --bitness 32 --push-run, as an
-# ordinary unit and alone (--max-insts 1), from the fexc of FEX fc4270d ("Compute compat effective addresses and stack
+# digits of the SHA-256 of the unit's code (relocation slots zeroed) at 0x401000 with the arguments the host sends for
+# such a unit (HOST below), as an ordinary unit and alone (--max-insts 1), from the fexc of FEX fc4270d ("Compute compat effective addresses and stack
 # updates at 32-bit width", the fork commit before the first check) with natemu 30793c6b's tools/fexc. To regenerate after a
 # deliberate change of that code: build that pair (tools/fexc/build.sh with FEXC_PIN and FEXC_TOOLS, or the two worktrees and
 # cmake as build.sh does) and hash the same compiles.
+HOST = ['--bitness', '32', '--push-run', '--narrow-cmp', '--ext-conds', '4']
 UNCHECKED = {
     'mov eax,gs:[0x14]': ('65a114000000', 'd9a153c9a98f8fe2', '719da5a5c89bc73f'),
     'mov gs:[0x14],eax': ('65a314000000', 'a3492b7f878a2147', 'fffa026083902e07'),
@@ -91,7 +92,7 @@ def check_unchecked(compiler):
     errors = []
     for name, (code, *digests) in UNCHECKED.items():
         for digest, size in zip(digests, ([], ['--max-insts', '1'])):
-            d = verify_precision.compile_(compiler, code, '0x401000', ['--bitness', '32', '--push-run', *size])
+            d = verify_precision.compile_(compiler, code, '0x401000', [*HOST, *size])
             if d['status'] != 'ok' or d['guest']['instructions_translated'] != 1:
                 errors.append(f'{name}: failed to translate the instruction')
                 continue

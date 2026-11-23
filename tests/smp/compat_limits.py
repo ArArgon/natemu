@@ -1192,6 +1192,26 @@ def cases(*, reference_control=False):
     add('fs-generic-address-xlat-in', 'fs xlatb', limit=7, success=True, prefix='    mov ebx, 4\n    mov eax, 0xffffff03\n',
         eax=0xffffff00 | VALUE[7], checks=0)
     add('fs-generic-address-xlat-over', 'fs xlatb', limit=7, prefix='    mov ebx, 4\n    mov eax, 0xffffff04\n', eax=0xffffff04, checks=1)
+    # MOVD's and the non-temporal moves' memory forms: FEX took their address without the segment's base (the access went
+    # to the flat address, here the unmapped page 0, whatever the limit said). Each form in range under a limited and a
+    # flat-limit segment (the bytes move at the base), out of range (the segment's fault), and in 64-bit code.
+    mm0 = f'    movq mm0, [{C.W:#x}]\n'
+    for name, insn, wide, result, extra in [
+        ('movd-mm-store', 'movd [{s}:{r}di], mm0', 4, INITIAL[:4] + VALUE[4:], dict(prefix=mm0)),
+        ('movd-xmm-store', 'movd [{s}:{r}di], xmm1', 4, INITIAL[:4] + VALUE[4:], {}),
+        ('vmovd-store', 'vmovd [{s}:{r}di], xmm1', 4, INITIAL[:4] + VALUE[4:], {}),
+        ('movntps', 'movntps [{s}:{r}di], xmm1', 16, INITIAL, {}),
+        ('movntpd', 'movntpd [{s}:{r}di], xmm1', 16, INITIAL, {}),
+        ('movntdq', 'movntdq [{s}:{r}di], xmm1', 16, INITIAL, {}),
+        ('movntdqa-load', 'movntdqa xmm1, [{s}:{r}di]', 16, VALUE, dict(xmm1=VALUE)),
+    ]:
+        for segment in ('fs', 'gs'):
+            form = insn.format(s=segment, r='e')
+            add(f'{segment}-generic-{name}', form, segment=segment, limit=wide - 1, success=True, memory=result, checks=0, **extra)
+            add(f'{segment}-generic-{name}-flat-limit', form, segment=segment, limit=0xfffff, flags=12, success=True, memory=result,
+                checks=0, **extra)
+            add(f'{segment}-generic-{name}-over', form, segment=segment, limit=wide - 2, checks=1, **{k: v for k, v in extra.items() if k != 'xmm1'})
+        add(f'fs-generic-{name}-64', insn.format(s='fs', r='r'), cpl3_mode=64, success=True, memory=result, checks=0, **extra)
     # A pending unmasked x87 exception is reported at the next waiting x87 instruction before that instruction's operand is
     # judged: #MF, not the segment's #GP, whether the operand is in range or not (CR0.NE: the exception is #MF).
     pending = (f'    fninit\n    mov word [{C.W + 0x50:#x}], 0x37b\n    fldcw [{C.W + 0x50:#x}]\n'
@@ -1235,7 +1255,21 @@ def cases(*, reference_control=False):
             xmm1=bytes.fromhex('11223344') + bytes(12), **wrap)
         add(f'fs-generic-wrapped-movss-store-{bits}', 'movss [fs:edi], xmm1', limit=limit, flags=flags, checks=0,
             captured={high: INITIAL[:2], low: INITIAL[2:4]}, **wrap)
-        add(f'fs-generic-wrapped-fild-{bits}', 'fild word [fs:edi+1]', limit=limit, flags=flags, checks=0, **wrap)
+        # (x87 loads, read back through FISTP: a word at FFFF_FFFFH, and the 8 bytes of the FILD m64, FISTP m64 pair.)
+        add(f'fs-generic-wrapped-fild-{bits}', f'fild word [fs:edi+1]\n    fistp dword [{C.W + 0x58:#x}]', limit=limit, flags=flags,
+            checks=0, captured={C.W + 0x58: struct.pack('<i', 0x3322)}, **wrap)
+        wide = max(limit, 0xff)
+        add(f'fs-generic-wrapped-fild64-{bits}', f'fild qword [fs:edi]\n    fistp qword [{C.W + 0x58:#x}]', limit=wide, flags=flags,
+            checks=0, captured={C.W + 0x58: bytes(4) + bytes.fromhex('11223344')}, **{**wrap, 'base': 0xfffffffa})
+        # 8-, 16- and 32-byte vector loads.
+        add(f'fs-generic-wrapped-movq-{bits}', 'movq xmm1, [fs:edi]', limit=wide, flags=flags, checks=0,
+            xmm1=bytes(4) + bytes.fromhex('11223344') + bytes(8), **{**wrap, 'base': 0xfffffffa})
+        add(f'fs-generic-wrapped-movups-{bits}', 'movups xmm1, [fs:edi]', limit=wide, flags=flags, checks=0,
+            xmm1=bytes(6) + bytes.fromhex('11223344') + bytes(6), **{**wrap, 'base': 0xfffffff8})
+        add(f'fs-generic-wrapped-vmovups-{bits}', 'vmovups ymm1, [fs:edi]', limit=wide, flags=flags, checks=0,
+            xmm1=bytes(14) + bytes.fromhex('1122'), ymm1_high=bytes.fromhex('3344') + bytes(14), **{**wrap, 'base': 0xfffffff0})
+        add(f'fs-generic-wrapped-movups-store-{bits}', 'movups [fs:edi], xmm1', limit=wide, flags=flags, checks=0,
+            captured={high: INITIAL[6:8], low: INITIAL[8:10]}, **{**wrap, 'base': 0xfffffff8})
     # A flat segment's access across 4 GiB is still its limit fault, and the stack's is #SS whatever the operand's segment.
     add('fs-generic-flat-base-zero-straddle', 'mov ecx, [fs:0xfffffffe]', base=0, limit=0xfffff, flags=12, mapped=C.WRAP,
         kernel_setup=up, checks=0)

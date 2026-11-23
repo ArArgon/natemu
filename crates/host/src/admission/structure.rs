@@ -714,10 +714,11 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
     let operands = segment_operands(c)?;
     // A block with an operand check relies on the exact memory-word, stub and control-flow rules of the code shape, also in
     // production: no native access of it is unrecorded.
-    let checked = Code { shape: c.shape || !operands.is_empty(), ..*c };
+    let checked = Code { shape: c.shape || operands.iter().any(|o| o.limited), ..*c };
     let c = &checked;
     let mut v = Verifier::new(c)?;
     v.segment_checks(&operands)?;
+    v.segment_bases(&operands)?;
     v.words()?;
     v.exits()?;
     if c.shape {
@@ -744,11 +745,13 @@ struct SegmentOperand {
     segment: u8,
     width: u8,
     write: bool,
+    /// The segment is limited (`c.limited`): the operand needs its check.
+    limited: bool,
 }
 
 /// M2 checkpoint C. Decodes the whole source of a 32-bit block, independently of the producer's PC table and of any list of
-/// instruction forms (a prefix byte inside a displacement or an immediate is ordinary data), and returns the operands that
-/// need a check: each instruction's memory operand through FS or GS when that segment is limited (`c.limited`), with the
+/// instruction forms (a prefix byte inside a displacement or an immediate is ordinary data), and returns each instruction's
+/// memory operand through FS or GS, with whether that segment is limited (`c.limited`: the operand needs a check), the
 /// operand's width and whether the instruction can write it (a conditional write is a write, a conditional read a read;
 /// LEA and the hint NOPs access nothing). Refused here: an FS or GS operand in a block that is not CPL 3; an access site
 /// whose segment tag is not its instruction's FS or GS (the resident judges an access that runs across 4 GiB by that tag);
@@ -812,9 +815,7 @@ fn segment_operands(c: &Code) -> Result<Vec<SegmentOperand>, String> {
         if !c.cpl3 {
             return Err(format!("FS or GS operand at guest offset {g:#x} in a block that is not CPL 3"));
         }
-        if c.limited[usize::from(segment - object::SEG_FS)] {
-            found.push(SegmentOperand { offset: g, segment, width, write });
-        }
+        found.push(SegmentOperand { offset: g, segment, width, write, limited: c.limited[usize::from(segment - object::SEG_FS)] });
     }
     let mut reported: Vec<_> = c.pcs.iter().map(|p| p.guest_offset).filter(|&g| g < c.guest_bytes).collect();
     reported.dedup();
@@ -842,14 +843,13 @@ impl<'a> Verifier<'a> {
     /// access of its instruction through that segment:
     /// `and x1, x28, #~0x1fffff; ubfx x2, x28, #21, #9; add x2, x2, #1; lsr x2, x2, #9; add x1, x1, #512, lsl #12;
     /// sub x1, x1, x2, lsl #22; ldr x1, [x1, #slot]` (the vCPU's read-only record: `(limit + 1) << 32 | base`, or 0),
-    /// `lsr x2, x1, #32; sub x2, x2, #W; sub x2, x2, wOffset, uxtw; tbnz x2, #63, stub` (or the far form `tbz x2, #63, +8;
-    /// b stub`), then `mov wBase, w1`, where the resident resumes with the base in x1. W is the operand's width and the
+    /// `lsr x2, x1, #32; sub x2, x2, #W; sub x2, x2, wOffset, uxtw; tbnz x2, #63, stub`, then `mov wBase, w1`, where the resident resumes with the base in x1. W is the operand's width and the
     /// stub's intent the operand's, both as this module decoded them. No branch enters the sequence and no relocation lies in
     /// it. With [`Verifier::frame_access`] refusing every load of a limited segment's base field, the base an access adds can
     /// only be this check's.
     fn segment_checks(&mut self, operands: &[SegmentOperand]) -> Result<(), String> {
         use object::kind::SEGMENT;
-        for op in operands {
+        for op in operands.iter().filter(|o| o.limited) {
             let g = op.offset;
             let fail = |what: &str| Err(format!("operand check of the instruction at guest offset {g:#x}: {what}"));
             let mut stubs = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
@@ -884,14 +884,15 @@ impl<'a> Verifier<'a> {
             }
             let test = sub + 8;
             let to = |at: u32, imm: u32, bits: u32| at.wrapping_add(((imm << (32 - bits)) as i32 >> (30 - bits)) as u32);
-            let (w0, w1) = (self.word(test), self.word(test + 4));
+            // (fexc's far form of the test, for a stub beyond `tbnz`'s reach, cannot occur: no admitted block is that long,
+            // [`natemu_abi::execution::cache::MAX_BLOCK_BYTES`].)
+            let w0 = self.word(test);
             let near = w0 & 0xfff8_001f == 0xb7f8_0002 && to(test, w0 >> 5 & 0x3fff, 14) == s.native_offset && back == test + 4;
-            let far = w0 == 0xb6f8_0042 && w1 >> 26 == 5 && to(test + 4, w1 & 0x03ff_ffff, 26) == s.native_offset && back == test + 8;
             let base = self.word(back) & 31;
-            if !(near || far) || self.word(back) & !31 != 0x2a01_03e0 || base == 28 || base == 31 {
+            if !near || self.word(back) & !31 != 0x2a01_03e0 || base == 28 || base == 31 {
                 return fail("its test or its base move");
             }
-            if self.branches_into(start, back).any(|(from, t)| !(far && from == test && t == back)) {
+            if self.branches_into(start, back).next().is_some() {
                 return fail("a branch enters it");
             }
             if overlaps_relocation32(start..back + 4, self.c.relocs) {
@@ -904,13 +905,71 @@ impl<'a> Verifier<'a> {
             if through.peek().is_none() || through.any(|a| a.native_offset <= back) {
                 return fail("an access through the segment is not after it");
             }
+            // The FILD m64, FISTP m64 pair: the resident keeps the integer for a rerun at this check from the marked store's
+            // register (`bank_at`), which must therefore hold at the check what the store writes.
+            if let Some(store) = self.c.accesses.iter().find(|a| a.guest_offset == g && a.kind == object::kind::STORE && a.guest_offset2 == object::X87_INT64)
+                && (store.native_offset <= back || self.written(1 << store.data_reg[0], back, store.native_offset))
+            {
+                return fail("the kept integer's register is written between it and the store");
+            }
             self.segment_view_reads.push(start + 24);
             self.claim(s.native_offset);
         }
-        if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != operands.len() {
+        if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != operands.iter().filter(|o| o.limited).count() {
             return Err("an operand check without a limited FS or GS operand".into());
         }
         self.segment_view_reads.sort_unstable();
+        Ok(())
+    }
+
+    /// M2 checkpoint C: every access of an instruction through FS or GS adds that segment's base. The base is the operand
+    /// check's (`mov wB, w1`, a limited segment) or the load of the segment's field in the guest-state page (`ldr wB,
+    /// [x28, #field]`, otherwise), inside the instruction; the access's address register must be computed from it: the
+    /// result of a chain of `add`/`sub` (register, extended register or immediate) and register moves that starts at wB,
+    /// with no other write of a register of the chain on the way. A translation that forgot the base (FEX's MOVD and
+    /// MOVNT stores did: the access then went to the flat address) has no such chain, whatever its instruction.
+    fn segment_bases(&self, operands: &[SegmentOperand]) -> Result<(), String> {
+        use object::kind::*;
+        for op in operands {
+            let g = op.offset;
+            let fail = |what: &str| Err(format!("access through {} of the instruction at guest offset {g:#x}: {what}", if op.segment == object::SEG_FS { "FS" } else { "GS" }));
+            let Some(first) = self.c.pcs.iter().position(|p| p.guest_offset == g) else {
+                return fail("the instruction has no code");
+            };
+            let start = self.c.pcs[first].native_offset;
+            let end = self.c.pcs[first..].iter().find(|p| p.guest_offset != g).map(|p| p.native_offset)
+                .unwrap_or_else(|| self.c.stubs.first().map_or(self.c.code.len() as u32, |s| s.native_offset));
+            let field = if op.segment == object::SEG_FS { frame::FS_BASE } else { frame::GS_BASE };
+            let check = self.c.stubs.iter().find(|s| s.kind == SEGMENT && s.guest_offset == g).map(|s| s.imm as u32);
+            let mut chain = 0u32;
+            let mut accesses = self.c.accesses.iter().filter(|a| a.guest_offset == g && a.segment == op.segment).peekable();
+            if accesses.peek().is_none() {
+                return fail("none is recorded");
+            }
+            for at in (start..end).step_by(4) {
+                let w = self.word(at);
+                if let Some(a) = accesses.peek().filter(|a| a.native_offset == at) {
+                    let index = if a.index_reg == object::NO_REG { 0 } else { 1 << a.index_reg };
+                    if a.base_reg >= 31 || chain & (1 << a.base_reg | index) == 0 {
+                        return fail("its address does not come from the segment's base");
+                    }
+                    accesses.next();
+                }
+                let (rd, rn, rm) = (w & 31, w >> 5 & 31, w >> 16 & 31);
+                let from = |r: u32| r < 31 && chain & 1 << r != 0;
+                let source = if op.limited { check == Some(at) } else { w & !31 == 0xb940_0380 | field / 4 << 10 };
+                let derived = source
+                    || (w & 0x1f20_0000 == 0x0b00_0000 && (from(rn) || from(rm))) // add/sub, shifted register
+                    || (w & 0x1fe0_0000 == 0x0b20_0000 && (from(rn) || from(rm))) // add/sub, extended register
+                    || (w & 0x1f00_0000 == 0x1100_0000 && from(rn)) // add/sub, immediate
+                    || (w & 0x1f20_0000 == 0x0a00_0000 && rn == 31 && from(rm)); // mov (orr with the zero register)
+                let writes = self.insn(at).map_or(u32::MAX, |i| i.writes());
+                chain = if derived && rd < 31 { chain & !writes | 1 << rd } else { chain & !writes };
+            }
+            if accesses.next().is_some() {
+                return fail("one is outside the instruction's code");
+            }
+        }
         Ok(())
     }
 
@@ -4685,118 +4744,147 @@ mod tests {
         }
         assert!(admit_with(fixture!("xchg-rip-crossing"), false).is_ok()); // a split lock: the resident's halt at run time
     }
-    /// M2 checkpoint C, with `FEXC` set: the sweep of 32-bit memory forms through a limited FS. Every opcode of the legacy
-    /// maps (one byte, 0f, 0f 38, 0f 3a, each plain and with 66, f3, f2 and LOCK), of x87 and of the VEX maps, with every
-    /// ModRM.reg, as `fs: op [ebx]`, alone in a unit (`--max-insts 1`, the resident's step) and followed by a `ret`: what
-    /// fexc translates must be admitted with its operand check, whose width and intent admission takes from its own decode.
-    /// The forms fexc translates and admission refuses are listed (none is expected: such a form would stop the VM).
+    /// M2 checkpoint C, with `FEXC` set: the sweep of 32-bit memory forms through a limited FS or GS. Every opcode of the
+    /// legacy maps (one byte, 0f, 0f 38, 0f 3a, each plain and with 66, f3, f2 and LOCK), of x87 and of the VEX maps, with
+    /// every ModRM.reg, as `fs: op [ebx]`: alone in a unit (`--max-insts 1`, the resident's step), followed by a `ret`, and
+    /// that with every x87 and SIMD exception unmasked; and, each for half of the forms, as `fs: op [disp32]`,
+    /// `fs: op [ebx+ecx*4+disp32]`, `gs: op [ebx]` and second in its unit (after an `inc eax`). For each: fexc answers; what
+    /// it translates without the check it translates with it; the checked unit is admitted, with its one operand check
+    /// (width and intent as admission decodes them) and every access adding the check's base, and is refused under any other
+    /// identity; and the unchecked unit of `fs: op [ebx]` is admitted too (every access adds the base it loads). The forms
+    /// admission refuses with and without the check are listed (VPCMPESTRI/VPCMPESTRM with VEX.W = 1).
     #[test]
     fn every_limited_fs_form_is_checked_or_refused() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
         use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
-        let mut forms: Vec<Vec<u8>> = Vec::new();
-        let mut add = |head: &[u8]| {
-            for reg in 0..8u8 {
-                // [ebx] and, for moffs and other forms without ModRM, whatever the bytes mean: iced says below.
-                let mut bytes = vec![0x64];
-                bytes.extend_from_slice(head);
-                bytes.push(reg << 3 | 3);
-                bytes.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0, 0, 0, 0]);
-                let mut d = Decoder::new(32, &bytes, DecoderOptions::NONE);
-                let i = d.decode();
-                if i.is_invalid() || i.memory_segment() != Register::FS || !i.op_kinds().any(|k| k == OpKind::Memory) {
-                    continue;
-                }
-                bytes.truncate(i.len());
-                if !forms.contains(&bytes) {
-                    forms.push(bytes);
-                }
-            }
-        };
+        // (segment prefix, ModRM mod and r/m, the bytes after ModRM, a leading instruction, step, unmasked, which half)
+        struct Arm { prefix: u8, modrm: u8, tail: &'static [u8], lead: &'static [u8], step: bool, unmasked: bool, half: Option<usize>, flat: bool }
+        let arm = Arm { prefix: 0x64, modrm: 3, tail: &[], lead: &[], step: false, unmasked: false, half: None, flat: false };
+        let arms = [
+            Arm { step: true, ..arm },
+            Arm { flat: true, ..arm },
+            Arm { unmasked: true, ..arm },
+            Arm { modrm: 5, tail: &[0x10, 0x20, 0x30, 0x00], half: Some(0), ..arm },
+            Arm { modrm: 0x84, tail: &[0x8b, 0x10, 0x20, 0x30, 0x00], half: Some(1), ..arm },
+            Arm { prefix: 0x65, half: Some(0), ..arm },
+            Arm { lead: &[0x40], half: Some(1), ..arm },
+        ];
+        let mut heads: Vec<Vec<u8>> = Vec::new();
         for prefix in [&[][..], &[0x66], &[0xf3], &[0xf2], &[0xf0]] {
             for op in 0..=255u8 {
                 for map in [&[][..], &[0x0f], &[0x0f, 0x38], &[0x0f, 0x3a]] {
-                    add(&[prefix, map, &[op]].concat());
+                    heads.push([prefix, map, &[op]].concat());
                 }
             }
         }
         for op in 0..=255u8 {
             for pp in 0..4u8 {
                 for l in 0..2u8 {
-                    add(&[0xc5, 0xf8 | l << 2 | pp, op]); // VEX map 1, vvvv = 1111b
-                    add(&[0xc5, 0xb8 | l << 2 | pp, op]); // vvvv = 0111b (the forms that take a second source)
+                    heads.push(vec![0xc5, 0xf8 | l << 2 | pp, op]); // VEX map 1, vvvv = 1111b
+                    heads.push(vec![0xc5, 0xb8 | l << 2 | pp, op]); // vvvv = 0111b (the forms that take a second source)
                     for map in [2u8, 3] {
                         for w in 0..2u8 {
-                            add(&[0xc4, 0xe0 | map, w << 7 | 0x78 | l << 2 | pp, op]);
-                            add(&[0xc4, 0xe0 | map, w << 7 | 0x38 | l << 2 | pp, op]);
+                            heads.push(vec![0xc4, 0xe0 | map, w << 7 | 0x78 | l << 2 | pp, op]);
+                            heads.push(vec![0xc4, 0xe0 | map, w << 7 | 0x38 | l << 2 | pp, op]);
                         }
                     }
                 }
             }
         }
+        // (head index, reg): the instruction of an arm, when iced decodes a memory operand through the arm's segment.
+        let form = |arm: &Arm, head: &[u8], reg: u8| -> Option<Vec<u8>> {
+            let mut bytes = vec![arm.prefix];
+            bytes.extend_from_slice(head);
+            bytes.push(reg << 3 | arm.modrm);
+            bytes.extend_from_slice(arm.tail);
+            bytes.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0, 0, 0, 0]);
+            let i = Decoder::new(32, &bytes, DecoderOptions::NONE).decode();
+            let segment = if arm.prefix == 0x64 { Register::FS } else { Register::GS };
+            (!i.is_invalid() && i.memory_segment() == segment && i.op_kinds().any(|k| k == OpKind::Memory)).then(|| bytes[..i.len()].to_vec())
+        };
         let dir = std::env::temp_dir().join(format!("natemu-fs-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let user = super::super::User32 { cpl3: true, limited: [true, false] };
-        let chunks: Vec<&[Vec<u8>]> = forms.chunks(forms.len().div_ceil(8)).collect();
+        let chunks: Vec<&[Vec<u8>]> = heads.chunks(heads.len().div_ceil(8)).collect();
         let (mut translated, mut refused) = (0, Vec::new());
         std::thread::scope(|scope| {
             let workers: Vec<_> = chunks
                 .iter()
                 .enumerate()
                 .map(|(n, chunk)| {
-                    let (fexc, dir) = (&fexc, &dir);
+                    let (fexc, dir, arms, form) = (&fexc, &dir, &arms, &form);
                     scope.spawn(move || {
                         let (mut translated, mut refused) = (0, Vec::new());
-                        for form in chunk.iter() {
-                            // (Also with every x87 and SIMD exception unmasked: the code then checks each floating-point
-                            // instruction's flags, with its own rules on what may precede the check.)
-                            for (step, unmasked) in [(true, false), (false, false), (false, true)] {
-                                let source = if step { form.clone() } else { [&form[..], &[0xc3]].concat() };
+                        for (k, head) in chunk.iter().enumerate() {
+                            for (arm, reg) in arms.iter().flat_map(|a| (0..8u8).map(move |r| (a, r))) {
+                                if arm.half.is_some_and(|h| (k + usize::from(reg)) % 2 != h) {
+                                    continue;
+                                }
+                                let Some(insn) = form(arm, head, reg) else { continue };
+                                let at = arm.lead.len();
+                                let source = [arm.lead, &insn[..], if arm.step { &[][..] } else { &[0xc3] }].concat();
                                 let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
-                                let label = if step { " (step)" } else if unmasked { " (unmasked)" } else { "" };
-                                // The unit's object when fexc translated the instruction (not cut before it or after it); fexc
-                                // must answer either way.
-                                let compile = |limited: bool| -> Option<Vec<u8>> {
+                                let label = if arm.step { " (step)" } else if arm.unmasked { " (unmasked)" } else { "" };
+                                let limited = [arm.prefix == 0x64, arm.prefix == 0x65];
+                                // The unit's object when fexc translated the instruction (not cut before it or after it);
+                                // fexc must answer either way.
+                                let compile = |checked: bool| -> Option<Vec<u8>> {
                                     let object = dir.join(format!("o{n}"));
                                     let _ = std::fs::remove_file(&object);
                                     let mut c = std::process::Command::new(fexc);
                                     c.args(["--hex", &hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run"]);
-                                    if limited {
-                                        c.arg("--fs-limited");
+                                    if checked {
+                                        c.arg(if limited[0] { "--fs-limited" } else { "--gs-limited" });
                                     }
-                                    if step {
+                                    if arm.step {
                                         c.args(["--max-insts", "1"]);
                                     }
-                                    if unmasked {
+                                    if arm.unmasked {
                                         c.args(["--x87-unmasked", "0x3f", "--simd-unmasked", "0x3f"]);
                                     }
                                     let out = c.arg("--object").arg(&object).arg("--out").arg("/dev/null").output().unwrap();
                                     assert!(out.status.code().is_some(), "{hex}{label}: fexc died");
                                     let o = std::fs::read(&object).ok().filter(|_| out.status.success())?;
-                                    (super::super::record::<Header>(&o, 0).guest_bytes as usize >= form.len()).then_some(o)
+                                    (super::super::record::<Header>(&o, 0).guest_bytes as usize >= at + insn.len()).then_some(o)
                                 };
+                                let admit = |o: &[u8], cpl3: bool, limited: [bool; 2]| {
+                                    let h: Header = super::super::record(o, 0);
+                                    super::super::admit_user(o, h.guest_rip, &source, u64::MAX, true, false, true, super::super::User32 { cpl3, limited })
+                                };
+                                let flat = if arm.flat { compile(false) } else { None };
                                 let Some(o) = compile(true) else {
                                     // The check must not cost a form: what fexc translates without it, it translates with it.
-                                    if compile(false).is_some() {
+                                    if flat.is_some() || (!arm.flat && compile(false).is_some()) {
                                         refused.push(format!("{hex}{label}: translated only without the check"));
                                     }
                                     continue;
                                 };
-                                let h: Header = super::super::record(&o, 0);
                                 translated += 1;
-                                if let Err(e) = super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, user) {
+                                let unchecked_refused = |f: Option<Vec<u8>>| f.is_none_or(|f| admit(&f, true, [false; 2]).is_err());
+                                match admit(&o, true, limited) {
+                                    Ok(_) => {
+                                        if arm.flat && unchecked_refused(flat) {
+                                            refused.push(format!("{hex}: refused without the check only"));
+                                        }
+                                    }
                                     // Not the check's doing when the same unit compiled without it is refused too.
-                                    let also = compile(false).is_none_or(|f| super::super::admit_mode(&f, h.guest_rip, &source, u64::MAX, true, false, true).is_err());
-                                    refused.push(format!("{hex}{label}{}: {e}", if also { " (also without the check)" } else { "" }));
+                                    Err(e) => {
+                                        let also = unchecked_refused(if arm.flat { flat } else { compile(false) });
+                                        refused.push(format!("{hex}{label}{}: {e}", if also { " (also without the check)" } else { "" }));
+                                    }
                                 }
-                                // The same object is never admitted as a block whose FS is not limited, nor outside CPL 3
-                                // (a form that accesses nothing, a prefetch or a hint NOP, has no check and is).
-                                let checked = (0..h.sites_count as usize)
-                                    .any(|k| super::super::record::<Site>(&o, h.sites_offset as usize + k * size_of::<Site>()).kind == object::kind::SEGMENT);
-                                for other in [super::super::User32 { cpl3: true, limited: [false, true] }, super::super::User32 { cpl3: false, limited: [true, false] }] {
-                                    assert!(!checked || super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, other).is_err(), "{hex}");
+                                // The same object is never admitted as a block whose segment is not limited, nor outside CPL 3
+                                // (a form that accesses nothing, a prefetch or a hint NOP, has no check and is). It has exactly
+                                // one check, its instruction's.
+                                let h: Header = super::super::record(&o, 0);
+                                let checks: Vec<Site> = (0..h.sites_count as usize)
+                                    .map(|k| super::super::record::<Site>(&o, h.sites_offset as usize + k * size_of::<Site>()))
+                                    .filter(|s| s.kind == object::kind::SEGMENT)
+                                    .collect();
+                                assert!(checks.len() <= 1 && checks.iter().all(|s| s.guest_offset as usize == at), "{hex}{label}");
+                                if !checks.is_empty() {
+                                    assert!(admit(&o, true, [limited[1], limited[0]]).is_err() && admit(&o, true, [false; 2]).is_err() && admit(&o, false, limited).is_err(), "{hex}{label}");
                                 }
                             }
                         }
@@ -4811,11 +4899,10 @@ mod tests {
             }
         });
         std::fs::remove_dir_all(&dir).unwrap();
-        eprintln!("{} forms, {translated} units translated, {} refused", forms.len(), refused.len());
-        assert!(translated > 2000, "{translated}");
-        // VPCMPESTRI/VPCMPESTRM with VEX.W = 1 (c4 e3 f9 60/61) are refused with or without the check (their helper call's shape).
-        let new: Vec<_> = refused.iter().filter(|r| !(r.contains("(also without the check)") && r.starts_with("64c4e3f96"))).collect();
-        assert!(new.is_empty(), "{new:#?}");
+        eprintln!("{} opcode heads, {translated} units translated, {} refused", heads.len(), refused.len());
+        let new: Vec<_> = refused.iter().filter(|r| !(r.contains("(also without the check)") && r.contains("c4e3f96"))).collect();
+        assert!(new.is_empty(), "{} unexpected, the first: {:#?}", new.len(), &new[..new.len().min(40)]);
+        assert!(translated > 50_000, "{translated}");
     }
 
     /// M2 checkpoint C, with `FEXC` set: an operand check that is not exactly the instruction's is refused, and so is every
@@ -4898,17 +4985,53 @@ mod tests {
         refused(admit(&flat, true, [true, false]), "not exactly one");
         refused(admit(&flat, false, [false, false]), "not CPL 3");
         // A GS operand's unchecked code is admitted while only FS is limited; with its base load turned into FS's
-        // (ldr wN, [x28, #gs_cached] -> #fs_cached) the frame rule refuses it, whatever the instruction.
+        // (ldr wN, [x28, #gs_cached] -> #fs_cached) its access no longer adds GS's base.
         let gs = compile("65ff03c3", &[]);
         admit(&gs, true, [true, false]).unwrap();
         let g: Header = super::super::record(&gs.1, 0);
-        let load = 0xb940_0380 | frame::GS_BASE / 4 << 10;
-        let n = (0..g.code_region_end).step_by(4).find(|&n| u32::from_le_bytes(gs.1[g.code_offset as usize + n as usize..][..4].try_into().unwrap()) & !31 == load);
-        let n = g.code_offset as usize + n.expect("the GS base load") as usize;
-        let mut o = gs.1.clone();
-        let w = u32::from_le_bytes(o[n..n + 4].try_into().unwrap()) & 31 | 0xb940_0380 | frame::FS_BASE / 4 << 10;
-        o[n..n + 4].copy_from_slice(&w.to_le_bytes());
-        refused(admit(&(gs.0.clone(), o), true, [true, false]), "base of a limited FS or GS");
+        let gword = |n: u32| u32::from_le_bytes(gs.1[g.code_offset as usize + n as usize..][..4].try_into().unwrap());
+        let load = |field: u32| 0xb940_0380 | field / 4 << 10;
+        let n = (0..g.code_region_end).step_by(4).find(|&n| gword(n) & !31 == load(frame::GS_BASE)).expect("the GS base load");
+        let with = |n: u32, w: u32| {
+            let mut o = gs.1.clone();
+            o[g.code_offset as usize + n as usize..][..4].copy_from_slice(&w.to_le_bytes());
+            (gs.0.clone(), o)
+        };
+        refused(admit(&with(n, gword(n) & 31 | load(frame::FS_BASE)), true, [true, false]), "does not come from the segment's base");
+        // The address formed without the base (the add after the load, both its sources the offset): refused under either
+        // identity, which is what FEX's MOVD and MOVNT stores once did.
+        let without = |w: u32, base: u32| {
+            let offset = if w >> 5 & 31 == base { w >> 16 & 31 } else { w >> 5 & 31 };
+            w & !(31 << 16 | 31 << 5) | offset << 16 | offset << 5
+        };
+        let add = (n + 4..g.code_region_end).step_by(4).find(|&a| gword(a) & 0x7f20_0000 == 0x0b00_0000).expect("the add of the base");
+        refused(admit(&with(add, without(gword(add), gword(n) & 31)), true, [false, false]), "does not come from the segment's base");
+        let sub_of = |o: &[u8]| sites(o).into_iter().find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap().1;
+        let c = sub_of(&checked.1);
+        let cadd = (c.imm as u32 + 4..h.code_region_end).step_by(4).find(|&a| word(&checked.1, a) & 0x7f20_0000 == 0x0b00_0000).expect("the add of the base");
+        let o = patched(&|o| o[code + cadd as usize..][..4].copy_from_slice(&without(word(&checked.1, cadd), word(&checked.1, c.imm as u32) & 31).to_le_bytes()));
+        refused(admit(&o, true, [true, false]), "does not come from the segment's base");
+        // A load of the limited FS's base field anywhere else (here in the place of the first word of `inc eax` before
+        // the GS instruction): the frame rule.
+        let two = compile("4065ff03c3", &[]);
+        admit(&two, true, [true, false]).unwrap();
+        let t: Header = super::super::record(&two.1, 0);
+        let first = super::super::record::<PcEntry>(&two.1, t.pcs_offset as usize).native_offset;
+        let mut o = two.1.clone();
+        o[t.code_offset as usize + first as usize..][..4].copy_from_slice(&(load(frame::FS_BASE)).to_le_bytes());
+        refused(admit(&(two.0.clone(), o), true, [true, false]), "base of a limited FS or GS");
+        // A unit too long for the test's `tbnz` to reach its stub has fexc's far form (`tbz x2, #63, +8; b stub`); no block
+        // that long is admitted, so admission knows only the near form.
+        let long = compile(&format!("64ff03{}c3", "0fa5c8".repeat(700)), &["--fs-limited"]); // (700 shld eax, ecx, cl: code, no sites)
+        let l: Header = super::super::record(&long.1, 0);
+        let far = sub_of(&long.1);
+        let lword = |n: u32| u32::from_le_bytes(long.1[l.code_offset as usize + n as usize..][..4].try_into().unwrap());
+        assert_eq!((lword(far.guest_offset2 + 8), lword(far.guest_offset2 + 12) >> 26), (0xb6f8_0042, 5));
+        refused(admit(&long, true, [true, false]), "code layout");
+        // The check's place and continuation are the record's: a `sub` word elsewhere, a continuation far from it.
+        refused(admit(&patched(&|o| o[at + offset_of!(Site, guest_offset2)..][..4].copy_from_slice(&(sub - 4).to_le_bytes())), true, [true, false]), "operand check");
+        refused(admit(&patched(&|o| o[at + offset_of!(Site, guest_offset2)..][..4].copy_from_slice(&8u32.to_le_bytes())), true, [true, false]), "its place");
+        refused(admit(&patched(&|o| o[at + offset_of!(Site, imm)..][..4].copy_from_slice(&(check.imm as u32 + 64).to_le_bytes())), true, [true, false]), "its continuation");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

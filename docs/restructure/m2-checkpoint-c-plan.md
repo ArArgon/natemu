@@ -530,14 +530,36 @@ code review):
   `fexc-address32` and `fexc-precision-32` passed; `tests/smp` `compat-kvm` `amd-generic`: the 85 generic cases have
   the fixture's expectations on an AMD Ryzen 7 8845HS under KVM.
 
+After the code review (November 23, 2026):
+
+- **Seven forms passed the check and then accessed memory without the segment's base**: MOVD m32 from an MM or XMM
+  register, VMOVD m32, MOVNTPS, MOVNTPD, MOVNTDQ and MOVNTDQA. Their handlers took the operand's address without a
+  base (upstream FEX's code, for every mode, so 64-bit code and Linux's TLS segment were affected as well as limited
+  segments). FEX `50ab9a6` gives them the base; that changes the code of the FS- and GS-prefixed forms of these
+  instructions in 64-bit code too.
+- **Admission now makes that hole impossible for 32-bit code** (`Verifier::segment_bases`): every access of an
+  instruction through FS or GS must compute its address from the segment's base, the check's `mov wB, w1` under a
+  limited segment or the load of the segment's field otherwise, through a chain of adds and moves. The design's
+  claim that "the base comes from the check alone" said nothing about an access that adds no base at all.
+- The check is a fault point for fexc's precision pass, not a commit (fexc died on a floating-point instruction
+  through a limited segment with an x87 or SIMD exception unmasked; found by the pending-#MF case, which exists now).
+- A missing check stops the compile instead of failing the decode; the far form of the check's test is not admitted
+  (no admitted block is long enough to need it).
+- The sweep also covers `[disp32]`, `[ebx+ecx*4+disp32]`, GS, the instruction second in its unit and unmasked
+  floating-point exceptions (55,531 units), asserts that fexc answers every request, that nothing is translated only
+  without the check, and that the unchecked `[ebx]` unit is admitted too.
+- The wrapped load completion accepts only zero-extending loads and the widths that can occur; straddle cases for
+  8-, 16- and 32-byte vector loads, a 16-byte store and the x87 integer loads; the kept x87 integer's register is tied
+  to the store's by admission.
+
 Not done, or not verified:
 
-- The case "pending #MF before the segment #GP" was not written (it needs a #MF gate and CR0.NE in the fixture). The
-  order holds by construction: the backend's pending check is emitted at the instruction's start, before the handler
-  decodes the operand.
-- A straddle through a site kind the completion does not handle (vector element loads, if any reach an abort) stops
-  loudly (`SITE_MISMATCH`); no case exercises one.
-- `compat-tls-natemu`'s new variants assemble but have not been run.
+- No case reaches the completion's `SITE_MISMATCH` stops: every site kind and width admission allows for an access
+  that can run across 4 GiB is handled (a byte cannot; aligned 16- and 32-byte accesses cannot; stores go through
+  their split stubs), so the stops are reachable only by a compiler change.
+- A check placed after an access of its instruction cannot be forged from a real object without moving code, so the
+  mutation test does not have it; the other refusals of the check's rule are each exercised.
+- 64-bit code is outside admission's source decode: the seven fixed forms there rest on the FEX fix and three VM cases.
 
 ## 3. Admit mixed-mode transfers
 

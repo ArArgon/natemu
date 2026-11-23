@@ -31,8 +31,8 @@ needs = { cores = 1, perf = true }
 
 [[suite]]
 name = "rust-fs-sweep"
-# M2 checkpoint C: admission's sweep of every 32-bit memory form through a limited FS (about 100,000 compiles on eight
-# threads, under three minutes): on its own, so the other Rust tests do not wait for it.
+# M2 checkpoint C: admission's sweep of every 32-bit memory form through a limited FS or GS (about 170,000 compiles on
+# eight threads, four to five minutes): on its own, so the other Rust tests do not wait for it.
 kind = "units"
 harness = "units"
 params = { tool = "nextest", fexc = true, filter = "test(/every_limited_fs_form/)" }

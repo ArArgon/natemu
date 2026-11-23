@@ -300,8 +300,8 @@ pub mod cache {
     pub const L1_TABLES: usize = 4;
     /// Tables per shadow space (privilege class): one 2 MiB block of data tables.
     pub const L1_SPACE_TABLES: usize = 2;
-    /// Two last-probed tags of the first user table hold the resident's current compatibility
-    /// FS/GS dword views. Their native targets are always DISPATCH_MISS; they have no L1 owner.
+    /// Two last-probed tags of the first user table hold the resident's current FS and GS records for
+    /// 32-bit user code ([`super::Cpu::compat_segment_records`]). Their native targets are always DISPATCH_MISS; they have no L1 owner.
     pub const SEGMENT_TABLE: usize = L1_SPACE_TABLES;
     pub const SEGMENT_SLOTS: [usize; 2] = [L1_WAYS + 1, 2 * L1_WAYS + 1];
     pub const fn segment_slot(table: usize, slot: usize) -> bool {

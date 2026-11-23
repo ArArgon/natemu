@@ -3557,7 +3557,8 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     // ([`frame::X87_INT`]; 32-bit code, where the FISTP that starts a unit looks for it).
     // (At the split stub of such a store, one that crosses a page, the mark is its access's.)
     // (M2 checkpoint C: at the instruction's operand check, which precedes the store, the mark is the instruction's store's;
-    // the integer is in that store's register since the FILD.)
+    // the integer is in that store's register since the FILD: admission holds the code to it, no write of that register
+    // between the check and the store, `Verifier::segment_checks`.)
     let store = if site.kind == object::kind::SPLIT {
         sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset).ok().map(|i| sites[i])
     } else if site.kind == object::kind::SEGMENT {
@@ -4269,7 +4270,7 @@ fn compat_pages(c: &Cpu, address: u64, width: u64) -> Option<[Option<u64>; 2]> {
 
 /// M2 checkpoint C: a native load of 32-bit code through FS or GS whose bytes wrap from FFFF_FFFFH to 0 ([`straddle`]
 /// allowed it), made here: both pages walked for reading before anything changes, the bytes copied from the two spans,
-/// the transfer register(s) written as the load instruction at `elr` writes them, and generated code resumed after it,
+/// the transfer register(s) written as the load instruction at `elr` writes them (zero-extended), and generated code resumed after it,
 /// where it computes the x86 result and flags as for any load. So no x86 instruction is named: the native load is all
 /// that is completed. #AC under alignment checking (the access is misaligned) and a data breakpoint (the instruction
 /// then runs alone) as for a page-crossing access; a device page on either side is refused, unassigned ones read as ones.
@@ -4280,7 +4281,7 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
     let fpr = site.data_class == object::CLASS_FPR;
     if !matches!(site.kind, object::kind::LOAD | object::kind::LOAD_PAIR)
         || site.writeback != object::WB_NONE
-        || !matches!((pair, fpr, width), (false, false, 2 | 4 | 8) | (false, true, 2 | 4 | 8 | 16) | (true, false, 16) | (true, true, 32))
+        || !matches!((pair, fpr, width), (false, false, 2 | 4 | 8) | (false, true, 2 | 4 | 8 | 16) | (true, true, 32))
     {
         halt(&s, stop::SITE_MISMATCH)
     }
@@ -4329,8 +4330,9 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
     if s.cpu.dr[5] & DR7_ENABLES != 0 {
         s.debug |= hits << debug::HITS;
     }
-    // The load word: a general register is zero-extended unless the word is an LDRS* (opc 1x of the load/store register
-    // class, V = 0: to 64 bits, or to 32 with opc 11).
+    // The load word zero-extends a general register (fexc emits no sign-extending load: it extends afterwards); a word
+    // that would not is none this completion knows. (A general-register pair is MOVAPS's aligned 16 bytes, which cannot
+    // run across 4 GiB: refused above.)
     let at = elr.wrapping_sub(natemu_abi::execution::cache::CODE_VA);
     let word = if let Some(o) =
         elr.checked_sub(natemu_abi::execution::cache::SLOT_VA).filter(|&o| o < natemu_abi::execution::cache::SLOT_BYTES as u64)
@@ -4339,6 +4341,9 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
     } else {
         unsafe { ((natemu_abi::execution::cache::CODE_WRITE_VA + at) as *const u32).read_volatile() }
     };
+    if !fpr && word >> 27 & 7 == 7 && word >> 26 & 1 == 0 && word >> 23 & 1 == 1 {
+        halt(&s, stop::SITE_MISMATCH)
+    }
     let frame = unsafe { &raw mut (*shared()).captured };
     let (rt, rt2) = (usize::from(site.data_reg[0]) & 31, usize::from(site.data_reg[1]) & 31);
     let quad = |k: usize| u64::from_le_bytes(bytes[8 * k..8 * k + 8].try_into().unwrap());
@@ -4348,17 +4353,8 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
             if pair {
                 (*frame).q[rt2].copy_from_slice(&bytes[16..]);
             }
-        } else if pair {
-            for (r, k) in [(rt, 0), (rt2, 1)] {
-                if r != 31 {
-                    (*frame).x[r] = quad(k);
-                }
-            }
         } else if rt != 31 {
-            let signed = word >> 27 & 7 == 7 && word >> 26 & 1 == 0 && word >> 23 & 1 == 1;
-            let shift = 64 - 8 * width as u32;
-            let value = if signed { ((quad(0) << shift) as i64 >> shift) as u64 } else { quad(0) };
-            (*frame).x[rt] = if signed && word >> 22 & 1 == 1 { value & 0xffff_ffff } else { value };
+            (*frame).x[rt] = quad(0);
         }
         s.splits += 1;
         write_record(record(), &s);
