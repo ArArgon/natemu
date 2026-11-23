@@ -2114,7 +2114,7 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // Every segment/base or mode change that returns to native code comes through this full
     // entry, including a fast SYSRET. A link, fast miss, or precise retry keeps the same hidden
     // descriptors; while 64-bit code runs (including inline SWAPGS), neither view is published.
-    cache::publish_segment_view(s.cpu.compat_dword_segments());
+    cache::publish_segment_view(s.cpu.compat_segment_records());
     s.mid_string = 0; // the next resident entry is at another boundary
     // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
     // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms
@@ -3935,20 +3935,19 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             watch::hit(s, f, b, &site, elr, spsr)
         }
         match site.kind {
-            // Resume at the compiler's checked continuation. An exception instead banks the original
-            // register and flag roots at the instruction and abandons that native continuation.
+            // M2 checkpoint C: an instruction's operand check through a limited FS or GS, whose inline test failed or whose
+            // segment the record does not model (read-only, expand-down, a code segment): the bank's descriptor decides. A
+            // fault is at the instruction (the state before it, as at any site); else generated code goes on after the
+            // check with the base in x1. An operand whose bytes then run across 4 GiB is the access's business
+            // ([`wrapped`]).
             object::kind::SEGMENT => {
-                let offset = f.x[0] as u32;
-                let va = match segments::operand(&s.cpu, u32::from(site.segment), u64::from(offset), u64::from(site.width), site.intent == object::INTENT_WRITE) {
-                    Ok(va) => va,
-                    Err(e) => guest_fault(s, f, b, &site, e),
-                };
-                // The native transfer is contiguous. A linear straddle requires a two-span access transaction.
-                if segments::outside(&s.cpu, va, u64::from(site.width)) {
-                    wrapped_segment_access(s, f, b, &site, va, spsr);
+                cache::control().segment_checks += 1;
+                let offset = f.x[usize::from(site.base_reg)] as u32;
+                if let Err(e) = segments::operand(&s.cpu, u32::from(site.segment), u64::from(offset), u64::from(site.width), site.intent == object::INTENT_WRITE) {
+                    guest_fault(s, f, b, &site, e)
                 }
                 let frame = &raw mut (*shared()).captured;
-                (*frame).x[0] = va;
+                (*frame).x[1] = u64::from(s.cpu.seg[usize::from(site.segment)].base as u32);
                 write_record(record(), &s);
                 resume(&s, frame, b.code_va() + site.imm as u64, spsr)
             }
@@ -4077,140 +4076,6 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site, spsr: u64
     unsafe { dispatch(&mut s) }
 }
 
-/// A bank-checked operand whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
-/// single architectural access here, before a native store probe or any guest byte is touched.
-fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va: u64, spsr: u64) -> ! {
-    let width = u64::from(site.width);
-    let write = site.intent == object::INTENT_WRITE;
-    // The ordinary MOVUPS-class abort path completes an 8-byte-aligned Q load under #AC.
-    let align = width.min(8);
-    if alignment_check(&s.cpu) != 0 && va & (align - 1) != 0 {
-        guest_fault(s, f, b, site, [17, 0, 0]);
-    }
-    let rmw = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU;
-    let exchange = site.data_reg[1] & 0xf0 == object::SEGMENT_XCHG;
-    let compare_exchange = site.data_reg[1] & 0xf0 == object::SEGMENT_CMPXCHG;
-    let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
-    if native && b.flags & cache::STEP == 0 {
-        // The private instruction slot survives page-table A/D writes and delivers data breakpoints
-        // after the native ALU has committed its result and flags.
-        step_from(s, f, b, site);
-    }
-    if !native {
-        // A MOV store can invalidate its own source block. Own its architectural roots before walking.
-        bank_at(&mut s, f, b, site);
-    }
-    // For an immediate store the checked native transfer register already holds the exact literal.
-    // Capture it before copying either half; the ordinary store and its split probes use the same register.
-    let [reg, result_and_length] = site.data_reg;
-    let length = result_and_length & 15;
-    let native_store = reg & object::SEGMENT_STORE_REGISTER != 0;
-    let alu = reg >> 3;
-    let reg = usize::from(if rmw { reg & 7 } else { reg & !object::SEGMENT_STORE_REGISTER });
-    let old = if native_store { f.x[reg] } else { s.cpu.gpr[reg] };
-    let mut value = if write { old.to_le_bytes() } else { [0; 8] };
-    let mut quad = [0; 16];
-    let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
-        Ok(pages) => pages,
-        Err([vector, error, cr2]) if native => guest_fault(s, f, b, site, [vector, cr2, error]),
-        Err(e) => {
-            deliver(&mut s, Event::Exception(e));
-            unsafe { dispatch(&mut s) }
-        }
-    };
-    let mixed = gpa.iter().any(|&p| !mmio::ram(p));
-    if mixed {
-        if exchange || compare_exchange {
-            mmio::stop_with(&s, natemu_abi::execution::mmio::ATOMIC)
-        }
-        // A write-intent RMW load has no scalar MMIO completion, including for an unassigned
-        // or firmware page. Both write walks have succeeded; no ALU effect has committed.
-        if rmw {
-            mmio::stop_with(&s, natemu_abi::execution::mmio::FORM)
-        }
-        let supported = if write {
-            gpa.iter().all(|&p| mmio::ram(p) || mmio::rom(p))
-        } else {
-            let device = gpa.map(|p| (!mmio::ram(p)).then_some(p));
-            mmio::ones(&mut s, f, b, site, [Some(va), Some(0)], device)
-        };
-        if !supported {
-            mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::CROSSING)
-        }
-        // Classifying a page or installing its shadow can serve a peer's shadow drop.
-        split_wait(&mut s, &gpa);
-    }
-    let first = ((1u64 << 32) - va) as usize;
-    // The existing split completion orders the transfer before subsequent guest memory operations.
-    unsafe { asm!("dmb ish") };
-    if compare_exchange {
-        use natemu_abi::interp::{exec, op};
-        let accumulator = s.cpu.gpr[0];
-        let [loaded, _] = split_atomic(&mut s, gpa, width, width, |loaded, _, mask| {
-            [if accumulator & mask == loaded { old } else { loaded }, 0]
-        });
-        let (_, flags) = exec::alu(op::SUB, accumulator as u32, loaded as u32, false, width as u8);
-        s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);
-        if flags & exec::ZF == 0 {
-            s.cpu.gpr[0] = if width == 2 { accumulator & !0xffff | loaded } else { loaded };
-        }
-    } else if exchange {
-        // A byte cannot straddle. The old banked word/dword supplies the swap, then receives the old RAM value.
-        let [loaded, _] = split_atomic(&mut s, gpa, width, width, |_, _, _| [old, 0]);
-        s.cpu.gpr[reg] = if width == 2 { old & !0xffff | loaded } else { loaded };
-    } else if rmw {
-        // Only word and dword operands can straddle. Both physical spans, the source register
-        // and incoming CF belong to this instruction until its non-atomic write commits.
-        use natemu_abi::interp::exec;
-        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], false);
-        unsafe { asm!("dmb ish") };
-        let (result, flags) = exec::alu(alu, u64::from_le_bytes(value) as u32, old as u32, s.cpu.rflags & 1 != 0, width as u8);
-        value = u64::from(result).to_le_bytes();
-        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], true);
-        s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);
-    } else {
-        let bytes = if width == 16 { &mut quad[..] } else { &mut value[..width as usize] };
-        if mixed {
-            segments::copy_mixed(&mut s, gpa, first, bytes, write);
-        } else {
-            segments::copy_ram(&mut s, gpa, first, bytes, write);
-        }
-    }
-    unsafe { asm!("dsb ish") };
-    watch::access(&mut s, va, width, write);
-    if native {
-        let sites = cache::sites(b);
-        let Ok(index) = sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset) else { halt(&s, stop::SITE_MISMATCH) };
-        let access = sites[index];
-        // Restore the exact native address and transfer at the step slot's continuation.
-        // A Q load commits its XMM and (for VEX) clears its upper half in the original code.
-        unsafe {
-            let frame = &raw mut (*shared()).captured;
-            (*frame).x[0] = va;
-            (*frame).x[usize::from(access.base_reg)] = va;
-            let rt = usize::from(access.data_reg[0]);
-            if width == 16 {
-                (*frame).q[rt] = quad;
-            } else {
-                (*frame).x[rt] = u64::from_le_bytes(value);
-            }
-            write_record(record(), &s);
-            resume(&s, frame, b.code_va() + u64::from(access.native_offset) + 4, spsr)
-        }
-    }
-    if !write {
-        let bits = 64 - width * 8;
-        let shifted = u64::from_le_bytes(value) << bits;
-        let loaded = if result_and_length & 0x40 != 0 { ((shifted as i64) >> bits) as u64 } else { shifted >> bits };
-        let dest32 = result_and_length & 0x20 != 0 || width == 4;
-        s.cpu.gpr[reg] = if dest32 { loaded as u32 as u64 } else { old & !0xffff | loaded & 0xffff };
-    }
-    (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
-    s.cpu.rip = segments::wrap(&s.cpu, s.cpu.rip.wrapping_add(u64::from(length)));
-    completed(&mut s);
-    unsafe { dispatch(&mut s) }
-}
-
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
 unsafe fn access_aborted(
     mut s: State,
@@ -4247,11 +4112,19 @@ unsafe fn access_aborted(
                 resume(&s, frame, elr, spsr)
             }
         }
+        // M2 checkpoint C: through FS or GS such an access is the segment's to judge (its bytes wrap to linear 0 when the
+        // operand lies within the limit, [`straddle`]): a load is made here over the two pages; a LOCKed access or XCHG
+        // goes on to its split lock below (it crosses 16 bytes); a store was caught by its split stub ([`split`]).
         if address.saturating_add(width) > 1 << 32 {
-            guest_fault(s, f, b, site, noncanonical(site))
+            if let Err(e) = straddle(&s.cpu, site, address, width, write) {
+                guest_fault(s, f, b, site, e)
+            }
+            if !swap {
+                unsafe { wrapped_load(s, f, b, site, address, elr, spsr) }
+            }
         }
     }
-    let touched = pages(address, width);
+    let touched = compat_pages(&s.cpu, address, width);
     let alignment = esr & 63 == 0x21 && esr >> 26 == 0x24;
     // CMPXCHG16B (a 16-byte caspal) on an operand that is not 16-byte aligned: #GP(0) (SDM CMPXCHG16B), checked before the
     // address is translated (QEMU's order; Arm ARM abort prioritization: an alignment fault from the instruction's own
@@ -4351,6 +4224,117 @@ unsafe fn access_aborted(
     unsafe {
         write_record(record(), &s);
         resume(&s, &raw const (*shared()).captured, elr, spsr)
+    }
+}
+
+/// M2 checkpoint C: whether an access of 32-bit code whose bytes run across 4 GiB is legal. Through a flat segment it is
+/// the limit fault it always was (#GP(0), #SS(0) through SS). Through FS or GS (the site's tag, which admission holds to
+/// the instruction's operand) the loaded descriptor decides at the offset the address stands for: within the limit and
+/// of a permitted kind, the linear address wraps and the bytes continue at 0 (the AMD reference machine, tests/smp
+/// `compat-kvm`); else the segment's fault. This is exact whether the block checked the operand inline (a limited
+/// segment) or not (a 4 GiB one with a base).
+fn straddle(c: &Cpu, site: &Site, address: u64, width: u64, write: bool) -> Result<(), segments::Exception> {
+    if !matches!(site.segment, object::SEG_FS | object::SEG_GS) {
+        return Err(noncanonical(site));
+    }
+    let offset = (address as u32).wrapping_sub(c.seg[usize::from(site.segment)].base as u32);
+    segments::operand(c, u32::from(site.segment), u64::from(offset), width, write).map(|_| ())
+}
+
+/// [`pages`], with the second page of an access that [`straddle`] allowed at linear 0.
+fn compat_pages(c: &Cpu, address: u64, width: u64) -> Option<[Option<u64>; 2]> {
+    let wrap = |va: u64| if c.code_mode() == Some(CodeMode::Bits64) { va } else { va & 0xffff_ffff };
+    pages(address, width).map(|[first, second]| [first, second.map(wrap)])
+}
+
+/// M2 checkpoint C: a native load of 32-bit code through FS or GS whose bytes wrap from FFFF_FFFFH to 0 ([`straddle`]
+/// allowed it), made here: both pages walked for reading before anything changes, the bytes copied from the two spans,
+/// the transfer register(s) written as the load instruction at `elr` writes them, and generated code resumed after it,
+/// where it computes the x86 result and flags as for any load. So no x86 instruction is named: the native load is all
+/// that is completed. #AC under alignment checking (the access is misaligned) and a data breakpoint (the instruction
+/// then runs alone) as for a page-crossing access; a device page on either side is refused, unassigned ones read as ones.
+#[inline(never)]
+unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, address: u64, elr: u64, spsr: u64) -> ! {
+    let width = usize::from(site.width);
+    let pair = site.kind == object::kind::LOAD_PAIR;
+    let fpr = site.data_class == object::CLASS_FPR;
+    if !matches!(site.kind, object::kind::LOAD | object::kind::LOAD_PAIR)
+        || site.writeback != object::WB_NONE
+        || !matches!((pair, fpr, width), (false, false, 2 | 4 | 8) | (false, true, 2 | 4 | 8 | 16) | (true, false, 16) | (true, true, 32))
+    {
+        halt(&s, stop::SITE_MISMATCH)
+    }
+    if alignment_check(&s.cpu) != 0 && !(width >= 16 && fpr && address & 7 == 0) {
+        guest_fault(s, f, b, site, [17, 0, 0])
+    }
+    let first = ((1u64 << 32) - address) as usize;
+    let hits = data_hits(&s.cpu.dr, address, first as u64, false) | data_hits(&s.cpu.dr, 0, (width - first) as u64, false);
+    if s.cpu.dr[5] & DR7_ENABLES != 0 && hits != 0 && b.flags & cache::STEP == 0 {
+        step_from(s, f, b, site)
+    }
+    let mut gpa = [0; 2];
+    for (k, va) in [address, 0].into_iter().enumerate() {
+        let Some((pa, _)) = translate(&mut s, f, b, site, va, Access::Read) else {
+            unsafe {
+                write_record(record(), &s);
+                resume(&s, &raw const (*shared()).captured, elr, spsr)
+            }
+        };
+        gpa[k] = pa & !4095 | va & 4095;
+    }
+    let mixed = gpa.iter().any(|&p| !mmio::ram(p));
+    if mixed {
+        let device = gpa.map(|p| (!mmio::ram(p)).then_some(p));
+        if !mmio::ones(&mut s, f, b, site, [Some(address), Some(0)], device) {
+            mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::CROSSING)
+        }
+    }
+    split_wait(&mut s, &gpa);
+    let mut bytes = [0u8; 32];
+    unsafe { asm!("dmb ish") };
+    if mixed {
+        segments::copy_mixed(&mut s, gpa, first, &mut bytes[..width], false);
+    } else {
+        segments::copy_ram(&mut s, gpa, first, &mut bytes[..width], false);
+    }
+    unsafe { asm!("dsb ish") };
+    if s.cpu.dr[5] & DR7_ENABLES != 0 {
+        s.debug |= hits << debug::HITS;
+    }
+    // The load word: a general register is zero-extended unless the word is an LDRS* (opc 1x of the load/store register
+    // class, V = 0: to 64 bits, or to 32 with opc 11).
+    let at = elr.wrapping_sub(natemu_abi::execution::cache::CODE_VA);
+    let word = if let Some(o) =
+        elr.checked_sub(natemu_abi::execution::cache::SLOT_VA).filter(|&o| o < natemu_abi::execution::cache::SLOT_BYTES as u64)
+    {
+        unsafe { ((natemu_abi::execution::cache::SLOT_WRITE_VA + o) as *const u32).read_volatile() }
+    } else {
+        unsafe { ((natemu_abi::execution::cache::CODE_WRITE_VA + at) as *const u32).read_volatile() }
+    };
+    let frame = unsafe { &raw mut (*shared()).captured };
+    let (rt, rt2) = (usize::from(site.data_reg[0]) & 31, usize::from(site.data_reg[1]) & 31);
+    let quad = |k: usize| u64::from_le_bytes(bytes[8 * k..8 * k + 8].try_into().unwrap());
+    unsafe {
+        if fpr {
+            (*frame).q[rt].copy_from_slice(&bytes[..16]);
+            if pair {
+                (*frame).q[rt2].copy_from_slice(&bytes[16..]);
+            }
+        } else if pair {
+            for (r, k) in [(rt, 0), (rt2, 1)] {
+                if r != 31 {
+                    (*frame).x[r] = quad(k);
+                }
+            }
+        } else if rt != 31 {
+            let signed = word >> 27 & 7 == 7 && word >> 26 & 1 == 0 && word >> 23 & 1 == 1;
+            let shift = 64 - 8 * width as u32;
+            let value = if signed { ((quad(0) << shift) as i64 >> shift) as u64 } else { quad(0) };
+            (*frame).x[rt] = if signed && word >> 22 & 1 == 1 { value & 0xffff_ffff } else { value };
+        }
+        s.splits += 1;
+        write_record(record(), &s);
+        resume(&s, frame, elr + 4, spsr)
     }
 }
 
@@ -4509,8 +4493,11 @@ unsafe fn split(
     // writeback below are made from the wrapped address.
     if s.cpu.code_mode() != Some(CodeMode::Bits64) {
         address &= 0xffff_ffff;
-        if address + width as u64 > 1 << 32 {
-            guest_fault(s, f, b, stub, noncanonical(stub))
+        // M2 checkpoint C: through FS or GS the store wraps to linear 0 when the segment allows it ([`straddle`]).
+        if address + width as u64 > 1 << 32
+            && let Err(e) = straddle(&s.cpu, &access, address, width as u64, true)
+        {
+            guest_fault(s, f, b, stub, e)
         }
     }
     // S4: a page-crossing store meeting a data breakpoint traps after its instruction: run alone (its step block's split
@@ -4521,8 +4508,8 @@ unsafe fn split(
         }
         s.debug |= data_hits(&s.cpu.dr, address, width as u64, true) << debug::HITS;
     }
-    let Some([Some(first), Some(second)]) = pages(address, width as u64) else {
-        match pages(address, width as u64) {
+    let Some([Some(first), Some(second)]) = compat_pages(&s.cpu, address, width as u64) else {
+        match compat_pages(&s.cpu, address, width as u64) {
             None => guest_fault(s, f, b, stub, noncanonical(stub)),
             Some(_) => halt(&s, stop::SITE_MISMATCH), // the check fired for an access within one page
         }
@@ -4641,7 +4628,7 @@ unsafe fn split_lock(
         s.debug |= data_hits(&s.cpu.dr, address, width, true) << debug::HITS;
     }
     let mut gpa = [u64::MAX; 2];
-    let touched = pages(address, width).into_iter().flatten().flatten();
+    let touched = compat_pages(&s.cpu, address, width).into_iter().flatten().flatten();
     for (k, va) in touched.enumerate() {
         match translate(&mut s, f, b, site, va, Access::Write) {
             None => unsafe {

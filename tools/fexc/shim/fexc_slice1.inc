@@ -571,6 +571,25 @@ inline Verdict Bits32(const DecodedInst& d) {
   return {UNSUPPORTED, false, nullptr};
 }
 
+// M2: the segment of a 32-bit instruction's explicit memory operand, as a bit (FS 1, GS 2, DS 4, ES 8; 0: none, or SS/CS, never
+// null at CPL 3): a ModRM memory operand (not LEA's nor a prefetch's or a multi-byte NOP's, which access nothing), moffs, XLAT,
+// the ESI source of movs/cmps/lods, through the last segment prefix, else SS for an EBP or ESP base and DS for the rest.
+inline uint8_t FexcSegThrough(const DecodedInst& d) {
+  const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
+  const uint8_t mod = d.ModRM >> 6, op = d.OPRaw;
+  const bool one = d.FexcMap == FEXC_MAP_PRIMARY, two = d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66;
+  const bool modrm = has_modrm && mod != 3 && !(one && op == 0x8D) && !(two && (op == 0x0D || (op >= 0x18 && op <= 0x1F)));
+  const bool implicit = one && ((op >= 0xA0 && op <= 0xA7) || op == 0xAC || op == 0xAD || op == 0xD7);
+  if (!modrm && !implicit) return 0;
+  const uint8_t rm = d.ModRM & 7, base = d.SIB & 7;
+  const bool stack = modrm && ((rm == 5 && mod != 0) || (rm == 4 && (base == 4 || (base == 5 && mod != 0))));
+  const uint32_t seg = d.Flags & DecodeFlags::FLAG_SEGMENTS;
+  return seg == DecodeFlags::FLAG_FS_PREFIX ? 1 : seg == DecodeFlags::FLAG_GS_PREFIX ? 2 : seg == DecodeFlags::FLAG_DS_PREFIX ? 4 :
+         seg == DecodeFlags::FLAG_ES_PREFIX ? 8 : seg || stack ? 0 : 4;
+}
+// M2 checkpoint C: the instruction accesses memory through a limited FS or GS (fexc_limited_segments): FEX checks its operand.
+inline bool FexcSegLimited(const DecodedInst& d) { return fexc_bits32 && fexc_limited_segments && (FexcSegThrough(d) & fexc_limited_segments & 3); }
+
 inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (fexc_bits32) if (Verdict v = Bits32(d); v.why) return v;
   const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
@@ -761,16 +780,8 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       return Sys("compatibility string with a based source");
   }
   if (fexc_bits32 && fexc_null_segments) {
-    const bool one = d.FexcMap == FEXC_MAP_PRIMARY, two = d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66;
-    const bool modrm = has_modrm && mod != 3 && !(one && op == 0x8D) && !(two && (op == 0x0D || (op >= 0x18 && op <= 0x1F)));
-    const bool implicit = one && ((op >= 0xA0 && op <= 0xA7) || op == 0xAC || op == 0xAD || op == 0xD7);
-    const bool to_edi = one && ((op >= 0xA4 && op <= 0xA7) || op == 0xAA || op == 0xAB || op == 0xAE || op == 0xAF);
-    const uint8_t rm = d.ModRM & 7, base = d.SIB & 7;
-    const bool stack = modrm && ((rm == 5 && mod != 0) || (rm == 4 && (base == 4 || (base == 5 && mod != 0))));
-    const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
-    const uint8_t through = seg == DecodeFlags::FLAG_FS_PREFIX ? 1 : seg == DecodeFlags::FLAG_GS_PREFIX ? 2 : seg == DecodeFlags::FLAG_DS_PREFIX ? 4 :
-                            seg == DecodeFlags::FLAG_ES_PREFIX ? 8 : seg || stack ? 0 : 4;
-    if ((((modrm || implicit) ? through : 0) | (to_edi ? 8 : 0)) & fexc_null_segments) {
+    const bool to_edi = d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0xA4 && op <= 0xA7) || op == 0xAA || op == 0xAB || op == 0xAE || op == 0xAF);
+    if ((FexcSegThrough(d) | (to_edi ? 8 : 0)) & fexc_null_segments) {
       v = Sys("access through a null segment in 32-bit code (#GP)"); v.null_segment = true; return v;
     }
   }

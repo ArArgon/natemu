@@ -297,60 +297,35 @@ void Arm64JITCore::FexcX87Begin() {
 // x87 state in the guest-state page: `movz w0, #fn; svc #X87`, fn the D9 opcode's second byte. No register changes (x0 is FEX's
 // TMP1); the resident leaves NZCV and every register as they were, and admission accepts the svc only right after that movz in
 // that very instruction.
-DEF_OP(FexcStoreImmediate) {
-  const uint32_t Value = IROp->C<IR::IROp_FexcStoreImmediate>()->Value;
-  movz(ARMEmitter::Size::i32Bit, GetReg(Node), Value & 0xffff);
-  movk(ARMEmitter::Size::i32Bit, GetReg(Node), Value >> 16, 16);
-}
-
-DEF_OP(FexcSegmentAddress) {
-  const auto Op = IROp->C<IR::IROp_FexcSegmentAddress>();
-  // Keep the guest roots intact at the stub. Its only native output is w0, which is reserved between IR operations.
-  auto* Label = FexcStub(FEXC_SITE_SEGMENT, true);
-  auto& Site = fexc_sites.back();
-  Site.segment = Op->Segment;
-  Site.width = Op->Bytes;
-  Site.intent = Op->Write;
-  Site.data_reg[1] = Op->Result;
-  uint64_t Offset;
-  if (IsInlineConstant(Op->Offset, &Offset)) {
-    Site.base_reg = TMP1.Idx();
-    movz(ARMEmitter::Size::i32Bit, TMP1, Offset & 0xffff);
-    movk(ARMEmitter::Size::i32Bit, TMP1, Offset >> 16, 16);
-  } else {
-    Site.base_reg = GetReg(Op->Offset).Idx();
-    mov(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->Offset));
-  }
-  if (Op->InlineDword) {
-    // The AArch64 backend reserves TMP1..TMP4 from the guest static and dynamic register
-    // files. Keep the input offset in w0 until both cold edges; x1 and x2 are dead between IR ops.
-    using Sz = ARMEmitter::Size;
-    ARMEmitter::ForwardLabel Cold, Joined;
-    // The read-only user dispatcher block is next to x28's 2 MiB, before it only at L2 index 511.
-    and_(Sz::i64Bit, TMP2, STATE, ~uint64_t(0x1fffff));
-    ubfx(Sz::i64Bit, TMP3, STATE, 21, 9);
-    add(Sz::i64Bit, TMP3, TMP3, 1);
-    lsr(Sz::i64Bit, TMP3, TMP3, 9);
-    add(Sz::i64Bit, TMP2, TMP2, 512, true);
-    sub(Sz::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 22);
-    ldr(TMP2, TMP2, Op->Segment == 4 ? 48 : 80);
-    lsr(Sz::i64Bit, TMP3, TMP2, 32);
-    sub(Sz::i64Bit, TMP3, TMP3, 3);
-    sub(Sz::i64Bit, TMP3, TMP3, TMP1);
-    (void)tbnz(TMP3, 63, &Cold);
-    add(Sz::i32Bit, TMP2, TMP2, TMP1);
-    add(Sz::i64Bit, TMP3, TMP2, 3);
-    (void)tbnz(TMP3, 32, &Cold);
-    mov(Sz::i32Bit, TMP1, TMP2);
-    (void)b(&Joined);
-    (void)Bind(&Cold);
-    b_OrRestart(Label);
-    (void)Bind(&Joined);
-  } else {
-    b_OrRestart(Label);
-  }
-  Site.imm = int32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
-  mov(ARMEmitter::Size::i32Bit, GetReg(Node), TMP1);
+// M2 checkpoint C: the check of an instruction's operand through a limited FS or GS, and the segment's base. The record is
+// (limit + 1) << 32 | base for a writable expand-up data segment, else 0 (the resident decides): out of range, or record 0,
+// when (limit + 1) - W - offset is negative. W (the operand's width) is fexc's to fill in (JoinSites, from the instruction's
+// access sites): the `sub x2, x2, #W` is at the site's access_native_offset. No flag is written; x0..x2 are dead between IR ops.
+// The stub's `brk` leaves every register as it was: the resident reads the offset from its register (the site's base_reg) and
+// resumes at the continuation with the base in x1.
+DEF_OP(FexcSegmentBase) {
+  const auto Op = IROp->C<IR::IROp_FexcSegmentBase>();
+  using Sz = ARMEmitter::Size;
+  const auto Offset = GetReg(Op->Offset);
+  auto* Label = FexcStub(FEXC_SITE_SEGMENT, false);
+  const size_t Index = fexc_sites.size() - 1;
+  fexc_sites[Index].segment = Op->Segment;
+  fexc_sites[Index].base_reg = Offset.Idx();
+  // The read-only user dispatcher block is next to x28's 2 MiB, before it only at L2 index 511.
+  and_(Sz::i64Bit, TMP2, STATE, ~uint64_t(0x1fffff));
+  ubfx(Sz::i64Bit, TMP3, STATE, 21, 9);
+  add(Sz::i64Bit, TMP3, TMP3, 1);
+  lsr(Sz::i64Bit, TMP3, TMP3, 9);
+  add(Sz::i64Bit, TMP2, TMP2, 512, true);
+  sub(Sz::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 22);
+  ldr(TMP2, TMP2, Op->Segment == 4 ? 48 : 80);
+  lsr(Sz::i64Bit, TMP3, TMP2, 32);
+  fexc_sites[Index].access_native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);   // the word JoinSites fills in
+  sub(Sz::i64Bit, TMP3, TMP3, 0);
+  sub(Sz::i64Bit, TMP3, TMP3, Offset, ARMEmitter::ExtendedType::UXTW, 0);
+  tbnz_OrRestart(TMP3, 63, Label);
+  fexc_sites[Index].imm = int32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+  mov(Sz::i32Bit, GetReg(Node), TMP2);
 }
 
 // M2 task 4: FLDCW. `ldrh w0, [x28, #fcw]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, K; strh wN, [x28, #fcw]`: a word with

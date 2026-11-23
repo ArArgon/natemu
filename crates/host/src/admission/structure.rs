@@ -63,7 +63,7 @@ use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
 use natemu_abi::execution::{
-    DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, SRA32, bitmask, frame, svc,
+    DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, bitmask, frame, svc,
 };
 
 /// The 64-bit index forms (LSL, UXTX, SXTX) compute the same address: one extend value.
@@ -668,6 +668,11 @@ pub(super) struct Code<'a> {
     pub cpl0: bool,
     /// M2: 32-bit code: guest addresses wrap at 4 GiB and the ES/CS/SS/DS bases may be loaded ([`Verifier::frame_access`]).
     pub bits32: bool,
+    /// M2 checkpoint C, 32-bit code: the request was at CPL 3 (only there may an instruction have an FS or GS operand: the
+    /// operand check's record is the user dispatcher table's), and its FS, GS was a limited segment (the code identity's
+    /// bits: every instruction's operand through it is checked, [`Verifier::segment_checks`]).
+    pub cpl3: bool,
+    pub limited: [bool; 2],
 }
 
 impl Code<'_> {
@@ -699,20 +704,20 @@ struct Verifier<'a> {
     bulk: Vec<Range<u32>>,
     /// Stack check runs (fexc --push-run): [`Verifier::aligned`], computed with the code shape (after `stub_checks`).
     aligned_before: Vec<u32>,
-    /// Exactly the read-only tag loads proved by scalar_segment_checks before the per-word pass.
+    /// M2 checkpoint C: the loads of the read-only FS/GS records, each proved part of an operand check by `segment_checks`.
     segment_view_reads: Vec<u32>,
 }
 
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
 /// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26).
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
-    let guarded = scalar_operands(c)?;
-    // The guarded slice relies on the existing exact memory-word, split-probe and control-flow
-    // verifiers even in production. This also rejects unrecorded native transfers anywhere in its block.
-    let checked = Code { shape: c.shape || !guarded.is_empty(), ..*c };
+    let operands = segment_operands(c)?;
+    // A block with an operand check relies on the exact memory-word, stub and control-flow rules of the code shape, also in
+    // production: no native access of it is unrecorded.
+    let checked = Code { shape: c.shape || !operands.is_empty(), ..*c };
     let c = &checked;
     let mut v = Verifier::new(c)?;
-    v.scalar_segment_checks(&guarded)?;
+    v.segment_checks(&operands)?;
     v.words()?;
     v.exits()?;
     if c.shape {
@@ -733,36 +738,36 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
     Ok((v.links, v.dispatch, !v.bulk.is_empty()))
 }
 
-/// Decode the complete source stream independently of the producer's PC table. A matching prefix
-/// byte inside a displacement or immediate is ordinary data.
-#[derive(Clone, Copy, PartialEq)]
-enum IntegerStore { Setcc, Reverse, NonTemporal }
-
-struct ScalarOperand {
+/// M2 checkpoint C: an instruction's memory operand through a limited FS or GS, from an independent decode of the source.
+struct SegmentOperand {
     offset: u32,
     segment: u8,
     width: u8,
-    write: u8,
-    data_reg: u8,
-    store_immediate: Option<u32>,
-    inline_dword: bool,
-    integer_store: Option<IntegerStore>,
-    result_and_length: u8,
-    absolute_offset: Option<u32>,
-    xlat: bool,
-    vex_qmove: bool,
-    qmove_offset: Option<[u32; 9]>,
+    write: bool,
 }
 
-fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
-    use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+/// M2 checkpoint C. Decodes the whole source of a 32-bit block, independently of the producer's PC table and of any list of
+/// instruction forms (a prefix byte inside a displacement or an immediate is ordinary data), and returns the operands that
+/// need a check: each instruction's memory operand through FS or GS when that segment is limited (`c.limited`), with the
+/// operand's width and whether the instruction can write it (a conditional write is a write, a conditional read a read;
+/// LEA and the hint NOPs access nothing). Refused here: an FS or GS operand in a block that is not CPL 3; an access site
+/// whose segment tag is not its instruction's FS or GS (the resident judges an access that runs across 4 GiB by that tag);
+/// a based string, which is the resident's.
+fn segment_operands(c: &Code) -> Result<Vec<SegmentOperand>, String> {
+    use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, OpAccess, Register};
+    use object::kind::*;
     let src = &c.source[..c.guest_bytes as usize];
-    let mut guarded = Vec::new();
+    let tagged = |s: &Site| matches!(s.segment, object::SEG_FS | object::SEG_GS);
+    let mut found = Vec::new();
     if !c.bits32 || !src.iter().any(|b| matches!(b, 0x64 | 0x65)) {
-        return Ok(guarded);
+        if c.accesses.iter().chain(c.stubs).any(|s| tagged(s) || s.kind == SEGMENT) {
+            return Err("an FS or GS site in a block without an FS or GS prefix".into());
+        }
+        return Ok(found);
     }
-    let mut starts = Vec::new();
+    let mut factory = InstructionInfoFactory::new();
     let mut decoder = Decoder::new(32, src, DecoderOptions::NONE);
+    let mut starts = Vec::new();
     while decoder.can_decode() {
         let g = decoder.position() as u32;
         let i = decoder.decode();
@@ -773,156 +778,142 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             return Err("based compatibility string must be a system transaction".into());
         }
         starts.push(g);
-        if !i.op_kinds().any(|k| k == OpKind::Memory) { continue; }
-        let seg = match i.memory_segment() { Register::FS => 4, Register::GS => 5, _ => continue };
-        let moffs = matches!(i.code(), Code::Mov_AL_moffs8 | Code::Mov_AX_moffs16 | Code::Mov_EAX_moffs32
-            | Code::Mov_moffs8_AL | Code::Mov_moffs16_AX | Code::Mov_moffs32_EAX);
-        if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
-        let vex_qmove = matches!(i.code(), Code::VEX_Vmovups_xmm_xmmm128 | Code::VEX_Vmovupd_xmm_xmmm128);
-        let qmove = vex_qmove || matches!(i.code(), Code::Movups_xmm_xmmm128 | Code::Movupd_xmm_xmmm128);
-        let encoded = &src[g as usize..decoder.position()];
-        if qmove && encoded[..crate::system::opcode_at(encoded).0].contains(&0x67) {
-            return Err("unsupported 16-bit packed MOV address".into());
+        let mut through = None;
+        for m in factory.info(&i).used_memory() {
+            let segment = match m.segment() {
+                Register::FS => object::SEG_FS,
+                Register::GS => object::SEG_GS,
+                _ => continue,
+            };
+            let write = match m.access() {
+                OpAccess::Read | OpAccess::CondRead => false,
+                OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite => true,
+                _ => continue,
+            };
+            let Ok(width) = u8::try_from(m.memory_size().size()) else {
+                return Err(format!("FS or GS operand at guest offset {g:#x}: its width"));
+            };
+            if through.replace((segment, width, write)).is_some() {
+                return Err(format!("two FS or GS operands at guest offset {g:#x}"));
+            }
         }
-        let xlat = i.code() == Code::Xlat_m8;
-        if xlat && (i.memory_base() != Register::EBX || i.memory_index() != Register::AL) {
-            return Err("unsupported 16-bit XLAT address".into());
+        // The instruction's own accesses of its explicit operand carry the tag; its stack accesses (push and pop kinds) and
+        // every site of an instruction without such an operand do not.
+        for a in c.accesses.iter().chain(c.stubs).filter(|a| a.guest_offset == g && a.kind != SEGMENT) {
+            let explicit = !matches!(a.kind, PUSH | POP | PUSH_PAIR | POP_PAIR);
+            let expected = through.filter(|_| explicit).map(|t| t.0);
+            let stub = a.native_offset >= c.stubs.first().map_or(u32::MAX, |s| s.native_offset);
+            // (A stub's tag is its access's; the stubs that cover no access have none.)
+            if if stub { tagged(a) && expected != Some(a.segment) } else { expected.unwrap_or(a.segment) != a.segment || (tagged(a) && expected.is_none()) } {
+                return Err(format!("site at {:#x}: its segment is not its instruction's operand's", a.native_offset));
+            }
         }
-        let store_immediate = match i.code() {
-            Code::Mov_rm8_imm8 => Some(u32::from(i.immediate8())),
-            Code::Mov_rm16_imm16 => Some(u32::from(i.immediate16())),
-            Code::Mov_rm32_imm32 => Some(i.immediate32()),
-            _ => None,
-        };
-        let integer_store = match i.code() {
-            Code::Seto_rm8 | Code::Setno_rm8 | Code::Setb_rm8 | Code::Setae_rm8 | Code::Sete_rm8 | Code::Setne_rm8
-            | Code::Setbe_rm8 | Code::Seta_rm8 | Code::Sets_rm8 | Code::Setns_rm8 | Code::Setp_rm8 | Code::Setnp_rm8
-            | Code::Setl_rm8 | Code::Setge_rm8 | Code::Setle_rm8 | Code::Setg_rm8 =>
-                Some(IntegerStore::Setcc),
-            Code::Movbe_m16_r16 | Code::Movbe_m32_r32 => Some(IntegerStore::Reverse),
-            Code::Movnti_m32_r32 => Some(IntegerStore::NonTemporal),
-            _ => None,
-        };
-        use natemu_abi::interp::op;
-        let rmw_alu = match i.code() {
-            Code::Add_rm8_r8 | Code::Add_rm16_r16 | Code::Add_rm32_r32 => Some(op::ADD),
-            Code::Or_rm8_r8 | Code::Or_rm16_r16 | Code::Or_rm32_r32 => Some(op::OR),
-            Code::Adc_rm8_r8 | Code::Adc_rm16_r16 | Code::Adc_rm32_r32 => Some(op::ADC),
-            Code::Sbb_rm8_r8 | Code::Sbb_rm16_r16 | Code::Sbb_rm32_r32 => Some(op::SBB),
-            Code::And_rm8_r8 | Code::And_rm16_r16 | Code::And_rm32_r32 => Some(op::AND),
-            Code::Sub_rm8_r8 | Code::Sub_rm16_r16 | Code::Sub_rm32_r32 => Some(op::SUB),
-            Code::Xor_rm8_r8 | Code::Xor_rm16_r16 | Code::Xor_rm32_r32 => Some(op::XOR),
-            _ => None,
-        };
-        let implicit_group = match i.code() {
-            Code::Mul_rm8 | Code::Mul_rm16 | Code::Mul_rm32 => Some(4),
-            Code::Imul_rm8 | Code::Imul_rm16 | Code::Imul_rm32 => Some(5),
-            Code::Div_rm8 | Code::Div_rm16 | Code::Div_rm32 => Some(6),
-            Code::Idiv_rm8 | Code::Idiv_rm16 | Code::Idiv_rm32 => Some(7),
-            _ => None,
-        };
-        let result = match i.code() {
-            _ if qmove => object::SEGMENT_NATIVE_LOAD,
-            _ if implicit_group.is_some() => object::SEGMENT_NATIVE_LOAD,
-            _ if moffs || store_immediate.is_some() || integer_store.is_some() => 0,
-            Code::Cmpxchg_rm8_r8 | Code::Cmpxchg_rm16_r16 | Code::Cmpxchg_rm32_r32 if i.has_lock_prefix() => object::SEGMENT_CMPXCHG,
-            _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
-            Code::Xchg_rm8_r8 | Code::Xchg_rm16_r16 | Code::Xchg_rm32_r32 => object::SEGMENT_XCHG,
-            _ if matches!(i.mnemonic(), Mnemonic::Cmovb | Mnemonic::Cmovae | Mnemonic::Cmovbe | Mnemonic::Cmova
-                | Mnemonic::Cmove | Mnemonic::Cmovne | Mnemonic::Cmovl | Mnemonic::Cmovge | Mnemonic::Cmovle | Mnemonic::Cmovg
-                | Mnemonic::Cmovo | Mnemonic::Cmovno | Mnemonic::Cmovs | Mnemonic::Cmovns | Mnemonic::Cmovp | Mnemonic::Cmovnp)
-                && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Memory => object::SEGMENT_NATIVE_LOAD,
-            Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Blsr_r32_rm32 | Code::VEX_Blsmsk_r32_rm32 | Code::VEX_Blsi_r32_rm32
-            | Code::VEX_Bzhi_r32_rm32_r32 | Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Pext_r32_r32_rm32 | Code::VEX_Pdep_r32_r32_rm32
-            | Code::VEX_Shlx_r32_rm32_r32 | Code::VEX_Sarx_r32_rm32_r32 | Code::VEX_Shrx_r32_rm32_r32
-            | Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Mulx_r32_r32_rm32 => object::SEGMENT_NATIVE_LOAD,
-            Code::Bsf_r16_rm16 | Code::Bsf_r32_rm32 | Code::Bsr_r16_rm16 | Code::Bsr_r32_rm32
-            | Code::Tzcnt_r16_rm16 | Code::Tzcnt_r32_rm32 | Code::Lzcnt_r16_rm16 | Code::Lzcnt_r32_rm32
-            | Code::Popcnt_r16_rm16 | Code::Popcnt_r32_rm32 | Code::Imul_r16_rm16 | Code::Imul_r32_rm32
-            | Code::Imul_r16_rm16_imm8 | Code::Imul_r32_rm32_imm8 | Code::Imul_r16_rm16_imm16 | Code::Imul_r32_rm32_imm32
-            | Code::Movbe_r16_m16 | Code::Movbe_r32_m32 | Code::Crc32_r32_rm8 | Code::Crc32_r32_rm16 | Code::Crc32_r32_rm32
-                => object::SEGMENT_NATIVE_LOAD,
-            Code::Xlat_m8 | Code::Add_r8_rm8 | Code::Add_r16_rm16 | Code::Add_r32_rm32
-            | Code::Or_r8_rm8 | Code::Or_r16_rm16 | Code::Or_r32_rm32
-            | Code::Adc_r8_rm8 | Code::Adc_r16_rm16 | Code::Adc_r32_rm32
-            | Code::Sbb_r8_rm8 | Code::Sbb_r16_rm16 | Code::Sbb_r32_rm32
-            | Code::And_r8_rm8 | Code::And_r16_rm16 | Code::And_r32_rm32
-            | Code::Sub_r8_rm8 | Code::Sub_r16_rm16 | Code::Sub_r32_rm32
-            | Code::Xor_r8_rm8 | Code::Xor_r16_rm16 | Code::Xor_r32_rm32
-            | Code::Cmp_r8_rm8 | Code::Cmp_r16_rm16 | Code::Cmp_r32_rm32
-            | Code::Cmp_rm8_r8 | Code::Cmp_rm16_r16 | Code::Cmp_rm32_r32
-            | Code::Test_rm8_r8 | Code::Test_rm16_r16 | Code::Test_rm32_r32
-            | Code::Cmp_rm8_imm8 | Code::Cmp_rm16_imm8 | Code::Cmp_rm32_imm8 | Code::Cmp_rm16_imm16 | Code::Cmp_rm32_imm32
-            | Code::Test_rm8_imm8 | Code::Test_rm16_imm16 | Code::Test_rm32_imm32 => object::SEGMENT_NATIVE_LOAD,
-            Code::Mov_rm8_r8 | Code::Mov_rm16_r16 | Code::Mov_rm32_r32 | Code::Mov_r8_rm8 | Code::Mov_r16_rm16 | Code::Mov_r32_rm32 => 0,
-            Code::Movzx_r16_rm8 | Code::Movzx_r16_rm16 => 0x10,
-            Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16 => 0x20,
-            Code::Movsx_r16_rm8 | Code::Movsx_r16_rm16 => 0x50,
-            Code::Movsx_r32_rm8 | Code::Movsx_r32_rm16 => 0x60,
-            _ => continue,
-        };
-        let first_is_memory = i.op0_kind() == OpKind::Memory;
-        let other = u32::from(first_is_memory);
-        // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
-        let modrm_reg = implicit_group.unwrap_or_else(|| match i.code() {
-            _ if integer_store == Some(IntegerStore::Setcc) => i.condition_code() as u8 - iced_x86::ConditionCode::o as u8,
-            // VEX.vvvv names the BLS destination; ModRM.reg is the operation selector.
-            Code::VEX_Blsr_r32_rm32 => 1,
-            Code::VEX_Blsmsk_r32_rm32 => 2,
-            Code::VEX_Blsi_r32_rm32 => 3,
-            _ if xlat => Register::AL.number() as u8,
-            _ if i.op_kind(other) == OpKind::Register => i.op_register(other).number() as u8,
-            _ if i.mnemonic() == iced_x86::Mnemonic::Cmp => 7,
-            _ => 0,
-        });
-        let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
-        let inline_dword = !c.cpl0 && matches!(i.code(), Code::Mov_rm32_r32 | Code::Mov_r32_rm32);
-        if inline_dword && crate::system::address_size(&i) != natemu_abi::execution::system::ADDRESS32 {
-            return Err("unsupported 16-bit address for compatibility dword MOV".into());
+        let Some((segment, width, write)) = through else { continue };
+        if !c.cpl3 {
+            return Err(format!("FS or GS operand at guest offset {g:#x} in a block that is not CPL 3"));
         }
-        guarded.push(ScalarOperand {
-            offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
-            data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, integer_store, result_and_length: result | i.len() as u8,
-            xlat, inline_dword, vex_qmove,
-            qmove_offset: qmove.then(|| {
-                let mut terms = [0u32; 9]; // EAX..EDI coefficients and the constant displacement
-                for (reg, factor) in [(i.memory_base(), 1), (i.memory_index(), i.memory_index_scale())] {
-                    if reg != Register::None { terms[reg.number()] += factor; }
-                }
-                terms[8] = i.memory_displacement32();
-                terms
-            }),
-        });
+        if c.limited[usize::from(segment - object::SEG_FS)] {
+            found.push(SegmentOperand { offset: g, segment, width, write });
+        }
     }
-    if !guarded.is_empty() {
-        let mut reported: Vec<_> = c.pcs.iter().map(|p| p.guest_offset).filter(|&g| g < c.guest_bytes).collect();
-        reported.dedup();
-        if starts != reported { return Err("scalar segment check instruction boundaries".into()); }
+    let mut reported: Vec<_> = c.pcs.iter().map(|p| p.guest_offset).filter(|&g| g < c.guest_bytes).collect();
+    reported.dedup();
+    if starts != reported {
+        return Err("the instruction boundaries of a block with an FS or GS prefix".into());
     }
-    Ok(guarded)
+    Ok(found)
 }
 
-/// A retained 32-bit block can rewrite a guest-RIP literal slot or a complete MOVZ/MOVK/NOP
-/// sequence at another RIP. A guest-independent store literal must keep both of its native words.
-fn overlaps_relocation32(words: Range<u32>, relocs: &[Reloc], include_branches: bool) -> bool {
+/// A retained 32-bit block can rewrite a guest-RIP literal slot or a complete MOVZ/MOVK/NOP sequence at another RIP, and a
+/// placed one's dispatch and probe branches are rewritten: none of them may lie in `words`.
+fn overlaps_relocation32(words: Range<u32>, relocs: &[Reloc]) -> bool {
     relocs.iter().any(|r| {
         let bytes = match r.kind {
             object::RELOC_GUEST_RIP_LITERAL => 8,
             object::RELOC_GUEST_RIP_MOVE => 12,
-            object::RELOC_DISPATCH_BRANCH | object::RELOC_PROBE_BRANCH if include_branches => 4,
-            _ => return false, // admit_records rejects other relocation kinds
+            _ => 4,
         };
         r.offset < words.end && r.offset.saturating_add(bytes) > words.start
     })
 }
 
-/// The only edges inside the inline guard are its two cold decisions and the hot join.
-/// All addresses are relative to the first owner calculation, including on retained objects.
-fn inline_dword_edge(start: u32, from: u32, to: u32) -> bool {
-    matches!((from.checked_sub(start), to.checked_sub(start)), (Some(40 | 52), Some(64)) | (Some(60), Some(68)))
-}
-
 impl<'a> Verifier<'a> {
+    /// M2 checkpoint C: each operand through a limited FS or GS has exactly one check, fexc's `FexcSegmentBase`, before every
+    /// access of its instruction through that segment:
+    /// `and x1, x28, #~0x1fffff; ubfx x2, x28, #21, #9; add x2, x2, #1; lsr x2, x2, #9; add x1, x1, #512, lsl #12;
+    /// sub x1, x1, x2, lsl #22; ldr x1, [x1, #slot]` (the vCPU's read-only record: `(limit + 1) << 32 | base`, or 0),
+    /// `lsr x2, x1, #32; sub x2, x2, #W; sub x2, x2, wOffset, uxtw; tbnz x2, #63, stub` (or the far form `tbz x2, #63, +8;
+    /// b stub`), then `mov wBase, w1`, where the resident resumes with the base in x1. W is the operand's width and the
+    /// stub's intent the operand's, both as this module decoded them. No branch enters the sequence and no relocation lies in
+    /// it. With [`Verifier::frame_access`] refusing every load of a limited segment's base field, the base an access adds can
+    /// only be this check's.
+    fn segment_checks(&mut self, operands: &[SegmentOperand]) -> Result<(), String> {
+        use object::kind::SEGMENT;
+        for op in operands {
+            let g = op.offset;
+            let fail = |what: &str| Err(format!("operand check of the instruction at guest offset {g:#x}: {what}"));
+            let mut stubs = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
+            let (Some(s), None) = (stubs.next(), stubs.next()) else {
+                return fail("not exactly one");
+            };
+            if s.segment != op.segment || s.width != op.width || s.intent != u8::from(op.write) {
+                return fail("its segment, width or intent is not the operand's");
+            }
+            let (sub, back, offset) = (s.guest_offset2, s.imm as u32, u32::from(s.base_reg));
+            let Some(start) = sub.checked_sub(32).filter(|&o| o >= ENTRY_OFFSET && sub % 4 == 0) else {
+                return fail("its place");
+            };
+            if back % 4 != 0 || back as usize + 4 > self.c.code.len() || back <= sub || back - sub > 16 {
+                return fail("its continuation");
+            }
+            let slot = natemu_abi::execution::cache::SEGMENT_SLOTS[usize::from(op.segment - object::SEG_FS)] as u32 * 16;
+            let head = [
+                0x926b_ab81,
+                0xd355_7782,
+                0x9100_0442,
+                0xd349_fc42,
+                0x9148_0021,
+                0xcb02_5821,
+                0xf940_0021 | (slot / 8) << 10,
+                0xd360_fc22,
+                0xd100_0042 | u32::from(op.width) << 10,
+                0xcb20_4042 | offset << 16,
+            ];
+            if !(3..31).contains(&offset) || offset == 28 || head.iter().enumerate().any(|(k, &w)| self.word(start + 4 * k as u32) != w) {
+                return fail("its words");
+            }
+            let test = sub + 8;
+            let to = |at: u32, imm: u32, bits: u32| at.wrapping_add(((imm << (32 - bits)) as i32 >> (30 - bits)) as u32);
+            let (w0, w1) = (self.word(test), self.word(test + 4));
+            let near = w0 & 0xfff8_001f == 0xb7f8_0002 && to(test, w0 >> 5 & 0x3fff, 14) == s.native_offset && back == test + 4;
+            let far = w0 == 0xb6f8_0042 && w1 >> 26 == 5 && to(test + 4, w1 & 0x03ff_ffff, 26) == s.native_offset && back == test + 8;
+            let base = self.word(back) & 31;
+            if !(near || far) || self.word(back) & !31 != 0x2a01_03e0 || base == 28 || base == 31 {
+                return fail("its test or its base move");
+            }
+            if self.branches_into(start, back).any(|(from, t)| !(far && from == test && t == back)) {
+                return fail("a branch enters it");
+            }
+            if overlaps_relocation32(start..back + 4, self.c.relocs) {
+                return fail("a relocation lies in it");
+            }
+            if self.instruction(start).map(|i| i.0) != Some(g) || self.instruction(back).map(|i| i.0) != Some(g) {
+                return fail("it is not in its instruction");
+            }
+            let mut through = self.c.accesses.iter().filter(|a| a.guest_offset == g && a.segment == op.segment).peekable();
+            if through.peek().is_none() || through.any(|a| a.native_offset <= back) {
+                return fail("an access through the segment is not after it");
+            }
+            self.segment_view_reads.push(start + 24);
+            self.claim(s.native_offset);
+        }
+        if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != operands.len() {
+            return Err("an operand check without a limited FS or GS operand".into());
+        }
+        self.segment_view_reads.sort_unstable();
+        Ok(())
+    }
+
     fn new(c: &'a Code<'a>) -> Result<Self, String> {
         let words = c.code.len() / 4;
         let mut insns = vec![None; words];
@@ -1112,535 +1103,6 @@ impl<'a> Verifier<'a> {
             && sealed
             && site.is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.guest_offset == g))
         .then_some(start..end)
-    }
-
-    /// Prove the values flowing into CASAL and its mandatory accumulator/SUB-flag writeback.
-    /// Source copies and extracts may move around effective-address setup; the guard replaces w0.
-    fn checked_cas(&self, op: &ScalarOperand, start: u32, back: u32, at: u32, rs: u8, rt: u8) -> Result<(), String> {
-        let bits = u32::from(op.width) * 8;
-        let acc = super::SRA32[0];
-        let high = bits == 8 && op.data_reg >= 4;
-        let src = super::SRA32[usize::from(if high { op.data_reg - 4 } else { op.data_reg })];
-        let source_shift = if high { 8 } else { 0 };
-        let error = || format!("checked CAS value flow at {at:#x} (guest +{:#x})", op.offset);
-        if op.offset + u32::from(op.result_and_length & 15) != self.c.guest_bytes || back < start + 4 || back > at {
-            return Err(error());
-        }
-
-        // Track just the low operand bits as (original register, source bit), beginning with
-        // the instruction's architectural bank. Unrecognized register definitions lose provenance.
-        // A single-instruction block can close the preceding x87 run inline before the guard.
-        // Its only GPR outputs are w0 and w1; the CBZ skips exactly the nine known words.
-        let x87_skip = (start + 4..back - 4).step_by(4).find(|&j| j + 40 <= back - 4 &&
-            self.word(j - 4) == 0x3950_5380 && self.word(j) == 0x3400_0140 &&
-            RUN_END.iter().take(9).enumerate().all(|(k, &w)| self.word(j + 4 + 4 * k as u32) == w));
-        // All architectural GPR and PF/AF roots must still describe the pre-instruction bank
-        // when a segment or page fault can occur, including when source and accumulator alias.
-        let bank = super::SRA32.iter().fold(0u32, |mask, &r| mask | (1 << r));
-        let mut roots = [None; 32];
-        for &r in &super::SRA32[..8] { roots[usize::from(r)] = Some((r, 0u32, 32u32)); }
-        for insn_at in (start..at).step_by(4) {
-            if x87_skip.is_some_and(|j| (j - 4..j + 40).contains(&insn_at)) {
-                roots[0] = None;
-                roots[1] = None;
-                continue;
-            }
-            let word = self.word(insn_at);
-            let insn = self.insn(insn_at).ok_or_else(error)?;
-            let dst = (word & 31) as usize;
-            let from = ((word >> 5) & 31) as usize;
-            let mov_from = ((word >> 16) & 31) as usize;
-            let copy = if word & 0x7fe0_ffe0 == 0x2a00_03e0 {
-                roots[mov_from]
-            } else if matches!(word & 0xffc0_0000, 0x5300_0000 | 0xd340_0000) {
-                let shift = (word >> 16) & 63;
-                let last = (word >> 10) & 63;
-                // The encountered fields are UXTB/UXTH or extraction of the high byte.
-                if (shift == 0 || shift == 8) && last + 1 == shift + bits {
-                    roots[from].filter(|&(_, _, valid)| shift + bits <= valid).map(|(r, offset, _)| (r, offset + shift, bits))
-                } else { None }
-            } else { None };
-            // Both the descriptor check and CASAL may fault. Their PSTATE is the incoming guest
-            // NZCV: register destinations alone cannot distinguish ADD from ADDS or see CMP.
-            let neutral_setup = word & 0x7fe0_ffe0 == 0x2a00_03e0                    // MOV register
-                || matches!(word & 0xffc0_0000, 0x5300_0000 | 0xd340_0000)          // UBFM
-                || word & 0x3f80_0000 == 0x1100_0000 || word & 0x3f00_0000 == 0x0b00_0000 // ADD/SUB, S=0
-                || word & 0x1f80_0000 == 0x1280_0000 || word & 0x7f80_0000 == 0x3200_0000; // MOV wide, ORR immediate
-            match insn {
-                Insn::Data(_) if neutral_setup => {}
-                Insn::B(_) if insn_at == back - 4 => {}
-                Insn::DmbIsh if insn_at == at - 4 => {}
-                _ => return Err(error()),
-            }
-            let writes = insn.writes();
-            if writes & bank != 0 { return Err(error()); }
-            for (r, root) in roots.iter_mut().enumerate() {
-                if writes & (1 << r) != 0 { *root = if r == dst { copy } else { None }; }
-            }
-            if insn_at == back - 4 { roots[0] = None; roots[1] = None; }
-        }
-        let holds = |reg: u8, guest: u8, shift: u32| {
-            roots[usize::from(reg)].is_some_and(|(origin, offset, valid)| origin == guest && offset == shift && valid >= bits)
-        };
-        if !holds(rs, acc, 0) || !holds(rt, src, source_shift) {
-            return Err(error());
-        }
-
-        // CASAL writes old memory into Rs. When FEX used TMP2 it immediately copies the
-        // result to its allocated register. The following operands are derived from those words.
-        let mut cursor = at + 4;
-        let next = self.insn(cursor).ok_or_else(error).map(|_| self.word(cursor))?;
-        let mut old = rs;
-        if next & !31 == 0x2a00_03e0 | (u32::from(rs) << 16) {
-            old = (next & 31) as u8;
-            cursor += 4;
-        }
-        let eor = self.insn(cursor).ok_or_else(error).map(|_| self.word(cursor))?;
-        let expected = ((eor >> 5) & 31) as u8;
-        // Only the real dword accumulator can be an architectural result register; TMP2 and
-        // the other allocator temporaries must not overwrite another guest root.
-        let temporary = |r: u8| r < 25 && !super::SRA32.contains(&r);
-        if !(temporary(rs) || (bits == 32 && rs == acc)) || !(temporary(old) || (bits == 32 && old == acc)) ||
-            expected == rs || expected == old || !holds(expected, acc, 0) ||
-            (bits == 32 && old != acc) || (bits < 32 && (old == acc || rs == acc || old == 0 || expected == 0)) {
-            return Err(error());
-        }
-        let a = u32::from(expected);
-        let m = u32::from(old);
-        let pair = m << 16 | a << 5;
-        let mut take = |word| {
-            if self.insn(cursor).is_none() || self.word(cursor) != word { return Err(error()); }
-            cursor += 4;
-            Ok(())
-        };
-        take(0xca00_001b | pair)?; // AF root: expected XOR old.
-        if bits == 32 {
-            take(0x6b00_001a | pair)?; // SUBS w26, expected, old: NZCV and parity.
-        } else {
-            // Put the guest sign bit at bit 31 for NZCV; parity uses the unshifted result.
-            take(0x5300_0000 | bits << 16 | (bits - 1) << 10 | a << 5)?;
-            take(0x6b00_001f | m << 16 | (32 - bits) << 10)?;
-            take(0x4b00_001a | pair)?;
-            take(0xb340_0000 | (bits - 1) << 10 | m << 5 | u32::from(acc))?;
-        }
-        let next_rip = self.c.rip.wrapping_add(u64::from(self.c.guest_bytes)) as u32;
-        if !matches!(self.rip_move(cursor, 0), Some((_, rip)) if rip == u64::from(next_rip))
-            || !matches!(self.insn(cursor + 12), Some(Insn::Svc(svc::LINK)))
-            || self.branches_into(start, cursor + 12).any(|edge| Some(edge) != x87_skip.map(|j| (j, j + 40))) {
-            return Err(error());
-        }
-        Ok(())
-    }
-
-    /// Every covered scalar compatibility operand through FS/GS reaches a bank check before its one memory access,
-    /// including in production admission. The continuation takes its base from w0, reserved for the resident.
-    fn inline_dword_guard(&self, back: u32, start: u32, segment: u8) -> Result<u32, String> {
-        // The vCPU's x28 page and its neighboring RO block use the same upper L2 table. Index
-        // 511 needs the previous block. Derive the address using scratch x1/x2; w0 stays the
-        // original offset until both cold tests have passed. Every operation preserves NZCV.
-        let slot = natemu_abi::execution::cache::SEGMENT_SLOTS[usize::from(segment - 4)];
-        let words = [
-            0x926b_ab81, // and x1,x28,#~0x1fffff
-            0xd355_7782, 0x9100_0442, 0xd349_fc42, // ubfx x2,x28,#21,#9; add x2,x2,#1; lsr x2,x2,#9
-            0x9148_0021, 0xcb02_5821, // add x1,x1,#2MiB; sub x1,x1,x2,lsl #22
-            0xf940_0021 | ((slot * 2) as u32) << 10, // ldr x1,[x1,#slot*16]
-            0xd360_fc22, 0xd100_0c42, 0xcb00_0042, // lsr x2,x1,#32; sub x2,x2,#3; sub x2,x2,x0
-            0xb7f8_00c2, // tbnz x2,#63,cold
-            0x0b00_0021, 0x9100_0c22, 0xb700_0062, // add w1,w1,w0; add x2,x1,#3; tbnz x2,#32,cold
-            0x2a01_03e0, 0x1400_0002, // mov w0,w1; b back; cold: b SEGMENT (checked below)
-        ];
-        let first = back.checked_sub((words.len() as u32 + 1) * 4).ok_or("short inline segment check")?;
-        if first < start + 4 || words.iter().enumerate().any(|(k, &word)| self.word(first + 4 * k as u32) != word) {
-            return Err("inline segment check differs from the expected dword MOV guard".into());
-        }
-        Ok(first)
-    }
-
-    /// FEX x32::RA, excluding all static roots, compiler scratch x0..x3, x25 and x28.
-    /// The post-guard address and a load awaiting its commit both occupy this register class.
-    fn inline_dword_transfer(&self, op: &ScalarOperand, access: &Site, start: u32, end: u32) -> Result<u32, String> {
-        let dynamic = |r| matches!(r, 12..=17 | 19..=24 | 29..=30);
-        let at = access.native_offset;
-        let Some(Insn::Mem(m)) = self.insn(at) else { return Err("inline dword MOV lacks its transfer".into()); };
-        let root = super::SRA32[usize::from(op.data_reg)];
-        let roots = super::SRA32.iter().fold(0, |mask, reg| mask | (1 << reg));
-        if !dynamic(access.base_reg) || m.vector || m.size != 4 || m.load != (op.write == 0)
-            || m.rt != access.data_reg[0] || m.addr.base != access.base_reg
-            || self.written(roots, start, at)
-        {
-            return Err("inline dword MOV address or architectural register changes before its transfer".into());
-        }
-        if !m.load {
-            // A source that was live before the check is still precisely the guest's static GPR.
-            if m.rt != root { return Err("inline dword store differs from its ModRM source".into()); }
-            return Ok(at);
-        }
-        // A faulting load never writes a guest root. On success the 32-bit value is zero extended,
-        // then the very next word commits it to the ModRM destination before another instruction.
-        let commit = at + 4;
-        let copy = 0xaa00_03e0 | u32::from(m.rt) << 16 | u32::from(root);
-        if !dynamic(m.rt) || commit >= end || self.word(commit) != copy {
-            return Err("inline dword load lacks its ModRM destination commit".into());
-        }
-        Ok(commit)
-    }
-
-    fn scalar_segment_checks(&mut self, guarded: &[ScalarOperand]) -> Result<(), String> {
-        use object::kind::SEGMENT;
-        for op in guarded {
-            let g = op.offset;
-            let index = self.c.pcs.partition_point(|p| p.guest_offset <= g);
-            let p = &self.c.pcs[index - 1];
-            let mut matching = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
-            let Some(site) = matching.next() else { return Err("missing scalar segment check".into()); };
-            if matching.next().is_some() || site.segment != op.segment || site.intent != op.write || site.width != op.width
-                || site.data_reg[1] != op.result_and_length || (op.store_immediate.is_none() && op.integer_store != Some(IntegerStore::Reverse) && site.data_reg[0] != op.data_reg) {
-                return Err("scalar segment check differs from its x86 operand".into());
-            }
-            let access = self.c.accesses.iter().find(|a| a.native_offset == site.guest_offset2)
-                .ok_or("scalar segment check without an access")?;
-            let mut effects = self.c.accesses.iter().filter(|a| a.guest_offset == g);
-            if effects.next().map(|a| a.native_offset) != Some(access.native_offset) {
-                return Err("scalar segment check must precede the first memory access".into());
-            }
-            if op.result_and_length & 0xf0 == object::SEGMENT_XCHG {
-                match self.insn(access.native_offset) {
-                    Some(Insn::Swap { size, rs, rt, rn }) if rt != 31 && rs != 31 => {
-                        self.swap_word(size, rs, rt, rn, access.native_offset)?;
-                    }
-                    _ => return Err("checked exchange requires an acquire-release SWPAL with source and result".into()),
-                }
-            }
-            if op.result_and_length & 0xf0 == object::SEGMENT_CMPXCHG {
-                if [site, access].iter().any(|s| s.nzcv != object::NZCV_PSTATE || s.flags_written_before != 0
-                    || s.cf_inverted != p.cf_inverted) {
-                    return Err("checked CAS requires incoming PSTATE at both fault points".into());
-                }
-                let at = access.native_offset;
-                match self.insn(at) {
-                    Some(Insn::Atomic { op: AtomicOp::Cas, size, rs, rt, rn })
-                        if rs != 31 && rt != 31 && rs != rn && rs != rt && at >= 4 && matches!(self.insn(at - 4), Some(Insn::DmbIsh)) => {
-                        self.atomic_word(size, rs, rt, rn, at)?;
-                        self.checked_cas(op, p.native_offset, site.imm as u32, at, rs, rt)?;
-                    }
-                    _ => return Err("locked compare-exchange requires a DMB followed by a single CASAL".into()),
-                }
-            }
-            let rmw_store = if op.result_and_length & 0xf0 == object::SEGMENT_RMW_ALU {
-                let store = effects.next().ok_or("missing second effect of checked ALU update")?;
-                if access.base_reg >= 31 || access.kind != object::kind::LOAD || access.rmw != object::RMW_LOAD
-                    || store.kind != object::kind::STORE || store.rmw != object::RMW_STORE
-                    || store.native_offset <= access.native_offset || store.insn_native_offset != access.insn_native_offset
-                    || store.width != op.width || store.intent != object::INTENT_WRITE || store.base_reg != access.base_reg
-                    || store.index_reg != object::NO_REG || store.imm != 0 || store.writeback != object::WB_NONE
-                    || store.data_class != object::CLASS_GPR
-                {
-                    return Err("checked ALU memory effects differ in address, width or intent".into());
-                }
-                Some(store.native_offset)
-            } else { None };
-            if effects.next().is_some() {
-                return Err("extra scalar memory access".into());
-            }
-            let back = site.imm as u32;
-            if back % 4 != 0 || back >= access.native_offset { return Err("scalar segment check continuation".into()); }
-            let inline = op.inline_dword.then(|| self.inline_dword_guard(back, p.native_offset, op.segment)).transpose()?;
-            let tag_load = inline.map(|at| at + 6 * 4);
-            if let Some(at) = tag_load { self.segment_view_reads.push(at); }
-            let end = self.c.pcs.get(index).map_or_else(
-                || self.c.stubs.first().map_or(self.c.code.len() as u32, |s| s.native_offset),
-                |next| next.native_offset,
-            );
-            // The PC of the last instruction may also cover the out-of-line x87 run-end. Only the
-            // block's entry probe can reach this exact sequence, which returns to the block's third word.
-            let run_end = self.run_test().filter(|&e| self.run_end_return(e + 36, ENTRY_OFFSET + 8));
-            for at in (p.native_offset..end).step_by(4) {
-                if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
-                if at == access.native_offset || Some(at) == rmw_store || Some(at) == tag_load { continue; }
-                // The VEX destination's verified upper-half clear occurs only after its Q load.
-                if op.vex_qmove && at == access.native_offset + 4 { continue; }
-                match self.insn(at) {
-                    // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
-                    Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
-                    // Folding FPSR from earlier completed x87 work is allowed by the precision contract.
-                    // A one-instruction unit can close the run inline, including clearing its run byte.
-                    Some(Insn::Mem(_)) if at >= 32 && (0..9).all(|k| self.word(at - 32 + k * 4) == RUN_END[k as usize])
-                        && self.branches_into(at - 32, at).next().is_none() => {}
-                    Some(Insn::Mem(_)) if at >= 16 && (0..5).all(|k| self.word(at - 16 + k * 4) == RUN_END[k as usize])
-                        && self.branches_into(at - 16, at).next().is_none() => {}
-                    Some(Insn::Mem(_) | Insn::Atomic { .. } | Insn::Swap { .. } | Insn::Literal { .. }) =>
-                        return Err(format!("unrecorded memory access: extra memory operation {:#010x} in scalar instruction at {at:#x}", self.word(at))),
-                    _ => {}
-                }
-            }
-            let setup = if let Some(offset) = op.absolute_offset {
-                let [lo, hi] = natemu_abi::execution::guest_rip_move32(u64::from(offset), 0);
-                if back < p.native_offset + 12 || site.base_reg != 0 || self.word(back - 12) != lo || self.word(back - 8) != hi {
-                    return Err("scalar moffs immediate differs from its x86 operand".into());
-                }
-                back - 12
-            } else {
-                let offset_end = inline.unwrap_or(back.saturating_sub(4));
-                if offset_end < p.native_offset + 4 || self.word(offset_end - 4) != 0x2a00_03e0 | (u32::from(site.base_reg) << 16) {
-                    return Err("scalar segment check offset register".into());
-                }
-                offset_end - 4
-            };
-            if op.width != 16 && (op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 || (inline.is_some() && op.write == 0)) {
-                // A wrapped native-load continuation and an inline MOV result both require the exact
-                // unsigned W load. MOV subsequently commits the entire X register to its guest root.
-                let size = u32::from(op.width.trailing_zeros()) << 30;
-                let registers = u32::from(access.base_reg) << 5 | u32::from(access.data_reg[0]);
-                let word = self.word(access.native_offset);
-                if back + 4 != access.native_offset || access.base_reg >= 31 || access.data_reg[0] >= 31
-                    || ![0x3940_0000, 0x3840_0000, 0x08df_fc00, 0x38bf_c000].iter().any(|opcode| word == size | opcode | registers)
-                {
-                    return Err(format!("scalar native load continuation {back:#x} to {:#x}, word {word:#010x}", access.native_offset));
-                }
-            }
-            let setup = if let Some(value) = op.store_immediate {
-                let reg = access.data_reg[0];
-                // The descriptor trap and a split probe can use x0/x1. The literal must live in a
-                // temporary, independent of the banked guest roots, all the way to the actual store.
-                if !(2..31).contains(&reg) || super::SRA32.contains(&reg)
-                    || site.data_reg[0] != object::SEGMENT_STORE_REGISTER | reg
-                    || !matches!(self.insn(access.native_offset), Some(Insn::Mem(m)) if !m.load && !m.vector && m.rt == reg && m.rt2.is_none())
-                {
-                    return Err("scalar immediate store transfer register".into());
-                }
-                let [lo, hi] = natemu_abi::execution::guest_rip_move32(u64::from(value), reg.into());
-                let high = self.last_write(reg, p.native_offset, setup).ok_or("missing scalar store immediate")?;
-                if high < p.native_offset + 4 || self.word(high - 4) != lo || self.word(high) != hi
-                    || self.written(1 << reg, high + 4, access.native_offset)
-                {
-                    return Err("scalar store immediate differs from its x86 operand".into());
-                }
-                if overlaps_relocation32(high - 4..high + 4, self.c.relocs, false) {
-                    return Err("scalar store immediate overlaps a guest-RIP relocation".into());
-                }
-                high - 4
-            } else { setup };
-            if let Some(form) = op.integer_store {
-                self.integer_store(form, op, site, access, p.native_offset, setup)?;
-            }
-            let last = rmw_store.unwrap_or(access.native_offset);
-            let sealed_end = if inline.is_some() {
-                let commit = self.inline_dword_transfer(op, access, p.native_offset, end)?;
-                // A retained, placed or shared object may patch guest RIPs, dispatch exits, or
-                // probe branches. No relocation can cover any word of this proof or its transfer.
-                let guarded_words = setup..commit + 4;
-                if overlaps_relocation32(guarded_words, self.c.relocs, true) {
-                    return Err("relocation within inline segment check".into());
-                }
-                commit
-            } else { last };
-            if self.instruction(last) != Some((g, p.native_offset)) || self.instruction(access.native_offset) != Some((g, p.native_offset))
-                || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
-                || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
-                || self.written(1 << access.base_reg, back + 4, last)
-                || self.branches_into(setup, sealed_end).any(|(from, to)| {
-                    if inline.is_some_and(|start| inline_dword_edge(start, from, to)) {
-                        return false;
-                    }
-                    // A successful split probe returns to its store after the segment check already ran.
-                    self.probing(from).is_none_or(|(i, k)| k != 4 || self.c.stubs[i].guest_offset2 != last || to != last)
-                })
-            {
-                return Err("scalar segment check continuation".into());
-            }
-            if op.width == 16 {
-                self.qmove_effect(op, p.native_offset, setup, back, access, end)?;
-            }
-            if op.xlat {
-                self.xlat_effect(p.native_offset, setup, access, end, site.base_reg)?;
-            }
-            self.claim(site.native_offset);
-        }
-        if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != guarded.len() {
-            return Err("extra scalar segment check".into());
-        }
-        Ok(())
-    }
-
-    fn integer_store(&self, form: IntegerStore, op: &ScalarOperand, site: &Site, access: &Site, start: u32, setup: u32) -> Result<(), String> {
-        let reg = access.data_reg[0];
-        let word = self.word(access.native_offset);
-        let size = u32::from(op.width.trailing_zeros()) << 30;
-        let regs = u32::from(access.base_reg) << 5 | u32::from(reg);
-        let plain = word == size | 0x3900_0000 | regs || word == size | 0x3800_0000 | regs;
-        let release = word == size | 0x089f_fc00 | regs;
-        if access.kind != object::kind::STORE || access.width != op.width || access.intent != object::INTENT_WRITE
-            || access.rmw != object::RMW_NONE || access.data_class != object::CLASS_GPR || !((plain && access.ordering == object::ORD_PLAIN) || (release && access.ordering == object::ORD_RELEASE))
-        {
-            return Err("checked integer store width, ordering or transfer".into());
-        }
-        // A false SETcc still writes zero. Wider writes may take their own split stub,
-        // while all three forms can close an incoming x87 run before their address check.
-        for &(from, to) in &self.branches {
-            if !(start..access.native_offset).contains(&from) || (from == site.imm as u32 - 4 && to == site.native_offset)
-                || self.inline_run_close(from, to, start, setup) { continue; }
-            if op.width > 1 && from >= site.imm as u32 + 4 && self.c.stubs.iter().any(|s|
-                s.kind == object::kind::SPLIT && s.native_offset == to && s.guest_offset2 == access.native_offset) { continue; }
-            return Err("branch skips or changes the checked integer store".into());
-        }
-        if form == IntegerStore::Setcc { return Ok(()); }
-        let root = SRA32[usize::from(op.data_reg)];
-        if form == IntegerStore::NonTemporal {
-            if !plain || reg != root || self.written(1 << root, start, access.native_offset) {
-                return Err("MOVNTI must store its source register with plain ordering".into());
-            }
-            return Ok(());
-        }
-        // Both the bank trap and native store must see the already-reversed source.
-        if !(2..31).contains(&reg) || SRA32.contains(&reg) || site.data_reg[0] != object::SEGMENT_STORE_REGISTER | reg {
-            return Err("MOVBE captured transfer register".into());
-        }
-        let last = self.last_write(reg, start, setup).ok_or("missing MOVBE byte reversal")?;
-        let rev = if op.width == 2 {
-            if last < start + 4 || self.word(last) != 0x5310_7c00 | u32::from(reg) << 5 | u32::from(reg) {
-                return Err("MOVBE word store must take the reversed low word".into());
-            }
-            last - 4
-        } else { last };
-        if self.word(rev) != 0x5ac0_0800 | u32::from(root) << 5 | u32::from(reg)
-            || self.written(1 << root, start, rev) || self.written(1 << reg, last + 4, access.native_offset)
-            || self.branches_into(rev, setup).any(|(from, to)| !self.inline_run_close(from, to, last + 4, setup))
-        {
-            return Err("MOVBE native store does not retain the reversed x86 source".into());
-        }
-        Ok(())
-    }
-
-    /// Only the CBZ over the exact inline x87 run close. Both paths rejoin at or before
-    /// the checked address setup, and neither can change a prepared store register.
-    fn inline_run_close(&self, from: u32, to: u32, earliest: u32, limit: u32) -> bool {
-        from >= earliest + 4 && to == from + 40 && to <= limit
-            && self.word(from - 4) == 0x3940_0380 | frame::X87_RUN << 10
-            && self.word(from) == 0x3400_0140
-            && RUN_END.iter().enumerate().all(|(i, &w)| self.word(from + 4 + 4 * i as u32) == w)
-            && self.branches_into(from - 4, to - 4).next().is_none()
-    }
-
-    fn qmove_effect(&self, op: &ScalarOperand, start: u32, setup: u32, back: u32, access: &Site, end: u32) -> Result<(), String> {
-        let at = access.native_offset;
-        let rt = u32::from(access.data_reg[0]);
-        let rn = u32::from(access.base_reg);
-        let dst = u32::from(op.data_reg);
-        let commit = at + 4 + u32::from(op.vex_qmove) * 4;
-        // In the compact register allocation v16..v23 are the architectural XMM roots.
-        // A faulting load must only target a temporary. The original native commit updates
-        // the low 128 bits, and only VEX zeros this destination's 16-byte upper slot.
-        let next = commit + 4;
-        let fall_through = self.c.address(u64::from(op.offset) + u64::from(op.result_and_length & 15));
-        // A cut or step block can end without a final PC entry. Its exact fall-through link
-        // must then start immediately after the result, before the out-of-line stubs.
-        if next != end && (next > end || self.link_point(next).is_none_or(|(target, _)| target != fall_through)) {
-            return Err("packed MOV commit does not end at its next PC or fall-through exit".into());
-        }
-        if dst >= 8 || !matches!(rt, 2..=15 | 24..=31) || !matches!(rn, 12..=17 | 19..=24 | 29..=30)
-            || at != back + 4 || self.word(at) != 0x3dc0_0000 | rn << 5 | rt
-            || self.word(commit) != 0x4ea0_1c00 | rt << 16 | rt << 5 | (16 + dst)
-        {
-            return Err("packed MOV needs one Q load and its XMM destination commit".into());
-        }
-        if op.vex_qmove {
-            let offset = frame::AVX_HIGH + dst * 16;
-            if self.word(at + 4) != 0xa900_7f9f | (offset / 8) << 15 {
-                return Err("packed VEX MOV needs the destination's upper-half clear".into());
-            }
-        }
-        // The only branch in the effect leaves for the SEGMENT stub. Pointer materialization
-        // before it and the result commit after it must preserve the other architectural roots.
-        // The step slot can close an inherited x87 run just before SEGMENT. Indexed EAs
-        // have already been formed in dynamic GPRs, which the exact run close leaves intact.
-        let fold = setup.checked_sub(36).filter(|&pos| pos >= start
-            && (0..9).all(|k| self.word(pos + k * 4) == RUN_END[k as usize]));
-        let test = fold.and_then(|pos| pos.checked_sub(8)).filter(|&pos| pos >= start
-            && self.word(pos) == 0x3940_0380 | frame::X87_RUN << 10 && self.word(pos + 4) == 0x3400_0140);
-        let offset = (self.word(setup) >> 16 & 31) as usize;
-        let expected = op.qmove_offset.ok_or("missing packed MOV address")?;
-        if self.qmove_offset(start, test.or(fold).unwrap_or(setup), offset) != Some(expected)
-            || self.branches_into(start, commit).any(|(from, to)| !test.is_some_and(|p| from == p + 4 && to == setup))
-            || overlaps_relocation32(start..commit + 4, self.c.relocs, false)
-            || self.c.relocs.iter().any(|r| (start..=commit).contains(&r.offset))
-        {
-            return Err("unsealed packed MOV address or result".into());
-        }
-        Ok(())
-    }
-
-    /// The address producers for a Q read are affine in the eight 32-bit GPRs. Track their
-    /// coefficients and the constant term modulo 2^32, so an indexed operand with any base,
-    /// scale or displacement must equal the independently decoded ModRM address.
-    fn qmove_offset(&self, mut at: u32, end: u32, offset: usize) -> Option<[u32; 9]> {
-        let mut regs = [None; 32];
-        for (i, &native) in SRA32[..8].iter().enumerate() {
-            let mut value = [0; 9];
-            value[i] = 1;
-            regs[usize::from(native)] = Some(value);
-        }
-        while at < end {
-            let w = self.word(at);
-            let rd = (w & 31) as usize;
-            if !matches!(rd, 12..=17 | 19..=24 | 29..=30) { return None; }
-            if let Some((words, n)) = self.move_sequence(at, rd as u8) {
-                if words.end > end { return None; }
-                let mut value = [0; 9];
-                value[8] = n as u32;
-                regs[rd] = Some(value);
-                at = words.end;
-                continue;
-            }
-            let rn = (w >> 5 & 31) as usize;
-            let rm = (w >> 16 & 31) as usize;
-            let value = if w & 0x7f80_0000 == 0x1100_0000 || w & 0x7f80_0000 == 0x5100_0000 {
-                let mut v = regs[rn]?;
-                let imm = (w >> 10 & 0xfff) << (12 * (w >> 22 & 1));
-                v[8] = if w & (1 << 30) == 0 { v[8].wrapping_add(imm) } else { v[8].wrapping_sub(imm) };
-                v
-            } else if w & 0x7fe0_0000 == 0x0b00_0000 {
-                let shift = w >> 10 & 63;
-                if shift > 3 { return None; }
-                let (a, b) = (regs[rn]?, regs[rm]?);
-                std::array::from_fn(|i| a[i].wrapping_add(b[i] << shift))
-            } else if w & 0xffc0_0000 == 0x5300_0000 {
-                let (r, s) = (w >> 16 & 63, w >> 10 & 63);
-                if !(29..=31).contains(&r) || s + 1 != r { return None; }
-                regs[rn]?.map(|v| v << (32 - r))
-            } else if w & 0x7fe0_ffe0 == 0x2a00_03e0 {
-                regs[rm]?
-            } else { return None; };
-            regs[rd] = Some(value);
-            at += 4;
-        }
-        regs[offset]
-    }
-
-    fn xlat_effect(&self, start: u32, setup: u32, access: &Site, end: u32, offset: u8) -> Result<(), String> {
-        let eax = u32::from(SRA32[0]);
-        let ebx = u32::from(SRA32[3]);
-        // The original roots survive through UXTB AL, ADD (32-bit), the check and the byte load.
-        let add = self.last_write(offset, start, setup).filter(|&at| at >= start + 4)
-            .ok_or("XLAT offset is missing its 32-bit sum")?;
-        let index = (self.word(add - 4) & 31) as u8;
-        if !xlat_allocated_registers([index, offset, access.base_reg, access.data_reg[0]]) {
-            return Err("XLAT temporary is not an allocatable compatibility register".into());
-        }
-        let index = u32::from(index);
-        if self.word(add - 4) != 0x5300_1c00 | eax << 5 | index
-            || self.word(add) != 0x0b00_0000 | index << 16 | ebx << 5 | u32::from(offset)
-            || self.branches_into(add - 4, setup).any(|(from, to)| from <= add || from >= to)
-        {
-            return Err("XLAT offset is not EBX plus unsigned AL".into());
-        }
-        let merge = access.native_offset + 4;
-        if merge >= end || self.word(merge) != 0xb340_1c00 | u32::from(access.data_reg[0]) << 5 | eax
-            || self.written((1 << eax) | (1 << ebx), start, merge)
-            || self.branches_into(access.native_offset, merge).next().is_some()
-        {
-            return Err("XLAT byte load does not preserve and merge AL".into());
-        }
-        Ok(())
     }
 
     /// Code shape: how each stub is reached (exactly one branch).
@@ -2106,6 +1568,11 @@ impl<'a> Verifier<'a> {
         // M2: 32-bit code loads the ES, CS, SS and DS bases (FEX adds a named segment's base, and ES's for every string
         // destination): `frame::LEGACY_BASES`, which the resident holds at 0 while only flat segments run.
         let legacy = self.c.bits32 && m.load && inside(&frame::LEGACY_BASES);
+        // M2 checkpoint C: the base of a limited FS or GS comes from the operand check alone ([`Verifier::segment_checks`]):
+        // code that loads its field would add it unchecked.
+        if [frame::FS_BASE, frame::GS_BASE].iter().zip(self.c.limited).any(|(&f, limited)| limited && offset < i64::from(f) + 8 && end > i64::from(f)) {
+            return Err(format!("frame access {:#010x} at {at:#x}: the base of a limited FS or GS outside its operand check", self.word(at)));
+        }
         if matches!(m.form, Form::Unsigned | Form::Pair)
             && (fields.iter().any(inside)
                 || legacy
@@ -2935,33 +2402,6 @@ impl<'a> Verifier<'a> {
     }
 
     /// Every div/idiv has exactly its #DE checks before FEX's divide; every divide stub is one of them.
-    /// FEX's compatibility memory-division result block after its last #DE branch. The
-    /// checked divisor d and the RDX:RAX roots supply the quotient and the following remainder.
-    fn checked_divide_result(&self, signed: bool, width: u32, d: u32, ax: u32, body: Range<u32>, fex: u32) -> bool {
-        let (prep, dividend, divisor, wide): (&[u32], _, _, _) = match (signed, width) {
-            (false, 8) => (&[], ax, d, false),
-            (true, 8) => (&[], ax, d, true),
-            (false, 16) => (&[0x5300_3c80, 0x3310_3ca0], 0, d, false), // uxth w0,w4; bfi w0,w5,#16,#16
-            (true, 16) => (&[0x5300_3c80, 0x3310_3ca0, 0x1300_3c01 | d << 5], 0, 1, false), // then sxth w1,wD
-            // DIV32 copies wD to w1 before forming EDX:EAX in x0. IDIV32 forms x0 first, then sign-extends wD to x1.
-            (false, 32) => (&[0x2a00_03e1 | d << 16, 0xaa04_03e0, 0xb360_7ca0], 0, 1, true),
-            (true, 32) => (&[0xaa04_03e0, 0xb360_7ca0, 0x9340_7c01 | d << 5], 0, 1, true),
-            _ => return false,
-        };
-        if fex != body.start + prep.len() as u32 * 4 || fex + 4 >= body.end
-            || !prep.iter().enumerate().all(|(i, &w)| self.word(body.start + i as u32 * 4) == w)
-            || self.branches_into(body.start, fex + 4).next().is_some() {
-            return false;
-        }
-        let sf = u32::from(wide) << 31;
-        let quotient = self.word(fex) & 31;
-        let remainder = self.word(fex + 4) & 31;
-        // The divisor and dividend must still hold their inputs for MSUB, and both outputs must survive it.
-        quotient != 31 && quotient != dividend && quotient != divisor && remainder != 31 && remainder != quotient
-            && self.word(fex) == sf | 0x1ac0_0800 | u32::from(signed) << 10 | divisor << 16 | dividend << 5 | quotient
-            && self.word(fex + 4) == sf | 0x1b00_8000 | divisor << 16 | dividend << 10 | quotient << 5 | remainder
-    }
-
     fn divisions(&mut self) -> Result<(), String> {
         let mut found: Vec<(u32, DivCheck, u32, u32, u32, u32)> = Vec::new(); // guest offset, kind, start, end, divisor, dividend
         for i in 0..self.c.stubs.len() {
@@ -3068,29 +2508,6 @@ impl<'a> Verifier<'a> {
             // The checks read FEX's own operands: its udiv/sdiv's divisor (directly or through FEX's x1 copy), at 8
             // bits its dividend, and the division `svc`'s divisor in x2; the divisor is unchanged from the checks to the divide.
             let (d, h) = (mine[0].3, mine.iter().map(|m| m.4).max().unwrap_or(0));
-            if let Some(guard) = self.c.stubs.iter().find(|s| s.kind == object::kind::SEGMENT && s.guest_offset == g) {
-                let load = self.c.accesses.iter().find(|a| a.native_offset == guard.guest_offset2).ok_or("divide guard without load")?;
-                let first = mine[0].1;
-                let at = load.native_offset;
-                let src = u32::from(load.data_reg[0]);
-                // The first #DE test must receive the completed word, or its byte sign extension
-                // for IDIV r/m8. Neither entry to the middle nor a substitute divisor is valid.
-                let from_load = self.last_write(d as u8, at, first).is_some_and(|last| {
-                    if signed && width == 8 {
-                        // Its #DE verdict uses W, but FEX uses the signed byte in X for the final SDIV.
-                        return last > at && self.word(last) == 0x9340_1c00 | src << 5 | d
-                            && self.last_write(src as u8, at, last) == Some(at);
-                    }
-                    last == at && d == src
-                });
-                if at >= first || !from_load || self.branches_into(at, first).next().is_some() {
-                    return fail("checked memory load must supply the divisor before its first #DE check");
-                }
-                let body = mine.last().unwrap().2 + 4..hi;
-                if !self.checked_divide_result(signed, width, d, h, body, fex) {
-                    return fail("checked memory divide and remainder must use the width-correct dividend and divisor");
-                }
-            }
             let w = self.word(fex);
             let (rn, rm, sdiv) = (w >> 5 & 31, w >> 16 & 31, w >> 10 & 1 == 1);
             let copy = |o: u32| {
@@ -3160,12 +2577,6 @@ impl<'a> Verifier<'a> {
         }
         Ok(())
     }
-}
-
-/// FEX's `x32::RA` excludes the guest's static registers, platform/state registers, WZR and the
-/// emitter's reserved scratch (including w0 used at the bank check).
-fn xlat_allocated_registers(regs: [u8; 4]) -> bool {
-    regs.into_iter().all(|r| matches!(r, 12..=17 | 19..=24 | 29..=30))
 }
 
 /// Whether the floating-point or SIMD word `x` reads v1 (AFP accurate plan chunk 4: the FMA check's stale destination): as Rn, as Rm (the
@@ -3658,50 +3069,16 @@ mod tests {
     }
 
     #[test]
-    fn only_internal_cold_and_hot_edges_can_join_the_inline_guard() {
-        // Source and target offsets only. Include sources outside the guard in both directions.
-        let start = 20;
-        let permitted = [(60, 84), (72, 84), (80, 88)];
-        for from in (0..=120).step_by(4) {
-            for to in (start..=start + 72).step_by(4) {
-                assert_eq!(inline_dword_edge(start, from, to), permitted.contains(&(from, to)), "{from} -> {to}");
-            }
-        }
-    }
-
-    #[test]
-    fn store_literal_words_are_disjoint_from_guest_rip_relocations() {
-        // The native literal occupies [20, 28). Check one-word intersections on both sides,
-        // complete overlap, and touching endpoints. These are offsets only; no guest is run.
-        for (kind, starts) in [
-            (object::RELOC_GUEST_RIP_MOVE, &[12, 16, 20, 24][..]),
-            (object::RELOC_GUEST_RIP_LITERAL, &[16, 20, 24][..]),
-            (object::RELOC_DISPATCH_BRANCH, &[20, 24][..]),
-            (object::RELOC_PROBE_BRANCH, &[20, 24][..]),
-        ] {
-            for offset in (4..=32).step_by(4) {
-                let r = Reloc { kind, offset, register: 3, size: if kind == object::RELOC_GUEST_RIP_LITERAL { 8 } else { 0 },
-                    reserved: 0, value: 0 };
-                let overlap = starts.contains(&offset);
-                assert_eq!(overlaps_relocation32(20..28, &[r], true), overlap, "guard: kind {kind}, offset {offset}");
-                let rip = matches!(kind, object::RELOC_GUEST_RIP_LITERAL | object::RELOC_GUEST_RIP_MOVE);
-                assert_eq!(overlaps_relocation32(20..28, &[r], false), rip && overlap, "literal: kind {kind}, offset {offset}");
-            }
-        }
-    }
-
-    #[test]
     fn code_of_32_bit_mode_is_admitted_under_its_mode_only() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
         let dir = std::env::temp_dir().join(format!("natemu-admit32-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let compile_with = |hex: &str, rip: &str, bits: &str, extra: &[&str]| -> (Vec<u8>, Vec<u8>) {
+        let compile = |hex: &str, rip: &str, bits: &str| -> (Vec<u8>, Vec<u8>) {
             let object = dir.join("o");
             let out = std::process::Command::new(&fexc)
                 .args(["--hex", hex, "--rip", rip, "--profile", "slice1", "--bitness", bits, "--narrow-cmp", "--ext-conds", "4"])
-                .args(extra)
                 .arg("--object")
                 .arg(&object)
                 .output()
@@ -3710,7 +3087,6 @@ mod tests {
             let source = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
             (std::fs::read(&object).unwrap(), source)
         };
-        let compile = |hex: &str, rip: &str, bits: &str| compile_with(hex, rip, bits, &[]);
         let admit = |(object, source): &(Vec<u8>, Vec<u8>), bits32: bool| {
             let h: Header = super::super::record(object, 0);
             super::super::admit_mode(object, h.guest_rip, source, u64::MAX, true, false, bits32).map(|a| a.links.len())
@@ -3740,469 +3116,6 @@ mod tests {
         }
         let e = admit(&compile("4889d8c3", "0x8048000", "64"), true).expect_err("64-bit code admitted as 32-bit code");
         assert!(e.contains("profile or settings"), "{e}");
-        let allocated = [12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 24, 29, 30];
-        for role in 0..4 {
-            for reg in 0..32 {
-                let mut regs = [20; 4];
-                regs[role] = reg;
-                assert_eq!(xlat_allocated_registers(regs), allocated.contains(&reg), "XLAT role {role}, w{reg}");
-            }
-        }
-        for hex in ["64d7", "89c389c865d790"] {
-            let (o, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&o, 0);
-            let guard = (0..h.sites_count as usize)
-                .map(|n| super::super::record::<Site>(&o, h.sites_offset as usize + n * size_of::<Site>()))
-                .find(|s| s.kind == object::kind::SEGMENT).unwrap();
-            let merge = guard.guest_offset2 + 4;
-            let at = (h.code_offset + merge) as usize;
-            let word = u32::from_le_bytes(o[at..at + 4].try_into().unwrap());
-            let (extract, uxtb) = (guard.insn_native_offset..guard.imm as u32 - 8)
-                .step_by(4)
-                .map(|pc| {
-                    let at = (h.code_offset + pc) as usize;
-                    (pc, u32::from_le_bytes(o[at..at + 4].try_into().unwrap()))
-                })
-                .find(|&(_, w)| w & !31 == 0x5300_1c00 | u32::from(SRA32[0]) << 5)
-                .expect("XLAT must extract unsigned AL");
-            for shape in [false, true] {
-                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
-                check(&o).unwrap();
-                let changed = patched((&o, &src), merge, word, word ^ (1 << 10));
-                assert!(check(&changed).unwrap_err().contains("does not preserve and merge AL"));
-                let changed = patched((&o, &src), extract, uxtb, uxtb & !31 | u32::from(SRA32[1]));
-                assert!(check(&changed).unwrap_err().contains("not an allocatable compatibility register"));
-            }
-        }
-        for hex in ["65f6b701000000", "64f63f", "6566f737", "6466f73f", "65f737", "64f73f"] {
-            let (o, source) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&o, 0);
-            let offset = (0..h.sites_count as usize).map(|n| h.sites_offset as usize + n * size_of::<Site>())
-                .find(|&at| super::super::record::<Site>(&o, at).kind == object::kind::LOAD).unwrap();
-            let load: Site = super::super::record(&o, offset);
-            let at = (h.code_offset + load.native_offset) as usize;
-            let word = u32::from_le_bytes(o[at..at+4].try_into().unwrap());
-            // Keep the typed load and native word consistent while detaching the original #DE
-            // checks from their memory source. Optional shape checks must not weaken that link.
-            let wrong = if load.data_reg[0] == 20 { 21 } else { 20 };
-            let mut changed = o.clone();
-            changed[at..at+4].copy_from_slice(&(word & !31 | u32::from(wrong)).to_le_bytes());
-            changed[offset + core::mem::offset_of!(Site, data_reg)] = wrong;
-            for shape in [false, true] {
-                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-                check(&o).unwrap();
-                assert!(check(&changed).unwrap_err().contains("load must supply the divisor"), "{hex}");
-                let body = (h.code_offset + load.native_offset) as usize;
-                let word_at = |at: usize| u32::from_le_bytes(o[at..at+4].try_into().unwrap());
-                let divide = (body..h.code_offset as usize + h.code_size as usize).step_by(4)
-                    .find(|&at| word_at(at) & 0x7fe0_f800 == 0x1ac0_0800 && word_at(at) & 31 != 0).unwrap();
-                let msub = divide + 4;
-                let mut edits = vec![(divide, 1 << 31), (msub, 1 << 31), (msub, 1 << 16),
-                                     (msub, 1 << 10), (msub, 1 << 5)];
-                if hex == "6466f73f" || hex == "64f73f" {
-                    edits.push((divide - 4, 1 << 31)); // change the width of the divisor sign extension
-                }
-                if hex == "65f737" {
-                    edits.push((divide - 12, 1 << 31)); // mov x1,xD in place of the required zero extension
-                }
-                if hex == "64f63f" {
-                    let extend = (body+4..divide).step_by(4).find(|&at| word_at(at) & 0xffff_fc00 == 0x9340_1c00).unwrap();
-                    edits.push((extend, 1 << 31)); // sxtb wD only sign-extends to 32 bits
-                }
-                for (at, flip) in edits {
-                    let mut altered = o.clone();
-                    altered[at..at+4].copy_from_slice(&(word_at(at) ^ flip).to_le_bytes());
-                    assert!(check(&altered).is_err(), "{hex}: admitted incorrect divide preparation or remainder at {at}");
-                }
-            }
-        }
-        // GS:BLSI ESI,[EDI] has /3 in ModRM and its destination in VEX.vvvv.
-        let (obj, src) = compile("65c4e248f31f", "0x8048000", "32");
-        let h: Header = super::super::record(&obj, 0);
-        let guard_at = (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .find(|&at| super::super::record::<Site>(&obj, at).kind == object::kind::SEGMENT).unwrap();
-        for shape in [false, true] {
-            let check = |o: &[u8], s: &[u8]| super::super::admit_mode(o, h.guest_rip, s, u64::MAX, shape, false, true);
-            check(&obj, &src).unwrap();
-            let mut changed = obj.clone();
-            changed[guard_at + core::mem::offset_of!(Site, data_reg)] = 6;
-            assert!(check(&changed, &src).unwrap_err().contains("differs from its x86 operand"));
-            let mut changed = src.clone();
-            changed[5] = 0x17; // BLSMSK /2.
-            assert!(check(&obj, &changed).unwrap_err().contains("differs from its x86 operand"));
-        }
-        for hex in ["650f942f", "640f38f10f", "65660f38f10f", "650fc30f"] {
-            let (obj, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&obj, 0);
-            let (at, guard) = (0..h.sites_count as usize)
-                .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-                .map(|at| (at, super::super::record::<Site>(&obj, at)))
-                .find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap();
-            for shape in [false, true] {
-                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
-                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
-                let mut different_role = obj.clone();
-                different_role[at + core::mem::offset_of!(Site, data_reg)] ^= 1;
-                assert!(check(&different_role).is_err(), "{hex}: changed store source or condition");
-                let word_at = (h.code_offset + guard.guest_offset2) as usize;
-                let mut wrong_size = obj.clone();
-                wrong_size[word_at + 3] ^= 0x40;
-                assert!(check(&wrong_size).is_err(), "{hex}: changed native store width");
-                if hex.contains("38f1") {
-                    let reversal = (guard.insn_native_offset..guard.imm as u32 - 8).step_by(4)
-                        .map(|pc| (h.code_offset + pc) as usize)
-                        .find(|&pc| u32::from_le_bytes(obj[pc..pc+4].try_into().unwrap()) & !1023 == 0x5ac0_0800)
-                        .expect("MOVBE store must reverse the guest source before its descriptor check");
-                    let mut other_gpr = obj.clone();
-                    other_gpr[reversal] ^= 1 << 5;
-                    assert!(check(&other_gpr).is_err(), "{hex}: reversed another source register");
-                }
-            }
-        }
-        for hex in ["650f952f", "64660f38f10f"] {
-            let (obj, src) = compile_with(hex, "0x8048000", "32", &["--max-insts", "1"]);
-            let h: Header = super::super::record(&obj, 0);
-            let guard = (0..h.sites_count as usize)
-                .map(|n| super::super::record::<Site>(&obj, h.sites_offset as usize + n * size_of::<Site>()))
-                .find(|s| s.kind == object::kind::SEGMENT).unwrap();
-            let body = (guard.insn_native_offset..guard.imm as u32 - 8).step_by(4)
-                .find(|&pc| {
-                    let at = (h.code_offset + pc) as usize;
-                    u32::from_le_bytes(obj[at..at+4].try_into().unwrap()) == 0x3400_0140
-                }).expect("one-instruction unit checks the incoming x87 run");
-            let at = (h.code_offset + body) as usize;
-            for shape in [false, true] {
-                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &src, u64::MAX, shape, false, true);
-                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
-                let mut skips_offset = obj.clone();
-                skips_offset[at] ^= 1 << 5;
-                assert!(check(&skips_offset).is_err(), "{hex}: run-close branch skips offset setup");
-                let mut different_root = obj.clone();
-                different_root[at - 4] ^= 1;
-                assert!(check(&different_root).is_err(), "{hex}: run-close reads another register");
-            }
-        }
-        // Inspect emitted objects only. Q width, temporary, XMM commit and the VEX upper
-        // slot must agree with the decoded guest operand under both admission profiles.
-        for (hex, vex) in [
-            ("640f100f", false), ("65660f104c8f08", false), ("640f100c8500000000", false),
-            ("640f108f00000080", false), ("640f100d07800408", false),
-            ("64c5f8100f", true), ("65c5f91017", true), ("64c4e178100c8578563412", true),
-        ] {
-            let (obj, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&obj, 0);
-            let access = (0..h.sites_count as usize)
-                .map(|i| super::super::record::<Site>(&obj, h.sites_offset as usize + i * size_of::<Site>()))
-                .find(|s| s.kind == object::kind::LOAD).unwrap();
-            let at = access.native_offset;
-            let word = |p| u32::from_le_bytes(obj[(h.code_offset + p) as usize..][..4].try_into().unwrap());
-            for shape in [true, false] {
-                let check = |o: &[u8], bytes: &[u8]| super::super::admit_mode(o, h.guest_rip, bytes, u64::MAX, shape, false, true);
-                check(&obj, &src).unwrap_or_else(|e| panic!("{hex}: {e}"));
-                if hex == "65660f104c8f08" {
-                    for (pos, delta) in [(5, 0x40), (5, 1), (6, 1)] {
-                        let mut other = src.clone();
-                        other[pos] ^= delta;
-                        assert!(check(&obj, &other).is_err(), "different ModRM base, scale or displacement");
-                    }
-                }
-                let commit = at + if vex { 8 } else { 4 };
-                for (p, replacement) in [(at, 0xfd40_0000 | word(at) & 0x3ff), (commit, word(commit) ^ 1), (commit, word(commit) ^ (1 << 16))] {
-                    let changed = patched((&obj, &src), p, word(p), replacement);
-                    assert!(check(&changed, &src).is_err(), "{hex}: changed Q transfer or commit at {p}");
-                }
-                if vex {
-                    for replacement in [word(at + 4) ^ (1 << 16), MOV_X0] {
-                        let changed = patched((&obj, &src), at + 4, word(at + 4), replacement);
-                        assert!(check(&changed, &src).is_err(), "{hex}: lost or misdirected YMM clear");
-                    }
-                }
-            }
-        }
-        let (alu, source) = compile("65330f", "0x8048000", "32");
-        let h: Header = super::super::record(&alu, 0);
-        let (site_offset, guard) = (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .map(|at| (at, super::super::record::<Site>(&alu, at)))
-            .find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap();
-        for shape in [false, true] {
-            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-            check(&alu).unwrap();
-            let mut changed = alu.clone();
-            changed[site_offset + core::mem::offset_of!(Site, data_reg) + 1] ^= object::SEGMENT_NATIVE_LOAD;
-            assert!(check(&changed).unwrap_err().contains("differs from its x86 operand"));
-            let at = (h.code_offset + guard.guest_offset2) as usize;
-            let mut changed = alu.clone();
-            let word = u32::from_le_bytes(changed[at..at+4].try_into().unwrap());
-            // Another W register of the same width cannot receive the load on the wrapped path.
-            changed[at..at+4].copy_from_slice(&(word ^ 1).to_le_bytes());
-            assert!(check(&changed).is_err());
-        }
-        // Mutating either half of the actual STORE's literal or its transfer register is a refusal,
-        // even in production admission. The original instruction and generated code are never executed here.
-        for hex in ["64c607fe", "6566c74702c381", "64c707efcdab89", "65c7057856341200000000"] {
-            let (obj, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&obj, 0);
-            let site = (0..h.sites_count as usize)
-                .map(|i| super::super::record::<Site>(&obj, h.sites_offset as usize + i * size_of::<Site>()))
-                .find(|s| s.kind == object::kind::SEGMENT).expect("immediate store has a descriptor check");
-            for shape in [false, true] {
-                let check = |o: &[u8], s: &[u8]| super::super::admit_mode(o, h.guest_rip, s, u64::MAX, shape, false, true);
-                check(&obj, &src).unwrap_or_else(|e| panic!("{hex}: {e}"));
-                for pos in src.len() - usize::from(site.width)..src.len() {
-                    let mut altered = src.clone();
-                    altered[pos] ^= 0x80;
-                    assert!(check(&obj, &altered).unwrap_err().contains("store immediate"), "{hex} byte {pos}");
-                }
-                let off = h.code_offset as usize + site.guest_offset2 as usize;
-                let mut altered = obj.clone();
-                altered[off] ^= 1;
-                assert!(check(&altered, &src).is_err(), "native STORE register {hex}");
-            }
-        }
-        // A literal equal to this guest instruction's original ending RIP is still an ordinary
-        // literal when the same bytes are compiled elsewhere. Both admission profiles accept it.
-        for rip in ["0x8048000", "0x9048000"] {
-            let (obj, src) = compile("64c70707800408", rip, "32");
-            let h: Header = super::super::record(&obj, 0);
-            for shape in [false, true] {
-                super::super::admit_mode(&obj, h.guest_rip, &src, u64::MAX, shape, false, true).unwrap();
-            }
-        }
-        // The RMW selector, high-byte register and immediate-store bit are all independently checked.
-        let (sbb, source) = compile("65182f", "0x8048000", "32");
-        let h: Header = super::super::record(&sbb, 0);
-        let guard = (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .find(|&at| super::super::record::<Site>(&sbb, at).kind == object::kind::SEGMENT).unwrap();
-        for shape in [false, true] {
-            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-            check(&sbb).unwrap();
-            for bit in [1, 8, object::SEGMENT_STORE_REGISTER] {
-                let mut changed = sbb.clone();
-                changed[guard + core::mem::offset_of!(Site, data_reg)] ^= bit;
-                assert!(check(&changed).is_err(), "inconsistent ALU selector or register {bit}");
-            }
-        }
-        let (cas, source) = compile("f0650fb02f", "0x8048000", "32");
-        let h: Header = super::super::record(&cas, 0);
-        let transfer = (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .find(|&at| super::super::record::<Site>(&cas, at).kind == object::kind::ATOMIC).unwrap();
-        let access = super::super::record::<Site>(&cas, transfer);
-        for shape in [false, true] {
-            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-            check(&cas).unwrap();
-            for at in [transfer + core::mem::offset_of!(Site, data_reg), transfer + core::mem::offset_of!(Site, data_reg) + 1,
-                       transfer + core::mem::offset_of!(Site, base_reg), transfer + core::mem::offset_of!(Site, width),
-                       h.code_offset as usize + access.native_offset as usize - 4] {
-                let mut changed = cas.clone();
-                changed[at] ^= 1;
-                assert!(check(&changed).is_err(), "inconsistent CAS operands or ordering at {at}");
-            }
-        }
-        // These are local verifier controls only: same-width native words, unchanged access records.
-        // CH extraction, the expected-value copy, and each consumer of the returned old byte are independent.
-        let native = h.code_offset as usize;
-        let finish = native + h.code_size as usize;
-        for (mask, pattern, change) in [
-            (0xffff_ffe0, 0x5308_3ce0, 1 << 5),   // extract CH from a different guest register
-            (0xffff_ffe0, 0x5308_3ce0, 1 << 16),  // shift by a different amount
-            (0xffff_ffff, 0x2a04_03e1, 1 << 16),  // expected value copied to TMP2
-            (0xffff_ffe0, 0x2a01_03e0, 1 << 16),  // forwarding of the returned old value
-            (0xffe0_001f, 0xca00_001b, 1 << 16),  // AF
-            (0xffe0_001f, 0x6b00_001f, 1 << 10),  // narrow NZCV
-            (0xffe0_001f, 0x4b00_001a, 1 << 16),  // PF
-            (0xffff_fc1f, 0xb340_1c04, 1 << 5),   // AL writeback
-        ] {
-            let off = (native..finish).step_by(4).find(|&n| {
-                u32::from_le_bytes(cas[n..n+4].try_into().unwrap()) & mask == pattern
-            }).expect("emitted byte-CAS data-flow instruction");
-            let mut changed = cas.clone();
-            let word = u32::from_le_bytes(changed[off..off+4].try_into().unwrap());
-            changed[off..off+4].copy_from_slice(&(word ^ change).to_le_bytes());
-            for shape in [false, true] {
-                assert!(super::super::admit_mode(&changed, h.guest_rip, &source, u64::MAX, shape, false, true).is_err());
-            }
-        }
-        // Exercise real compiler setup for a scaled address and displacements. Changing ADD to
-        // ADDS leaves its GPR value and all records identical, but destroys the faulting flags.
-        for hex in ["f064660fb10c77", "f0650fb18c7734120000", "f0640fb14ffc", "f0650fb10d78563412"] {
-            let (obj, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&obj, 0);
-            let sites: Vec<_> = (0..h.sites_count as usize)
-                .map(|i| h.sites_offset as usize + i * size_of::<Site>())
-                .map(|i| (i, super::super::record::<Site>(&obj, i)))
-                .filter(|(_, s)| matches!(s.kind, object::kind::SEGMENT | object::kind::ATOMIC)).collect();
-            assert_eq!(sites.len(), 2);
-            for shape in [false, true] {
-                let check = |o: &[u8]| super::super::admit_mode(o, h.guest_rip, &src, u64::MAX, shape, false, true);
-                check(&obj).unwrap_or_else(|e| panic!("{hex}: {e}"));
-                if hex != "f064660fb10c77" { continue; }
-                let start = (h.code_offset + sites[0].1.insn_native_offset) as usize;
-                let guard = sites.iter().find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap().1;
-                let end = h.code_offset as usize + guard.imm as usize - 4;
-                let add = (start..end).step_by(4).find(|&off| {
-                    u32::from_le_bytes(obj[off..off+4].try_into().unwrap()) & 0xff20_0000 == 0x0b00_0000
-                }).expect("scaled address emitted as ADD");
-                let mut changed = obj.clone();
-                changed[add + 3] ^= 0x20;
-                assert!(check(&changed).unwrap_err().contains("checked CAS value flow"));
-                for (offset, _) in &sites {
-                    let mut changed = obj.clone();
-                    changed[offset + core::mem::offset_of!(Site, nzcv)] = object::NZCV_SAVED;
-                    assert!(check(&changed).is_err());
-                }
-            }
-        }
-        let (swap, source) = compile("f065862f", "0x8048000", "32"); // LOCK XCHG [GS:EDI], CH
-        let h: Header = super::super::record(&swap, 0);
-        let site_at = |kind| (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .find(|&at| super::super::record::<Site>(&swap, at).kind == kind).unwrap();
-        let guard = site_at(object::kind::SEGMENT);
-        let transfer = site_at(object::kind::SWAP);
-        for shape in [false, true] {
-            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-            check(&swap).unwrap();
-            for pos in [guard + core::mem::offset_of!(Site, data_reg), transfer + core::mem::offset_of!(Site, data_reg),
-                        transfer + core::mem::offset_of!(Site, data_reg) + 1, transfer + core::mem::offset_of!(Site, base_reg)] {
-                let mut changed = swap.clone();
-                changed[pos] ^= 1;
-                assert!(check(&changed).is_err(), "inconsistent XCHG operand at {pos}");
-            }
-        }
-        let (add, source) = compile("65010f", "0x8048000", "32");
-        let h: Header = super::super::record(&add, 0);
-        let store = (0..h.sites_count as usize)
-            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
-            .find(|&at| super::super::record::<Site>(&add, at).kind == object::kind::STORE).unwrap();
-        for shape in [false, true] {
-            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
-            check(&add).unwrap();
-            for field in [core::mem::offset_of!(Site, rmw), core::mem::offset_of!(Site, base_reg)] {
-                let mut changed = add.clone();
-                changed[store + field] ^= 1;
-                assert!(check(&changed).is_err(), "inconsistent ADD store field at {field}");
-            }
-        }
-        let (moffs, source) = compile("65a178563412", "0x8048000", "32");
-        let h: Header = super::super::record(&moffs, 0);
-        for shape in [false, true] {
-            let check = |src: &[u8]| super::super::admit_mode(&moffs, h.guest_rip, src, u64::MAX, shape, false, true);
-            check(&source).unwrap();
-            for pos in [2, 5] {
-                let mut changed = source.clone();
-                changed[pos] ^= 0x80;
-                assert!(check(&changed).unwrap_err().contains("moffs immediate"), "changed offset byte {pos}");
-            }
-        }
-        // All modifications below are admission-only, including when optional code shape is off.
-        for hex in ["648b0f", "65890f"] {
-            let (obj, src) = compile(hex, "0x8048000", "32");
-            let h: Header = super::super::record(&obj, 0);
-            let records: Vec<_> = (0..h.sites_count as usize).map(|i| h.sites_offset as usize + i * size_of::<Site>())
-                .map(|off| (off, super::super::record::<Site>(&obj, off))).collect();
-            let (_, access) = records.iter().find(|(_, s)| matches!(s.kind, object::kind::LOAD | object::kind::STORE)).unwrap();
-            let word = |at| u32::from_le_bytes(obj[(h.code_offset + at) as usize..][..4].try_into().unwrap());
-            let is_load = access.kind == object::kind::LOAD;
-            for shape in [false, true] {
-                let check = |o: &[u8]| super::super::admit_mode(o, h.guest_rip, &src, u64::MAX, shape, false, true);
-                check(&obj).unwrap();
-                // The instruction and its matching transfer records agree with one another. They
-                // must also agree with the decoded ModRM register and be live across the guard.
-                for rt in [0u8, 1, 2, 6, 21] {
-                    let at = access.native_offset;
-                    let mut changed = patched((&obj, &src), at, word(at), (word(at) & !31) | u32::from(rt));
-                    for (off, s) in &records {
-                        if s.native_offset == at || s.kind == object::kind::SPLIT && s.guest_offset2 == at {
-                            changed[off + core::mem::offset_of!(Site, data_reg)] = rt;
-                        }
-                    }
-                    assert!(check(&changed).is_err(), "{hex} admitted changed Rt {rt}");
-                }
-                if is_load {
-                    // Preserve all site records, Rn, Rt and the following MOV X. A signed word
-                    // load reads the same four bytes but would commit different high register bits.
-                    let at = access.native_offset;
-                    let signed = 0xb980_0000 | (word(at) & 0x3ff); // LDRSW Xt,[Xn]
-                    let changed = patched((&obj, &src), at, word(at), signed);
-                    assert!(check(&changed).unwrap_err().contains("scalar native load continuation"));
-                    let at = access.native_offset + 4;
-                    for replacement in [word(at) ^ 1, word(at) ^ (1 << 16), MOV_X0] {
-                        let changed = patched((&obj, &src), at, word(at), replacement);
-                        assert!(check(&changed).unwrap_err().contains("ModRM destination commit"));
-                    }
-                }
-            }
-        }
-        // Prefix order does not affect the decoded address size. Keep instruction length,
-        // register, width and FS fixed, replacing the redundant DS override with 67h.
-        for (hex, pos) in [("3e648b0f", 0), ("6464890f", 0)] {
-            let (obj, mut src) = compile(hex, "0x8048000", "32");
-            src[pos] = 0x67;
-            for shape in [false, true] {
-                let e = super::super::admit_mode(&obj, 0x8048000, &src, u64::MAX, shape, false, true).unwrap_err();
-                assert!(e.contains("unsupported 16-bit address"), "{hex}: {e}");
-            }
-        }
-        // Ordinary compatibility blocks also require v6. Default 64-bit code keeps its v4 contract.
-        for (bits, version, hex) in [("32", 6u32, "89d8"), ("64", 4u32, "4889d8")] {
-            let (mut obj, source) = compile(hex, "0x8048000", bits);
-            let h: Header = super::super::record(&obj, 0);
-            assert_eq!(h.version, version);
-            for shape in [false, true] {
-                super::super::admit_mode(&obj, h.guest_rip, &source, u64::MAX, shape, false, bits == "32").unwrap();
-            }
-            obj[8..12].copy_from_slice(&5u32.to_le_bytes());
-            for shape in [false, true] {
-                assert!(super::super::admit_mode(&obj, h.guest_rip, &source, u64::MAX, shape, false, bits == "32")
-                    .unwrap_err().contains("version"));
-            }
-        }
-        // The mandatory check is tied to its decoded operand and both native register moves.
-        let (o, source) = compile("648b0f", "0x8048000", "32");
-        let h: Header = super::super::record(&o, 0);
-        let site = (0..h.sites_count as usize)
-            .map(|i| super::super::record::<Site>(&o, h.sites_offset as usize + i * size_of::<Site>()))
-            .find(|s| s.kind == object::kind::SEGMENT).unwrap();
-        let back = u32::try_from(site.imm).unwrap();
-        for shape in [false, true] {
-            let check = |obj: &[u8], src: &[u8]| super::super::admit_mode(obj, h.guest_rip, src, u64::MAX, shape, false, true);
-            check(&o, &source).unwrap();
-            for changed in [[0x65, 0x8b, 0x0f], [0x64, 0x89, 0x0f], [0x64, 0x8a, 0x0f]] {
-                assert!(check(&o, &changed).unwrap_err().contains("differs from its x86 operand"));
-            }
-            // A source suffix cannot disappear by moving its instruction boundary inside a MOV.
-            let (mut multi, src) = compile("90648b0f", "0x8048000", "32");
-            let head: Header = super::super::record(&multi, 0);
-            for n in 0..head.pcs_count as usize {
-                let off = head.pcs_offset as usize + n * size_of::<PcEntry>() + 4;
-                if multi[off..off + 4] == 1u32.to_le_bytes() { multi[off..off + 4].copy_from_slice(&0u32.to_le_bytes()); }
-            }
-            assert!(check(&multi, &src).is_err(), "missing MOV boundary");
-            let extra = patched((&o, &source), back, u32::from_le_bytes(o[(h.code_offset + back) as usize..][..4].try_into().unwrap()), 0xb940_0084);
-            assert!(check(&extra, &source).unwrap_err().contains("unrecorded memory access"));
-            // Every instruction, from the original offset to the post-check linear handoff.
-            assert_eq!(h.version, 6);
-            let mut prior = o.clone();
-            prior[8..12].copy_from_slice(&5u32.to_le_bytes());
-            assert!(check(&prior, &source).unwrap_err().contains("version"));
-            for at in (back - 72..=back).step_by(4) {
-                let old = u32::from_le_bytes(o[(h.code_offset + at) as usize..][..4].try_into().unwrap());
-                let changed = patched((&o, &source), at, old, MOV_X0);
-                assert!(check(&changed, &source).is_err(), "absent address check word {at:#x}");
-            }
-        }
-        for shape in [false, true] {
-            let (o, src) = compile("640fb70f", "0x8048000", "32");
-            let check = |bytes: &[u8]| super::super::admit_mode(&o, 0x8048000, bytes, u64::MAX, shape, false, true);
-            check(&src).unwrap();
-            for different in [[0x64, 0x0f, 0xbf, 0x0f], [0x64, 0x0f, 0xb6, 0x0f], [0x64, 0x0f, 0xb7, 0x17]] {
-                assert!(check(&different).is_err(), "changed extension, source width, or output register");
-            }
-        }
         // The link points of the wrapping exits carry the wrapped RIPs (0, not 4 GiB).
         assert_eq!(admit(&compile("7402ebfe", "0xfffffffc", "32"), true), Ok(2));
         // fexc's one form of a 32-bit guest-RIP move, `movz w; movk w, lsl #16; nop` (zero halves too: a call at 0 pushes 5,
@@ -5772,4 +4685,127 @@ mod tests {
         }
         assert!(admit_with(fixture!("xchg-rip-crossing"), false).is_ok()); // a split lock: the resident's halt at run time
     }
+    /// M2 checkpoint C, with `FEXC` set: the sweep of 32-bit memory forms through a limited FS. Every opcode of the legacy
+    /// maps (one byte, 0f, 0f 38, 0f 3a, each plain and with 66, f3, f2 and LOCK), of x87 and of the VEX maps, with every
+    /// ModRM.reg, as `fs: op [ebx]`, alone in a unit (`--max-insts 1`, the resident's step) and followed by a `ret`: what
+    /// fexc translates must be admitted with its operand check, whose width and intent admission takes from its own decode.
+    /// The forms fexc translates and admission refuses are listed (none is expected: such a form would stop the VM).
+    #[test]
+    fn every_limited_fs_form_is_checked_or_refused() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
+        let mut forms: Vec<Vec<u8>> = Vec::new();
+        let mut add = |head: &[u8]| {
+            for reg in 0..8u8 {
+                // [ebx] and, for moffs and other forms without ModRM, whatever the bytes mean: iced says below.
+                let mut bytes = vec![0x64];
+                bytes.extend_from_slice(head);
+                bytes.push(reg << 3 | 3);
+                bytes.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0, 0, 0, 0]);
+                let mut d = Decoder::new(32, &bytes, DecoderOptions::NONE);
+                let i = d.decode();
+                if i.is_invalid() || i.memory_segment() != Register::FS || !i.op_kinds().any(|k| k == OpKind::Memory) {
+                    continue;
+                }
+                bytes.truncate(i.len());
+                if !forms.contains(&bytes) {
+                    forms.push(bytes);
+                }
+            }
+        };
+        for prefix in [&[][..], &[0x66], &[0xf3], &[0xf2], &[0xf0]] {
+            for op in 0..=255u8 {
+                for map in [&[][..], &[0x0f], &[0x0f, 0x38], &[0x0f, 0x3a]] {
+                    add(&[prefix, map, &[op]].concat());
+                }
+            }
+        }
+        for op in 0..=255u8 {
+            for pp in 0..4u8 {
+                for l in 0..2u8 {
+                    add(&[0xc5, 0xf8 | l << 2 | pp, op]); // VEX map 1, vvvv = 1111b
+                    add(&[0xc5, 0xb8 | l << 2 | pp, op]); // vvvv = 0111b (the forms that take a second source)
+                    for map in [2u8, 3] {
+                        for w in 0..2u8 {
+                            add(&[0xc4, 0xe0 | map, w << 7 | 0x78 | l << 2 | pp, op]);
+                            add(&[0xc4, 0xe0 | map, w << 7 | 0x38 | l << 2 | pp, op]);
+                        }
+                    }
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("natemu-fs-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = super::super::User32 { cpl3: true, limited: [true, false] };
+        let chunks: Vec<&[Vec<u8>]> = forms.chunks(forms.len().div_ceil(8)).collect();
+        let (mut translated, mut refused) = (0, Vec::new());
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = chunks
+                .iter()
+                .enumerate()
+                .map(|(n, chunk)| {
+                    let (fexc, dir) = (&fexc, &dir);
+                    scope.spawn(move || {
+                        let (mut translated, mut refused) = (0, Vec::new());
+                        for form in chunk.iter() {
+                            for step in [true, false] {
+                                let source = if step { form.clone() } else { [&form[..], &[0xc3]].concat() };
+                                let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+                                let object = dir.join(format!("o{n}"));
+                                let _ = std::fs::remove_file(&object);
+                                let mut c = std::process::Command::new(fexc);
+                                c.args(["--hex", &hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run", "--fs-limited"]);
+                                if step {
+                                    c.args(["--max-insts", "1"]);
+                                }
+                                let out = c.arg("--object").arg(&object).arg("--out").arg("/dev/null").output().unwrap();
+                                let Ok(o) = std::fs::read(&object) else { continue };
+                                let h: Header = super::super::record(&o, 0);
+                                // (Cut before the instruction, or after it: only a unit that holds it counts.)
+                                if !out.status.success() || (h.guest_bytes as usize) < form.len() {
+                                    continue;
+                                }
+                                translated += 1;
+                                if let Err(e) = super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, user) {
+                                    // Not the check's doing when the same unit compiled without it is refused too.
+                                    let flat = dir.join(format!("f{n}"));
+                                    let mut c = std::process::Command::new(fexc);
+                                    c.args(["--hex", &hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run"]);
+                                    if step {
+                                        c.args(["--max-insts", "1"]);
+                                    }
+                                    assert!(c.arg("--object").arg(&flat).arg("--out").arg("/dev/null").output().unwrap().status.success(), "{hex}");
+                                    let f = std::fs::read(&flat).unwrap();
+                                    let also = super::super::admit_mode(&f, h.guest_rip, &source, u64::MAX, true, false, true).is_err();
+                                    refused.push(format!("{hex}{}{}: {e}", if step { " (step)" } else { "" }, if also { " (also without the check)" } else { "" }));
+                                }
+                                // The same object is never admitted as a block whose FS is not limited, nor outside CPL 3
+                                // (a form that accesses nothing, a prefetch or a hint NOP, has no check and is).
+                                let checked = (0..h.sites_count as usize)
+                                    .any(|k| super::super::record::<Site>(&o, h.sites_offset as usize + k * size_of::<Site>()).kind == object::kind::SEGMENT);
+                                for other in [super::super::User32 { cpl3: true, limited: [false, true] }, super::super::User32 { cpl3: false, limited: [true, false] }] {
+                                    assert!(!checked || super::super::admit_user(&o, h.guest_rip, &source, u64::MAX, true, false, true, other).is_err(), "{hex}");
+                                }
+                            }
+                        }
+                        (translated, refused)
+                    })
+                })
+                .collect();
+            for w in workers {
+                let (t, r) = w.join().unwrap();
+                translated += t;
+                refused.extend(r);
+            }
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!("{} forms, {translated} units translated, {} refused", forms.len(), refused.len());
+        assert!(translated > 2000, "{translated}");
+        // VPCMPESTRI/VPCMPESTRM with VEX.W = 1 (c4 e3 f9 60/61) are refused with or without the check (their helper call's shape).
+        let new: Vec<_> = refused.iter().filter(|r| !(r.contains("(also without the check)") && r.starts_with("64c4e3f96"))).collect();
+        assert!(new.is_empty(), "{new:#?}");
+    }
+
 }

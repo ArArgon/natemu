@@ -1003,6 +1003,10 @@ pub mod cache {
         /// M2 Part 2, the firmware boot mode: the firmware image's size (`super::FIRMWARE_END` - size .. 4 GiB), set by the
         /// host at prepare; 0, the default, is none. Read only where a page is found outside guest RAM. Appended.
         pub firmware_bytes: u64,
+        /// M2 checkpoint C: operand checks of 32-bit user code decided by the resident ([`crate::code_object::kind::SEGMENT`]
+        /// stubs taken): an in-range operand under a writable expand-up FS or GS takes none. A plain counter in every
+        /// build. Appended.
+        pub segment_checks: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -2864,6 +2868,8 @@ pub const ATTR_D: u16 = 1 << 14;
 /// M2 task 3a: the segment registers whose null selector is a code identity bit in 32-bit code (bits 5 to 8, in this
 /// order; fexc's `--fs-null`, `--gs-null`, `--ds-null`, `--es-null`). CS and SS cannot be null at CPL 3.
 pub const NULL_SREGS: [usize; 4] = [SREG_FS, SREG_GS, SREG_DS, SREG_ES];
+/// M2 checkpoint C: the segments whose limits 32-bit user code's translations check ([`Cpu::limited_segment`]).
+pub const LIMITED_SREGS: [usize; 2] = [SREG_FS, SREG_GS];
 impl Segment {
     pub const NULL: Self = Self {
         selector: 0,
@@ -3208,17 +3214,29 @@ impl Cpu {
     pub fn null_segment(&self, sreg: usize) -> bool {
         self.code_mode() == Some(CodeMode::Compat32) && self.seg[sreg].attributes & ATTR_P == 0
     }
-    /// The two FS/GS records published only for compatibility-user dword MOV. An inclusive
-    /// limit smaller than three admits no dword at any offset, including the disabled zero record.
-    /// Only present expand-up writable data segments qualify; other forms keep the resident check.
-    pub fn compat_dword_segments(&self) -> [u64; 2] {
+    /// M2 checkpoint C: `sreg` (FS or GS, [`LIMITED_SREGS`]) is loaded while 32-bit user code runs and is not a writable
+    /// expand-up data segment with a 4 GiB limit ([`Self::code_context`] bits 34 and 35). Under such a segment an offset
+    /// can be out of range or the access of the wrong kind, so a translation checks each instruction's operand through it
+    /// ([`Self::compat_segment_records`]); under any other the code has no check. A null segment is the null bit's.
+    pub fn limited_segment(&self, sreg: usize) -> bool {
+        let seg = &self.seg[sreg];
+        self.cpl == 3
+            && self.code_mode() == Some(CodeMode::Compat32)
+            && seg.attributes & ATTR_P != 0
+            && !(seg.attributes & 0x9e == 0x92 && seg.limit == u32::MAX)
+    }
+    /// The two FS/GS records the inline operand check of 32-bit user code reads: `(limit + 1) << 32 | base` for a present,
+    /// writable, expand-up data segment whose limit is below 4 GiB, else 0. The check passes when
+    /// `(limit + 1) - width - offset >= 0`, so the record 0 passes nothing (no width is 0) and the resident decides every
+    /// access through such a segment (read-only, expand-down and code segments; outside 32-bit user code).
+    pub fn compat_segment_records(&self) -> [u64; 2] {
         if self.cpl != 3 || self.efer & EFER_LMA == 0 || self.code_mode() != Some(CodeMode::Compat32) {
             return [0; 2];
         }
-        [SREG_FS, SREG_GS].map(|r| {
+        LIMITED_SREGS.map(|r| {
             let seg = &self.seg[r];
-            if seg.attributes & 0x9e == ATTR_P | 0x12 && seg.limit >= 3 {
-                u64::from(seg.limit) << 32 | u64::from(seg.base as u32)
+            if seg.attributes & 0x9e == 0x92 && seg.limit != u32::MAX {
+                (u64::from(seg.limit) + 1) << 32 | u64::from(seg.base as u32)
             } else {
                 0
             }
@@ -3248,7 +3266,10 @@ impl Cpu {
             // AFP accurate plan chunk 1: accurate mode without AFP only; on an AFP host accurate mode changes no code, so no bit.
             | accurate_key(self.accurate_fp, self.no_afp) << 32
             // Misaligned stack pointers keep tripping the run check: code without it (`--push-run` not asked).
-            | u64::from(self.stack_traps >= STACK_TRAP_LIMIT) << 33;
+            | u64::from(self.stack_traps >= STACK_TRAP_LIMIT) << 33
+            // M2 checkpoint C: FS, GS not a flat-limit segment in 32-bit user code: code that checks operands through it.
+            | bit(self.limited_segment(SREG_FS), 34)
+            | bit(self.limited_segment(SREG_GS), 35);
         word
     }
 }
@@ -4784,31 +4805,49 @@ mod tests {
         let fs = &mut c.seg[SREG_FS];
         fs.base = 0x1_1234_5678;
         fs.limit = u32::MAX;
+        fs.limit = 0x0fff_ffff;
         for a in 0..=255 {
             c.seg[SREG_FS].attributes = a;
             let d = c.seg[SREG_FS];
-            let expected = if a & ATTR_P != 0 && a & 0x10 != 0 && a & 0x0c == 0 && a & 2 != 0 {
-                0xffff_ffff_1234_5678
-            } else { 0 };
-            assert_eq!(c.compat_dword_segments()[0], expected, "access byte {a:#x}");
-            if expected != 0 {
-                assert!(d.allows(0xffff_fffc, 4, true, true));
-                assert!(!d.allows(0xffff_fffd, 4, false, true));
+            let data = a & ATTR_P != 0 && a & 0x10 != 0 && a & 0x0c == 0 && a & 2 != 0;
+            let expected = if data { 0x1000_0000_1234_5678 } else { 0 };
+            assert_eq!(c.compat_segment_records()[0], expected, "access byte {a:#x}");
+            // Present and not flat-limit: limited, whatever the type; the record models only the writable expand-up data segment.
+            assert_eq!(c.limited_segment(SREG_FS), a & ATTR_P != 0, "access byte {a:#x}");
+            assert_eq!(c.code_context() >> 34 & 3, u64::from(a & ATTR_P != 0));
+            if data {
+                assert!(d.allows(0x0fff_fffc, 4, true, true));
+                assert!(!d.allows(0x0fff_fffd, 4, false, true));
             }
         }
+        // The check's arithmetic on the record: (limit + 1) - width - offset >= 0; record 0 passes nothing.
+        let passes = |record: u64, offset: u32, width: i64| (record >> 32) as i64 - width - i64::from(offset) >= 0;
         c.seg[SREG_FS].attributes = 0xf3;
-        for limit in 0..=3 {
+        for limit in [0, 1, 3, 0xfffe, 0xffff_fffe] {
             c.seg[SREG_FS].limit = limit;
-            assert_eq!(c.compat_dword_segments()[0] != 0, limit == 3);
+            let record = c.compat_segment_records()[0];
+            for width in [1u32, 2, 4, 8, 16, 32] {
+                for offset in [0, 1, limit.wrapping_sub(width), limit.wrapping_sub(width).wrapping_add(1), limit.wrapping_sub(width).wrapping_add(2), limit, u32::MAX] {
+                    assert_eq!(passes(record, offset, i64::from(width)), c.seg[SREG_FS].allows(u64::from(offset), u64::from(width), true, true), "{limit:#x} {offset:#x} {width}");
+                }
+            }
         }
+        assert!(!passes(0, 0, 1));
+        // A 4 GiB writable expand-up data segment is not limited and has no record; read-only at 4 GiB is limited, record 0.
+        c.seg[SREG_FS].limit = u32::MAX;
+        assert_eq!((c.limited_segment(SREG_FS), c.compat_segment_records()[0]), (false, 0));
+        c.seg[SREG_FS].attributes = 0xf1;
+        assert_eq!((c.limited_segment(SREG_FS), c.compat_segment_records()[0]), (true, 0));
+        c.seg[SREG_FS].attributes = 0xf3;
+        c.seg[SREG_FS].limit = 0xffff;
         c.efer &= !EFER_LMA;
-        assert_eq!(c.compat_dword_segments(), [0; 2]);
+        assert_eq!(c.compat_segment_records(), [0; 2]);
         c.efer |= EFER_LMA;
         c.seg[SREG_CS].attributes = ATTR_L;
-        assert_eq!(c.compat_dword_segments(), [0; 2]);
+        assert_eq!((c.compat_segment_records(), c.limited_segment(SREG_FS), c.code_context() >> 34), ([0; 2], false, 0));
         c.seg[SREG_CS].attributes = ATTR_D;
         c.cpl = 0;
-        assert_eq!(c.compat_dword_segments(), [0; 2]);
+        assert_eq!((c.compat_segment_records(), c.limited_segment(SREG_FS), c.code_context() >> 34), ([0; 2], false, 0));
     }
 
     #[test]

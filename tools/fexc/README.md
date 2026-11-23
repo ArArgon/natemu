@@ -1070,6 +1070,12 @@ The shim sets `fexc_bits32` for the request (not a gating argument: the host's c
   that should wrap at 4 GiB does not. The shim handles both since task 3a (it enters 32-bit code with the registers
   zero-extended and makes an access that aborted above 4 GiB again at the wrapped address:
   [task 3a's findings](../../docs/restructure/m2-task3a-findings.md)).
+- `--fs-limited` and `--gs-limited` (checkpoint C; 32-bit code only, from the host's code identity): FS, GS is loaded and
+  is not a writable expand-up data segment with a 4 GiB limit. Every instruction with a memory operand through it gets one
+  operand check before its accesses (IR op `FexcSegmentBase`, site kind `segment`: the operand's width and intent, the
+  offset's register, the continuation), inline against the vCPU's read-only record, and the base comes from that check
+  alone. Without the argument the code has no check and loads the base from the guest-state page. In 32-bit objects
+  (version 7) the access sites of an FS or GS operand carry that segment.
 - `--fs-null`, `--gs-null`, `--ds-null` and `--es-null` (task 3a; 32-bit code only, from the host's code identity): that
   segment register holds a null selector, so an access through it is #GP(0). Such an instruction is a system cut
   reported as `cut_gated: "null_segment"`, which the resident raises. An instruction's accesses: the explicit memory

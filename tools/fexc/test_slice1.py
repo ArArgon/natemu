@@ -669,269 +669,100 @@ class Slice1Cutting(unittest.TestCase):
             d, _ = run(PRE + SYSTEM['cli'], RIP, '--object', str(obj))
             self.assertEqual(check_sites.END_REASONS[check_sites.read_object(obj)['end_reason']], 'system_instruction')
 
-    def test_compat_scalar_segment_fault_points(self):
+    # M2 checkpoint C: (hex, operand width, intent) of 32-bit forms with an FS operand, one of each class the per-opcode
+    # checks left out or trapped on; the admission sweep (crates/host, every_limited_fs_form_is_checked_or_refused) has all.
+    LIMITED = [('648b0f', 4, 'read'), ('64890f', 4, 'write'), ('64a114000000', 4, 'read'), ('64a214000000', 1, 'write'),
+               ('64d7', 1, 'read'), ('640fb60f', 1, 'read'), ('64660fbf0f', 2, 'read'), ('64ff03', 4, 'write'),
+               ('6483030a', 4, 'write'), ('64f713', 4, 'write'), ('64d123', 4, 'write'), ('64ff33', 4, 'read'),
+               ('648f03', 4, 'write'), ('64ff13', 4, 'read'), ('f0640103', 4, 'write'), ('f0640fb10b', 4, 'write'),
+               ('640fc103', 4, 'write'), ('640fab03', 4, 'write'), ('640fba2b07', 4, 'write'), ('640fa303', 4, 'read'),
+               ('f3640f1103', 4, 'write'), ('f2640f1003', 8, 'read'), ('640f1003', 16, 'read'), ('640f2903', 16, 'write'),
+               ('640f6f03', 8, 'read'), ('64d903', 4, 'read'), ('64dd1b', 8, 'write'), ('64df03', 2, 'read'),
+               ('64f733', 4, 'read'), ('64c703efbeadde', 4, 'write'), ('640f9403', 1, 'write'), ('640fc70b', 8, 'write'),
+               ('643903', 4, 'read'), ('64833b00', 4, 'read'), ('64c5fc1003', 32, 'read')]
+
+    def test_limited_segment_operand_check(self):
+        """--fs-limited/--gs-limited: one operand check per instruction, before every access through the segment, with the
+        operand's width and intent; the base comes from the check alone (no load of fs_cached/gs_cached); the object and the
+        precision checker agree with it."""
         import replay, verify_precision
         with tempfile.TemporaryDirectory() as t:
             path = Path(t) / 'o.bin'
-            for opcode, seg, write in [('648b0f', 'fs', False), ('65890f', 'gs', True)]:
-                data, rc = run('83c701' + opcode + '83c601', RIP, '--bitness', '32', '--object', str(path))
-                self.assertEqual(rc, 0)
-                obj = check_sites.read_object(path)
-                self.assertEqual(obj['version'], 6)
-                self.assertEqual(check_sites.object_vs_json(obj, data), [])
-                site, = (r for r in obj['sites'] if r[5] == 25)
-                desc, = (s for s in data['sites'] if s['kind'] == 'segment')
-                self.assertEqual((desc['segment'], desc['intent'], desc['width']), (seg, 'write' if write else 'read', 4))
-                self.assertEqual((site[0], site[1], site[2], site[3], site[4], site[6], site[7], site[9], site[10]),
-                                 (desc['native_offset'], desc['guest_offset'], desc['access_native_offset'],
-                                  desc['insn_native_offset'], desc['imm'], 4, int(write), 4 if seg == 'fs' else 5, desc['base_reg']))
-                self.assertIsNotNone(check_sites.inline_dword_start(desc, obj['code']))
-                self.assertEqual(verify_precision.verify(data, Path(t))[0], [])
-                binary = path.read_bytes()
-                reply = struct.pack('<5I', 0, 0, len(binary), 0, 0) + binary
-                self.assertIsNone(replay.only_moves(reply, reply))
-                at = 20 + struct.unpack_from('<I', binary, 64)[0] + 40 * obj['sites'].index(site)
-                for field in [8, 16]:  # offset of the linked access and the continuation must each map
-                    changed = bytearray(reply)
-                    struct.pack_into('<I', changed, at + field, struct.unpack_from('<I', reply, at + field)[0] + 4)
-                    self.assertEqual(replay.only_moves(reply, changed), 'a site record differs')
+            for form, width, intent in self.LIMITED:
+                for prefix, seg, flag, cached in [('64', 'fs', '--fs-limited', 1000), ('65', 'gs', '--gs-limited', 992)]:
+                    form = form.replace('64', prefix, 1)
+                    for extra in [(), ('--max-insts', '1')]:
+                        with self.subTest(form=form, extra=extra):
+                            hexs = form if extra else '83c701' + form + '83c601'
+                            data, rc = run(hexs, RIP, '--bitness', '32', flag, *extra, '--object', str(path))
+                            self.assertEqual((rc, data['status']), (0, 'ok'))
+                            at = 0 if extra else 3
+                            self.assertTrue(data['guest']['instructions'][1 if at else 0]['translated'])
+                            code = bytes.fromhex(data['code']['hex'])
+                            check, = (s for s in data['sites'] if s['kind'] == 'segment')
+                            self.assertEqual((check['guest_offset'], check['segment'], check['width'], check['intent']), (at, seg, width, intent))
+                            start = check_sites.segment_check_start(check, code)
+                            self.assertIsNotNone(start)
+                            through = [s for s in data['sites'] if s['guest_offset'] == at and s['segment'] == seg and
+                                       s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')]
+                            self.assertTrue(through and all(s['native_offset'] > check['imm'] for s in through))
+                            # Every other site of the instruction is its stack's (push, pop, call).
+                            self.assertTrue(all(s['segment'] == 'ss' and s['kind'] in ('push', 'pop')
+                                                for s in data['sites'] if s['guest_offset'] == at and s['segment'] != seg and s['kind'] in
+                                                ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair', 'push', 'pop')))
+                            # No load of the segment's base field anywhere in the unit.
+                            load = (0xb9400380 | (cached // 4) << 10, 0xf9400380 | (cached // 8) << 10)   # ldr wN|xN, [x28, #cached]
+                            end = data['code']['layout']['code_region_end']
+                            self.assertFalse([o for o in range(4, end, 4) if struct.unpack_from('<I', code, o)[0] & ~31 in load])
+                            obj = check_sites.read_object(path)
+                            self.assertEqual(obj['version'], 7)
+                            self.assertEqual(check_sites.object_vs_json(obj, data), [])
+                            self.assertEqual(verify_precision.verify(data, Path(t))[0], [])
+                            binary = path.read_bytes()
+                            reply = struct.pack('<5I', 0, 0, len(binary), 0, 0) + binary
+                            self.assertIsNone(replay.only_moves(reply, reply))
 
-    def test_compat_inline_dword_mov_scope(self):
-        # The guest encoding, rather than access width alone, selects the checked dword path.
-        for opcode, hot in [('648b0f', True), ('65890f', True), ('648b0cfd00000000', True),
-                            ('648a0f', False), ('6566890f', False), ('64a100000000', False),
-                            ('65c70701000000', False), ('65030f', False)]:
-            d, rc = run(opcode, RIP, '--bitness', '32')
-            self.assertEqual(rc, 0, opcode)
-            guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-            self.assertEqual(check_sites.inline_dword_start(guard, bytes.fromhex(d['code']['hex'])) is not None, hot, opcode)
-
-    def test_compat_packed_segment_loads(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as tmp:
-            for form, vex in [('640f100f', False), ('65660f104c9708', False),
-                              ('64c5f8100f', True), ('65c5f91017', True)]:
-                d, rc = run(form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                load, = (s for s in d['sites'] if s['kind'] == 'load')
-                self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation'], load['data_class'],
-                                  guard['access_native_offset'], guard['imm'] + 4), (16, 'read', True, 'fpr',
-                                  load['native_offset'], load['native_offset']), form)
-                self.assertEqual(verify_precision.verify(d, Path(tmp))[0], [], form)
-                gated, _ = run(form, RIP, '--bitness', '32', '--avx-gated' if vex else '--sse-gated', '--fs-null', '--gs-null')
-                self.assertEqual(gated['guest']['end']['reason'], 'system_instruction', form)
-                self.assertIs(gated['guest']['end'].get('cut_gated'), True, form)
-            for form in ['640f110f', '640f280f', '64f30f100f', '64f20f100f', '64c5fc100f', '64d907']:
-                d, _ = run(form, RIP, '--bitness', '32')
-                self.assertFalse(any(s['kind'] == 'segment' for s in d.get('sites', [])), form)
-
-    def test_compat_extending_segment_loads(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for form, size, dest, signed in [('640fb60f', 1, 4, False), ('66650fb70f', 2, 2, False),
-                                            ('66640fbe0f', 1, 2, True), ('650fbf0f', 2, 4, True)]:
-                obj = Path(t) / 'o.bin'
-                data, rc = run(form, RIP, '--bitness', '32', '--object', str(obj))
-                self.assertEqual(rc, 0)
-                desc, = (s for s in data['sites'] if s['kind'] == 'segment')
-                self.assertEqual((desc['width'], desc['destination_width'], desc['signed'], desc['instruction_length']),
-                                 (size, dest, signed, len(form) // 2), form)
-                self.assertEqual(verify_precision.verify(data, Path(t))[0], [], form)
-
-    def test_compat_accumulator_moffs(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for segment, prefix in [('fs', '64'), ('gs', '65')]:
-                for op, width in [('a0', 1), ('66a1', 2), ('a1', 4), ('a2', 1), ('66a3', 2), ('a3', 4)]:
-                    form = prefix + op + '78563412'
-                    path = Path(t) / 'o.bin'
-                    data, rc = run('90' + form + '90', RIP, '--bitness', '32', '--object', str(path))
-                    self.assertEqual(rc, 0, form)
-                    desc, = (s for s in data['sites'] if s['kind'] == 'segment')
-                    self.assertEqual((desc['segment'], desc['intent'], desc['width'], desc['data_regs'], desc['instruction_length']),
-                                     (segment, 'write' if op[-1] in '23' else 'read', width, [0], len(form) // 2), form)
-                    self.assertEqual(check_sites.object_vs_json(check_sites.read_object(path), data), [])
-                    self.assertEqual(verify_precision.verify(data, Path(t))[0], [], form)
-
-    def test_compat_alu_segment_loads(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for opcode in (0x02, 0x0a, 0x12, 0x1a, 0x22, 0x2a, 0x32, 0x3a, 0x38, 0x84):
-                for width in (1, 2, 4):
-                    form = bytes([0x65] + ([0x66] if width == 2 else []) + [opcode + (width != 1), 0x0f])
-                    d, rc = run('90' + form.hex() + '90', RIP, '--bitness', '32')
-                    self.assertEqual(rc, 0)
-                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                    load, = (s for s in d['sites'] if s['kind'] == 'load')
-                    self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation']),
-                                     (width, 'read', True), form)
-                    self.assertEqual((guard['imm'] + 4, guard['access_native_offset']),
-                                     (load['native_offset'], load['native_offset']), form)
-                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-
-    def test_compat_alu_immediate_segment_loads(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for form, width, group in [('64803f7f', 1, 7), ('6664813f0080', 2, 7), ('65813f00000080', 4, 7),
-                                       ('6665833fff', 2, 7), ('64833fff', 4, 7), ('65f607ff', 1, 0),
-                                       ('6664f707ffff', 2, 0), ('65f70700000080', 4, 0)]:
-                d, rc = run(form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0, form)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                load, = (s for s in d['sites'] if s['kind'] == 'load')
-                self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation']),
-                                 (width, 'read', [group], True), form)
-                self.assertEqual((guard['imm'] + 4, guard['access_native_offset']), (load['native_offset'], load['native_offset']), form)
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-
-    def test_read_only_alu_guard_excludes_memory_updates(self):
-        # Neighbouring direction bits and immediate-group selectors can instead write memory.
-        for form in ('64830701', '65f617', '64f71f'):
-            d, rc = run(form, RIP, '--bitness', '32')
-            self.assertEqual(rc, 0, form)
-            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
-            self.assertTrue(any(s['kind'] == 'store' for s in d['sites']), form)
-
-    def test_compat_integer_register_loads(self):
-        import verify_precision
-        forms = [(os + '0f' + f'{0x40 + cc:02x}' + '0f', width)
-                 for cc in range(16) for os, width in [('', 4), ('66', 2)]]
-        for os, width in [('', 4), ('66', 2)]:
-            for opcode in ('0fbc', '0fbd', 'f30fb8', 'f30fbc', 'f30fbd', '0faf', '0f38f0', 'f20f38f1'):
-                forms.append((os + opcode + '0f', width))
-            forms.extend([(os + '6b0ffd', width), (os + '690f' + '34' * width, width)])
-        forms += [('f20f38f00f', 1), ('66f20f38f00f', 1)]
-        with tempfile.TemporaryDirectory() as t:
-            for n, (form, width) in enumerate(forms):
-                d, rc = run(('64' if n % 2 else '65') + form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0, form)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                load, = (s for s in d['sites'] if s['kind'] == 'load')
-                self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation'], guard['imm'] + 4,
-                                  guard['access_native_offset']), (width, 'read', True, load['native_offset'], load['native_offset']), form)
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-
-    def test_compat_integer_stores(self):
-        import verify_precision
-        forms = [('640f' + f'{0x90 + cc:02x}' + '2f', 1, cc) for cc in range(16)] # ignored ModRM.reg = 5
-        forms += [('65660f38f10f', 2, None), ('640f38f10f', 4, None), ('650fc30f', 4, 1)]
-        with tempfile.TemporaryDirectory() as t:
-            for form, width, role in forms:
-                d, rc = run(form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0, form)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                store, = (s for s in d['sites'] if s['kind'] == 'store')
-                self.assertEqual((guard['width'], guard['intent'], guard['access_native_offset'], store['width']),
-                                 (width, 'write', store['native_offset'], width), form)
-                self.assertEqual(guard['data_regs'], [role if role is not None else 0x40 | store['data_regs'][0]], form)
-                self.assertLess(guard['imm'], store['native_offset'], form)
-                if form == '650fc30f':
-                    self.assertEqual(store['ordering'], 'plain')
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-
-    def test_compat_locked_cmpxchg_segment(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for width, reg, form in [(1, 5, 'f0650fb02f'), (2, 1, 'f064660fb10c77'), (4, 1, 'f0650fb10f')]:
-                d, rc = run('90' + form + '90', RIP, '--bitness', '32')
-                self.assertEqual(rc, 0)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                cas, = (s for s in d['sites'] if s['kind'] in ('load', 'store', 'swap', 'atomic'))
-                self.assertEqual((guard['atomic_compare_exchange'], guard['data_regs'], guard['intent'], guard['width']),
-                                 (True, [reg], 'write', width))
-                self.assertEqual((cas['kind'], cas['width'], cas['native_offset']), ('atomic', width, guard['access_native_offset']))
-                self.assertNotIn('destination_width', guard)
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-            # Materialize the old value/flags even when the next guest instruction overwrites both.
-            for form in ('f0650fb10f', 'f0640fb027', 'f0650fb107'):
-                d, rc = run('90' + form + '31c0', RIP, '--bitness', '32')
-                self.assertEqual(rc, 0)
-                self.assertEqual(d['guest']['bytes_translated'], 1 + len(form) // 2)
-                self.assertEqual(d['guest']['end']['reason'], 'block_ending_instruction')
-            for form in ('650fb10f', 'f0650fc70f', '650fb1c1'):
-                d, rc = run(form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0, form)
-                self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
-
-    def test_compat_xchg_segment_swap(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for lock in ('', 'f0'):
-                for width, source, form in ((1, 5, '65862f'), (2, 1, '6466870c77'), (4, 1, '65870f')):
-                    d, rc = run('90' + lock + form + '90', RIP, '--bitness', '32')
-                    self.assertEqual(rc, 0, form)
-                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                    swap, = (s for s in d['sites'] if s['kind'] in ('load', 'store', 'swap', 'atomic'))
-                    self.assertEqual((guard['atomic_exchange'], guard['data_regs'], guard['intent'], guard['width']),
-                                     (True, [source], 'write', width))
-                    self.assertEqual((swap['kind'], swap['intent'], swap['width'], swap['native_offset']),
-                                     ('swap', 'write', width, guard['access_native_offset']))
-                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-            d, rc = run('6487c1', RIP, '--bitness', '32')
+    def test_limited_segment_bits_change_nothing_else(self):
+        """Without the bits no unit has a check (the code is what FEX made before the checks existed, with the base loaded from
+        the guest-state page), and its FS/GS access sites carry the segment; with a bit, a unit without an operand through
+        that segment is the same code; an instruction that accesses nothing (LEA, a prefetch, a hint NOP) has no check; 64-bit
+        code refuses the arguments."""
+        for form, _, _ in self.LIMITED:
+            flat, rc = run('83c701' + form + '83c601', RIP, '--bitness', '32')
             self.assertEqual(rc, 0)
-            self.assertFalse(any(s['kind'] in ('segment', 'swap', 'load', 'store') for s in d['sites']))
+            self.assertFalse([s for s in flat['sites'] if s['kind'] == 'segment'], form)
+            self.assertTrue([s for s in flat['sites'] if s['segment'] == 'fs'], form)
+            other, rc = run('83c701' + form + '83c601', RIP, '--bitness', '32', '--gs-limited')
+            self.assertEqual((rc, other['code']['hex'], other['sites']), (0, flat['code']['hex'], flat['sites']), form)
+        for form in ['648d03', '640f1803', '640f1f03', '8b03', '648bc3']:
+            d, rc = run('83c701' + form + '83c601', RIP, '--bitness', '32', '--fs-limited', '--gs-limited')
+            self.assertEqual(rc, 0)
+            self.assertFalse([s for s in d['sites'] if s['kind'] == 'segment' or s['segment'] in ('fs', 'gs')], form)
+        r = subprocess.run([FEXC, '--profile', 'slice1', '--hex', '648b03', '--rip', hex(RIP), '--fs-limited'], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        # 64-bit code's sites keep DS for an FS/GS operand (their objects are unchanged).
+        d, rc = run('648b03c3', RIP)
+        self.assertEqual((rc, [s['segment'] for s in d['sites'] if s['kind'] == 'load']), (0, ['ds', 'ss']))
 
-    def test_compat_bmi_scalar_reads(self):
-        import verify_precision
-        # The F3 group takes its destination from VEX.vvvv (ESI), not ModRM.reg (/1../3).
-        forms = [('e248f20f', 1), ('e248f30f', 1), ('e248f317', 2), ('e248f31f', 3),
-                 ('e248f70f', 1), ('e248f50f', 1), ('e24af50f', 1), ('e24bf50f', 1),
-                 ('e263f60f', 1), ('e249f70f', 1), ('e24af70f', 1), ('e24bf70f', 1), ('e37bf00f07', 1)]
-        with tempfile.TemporaryDirectory() as t:
-            for n, (tail, reg) in enumerate(forms):
-                form = ('64' if n % 2 else '65') + 'c4' + tail
-                d, rc = run(form, RIP, '--bitness', '32')
-                self.assertEqual(rc, 0, form)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                load, = (s for s in d['sites'] if s['kind'] == 'load')
-                self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation']),
-                                 (4, 'read', [reg], True), form)
-                self.assertEqual((guard['imm'] + 4, guard['access_native_offset']), (load['native_offset'], load['native_offset']), form)
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-        for form, bits in [('c4e248f20f', '32'), ('64c4e248f20f', '64'), ('65c4e248f2cf', '32')]:
-            d, rc = run(form, RIP, '--bitness', bits)
-            self.assertEqual(rc, 0, form)
-            self.assertFalse(any(s['kind'] == 'segment' for s in d['sites']), form)
-
-    def test_compat_alu_segment_pair(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            forms = [(group, width, prefix + f'{8 * group + (width > 1):02x}' + memory, source)
-                     for group in range(7)
-                     for width, prefix, memory, source in [(1, '65', '27', 4), (2, '6466', '0c77', 1), (4, '65', '0f', 1)]]
-            for group, width, form, source in [*forms, (0, 4, '64010f', 1)]:
-                d, rc = run('90' + form + '90', RIP, '--bitness', '32')
+    def test_limited_segment_offsets(self):
+        """The checked offset's register is the address every access adds the base to: one `add wA, wOffset, wBase` (or
+        `add wA, wBase, wOffset`) between the check and the access, for each addressing form; BT's register index and XLAT's
+        AL are in the offset; POP m's check follows its stack read."""
+        for form in ['648b0d44332211', '648b0b', '648b4b10', '648b8b00100000', '648b0c9b', '648b4c9b08', '648b0c24', '648b4d00',
+                     '648b4c2410', '64a144332211', '64d7', '640fab0b', '648f03', '648f0424']:
+            with self.subTest(form=form):
+                d, rc = run(form, RIP, '--bitness', '32', '--fs-limited', '--max-insts', '1')
                 self.assertEqual(rc, 0)
-                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                self.assertEqual((guard['rmw_alu'], guard['data_regs']), (group, [(group << 3) | source]))
-                self.assertIsNone(guard.get('native_load_continuation'))
-                self.assertNotIn('destination_width', guard)
-                load, store = (s for s in d['sites'] if s['kind'] in ('load', 'store'))
-                self.assertEqual((guard['width'], guard['intent'], guard['access_native_offset']),
-                                 (width, 'write', load['native_offset']))
-                for site, effect in ((load, 'load'), (store, 'store')):
-                    self.assertEqual((site['kind'], site['rmw'], site['width'], site['intent'], site['base_reg']),
-                                     (effect, effect, width, 'write', load['base_reg']))
-                self.assertLess(load['native_offset'], store['native_offset'])
-                self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
-
-    def test_compat_implicit_multiply_divide_sources(self):
-        import verify_precision
-        with tempfile.TemporaryDirectory() as t:
-            for group in range(4, 8):
-                for width in (1, 2, 4):
-                    form = bytes(([0x66] if width == 2 else []) + [0x64 if group % 2 else 0x65,
-                                 0xf6 if width == 1 else 0xf7, (group << 3) | 7]).hex()
-                    d, rc = run(form, RIP, '--bitness', '32')
-                    self.assertEqual(rc, 0, form)
-                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
-                    load, = (s for s in d['sites'] if s['kind'] == 'load')
-                    de = [s for s in d['sites'] if s['kind'] == 'divide']
-                    self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation'],
-                                      guard['imm'] + 4, guard['access_native_offset'], len(de)),
-                                     (width, 'read', [group], True, load['native_offset'], load['native_offset'], max(0, group - 5)), form)
-                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+                code = bytes.fromhex(d['code']['hex'])
+                check, = (s for s in d['sites'] if s['kind'] == 'segment')
+                access = min((s for s in d['sites'] if s['segment'] == 'fs' and s['kind'] in ('load', 'store')), key=lambda s: s['native_offset'])
+                base = struct.unpack_from('<I', code, check['imm'])[0] & 31
+                adds = [struct.unpack_from('<I', code, o)[0] for o in range(check['imm'] + 4, access['native_offset'], 4)]
+                want = {0x0b000000 | base << 16 | check['base_reg'] << 5 | access['base_reg'], 0x0b000000 | check['base_reg'] << 16 | base << 5 | access['base_reg']}
+                self.assertTrue(want & set(adds), form)
+                if form.startswith('648f'):
+                    pop, = (s for s in d['sites'] if s['kind'] == 'pop')
+                    self.assertLess(pop['native_offset'], check['access_native_offset'] - 32)
 
     def test_max_instructions_still_works(self):
         d, rc = run(PRE + PRE, RIP, '--max-insts', '3')

@@ -71,7 +71,9 @@ enum FexcSiteKind : uint8_t {
                                             // the unit and goes on at this instruction
   FEXC_SITE_X87MAP = 24,                    // slice1 (M2 task 4), no access and no stub: the x87 stack state at the fault points of one guest
                                             // instruction (fexc_x87_maps; in the binary site table at the instruction's native offset + 1)
-  FEXC_SITE_SEGMENT = 25,                    // bank-checked compatibility operand (brk #14)
+  FEXC_SITE_SEGMENT = 25,                   // slice1 stub (M2 checkpoint C): the check of an instruction's whole operand through a limited FS or GS (FexcSegmentBase;
+                                            // brk #14): segment 4/5, width and intent the operand's, base_reg the offset's register, imm the continuation's native
+                                            // offset, where the resident resumes with the base in x1
   FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
                                             // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };
@@ -133,6 +135,11 @@ inline bool fexc_bits32 = false;
 // an access through that segment is cut as a system instruction, which the resident raises as #GP(0) (SDM Vol.3 3.4.4). Not
 // FexcArgs: the host keeps no answer of a 32-bit request.
 inline uint8_t fexc_null_segments = 0;
+// M2 checkpoint C, 32-bit user code: FS (bit 0), GS (bit 1) is loaded and not a writable expand-up data segment with a 4 GiB limit
+// (--fs-limited, --gs-limited, from the host's code identity): an instruction's operand through it is checked once, inline, against
+// the vCPU's read-only record (FEX FexcSegmentCheck; shim/fexc_sites.inc FexcSegmentBase), and FEX gets the base from that check
+// alone. Clear: FEX adds fs_cached/gs_cached with no check. Not FexcArgs, as the null bits.
+inline uint8_t fexc_limited_segments = 0;
 // Extended blocks (--ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
 // fall-through instructions in the same unit while the unit has fewer than N conditional branches and the fall-through
 // starts in the unit's first page; the taken edge stays an ordinary exit. 0: off (FEX's single basic block).

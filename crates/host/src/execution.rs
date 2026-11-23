@@ -2250,7 +2250,8 @@ impl Answer {
 pub(crate) const GATING: usize = 15;
 /// M2 reuse: the kept answers' RIP of 32-bit code, tagged in its upper half, which a 32-bit address leaves free, with
 /// everything of the request that 64-bit code has not: bit 62 (32-bit code; with bit 63 clear, so no canonical address:
-/// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35) and the
+/// 64-bit code also runs below 4 GiB, and never shares an entry), the null FS, GS, DS and ES (bits 32 to 35), the limited
+/// FS and GS (M2 checkpoint C: bits 49 and 50) and the
 /// x87 guess (from bit 36; 13 bits): the request's for an answer whose compile read it, [`GUESS_FREE`] for one that did
 /// not (a unit without x87 instructions: one entry, and one publication, under every guess). The answers table alone
 /// sees it ([`Answers::find`], [`Answers::insert`], an entry's fingerprint): an answer of another tag is under another
@@ -2260,12 +2261,13 @@ const TAG32: u64 = 1 << 62;
 /// The guess field of a 32-bit answer that did not read the guess: no guess's value (a guess is 0 or has bit 12 set and
 /// bit 11 clear: 0x1000 | TOP << 8 | tags).
 const GUESS_FREE: u64 = 0x800;
-fn tag32(null_segments: [bool; 4], x87_guess: u64) -> Result<u64> {
+fn tag32(null_segments: [bool; 4], limited_segments: [bool; 2], x87_guess: u64) -> Result<u64> {
     if x87_guess >> 13 != 0 {
         return Err(format!("x87 guess {x87_guess:#x}: more than 13 bits").into());
     }
     let null = null_segments.iter().enumerate().fold(0, |m, (i, &null)| m | u64::from(null) << i);
-    Ok(TAG32 | x87_guess << 36 | null << 32)
+    let limited = limited_segments.iter().enumerate().fold(0, |m, (i, &on)| m | u64::from(on) << i);
+    Ok(TAG32 | limited << 49 | x87_guess << 36 | null << 32)
 }
 /// A tagged RIP ([`tag32`]): no canonical address has bit 62 set and bit 63 clear.
 fn tagged(at: u64) -> bool {
@@ -2798,6 +2800,10 @@ pub struct Compiler {
     /// 5 to 8): fexc's `--fs-null` .. `--es-null` cut every access through that segment, which the resident raises as
     /// #GP(0) ([`exec::system::NULL_SEGMENT`]). Not gating values of the kept answers: 32-bit requests keep none.
     pub(crate) null_segments: [bool; 4],
+    /// M2 checkpoint C, 32-bit user code: FS, GS is a limited segment ([`exec::Cpu::limited_segment`]: fexc's `--fs-limited`,
+    /// `--gs-limited`, under which every instruction's operand through it is checked; admission holds the code to it). Part
+    /// of a 32-bit answer's tagged RIP ([`tag32`]), as the null segments.
+    pub(crate) limited_segments: [bool; 2],
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -2992,6 +2998,7 @@ impl Compiler {
             x87_guess: 0,
             bits32: false,
             null_segments: [false; 4],
+            limited_segments: [false; 2],
             perf: None,
             read: 0,
             guess_read: false,
@@ -3077,7 +3084,7 @@ impl Compiler {
         if rip >> 32 != 0 || self.x87_guess & GUESS_FREE != 0 {
             return Err(format!("32-bit code at {rip:#x}, x87 guess {:#x}", self.x87_guess).into());
         }
-        Ok(rip | tag32(self.null_segments, guess)?)
+        Ok(rip | tag32(self.null_segments, self.limited_segments, guess)?)
     }
     /// fexc's `args_read` as a kept answer's `read`: its gating arguments and, for 32-bit code, the x87 guess's bit, which
     /// says under which tag the answer is kept ([`Compiler::at`]). Any other argument is an error, and the guess for 64-bit
@@ -3421,7 +3428,7 @@ impl Compiler {
                     let mut admitted = match skipped {
                         Some(a) if !self.check_reuse => a,
                         skipped => {
-                            let a = admission::admit_mode(
+                            let a = admission::admit_user(
                                 object,
                                 rip,
                                 bytes,
@@ -3429,6 +3436,7 @@ impl Compiler {
                                 self.shape,
                                 self.cpl0,
                                 self.bits32,
+                                admission::User32 { cpl3: self.cpl3, limited: self.limited_segments },
                             )?;
                             // The reuse check: the kept form is admission's.
                             if skipped.is_some_and(|s| s != a) {
@@ -3604,6 +3612,11 @@ impl Compiler {
             arg(&mut body, b"--bitness");
             arg(&mut body, b"32");
             for (on, a) in self.null_segments.into_iter().zip([&b"--fs-null"[..], b"--gs-null", b"--ds-null", b"--es-null"]) {
+                if on {
+                    arg(&mut body, a);
+                }
+            }
+            for (on, a) in self.limited_segments.into_iter().zip([&b"--fs-limited"[..], b"--gs-limited"]) {
                 if on {
                     arg(&mut body, a);
                 }
@@ -4595,6 +4608,7 @@ fn translation(
         // segments: `Cpu::compat_refused`), and in 32-bit code the null FS, GS, DS and ES.
         compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
         compiler.null_segments = exec::NULL_SREGS.map(|r| state.cpu.null_segment(r));
+        compiler.limited_segments = exec::LIMITED_SREGS.map(|r| state.cpu.limited_segment(r));
         // (The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode; fexc refuses them with --bitness 32.)
         compiler.cpl0 = state.cpu.cpl == 0 && !step && !compiler.bits32;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
@@ -5349,10 +5363,17 @@ mod tests {
     #[test]
     fn answers_of_another_tag_are_never_found() {
         // M2 reuse: the same bytes at the same address (and at another of its page offset) under 64-bit code, 32-bit code,
-        // a null segment and an x87 guess are four entries; each is found only under its own tag, at any of its RIPs.
+        // a null segment, an x87 guess and a limited FS or GS are six entries; each is found only under its own tag, at any of its RIPs.
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        let tags = [0, tag32([false; 4], 0).unwrap(), tag32([false, false, true, false], 0).unwrap(), tag32([false; 4], 0x1000).unwrap()];
+        let tags = [
+            0,
+            tag32([false; 4], [false; 2], 0).unwrap(),
+            tag32([false, false, true, false], [false; 2], 0).unwrap(),
+            tag32([false; 4], [false; 2], 0x1000).unwrap(),
+            tag32([false; 4], [true, false], 0).unwrap(),
+            tag32([false; 4], [false, true], 0).unwrap(),
+        ];
         for (owner, &tag) in tags.iter().enumerate() {
             assert_eq!(a.find(&[1, 2, 3], 0x40_1100 | tag, None, &g).0.map(|e| e.owner), None);
             let e = Entry { tag, ..Arc::into_inner(entry(0x40_1100, owner as u8, &[1, 2, 3], 0, g)).unwrap() };
@@ -5365,7 +5386,7 @@ mod tests {
             }
         }
         assert!(tags[1..].iter().all(|&t| tagged(t | 0xffff_ffff) && !exec::canonical(t) && untagged(t | 0x1234) == 0x1234));
-        assert!(!tagged(0x7fff_ffff_f000) && !tagged(0xffff_8000_0000_0000) && tag32([false; 4], 0x2000).is_err());
+        assert!(!tagged(0x7fff_ffff_f000) && !tagged(0xffff_8000_0000_0000) && tag32([false; 4], [false; 2], 0x2000).is_err());
     }
 
     /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of

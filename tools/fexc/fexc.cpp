@@ -247,30 +247,19 @@ int SegmentOverride(uint32_t flags) {
 void JoinSites(uint64_t rip) {
   uint32_t last_load_instruction = FEXC_NONE32;
   for (auto& s : Cap.sites) {
-    if (s.kind == FEXC_SITE_SEGMENT) {
-      // The ModRM.reg field names the MOV register (including AH..BH) or the ALU register/opcode extension.
-      for (const auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
-        s.data_reg[0] = i.modrm_reg;
-        if ((s.data_reg[1] & 0xf0) == 0x30) {
-          s.data_reg[0] |= i.primary_op & 0x38; // Primary ALU operation, independent of the source register.
-        } else if (i.primary_op == 0xc6 || i.primary_op == 0xc7 || (i.name == "MOVBE" && s.intent == 1)) {
-          // The wrapped transaction uses the same native transfer register as the ordinary STORE.
-          for (const auto& a : Cap.sites) if (a.kind == FEXC_SITE_STORE && a.native_offset == s.access_native_offset)
-            s.data_reg[0] = 0x40 | a.data_reg[0];
-        }
-        s.data_reg[1] |= i.size;
-        break;
-      }
-      continue;
-    }
+    if (s.kind == FEXC_SITE_SEGMENT) continue;   // below, once its instruction's access sites are joined
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC ||
         s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         if (i.mem.present) {
-          s.segment = i.seg ? i.seg == 2 : i.mem.base == 4 || i.mem.base == 5;
+          // M2 checkpoint C: in 32-bit code an FS or GS operand's sites say so (4, 5): an access of theirs that runs across
+          // 4 GiB is the segment's to judge, not a flat segment's limit fault.
+          s.segment = fexc_bits32 && (i.seg == 4 || i.seg == 5) ? i.seg : i.seg ? i.seg == 2 : i.mem.base == 4 || i.mem.base == 5;
         } else if (i.sets_rip || i.name == "LEAVE") {
           s.segment = 1;
+        } else if (fexc_bits32 && (i.seg == 4 || i.seg == 5) && ((i.primary_op >= 0xa0 && i.primary_op <= 0xa3) || i.primary_op == 0xd7)) {
+          s.segment = i.seg;   // moffs, XLAT (an FS or GS string source is the resident's)
         } else if (i.seg == 2) {
           // In compatibility code SS can override a moffs, XLAT or string source. String destinations
           // always use ES. FexcStringOp emits CMPS's destination load first, then its source load.
@@ -284,6 +273,26 @@ void JoinSites(uint64_t rip) {
         if (s.kind == FEXC_SITE_LOAD) last_load_instruction = s.insn_native_offset;
         break;
       }
+  }
+  // M2 checkpoint C: the operand check of an instruction (FexcSegmentBase) takes its width and intent from the instruction's
+  // own accesses through that segment: the widest, and a write if any writes (a read-modify-write's and a LOCK form's whole
+  // operand is checked for writing before its read). The width goes into the check's `sub x2, x2, #W`. The host does not
+  // trust it: admission compares both with its own decode of the instruction.
+  for (auto& s : Cap.sites) {
+    if (s.kind != FEXC_SITE_SEGMENT) continue;
+    for (auto& a : Cap.sites) {
+      if (a.guest_offset != s.guest_offset || a.segment != s.segment) continue;
+      const bool store = a.kind == FEXC_SITE_STORE || a.kind == FEXC_SITE_STORE_PAIR || a.kind == FEXC_SITE_SWAP || a.kind == FEXC_SITE_ATOMIC;
+      if (!store && a.kind != FEXC_SITE_LOAD && a.kind != FEXC_SITE_LOAD_PAIR) continue;
+      s.width = std::max(s.width, a.width);
+      s.intent |= uint8_t(store);
+    }
+    uint32_t w;
+    if (s.access_native_offset + 4 > Cap.code.size()) std::abort();
+    std::memcpy(&w, Cap.code.data() + s.access_native_offset, 4);
+    if (w != 0xd1000042 || s.width > 64) std::abort();   // a hard check: sub x2, x2, #0
+    w |= uint32_t(s.width) << 10;
+    std::memcpy(Cap.code.data() + s.access_native_offset, &w, 4);
   }
   for (auto& s : Cap.sites) {
     const auto stub = [](uint8_t k) { return k == FEXC_SITE_GUARD || k == FEXC_SITE_SPLIT || k == FEXC_SITE_ALIGN || k == FEXC_SITE_STACK; };
@@ -422,7 +431,7 @@ static void ResetGlobals() {
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_guess = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_int_pair.clear(); fexc_x87_fp.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = fexc_x87_hold_missing = fexc_x87_hold_all = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
-  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED; fexc_probe_branches.clear();
+  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_limited_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED; fexc_probe_branches.clear();
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
 
@@ -445,6 +454,7 @@ struct Setup {
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
   bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0, x87_guess = 0;
+  uint8_t limited_segments = 0;   // M2 checkpoint C (--fs-limited 1, --gs-limited 2): 32-bit code only
   uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2, --ds-null 4, --es-null 8): 32-bit code only
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
@@ -489,6 +499,8 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--gs-null") s.null_segments |= 2;   // the same for GS,
     else if (a == "--ds-null") s.null_segments |= 4;   // DS (the default segment of most accesses)
     else if (a == "--es-null") s.null_segments |= 8;   // and ES (string destinations)
+    else if (a == "--fs-limited") s.limited_segments |= 1;   // slice1 (M2 checkpoint C), 32-bit user code: FS is not a flat-limit segment: operands through it are checked
+    else if (a == "--gs-limited") s.limited_segments |= 2;   // the same for GS
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
     else if (a == "--simd-unmasked") s.simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
@@ -510,6 +522,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
   // The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load, and the
   // inline CLI/STI, VERW and RDTSC are untested there. In 32-bit code they stay the resident's.
   if ((s.cpl0 || s.tsc) && s.bitness != 64) return Fail("--cpl0 and --tsc are 64-bit only");
+  if (s.limited_segments && s.bitness != 32) return Fail("--fs-limited and --gs-limited are 32-bit only");
   if (st.ext_conds && (!s.slice1 || st.ext_conds < 0 || st.ext_conds > 8)) return Fail("--ext-conds needs profile slice1 and N in 0..8");
   if (s.slice1 && s.sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
   if (s.slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
@@ -556,6 +569,7 @@ static void Arm(const Setup& s) {
   fexc_slice1 = s.slice1;
   fexc_bits32 = s.bitness == 32;
   fexc_null_segments = fexc_bits32 ? s.null_segments : 0;
+  fexc_limited_segments = s.limited_segments;
 }
 
 // FEX's Config is process-global: rebuilt from nothing (Shutdown, Initialize, then `sets`) whenever a request needs other values
@@ -1062,17 +1076,6 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
        .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
        .kv("flags_written_before_site", bool(s.flags_written_before))
        .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
-      if (s.kind == FEXC_SITE_SEGMENT) {
-        j.kv("instruction_length", int(s.data_reg[1] & 15));
-        if (s.data_reg[1] & 0x80) j.kv("native_load_continuation", true);
-        if ((s.data_reg[1] & 0xf0) == 0x40) j.kv("atomic_exchange", true);
-        else if ((s.data_reg[1] & 0xf0) == 0x70) j.kv("atomic_compare_exchange", true);
-        else if ((s.data_reg[1] & 0xf0) == 0x30) {
-          j.kv("rmw_alu", int(s.data_reg[0] >> 3));
-          if ((s.data_reg[0] >> 3) == 0) j.kv("rmw_add", true);
-        }
-        else if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
-      }
       if (slice1) {
         if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
       }
@@ -1123,7 +1126,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
     memcpy(f.data(), "NFXOBJ\0\x01", 8);
-    put(8, bitness == 32 ? 6 : 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
+    put(8, bitness == 32 ? 7 : 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
     put(32, Cap.info.TotalLength, 4); put(36, Cap.info.TotalInstructions, 4);
     put(40, f.size(), 4); put(44, code.size(), 4);
     put(48, Cap.prologues[0].second, 4); put(52, marker == UINT64_MAX ? 0xFFFFFFFFull : marker, 4);

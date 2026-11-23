@@ -351,19 +351,11 @@ def guards(d, dis, order):
             check_at[at] = refs[at][0]
             # M2 task 4, a translated FLDCW: `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, stub`.
             t = refs[at][0]
+            # M2 checkpoint C, an operand check: the exact sequence (check_sites.segment_check_start), its test branching here
+            # and its continuation (`mov wN, w1`) right after.
             if s['kind'] == 'segment':
-                guest = next(i for i in d['guest']['instructions'] if i['offset'] == s['guest_offset'] and i['translated'])
-                insn = bytes.fromhex(guest['bytes_hex'])
-                if len(insn) >= 5 and 0xa0 <= insn[-5] <= 0xa3 and all(b in (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0xf2, 0xf3) for b in insn[:-5]):
-                    imm = int.from_bytes(insn[-4:], 'little')
-                    offset_ok = (s['base_reg'] == 0 and int.from_bytes(code[t-8:t-4], 'little') == 0x52800000 | (imm & 0xffff) << 5
-                                 and int.from_bytes(code[t-4:t], 'little') == 0x72a00000 | (imm >> 16) << 5)
-                else:
-                    start = check_sites.inline_dword_start(s, code)
-                    offset_ok = dis.get((t if start is None else start) - 4) == f'mov w0, w{s["base_reg"]}'
-                if (dis.get(t) != f'b {at:#x}' or not offset_ok
-                        or s['imm'] != t + 4 or not re.fullmatch(r'mov w[0-9]+, w0', dis.get(t + 4, ''))):
-                    out.append(f'stub +{at} (segment): offset or continuation mismatch')
+                if check_sites.segment_check_start(s, code) is None or s['access_native_offset'] + 8 != t:
+                    out.append(f'stub +{at} (segment): its check is not the operand check')
                 else:
                     ok.add(t)
             if s['kind'] == 'fldcw' and not (dis.get(t) == f'cbnz w0, {at:#x}' and dis.get(t - 4) == 'and w0, w0, #0x3f' and
@@ -398,7 +390,8 @@ def guards(d, dis, order):
             out.append('code after the stubs')
     linked = {}
     for at, s in stubs.items():
-        linked.setdefault(s['access_native_offset'], []).append(s)
+        if s['kind'] != 'segment':   # (an operand check's is its own `sub x2, x2, #W`, no access)
+            linked.setdefault(s['access_native_offset'], []).append(s)
     by_off = {s['native_offset']: s for s in sites if s['kind'] not in STUBS}
     for a, ss in linked.items():
         if a is not None and a not in by_off:

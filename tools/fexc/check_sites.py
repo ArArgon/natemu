@@ -231,7 +231,7 @@ def run(hexs, rip, tmp, *extra):
 def read_object(path):
     f = Path(path).read_bytes()
     h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4, 5, 6) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4, 5, 6, 7) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
      sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
@@ -273,18 +273,22 @@ def asm0_cut(p):
     return first_cut(p['asm']) == 0
 
 
-def inline_dword_start(site, code):
-    """Recognize the exact compat fast guard. Only its single RO metadata read is a non-guest transfer."""
-    if site['kind'] != 'segment' or site['width'] != 4 or site['segment'] not in ('fs', 'gs'):
+def segment_check_start(site, code):
+    """M2 checkpoint C: the operand check of a 'segment' site (fexc shim FexcSegmentBase), recognized exactly: the native
+    offset of its first word, or None. Only its one load of the read-only record is a non-guest transfer."""
+    if site['kind'] != 'segment' or site['segment'] not in ('fs', 'gs') or site.get('access_native_offset') is None:
         return None
-    start = site['imm'] - 68
-    if start < site['insn_native_offset'] + 4 or start + 64 > len(code):
+    sub = site['access_native_offset']
+    start = sub - 32
+    if start < site['insn_native_offset'] or sub + 16 > len(code) or site['imm'] != sub + 12:
         return None
-    tag_load = 0xf9401821 if site['segment'] == 'fs' else 0xf9402821
-    words = (0x926bab81, 0xd3557782, 0x91000442, 0xd349fc42, 0x91480021, 0xcb025821,
-             tag_load, 0xd360fc22, 0xd1000c42, 0xcb000042, 0xb7f800c2, 0x0b000021,
-             0x91000c22, 0xb7000062, 0x2a0103e0, 0x14000002)
-    return start if struct.unpack_from('<16I', code, start) == words else None
+    record = 0xf9401821 if site['segment'] == 'fs' else 0xf9402821
+    words = (0x926bab81, 0xd3557782, 0x91000442, 0xd349fc42, 0x91480021, 0xcb025821, record, 0xd360fc22,
+             0xd1000042 | site['width'] << 10, 0xcb204042 | site['base_reg'] << 16)
+    test, move = struct.unpack_from('<2I', code, sub + 8)
+    if struct.unpack_from('<10I', code, start) != words or test & 0xfff8001f != 0xb7f80002 or move & ~31 != 0x2a0103e0:
+        return None
+    return start
 
 
 def code_vs_sites(sites, dis, code):
@@ -293,7 +297,7 @@ def code_vs_sites(sites, dis, code):
     transfer registers differ from the instruction. Independent of the guest program (needs no `asm`)."""
     out = []
     by_off = {s['native_offset']: s for s in sites if s['kind'] not in STUBS}
-    tag_reads = {start + 24 for site in sites if (start := inline_dword_start(site, code)) is not None}
+    tag_reads = {start + 24 for site in sites if (start := segment_check_start(site, code)) is not None}
     native = {}
     for off, text in dis.items():
         a = native_access(text)
@@ -398,7 +402,10 @@ def check_program(p, tmp):
         ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or \
             bool((seg not in ('fs', 'gs') and re.search(r'\[(rsp|rbp)\b', a)) and s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')) or \
             (mn in ('leave', 'ret') and s['kind'] == 'load')
-        if (s['segment'] == 'ss') != ss:
+        # M2 checkpoint C: in 32-bit code an FS or GS operand's sites say so.
+        if s['segment'] in ('fs', 'gs') and (ss or seg != s['segment']):
+            problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
+        if s['segment'] not in ('fs', 'gs') and (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
         if not s['located']:
             problems.append(('ERROR', f'site at {s["native_offset"]} ({s["ir_op"]}) not located in its emitted range'))
@@ -433,8 +440,6 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
         if s['kind'] == 'segment' and (rec[7], rec[9], rec[10]) != (int(s['intent'] == 'write'), {'fs': 4, 'gs': 5}.get(s['segment']), s['base_reg']):
             problems.append(('ERROR', f'object site at {s["native_offset"]}: segment operand differs from JSON'))
-        if s['kind'] == 'segment' and bool(rec[17] & 0x80) != s.get('native_load_continuation', False):
-            problems.append(('ERROR', f'object site at {s["native_offset"]}: native load continuation differs from JSON'))
         if rec[24] != int(s['located']) or rec[4] != s['imm']:
             problems.append(('ERROR', f'object site at {s["native_offset"]}: located/imm disagree with JSON'))
         link = s.get('access_native_offset') if s['kind'] in STUBS else s.get('mmio', s['guest_offset2'])   # a stub's guest_offset2 is

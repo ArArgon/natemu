@@ -389,6 +389,29 @@ pub(crate) fn admit_mode(
     cpl0: bool,
     bits32: bool,
 ) -> Result<Admitted, String> {
+    admit_user(bytes, rip, source, supported, shape, cpl0, bits32, User32 { cpl3: true, limited: [false; 2] })
+}
+
+/// M2 checkpoint C: what a 32-bit request's code identity says of its FS and GS operands: the request was at CPL 3, and
+/// FS, GS was a limited segment ([`natemu_abi::execution::Cpu::limited_segment`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct User32 {
+    pub cpl3: bool,
+    pub limited: [bool; 2],
+}
+
+/// [`admit_mode`] with the request's [`User32`] (read for 32-bit code only).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_user(
+    bytes: &[u8],
+    rip: u64,
+    source: &[u8],
+    supported: u64,
+    shape: bool,
+    cpl0: bool,
+    bits32: bool,
+    user: User32,
+) -> Result<Admitted, String> {
     let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0, bits32)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
@@ -410,6 +433,8 @@ pub(crate) fn admit_mode(
         shape,
         cpl0,
         bits32,
+        cpl3: user.cpl3,
+        limited: user.limited,
     };
     let (links, dispatch_exit, bulk) =
         structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
@@ -883,7 +908,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.native_offset < region
         && s.insn_native_offset <= s.native_offset
         && s.guest_offset < h.guest_bytes
-        && (s.segment <= object::SEG_SS || s.kind == object::kind::SEGMENT && matches!(s.segment, 4 | 5))
+        && (s.segment <= object::SEG_SS || h.guest_bitness == 32 && matches!(s.segment, object::SEG_FS | object::SEG_GS))
         && (register(s.base_reg)
             || s.base_reg == 31
             || ((addressless(s) || s.kind == object::kind::FMA) && s.base_reg == object::NO_REG))
@@ -965,25 +990,10 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
     if s.kind == SEGMENT {
-        return matches!(s.segment, 4 | 5) && matches!(s.width, 1 | 2 | 4 | 16)
-            && s.base_reg < 31 && s.index_reg == object::NO_REG && s.writeback == object::WB_NONE
-            && s.rmw == object::RMW_NONE && access.is_some_and(|a| {
-                (match s.data_reg[1] & 0xf0 {
-                    object::SEGMENT_XCHG => a.kind == SWAP,
-                    object::SEGMENT_CMPXCHG => a.kind == ATOMIC,
-                    _ => matches!(a.kind, LOAD | STORE),
-                })
-                    && a.guest_offset == s.guest_offset && a.insn_native_offset == s.insn_native_offset
-                    && a.width == s.width && a.intent == s.intent
-                    && if s.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU {
-                        a.kind == LOAD && a.rmw == object::RMW_LOAD
-                    } else { a.rmw == object::RMW_NONE }
-                    && if s.width == 16 {
-                        a.kind == LOAD && a.data_class == object::CLASS_FPR && s.data_reg[1] & 0xf0 == object::SEGMENT_NATIVE_LOAD
-                    } else { a.data_class == object::CLASS_GPR }
-                    && a.imm == 0 && a.index_reg == object::NO_REG
-                    && a.writeback == object::WB_NONE
-            });
+        // M2 checkpoint C: an operand check (the structure check proves its words, width, intent and place).
+        return matches!(s.segment, object::SEG_FS | object::SEG_GS) && (1..=64).contains(&s.width) && s.intent <= 1
+            && s.base_reg < 31 && s.index_reg == object::NO_REG && s.writeback == object::WB_NONE && s.rmw == object::RMW_NONE
+            && s.imm > 0 && access.is_none();
     }
     if addressless(s) {
         // AFP fallback, decision C: a SIMD stub may describe its instruction's operands (width = meta, imm = registers,

@@ -10,11 +10,9 @@
 
 pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
 pub const VERSION: u32 = 4;
-/// Compatibility objects carry the resident scalar FS/GS check contract.
-pub const COMPAT_VERSION: u32 = 6;
-/// SEGMENT.data_reg[0] marks a native store source held live at the descriptor check.
-/// Its low five bits name the ordinary STORE's transfer register.
-pub const SEGMENT_STORE_REGISTER: u8 = 0x40;
+/// 32-bit objects: 7 is the generic FS/GS operand check (M2 checkpoint C: one [`kind::SEGMENT`] check per instruction under a
+/// limited segment, FS/GS tags on access sites); 6 was the per-opcode check.
+pub const COMPAT_VERSION: u32 = 7;
 /// "No value" for a u32 offset field.
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
@@ -104,20 +102,16 @@ pub mod kind {
     /// starts at `insn_native_offset` ([`super::x87_map`]), which generated code did not write to the guest-state page before
     /// that instruction. Its `native_offset` is that offset + 1 (no word is there: the record is found by this key).
     pub const X87MAP: u8 = 24;
-    /// Bank-checked scalar FS/GS offset in `base_reg`. The resident returns its linear address in w0 at
-    /// `imm` (the word after the stub branch). `guest_offset2` names the native access consuming that result.
+    /// M2 checkpoint C: the check of an instruction's whole operand through a limited FS or GS (`segment` 4 or 5; `width`
+    /// bytes, `intent`) at the offset in `base_reg`, before any access of the instruction: inline against the vCPU's read-only
+    /// record, and this stub (`brk #14`) when that fails. The resident judges the operand and resumes at native offset `imm`
+    /// with the segment's base in x1. `guest_offset2` is the native offset of the check's `sub x2, x2, #width`.
     pub const SEGMENT: u8 = 25;
 }
-/// A SEGMENT check whose checked-base move directly precedes its unsigned GPR or packed Q load.
-/// On a linear straddle the resident supplies the native transfer and resumes after it.
-pub const SEGMENT_NATIVE_LOAD: u8 = 0x80;
-/// High nibble of SEGMENT.data_reg[1] for a non-LOCK integer ALU memory destination.
-/// data_reg[0] holds the primary ALU selector in bits 5:3 and the x86 ModRM.reg in bits 2:0.
-pub const SEGMENT_RMW_ALU: u8 = 0x30;
-/// High nibble of SEGMENT.data_reg[1] for memory XCHG, including the explicit LOCK spelling.
-pub const SEGMENT_XCHG: u8 = 0x40;
-/// High nibble for LOCK CMPXCHG r/m,r. The comparison and result register is implicitly AL/AX/EAX.
-pub const SEGMENT_CMPXCHG: u8 = 0x70;
+/// [`Site::segment`] of an access through FS or GS in a 32-bit object (the x86 segment register numbers); 64-bit objects
+/// have only [`SEG_DS`] and [`SEG_SS`].
+pub const SEG_FS: u8 = 4;
+pub const SEG_GS: u8 = 5;
 
 /// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault
