@@ -5,10 +5,10 @@ a6d03605 the same day, section 12). It develops Part 2 of [the M2 design notes](
 survey of [the S3g plan](s3g-plan.md) as input. Two independent reviews, three rechecks and an independent replication
 of the upstream census were folded in before the build (section 12); the results of the build are folded into each
 section ("Built"), and the decisions taken are in section 11. B0-B5 are built. On the rebased branch (section 12): the
-full gate at 9f35eb96 passed but for `fxsave-full-stack` and its row, which fail the same way on main a6d03605 (an
-AFP-dependent x87 status byte, main's open issue); its AFP part passed on the M3 (at bc38dfba, the same code); the
-system-call bench cases are no slower than main; the campaign tier did not run on it, the owner stopped it (before the
-rebase: 0 failed, and 290 build failures from the builder's network outage). B6 stays deferred. natemu's numbers at
+full gate at 9f35eb96 passed but for `fxsave-full-stack` and its row, which failed the same way on main a6d03605 (an
+AFP-dependent x87 status byte) and are judged as a documented deviation since 7bf62b60; its AFP part passed on the M3
+(at bc38dfba, the same code); the system-call bench cases are no slower than main; the campaign tier at 9ced297a passed
+but for three cases that fail the same way on main and whose expected lists 4eb77c8e and ca3bf672 correct. B6 stays deferred. natemu's numbers at
 9f35eb96 (M4) are on [the benchmarks page](../benchmarks.md).
 Results, all framework cases on the M2 Max:
 
@@ -21,7 +21,7 @@ Results, all framework cases on the M2 Max:
 - the M2 exit test, our firmware from the reset vector at 1, 2, 4 and 8 CPUs (`exit-fw-natemu`), and OVMF's reset
   vector to SEC from both entries (`ovmf-natemu`);
 - x86 ordering between an interpreting vCPU and a translated one: four litmus patterns, 100,000 iterations each, no
-  forbidden outcome (`tests/interp` `natemu-litmus`, at 77ef2af7; section 8);
+  forbidden outcome (`tests/interp` `natemu-litmus`, at 22589f54; section 8);
 - no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case; M2
   Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
   [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
@@ -481,7 +481,7 @@ the repository; every number from a framework case (or labelled an experiment).
   store-store order) and with A reading (load-load), store buffering (store-load: both old is allowed, counted) and load
   buffering (load-store), 100,000 iterations each. Every outcome must be in the model's allowed set, and each pattern's
   overlap outcomes (sequentially consistent, given by neither participant running alone first) must show in at least
-  0.5% of the iterations: B landed between A's two accesses, where a reordering of them shows. At 77ef2af7 (M2 Max):
+  0.5% of the iterations: B landed between A's two accesses, where a reordering of them shows. At 22589f54 (M2 Max):
   no forbidden outcome; the overlap outcomes in 14,735 to 16,950 of each pattern's 100,000; store buffering's both old
   never. It fails when the memory layer reorders (experiments: the case on a mutated resident, M2 Max, reverted):
   half the stores (picked by an LCG) held for two instructions while the others are made at once, so a later store can
@@ -727,8 +727,20 @@ its 13 further failures were those runners on a stale `io-test-hooks` build. The
 cannot run, on a second Mac that has AFP) at bc38dfba, whose code is identical to 9f35eb96's, M3 (`tools/natemu-test
 submit --gate tests/fp "tests/unit/family.toml::rust-afp/all[afp=True]" -k "not False"`): 2,975 passed, 0 failed. The
 benchmark round: the system-call bench cases, the rebased tip 5113ba57 against main a6d03605, 4.2-4.6% faster, each
-beyond the noise (below). The campaign tier did not run on the rebased branch: the owner stopped it (before the rebase:
-above).
+beyond the noise (below). The campaign tier (`tools/natemu-test run --tier campaign`) at 9ced297a, M2 Max, 1 h 41 min:
+15,651 passed, 6 failed, 2 not-runnable (they need AFP), 1,382 expected-fail, 518 unsupported, 8 unverified, 2 flaky, no
+build failure. The 6 failures are three cases with their rows, and each fails the same way on main a6d03605 (the same
+parts run there): `public/part-30`'s `qemu-fma` at 1 and 4 vCPUs (two `vfmadd132sd` cases hit the documented fast-mode
+deviations without AFP, `fma-invalid-flag` and `band-ue-flag`; it passes on the M4 and in accurate mode; 4eb77c8e lists
+it under the suite's `expected_without.afp`), and `cpyt/part-5[vcpus=4]`'s `test_ensurepip` (Debian's
+ensurepip-disabled patch exits outside a venv, so 15 of its cases error on every host, the M4 included; ca3bf672 lists it
+as expected). Both are main's lists, so both commits belong on main too.
+
+**After the final gate, test-only (November 22).** 7bf62b60: `system` `i5b-images::fxsave-full-stack` is judged by
+`tests/lib/fp_deviations.py`'s `masked-x87-de` where the run is fast x87 without AFP, as the other x87 runners are; on
+the M2 Max it passes as that documented deviation, and on the M4 (AFP) x86's state is still required (47 passed; a wrong
+expected byte fails). It belongs on main too. 8aa0805a: the exit test at 8 vCPUs as well (above). 22589f54:
+`natemu-litmus` (above). Each ran the cases it adds or changes; the code is 9f35eb96's.
 
 **The system-call bench cases (M2 Max, November 22).** `guest-hackbench` makes its system calls by SYSCALL;
 `guest-hackbench32` is the same program built as 32-bit code (i686), through the kernel's 32-bit vDSO (SYSENTER);
