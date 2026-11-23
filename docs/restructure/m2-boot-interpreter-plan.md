@@ -20,6 +20,8 @@ Results, all framework cases on the M2 Max:
   (`exit-ap-natemu`);
 - the M2 exit test, our firmware from the reset vector at 1, 2, 4 and 8 CPUs (`exit-fw-natemu`), and OVMF's reset
   vector to SEC from both entries (`ovmf-natemu`);
+- x86 ordering between an interpreting vCPU and a translated one: four litmus patterns, 100,000 iterations each, no
+  forbidden outcome (`tests/interp` `natemu-litmus`, at 77ef2af7; section 8);
 - no cost to a running 64-bit OS: the hot paths are identical by disassembly (an experiment, not a framework case; M2
   Max) but for `helpers::x87`, which keeps one outlined call per `svc #X87` (the code-generation units' partitioning,
   [interp-transitions.md](interp-transitions.md)), and, with the firmware boot mode, a register rename in
@@ -97,8 +99,10 @@ events, the CPU start-up wait (`events::wait_mailbox`), the software page walk a
 (`segments::linear`/`copy`, `GUEST_RAM_VA`). It already caches host-decoded system instructions as `SYSTEM` records keyed
 like blocks and runs them with no host exit (`cache::place_system`; `find` → `system()` → `transaction()` →
 `commit()`), and it runs under Apple's TSO bit (set by the host, `crates/host/src/vm.rs:445`; checked at EL1,
-`crates/runtime/src/main.rs:76`; that it orders the resident's own accesses is **Inferred**: no case checks it, since
-the litmus test of section 8 was not built).
+`crates/runtime/src/main.rs:76`). The interpreter's ordering does not rest on that bit: its memory layer orders every
+instruction's accesses after the previous instruction's itself (section 4, layer 5), which the litmus case of section 8
+checks, and with the bit cleared at EL1 (a mutation) that case still saw no forbidden outcome. Whether the bit orders
+the rest of the resident's EL1 accesses stays **Inferred**: that case cannot tell (section 8).
 
 What does not carry over:
 
@@ -219,7 +223,11 @@ because nothing faults natively mid-instruction and no mapping state needs keepi
    and registers as they were (and is reported in a typed stop, section 6). Commit performs the accesses in program
    order and updates registers, flags and IP.
 5. **Between CPUs:** the same physical memory translated code uses, with the same guarantees:
-   - order: the TSO bit (**Inferred** that it covers the resident's accesses at EL1; not checked by a case);
+   - order: the interpreter's own, whatever the TSO bit: before an instruction's accesses its check waits out a peer's
+     split lock (`split_wait`), whose store-release of the vCPU's holding word and load-acquire of the lock word order
+     every access of earlier instructions before every access of this one (Armv8: a load-acquire after a store-release
+     is ordered after it), and every store is followed by `dsb ish`: sequentially consistent between instructions,
+     stronger than x86's order. Checked by `tests/interp` `natemu-litmus` (section 8);
    - single-copy atomicity: aligned 2/4/8-byte accesses as single Arm accesses, and a misaligned one inside 16 bytes as
      one unaligned Arm access, atomic within 16 bytes on Apple's cores (FEAT_LSE2; an unaligned `casal` inside 16 bytes runs at EL1: self-test `p32-lock-unaligned`),
      not `copy_in`'s byte-by-byte fallback; crossing 16 bytes may tear, the deviation translated code already has;
@@ -234,8 +242,11 @@ resident uses for 32-bit user code (`segments::address`, `linear_of`, `outside`,
 in place would make a 32-bit program with a small-limit FS fault in resident-executed instructions while the same
 access in translated code succeeds. They keep today's behaviour.
 
-Per access the cost is a few calls, a walk in compatibility mode and `copy_in`'s barrier after each store; whether that
-`dsb ish` is needed for RAM under the TSO bit was not checked (**Inferred** not; the barrier stays).
+Per access the cost is a few calls, a walk in compatibility mode and the barrier after each store (`Mem::stored`'s
+`dsb ish`, as `copy_in`'s). For the order other CPUs see it is not needed: the next instruction's `split_wait` orders the
+store before that instruction's accesses, the code-write recheck after the store has its own `dmb ish`
+(`cache::rechecked`), and `natemu-litmus` saw no forbidden outcome with it removed (a mutation, section 8). Whether
+anything else needs it was not checked (**Inferred** not); the barrier stays.
 
 **Memory type at power-on (decided by the session; the owner asked for "whatever reasonable", November 22): unchanged
 in M2.** With IA32_MTRR_DEF_TYPE.E = 0, the reset value, `mtrr_type` makes all RAM UC (`crates/abi/src/cpu.rs:109`),
@@ -463,7 +474,24 @@ the repository; every number from a framework case (or labelled an experiment).
   both in and past the 16-bit part; and a litmus test between an interpreting CPU and one running translated code.
   Built: `exit-fw-natemu` at 1, 2, 4 and 8 vCPUs with those bounds (per vCPU), and `exit-ap-natemu` and the references
   (`exit-fw-*`, `exit-ap-*`: QEMU 11.1.2 under TCG, and KVM, which overcommits the reference machine's 4 cores at 8) at
-  the same counts. Not built (later): the litmus test.
+  the same counts.
+- **The litmus test** (built: `tests/interp` `natemu-litmus`, `interp_litmus.py`): vCPU A in P32 (every access the
+  interpreter's memory layer, at EL1), vCPU B in 64-bit code at CPL 0 (translated, EL0), over machine descriptions;
+  `ordering_model.py`'s two-participant profiles with A as one participant: message passing with A writing (its
+  store-store order) and with A reading (load-load), store buffering (store-load: both old is allowed, counted) and load
+  buffering (load-store), 100,000 iterations each. Every outcome must be in the model's allowed set, and each pattern's
+  overlap outcomes (sequentially consistent, given by neither participant running alone first) must show in at least
+  0.5% of the iterations: B landed between A's two accesses, where a reordering of them shows. At 77ef2af7 (M2 Max):
+  no forbidden outcome; the overlap outcomes in 14,735 to 16,950 of each pattern's 100,000; store buffering's both old
+  never. It fails when the memory layer reorders (experiments: the case on a mutated resident, M2 Max, reverted):
+  half the stores (picked by an LCG) held for two instructions while the others are made at once, so a later store can
+  pass an earlier one, give message passing with A writing 8,939 forbidden outcomes and load buffering 8,450 (A's
+  location store visible after its done word), and store buffering's both old 10,058 times (allowed); a MOV load whose
+  register is read again after the next instruction gives message passing with A reading 1,893 and load buffering
+  1,717. With Apple's TSO bit cleared at EL1 on A's vCPU (ACTLR_EL1 reads back 0), and both the `dsb ish` after each
+  store and `split_wait` removed, it saw no forbidden outcome and no both-old in 400,000 iterations: one interpreted
+  instruction apart, the hardware showed no reordering, so the case shows the interpreter's ordering (section 4, layer
+  5), not whether the TSO bit orders EL1 accesses (section 2).
 - **No effect on a running 64-bit OS** (section 9c): the gate, the compiler's replay check (`static/fexc/fexc-replay`)
   and the benchmark cases `guest-hackbench`, `guest-hackbench32` and `guest-hackbench32-int80` (system-call paths), with a
   benchmark round, at the end of every slice that touches a hot path, against the parent commit.
@@ -544,7 +572,7 @@ plumbing, so the risky integration is proven on real code before the breadth wor
 
 | Slice | What runs at the end | Agent hours (guess, low confidence) |
 | --- | --- | --- |
-| **B0 spike** | As framework cases or labelled experiments: the resident's size and stack headroom, and the constants the window move changes with the replay result; the cost of an iced-only decode request; a system-call cost baseline (the hackbench cases) and a benchmark baseline of the parent commit; TSO at EL1 (litmus); unaligned single-copy atomicity within 16 bytes at EL1; whether `copy_in`'s `dsb ish` is needed for RAM; ~~the SDM's wait-for-SIPI NMI rule~~ (answered, section 6); ~~KVM real mode on the AMD machine; gcc `-m16` in the amd64 container~~ (answered, section 8). Replaces the estimates below. Built: TSO at EL1 and the `dsb ish` were not spiked (both stay **Inferred**, section 4); unaligned atomicity within 16 bytes at EL1 is self-test `p32-lock-unaligned`. | 8-12 |
+| **B0 spike** | As framework cases or labelled experiments: the resident's size and stack headroom, and the constants the window move changes with the replay result; the cost of an iced-only decode request; a system-call cost baseline (the hackbench cases) and a benchmark baseline of the parent commit; TSO at EL1 (litmus); unaligned single-copy atomicity within 16 bytes at EL1; whether `copy_in`'s `dsb ish` is needed for RAM; ~~the SDM's wait-for-SIPI NMI rule~~ (answered, section 6); ~~KVM real mode on the AMD machine; gcc `-m16` in the amd64 container~~ (answered, section 8). Replaces the estimates below. Built: TSO at EL1 and the `dsb ish` were not spiked; the litmus case (section 8) later showed that the interpreter's order rests on neither, and TSO at EL1 for the rest of the resident stays **Inferred** (sections 2, 4); unaligned atomicity within 16 bytes at EL1 is self-test `p32-lock-unaligned`. | 8-12 |
 | **B1 plumbing** (three commits, each with the section 9c checks) | (a) The resident's code window moved and grown. (b) The interpreted classification and the entry plumbing (the halting arms of `controls()`, the test on `system()`'s exit, `start()`, `find_from`'s flag test for the new record kind), the paging-off walk variant, and the CPL-3 deviation lock cases. (c) New code only: `REQUEST_DECODE` and the record; the abi executor core skeleton with host unit tests; byte-validated records; driver start states in each mode; a handful of instructions with QEMU-locked cases. | 16-26 |
 | **B2 vertical slice: CPU start-up** | INIT/SIPI state machine (model first), wait-for-SIPI, power-on/INIT state; the instructions the Linux trampoline and the exit-test AP stub use; INIT and SIPI taken by the interpreter loop, every other event while interpreting a typed stop; real mode → P32 → long mode → hand-off to the translator (the interpreter's far JMP from C32 to the 64-bit CS); Debian with the mailbox left out at 2 vCPUs, then 4, through shutdown (built, `boot-startup`: no typed stop; its warm-reset writes, CMOS 0x0F = 0AH and the vector at 0x467, made and restored at every AP start, mailbox or not, are benign: a plain CMOS byte and guest RAM); the exit test's program variant (its AP part, a shared counter on the stub page) at 1, 2 and 4 vCPUs through a new wait-for-SIPI driver item. | 20-30 |
 | **B3 the rest of the list** | The remaining forms of section 1's list in R/P32/C32, exact segmentation and the typed stops' exception reports; generated cases against QEMU and hardware; the interpreter-versus-translator cross-check. | 8-15 |

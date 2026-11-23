@@ -17,6 +17,7 @@ This page is the contract between the generator, the reference rig and the natem
 | `tests/interp/tests.lock` | Every case's two answers, inline (`[answers]`, `tools/reference/answers.py`). |
 | `tests/interp/run_interp_natemu.py` | natemu's side: each case as a machine description through the program driver, judged against the lock (case `natemu`); `--selftest`, case `natemu-machine`: descriptions with the fields they must leave, in 64-bit and interpreted modes. |
 | `tests/interp/interp_faults.py` | The fault and transition cases against `segment_model` and `modes_model` (case `natemu-faults`). |
+| `tests/interp/interp_litmus.py` | Litmus patterns between an interpreting vCPU (P32) and a translated one (64-bit), judged by `tools/models/ordering_model.py` (case `natemu-litmus`; [the plan](m2-boot-interpreter-plan.md) section 8). |
 
 The corpus covers exactly section 1's first-version list in R, P32 and C32, the P16 stretch, and the transitions R → P16,
 R → P32, P16 → R, P32 → C32, P32 → 64-bit, C32 → P32 and C32 → 64-bit: 1,716 cases (case `references`, the generator at
