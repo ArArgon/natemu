@@ -137,14 +137,21 @@ fn controls(s: &State) -> paging::Control {
     }
 }
 /// [`controls`]' check at the end of a system transaction ([`commit`], and [`set_cpl`] inside one), where the controls are
-/// not needed: its two returning arms, unchanged; where it halts, M2 Part 2: a state the boot-time interpreter runs is
+/// not needed: its two returning arms (the compatibility one also zero-extends EAX..EDI); where it halts, M2 Part 2: a state the boot-time interpreter runs is
 /// recorded ([`debug::INTERPRET`]) for the next boundary to enter once the transaction has completed, any other halts as
 /// there ([`interpret::record`], out of line). Inlined, as [`controls`] is (SYSCALL and SYSRET pass through both callers).
 #[inline(always)]
 fn ends_in_mode(s: &mut State) {
     match (s.cpu.paging(), s.cpu.code_mode()) {
         (Some(_), Some(CodeMode::Bits64)) => {}
-        (Some(c), Some(_)) if c.cpl == 3 => {}
+        // A transaction that ends in compatibility code (far JMP, CALL, RET, IRET, SYSRET, SYSEXIT from 64-bit code
+        // included) leaves EAX..EDI zero-extended, as [`enter`] and [`bank`] keep them: the resident's own accesses
+        // there (POP Sreg, POPA, POPFD) then use ESP, never a 64-bit RSP the transfer kept.
+        (Some(c), Some(_)) if c.cpl == 3 => {
+            for r in &mut s.cpu.gpr[..8] {
+                *r = *r as u32 as u64;
+            }
+        }
         (None, _) => interpret::record(s, stop::UNSUPPORTED_MODE),
         _ => interpret::record(s, stop::UNSUPPORTED_CODE_MODE),
     }

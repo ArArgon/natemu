@@ -497,6 +497,21 @@ def mixed_far_cases():
             extra += f'memory {after_sp:#x} {bytes(16).hex()}\n'
         yield 'mixed-' + name, body, extra, check(at, vector, error, cr2, after_sp, frame), base
 
+    # A same-level far JMP from 64-bit code whose RSP is above 4 GiB, to 32-bit code whose first instruction the resident
+    # runs: compatibility code's stack pointer is ESP (natemu zeroes the upper halves of RAX..RDI when a transfer commits
+    # there), so POP DS, POPA and POPFD pop at ESP, where RSP would be #SS(0).
+    eax = 0x600df00d
+    for name, insn, data, popped, rax, flags in (
+            ('pop-ds', 'pop ds\nmov eax, ds', (0x1b).to_bytes(4, 'little'), 4, 0x1b, None),
+            ('popa', 'popa', b''.join(k.to_bytes(4, 'little') for k in (1, 2, 3, 0, 5, 6, 7, eax)), 32, eax, None),
+            ('popfd', 'popfd', (0x8c3).to_bytes(4, 'little'), 4, None, 0x8c1)):
+        code = setup(cs64, 1 << 32 | stack) + f'times {source} - ($-$$+{base}) db 0x90\njmp far [rsi]\n' + \
+            f'times {target} - ($-$$+{base}) db 0x90\nbits 32\n{insn}\nud2'
+        body = P.asm(code)
+        extra = (f'memory {pointer:#x} {(target.to_bytes(8, "little") + cs32.to_bytes(2, "little")).hex()}\n'
+                 f'memory {stack:#x} {data.hex()}\n')
+        yield f'mixed-high-rsp-{name}', body, extra, check(base + len(body) - 2, 6, 0, 0, stack + popped, cs=rax, flags=flags), base
+
     # Narrow SYSEXIT ignores both register high halves and installs its synthetic segments without a GDT load.
     sysexit = f"""org {base}
         mov esp, 0x500f00
