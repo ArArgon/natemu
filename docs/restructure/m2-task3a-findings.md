@@ -91,27 +91,26 @@ displacement folded into the Arm addressing mode (`[ebp-8]`), and the stack poin
   not. Task 2 already put that decision at
   checkpoint C (32-bit address arithmetic for these two forms in translated code, one more instruction each).
 
-### Checkpoint C implementation, November 22
+### Checkpoint C implementation, November 22 and 23
 
-FEX fork `fc4270de` computes compatibility-mode scalar and paired addresses before the native memory instruction.
-A PUSH computes its wrapped ESP before the split check, stores at that address, and commits ESP after the store.
-A POP reads before its 32-bit ESP increment. PUSH and POP retain their stack site kinds for recovery.
-The resident preserves its previous abort fallback. To enforce the flat segment end on a native read, it removes
-the first user shadow page above 4 GiB before entering or resuming compatibility code if a 64-bit access populated it.
-The supervisor has its own shadow. A later 64-bit user access can populate its page again.
+The limit above is closed by the tables, not by the compiler
+([the checkpoint C plan](m2-checkpoint-c-plan.md), section 1, "Folded displacements behind a 4 GiB translation root").
+32-bit user code runs under translation roots of its own that reach the user space's shadows below 4 GiB and no other
+guest address, so an access at an address that should have wrapped always aborts, in a mixed process too, and the
+repair above makes it exact. FEX folds displacements and steps ESP with writeback as at task 3a. (For a day, fork
+`fc4270de` formed every address in 32 bits before the access instead; that cost 12 to 14% on 32-bit code and did not
+cover a register whose upper half was already wrong.) A PUSH and POP keep their stack site kinds for recovery.
 
-The M4 framework case `static/fexc-address32` checks the emitted native operands, their 32-bit address definitions,
-and the increment after a POP. The same check detects the old compiler's folded displacements and stack writeback
-without executing its code. The case also checks which implicit operands yield a stack fault. MOVS reads the
-overridable source before storing through ES. CMPS reads ES first, then the overridable source.
-The linked stubs inherit each access's segment.
+The M4 framework case `static/fexc-address32` checks the emitted native operands and which implicit operands yield a
+stack fault. MOVS reads the overridable source before storing through ES. CMPS reads ES first, then the overridable
+source. The linked stubs inherit each access's segment.
 
 In `system/compat32-resident-limits`, the string and moffs fixtures check the saved fault frame, vector state and CR2.
 The mixed-user-wrap fixture uses one vCPU and CR3. A 64-bit user writes low and high pages and enters 32-bit code
 through IRETQ. The 32-bit code uses a wrapped SIB store, pushes a memory operand across the ESP update and
 pops to memory addressed with the incremented ESP. Both block sizes check the low values, the stack word,
-the final ESP and the unchanged high sentinel. This high page has an independent address; a warm mapping
-at exactly the old compiler's unintended address remains outside the guest execution evidence.
+the final ESP and the unchanged high sentinel. `mixed-user-wrap-far`, `mixed-user-fold` and the two `mixed-user-shld`
+fixtures warm a page at exactly the address the native instruction would reach unrepaired.
 Based FS/GS bounds and legal wrapped linear spans have their own checkpoint C requirements.
 
 ## Tests

@@ -43,7 +43,7 @@ the access can complete before the resident sees it.
   high pages and prove the unmodified runtime fails the case. Check the selected value and the untouched
   sentinel as appropriate. Test both address formation and the next access after a stack update.
 
-### Folded displacements behind a 4 GiB translation root (design, November 23, 2026, revised after review; not yet built)
+### Folded displacements behind a 4 GiB translation root (design of November 23, 2026, revised after review; built the same day, "As built" below)
 
 **Why.** Forming every displaced 32-bit address with its own 32-bit add (fork commit `fc4270d`, natemu `30793c6b`) cost
 12 to 14% on 32-bit code: bench cases `io5-solo32`, `guest-sqlite32` and `guest-startup32`, Apple M4, three alternating
@@ -153,6 +153,32 @@ base, `mov bx,0xF000`, then `[ebx+0x2000]`); a displacement just under 16 KiB pa
 PUSH at ESP = 0 with a user page at the top of the address space; base + index without a displacement. Unit tests in
 `shadow.rs`: the four copies follow link, `reset` and `reset_cr3`; an invalidation below 4 GiB names both ASIDs.
 64-bit objects stay byte-identical (`static/fexc-replay`).
+
+**As built (November 23, 2026; natemu `0a077e5c` and the tests after it, FEX `10ff87f` and `13a1bfc`).** As designed,
+with these notes.
+
+- The three pages are the first three of the old pool (`COMPAT_LOWER_ROOT`, `COMPAT_UPPER_ROOT`, `COMPAT_L1` in
+  `crates/abi/src/shadow.rs`). `shadow::asids` holds the ASID arithmetic for `tables::space` and `tables::select`.
+  `select_guest_space` stays as the one-line caller of `tables::select` at the four entry points.
+- For 49 addressing, stack and unchecked FS/GS forms at both block sizes (those `fexc-address32` held, and absolute
+  addresses, a 16 KiB displacement and plain PUSH and POP) the compiler's code is byte for byte `main` `035b243e`'s;
+  only SHLD and SHRD by CL differ. `fexc-address32` pins the native operand of each access and the digests of the
+  unchecked FS/GS forms.
+- Failing first, M4, `tests/system` `compat32-resident-limits`: on `5e028c91` the two SHLD programs fail at `[eax]`
+  in the whole-block run. On a throwaway build of `5e028c91` with FEX `10ff87f` (folding, the old runtime)
+  `mixed-user-wrap-far`, `mixed-user-fold` (the 16-bit write step in the whole-block run), `mixed-user-shld`
+  (`[eax]` and `[eax+8]`) and `mixed-user-shld-6g` fail. In a one-instruction block the register is cut at each
+  entry, so the upper-half steps pass there on any build.
+- PUSH at ESP = 0 against a user page at the top of the address space is not a case: the fixture's table entry for
+  that page lies in the bytes the push writes. `[ebp-16]` with EBP = 4 covers the top of the address space, and
+  `mixed-user-wrap` keeps PUSH at ESP = 0.
+- The scan for 64-bit writes of 32-bit guest registers is part of `static/fexc-asm32` (`run_asm.py` `wide_writes`):
+  it follows a temporary to its last write, checks itself on the old SHLD sequence, and finds nothing else in FEX's
+  245 32-bit tests.
+- FXSAVE, XSAVE, FNSAVE and m80 past 4 GiB were already exact: the resident's handlers test the operand's extent
+  (`operand_range(..).outside`, `xsave.rs`, `x87.rs`), and `c32` has `fxsave-limit`. Nothing was built.
+- Not measured yet: the A/B against `main` (bench cases `io5-solo`, `io5-solo32`, `guest-hackbench32`,
+  `guest-hackbench32-int80`, `guest-startup32`, `guest-sqlite32`, M4) follows the code review.
 
 ## 2. Enforce FS and GS limits at the point of access
 
@@ -275,9 +301,8 @@ The review found three defects that come from the approach, not from its details
 A segment that is present, a writable expand-up data segment and 4 GiB long ("flat-limit"; Linux's TLS segment) needs
 no check: nothing an in-range offset can do fails. Two new code-identity bits say that FS, respectively GS, is *not*
 flat-limit. With a bit clear the block is compiled as this branch's FEX compiled it before any segment-check commit
-(fork commit `fc4270d`): FEX adds `fs_cached` / `gs_cached`, no check, no record. That is `main`'s code plus section
-1's 32-bit address formation, which is not on `main` and changes every displaced 32-bit access, with or without a
-segment prefix. With a bit set, FEX cannot obtain that segment's base except from one new IR
+(fork commit `fc4270d`): FEX adds `fs_cached` / `gs_cached`, no check, no record. (Since section 1's "Folded
+displacements behind a 4 GiB translation root" that is `main`'s code again.) With a bit set, FEX cannot obtain that segment's base except from one new IR
 operation, emitted once per guest instruction before any of its effects, which checks the whole operand (offset,
 architectural width) inline against a read-only per-vCPU record and yields the base; a failing check, or a segment the
 inline test does not model, branches to the existing resident stub, where the reviewed operand rule decides. An access
@@ -450,8 +475,9 @@ at the level of the *native access*, replacing the per-form `wrapped_segment_acc
   reader of the tag is `noncanonical` (`rt/execution.rs:3643-3654`: SS gives #SS, anything else #GP), which is right
   for 4/5 unchanged; the host's two constructors of `SEG_SS` sites are test fixtures (`host/admission.rs:1947, 2182`).
 - FEX forms the 32-bit sum of base and offset (`FEX/Addressing.cpp:60-66`), so the first byte's address is already
-  wrapped. `select_guest_space` keeps the page at 4 GiB unmapped while 32-bit user code runs (`rt/execution.rs`,
-  `enter_compat_user` in `crates/abi/src/shadow.rs`), so a native access running across 4 GiB always aborts, or is
+  wrapped (or, with a folded displacement, is made again there). 32-bit user code runs under roots that map nothing at
+  or above 4 GiB (section 1, "Folded displacements behind a 4 GiB translation root"; at first one unmapped page,
+  `enter_compat_user`), so a native access running across 4 GiB always aborts, or is
   caught by its split-store stub first.
 - At the three places that give #GP today for `address + width > 4 GiB` (`access_aborted` `:4245`, `split` `:4509`,
   and the path into `split_lock`), the resident asks: is the site's tag FS or GS, and does
