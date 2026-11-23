@@ -21,7 +21,12 @@ tools=$here
 externals="fmt xxhash unordered_dense"
 # A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
 # update a submodule path that is a symlink. The pin check below still applies.
-if [ ! -L "$root/third_party/FEX" ]; then
+# So is a third_party/FEX that is a linked git worktree of the main checkout's submodule (its git dir is not the
+# submodule's common one): `git submodule update` there would rewrite the shared module's core.worktree to this checkout
+# and break the main checkout's FEX. The externals then come from the submodule's own module stores (below).
+linked=
+[ -L "$root/third_party/FEX" ] || [ "$(cd "$fex" 2>/dev/null && git rev-parse --absolute-git-dir 2>/dev/null)" = "$(cd "$fex" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" ] || linked=1
+if [ ! -L "$root/third_party/FEX" ] && [ -z "$linked" ]; then
   git -C "$root" submodule update --init --depth 1 third_party/FEX
   for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
 fi
@@ -35,7 +40,8 @@ mkdir "$build"
 git -C "$fex" worktree add -q --detach "$build/src" "$pin"
 for e in $externals; do
   mkdir -p "$build/src/External/$e"
-  git -C "$fex/External/$e" archive "$(git -C "$fex" rev-parse "$pin:External/$e")" | tar x -C "$build/src/External/$e"   # as the pin records it
+  if [ -n "$linked" ]; then extgit="--git-dir=$(cd "$fex" && cd "$(git rev-parse --git-common-dir)" && pwd -P)/modules/External/$e"; else extgit="-C $fex/External/$e"; fi
+  git $extgit archive "$(git -C "$fex" rev-parse "$pin:External/$e")" | tar x -C "$build/src/External/$e"   # as the pin records it
 done
 cmake -S "$tools" -B "$build/obj" -G Ninja -DFEXC_SRC="$build/src" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
