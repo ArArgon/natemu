@@ -253,6 +253,29 @@ def cases():
         add(name + '-missing', insn, segment=seg, base=0xfffffffb, limit=6, mapped=C.TOP_ONLY,
             prefix=seed_ax, eax=accumulator, fault=14, error=6 if write else 4, cr2=0, rflags=0x10045,
             kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    # Both active dwords fit GS. One lies on each side of the linear wrap. A missing second page
+    # leaves lane 0 untouched. A shorter segment faults before paging; an empty AVX mask addresses no lane.
+    pair = 'vpmaskmovd [gs:eax], xmm3, xmm1'
+    lane0 = '    mov ebx, 0xfffffffc\n    mov dword [rbx], 0x44332211\n'
+    unchanged = {C.HIGH + 4092: VALUE[:4]}
+    def mask_pair(name, mapped=C.TOP_ONLY, captured=unchanged, kernel_setup=lane0, **kwargs):
+        add('gs-maskstore-wrapped-' + name, pair, segment='gs', base=0xfffffffc, mapped=mapped,
+            captured=captured, kernel_setup=kernel_setup, **kwargs)
+
+    mask_pair('gp', limit=3)
+    mask_pair('page', limit=7, fault=14, error=6, cr2=0)
+    mask_pair('empty', limit=0, prefix=set0, xmm3=bytes(16), success=True)
+    written = {C.HIGH + 4092: INITIAL[:4], low: INITIAL[4:8] + bytes(4)}
+    mask_pair('pair', C.WRAP, written, limit=7, success=True)
+    mask_pair('watch-low', C.WRAP, written, lane0 + watch_low, limit=7, fault=1, after_trap=True)
+    # Standard XSAVE merges XSTATE_BV, writes only selected components, and leaves reserved header bytes alone.
+    flags = '    mov eax, 2\n    xor edx, edx\n'
+    add('fs-xsave-wrapped-header', 'xsave [fs:0]', base=0xffffffc0, limit=1023, mapped=C.WRAP,
+        kernel_setup=load_bytes(448, bytes.fromhex('0100000000000000aabbccdd')),
+        prefix=flags, success=True, captured={low + 112: INITIAL, low + 448: bytes.fromhex('0300000000000000aabbccdd')})
+    add('fs-xsave-wrapped-page', 'xsave [fs:0]', base=0xffffffc0, limit=1023, mapped=C.TOP_ONLY,
+        kernel_setup='    mov ebx, 0xffffffd8\n    mov dword [rbx], 0x44332211\n',
+        prefix=flags, fault=14, error=6, cr2=0, captured={C.HIGH + 0xfd8: VALUE[:4]})
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)

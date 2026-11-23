@@ -21,7 +21,7 @@
 //! explicitly permitted by its SDM page), and writes selected bytes. Unlike the SIMD forms it checks pending #MF and
 //! natural alignment under #AC (Vol.3B Table 24-8); canonicality precedes #AC, which precedes page faults as for `linear`.
 //! Only successful completion sets TOP=0 and all tags valid, including a zero mask. CR4.OSFXSR does not gate it.
-use super::segments::{Exception, copy, operand_range, offset, operand, pages, usable};
+use super::segments::{Exception, operand_range, offset, operand, span::Span, usable};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;
 
@@ -75,33 +75,38 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     usable(&s.cpu, i.segment)?;
     let nc = operand_range(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
-    let mut addresses = [0; 16];
+    let mut spans = [None; 8];
     if ew == 1 {
         // MASKMOVQ and [V]MASKMOVDQU preflight the whole operand, even for an empty mask.
         let at = operand(&s.cpu, i.segment, ea, n as u64, true)?;
         if mmx && alignment_check(&s.cpu) != 0 && at & 7 != 0 && !nc.outside(&s.cpu, at, 8) {
             return Err([17, 0, 0]);
         }
-        pages(s, at, n as u64, true, false, nc)?;
-        for (j, va) in addresses[..n].iter_mut().enumerate() {
-            *va = super::segments::wrap(&s.cpu, at.wrapping_add(j as u64));
-        }
+        spans[0] = Some(Span::walk(s, at, n, true, nc)?);
     } else {
         // VMASKMOV and VPMASKMOV check bounds only for active lanes, before any lane moves.
+        let mut addresses = [0; 8];
         for j in (0..n).filter(|&j| on(j)) {
             addresses[j] = operand(&s.cpu, i.segment, ea.wrapping_add((ew * j) as u64), ew as u64, store)?;
         }
         for j in (0..n).filter(|&j| on(j)) {
-            pages(s, addresses[j], ew as u64, store, false, nc)?;
+            spans[j] = Some(Span::walk(s, addresses[j], ew, store, nc)?);
         }
     }
+    let active = (0..n).filter(|&j| on(j)).map(|j| {
+        let (index, offset) = if ew == 1 { (0, j) } else { (j, 0) };
+        (j, spans[index].as_ref().unwrap(), offset)
+    });
+    for (_, span, offset) in active.clone() {
+        span.check_backing(s, offset, ew, true);
+    }
     let mut d = [0u8; 32];
-    for j in (0..n).filter(|&j| on(j)) {
+    for (j, span, offset) in active {
         let bytes = &mut d[ew * j..ew * j + ew];
         if store {
             bytes.copy_from_slice(&data[ew * j..ew * j + ew]);
         }
-        copy(s, addresses[j], bytes, store, false, nc)?; // walked above: no fault left
+        span.copy(s, offset, bytes, store);
     }
     if !store {
         let r = i.reg as usize;

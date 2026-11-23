@@ -11,6 +11,7 @@
 //! CPL-0 compatibility code retains the boot interpreter route. Call gates stop at CPL 0 and raise
 //! #GP(selector) at CPL 3. See `tools/models/segment_model.py` for transaction order and the IRET rules.
 use super::*;
+pub(super) mod span;
 
 /// An exception a transaction raises: vector, error code, CR2.
 pub(super) type Exception = [u64; 3];

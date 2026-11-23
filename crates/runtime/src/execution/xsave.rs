@@ -23,7 +23,7 @@
 //! for write before any state or memory changes (a #PF or #GP leaves both as they were). I5c: an FCW or MXCSR with masks
 //! clear re-keys the code (`Cpu::code_context`); FXRSTOR/XRSTOR, like FXSAVE/XSAVE, ignore a pending x87 exception (SDM
 //! Vol.3 event 16), and an unmasked flag they load is pending for the next waiting x87 instruction.
-use super::segments::{Exception, address, linear, operand_range, pages};
+use super::segments::{Exception, address, linear, operand_range, span::Span};
 use super::*;
 
 use natemu_abi::x87::{f80_int, from_f80, int_f80, to_f80};
@@ -122,37 +122,19 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 .fold((AREA, 0), |(lo, hi), p| (lo.min(p.1), hi.max(p.2)));
             // Every page the stores reach (both ends of [lo, hi) are stored, so each page in it is) walked for write first;
             // as `linear`, nothing is written unless all of it is guest RAM (M3: a device page stops first).
-            let (start, n) = (va.wrapping_add(lo as u64), (hi - lo) as u64);
-            let gpa = pages(s, start, n, true, false, nc)?;
-            let crosses = (start ^ start.wrapping_add(n - 1)) >> 12 != 0;
-            if !mmio::ram(gpa[0]) || (crosses && !mmio::ram(gpa[1])) {
-                mmio::system_access(s)
-            }
+            let span = Span::walk(s, va.wrapping_add(lo as u64), hi - lo, true, nc)?;
+            span.check_backing(s, 0, hi - lo, false);
             let bv = if compact {
                 img[HEADER + 8..HEADER + 16].copy_from_slice(&(COMPACTED | rfbm).to_le_bytes());
                 rfbm
             } else {
-                linear(
-                    s,
-                    va.wrapping_add(HEADER as u64),
-                    &mut img[HEADER..HEADER + 8],
-                    false,
-                    false,
-                    nc,
-                )?;
+                span.copy(s, HEADER - lo, &mut img[HEADER..HEADER + 8], false);
                 word(&img, HEADER) | rfbm
             };
             img[HEADER..HEADER + 8].copy_from_slice(&bv.to_le_bytes());
             for &(on, from, to) in &parts {
                 if on {
-                    linear(
-                        s,
-                        va.wrapping_add(from as u64),
-                        &mut img[from..to],
-                        true,
-                        false,
-                        nc,
-                    )?;
+                    span.copy(s, from - lo, &mut img[from..to], true);
                 }
             }
         }
