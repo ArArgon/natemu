@@ -2120,8 +2120,13 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     served(s);
     // Every segment/base or mode change that returns to native code comes through this full
     // entry, including a fast SYSRET. A link, fast miss, or precise retry keeps the same hidden
-    // descriptors; while 64-bit code runs (including inline SWAPGS), neither view is published.
-    cache::publish_segment_view(s.cpu.compat_segment_records());
+    // descriptors. Only 32-bit user code reads the records (a block with an FS/GS-limited bit,
+    // `Cpu::limited_segment`'s condition), so only an entry into it publishes; under any other
+    // context they are unread and may be stale, and the next entry into 32-bit user code
+    // republishes from the bank before any such block runs.
+    if s.cpu.cpl == 3 && s.cpu.code_mode() == Some(CodeMode::Compat32) {
+        cache::publish_segment_view(s.cpu.compat_segment_records());
+    }
     s.mid_string = 0; // the next resident entry is at another boundary
     // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
     // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms

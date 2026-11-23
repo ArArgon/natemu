@@ -100,7 +100,7 @@ def program(n, flat=False):
     memory = [region(C.U, C.user32(user)), region(gp_handler, P.asm(gp)), region(int_handler, P.asm(report)),
               region(C.IDT, idt), region(C.IDTR, struct.pack('<HQ', len(idt) - 1, C.IDT)), P.zero(barrier, 4),
               region(fs_base, struct.pack('<III', 3, 0, fs_word)), region(gs_base, struct.pack('<III', 7, 0, gs_word))]
-    bodies, cpus, expected = [], [], {barrier: struct.pack('<I', n)}
+    bodies, cpus, views, expected = [], [], [], {barrier: struct.pack('<I', n)}
     for i in range(n):
         f = S.fields(i)
         small, roomy = 4 + i, 16 + 4 * i
@@ -111,6 +111,10 @@ def program(n, flat=False):
             gdt[sel:sel + 8] = descriptor(base, limit).to_bytes(8, 'little')
         if flat and i == 0:
             gdt[0x28:0x30] = descriptor(fs_base, 0xfffff, flags=12).to_bytes(8, 'little')
+        # The vCPU stops in 64-bit code, which publishes no records: the tags keep its 32-bit user code's last ones,
+        # (limit + 1) << 32 | base, 0 for the flat-limit FS.
+        views.append([0 if flat and i == 0 else (small if fs_small else roomy) + 1 << 32 | fs_base,
+                      (roomy if fs_small else small) + 1 << 32 | gs_base])
         memory += S.memory(i, n, gdt=gdt)
         enter = f'    mov edi, {f["c"]:#x}\n    mov ebp, {rounds}\n    lea r15, [rel .done]\n'
         # Each private GDT and TSS is visible in table A of CPU 0. All CPUs run under exactly that CR3.
@@ -125,7 +129,7 @@ def program(n, flat=False):
                                          fs_rip if fs_small else gs_rip, 0, 0xdb, 1, return_rip, 0xdb, 3 * (3 + 7))
     # Each round's one out-of-range access is the only operand check the resident decides: every other passes inline.
     return dict(name=f'c32-per-cpu-fs-{"flat-limit" if flat else "gs"}@{n}', ncpu=n, system=True, bodies=bodies, cpus=cpus,
-                memory=memory, segment_views=[[0, 0] for _ in cpus], segment_checks=[rounds] * n), expected
+                memory=memory, segment_views=views, segment_checks=[rounds] * n), expected
 
 def storage(n, transition):
     """The host reads the stopped vCPU's two read-only tags. Guest instructions never read the view."""
@@ -176,8 +180,8 @@ def storage(n, transition):
         cpus.append(dict(P.cpu(i, C.U, rdx=P.SYS_CODE(i)), cpl=0))
         def packed(seg):
             return seg[1] + 1 << 32 | seg[0]   # the record: (limit + 1) << 32 | base
-        views.append([0, 0] if transition == 'user64' else [
-            0 if transition in ('null', 'readonly') else packed(gs if transition == 'reload' else fs), packed(gs)])
+        # (`user64` stops in 64-bit user code, which publishes no records: the tags keep the 32-bit code's last ones.)
+        views.append([0 if transition in ('null', 'readonly') else packed(gs if transition == 'reload' else fs), packed(gs)])
         expected[fields['c']] = struct.pack('<I', 0x12345678)
     return dict(name=f'c32-segment-storage-{transition}@{n}', ncpu=n, system=True, bodies=bodies,
                 cpus=cpus, memory=memory, segment_views=views), expected

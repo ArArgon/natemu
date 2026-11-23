@@ -113,6 +113,25 @@ def identity_switch(faults):
                   C.REC + 0x48: struct.pack('<I', ecx), tls: VALUE}
 
 
+def kernel_shrink():
+    """M2 checkpoint C: 64-bit kernel code between two passes of one 32-bit instruction reloads FS with a smaller limit
+    (both limited: one code identity, one compiled check). The 32-bit code's record is published only when 32-bit user
+    code is entered, so the return must republish it: the second pass faults at the new limit. A record kept from the
+    first pass would let the access run and end the program at INT 0x80."""
+    tls = C.W + 0x80
+    word = int.from_bytes(VALUE[4:8], 'little')
+    setup = f'    mov rax, {descriptor(tls, 0xff):#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n' + load_bytes(tls, VALUE)
+    shrink = (f'.shrink:\n    push rax\n    mov rax, {descriptor(tls, 3):#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
+              '    mov eax, 0x2b\n    mov fs, ax\n    pop rax\n    iretq\n')
+    head = '    mov edx, 0x2b\n    mov fs, dx\n    mov esi, 2\n    xor edi, edi\n    xor ecx, ecx\n.again:\n'
+    fault_rip = C.U + len(C.user32(head))
+    user = head + '    add ecx, [fs:edi+4]\n    int 0x7f\n    dec esi\n    jnz .again\n    int 0x80\n'
+    prog = C.program('fs-kernel-shrink', C.gate(0x7f, '.shrink', 3) + setup + C.ENTER() + shrink
+                     + C.handlers('    jmp .fin\n'), user)
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 13, 0, fault_rip, 0xdb),
+                  C.REC + 0x48: struct.pack('<I', word), tls: VALUE}
+
+
 def cases(*, reference_control=False):
     # Each instruction follows a successful load of a real descriptor. A separate register selects the
     # control segment, so mixing the two segments or validating a based linear address fails the case.
@@ -1124,7 +1143,7 @@ def cases(*, reference_control=False):
             prefix=f'    mov esi, {C.W:#x}\n    mov edi, 0xfffffffe\n')
     add('ss-moffs-load', 'mov eax, [ss:0xfffffffe]', fault=12, mapped=C.TOP_ONLY)
     cases += [mixed_user_wrap(), mixed_user_wrap_far(), mixed_user_fold(), mixed_user_shld(), mixed_user_shld_6g(),
-              identity_switch(False), identity_switch(True)]
+              identity_switch(False), identity_switch(True), kernel_shrink()]
     # M2 checkpoint C, the generic operand check: one in-range and one out-of-range case per instruction class the
     # per-opcode checks left unchecked, under a writable expand-up segment. In range the inline check passes (the
     # resident decides none: checks=0) and the effect is the instruction's; out of range the fault is at the instruction
