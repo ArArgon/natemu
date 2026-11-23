@@ -9,7 +9,11 @@ EBX 576/832 by XCR0, ECX 832): final GPRs and the whole data region byte by byte
 system mode with the CPU model QCPU, which decided these before (tests/system/test_i5b_expected.py). x87 values are doubles (exact under I6's reduced precision); one case loads an 80-bit value with more significand
 bits, where natemu's slot must be that value rounded to a double by FCW.RC (I6 deviation 2) and only there. QEMU writes
 nothing into bytes 10..15 of an FXSAVE ST slot, natemu writes zeros (the SDM's reserved bytes): those 48 bytes are
-compared only where the program pre-zeroed them (a declared difference; every other byte is compared).
+compared only where the program pre-zeroed them (a declared difference; every other byte is compared). One case meets a
+documented deviation of fast mode on a Mac without AFP (tests/lib/fp_deviations.py, derived by `i5b_expected.deviation`):
+fxsave-full-stack loads the denormal double 2^-1060 by FLD m64, so there its FSW lacks DE (`masked-x87-de`). Where the
+run's own report says no AFP and fast mode only that deviated state passes, reported `excluded` with the class named; on
+an AFP Mac and in accurate mode only x86's.
 
 XSAVEOPT (advertised since November 3) is compared like XSAVE (QEMU's is XSAVE with every component in use, as natemu's).
 XSAVEC and the compacted form of XRSTOR (since November 3) have no TCG implementation in QEMU 11.1.2: their images are the
@@ -27,11 +31,11 @@ non-canonical address; the last of several FS/GS prefixes applies; FS/GS on an i
 (`segment_cases`); where the SDM leaves it open the expectation is the reference AMD machine's (probe lines).
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import argparse, json, pathlib, struct, subprocess, sys, time
+import argparse, pathlib, struct, subprocess, sys, time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 import run_slice3_vm as s3  # noqa: E402  (also puts tools/reference and tools/bench/smp on the path)
-import ref, smp, answers, run_slice1_vm as vm1, qemucache  # noqa: E402
+import ref, smp, answers, run_slice1_vm as vm1, qemucache, fp_deviations as dev  # noqa: E402
 qemucache.install(smp)      # (run_slice3_vm did: idempotent)
 
 # QEMU's Haswell (11.1.2 TCG): leaf 0DH sub-leaves 0 and 2 and leaf 1 ECX equal the profile's; sub-leaf 1 also advertises
@@ -459,8 +463,14 @@ def run_images(a, host, runtime, stub, results):
     bad = 0
     for prog, mask in image_cases():
         if a.only and a.only not in prog['name']: continue
-        diffs = []
+        diffs, kinds = [], set()
         want = i5b_expected.expected(prog, mask)      # written from the program and the SDM's layouts (equal to QEMU's answers)
+        # A documented deviation of fast mode without AFP that changes the expected state, derived from the model
+        # (fxsave-full-stack: `masked-x87-de`, no DE in the FSW after the prelude's FLD of 2^-1060). Where the run's own report
+        # says no AFP and fast mode only that deviated state passes (tests/lib/fp_deviations.py); everywhere else only x86's.
+        tag = i5b_expected.deviation(prog, mask)
+        wants = (want, i5b_expected.expected(prog, mask, tag) if tag else None)
+        label = 'masked/' + ','.join(f'{off}+{n}' for off, n, *_ in mask)
         for limit in (None, 1):
             rc, out, err = natemu(a, host, runtime, description(prog), a.out / 'work' / f"{prog['name']}{'-1' if limit else ''}", limit)
             if rc: diffs.append(f'driver exit {rc}: {err.strip()[-300:]}'); continue
@@ -468,20 +478,23 @@ def run_images(a, host, runtime, stub, results):
             end = CODE + len(prog['bodies'][0]['code']) // 2
             if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end:
                 diffs.append(f"stopped {cpu['stop']} {cpu['reason']} {cpu.get('fault')} at {cpu['rip']}"); continue
-            diffs += s3.per_vcpu_checks(cpu)
+            checks = s3.per_vcpu_checks(cpu)
             got = s3.vm_state(prog, out)
-            if want:
-                # The masked ranges are left out of the comparison (zero in both states); QEMU's run ends without a fault.
-                zero = bytes(max((off + n for off, n, *_ in mask), default=0))
-                w = answers.view(want, 'masked/' + ','.join(f'{off}+{n}' for off, n, *_ in mask),
-                                 lambda w: (lambda w: {**w, 'cpus': [{**w['cpus'][0], 'fault': None}]})(masked(w, mask, zero)))
-                diffs += [f"max-block {limit}: {x}" for x in smp.compare(prog, masked(got, mask, zero), w)]
+            # The masked ranges are left out of the comparison (zero in both states); QEMU's run ends without a fault.
+            zero = bytes(max((off + n for off, n, *_ in mask), default=0))
+            view = lambda w: (lambda w: {**w, 'cpus': [{**w['cpus'][0], 'fault': None}]})(masked(w, mask, zero))
+            cmp = [[f"max-block {limit}: {x}" for x in smp.compare(prog, masked(got, mask, zero), answers.view(w, label, view))] if w else []
+                   for w in wants]
+            natemu_bytes = []
             for off, n, *value in mask:     # natemu's: 0 (pointers, reserved bytes), or the value I6 deviation 2 gives
                 if got['memory'][0]['data'][off:off + n] != (value[0] if value else bytes(n)):
-                    diffs.append(f"natemu bytes at +{off:#x}: {got['memory'][0]['data'][off:off + n].hex()}")
+                    natemu_bytes.append(f"natemu bytes at +{off:#x}: {got['memory'][0]['data'][off:off + n].hex()}")
+            kind, problems = dev.x87_verdict(tag, cpu, checks + cmp[0] + natemu_bytes, checks + cmp[1] + natemu_bytes)
+            kinds.add(kind); diffs += problems
+        kind = 'fail' if diffs else 'deviated' if 'deviated' in kinds else 'ok'
         bad += bool(diffs)
-        results.append({'group': 'images', 'name': prog['name'], 'ok': not diffs, 'diffs': diffs})
-        print(f"{prog['name']}: {'ok' if not diffs else 'FAIL'}", *diffs[:6], sep='\n  ', flush=True)
+        results.append({'group': 'images', 'name': prog['name'], 'ok': not diffs, 'outcome': kind, 'tag': tag, 'problems': diffs})
+        print(f"{prog['name']}: {dict(ok='ok', fail='FAIL', deviated=f'deviated as documented ({tag})')[kind]}", *diffs[:6], sep='\n  ', flush=True)
     return bad
 
 
@@ -539,8 +552,10 @@ def main():
     results = []
     bad = (run_images(a, host, runtime, smp.build_stub(a.out / 'qemu-build'), results) if a.group != 'faults' else 0) + \
           (run_faults(a, host, runtime, results) if a.group != 'images' else 0)
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1, default=str) + '\n')
-    print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
+    dev.write_results(a.out / 'results.json', results)      # (a deviated case: `excluded`, its class named)
+    tags = [r['tag'] for r in results if r.get('outcome') == 'deviated']
+    print(f'{len(results)} cases, {len(results) - bad - len(tags)} as expected, {bad} not' +
+          (f", {len(tags)} deviated as documented ({', '.join(sorted(set(tags)))})" if tags else ''))
     sys.exit(1 if bad else 0)
 
 

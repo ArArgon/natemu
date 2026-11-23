@@ -21,5 +21,14 @@ class I5bExpected(unittest.TestCase):
             self.assertIsNone(crosscheck.agrees('i5b', f'{key}/{label}', answers.system_projection(E.expected(prog, mask))), prog['name'])
         self.assertEqual(len(cases), 46)
 
+    def test_masked_x87_de_is_derived_for_fxsave_full_stack_alone(self):
+        # The only program whose expected state the documented deviation changes: the prelude's FLD m64 of 2^-1060, then
+        # FXSAVE; the deviated state differs only in the saved FSW's DE (byte +0x1002, 02H against 00H).
+        tagged = {prog['name']: E.deviation(prog, mask) for prog, mask in I.image_cases() if E.deviation(prog, mask)}
+        self.assertEqual(tagged, {'fxsave-full-stack': 'masked-x87-de'})
+        prog, mask = next(c for c in I.image_cases() if c[0]['name'] == 'fxsave-full-stack')
+        exact, deviated = (E.expected(prog, mask, t)['memory'][0]['data'] for t in (None, 'masked-x87-de'))
+        self.assertEqual([(k, exact[k], deviated[k]) for k in range(len(exact)) if exact[k] != deviated[k]], [(0x1002, 0x02, 0x00)])
+
 
 if __name__ == '__main__': unittest.main()

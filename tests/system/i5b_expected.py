@@ -4,7 +4,9 @@ FXRSTOR, XSAVE, XSAVEOPT, XRSTOR, FNSTENV, XGETBV, XSETBV, CPUID 0DH): an x87 un
 and 16 XMM/YMM registers run through each program's lines. Values the runner masks (FOP, FIP, FDP and their selectors,
 ST slots' reserved bytes, the MXCSR QEMU leaves for RFBM = AVX alone) are compared by neither side.
 `expected(prog, mask)` -> the state smp.parse_dump gives, with the masked bytes zero (the runner's view). Equal to QEMU
-11.1.2's answers (tests/system/test_i5b_expected.py, tools/reference/crosscheck/i5b.json)."""
+11.1.2's answers (tests/system/test_i5b_expected.py, tools/reference/crosscheck/i5b.json). `expected(prog, mask,
+'masked-x87-de')`: the state fast mode gives on a Mac without AFP (tests/lib/fp_deviations.py), where an FLD of a denormal
+m64 sets no DE; `deviation(prog, mask)` names that class for a program whose expected state it changes."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import pathlib, re, struct, sys
 
@@ -40,7 +42,8 @@ def tag_of(m, se):
 
 
 class State:
-    def __init__(self, d):
+    def __init__(self, d, masked_x87_de=False):
+        self.masked_x87_de = masked_x87_de                             # fp_deviations `masked-x87-de`: no DE from a memory operand
         self.mem = bytearray(d)
         self.g = {r: 0 for r in smp.REGS}; self.g.update(rdi=I.D, rsp=I.STACK)
         self.flags, self.cr4, self.xcr0 = 0x2, START_CR4, 1
@@ -121,7 +124,7 @@ class State:
         elif op == 'fld':
             d = struct.unpack('<d', self.get(self.addr(a[0]), 8))[0]
             bits = struct.unpack('<Q', struct.pack('<d', d))[0]
-            if bits >> 52 & 0x7ff == 0 and bits & ((1 << 52) - 1): self.fsw |= 0x2      # #D: a denormal source (masked: DE)
+            if bits >> 52 & 0x7ff == 0 and bits & ((1 << 52) - 1) and not self.masked_x87_de: self.fsw |= 0x2   # #D: a denormal source (masked: DE)
             self.push(f80(d))
         elif op == 'fld1': self.push((1 << 63, 0x3fff))
         elif op == 'ldmxcsr': self.mxcsr = struct.unpack('<I', self.get(self.addr(a[0]), 4))[0]
@@ -162,11 +165,19 @@ class State:
             raise ValueError(f'not interpreted: {line}')
 
 
-def expected(prog, mask):
+def expected(prog, mask, deviation=None):
+    assert deviation in (None, 'masked-x87-de'), deviation
     d = smp.region_bytes(prog['memory'][0])
-    s = State(d)
+    s = State(d, masked_x87_de=deviation == 'masked-x87-de')
     for line in prog['asm']: s.run(line)
     data = bytearray(s.mem)
     for off, n, *_ in mask: data[off:off + n] = bytes(n)             # the runner's view: masked bytes zero on both sides
     regs = {r: v for r, v in s.g.items()}
     return expect.state(prog, [dict(regs, rflags=s.flags, fault=None)], [(I.D, bytes(data))])
+
+
+def deviation(prog, mask):
+    """The documented deviation of fast mode without AFP (a tests/lib/fp_deviations.py class) that changes the program's
+    expected state, derived from the model and never written by hand: `masked-x87-de` where a denormal m64 operand's DE
+    reaches the final state (fxsave-full-stack: the prelude's FLD of 2^-1060, then FXSAVE), else None."""
+    return 'masked-x87-de' if expected(prog, mask) != expected(prog, mask, 'masked-x87-de') else None

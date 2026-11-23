@@ -66,5 +66,41 @@ class FaultVerdict(unittest.TestCase):
         self.assertTrue(ran)
 
 
+class ImageVerdict(unittest.TestCase):
+    """run_images on fxsave-full-stack, given natemu's final state and the run's report: x86's state (FSW.DE set) passes
+    unless the report says no AFP and fast mode; there only the documented `masked-x87-de` state (DE clear) does."""
+    def verdict(self, report, deviated):
+        import i5b_expected as E
+        prog, mask = next(c for c in R.image_cases() if c[0]['name'] == 'fxsave-full-stack')
+        state = E.expected(prog, mask, 'masked-x87-de' if deviated else None)
+        end = R.CODE + len(prog['bodies'][0]['code']) // 2
+        natemu = lambda a, host, runtime, text, work, limit=None: (0, {'cpus': [{'stop': 'reached', 'rip': hex(end), **report}]}, '')
+        saved = R.image_cases, R.natemu, R.s3.vm_state, R.s3.per_vcpu_checks
+        R.image_cases, R.natemu = (lambda: [(prog, mask)]), natemu
+        R.s3.vm_state, R.s3.per_vcpu_checks = (lambda p, o: state), (lambda cpu: [])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                results = []
+                bad = R.run_images(types.SimpleNamespace(only=None, out=pathlib.Path(d)), None, None, None, results)
+        finally:
+            R.image_cases, R.natemu, R.s3.vm_state, R.s3.per_vcpu_checks = saved
+        self.assertEqual(bad, int(results[0]['outcome'] == 'fail'))
+        return results[0]['outcome'], ' '.join(results[0]['problems'])
+
+    def test_exact_where_afp_or_accurate(self):
+        for report in ({'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'accurate'}, {'afp': True, 'fp': 'accurate'}, {}):
+            self.assertEqual(self.verdict(report, deviated=False), ('ok', ''), report)
+            kind, why = self.verdict(report, deviated=True)
+            self.assertEqual(kind, 'fail', report)
+            self.assertIn('+0x1002: 0x00 != 0x02', why)
+
+    def test_deviated_only_without_afp_in_fast_mode(self):
+        m2 = {'afp': False, 'fp': 'fast'}
+        self.assertEqual(self.verdict(m2, deviated=True), ('deviated', ''))
+        kind, why = self.verdict(m2, deviated=False)
+        self.assertEqual(kind, 'fail')
+        self.assertIn('tagged masked-x87-de but exact', why)
+
+
 if __name__ == '__main__':
     unittest.main()
