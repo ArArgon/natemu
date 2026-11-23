@@ -49,6 +49,9 @@ const LIST: usize = 4;
 /// such shadows a vCPU, a few per CR3 load, made 58-68% of the loads reset the kept half whole. Listed, a load removes
 /// only them (what the load must drop); past this many it resets everything, as before.
 const LIST_MAX: usize = 64;
+/// A user shadow of the first page above the 32-bit address space may exist.
+const COMPAT_EDGE_MAPPED: usize = LIST + LIST_MAX;
+const COMPAT_END: u64 = 1 << 32;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
 /// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
 /// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
@@ -273,6 +276,9 @@ impl<M: Maintenance> Space<M> {
                 }
             }
         }
+        if self.user && va == COMPAT_END {
+            self.set(STATE_OFFSET, COMPAT_EDGE_MAPPED, 1);
+        }
         let new = target | PAGE | NOT_GLOBAL | if writable { 0 } else { READ_ONLY };
         let old = self.get(table, index);
         if old == new {
@@ -284,6 +290,16 @@ impl<M: Maintenance> Space<M> {
         }
         self.set(table, index, new);
         self.tlb.publish();
+        Ok(())
+    }
+    /// With the first page above 4 GiB absent from the user space, a native load beginning below the
+    /// flat segment limit and extending past it must fault. The resident checks the range before paging.
+    /// A later 64-bit access can fill the page normally. An unrelated eviction may leave the hint set.
+    pub fn enter_compat_user(&mut self) -> Result<(), Error> {
+        if self.user && self.get(STATE_OFFSET, COMPAT_EDGE_MAPPED) != 0 {
+            self.unmap(COMPAT_END)?;
+            self.set(STATE_OFFSET, COMPAT_EDGE_MAPPED, 0);
+        }
         Ok(())
     }
     /// Remove `va`'s shadow, if any, and invalidate it.
@@ -411,6 +427,32 @@ mod tests {
     }
     fn word(memory: &[u64], offset: usize) -> u64 {
         memory[offset / 8]
+    }
+
+    #[test]
+    fn compatibility_entry_removes_only_the_boundary_leaf_in_the_user_space() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_PAGES);
+        let target = 0x4007_0000;
+        s.map(COMPAT_END, target, true).unwrap();
+        s.user = true;
+        for va in [COMPAT_END - 4096, COMPAT_END, COMPAT_END + 4096] {
+            s.map(va, target, true).unwrap();
+        }
+        s.tlb.0.clear();
+        s.enter_compat_user().unwrap();
+        s.enter_compat_user().unwrap();
+        assert_eq!(s.tlb.0, [COMPAT_END]);
+        assert_eq!(s.descriptor(COMPAT_END), 0);
+        assert_ne!(s.descriptor(COMPAT_END - 4096), 0);
+        assert_ne!(s.descriptor(COMPAT_END + 4096), 0);
+        s.user = false;
+        assert_ne!(s.descriptor(COMPAT_END), 0);
+        s.user = true;
+        s.map_global(COMPAT_END, target, false).unwrap();
+        assert_ne!(s.descriptor(COMPAT_END), 0);
+        s.enter_compat_user().unwrap();
+        assert_eq!(s.descriptor(COMPAT_END), 0);
     }
 
     /// K1: `unmap_large` removes and invalidates exactly the shadows of the 2 MiB region holding its address.

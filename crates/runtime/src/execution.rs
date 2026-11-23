@@ -1042,7 +1042,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     s.l2_hits += 1;
     c.fast_taken += 1;
     cache::fill_l1(rip, target);
-    tables::select(s.cpu.cpl);
+    select_guest_space(s);
     crate::perf::enter(crate::perf::GUEST);
     // SAFETY: the target is a live block; the frame is the gate's, intact (see `resume_exception`'s layout contract). PSTATE as
     // `enter` builds it, from the NZCV the gate stored. A PIC target's `full_entry` writes the page base itself.
@@ -2303,7 +2303,7 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
             write_record(record(), s);
             crate::perf::leave(c);
         }
-        tables::select(s.cpu.cpl);
+        select_guest_space(s);
         crate::perf::enter(crate::perf::GUEST);
         enter_allocated(f, pc, BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
     }
@@ -2460,6 +2460,19 @@ unsafe fn division(signed: bool, f: &NativeFrame, elr: u64, spsr: u64) -> ! {
     }
 }
 
+/// Every entry or resume selects the current privilege's shadows. A mixed process can leave the first
+/// page above 4 GiB mapped for its 64-bit code. Drop that one user shadow before running 32-bit code:
+/// native loads can then report a flat segment straddle even if the guest maps both pages.
+fn select_guest_space(s: &State) {
+    if s.cpu.cpl == 3
+        && s.cpu.code_mode() == Some(CodeMode::Compat32)
+        && tables::space(true).enter_compat_user().is_err()
+    {
+        halt(s, stop::SHADOW)
+    }
+    tables::select(s.cpu.cpl);
+}
+
 /// Resumes generated code mid-block at `pc` (a division, a retried access, a split store): a stop still wanted is
 /// armed again in the block holding `pc` (the entry disarmed it).
 unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! {
@@ -2470,7 +2483,7 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
         cache::control().rearms += 1;
     }
     post_pending(s, false);
-    tables::select(s.cpu.cpl);
+    select_guest_space(s);
     crate::perf::enter(crate::perf::GUEST);
     unsafe { resume_exception(frame, pc, spsr, alignment_check(&s.cpu)) }
 }
@@ -2607,7 +2620,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     }
     // Perf chunk 15: an inline STI later in this block sees the event and lets the resident run it (its shadow).
     post_pending(&s, false);
-    tables::select(s.cpu.cpl);
+    select_guest_space(&s);
     unsafe {
         write_record(record(), &s);
         crate::perf::enter(crate::perf::GUEST);
@@ -3898,6 +3911,14 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         if b.flags & cache::STEP == 0 && (s.generation != generation || b.flags & cache::DEAD != 0)
         {
             step_from(s, f, b, &site)
+        }
+        // A flat segment's end precedes the alignment or watchpoint decision. Data aborts and split
+        // stores make the same extent check in their handlers, before walking either page.
+        if (site.kind == object::kind::ALIGN || esr >> 26 == 0x34)
+            && s.cpu.code_mode() == Some(CodeMode::Compat32)
+            && u64::from(site_address(&site, f) as u32) + u64::from(site.width) > 1 << 32
+        {
+            guest_fault(s, f, b, &site, noncanonical(&site))
         }
         // (A probe that met a watchpoint is the split store's business: it tests the debug registers itself.)
         if esr >> 26 == 0x34 && site.kind != object::kind::SPLIT {

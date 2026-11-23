@@ -58,6 +58,9 @@ argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--sh
 [suite.cases."fexc-precision-32"]
 argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--bits32"]
 
+[suite.cases."fexc-address32"]
+argv = ["tests/static/check_compat_address.py", "{fexc}"]
+
 # M2: FEX's 32-bit ASM suite (245 tests), offline: every reachable block compiled for 32-bit code and admitted by the
 # host with the code-shape check. Running them waits for 32-bit code in the VM (M2 task 3).
 [suite.cases."fexc-asm32"]
