@@ -6,13 +6,19 @@
 // The words run with x28 = buf (FEX's state register), x<reg> = buf + offset for each pointer pair, the other registers as given, and
 // end by a jump back (FEX's code uses x30 as an ordinary temporary, so no `ret`; x16 is the jump's scratch). out: x[32] u64, v[32]
 // 16 bytes, buf[8192].
+// 32-bit code (M2 checkpoint C): it forms every effective address in 32 bits, so a pointer into buf loses its upper half, and
+// macOS maps nothing below 4 GiB for an arm64 process. The access then faults at the truncated address: the handler gives the
+// access's base register buf's upper half back and the instruction runs again (what the address would be had buf lain below 4 GiB;
+// the words after it use that register's low half only, or write it anew).
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ucontext.h>
 
 typedef struct { uint64_t x[32]; uint8_t v[32][16]; } Regs;
 void exec_block(Regs* r, void* code);
@@ -46,6 +52,17 @@ __asm__(
   "  add sp, sp, #176\n  ret\n");
 
 #define BUF 8192
+static uint64_t buf_high;
+static void low_address(int sig, siginfo_t* info, void* context) {
+  ucontext_t* uc = context;
+  const uint32_t word = *(const uint32_t*)uc->uc_mcontext->__ss.__pc;
+  const unsigned rn = word >> 5 & 31;   // the base register of every load, store and atomic
+  if ((uint64_t)info->si_addr >> 32 == 0 && rn < 29 && uc->uc_mcontext->__ss.__x[rn] >> 32 == 0) {
+    uc->uc_mcontext->__ss.__x[rn] |= buf_high;
+    return;
+  }
+  signal(sig, SIG_DFL);
+}
 static void need(size_t n, size_t got) { if (n != got) { fprintf(stderr, "exec_words: short input\n"); exit(2); } }
 
 int main(int argc, char** argv) {
@@ -66,6 +83,10 @@ int main(int argc, char** argv) {
   uint8_t* buf = mmap(NULL, BUF, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   need(BUF, fread(buf, 1, BUF, stdin));
   for (uint32_t i = 0; i < np; ++i) r.x[ptr[i][0]] = (uint64_t)(buf + ptr[i][1]);
+  buf_high = (uint64_t)buf & ~0xffffffffull;
+  struct sigaction sa = {.sa_sigaction = low_address, .sa_flags = SA_SIGINFO};
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGBUS, &sa, NULL);
   r.x[28] = (uint64_t)buf;
   void* code = mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (code == MAP_FAILED) { perror("mmap"); return 1; }
