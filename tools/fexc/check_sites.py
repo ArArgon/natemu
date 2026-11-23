@@ -52,7 +52,7 @@ RMW_DST = {'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 
 LOAD_DST = {'cmp', 'test', 'bt'}
 LOAD_ONLY_1OP = {'mul', 'imul', 'div', 'idiv'}
 WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i in range(8, 16)}
-STUBS = ('guard', 'split', 'divide', 'align', 'stack', 'fldcw', 'x87tag', 'x87guess')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
+STUBS = ('guard', 'split', 'divide', 'align', 'stack', 'fldcw', 'x87tag', 'x87guess', 'segment')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
 STRING = re.compile(r'(?:(?:rep|repe|repne)\s+)?(movs|stos|lods|scas|cmps)([bwdq]?)\b(.*)')
@@ -231,7 +231,7 @@ def run(hexs, rip, tmp, *extra):
 def read_object(path):
     f = Path(path).read_bytes()
     h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4, 5) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
      sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
@@ -412,10 +412,12 @@ def check_program(p, tmp):
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
     kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap', 'atomic', 'align',
-             'simd', 'x87', 'pending', 'fma', 'denorm', 'stack', 'fldcw', 'x87tag', 'x87guess']
+             'simd', 'x87', 'pending', 'fma', 'denorm', 'stack', 'fldcw', 'x87tag', 'x87guess', 'x87map', 'segment']
     for rec, s in zip(o['sites'], sites):
         if (rec[0], rec[1], kinds[rec[5]], rec[6]) != (s['native_offset'], s['guest_offset'], s['kind'], s['width']):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
+        if s['kind'] == 'segment' and (rec[7], rec[9], rec[10]) != (int(s['intent'] == 'write'), {'fs': 4, 'gs': 5}.get(s['segment']), s['base_reg']):
+            problems.append(('ERROR', f'object site at {s["native_offset"]}: segment operand differs from JSON'))
         if rec[24] != int(s['located']) or rec[4] != s['imm']:
             problems.append(('ERROR', f'object site at {s["native_offset"]}: located/imm disagree with JSON'))
         link = s.get('access_native_offset') if s['kind'] in STUBS else s.get('mmio', s['guest_offset2'])   # a stub's guest_offset2 is

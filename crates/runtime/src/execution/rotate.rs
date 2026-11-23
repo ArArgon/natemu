@@ -37,9 +37,9 @@ pub(super) fn memory(
 ) -> Result<(), segments::Exception> {
     let n = u64::from(i.size);
     let va = segments::address(&s.cpu, &i, n, true)?;
-    let nc = segments::noncanonical(&i);
-    if segments::outside(&s.cpu, va, n) {
-        return Err(nc);
+    let nc = segments::operand_range(&i);
+    if nc.outside(&s.cpu, va, n) {
+        return Err(nc.fault());
     }
     if s.cpu.alignment_check() && va & (n - 1) != 0 {
         return Err([17, 0, 0]);

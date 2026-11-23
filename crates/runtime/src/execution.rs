@@ -3121,7 +3121,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 &mut buf,
                 true,
                 false,
-                segments::noncanonical(&i),
+                segments::operand_range(&i),
             )?;
             false
         }
@@ -3143,7 +3143,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     &mut buf,
                     false,
                     false,
-                    segments::noncanonical(&i),
+                    segments::operand_range(&i),
                 )?;
                 u64::from(u16::from_le_bytes(buf))
             } else {
@@ -3853,6 +3853,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             from_el0(spsr)
                 && match site.kind {
                     object::kind::GUARD => brk(1),
+                    object::kind::SEGMENT => brk(14),
                     // The `brk` (a step unit's stub, at the site; 32-bit code's, behind the probes), or a probe's data abort:
                     // a translation or permission fault on the byte it writes, the store's first or last, reported as a
                     // write or as a read (the M4 reports an atomic's translation fault as a read); or its watchpoint.
@@ -3925,6 +3926,23 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             watch::hit(s, f, b, &site, elr, spsr)
         }
         match site.kind {
+            // Resume at the compiler's checked continuation. An exception instead banks the original
+            // register and flag roots at the instruction and abandons that native continuation.
+            object::kind::SEGMENT => {
+                let offset = f.x[0] as u32;
+                let va = match segments::operand(&s.cpu, u32::from(site.segment), u64::from(offset), u64::from(site.width), site.intent == object::INTENT_WRITE) {
+                    Ok(va) => va,
+                    Err(e) => guest_fault(s, f, b, &site, e),
+                };
+                // The native MOV is contiguous. A linear straddle requires a two-span access transaction.
+                if segments::outside(&s.cpu, va, u64::from(site.width)) {
+                    wrapped_segment_mov(s, f, b, &site, va);
+                }
+                let frame = &raw mut (*shared()).captured;
+                (*frame).x[0] = va;
+                write_record(record(), &s);
+                resume(&s, frame, b.code_va() + site.imm as u64, spsr)
+            }
             // A branch target checked non-canonical: #GP(0) at the branch.
             object::kind::GUARD => guest_fault(s, f, b, &site, noncanonical(&site)),
             // #DE: no error code.
@@ -4047,6 +4065,66 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site, spsr: u64
         },
     };
     deliver(&mut s, Event::Exception(e));
+    unsafe { dispatch(&mut s) }
+}
+
+/// A bank-checked scalar MOV whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
+/// single architectural access here, before a native store probe or any guest byte is touched.
+fn wrapped_segment_mov(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va: u64) -> ! {
+    let width = u64::from(site.width);
+    let write = site.intent == object::INTENT_WRITE;
+    if alignment_check(&s.cpu) != 0 && va & (width - 1) != 0 {
+        guest_fault(s, f, b, site, [17, 0, 0]);
+    }
+    // Use owned architectural roots before walking: a write can invalidate its own translated block.
+    bank_at(&mut s, f, b, site);
+    let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
+        Ok(pages) => pages,
+        Err(e) => {
+            deliver(&mut s, Event::Exception(e));
+            unsafe { dispatch(&mut s) }
+        }
+    };
+    let mixed = gpa.iter().any(|&p| !mmio::ram(p));
+    if mixed {
+        let supported = if write {
+            gpa.iter().all(|&p| mmio::ram(p) || mmio::rom(p))
+        } else {
+            let device = gpa.map(|p| (!mmio::ram(p)).then_some(p));
+            mmio::ones(&mut s, f, b, site, [Some(va), Some(0)], device)
+        };
+        if !supported {
+            mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::CROSSING)
+        }
+        // Classifying a page or installing its shadow can serve a peer's shadow drop.
+        split_wait(&mut s, &gpa);
+    }
+    // A byte cannot straddle. These forms name one 16- or 32-bit guest register.
+    let [reg, result_and_length] = site.data_reg;
+    let length = result_and_length & 15;
+    let reg = usize::from(reg);
+    let old = s.cpu.gpr[reg];
+    let mut value = old.to_le_bytes();
+    let first = ((1u64 << 32) - va) as usize;
+    // The existing split completion orders the transfer before subsequent guest memory operations.
+    unsafe { asm!("dmb ish") };
+    if mixed {
+        segments::copy_mixed(&mut s, gpa, first, &mut value[..width as usize], write);
+    } else {
+        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], write);
+    }
+    unsafe { asm!("dsb ish") };
+    if !write {
+        let bits = 64 - width * 8;
+        let shifted = u64::from_le_bytes(value) << bits;
+        let loaded = if result_and_length & 0x40 != 0 { ((shifted as i64) >> bits) as u64 } else { shifted >> bits };
+        let dest32 = result_and_length & 0x20 != 0 || width == 4;
+        s.cpu.gpr[reg] = if dest32 { loaded as u32 as u64 } else { old & !0xffff | loaded & 0xffff };
+    }
+    watch::access(&mut s, va, width, write);
+    (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
+    s.cpu.rip = segments::wrap(&s.cpu, s.cpu.rip.wrapping_add(u64::from(length)));
+    completed(&mut s);
     unsafe { dispatch(&mut s) }
 }
 

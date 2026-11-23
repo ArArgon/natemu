@@ -328,6 +328,8 @@ def smp_description(prog):
     """natemu-smp-v1 -> driver description: the bodies and memory form the shared space, one `cpu` section per CPU. A
     `system` program's space is identity-mapped (its bodies build page tables from physical addresses)."""
     lines = ['identity'] if prog.get('system') else []
+    if prog.get('firmware'):
+        lines.append('firmware ' + prog['firmware'])
     lines += [f"body {smp.num(b['addr']):#x} {b['code']}" for b in prog['bodies']]
     lines += [f"memory {smp.num(r['addr']):#x} {smp.region_bytes(r).hex()}" for r in prog['memory']]
     for c in prog['cpus']:
@@ -1674,13 +1676,18 @@ def cmd_compat_limits(a, host, runtime):
             continue
         for limit in ([], [1]):
             label = f'{name}/{limit[0] if limit else "default"}'
-            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / label, limit)
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / label, limit + (['--strict-unassigned'] if prog.get('strict_unassigned') else []))
             diffs = []
             if rc:
                 diffs.append(f'driver {rc}: {err}')
             else:
                 cpu = out['cpus'][0]
-                if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(prog['cpus'][0]['rip'])):
+                if (refusal := prog.get('limit_refusal')):
+                    why, rip = refusal
+                    got = cpu['stop'], cpu['reason'].split()[0], smp.num(cpu['rip']), cpu['mmio']['status']
+                    if got != ('resident', 'unsupported_mmio', rip, why):
+                        diffs.append(f'expected {why} at {rip:#x}, got {got}')
+                elif cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(prog['cpus'][0]['rip'])):
                     diffs.append(f'stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
                 captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
                 for addr, want in expected.items():

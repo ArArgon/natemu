@@ -704,8 +704,14 @@ struct Verifier<'a> {
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
 /// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26).
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
+    let guarded = scalar_movs(c)?;
+    // The guarded slice relies on the existing exact memory-word, split-probe and control-flow
+    // verifiers even in production. This also rejects unrecorded native transfers anywhere in its block.
+    let checked = Code { shape: c.shape || !guarded.is_empty(), ..*c };
+    let c = &checked;
     let mut v = Verifier::new(c)?;
     v.words()?;
+    v.scalar_segment_checks(&guarded)?;
     v.exits()?;
     if c.shape {
         v.stub_checks()?;
@@ -723,6 +729,62 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
         }
     }
     Ok((v.links, v.dispatch, !v.bulk.is_empty()))
+}
+
+/// Decode the complete source stream independently of the producer's PC table. A matching prefix
+/// byte inside a displacement or immediate is ordinary data.
+struct ScalarMov {
+    offset: u32,
+    segment: u8,
+    width: u8,
+    write: u8,
+    register: u8,
+    result_and_length: u8,
+    absolute_offset: Option<u32>,
+}
+
+fn scalar_movs(c: &Code) -> Result<Vec<ScalarMov>, String> {
+    use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
+    let src = &c.source[..c.guest_bytes as usize];
+    let mut guarded = Vec::new();
+    if !c.bits32 || !src.iter().any(|b| matches!(b, 0x64 | 0x65)) {
+        return Ok(guarded);
+    }
+    let mut starts = Vec::new();
+    let mut decoder = Decoder::new(32, src, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let g = decoder.position() as u32;
+        let i = decoder.decode();
+        if i.is_invalid() {
+            return Err("invalid compatibility source instruction".into());
+        }
+        starts.push(g);
+        if !i.op_kinds().any(|k| k == OpKind::Memory) { continue; }
+        let seg = match i.memory_segment() { Register::FS => 4, Register::GS => 5, _ => continue };
+        let moffs = matches!(i.code(), Code::Mov_AL_moffs8 | Code::Mov_AX_moffs16 | Code::Mov_EAX_moffs32
+            | Code::Mov_moffs8_AL | Code::Mov_moffs16_AX | Code::Mov_moffs32_EAX);
+        if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
+        let result = match i.code() {
+            _ if moffs => 0,
+            Code::Mov_rm8_r8 | Code::Mov_rm16_r16 | Code::Mov_rm32_r32 | Code::Mov_r8_rm8 | Code::Mov_r16_rm16 | Code::Mov_r32_rm32 => 0,
+            Code::Movzx_r16_rm8 | Code::Movzx_r16_rm16 => 0x10,
+            Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16 => 0x20,
+            Code::Movsx_r16_rm8 | Code::Movsx_r16_rm16 => 0x50,
+            Code::Movsx_r32_rm8 | Code::Movsx_r32_rm16 => 0x60,
+            _ => continue,
+        };
+        let write = u8::from(i.op0_kind() == OpKind::Memory);
+        guarded.push(ScalarMov {
+            offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
+            register: i.op_register(u32::from(write)).number() as u8, result_and_length: result | i.len() as u8,
+        });
+    }
+    if !guarded.is_empty() {
+        let mut reported: Vec<_> = c.pcs.iter().map(|p| p.guest_offset).filter(|&g| g < c.guest_bytes).collect();
+        reported.dedup();
+        if starts != reported { return Err("scalar segment check instruction boundaries".into()); }
+    }
+    Ok(guarded)
 }
 
 impl<'a> Verifier<'a> {
@@ -914,6 +976,82 @@ impl<'a> Verifier<'a> {
             && sealed
             && site.is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.guest_offset == g))
         .then_some(start..end)
+    }
+
+    /// Every covered scalar compatibility MOV through FS/GS reaches a bank check before its one memory access,
+    /// including in production admission. The continuation takes its base from w0, reserved for the resident.
+    fn scalar_segment_checks(&mut self, guarded: &[ScalarMov]) -> Result<(), String> {
+        use object::kind::SEGMENT;
+        for op in guarded {
+            let g = op.offset;
+            let index = self.c.pcs.partition_point(|p| p.guest_offset <= g);
+            let p = &self.c.pcs[index - 1];
+            let mut matching = self.c.stubs.iter().filter(|s| s.kind == SEGMENT && s.guest_offset == g);
+            let Some(site) = matching.next() else { return Err("missing scalar segment check".into()); };
+            if matching.next().is_some() || site.segment != op.segment || site.intent != op.write || site.width != op.width
+                || site.data_reg != [op.register, op.result_and_length] {
+                return Err("scalar segment check differs from its x86 operand".into());
+            }
+            let access = self.c.accesses.iter().find(|a| a.native_offset == site.guest_offset2)
+                .ok_or("scalar segment check without an access")?;
+            if self.c.accesses.iter().filter(|a| a.guest_offset == g).count() != 1 {
+                return Err("scalar segment check needs exactly one memory access".into());
+            }
+            let end = self.c.pcs.get(index).map_or_else(
+                || self.c.stubs.first().map_or(self.c.code.len() as u32, |s| s.native_offset),
+                |next| next.native_offset,
+            );
+            // The PC of the last instruction may also cover the out-of-line x87 run-end. Only the
+            // block's entry probe can reach this exact sequence, which returns to the block's third word.
+            let run_end = self.run_test().filter(|&e| self.run_end_return(e + 36, ENTRY_OFFSET + 8));
+            for at in (p.native_offset..end).step_by(4) {
+                if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
+                if at == access.native_offset { continue; }
+                match self.insn(at) {
+                    // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
+                    Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
+                    // Folding FPSR from earlier completed x87 work is allowed by the precision contract.
+                    // A one-instruction unit can close the run inline, including clearing its run byte.
+                    Some(Insn::Mem(_)) if at >= 32 && (0..9).all(|k| self.word(at - 32 + k * 4) == RUN_END[k as usize])
+                        && self.branches_into(at - 32, at).next().is_none() => {}
+                    Some(Insn::Mem(_)) if at >= 16 && (0..5).all(|k| self.word(at - 16 + k * 4) == RUN_END[k as usize])
+                        && self.branches_into(at - 16, at).next().is_none() => {}
+                    Some(Insn::Mem(_) | Insn::Atomic { .. } | Insn::Swap { .. } | Insn::Literal { .. }) =>
+                        return Err(format!("extra memory operation {:#010x} in scalar MOV at {at:#x}", self.word(at))),
+                    _ => {}
+                }
+            }
+            let back = site.imm as u32;
+            if back >= access.native_offset { return Err("scalar segment check continuation".into()); }
+            let setup = if let Some(offset) = op.absolute_offset {
+                let [lo, hi] = natemu_abi::execution::guest_rip_move32(u64::from(offset), 0);
+                if back < p.native_offset + 12 || site.base_reg != 0 || self.word(back - 12) != lo || self.word(back - 8) != hi {
+                    return Err("scalar moffs immediate differs from its x86 operand".into());
+                }
+                back - 12
+            } else {
+                if back < p.native_offset + 8 || self.word(back - 8) != 0x2a00_03e0 | (u32::from(site.base_reg) << 16) {
+                    return Err("scalar segment check offset register".into());
+                }
+                back - 8
+            };
+            if self.instruction(access.native_offset) != Some((g, p.native_offset))
+                || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
+                || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
+                || self.written(1 << access.base_reg, back + 4, access.native_offset)
+                || self.branches_into(setup, access.native_offset).any(|(from, to)| {
+                    // A successful split probe returns to its store after the segment check already ran.
+                    self.probing(from).is_none_or(|(i, k)| k != 4 || self.c.stubs[i].guest_offset2 != access.native_offset || to != access.native_offset)
+                })
+            {
+                return Err("scalar segment check continuation".into());
+            }
+            self.claim(site.native_offset);
+        }
+        if self.c.stubs.iter().filter(|s| s.kind == SEGMENT).count() != guarded.len() {
+            return Err("extra scalar segment check".into());
+        }
+        Ok(())
     }
 
     /// Code shape: how each stub is reached (exactly one branch).
@@ -2921,6 +3059,54 @@ mod tests {
         }
         let e = admit(&compile("4889d8c3", "0x8048000", "64"), true).expect_err("64-bit code admitted as 32-bit code");
         assert!(e.contains("profile or settings"), "{e}");
+        let (moffs, source) = compile("65a178563412", "0x8048000", "32");
+        let h: Header = super::super::record(&moffs, 0);
+        for shape in [false, true] {
+            let check = |src: &[u8]| super::super::admit_mode(&moffs, h.guest_rip, src, u64::MAX, shape, false, true);
+            check(&source).unwrap();
+            for pos in [2, 5] {
+                let mut changed = source.clone();
+                changed[pos] ^= 0x80;
+                assert!(check(&changed).unwrap_err().contains("moffs immediate"), "changed offset byte {pos}");
+            }
+        }
+        // The mandatory check is tied to its decoded operand and both native register moves.
+        let (o, source) = compile("648b0f", "0x8048000", "32");
+        let h: Header = super::super::record(&o, 0);
+        let site = (0..h.sites_count as usize)
+            .map(|i| super::super::record::<Site>(&o, h.sites_offset as usize + i * size_of::<Site>()))
+            .find(|s| s.kind == object::kind::SEGMENT).unwrap();
+        let back = u32::try_from(site.imm).unwrap();
+        for shape in [false, true] {
+            let check = |obj: &[u8], src: &[u8]| super::super::admit_mode(obj, h.guest_rip, src, u64::MAX, shape, false, true);
+            check(&o, &source).unwrap();
+            for changed in [[0x65, 0x8b, 0x0f], [0x64, 0x89, 0x0f], [0x64, 0x8a, 0x0f]] {
+                assert!(check(&o, &changed).unwrap_err().contains("differs from its x86 operand"));
+            }
+            // A source suffix cannot disappear by moving its instruction boundary inside a MOV.
+            let (mut multi, src) = compile("90648b0f", "0x8048000", "32");
+            let head: Header = super::super::record(&multi, 0);
+            for n in 0..head.pcs_count as usize {
+                let off = head.pcs_offset as usize + n * size_of::<PcEntry>() + 4;
+                if multi[off..off + 4] == 1u32.to_le_bytes() { multi[off..off + 4].copy_from_slice(&0u32.to_le_bytes()); }
+            }
+            assert!(check(&multi, &src).is_err(), "missing MOV boundary");
+            let extra = patched((&o, &source), back, u32::from_le_bytes(o[(h.code_offset + back) as usize..][..4].try_into().unwrap()), 0xb940_0084);
+            assert!(check(&extra, &source).unwrap_err().contains("unrecorded memory access"));
+            for at in [back - 8, back - 4, back] {
+                let old = u32::from_le_bytes(o[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+                let changed = patched((&o, &source), at, old, MOV_X0);
+                assert!(check(&changed, &source).is_err(), "absent address check word {at:#x}");
+            }
+        }
+        for shape in [false, true] {
+            let (o, src) = compile("640fb70f", "0x8048000", "32");
+            let check = |bytes: &[u8]| super::super::admit_mode(&o, 0x8048000, bytes, u64::MAX, shape, false, true);
+            check(&src).unwrap();
+            for different in [[0x64, 0x0f, 0xbf, 0x0f], [0x64, 0x0f, 0xb6, 0x0f], [0x64, 0x0f, 0xb7, 0x17]] {
+                assert!(check(&different).is_err(), "changed extension, source width, or output register");
+            }
+        }
         // The link points of the wrapping exits carry the wrapped RIPs (0, not 4 GiB).
         assert_eq!(admit(&compile("7402ebfe", "0xfffffffc", "32"), true), Ok(2));
         // fexc's one form of a 32-bit guest-RIP move, `movz w; movk w, lsl #16; nop` (zero halves too: a call at 0 pushes 5,

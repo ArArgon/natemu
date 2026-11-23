@@ -44,7 +44,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             return Ok(c.gpr[i.reg as usize] as u16);
         }
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, operand_range(&i))?;
         Ok(u16::from_le_bytes(b))
     };
     match i.kind {
@@ -52,7 +52,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         system::LGDT..=system::LIDT => {
             let mut b = [0u8; 10];
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i, n as u64, false)?, &mut b[..n], false, false, noncanonical(&i))?;
+            linear(s, address(&c, &i, n as u64, false)?, &mut b[..n], false, false, operand_range(&i))?;
             let base = u64::from_le_bytes(b[2..].try_into().unwrap());
             let table = Table {
                 base: if i.size == 2 { base & 0xff_ffff } else { base },
@@ -78,7 +78,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             b[..2].copy_from_slice(&(t.limit as u16).to_le_bytes());
             b[2..].copy_from_slice(&t.base.to_le_bytes());
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i, n as u64, true)?, &mut b[..n], true, false, noncanonical(&i))?;
+            linear(s, address(&c, &i, n as u64, true)?, &mut b[..n], true, false, operand_range(&i))?;
         }
         system::SLDT..=system::MOV_FROM_SREG => {
             let v = match i.kind {
@@ -93,7 +93,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                     &mut v.to_le_bytes(),
                     true,
                     false,
-                    noncanonical(&i),
+                    operand_range(&i),
                 )?;
             } else {
                 let r = &mut s.cpu.gpr[i.reg as usize];
@@ -168,7 +168,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 w,
                 if w == 2 { 2 } else { 4 },
                 false,
-                noncanonical(&i),
+                operand_range(&i),
             )?;
             load_data(s, i.cr as usize, u16::from_le_bytes([pointer[w], pointer[w + 1]]))?;
             let mut offset = [0u8; 8];
@@ -241,25 +241,48 @@ pub(super) fn wrap(c: &Cpu, v: u64) -> u64 {
         v as u32 as u64
     }
 }
-/// Whether the explicit access `[va, va + n)` cannot be made by address: not canonical or wrapping past 2^64, or in 32-bit
-/// code (M2 task 3b) across 4 GiB, outside the flat segment's limit (SDM Vol.3 5.3: #GP(0), #SS(0) through SS). Every
-/// check before #AC uses it, so segmentation comes before alignment checking. ponytail: checked on the linear address,
-/// which for a based FS or GS is not the offset the limit applies to; an access whose linear address wraps across 4 GiB
-/// faults here where x86 wraps it. Check the offset when based segments matter.
+/// A flat compatibility segment rejects an operand that crosses 4 GiB. A based FS/GS operand
+/// reaching this layer already passed its offset/limit check, so its linear byte addresses wrap.
+#[derive(Clone, Copy)]
+pub(super) enum OperandRange {
+    Flat(Exception),
+    Based,
+}
+
+impl From<Exception> for OperandRange {
+    fn from(fault: Exception) -> Self {
+        Self::Flat(fault)
+    }
+}
+
+impl OperandRange {
+    pub(super) fn fault(self) -> Exception {
+        match self { Self::Flat(fault) => fault, Self::Based => GP0 }
+    }
+
+    fn line(self, c: &Cpu, va: u64) -> u64 {
+        if matches!(self, Self::Based) { wrap(c, va) } else { va }
+    }
+
+    pub(super) fn outside(self, c: &Cpu, va: u64, n: u64) -> bool {
+        if matches!(self, Self::Based) && c.code_mode() == Some(CodeMode::Compat32) {
+            return false;
+        }
+        outside(c, va, n)
+    }
+}
+
 pub(super) fn outside(c: &Cpu, va: u64, n: u64) -> bool {
     let last = va.wrapping_add(n - 1);
-    !paging::canonical(va)
-        || !paging::canonical(last)
-        || last < va
+    !paging::canonical(va) || !paging::canonical(last) || last < va
         || (last >> 32 != 0 && c.code_mode() != Some(CodeMode::Bits64))
 }
-/// A non-canonical memory operand: #SS(0) for an SS reference (the host gives an RSP or RBP base with no FS/GS override
-/// SS: it ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
-pub(super) fn noncanonical(i: &System) -> Exception {
-    if i.segment as usize == SREG_SS {
-        SS0
-    } else {
-        GP0
+
+pub(super) fn operand_range(i: &System) -> OperandRange {
+    match i.segment as usize {
+        SREG_FS | SREG_GS => OperandRange::Based,
+        SREG_SS => OperandRange::Flat(SS0),
+        _ => OperandRange::Flat(GP0),
     }
 }
 
@@ -275,8 +298,9 @@ pub(super) fn linear(
     buf: &mut [u8],
     write: bool,
     supervisor: bool,
-    noncanonical: Exception,
+    range: impl Into<OperandRange>,
 ) -> Result<(), Exception> {
+    let range = range.into();
     let n = buf.len() as u64;
     // X2: an explicit access at CPL 3 under alignment checking (SDM Vol.3 7.15, Table 7-7): #AC(0) after the canonical
     // check, before any walk, when misaligned for its data type: a word 2, a doubleword or a 48-bit far pointer or
@@ -291,11 +315,11 @@ pub(super) fn linear(
             2 => 2,
             _ => 1,
         };
-        if va & (align - 1) != 0 && !outside(&s.cpu, va, n) {
+        if va & (align - 1) != 0 && !range.outside(&s.cpu, va, n) {
             return Err([17, 0, 0]);
         }
     }
-    copy(s, va, buf, write, supervisor, noncanonical)
+    copy(s, va, buf, write, supervisor, range)
 }
 /// [`linear`] without its alignment check: for the explicit accesses that never raise #AC (the gathers' elements, SDM
 /// Vol.2 2.5 exception class 12).
@@ -305,10 +329,11 @@ pub(super) fn copy(
     buf: &mut [u8],
     write: bool,
     supervisor: bool,
-    noncanonical: Exception,
+    range: impl Into<OperandRange>,
 ) -> Result<(), Exception> {
+    let range = range.into();
     let n = buf.len() as u64;
-    let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
+    let gpa = pages(s, va, n, write, supervisor, range)?;
     // S4: an explicit access meets data breakpoints; an implicit supervisor one (descriptor tables, TSS, IDT) never does.
     if !supervisor {
         super::watch::access(s, va, n, write);
@@ -320,6 +345,12 @@ pub(super) fn copy(
         copy_rom(s, gpa[0], gpa[1], buf, write);
         return Ok(());
     }
+    copy_ram(s, gpa, first, buf, write);
+    Ok(())
+}
+
+/// Both pages have been walked at the required permissions and are held against split locks.
+pub(super) fn copy_ram(s: &mut State, gpa: [u64; 2], first: usize, buf: &mut [u8], write: bool) {
     let (low, high) = buf.split_at_mut(first);
     for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
         if chunk.is_empty() {
@@ -339,7 +370,6 @@ pub(super) fn copy(
             halt(s, stop::UNSUPPORTED_SYSTEM)
         }
     }
-    Ok(())
 }
 /// [`copy`] when a page of the access is not RAM: with every such page in the firmware image (M2 Part 2,
 /// docs/restructure/firmware-mode.md), the access is made, the image read and a store to it dropped (x86's ROM; a descriptor
@@ -352,6 +382,13 @@ fn copy_rom(s: &mut State, low: u64, high: u64, buf: &mut [u8], write: bool) {
     if gpa[..pages].iter().any(|&g| !super::mmio::ram(g) && !super::mmio::rom(g)) {
         super::mmio::system_access(s)
     }
+    copy_mixed(s, gpa, first, buf, write)
+}
+
+/// Copy resolved RAM or ROM spans. For a generated read, the MMIO page classifier has also
+/// approved any unassigned span for the board's all-ones response. A write may only name RAM/ROM.
+#[cold]
+pub(super) fn copy_mixed(s: &mut State, gpa: [u64; 2], first: usize, buf: &mut [u8], write: bool) {
     let (low, high) = buf.split_at_mut(first);
     for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
         if chunk.is_empty() || write && super::mmio::rom(gpa) {
@@ -359,6 +396,9 @@ fn copy_rom(s: &mut State, low: u64, high: u64, buf: &mut [u8], write: bool) {
         }
         let done = if super::mmio::rom(gpa) {
             super::mmio::firmware().copy_out(gpa, chunk)
+        } else if !super::mmio::ram(gpa) && !write {
+            chunk.fill(0xff);
+            true
         } else if write {
             if cache::translated(gpa) {
                 FetchWrites(s).code_write(gpa);
@@ -385,12 +425,14 @@ pub(super) fn pages(
     n: u64,
     write: bool,
     supervisor: bool,
-    noncanonical: Exception,
+    range: impl Into<OperandRange>,
 ) -> Result<[u64; 2], Exception> {
+    let range = range.into();
+    let va = range.line(&s.cpu, va);
     let last = va.wrapping_add(n - 1);
     // Implicit accesses (descriptor tables, the TSS) are 64-bit ones whatever the code's mode.
-    if !paging::canonical(va) || !paging::canonical(last) || last < va || (!supervisor && outside(&s.cpu, va, n)) {
-        return Err(noncanonical);
+    if !paging::canonical(va) || !paging::canonical(last) || last < va || (!supervisor && range.outside(&s.cpu, va, n)) {
+        return Err(range.fault());
     }
     let mut control = controls(s);
     if supervisor {
@@ -399,7 +441,7 @@ pub(super) fn pages(
     let access = if write { Access::Write } else { Access::Read };
     let crosses = (last ^ va) >> 12 != 0;
     let mut gpa = [0u64; 2];
-    for (k, at) in [va, last & !4095]
+    for (k, at) in [va, range.line(&s.cpu, last & !4095)]
         .into_iter()
         .enumerate()
         .take(1 + usize::from(crosses))
@@ -673,7 +715,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
             w,
             if w == 2 { 2 } else { 4 },
             false,
-            noncanonical(&i),
+            operand_range(&i),
         )?;
         let (mut offset, mut word) = ([0u8; 8], [0u8; 2]);
         offset[..w].copy_from_slice(&pointer[..w]);
@@ -871,10 +913,11 @@ pub(super) fn aligned_operand(
     slot: usize,
     alignment: u64,
     write: bool,
-    nc: Exception,
+    range: impl Into<OperandRange>,
 ) -> Result<(), Exception> {
-    if outside(&s.cpu, at, bytes.len() as u64) {
-        return Err(nc);
+    let range = range.into();
+    if range.outside(&s.cpu, at, bytes.len() as u64) {
+        return Err(range.fault());
     }
     if s.cpu.alignment_check() && at & (alignment - 1) != 0 {
         return Err([17, 0, 0]);
@@ -882,7 +925,7 @@ pub(super) fn aligned_operand(
     // Preflight the entire pointer/frame, then transfer its operand-sized slots (a pointer's last selector is2bytes).
     // Naturally aligned slots cannot tear; the frame as a whole need not be atomic. Pointer alignment and offset
     // width are distinct: m16:64 aligns4 but its offset is an8byte load.
-    let gpa = pages(s, at, bytes.len() as u64, write, false, nc)?;
+    let gpa = pages(s, at, bytes.len() as u64, write, false, range)?;
     let head = bytes.len().min((4096 - (at & 4095)) as usize);
     if !mmio::ram(gpa[0]) || (head < bytes.len() && !mmio::ram(gpa[1])) {
         mmio::system_access(s);
@@ -965,7 +1008,7 @@ pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
         c.gpr[i.reg as usize] as u16
     } else {
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i, 2, false)?, &mut b, false, false, operand_range(&i))?;
         u16::from_le_bytes(b)
     };
     let found = if selector & 0xfffc == 0 {

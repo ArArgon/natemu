@@ -50,7 +50,7 @@ inline bool LoadsInto(FEXCore::IR::IROps Op) {
 // every static register (no value is coalesced into its static register across one), so at their stub the guest state is the
 // state before the instruction.
 inline bool CheckOp(FEXCore::IR::IROps Op) {
-  return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
+  return Op == FEXCore::IR::OP_FEXCSEGMENTADDRESS || Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
          Op == FEXCore::IR::OP_FEXCX87CHECKDE || Op == FEXCore::IR::OP_FEXCFLDCW || Op == FEXCore::IR::OP_FEXCX87TAG || Op == FEXCore::IR::OP_FEXCX87GUESS;   // (FLDCW's stub, the x87 stack check's: M2 task 4)
 }
 // AFP accurate plan, chunk 4: the FMA NaN check is no fault point (the resident resumes after it, no guest exception comes of it), but for

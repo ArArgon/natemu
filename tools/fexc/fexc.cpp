@@ -188,7 +188,7 @@ struct Capture {
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
   // seg: the FS/GS override FEX applies (4 fs, 5 gs, 0 none: the last FS/GS prefix; CS/DS/ES/SS are ignored in 64-bit mode).
-  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; int primary_op; };
+  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; int primary_op; uint8_t modrm_reg; };
   struct Block { uint64_t entry, size, count; int status; bool entry_point; };
   std::vector<Inst> insts;
   std::vector<Block> blocks;
@@ -247,6 +247,15 @@ int SegmentOverride(uint32_t flags) {
 void JoinSites(uint64_t rip) {
   uint32_t last_load_instruction = FEXC_NONE32;
   for (auto& s : Cap.sites) {
+    if (s.kind == FEXC_SITE_SEGMENT) {
+      // The cold wrapped-span transaction needs the architectural register, including AH..BH.
+      for (const auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
+        s.data_reg[0] = i.modrm_reg;
+        s.data_reg[1] |= i.size;
+        break;
+      }
+      continue;
+    }
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC ||
         s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
@@ -288,13 +297,13 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   const auto it = fexc_mmio.find(rip + s.guest_offset);
   if (it == fexc_mmio.end()) return 0;
   int accesses = 0;
-  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_STACK && a.kind != FEXC_SITE_DIVIDE &&
+  for (auto& a : Cap.sites) accesses += a.kind != FEXC_SITE_SEGMENT && a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_STACK && a.kind != FEXC_SITE_DIVIDE &&
                                                        a.kind < FEXC_SITE_SIMD;
   const uint32_t r = it->second;
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag", "x87guess", "x87map"};
+                                "simd", "x87", "pending", "fma", "denorm", "stack", "fldcw", "x87tag", "x87guess", "x87map", "segment"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -324,7 +333,8 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
       Cap.insts.push_back({d.PC, d.InstSize, d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?",
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END),
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d),
-                           SegmentOverride(d.Flags), d.FexcMap == FEXC_MAP_PRIMARY ? d.OPRaw : -1});
+                           SegmentOverride(d.Flags), d.FexcMap == FEXC_MAP_PRIMARY ? d.OPRaw : -1,
+                           uint8_t(d.Flags & X86Tables::DecodeFlags::FLAG_DECODED_MODRM ? (d.ModRM >> 3) & 7 : 0)});
     }
   }
 }
@@ -1032,7 +1042,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       if (s.guest_offset2 != FEXC_NONE32) j.kv("guest_offset2", s.guest_offset2); else j.null("guest_offset2");
       if (const uint32_t m = MmioRecord(s, rip)) j.kv("mmio", m);   // M3
       j.kv("insn_native_offset", s.insn_native_offset).kv("ir_op", s.ir_op).kv("kind", KindName[s.kind]).kv("width", int(s.width))
-       .kv("intent", s.intent ? "write" : "read").kv("rmw", RmwName[s.rmw]).kv("segment", s.segment ? "ss" : "ds")
+       .kv("intent", s.intent ? "write" : "read").kv("rmw", RmwName[s.rmw]).kv("segment", s.segment == 4 ? "fs" : s.segment == 5 ? "gs" : s.segment ? "ss" : "ds")
        .kv("base_reg", int(s.base_reg));
       if (s.index_reg != 0xff) j.kv("index_reg", int(s.index_reg)); else j.null("index_reg");
       j.kv("extend", ExtendName[s.extend]).kv("shift", int(s.shift)).kv("imm", s.imm);
@@ -1044,6 +1054,10 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
        .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
        .kv("flags_written_before_site", bool(s.flags_written_before))
        .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
+      if (s.kind == FEXC_SITE_SEGMENT) {
+        j.kv("instruction_length", int(s.data_reg[1] & 15));
+        if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
+      }
       if (slice1) {
         if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
       }
@@ -1094,7 +1108,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
     memcpy(f.data(), "NFXOBJ\0\x01", 8);
-    put(8, 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
+    put(8, bitness == 32 ? 5 : 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
     put(32, Cap.info.TotalLength, 4); put(36, Cap.info.TotalInstructions, 4);
     put(40, f.size(), 4); put(44, code.size(), 4);
     put(48, Cap.prologues[0].second, 4); put(52, marker == UINT64_MAX ? 0xFFFFFFFFull : marker, 4);
@@ -1117,7 +1131,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     std::stable_sort(rows.begin(), rows.end(), [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; });
     put(64, f.size(), 4); put(68, rows.size(), 4);
     for (auto& s : rows) {
-      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN || s.kind == FEXC_SITE_STACK;   // a stub's guest_offset2 is its access site
+      const bool stub = s.kind == FEXC_SITE_SEGMENT || s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN || s.kind == FEXC_SITE_STACK;   // a stub's guest_offset2 is its access site
       push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.kind != FEXC_SITE_X87MAP && MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,

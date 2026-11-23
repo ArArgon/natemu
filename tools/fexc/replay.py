@@ -71,7 +71,7 @@ def answer(p, record):
     return p.stdout.read(struct.unpack('<I', head)[0])
 
 
-MAGIC, STUB_KINDS, SPLIT = b'NFXOBJ\0\x01', {6, 7, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23}, 7
+MAGIC, STUB_KINDS, SPLIT = b'NFXOBJ\0\x01', {6, 7, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25}, 7
 BRK2, PLACEHOLDER, PROBE_BRANCH = 0xd4200040, 0x14000000, 5
 
 
@@ -166,7 +166,7 @@ def only_probes(old, new):
 
 NOP, NONE32, X87_INT64 = 0xd503201f, 0xffffffff, 0xc0000001
 GUEST_RIP_LITERAL, GUEST_RIP_MOVE = 1, 3
-STUB = {6, 7, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23}   # natemu_abi::code_object::kind::is_stub_kind
+STUB = {6, 7, 11, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25}   # natemu_abi::code_object::kind::is_stub_kind
 
 
 def bitmask(w, sf):
@@ -327,6 +327,8 @@ def only_moves(old, new):
     same = lambda x, y: x == y == NONE32 or (x != NONE32 and at(x) == y)
     for x, y in zip(sa, sb):
         nat = (0, 12) + ((8,) if x[20] in STUB and u32(x, 8) != X87_INT64 else ())
+        if x[20] == 25:   # SEGMENT: imm is the native continuation after its guard
+            nat += (16,)
         if any(not same(u32(x, k), u32(y, k)) for k in nat) or any(x[k:k + 4] != y[k:k + 4] for k in range(4, 40, 4) if k not in nat):
             return 'a site record differs'
     if any(not same(u32(x, 0), u32(y, 0)) or x[4:] != y[4:] for x, y in zip(pa, pb)): return 'a PC entry differs'

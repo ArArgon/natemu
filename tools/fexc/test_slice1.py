@@ -662,6 +662,60 @@ class Slice1Cutting(unittest.TestCase):
             d, _ = run(PRE + SYSTEM['cli'], RIP, '--object', str(obj))
             self.assertEqual(check_sites.END_REASONS[check_sites.read_object(obj)['end_reason']], 'system_instruction')
 
+    def test_compat_scalar_segment_fault_points(self):
+        import replay, verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / 'o.bin'
+            for opcode, seg, write in [('648b0f', 'fs', False), ('65890f', 'gs', True)]:
+                data, rc = run('83c701' + opcode + '83c601', RIP, '--bitness', '32', '--object', str(path))
+                self.assertEqual(rc, 0)
+                obj = check_sites.read_object(path)
+                self.assertEqual(obj['version'], 5)
+                self.assertEqual(check_sites.object_vs_json(obj, data), [])
+                site, = (r for r in obj['sites'] if r[5] == 25)
+                desc, = (s for s in data['sites'] if s['kind'] == 'segment')
+                self.assertEqual((desc['segment'], desc['intent'], desc['width']), (seg, 'write' if write else 'read', 4))
+                self.assertEqual((site[0], site[1], site[2], site[3], site[4], site[6], site[7], site[9], site[10]),
+                                 (desc['native_offset'], desc['guest_offset'], desc['access_native_offset'],
+                                  desc['insn_native_offset'], desc['imm'], 4, int(write), 4 if seg == 'fs' else 5, desc['base_reg']))
+                self.assertEqual(verify_precision.verify(data, Path(t))[0], [])
+                binary = path.read_bytes()
+                reply = struct.pack('<5I', 0, 0, len(binary), 0, 0) + binary
+                self.assertIsNone(replay.only_moves(reply, reply))
+                at = 20 + struct.unpack_from('<I', binary, 64)[0] + 40 * obj['sites'].index(site)
+                for field in [8, 16]:  # offset of the linked access and the continuation must each map
+                    changed = bytearray(reply)
+                    struct.pack_into('<I', changed, at + field, struct.unpack_from('<I', reply, at + field)[0] + 4)
+                    self.assertEqual(replay.only_moves(reply, changed), 'a site record differs')
+
+    def test_compat_extending_segment_loads(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for form, size, dest, signed in [('640fb60f', 1, 4, False), ('66650fb70f', 2, 2, False),
+                                            ('66640fbe0f', 1, 2, True), ('650fbf0f', 2, 4, True)]:
+                obj = Path(t) / 'o.bin'
+                data, rc = run(form, RIP, '--bitness', '32', '--object', str(obj))
+                self.assertEqual(rc, 0)
+                desc, = (s for s in data['sites'] if s['kind'] == 'segment')
+                self.assertEqual((desc['width'], desc['destination_width'], desc['signed'], desc['instruction_length']),
+                                 (size, dest, signed, len(form) // 2), form)
+                self.assertEqual(verify_precision.verify(data, Path(t))[0], [], form)
+
+    def test_compat_accumulator_moffs(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for segment, prefix in [('fs', '64'), ('gs', '65')]:
+                for op, width in [('a0', 1), ('66a1', 2), ('a1', 4), ('a2', 1), ('66a3', 2), ('a3', 4)]:
+                    form = prefix + op + '78563412'
+                    path = Path(t) / 'o.bin'
+                    data, rc = run('90' + form + '90', RIP, '--bitness', '32', '--object', str(path))
+                    self.assertEqual(rc, 0, form)
+                    desc, = (s for s in data['sites'] if s['kind'] == 'segment')
+                    self.assertEqual((desc['segment'], desc['intent'], desc['width'], desc['data_regs'], desc['instruction_length']),
+                                     (segment, 'write' if op[-1] in '23' else 'read', width, [0], len(form) // 2), form)
+                    self.assertEqual(check_sites.object_vs_json(check_sites.read_object(path), data), [])
+                    self.assertEqual(verify_precision.verify(data, Path(t))[0], [], form)
+
     def test_max_instructions_still_works(self):
         d, rc = run(PRE + PRE, RIP, '--max-insts', '3')
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 3, 'max_instructions'))

@@ -199,7 +199,7 @@ struct Space {
     identity: bool,
     /// M3: (linear page, device page, a test device there) of `mmio` items.
     mmio: Vec<(u64, u64, bool)>,
-    /// M2 Part 2: a machine description's firmware image (`firmware HEX`; empty: none).
+    /// The shared firmware image (`firmware HEX`; empty: none).
     firmware: Vec<u8>,
 }
 /// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
@@ -501,6 +501,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("code", [h]) => space.bodies.push((None, hex(h)?)),
             ("body", [a, h]) => space.bodies.push((Some(number(a)?), hex(h)?)),
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
+            ("firmware", [h]) if space.firmware.is_empty() => space.firmware = hex(h)?,
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
             ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
             ("identity", []) => space.identity = true,
@@ -554,9 +555,7 @@ fn machine_items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section
             })
         };
         match (words[0], &words[1..]) {
-            ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
-            ("firmware", [h]) if space.firmware.is_empty() => space.firmware = hex(h)?,
-            ("rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
+            ("memory" | "firmware" | "rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
                 items(&[*line], space, cpu.as_deref_mut())?
             }
             ("cr0" | "cr3" | "cr4" | "efer", [v]) => {
@@ -1893,7 +1892,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         return Err(format!("mmio page {gpa:#x} is guest RAM"));
     }
     require_vcpus(n)?;
-    // M2 Part 2: a machine description's firmware image, in its shared space only.
+    // M2 Part 2: the program description's firmware image, in its shared space only.
     if d.spaces.iter().skip(1).any(|s| !s.firmware.is_empty()) {
         return Err("firmware: an item of the shared space (before the first cpu line)".into());
     }

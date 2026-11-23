@@ -297,6 +297,29 @@ void Arm64JITCore::FexcX87Begin() {
 // x87 state in the guest-state page: `movz w0, #fn; svc #X87`, fn the D9 opcode's second byte. No register changes (x0 is FEX's
 // TMP1); the resident leaves NZCV and every register as they were, and admission accepts the svc only right after that movz in
 // that very instruction.
+DEF_OP(FexcSegmentAddress) {
+  const auto Op = IROp->C<IR::IROp_FexcSegmentAddress>();
+  // Keep the guest roots intact at the stub. Its only native output is w0, which is reserved between IR operations.
+  auto* Label = FexcStub(FEXC_SITE_SEGMENT, true);
+  auto& Site = fexc_sites.back();
+  Site.segment = Op->Segment;
+  Site.width = Op->Bytes;
+  Site.intent = Op->Write;
+  Site.data_reg[1] = Op->Result;
+  uint64_t Offset;
+  if (IsInlineConstant(Op->Offset, &Offset)) {
+    Site.base_reg = TMP1.Idx();
+    movz(ARMEmitter::Size::i32Bit, TMP1, Offset & 0xffff);
+    movk(ARMEmitter::Size::i32Bit, TMP1, Offset >> 16, 16);
+  } else {
+    Site.base_reg = GetReg(Op->Offset).Idx();
+    mov(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->Offset));
+  }
+  b_OrRestart(Label);
+  Site.imm = int32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+  mov(ARMEmitter::Size::i32Bit, GetReg(Node), TMP1);
+}
+
 // M2 task 4: FLDCW. `ldrh w0, [x28, #fcw]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, K; strh wN, [x28, #fcw]`: a word with
 // other exception masks is the resident's (K, a FLDCW stub: the state before the instruction; the masks are in the code
 // identity and unmasking a set flag makes an exception pending); else only the rounding and precision controls change.
@@ -1369,7 +1392,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11, FexcBrkX87Tag = 12, FexcBrkX87Guess = 13;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11, FexcBrkX87Tag = 12, FexcBrkX87Guess = 13, FexcBrkSegment = 14;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1392,7 +1415,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.completed_effects = !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
-  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
+  S.ir_op = Kind == FEXC_SITE_SEGMENT ? "segment" : Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
             Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : Kind == FEXC_SITE_X87TAG ? "x87tag" : Kind == FEXC_SITE_X87GUESS ? "x87guess" : "guard";
   const size_t Index = fexc_sites.size();
   FexcX87SiteCheck();
@@ -1652,7 +1675,7 @@ void Arm64JITCore::FexcEmitStubs() {
       continue;
     }
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_X87GUESS ? FexcBrkX87Guess : K == FEXC_SITE_X87TAG ? FexcBrkX87Tag : K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+    brk(K == FEXC_SITE_SEGMENT ? FexcBrkSegment : K == FEXC_SITE_X87GUESS ? FexcBrkX87Guess : K == FEXC_SITE_X87TAG ? FexcBrkX87Tag : K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
         K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }

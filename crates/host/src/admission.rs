@@ -566,7 +566,7 @@ fn admit_records(
     }
     let h: Header = record(bytes, 0);
     if h.magic != object::MAGIC
-        || h.version != object::VERSION
+        || h.version != if h.guest_bitness == 32 { object::COMPAT_VERSION } else { object::VERSION }
         || h.header_size as usize != size_of::<Header>()
         || h.total_size as usize != bytes.len()
     {
@@ -883,7 +883,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.native_offset < region
         && s.insn_native_offset <= s.native_offset
         && s.guest_offset < h.guest_bytes
-        && s.segment <= object::SEG_SS
+        && (s.segment <= object::SEG_SS || s.kind == object::kind::SEGMENT && matches!(s.segment, 4 | 5))
         && (register(s.base_reg)
             || s.base_reg == 31
             || ((addressless(s) || s.kind == object::kind::FMA) && s.base_reg == object::NO_REG))
@@ -921,6 +921,7 @@ fn is_stub(s: &Site) -> bool {
             | object::kind::SPLIT
             | object::kind::DIVIDE
             | object::kind::ALIGN
+            | object::kind::SEGMENT
             | object::kind::STACK
     ) || addressless(s)
 }
@@ -939,6 +940,7 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
         object::kind::GUARD => 1,
         object::kind::SPLIT => 2,
         object::kind::ALIGN => 4,
+        object::kind::SEGMENT => 14,
         object::kind::SIMD => 5,
         object::kind::X87 => 7,
         object::kind::PENDING => 8,
@@ -962,6 +964,17 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 /// instruction's length (the resident resumes after it).
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
+    if s.kind == SEGMENT {
+        return matches!(s.segment, 4 | 5) && matches!(s.width, 1 | 2 | 4)
+            && s.base_reg < 31 && s.index_reg == object::NO_REG && s.writeback == object::WB_NONE
+            && s.rmw == object::RMW_NONE && access.is_some_and(|a| {
+                matches!(a.kind, LOAD | STORE)
+                    && a.guest_offset == s.guest_offset && a.insn_native_offset == s.insn_native_offset
+                    && a.width == s.width && a.intent == s.intent && a.rmw == object::RMW_NONE
+                    && a.data_class == object::CLASS_GPR && a.imm == 0 && a.index_reg == object::NO_REG
+                    && a.writeback == object::WB_NONE
+            });
+    }
     if addressless(s) {
         // AFP fallback, decision C: a SIMD stub may describe its instruction's operands (width = meta, imm = registers,
         // guest_offset2 = the offset after the check's cbnz, which `fp_checks` verifies against the code).

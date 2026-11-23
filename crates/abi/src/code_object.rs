@@ -10,6 +10,8 @@
 
 pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
 pub const VERSION: u32 = 4;
+/// Compatibility objects carry the resident scalar FS/GS check contract.
+pub const COMPAT_VERSION: u32 = 5;
 /// "No value" for a u32 offset field.
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
@@ -39,7 +41,7 @@ pub const NO_REG: u8 = 0xff;
 pub mod kind {
     /// A check stub's site (its native offset is the stub's first word): the kinds admission takes as stubs.
     pub const fn is_stub_kind(k: u8) -> bool {
-        matches!(k, GUARD | SPLIT | DIVIDE | ALIGN | SIMD | X87 | PENDING | DENORM | STACK | FLDCW | X87TAG | X87GUESS)
+        matches!(k, SEGMENT | GUARD | SPLIT | DIVIDE | ALIGN | SIMD | X87 | PENDING | DENORM | STACK | FLDCW | X87TAG | X87GUESS)
     }
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -99,6 +101,9 @@ pub mod kind {
     /// starts at `insn_native_offset` ([`super::x87_map`]), which generated code did not write to the guest-state page before
     /// that instruction. Its `native_offset` is that offset + 1 (no word is there: the record is found by this key).
     pub const X87MAP: u8 = 24;
+    /// Bank-checked scalar FS/GS offset in `base_reg`. The resident returns its linear address in w0 at
+    /// `imm` (the word after the stub branch). `guest_offset2` names the native access consuming that result.
+    pub const SEGMENT: u8 = 25;
 }
 /// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault

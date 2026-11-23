@@ -213,7 +213,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb', 'x87tag': 'brk #0xc', 'x87guess': 'brk #0xd'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb', 'x87tag': 'brk #0xc', 'x87guess': 'brk #0xd', 'segment': 'brk #0xe'}
 M64 = (1 << 64) - 1
 
 
@@ -232,7 +232,7 @@ def probing(s, dis, d, check=None):
     if s['kind'] != 'split' or s.get('imm', 0) != 0: return None
     back = re.fullmatch(r'adr x0, 0x([0-9a-f]+)', dis.get(at, ''))
     if not back or (check is not None and int(back[1], 16) != check + 4) or dis.get(at + 4) != f'b {at + 4:#x}': return None
-    want = probe_index(bool(BITS), s['base_reg'], s['width'])
+    want = probe_index(d['input']['bitness'] == 32, s['base_reg'], s['width'])
     if want is None or not any(r['kind'] == 'probe_branch' and r['offset'] == at + 4 and r.get('probe') == want for r in d['code']['relocations']):
         return None
     return {at, at + 4}
@@ -260,7 +260,7 @@ def run_test(d, dis, order):
     e, first = run_test_end(d, dis), d['code']['layout']['code_region_begin']
     if e is None: return []
     out = []
-    if not BITS: out.append('the x87 run test at the top of 64-bit code')
+    if d['input']['bitness'] != 32: out.append('the x87 run test at the top of 64-bit code')
     if dis.get(e + 36) != f'b {first + 8:#x}': out.append("the x87 run test's end does not go back to the block's third word")
     out += [f'+{o} "{dis[o]}" opens an x87 run in a block that begins with the test for one' for o in order
             if re.fullmatch(r'strb w\d+, \[x28, #0x414\]', dis[o])]
@@ -350,6 +350,21 @@ def guards(d, dis, order):
             check_at[at] = refs[at][0]
             # M2 task 4, a translated FLDCW: `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, stub`.
             t = refs[at][0]
+            if s['kind'] == 'segment':
+                guest = next(i for i in d['guest']['instructions'] if i['offset'] == s['guest_offset'] and i['translated'])
+                insn = bytes.fromhex(guest['bytes_hex'])
+                if len(insn) >= 5 and 0xa0 <= insn[-5] <= 0xa3 and all(b in (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0xf2, 0xf3) for b in insn[:-5]):
+                    imm = int.from_bytes(insn[-4:], 'little')
+                    code = bytes.fromhex(d['code']['hex'])
+                    offset_ok = (s['base_reg'] == 0 and int.from_bytes(code[t-8:t-4], 'little') == 0x52800000 | (imm & 0xffff) << 5
+                                 and int.from_bytes(code[t-4:t], 'little') == 0x72a00000 | (imm >> 16) << 5)
+                else:
+                    offset_ok = dis.get(t - 4) == f'mov w0, w{s["base_reg"]}'
+                if (dis.get(t) != f'b {at:#x}' or not offset_ok
+                        or s['imm'] != t + 4 or not re.fullmatch(r'mov w[0-9]+, w0', dis.get(t + 4, ''))):
+                    out.append(f'stub +{at} (segment): offset or continuation mismatch')
+                else:
+                    ok.add(t)
             if s['kind'] == 'fldcw' and not (dis.get(t) == f'cbnz w0, {at:#x}' and dis.get(t - 4) == 'and w0, w0, #0x3f' and
                                              re.fullmatch(r'eor w0, w0, w\d+', dis.get(t - 8, '')) and dis.get(t - 12) == 'ldrh w0, [x28, #0x4b0]'):
                 out.append(f'stub +{at} (fldcw): its check is not `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0`')
@@ -388,7 +403,7 @@ def guards(d, dis, order):
         if a is not None and a not in by_off:
             out.append(f'stub(s) {[s["native_offset"] for s in ss]} linked to +{a}, which is no access site')
         for s in ss:
-            if a in by_off and (s['guest_offset'], s['segment']) != (by_off[a]['guest_offset'], by_off[a]['segment']):
+            if a in by_off and (s['guest_offset'] != by_off[a]['guest_offset'] or s['kind'] != 'segment' and s['segment'] != by_off[a]['segment']):
                 out.append(f'stub +{s["native_offset"]}: guest offset/segment differ from its access +{a}')
     rel = [r for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move']
 
@@ -415,7 +430,7 @@ def guards(d, dis, order):
     # stack check's fall-through adds its base; writebacks of 8n keep a base; add/sub #8n and mov copy it; other writes clear;
     # branch targets meet their sources; svc clears all; a back edge clears what its loop writes.
     # M2 task 4, 32-bit code: the slot is 4 bytes, the check `and x0, xB, #0x3`, and the 32-bit add/sub/mov forms carry it too.
-    SLOT, XW = (4, '[xw]') if BITS else (8, 'x')
+    SLOT, XW = (4, '[xw]') if d['input']['bitness'] == 32 else (8, 'x')
     aligned_at = {}
     est = {tx: x['base_reg'] for x in stubs.values() if x['kind'] == 'stack' for tx in [stack_check(x)] if tx is not None}
     pend, mm, dead = {}, 0, False
@@ -800,7 +815,7 @@ def entry_and_branches(d, dis, order):
         guest_state = acc and acc[2] == 'x28' and acc[1] == 1 and acc[3] is None and acc[5] == 'none' and \
             acc[4] in (GUEST_STATE_DF if acc[0] == 'store' else GUEST_STATE_FLAGS)
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
-                                      any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES + (((976, 16),) if BITS else ())))   # M2: 32-bit code also loads es/cs/ss/ds_cached (frame::LEGACY_BASES)
+                                      any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES + (((976, 16),) if d['input']['bitness'] == 32 else ())))   # M2: 32-bit code also loads es/cs/ss/ds_cached (frame::LEGACY_BASES)
         inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
         guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(X87_RUN_STATE) or inside(AVX_HIGH) or inside((X87_FCW,))))   # (FCW: a translated FLDCW stores it, M2 task 4)
         if acc and acc[2] in ('x28', 'sp') and not guest_state:

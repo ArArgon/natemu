@@ -29,7 +29,7 @@ def cases():
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -42,17 +42,50 @@ def cases():
                 f'    movdqu xmm3, [{C.W + 32:#x}]\n    xor edi, edi\n    xor eax, eax\n'
                 + after_load + prefix)
         fault_rip = C.U + len(C.user32(user))
-        user += f'    {insn}\n    int 0x80\n'
-        rip = C.U + len(C.user32(user)) if success else fault_rip
+        user += f'    {insn}\n'
+        trap_rip = C.U + len(C.user32(user)) if after_trap else fault_rip
+        user += '    int 0x80\n'
+        rip = C.U + len(C.user32(user)) if success else trap_rip
         saved = f'    mov rax, cr2\n    mov [{C.W + 0x40:#x}], rax\n    jmp .fin\n'
+        if firmware is not None:
+            saved = f'    xor eax, eax\n    movzx eax, word [rax]\n    mov [{C.W + 0x48:#x}], eax\n' + saved
+        if reload_limit is not None:
+            # The first fault edits the table. The unchanged hidden descriptor faults a second time.
+            # Only the second handler reloads FS; both IRETs retry the same compiled instruction.
+            changed = descriptor(base, reload_limit, access, flags)
+            saved = (f'    cmp qword [{C.LOG:#x}], 1\n    jne .reload\n    mov rax, {changed:#x}\n'
+                     f'    mov [{C.F["g"] + 0x28:#x}], rax\n    jmp .resume\n.reload:\n'
+                     f'    cmp qword [{C.LOG:#x}], 2\n    jne .done\n    mov ax, {selector:#x}\n'
+                     f'    mov {segment}, ax\n    jmp .resume\n.done:\n' + saved)
         enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23).replace('    push 2\n', f'    push {enter_flags}\n')
-        prog = C.program(name, C.gate(12, '.v12') + setup + kernel_setup + enter
-                         + C.handlers(saved, xmm=True, vectors=(6, 12, 13, 14, 128)), user, memory=mapped)
+        prog = C.program(name, C.gate(12, '.v12') + (C.gate(1, '.v1') if after_trap else '') + setup + kernel_setup + enter
+                         + C.handlers(saved, xmm=True, vectors=(1, 6, 12, 13, 14, 128)), user, memory=mapped)
         # Handler offsets are from compat.handlers, the target memory and CR2 are independent of the recorded frame.
-        expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, 0, rip,
+        expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, error, rip,
                                                                      0xdb if cpl3_mode == 32 else 0x23),
                     C.REC + 0x110: xmm1, C.REC + 0x130: xmm3,
-                    C.W + 0x40: struct.pack('<Q', CR2), tls: memory}
+                    C.W + 0x40: struct.pack('<Q', cr2), tls: memory}
+        if captured:
+            expected.update(captured)
+        if rflags is not None:
+            expected[C.REC + 0x20] = struct.pack('<Q', rflags)
+        if eax is not None:
+            expected[C.REC + 0x40] = struct.pack('<I', eax)
+        if ecx is not None:
+            expected[C.REC + 0x48] = struct.pack('<I', ecx)
+        if reload_limit is not None:
+            expected.update({addr + 0x400: data for addr, data in expected.items() if C.REC <= addr < C.REC + 0x200})
+            for delta in (0, 0x200):
+                expected[C.REC + delta] = struct.pack('<QQQQ', 13, 0, fault_rip, 0xdb)
+                expected[C.REC + delta + 0x48] = struct.pack('<I', 0x12345678)
+            expected[C.LOG] = struct.pack('<Q', 3)
+        if firmware is not None:
+            prog['firmware'] = firmware.hex()
+            expected[C.W + 0x48] = firmware[:2] + bytes(2)
+        if refuse is not None:
+            prog['limit_refusal'] = (refuse, fault_rip)
+            prog['strict_unassigned'] = strict
+            expected = {C.LOG: bytes(8), **(captured or {})}
         cases.append((prog, expected))
 
     add('fs-full-word-at-limit', 'mov [fs:2], ds', success=True,
@@ -96,6 +129,130 @@ def cases():
         prefix=set0, xmm3=bytes(16))
     add('fs-null-gather-zero', 'vpgatherdd xmm1, [fs:eax+xmm2*4], xmm3', selector=0,
         prefix=set0, xmm3=bytes(16))
+    # Force ModRM encodings (the assembler can select moffs for an absolute EAX operand).
+    seed = '    mov ecx, 0x12345678\n'
+    add('fs-generated-read-end', 'mov ecx, [fs:edi]', success=True, prefix=seed, ecx=0x44332211)
+    add('gs-generated-read-overrun', 'mov ecx, [gs:edi+1]', segment='gs',
+        prefix=seed + '    cmp al, al\n    stc\n', ecx=0x12345678, rflags=0x10045)
+    add('fs-generated-store-overrun', 'mov [fs:edi+1], ecx', prefix=seed, ecx=0x12345678)
+    add('gs-generated-store-end', 'mov [gs:edi], ecx', prefix='    mov ecx, 0xabcdef06\n',
+        segment='gs', success=True, ecx=0xabcdef06, memory=bytes.fromhex('06efcdab') + VALUE[4:])
+    add('gs-generated-store-readonly', 'mov [gs:edi], ecx', access=0xf1, segment='gs', prefix=seed, ecx=0x12345678)
+    add('fs-generated-read-misaligned-word', 'mov cx, [fs:edi+3]', enter_flags=0x40002, prefix=seed, ecx=0x12345678,
+        kernel_setup='    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n')
+    add('fs-generated-word-at-limit', 'mov cx, [fs:edi+2]', prefix=seed, success=True, ecx=0x12344433)
+    add('gs-generated-byte-at-limit', 'mov ch, [gs:edi+3]', prefix=seed, segment='gs', success=True,
+        ecx=0x12344478)
+    add('fs-generated-address16-refusal', 'mov cx, [fs:bx+si+2]', prefix=seed + '    mov ebx, 0xffff\n    xor esi, esi\n',
+        fault=6, ecx=0x12345678)
+    add('fs-generated-retry-after-reload', 'mov ecx, [fs:edi+1]', prefix=seed, success=True,
+        ecx=0x55443322, reload_limit=7)
+    # An in-range segment offset locates bytes on the final and first linear pages, in that order.
+    high, low = C.HIGH + 4094, C.LOW0
+    init = '    mov ax, 0x2211\n    mov rbx, 0xfffffffe\n    mov [rbx], ax\n'
+    up = init + '    xor ebx, ebx\n    mov word [rbx], 0x4433\n'
+    have = {high: bytes.fromhex('1122'), low: bytes.fromhex('3344')}
+    add('fs-generated-wrapped-load', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=C.WRAP, prefix=seed,
+        success=True, ecx=0x44332211, kernel_setup=up, captured=have)
+    for op, loaded in [('movzx', 0x00008022), ('movsx', 0xffff8022)]:
+        add(f'fs-generated-wrapped-{op}-word', f'{op} ecx, word [fs:edi]', base=0xffffffff, limit=1,
+            mapped=C.WRAP, prefix=seed, success=True, ecx=loaded,
+            kernel_setup=init + '    xor ebx, ebx\n    mov byte [rbx], 0x80\n')
+    add('gs-generated-wrapped-store', 'mov [gs:edi], ecx', base=0xfffffffe, segment='gs', mapped=C.WRAP,
+        success=True, prefix=seed, kernel_setup=up, captured={high: bytes.fromhex('7856'), low: bytes.fromhex('3412')})
+    # Only the second half is unassigned physical space; its two bytes read as FF.
+    low_hole = [C.entry(C.TA + 0x3000, 0xa1000000 | C.P.LEAF) if n == 3 else mem for n, mem in enumerate(C.WRAP)]
+    add('fs-generated-wrapped-load-unassigned-low', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=low_hole,
+        prefix=seed, success=True, ecx=0xffff2211, kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    low_rom = [C.entry(C.TA + 0x3000, 0xfffff000 | C.P.LEAF) if n == 3 else mem for n, mem in enumerate(C.WRAP)]
+    rom = bytes.fromhex('3344') + bytes(4094)
+    add('gs-generated-wrapped-load-rom-low', 'mov ecx, [gs:edi]', base=0xfffffffe, segment='gs',
+        mapped=low_rom, firmware=rom, prefix=seed, success=True, ecx=0x44332211, kernel_setup=init)
+    add('fs-generated-wrapped-store-rom-low', 'mov [fs:edi], ecx', base=0xfffffffe, mapped=low_rom,
+        firmware=rom, prefix=seed, success=True, kernel_setup=init, captured={high: bytes.fromhex('7856')})
+    low_apic = [C.entry(C.TA + 0x3000, 0xfee00000 | C.P.LEAF) if n == 3 else mem for n, mem in enumerate(C.WRAP)]
+    add('fs-generated-wrapped-claimed-read', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=low_apic,
+        prefix=seed, refuse='crossing', kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    add('fs-generated-wrapped-claimed-store', 'mov [fs:edi], ecx', base=0xfffffffe, mapped=low_apic,
+        prefix=seed, refuse='crossing', kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    add('fs-generated-wrapped-strict-unassigned', 'mov ecx, [fs:edi]', base=0xfffffffe, mapped=low_hole,
+        prefix=seed, refuse='unassigned', strict=True, kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    for insn, write in [('mov ecx, [fs:edi]', False), ('mov [fs:edi], ecx', True)]:
+        add('fs-generated-wrapped-missing-' + ('store' if write else 'load'), insn, base=0xfffffffe,
+            mapped=C.TOP_ONLY, prefix=seed, ecx=0x12345678, fault=14, error=6 if write else 4, cr2=0,
+            kernel_setup=init, captured={high: bytes.fromhex('1122')})
+    watch_low = '    xor eax, eax\n    mov dr0, rax\n    mov eax, 0x10001\n    mov dr7, rax\n'
+    add('gs-generated-wrapped-store-watch-low', 'mov [gs:edi], ecx', base=0xfffffffe, segment='gs', mapped=C.WRAP,
+        prefix=seed, fault=1, after_trap=True, kernel_setup=up + watch_low,
+        captured={high: bytes.fromhex('7856'), low: bytes.fromhex('3412')})
+    add('fs-resident-wrapped-word', 'mov [fs:0], ds', base=0xffffffff, mapped=C.WRAP, success=True,
+        kernel_setup=up, captured={high: bytes.fromhex('111b'), low: bytes.fromhex('0044')})
+    add('gs-resident-wrapped-word-missing', 'mov [gs:0], ds', segment='gs', base=0xffffffff, mapped=C.TOP_ONLY,
+        kernel_setup=init, fault=14, error=6, cr2=0, captured={high: bytes.fromhex('1122')})
+    add('fs-fxsave-wrapped-image', 'fxsave [fs:0]', base=0xffffff80, limit=511, mapped=C.WRAP,
+        success=True, captured={low + 48: INITIAL})
+    add('fs-xsave-wrapped-component', 'xsave [fs:0]', base=0xffffffc0, limit=1023, mapped=C.WRAP, success=True,
+        prefix='    mov eax, 2\n    xor edx, edx\n', captured={low + 112: INITIAL})
+    # The SDM's byte-to-word forms (66 B6/BE) preserve ECX[31:16]. B7/BF use dword
+    # destinations here. Both source widths end exactly at offset 9 in the passing cases.
+    extend_forms = (
+        ('movzx', 'ecx', 'byte', 0x000000aa),
+        ('movsx', 'ecx', 'byte', 0xffffffaa),
+        ('movzx', 'cx', 'byte', 0x123400aa),
+        ('movsx', 'cx', 'byte', 0x1234ffaa),
+        ('movzx', 'ecx', 'word', 0x0000aa99),
+        ('movsx', 'ecx', 'word', 0xffffaa99),
+    )
+    for segment in ('fs', 'gs'):
+        for op, dst, src, value in extend_forms:
+            name = f'{segment}-generated-extend-{op}-{dst}-{src}'
+            disp = 5 if src == 'byte' else 4
+            prefix = seed + '    mov edi, 4\n    cmp al, al\n    stc\n'
+            add(f'{name}-ok', f'{op} {dst}, {src} [{segment}:edi+{disp}]', limit=9, segment=segment,
+                prefix=prefix, success=True, ecx=value, rflags=0x45)
+            # A rejected span points to an absent guest page so #GP must precede any page walk.
+            add(f'{name}-limit', f'{op} {dst}, {src} [{segment}:edi+{disp + 1}]', limit=9, segment=segment,
+                base=C.XPAGE, prefix=prefix, ecx=0x12345678, rflags=0x10045,
+                kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n')
+    # Raw A0..A3 keep the accumulator-only encoding independent of NASM's ModRM choices.
+    def moffs(segment, width, write, offset, address16=False):
+        opcode = (0xa2 if write else 0xa0) + (width != 1)
+        form = (b'\x67' if address16 else b'') + (b'\x66' if width == 2 else b'')
+        form += bytes([0x64 if segment == 'fs' else 0x65, opcode]) + offset.to_bytes(2 if address16 else 4, 'little')
+        return 'db ' + ','.join(hex(b) for b in form)
+
+    accumulator = 0x12345678
+    seed_ax = '    mov eax, 0x12345678\n    cmp al, al\n    stc\n'
+    for segment in ('fs', 'gs'):
+        for width in (1, 2, 4):
+            at = 10 - width  # last byte exactly at limit 9
+            mask = (1 << (width * 8)) - 1
+            loaded = (accumulator & ~mask) | int.from_bytes(VALUE[at:at + width], 'little')
+            stored = VALUE[:at] + accumulator.to_bytes(4, 'little')[:width] + VALUE[at + width:]
+            for write in (False, True):
+                name = f'{segment}-moffs-{width}-{"write" if write else "read"}'
+                add(name + '-ok', moffs(segment, width, write, at), segment=segment, limit=9, prefix=seed_ax,
+                    success=True, eax=accumulator if write else loaded, memory=stored if write else VALUE, rflags=0x45)
+                add(name + '-limit', moffs(segment, width, write, at + 1), segment=segment, limit=9,
+                    prefix=seed_ax, eax=accumulator, rflags=0x10045)
+    add('gs-moffs-readonly-store', moffs('gs', 1, True, 3), segment='gs', access=0xf1,
+        prefix=seed_ax, eax=accumulator, rflags=0x10045)
+    add('fs-moffs-address16-refusal', moffs('fs', 2, False, 1, address16=True), fault=6,
+        prefix=seed_ax, eax=accumulator)
+    # Both halves of an absolute offset participate before the segment base wraps to RAM.
+    add('gs-moffs-high-offset', moffs('gs', 4, False, 0x87654321), segment='gs',
+        base=(tls - 0x87654321) & 0xffffffff, limit=0xfffff, flags=12, success=True,
+        prefix=seed_ax, eax=0x44332211, rflags=0x45)
+    for write in (False, True):
+        seg = 'gs' if write else 'fs'
+        name = f'{seg}-moffs-wrapped-{"write" if write else "read"}'
+        insn = moffs(seg, 4, write, 3)
+        add(name, insn, segment=seg, base=0xfffffffb, limit=6, mapped=C.WRAP,
+            success=True, prefix=seed_ax, kernel_setup=up, rflags=0x45,
+            eax=accumulator if write else 0x44332211, captured={high: bytes.fromhex('7856'), low: bytes.fromhex('3412')} if write else have)
+        add(name + '-missing', insn, segment=seg, base=0xfffffffb, limit=6, mapped=C.TOP_ONLY,
+            prefix=seed_ax, eax=accumulator, fault=14, error=6 if write else 4, cr2=0, rflags=0x10045,
+            kernel_setup=init, captured={high: bytes.fromhex('1122')})
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)

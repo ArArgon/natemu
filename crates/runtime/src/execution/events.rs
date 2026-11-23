@@ -293,7 +293,7 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
     super::watch::access(s, unit, size, i.cr != 0);
     if s.cpu.alignment_check()
         && unit & (size - 1) != 0
-        && !super::segments::outside(&s.cpu, unit, size)
+        && !super::segments::operand_range(&operand).outside(&s.cpu, unit, size)
     {
         return Err([17, 0, 0]);
     }

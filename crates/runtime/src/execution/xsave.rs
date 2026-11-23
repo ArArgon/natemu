@@ -23,7 +23,7 @@
 //! for write before any state or memory changes (a #PF or #GP leaves both as they were). I5c: an FCW or MXCSR with masks
 //! clear re-keys the code (`Cpu::code_context`); FXRSTOR/XRSTOR, like FXSAVE/XSAVE, ignore a pending x87 exception (SDM
 //! Vol.3 event 16), and an unmasked flag they load is pending for the next waiting x87 instruction.
-use super::segments::{Exception, address, linear, noncanonical, pages};
+use super::segments::{Exception, address, linear, operand_range, pages};
 use super::*;
 
 use natemu_abi::x87::{f80_int, from_f80, int_f80, to_f80};
@@ -68,15 +68,15 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     let (xmm_end, avx_end) = (160 + 16 * xmms, AVX + 16 * xmms);
     // FX* and XSAVE check the entire architectural area, including slots this mode does not transfer.
     let operand = if fx { 512 } else if xcr0 & 4 != 0 { AREA } else { AVX };
-    let nc = noncanonical(&i);
+    let nc = operand_range(&i);
     let va = if i.memory == 1 {
         let write = matches!(i.kind, system::FXSAVE | system::XSAVE | system::XSAVEC);
         let va = address(&s.cpu, &i, operand as u64, write)?;
         if va & if fx { 15 } else { 63 } != 0 {
             return Err(GP);
         }
-        if xmms == 8 && super::segments::outside(&s.cpu, va, operand as u64) {
-            return Err(nc);
+        if xmms == 8 && nc.outside(&s.cpu, va, operand as u64) {
+            return Err(nc.fault());
         }
         va
     } else {
@@ -159,8 +159,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         system::XRSTOR => {
             // The header (all 64 bytes, in the area's first page with the 64-byte alignment) is read first, but its canonical
             // check starts at the area's base: a non-canonical base is #GP/#SS before a #PF on the header's page.
-            if super::segments::outside(&s.cpu, va, HEADER as u64 + 64) {
-                return Err(nc);
+            if nc.outside(&s.cpu, va, HEADER as u64 + 64) {
+                return Err(nc.fault());
             }
             linear(
                 s,

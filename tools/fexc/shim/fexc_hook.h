@@ -71,6 +71,7 @@ enum FexcSiteKind : uint8_t {
                                             // the unit and goes on at this instruction
   FEXC_SITE_X87MAP = 24,                    // slice1 (M2 task 4), no access and no stub: the x87 stack state at the fault points of one guest
                                             // instruction (fexc_x87_maps; in the binary site table at the instruction's native offset + 1)
+  FEXC_SITE_SEGMENT = 25,                    // bank-checked compatibility operand (brk #14)
   FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
                                             // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };

@@ -1,6 +1,6 @@
 //! VCVTPS2PH memory destination. Memory faults precede conversion publication; Type 11 does not raise #AC.
 use super::*;
-use segments::{Exception, address, noncanonical, pages};
+use segments::{Exception, address, operand_range, pages};
 
 pub(super) fn store(s: &mut State, i: System) -> Result<(), Exception> {
     if !s.cpu.avx_enabled() {
@@ -11,7 +11,7 @@ pub(super) fn store(s: &mut State, i: System) -> Result<(), Exception> {
     }
     let va = address(&s.cpu, &i, u64::from(i.size), true)?;
     let n = i.size as usize;
-    let gpa = pages(s, va, n as u64, true, false, noncanonical(&i))?;
+    let gpa = pages(s, va, n as u64, true, false, operand_range(&i))?;
     let head = n.min((4096 - (va & 4095)) as usize);
     if !mmio::ram(gpa[0]) || (head < n && !mmio::ram(gpa[1])) {
         mmio::system_access(s);

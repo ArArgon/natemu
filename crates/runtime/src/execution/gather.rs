@@ -20,7 +20,7 @@
 //! (SDM: "If any traps or interrupts are pending from already gathered elements, they will be delivered in lieu of the
 //! exception; in this case, EFLAG.RF is set to one"); the restart then meets the fault. A device page stops
 //! `unsupported_mmio` as any vector form's (M3); UC RAM is read in order like any RAM.
-use super::segments::{Exception, copy, noncanonical};
+use super::segments::{Exception, copy, operand_range};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;
 
@@ -63,7 +63,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         s.cpu.gpr[i.base as usize]
     };
     super::segments::usable(&s.cpu, i.segment)?;
-    let nc = noncanonical(&i);
+    let nc = operand_range(&i);
     for j in 0..n {
         if m[ew * j + ew - 1] & 0x80 != 0 {
             let at = iw * j;

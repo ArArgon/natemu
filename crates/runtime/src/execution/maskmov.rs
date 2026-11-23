@@ -21,7 +21,7 @@
 //! explicitly permitted by its SDM page), and writes selected bytes. Unlike the SIMD forms it checks pending #MF and
 //! natural alignment under #AC (Vol.3B Table 24-8); canonicality precedes #AC, which precedes page faults as for `linear`.
 //! Only successful completion sets TOP=0 and all tags valid, including a zero mask. CR4.OSFXSR does not gate it.
-use super::segments::{Exception, copy, noncanonical, offset, operand, pages, usable};
+use super::segments::{Exception, copy, operand_range, offset, operand, pages, usable};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;
 
@@ -73,13 +73,13 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     };
     let ea = offset(&s.cpu, &i);
     usable(&s.cpu, i.segment)?;
-    let nc = noncanonical(&i);
+    let nc = operand_range(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
     let mut addresses = [0; 16];
     if ew == 1 {
         // MASKMOVQ and [V]MASKMOVDQU preflight the whole operand, even for an empty mask.
         let at = operand(&s.cpu, i.segment, ea, n as u64, true)?;
-        if mmx && alignment_check(&s.cpu) != 0 && at & 7 != 0 && !super::segments::outside(&s.cpu, at, 8) {
+        if mmx && alignment_check(&s.cpu) != 0 && at & 7 != 0 && !nc.outside(&s.cpu, at, 8) {
             return Err([17, 0, 0]);
         }
         pages(s, at, n as u64, true, false, nc)?;

@@ -8,7 +8,7 @@
 //! one, the waiting transactions here ([`pending`]). Not modelled: the last instruction and data pointers and opcode
 //! (stored as 0). 80-bit values are rounded to doubles on the way in (by FCW.RC) and widened exactly on the way out: the
 //! reduced-precision deviation (plan I6).
-use super::segments::{Exception, address, linear, noncanonical};
+use super::segments::{Exception, address, linear, operand_range};
 use super::*;
 
 use natemu_abi::x87::{INDEFINITE, from_f80, to_f80};
@@ -307,8 +307,8 @@ fn gate(c: &Cpu) -> Result<(), Exception> {
 /// #AC(0) under alignment checking for an x87 memory operand that is not `align`-aligned (SDM Vol.3 Table 7-7), after the
 /// canonical check (which [`linear`] makes first otherwise).
 fn aligned(s: &State, va: u64, n: u64, align: u64, i: &System) -> Result<(), Exception> {
-    if super::segments::outside(&s.cpu, va, n) {
-        return Err(noncanonical(i));
+    if operand_range(i).outside(&s.cpu, va, n) {
+        return Err(operand_range(i).fault());
     }
     if alignment_check(&s.cpu) != 0 && va & (align - 1) != 0 {
         Err([17, 0, 0])
@@ -357,7 +357,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     ) {
         pending(s)?;
     }
-    let fault = noncanonical(&i);
+    let fault = operand_range(&i);
     // The environment image: FCW, FSW, FTW at 2- or 4-byte strides (the rest: instruction and data pointers, 0 here).
     let (env, stride) = if i.size == 2 { (14, 2) } else { (28, 4) };
     match i.kind {

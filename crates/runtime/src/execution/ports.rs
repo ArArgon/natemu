@@ -180,7 +180,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         }
         super::watch::access(s, va, size, true);
     } else {
-        segments::linear(s, va, element, false, false, segments::noncanonical(&i))?;
+        segments::linear(s, va, element, false, false, segments::operand_range(&i))?;
         power = access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes)))).1;
     }
     super::watch::port(s, port, size);

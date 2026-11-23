@@ -158,7 +158,17 @@ fn rearm() {
 #[inline(always)]
 pub(super) fn access(s: &mut State, va: u64, width: u64, write: bool) {
     if s.cpu.dr[5] & DR7_ENABLES != 0 {
-        s.debug |= data_hits(&s.cpu.dr, va, width, write) << debug::HITS;
+        let (va, first) = if s.cpu.code_mode() == Some(CodeMode::Compat32) {
+            let start = u64::from(va as u32);
+            (start, width.min((1 << 32) - start))
+        } else {
+            (va, width)
+        };
+        let mut hits = data_hits(&s.cpu.dr, va, first, write);
+        if first < width {
+            hits |= data_hits(&s.cpu.dr, 0, width - first, write);
+        }
+        s.debug |= hits << debug::HITS;
     }
 }
 /// The bits of the armed I/O breakpoints (R/W 10, CR4.DE) a port access of `width` bytes meets (SDM Vol.3 18.2.4: R/W 10

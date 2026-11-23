@@ -1,7 +1,7 @@
 //! M2 task 3b: the instructions only 32- and 16-bit code has that the compiler leaves to the resident (fexc's 32-bit rows,
 //! m2-task2-findings): ARPL, BOUND, PUSHA/POPA and AAM (SDM Vol.2 each). The host decodes them only outside 64-bit mode,
 //! where their opcodes are other instructions or #UD. Each checks everything before its first change.
-use super::segments::{Exception, address, aligned_operand, noncanonical, wrap};
+use super::segments::{Exception, address, aligned_operand, operand_range, wrap};
 use super::*;
 
 const SS0: Exception = [12, 0, 0];
@@ -37,7 +37,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<(), Exception> {
         // lies outside them.
         system::BOUND => {
             let mut b = [0u8; 8];
-            aligned_operand(s, address(&c, &i, (2 * w) as u64, false)?, &mut b[..2 * w], w, w as u64, false, noncanonical(&i))?;
+            aligned_operand(s, address(&c, &i, (2 * w) as u64, false)?, &mut b[..2 * w], w, w as u64, false, operand_range(&i))?;
             let signed = |v: u64| if w == 2 { v as i16 as i64 } else { v as i32 as i64 };
             let word = |k: usize| {
                 let mut v = [0u8; 8];

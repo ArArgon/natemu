@@ -97,7 +97,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     }
     let load = matches!(i.kind, system::LDMXCSR | system::VLDMXCSR);
     let va = address(&s.cpu, &i, 4, !load)?;
-    let noncanonical = super::segments::noncanonical(&i);
+    let noncanonical = super::segments::operand_range(&i);
     if load {
         let mut buf = [0; 4];
         linear(s, va, &mut buf, false, false, noncanonical)?;
