@@ -4808,4 +4808,98 @@ mod tests {
         assert!(new.is_empty(), "{new:#?}");
     }
 
+    /// M2 checkpoint C, with `FEXC` set: an operand check that is not exactly the instruction's is refused, and so is every
+    /// way around it: a check of another width or intent, a changed word, a record of the other segment, the unchecked code
+    /// under a limited identity, a load of the limited segment's base field, a site tag that is not the operand's, and an FS
+    /// operand outside CPL 3.
+    #[test]
+    fn operand_check_mutations_are_refused() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        use super::super::User32;
+        use core::mem::offset_of;
+        let dir = std::env::temp_dir().join(format!("natemu-fs-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |hex: &str, extra: &[&str]| -> (Vec<u8>, Vec<u8>) {
+            let object = dir.join("o");
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--narrow-cmp", "--push-run"])
+                .args(extra)
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg("/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex}");
+            ((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect(), std::fs::read(&object).unwrap())
+        };
+        let admit = |(source, object): &(Vec<u8>, Vec<u8>), cpl3: bool, limited: [bool; 2]| {
+            let h: Header = super::super::record(object, 0);
+            super::super::admit_user(object, h.guest_rip, source, u64::MAX, true, false, true, User32 { cpl3, limited }).map(|_| ())
+        };
+        let sites = |object: &[u8]| -> Vec<(usize, Site)> {
+            let h: Header = super::super::record(object, 0);
+            (0..h.sites_count as usize)
+                .map(|k| h.sites_offset as usize + k * size_of::<Site>())
+                .map(|at| (at, super::super::record::<Site>(object, at)))
+                .collect()
+        };
+        let refused = |r: Result<(), String>, why: &str| {
+            let e = r.expect_err(why);
+            assert!(e.contains(why), "{e}: expected {why}");
+        };
+        // inc dword fs:[ebx]; ret: a write of 4 bytes.
+        let checked = compile("64ff03c3", &["--fs-limited"]);
+        admit(&checked, true, [true, false]).unwrap();
+        refused(admit(&checked, true, [false, false]), "operand check without a limited");
+        refused(admit(&checked, true, [false, true]), "operand check without a limited");
+        refused(admit(&checked, false, [true, false]), "not CPL 3");
+        let h: Header = super::super::record(&checked.1, 0);
+        let (at, check) = sites(&checked.1).into_iter().find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap();
+        assert_eq!((check.segment, check.width, check.intent), (object::SEG_FS, 4, 1));
+        let patched = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut o = checked.1.clone();
+            f(&mut o);
+            (checked.0.clone(), o)
+        };
+        for (field, value) in [(offset_of!(Site, width), 2u8), (offset_of!(Site, intent), 0), (offset_of!(Site, segment), object::SEG_GS)] {
+            refused(admit(&patched(&|o| o[at + field] = value), true, [true, true]), "operand check");
+        }
+        let code = h.code_offset as usize;
+        let word = |o: &[u8], n: u32| u32::from_le_bytes(o[code + n as usize..][..4].try_into().unwrap());
+        let sub = check.guest_offset2;
+        // The width in the code (4 -> 2), the record's slot (FS's -> GS's), the offset's register, the base move's source.
+        for (n, flip) in [(sub, 6 << 10), (sub - 8, 4 << 10), (sub + 4, 1 << 16), (check.imm as u32, 1 << 16)] {
+            let o = patched(&|o| o[code + n as usize..][..4].copy_from_slice(&(word(&checked.1, n) ^ flip).to_le_bytes()));
+            refused(admit(&o, true, [true, false]), "operand check");
+        }
+        // An access site of the operand that does not say FS; a site of the `ret` that does.
+        let tagged: Vec<_> = sites(&checked.1).into_iter().filter(|(_, s)| s.segment == object::SEG_FS && s.kind != object::kind::SEGMENT).collect();
+        assert!(tagged.iter().any(|(_, s)| s.kind == object::kind::LOAD) && tagged.iter().any(|(_, s)| s.kind == object::kind::STORE));
+        refused(admit(&patched(&|o| o[tagged[0].0 + offset_of!(Site, segment)] = object::SEG_DS), true, [true, false]), "segment is not its instruction's");
+        let (ret, _) = sites(&checked.1).into_iter().find(|(_, s)| s.guest_offset == 3 && s.kind == object::kind::LOAD).unwrap();
+        refused(admit(&patched(&|o| o[ret + offset_of!(Site, segment)] = object::SEG_FS), true, [true, false]), "segment is not its instruction's");
+        // The unchecked code of the same instruction under the limited identity: no check, and its base load.
+        let flat = compile("64ff03c3", &[]);
+        admit(&flat, true, [false, false]).unwrap();
+        admit(&flat, true, [false, true]).unwrap();
+        refused(admit(&flat, true, [true, false]), "not exactly one");
+        refused(admit(&flat, false, [false, false]), "not CPL 3");
+        // A GS operand's unchecked code is admitted while only FS is limited; with its base load turned into FS's
+        // (ldr wN, [x28, #gs_cached] -> #fs_cached) the frame rule refuses it, whatever the instruction.
+        let gs = compile("65ff03c3", &[]);
+        admit(&gs, true, [true, false]).unwrap();
+        let g: Header = super::super::record(&gs.1, 0);
+        let load = 0xb940_0380 | frame::GS_BASE / 4 << 10;
+        let n = (0..g.code_region_end).step_by(4).find(|&n| u32::from_le_bytes(gs.1[g.code_offset as usize + n as usize..][..4].try_into().unwrap()) & !31 == load);
+        let n = g.code_offset as usize + n.expect("the GS base load") as usize;
+        let mut o = gs.1.clone();
+        let w = u32::from_le_bytes(o[n..n + 4].try_into().unwrap()) & 31 | 0xb940_0380 | frame::FS_BASE / 4 << 10;
+        o[n..n + 4].copy_from_slice(&w.to_le_bytes());
+        refused(admit(&(gs.0.clone(), o), true, [true, false]), "base of a limited FS or GS");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

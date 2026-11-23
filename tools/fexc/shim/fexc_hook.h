@@ -180,8 +180,7 @@ inline std::set<uint64_t> fexc_pre_nzcv;
 // Which opcode map produced a decoded instruction (DecodedInst::FexcMap, set by the patched decoder).
 enum FexcMap : uint8_t { FEXC_MAP_PRIMARY = 0, FEXC_MAP_TWO = 1, FEXC_MAP_TWO_F3 = 2, FEXC_MAP_TWO_F2 = 3, FEXC_MAP_TWO_66 = 4,
                          FEXC_MAP_0F38 = 5, FEXC_MAP_0F3A = 6, FEXC_MAP_3DNOW = 7, FEXC_MAP_VEX = 8 };
-// L=0 scalar BMI encodings. The slice allowlist applies the guest feature gate; the
-// compatibility address builder uses the same table only when an operand is actually loaded.
+// L=0 scalar BMI encodings. The slice allowlist applies the guest feature gate.
 enum class FexcBmiFamily { None, Bmi1, Bmi2 };
 inline FexcBmiFamily FexcBmiEncoding(uint8_t vex, uint8_t opcode, bool has_modrm, uint8_t group) {
   const uint8_t map = vex & 3, pp = vex >> 2 & 3;

@@ -6672,9 +6672,19 @@ mod tests {
         c32.null_segments = [false, false, true, false];
         c32.compile(&call, 0xf7c5_7000, false, &mut ()).unwrap();
         assert_eq!((c32.compiles, c32.disk_hits), (1, 1));
+        // M2 checkpoint C: nor under a limited FS or GS, at the same EIP (the request's `--fs-limited`, the answer's tag).
+        c32.null_segments = [false; 4];
+        for (n, limited) in [[true, false], [false, true], [true, true]].into_iter().enumerate() {
+            c32.limited_segments = limited;
+            c32.compile(&call, 0xf7c5_6000, false, &mut ()).unwrap();
+            assert_eq!((c32.compiles, c32.disk_hits), (2 + n as u64, 1), "{limited:?}");
+            c32.compile(&call, 0xf7c5_6000, false, &mut ()).unwrap();
+            assert_eq!((c32.compiles, c32.disk_hits), (2 + n as u64, 1), "{limited:?}: its own answer is kept");
+        }
+        c32.limited_segments = [false; 2];
         c32.bits32 = false;
         assert!(matches!(c32.compile(&call, 0x5655_5000, false, &mut ()), Ok(Code::Block(b)) if b.guest_insns == 1));
-        assert_eq!((c32.compiles, c32.disk_hits), (2, 1));
+        assert_eq!((c32.compiles, c32.disk_hits), (5, 1));
         drop(c32);
         let disk = c.disk.clone().unwrap();
         let stored = disk.get(&disk.key(&body)).unwrap();
