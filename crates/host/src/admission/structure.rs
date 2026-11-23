@@ -790,7 +790,15 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             Code::Xor_rm8_r8 | Code::Xor_rm16_r16 | Code::Xor_rm32_r32 => Some(op::XOR),
             _ => None,
         };
+        let implicit_group = match i.code() {
+            Code::Mul_rm8 | Code::Mul_rm16 | Code::Mul_rm32 => Some(4),
+            Code::Imul_rm8 | Code::Imul_rm16 | Code::Imul_rm32 => Some(5),
+            Code::Div_rm8 | Code::Div_rm16 | Code::Div_rm32 => Some(6),
+            Code::Idiv_rm8 | Code::Idiv_rm16 | Code::Idiv_rm32 => Some(7),
+            _ => None,
+        };
         let result = match i.code() {
+            _ if implicit_group.is_some() => object::SEGMENT_NATIVE_LOAD,
             _ if moffs || store_immediate.is_some() => 0,
             _ if rmw_alu.is_some() && !i.has_lock_prefix() => object::SEGMENT_RMW_ALU,
             Code::Xchg_rm8_r8 | Code::Xchg_rm16_r16 | Code::Xchg_rm32_r32 => object::SEGMENT_XCHG,
@@ -828,6 +836,8 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         // Immediate compare/test use the ModRM.reg opcode extension, /7 and /0 respectively.
         let modrm_reg = if xlat {
             Register::AL.number() as u8
+        } else if let Some(group) = implicit_group {
+            group
         } else if i.op_kind(other) == OpKind::Register {
             i.op_register(other).number() as u8
         } else if i.mnemonic() == iced_x86::Mnemonic::Cmp { 7 } else { 0 };
@@ -2507,6 +2517,33 @@ impl<'a> Verifier<'a> {
     }
 
     /// Every div/idiv has exactly its #DE checks before FEX's divide; every divide stub is one of them.
+    /// FEX's compatibility memory-division result block after its last #DE branch. The
+    /// checked divisor d and the RDX:RAX roots supply the quotient and the following remainder.
+    fn checked_divide_result(&self, signed: bool, width: u32, d: u32, ax: u32, body: Range<u32>, fex: u32) -> bool {
+        let (prep, dividend, divisor, wide): (&[u32], _, _, _) = match (signed, width) {
+            (false, 8) => (&[], ax, d, false),
+            (true, 8) => (&[], ax, d, true),
+            (false, 16) => (&[0x5300_3c80, 0x3310_3ca0], 0, d, false), // uxth w0,w4; bfi w0,w5,#16,#16
+            (true, 16) => (&[0x5300_3c80, 0x3310_3ca0, 0x1300_3c01 | d << 5], 0, 1, false), // then sxth w1,wD
+            // DIV32 copies wD to w1 before forming EDX:EAX in x0. IDIV32 forms x0 first, then sign-extends wD to x1.
+            (false, 32) => (&[0x2a00_03e1 | d << 16, 0xaa04_03e0, 0xb360_7ca0], 0, 1, true),
+            (true, 32) => (&[0xaa04_03e0, 0xb360_7ca0, 0x9340_7c01 | d << 5], 0, 1, true),
+            _ => return false,
+        };
+        if fex != body.start + prep.len() as u32 * 4 || fex + 4 >= body.end
+            || !prep.iter().enumerate().all(|(i, &w)| self.word(body.start + i as u32 * 4) == w)
+            || self.branches_into(body.start, fex + 4).next().is_some() {
+            return false;
+        }
+        let sf = u32::from(wide) << 31;
+        let quotient = self.word(fex) & 31;
+        let remainder = self.word(fex + 4) & 31;
+        // The divisor and dividend must still hold their inputs for MSUB, and both outputs must survive it.
+        quotient != 31 && quotient != dividend && quotient != divisor && remainder != 31 && remainder != quotient
+            && self.word(fex) == sf | 0x1ac0_0800 | u32::from(signed) << 10 | divisor << 16 | dividend << 5 | quotient
+            && self.word(fex + 4) == sf | 0x1b00_8000 | divisor << 16 | dividend << 10 | quotient << 5 | remainder
+    }
+
     fn divisions(&mut self) -> Result<(), String> {
         let mut found: Vec<(u32, DivCheck, u32, u32, u32, u32)> = Vec::new(); // guest offset, kind, start, end, divisor, dividend
         for i in 0..self.c.stubs.len() {
@@ -2613,6 +2650,29 @@ impl<'a> Verifier<'a> {
             // The checks read FEX's own operands: its udiv/sdiv's divisor (directly or through FEX's x1 copy), at 8
             // bits its dividend, and the division `svc`'s divisor in x2; the divisor is unchanged from the checks to the divide.
             let (d, h) = (mine[0].3, mine.iter().map(|m| m.4).max().unwrap_or(0));
+            if let Some(guard) = self.c.stubs.iter().find(|s| s.kind == object::kind::SEGMENT && s.guest_offset == g) {
+                let load = self.c.accesses.iter().find(|a| a.native_offset == guard.guest_offset2).ok_or("divide guard without load")?;
+                let first = mine[0].1;
+                let at = load.native_offset;
+                let src = u32::from(load.data_reg[0]);
+                // The first #DE test must receive the completed word, or its byte sign extension
+                // for IDIV r/m8. Neither entry to the middle nor a substitute divisor is valid.
+                let from_load = self.last_write(d as u8, at, first).is_some_and(|last| {
+                    if signed && width == 8 {
+                        // Its #DE verdict uses W, but FEX uses the signed byte in X for the final SDIV.
+                        return last > at && self.word(last) == 0x9340_1c00 | src << 5 | d
+                            && self.last_write(src as u8, at, last) == Some(at);
+                    }
+                    last == at && d == src
+                });
+                if at >= first || !from_load || self.branches_into(at, first).next().is_some() {
+                    return fail("checked memory load must supply the divisor before its first #DE check");
+                }
+                let body = mine.last().unwrap().2 + 4..hi;
+                if !self.checked_divide_result(signed, width, d, h, body, fex) {
+                    return fail("checked memory divide and remainder must use the width-correct dividend and divisor");
+                }
+            }
             let w = self.word(fex);
             let (rn, rm, sdiv) = (w >> 5 & 31, w >> 16 & 31, w >> 10 & 1 == 1);
             let copy = |o: u32| {
@@ -3275,6 +3335,48 @@ mod tests {
                 assert!(check(&changed).unwrap_err().contains("does not preserve and merge AL"));
                 let changed = patched((&o, &src), extract, uxtb, uxtb & !31 | u32::from(SRA32[1]));
                 assert!(check(&changed).unwrap_err().contains("not an allocatable compatibility register"));
+            }
+        }
+        for hex in ["65f6b701000000", "64f63f", "6566f737", "6466f73f", "65f737", "64f73f"] {
+            let (o, source) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&o, 0);
+            let offset = (0..h.sites_count as usize).map(|n| h.sites_offset as usize + n * size_of::<Site>())
+                .find(|&at| super::super::record::<Site>(&o, at).kind == object::kind::LOAD).unwrap();
+            let load: Site = super::super::record(&o, offset);
+            let at = (h.code_offset + load.native_offset) as usize;
+            let word = u32::from_le_bytes(o[at..at+4].try_into().unwrap());
+            // Keep the typed load and native word consistent while detaching the original #DE
+            // checks from their memory source. Optional shape checks must not weaken that link.
+            let wrong = if load.data_reg[0] == 20 { 21 } else { 20 };
+            let mut changed = o.clone();
+            changed[at..at+4].copy_from_slice(&(word & !31 | u32::from(wrong)).to_le_bytes());
+            changed[offset + core::mem::offset_of!(Site, data_reg)] = wrong;
+            for shape in [false, true] {
+                let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+                check(&o).unwrap();
+                assert!(check(&changed).unwrap_err().contains("load must supply the divisor"), "{hex}");
+                let body = (h.code_offset + load.native_offset) as usize;
+                let word_at = |at: usize| u32::from_le_bytes(o[at..at+4].try_into().unwrap());
+                let divide = (body..h.code_offset as usize + h.code_size as usize).step_by(4)
+                    .find(|&at| word_at(at) & 0x7fe0_f800 == 0x1ac0_0800 && word_at(at) & 31 != 0).unwrap();
+                let msub = divide + 4;
+                let mut edits = vec![(divide, 1 << 31), (msub, 1 << 31), (msub, 1 << 16),
+                                     (msub, 1 << 10), (msub, 1 << 5)];
+                if hex == "6466f73f" || hex == "64f73f" {
+                    edits.push((divide - 4, 1 << 31)); // change the width of the divisor sign extension
+                }
+                if hex == "65f737" {
+                    edits.push((divide - 12, 1 << 31)); // mov x1,xD in place of the required zero extension
+                }
+                if hex == "64f63f" {
+                    let extend = (body+4..divide).step_by(4).find(|&at| word_at(at) & 0xffff_fc00 == 0x9340_1c00).unwrap();
+                    edits.push((extend, 1 << 31)); // sxtb wD only sign-extends to 32 bits
+                }
+                for (at, flip) in edits {
+                    let mut altered = o.clone();
+                    altered[at..at+4].copy_from_slice(&(word_at(at) ^ flip).to_le_bytes());
+                    assert!(check(&altered).is_err(), "{hex}: admitted incorrect divide preparation or remainder at {at}");
+                }
             }
         }
         let (alu, source) = compile("65330f", "0x8048000", "32");

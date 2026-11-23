@@ -825,6 +825,23 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertLess(load['native_offset'], store['native_offset'])
                 self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
 
+    def test_compat_implicit_multiply_divide_sources(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for group in range(4, 8):
+                for width in (1, 2, 4):
+                    form = bytes(([0x66] if width == 2 else []) + [0x64 if group % 2 else 0x65,
+                                 0xf6 if width == 1 else 0xf7, (group << 3) | 7]).hex()
+                    d, rc = run(form, RIP, '--bitness', '32')
+                    self.assertEqual(rc, 0, form)
+                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                    load, = (s for s in d['sites'] if s['kind'] == 'load')
+                    de = [s for s in d['sites'] if s['kind'] == 'divide']
+                    self.assertEqual((guard['width'], guard['intent'], guard['data_regs'], guard['native_load_continuation'],
+                                      guard['imm'] + 4, guard['access_native_offset'], len(de)),
+                                     (width, 'read', [group], True, load['native_offset'], load['native_offset'], max(0, group - 5)), form)
+                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+
     def test_max_instructions_still_works(self):
         d, rc = run(PRE + PRE, RIP, '--max-insts', '3')
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 3, 'max_instructions'))

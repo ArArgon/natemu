@@ -60,8 +60,8 @@ def cases():
                      f'    cmp qword [{C.LOG:#x}], 2\n    jne .done\n    mov ax, {selector:#x}\n'
                      f'    mov {segment}, ax\n    jmp .resume\n.done:\n' + saved)
         enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23).replace('    push 2\n', f'    push {enter_flags}\n')
-        prog = C.program(name, C.gate(12, '.v12') + (C.gate(1, '.v1') if fault == 1 else '') + setup + kernel_setup + enter
-                         + C.handlers(saved, xmm=True, vectors=(1, 6, 12, 13, 14, 128), flags_mask=flags_mask), user, memory=mapped)
+        prog = C.program(name, C.gate(12, '.v12') + (C.gate(0, '.v0') if fault == 0 else '') + (C.gate(1, '.v1') if fault == 1 else '') + setup + kernel_setup + enter
+                         + C.handlers(saved, xmm=True, vectors=((0,) if fault == 0 else ()) + (1, 6, 12, 13, 14, 128), flags_mask=flags_mask), user, memory=mapped)
         # Handler offsets are from compat.handlers, the target memory and CR2 are independent of the recorded frame.
         expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, error, rip,
                                                                      0xdb if cpl3_mode == 32 else 0x23),
@@ -690,6 +690,102 @@ def cases():
         fault=6, eax=0xaabbcc01, rflags=0x10045)
     add('gs-xlat-retry-after-reload', 'gs xlatb', segment='gs', prefix=xlat_regs(3, 1),
         eax=0xaabbcc55, success=True, reload_limit=4, retry_regs={C.REC + 0x40: struct.pack('<I', 0xaabbcc01)})
+    # Single memory source, implicit AX or DX:AX. Seed the unused high halves independently;
+    # signed division truncates toward zero and its remainder has the dividend's sign.
+    def muldiv(name, op, width, src, a, d, *, wrapped=False, missing=False, denied=False, overflow=False, watch=False):
+        bits = width * 8
+        mask = (1 << bits) - 1
+        seg = 'gs' if op in ('imul', 'idiv') else 'fs'
+        raw = (src & mask).to_bytes(width, 'little')
+        split = width // 2
+        base = (1 << 32) - split if wrapped else C.W + 0xa0
+        size = {1: 'byte', 2: 'word', 4: 'dword'}[width]
+        pos = int(denied)
+        prefix = f'    mov eax, {a:#x}\n    mov edx, {d:#x}\n    mov edi, {pos}\n    cmp edi, edi\n    stc\n'
+        mapped = (C.TOP_ONLY if missing else C.WRAP) if wrapped else ()
+        mem = {}
+        setup = load_bytes(base, raw.ljust(4, b'\0')) if not wrapped else ''
+        if wrapped:
+            half = 'byte' if split == 1 else 'word'
+            setup = f'    mov ebx, {base:#x}\n    mov {half} [rbx], {int.from_bytes(raw[:split], "little"):#x}\n'
+            mem[high + 2 - split] = raw[:split]
+            if not missing:
+                setup += f'    xor ebx, ebx\n    mov {half} [rbx], {int.from_bytes(raw[split:], "little"):#x}\n'
+                mem[low] = raw[split:]
+        if watch:
+            setup += watch_low.replace('0x10001', '0x30001')
+        signed = op in ('imul', 'idiv')
+        def sx(value, n):
+            return value - (1 << n) if signed and value & (1 << (n - 1)) else value
+
+        fault = 13 if denied else 14 if missing else 0 if op in ('div', 'idiv') and (not src or overflow) else None
+        flags = 0x10045
+        flags_mask = 0x10ed5
+        if fault is None:
+            operand = sx(src & mask, bits)
+            if op in ('mul', 'imul'):
+                product = sx(a & mask, bits) * operand
+                lo_part, hi_part = product & mask, (product >> bits) & mask
+                flags_mask = 0x801
+                flags = 0x801 if product != sx(lo_part, bits) else 0
+            else:
+                dividend = (a & 0xffff) if width == 1 else ((d & mask) << bits) | (a & mask)
+                dividend = sx(dividend, 2 * bits)
+                q = abs(dividend) // abs(operand) * (-1 if (dividend < 0) != (operand < 0) else 1)
+                lo_part, hi_part = q & mask, (dividend - q * operand) & mask
+                flags = None  # successful DIV/IDIV leave arithmetic flags undefined
+            if width == 1:
+                a = (a & ~0xffff) | (hi_part << 8) | lo_part
+            else:
+                a, d = (a & ~mask) | lo_part, (d & ~mask) | hi_part
+        mem[C.REC + 0x50] = struct.pack('<I', d)
+        add(name, f'{op} {size} [{seg}:edi]', segment=seg, base=base, limit=width - 1, access=0xf1, mapped=mapped,
+            prefix=prefix, kernel_setup=setup, success=fault is None, fault=fault, error=4 if missing and not denied else 0,
+            cr2=0 if missing and not denied else CR2, eax=a, captured=mem, rflags=flags, flags_mask=flags_mask)
+
+    for width in (1, 2, 4):
+        bits = width * 8
+        mask = (1 << bits) - 1
+        hi_seed = 0x76543210
+        for op in ('mul', 'imul', 'div', 'idiv'):
+            name = f'implicit-{op}-{bits}'
+            if op in ('mul', 'imul'):
+                src, a, d = mask, 0xffffff83, hi_seed
+            elif op == 'idiv':
+                src = 3
+                a = 0xabcdffef if width == 1 else 0xffffffef
+                d = hi_seed if width == 1 else 0x7654ffff if width == 2 else 0xffffffff
+            else:
+                src = 3
+                a = 0xabcd0111 if width == 1 else 0xabcd0011 if width == 2 else 17
+                d = hi_seed if width == 1 else 0x76540001 if width == 2 else 1
+            muldiv(name + '-read', op, width, src, a, d)
+            muldiv(name + '-limit', op, width, 0, a, d, denied=True)
+            if width > 1:
+                muldiv(name + '-wrap', op, width, src, a, d, wrapped=True)
+                muldiv(name + '-wrap-pf', op, width, 0, a, d, wrapped=True, missing=True)
+            if op in ('div', 'idiv'):
+                for wrap in ((False, True) if width > 1 else (False,)):
+                    suffix = '-wrapped' if wrap else '-ordinary'
+                    muldiv(name + '-zero' + suffix, op, width, 0, a, d, wrapped=wrap)
+                    # A quotient just outside the representable width, with a nonzero divisor.
+                    if op == 'div':
+                        oa, od, divisor = (0xabcd0100 if width == 1 else 0), (hi_seed if width == 1 else 1), 1
+                    else:
+                        oa = 0xabcdff80 if width == 1 else 1 << (bits - 1)
+                        od, divisor = (hi_seed if width == 1 else mask), mask
+                    muldiv(name + '-overflow' + suffix, op, width, divisor, oa, od, wrapped=wrap, overflow=True)
+    for width in (1, 2, 4):
+        for wrap in ((False, True) if width > 1 else (False,)):
+            # +17 / -3 gives -5 remainder +2. Replacing the signed source by its unsigned
+            # low bits often leaves the zero/overflow checks happy but changes the quotient.
+            a = 0xabcd0011 if width < 4 else 17
+            d = 0x76543210 if width == 1 else 0x76540000 if width == 2 else 0
+            muldiv(f'implicit-idiv-{8*width}-negative-divisor-{"wrap" if wrap else "read"}', 'idiv', width, -3, a, d, wrapped=wrap)
+    muldiv('implicit-mul-word-no-overflow', 'mul', 2, 3, 0xabcd0002, 0x12345678)
+    muldiv('implicit-imul-dword-signed-overflow', 'imul', 4, -1, 0x80000000, 0x12345678, wrapped=True)
+    # A memory read matching DR0 still faults for a zero divisor and owes no post-instruction #DB.
+    muldiv('implicit-idiv-de-before-data-trap', 'idiv', 4, 0, 8, 0, wrapped=True, watch=True)
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)
