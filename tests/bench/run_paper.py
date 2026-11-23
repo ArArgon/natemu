@@ -30,7 +30,7 @@ makes its translations and later starts reuse those of unchanged code (the JDK's
 each time) from natemu's in-memory pool. The result is per start position: the median over the boots (by_position).
 The guest reports what it ran with (installed packages' digest, JDK version, seed, links up) under each phase's facts. The case passes
 --speculation-barriers, as the README advises: without it Linux turns on PTI, whose page-table switches natemu has no
-fast path for yet (a start takes about 5x as long; docs/benchmarks.md, mitigations). Results: OUT/result.json and
+fast path for yet (a start takes about 5x as long; an experiment in docs/writable-drop.md). Results: OUT/result.json and
 OUT/bench.jsonl (one line). Exit 0 when every boot ended cleanly and every start reached "Done"; 3 when another VM ran
 during a timed boot (contended: not comparable); 1 otherwise."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
