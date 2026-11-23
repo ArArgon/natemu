@@ -85,6 +85,22 @@ stop being a correctness premise.
 - The page kept unmapped at 4 GiB, its state word, `enter_compat_user` and `select_guest_space` are deleted: the
   root has no entry there, so a load running across 4 GiB aborts as before.
 
+**Named for the implementation (second review).**
+
+- The host writes root links too (`crates/host/src/memory.rs`): the private link into each lower root, and the alias
+  entry into each upper root in three places. The compat roots join all of them, or the guest-state page is unmapped
+  under the compat root.
+- The three pages leave the pool but stay owned by the window and stay refused as shadow targets (`Space::install`
+  refuses the owner's table pages; a guest page backed by one of them must not become a writable EL0 shadow). A unit
+  case pins it.
+- `tables::space` derives the loaded root, the window's IPA and the supervisor ASID from TTBR0, today from one bit;
+  it and `select`'s early return become three-way: an ASID of 130 or more is the compat root of vCPU ASID - 130. A
+  unit case pins the arithmetic; it is on every install and flush path, so it stays a compare and a subtraction.
+- Of the review's two scenarios only SHLD then `[eax]` fails on the branch as built (it has no folding). SHLD then
+  `[eax+8]` and the repaired-base case are shown failing on an intermediate build (folding restored, the runtime
+  without the compat root) if that is cheap, else recorded as guards beside the failing control.
+- The scan of `fexc-asm32` for 64-bit-form writes of guest registers is a kept static case, not a one-time pass.
+
 **Cost.**
 
 - A pure 32-bit process: the same number of root switches as today (a system call goes compat, supervisor, compat
