@@ -1241,6 +1241,11 @@ smoke = ["part-0", "part-24", "part-62", "part-72", "part-75", "part-77", "part-
 "ptrace-vmaccess" = "global.attach hits its 30 s internal timeout: a Linux 6.12.107 ptrace/exec wait cycle in the guest kernel, on QEMU too (docs/restructure/correctness-public-kernel.md, ptrace follow-up)"
 "mm-mremap_test" = "the default guest fixture rejects the 2 GiB mappings (commit accounting) and the 40 MiB preamble (EEXIST); mm-mremap_test-overcommit-noaslr is the passing fixture (docs/restructure/correctness-public-kernel.md, defect list)"
 
+[suite.expected_without.afp]
+# Only in fast mode on a Mac without FEAT_AFP (M1, M2): QEMU's test-i386-fma checks two of fast mode's documented
+# deviations there (docs/floating-point.md). With AFP (the M4) and in accurate mode it passes, and must.
+"qemu-fma" = "fma-invalid-flag: vfmadd132sd of 0 * inf + QNaN 0x7ff800000000aaaa gives the default NaN with MXCSR.IE (x86: that QNaN, no flag); and band-ue-flag: 0x3fdfffffffffffff * 0x1fffffffffffff + 0x801fffffffffffff, rounding up to -MIN_NORMAL, sets UE beside PE (x86 judges tininess after rounding; docs/floating-point.md)"
+
 [[suite]]
 name = "litmus"
 kind = "judged"
