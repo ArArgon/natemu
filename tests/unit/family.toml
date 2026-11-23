@@ -36,7 +36,7 @@ name = "rust-fs-sweep"
 kind = "units"
 harness = "units"
 params = { tool = "nextest", fexc = true, filter = "test(/every_limited_fs_form/)" }
-needs = { cores = 8, perf = true }
+needs = { cores = 4, perf = true }
 
 [[suite]]
 name = "rust-afp"

@@ -77,7 +77,9 @@ def program(segment, flat_limit=False, mixed=False):
     # A byte-granular limit of 0xfff (a limited segment), or 4 GiB (flat-limit: page-granular, limit 0xfffff).
     limit = (f'    mov word [{descriptor:#x}], 0xffff\n    or byte [{descriptor + 6:#x}], 0x8f\n' if flat_limit else
              f'    mov word [{descriptor:#x}], 0xfff\n    and byte [{descriptor + 6:#x}], 0x70\n')
-    kernel = limit + compat.ENTER() + compat.handlers()
+    # (The mixed loop's MOVSS needs CR4.OSFXSR.)
+    sse = '    mov rax, cr4\n    bts rax, 9\n    mov cr4, rax\n' if mixed else ''
+    kernel = limit + sse + compat.ENTER() + compat.handlers()
     return compat.program(f'compat-tls-{segment}{"-flat-limit" if flat_limit else ""}{"-mixed" if mixed else ""}', kernel, user)
 
 
