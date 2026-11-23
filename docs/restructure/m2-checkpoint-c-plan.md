@@ -286,7 +286,9 @@ cold: mov w0, wOffset       ; out of line as today (fexc_sites.inc:341-343): a s
   that nothing proves equal). For a plain ModRM operand the hook computes the 32-bit effective offset once
   (`DecodeAddress` and `LoadEffectiveAddress` without the base). When the handler then calls `DecodeAddress`
   (`FEX/OpcodeDispatcher.cpp:4602`) for that operand, it gets `{Base = that offset, Segment = the checked base}`
-  instead of decoding again, so the address every access uses is the checked offset plus the checked base by
+  instead of decoding again (only for the memory operand: `DecodeAddress` also runs for literal and register
+  operands and sets their `Segment`, `:4606`, which must stay as they are, or `add fs:[x], imm` would get the offset
+  as its immediate), so the address every access uses is the checked offset plus the checked base by
   construction. `GetSegment` (`:4330-4377`), the only place FEX reads `fs_cached`/`gs_cached` for 32-bit code
   (`:4365-4369`), returns the checked base for a limited segment, which covers `AppendSegmentOffset` (`:4379`), the
   roughly 45 `MakeSegmentAddress` callers (the operand form, `FEX/OpcodeDispatcher.h:1658-1665`, loads the
@@ -299,7 +301,12 @@ cold: mov w0, wOffset       ; out of line as today (fexc_sites.inc:341-343): a s
 - **POP m is checked after its stack read.** x86 reads the stack first, so a stack #PF or #SS comes before the
   destination's #GP. For POP m alone the check is not emitted in the loop but at the handler's `DecodeAddress` call
   for the destination, after its stack load, from the address that call computes (section 1 already made it use the
-  updated ESP). Admission's placement rule names this exception.
+  updated ESP). `Pop()` writes the new ESP to FEX's register cache before the destination is decoded
+  (`FEX/OpcodeDispatcher.cpp:430-433`, `OpcodeDispatcher.h:2691-2699`), but fexc's precision passes keep every state
+  commit of an instruction after its last site, and the check is a site (`tools/fexc/shim/fexc_precision.h:53`): in
+  the emitted code of `pop dword [eax]` the ESP register is written after the store. So a #GP at the check banks
+  the ESP from before the pop, as a #PF at the store does today; `verify_precision.py` checks it on the code and the
+  POP case checks it at run time. Admission's placement rule names this exception.
 - **Same IR block.** FEX's register allocation is block-local, so the base must be used in the IR block that holds
   the check. If `GetSegment` or `DecodeAddress` is asked for a limited segment with no checked base for this
   instruction, or from another IR block than the check's, the compile fails (the dispatcher's `DecodeFailure`,
@@ -343,7 +350,9 @@ at the level of the *native access*, replacing the per-form `wrapped_segment_acc
   (`SegmentOverride`, `:232-237`); push and pop kinds stay SS, so `push fs:[x]` with ESP = FFFF_FFFEH still gets #SS
   from its stack access; split, guard and alignment stubs take the tag of the access they cover, as they take its
   other fields (`:286-`). Admission accepts 4/5 on those kinds in 32-bit objects and checks every site's tag against
-  iced's `memory_segment()` for the instruction (push/pop kinds: SS), with the bit set or clear. The resident's only
+  iced's `memory_segment()` for the instruction (push/pop kinds: SS), with the bit set or clear, under `JoinSites`'
+  own mapping: FS and GS are 4 and 5; an SS prefix, or no FS/GS/SS prefix with an ESP or EBP base, is SS; everything
+  else (ES, CS and DS prefixes included, which `JoinSites` ignores, `:266-281`) is DS. The resident's only
   reader of the tag is `noncanonical` (`rt/execution.rs:3643-3654`: SS gives #SS, anything else #GP), which is right
   for 4/5 unchanged; the host's two constructors of `SEG_SS` sites are test fixtures (`host/admission.rs:1947, 2182`).
 - FEX forms the 32-bit sum of base and offset (`FEX/Addressing.cpp:60-66`), so the first byte's address is already
@@ -451,7 +460,7 @@ the string cut; every test (cases that named the cold path now assert the counte
   and the abort-path completion instead.
 - **Straddles**: load, store, read-modify-write, LOCK, 16-byte vector and x87 operands across 4 GiB with the bit set
   and with it clear (4 GiB limit, base just below 4 GiB), against the `compat-kvm` answers; the base-0 control still
-  faults; `push fs:[x]` with ESP = FFFF_FFFEH gives #SS; the two recorded deviations' cases.
+  faults; `push fs:[x]` and `call fs:[x]` with ESP = FFFF_FFFEH give #SS; the two recorded deviations' cases.
 - **Stale bits**: the same EIP and bytes run under a flat-limit FS, then after a reload with a small limit (must
   fault), then flat again (must run with stub count 0), in ordinary and one-instruction blocks, across a link, and
   after a round trip through 64-bit code that reloads FS; a GDT rewrite without a reload changes nothing;
