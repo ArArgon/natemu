@@ -1677,7 +1677,7 @@ def cmd_compat_limits(a, host, runtime):
         name = prog['name']
         if a.programs and not any(n in name for n in a.programs):
             continue
-        for limit in ([], [1]):
+        for limit in ([],) if prog.get('whole_blocks') else ([], [1]):
             label = f'{name}/{limit[0] if limit else "default"}'
             extra = limit + (['--strict-unassigned'] if prog.get('strict_unassigned') else [])
             if 'frame_alias' in prog:

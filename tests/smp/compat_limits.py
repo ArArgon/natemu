@@ -97,7 +97,7 @@ def cases(*, reference_control=False):
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5, production=False, frame_alias=None, require_link=False, ymm1_high=None, fp_controls=None):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5, production=False, frame_alias=None, require_link=False, ymm1_high=None, fp_controls=None, checks=None, whole_blocks=False):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -175,6 +175,10 @@ def cases(*, reference_control=False):
             expected[C.LOG] = struct.pack('<Q', 3)
         if production:
             prog['production_admission'] = True
+        if whole_blocks:
+            prog['whole_blocks'] = True   # not also one instruction per block
+        if checks is not None:
+            prog['segment_checks'] = [checks]   # operand checks the resident decides (0: all passed inline)
         if frame_alias is not None:
             prog['frame_alias'] = frame_alias
         if require_link:
@@ -1096,6 +1100,117 @@ def cases(*, reference_control=False):
             prefix=f'    mov esi, {C.W:#x}\n    mov edi, 0xfffffffe\n')
     add('ss-moffs-load', 'mov eax, [ss:0xfffffffe]', fault=12, mapped=C.TOP_ONLY)
     cases += [mixed_user_wrap(), mixed_user_wrap_far()]
+    # M2 checkpoint C, the generic operand check: one in-range and one out-of-range case per instruction class the
+    # per-opcode checks left unchecked, under a writable expand-up segment. In range the inline check passes (the
+    # resident decides none: checks=0) and the effect is the instruction's; out of range the fault is at the instruction
+    # with memory, registers and flags as before it (the resident decided one).
+    dword = int.from_bytes(VALUE[1:5], 'little')
+
+    def at1(value):
+        return VALUE[:1] + (value & 0xffffffff).to_bytes(4, 'little') + VALUE[5:]
+
+    regs = '    mov eax, 0x10\n    mov ecx, 0x01020304\n    cmp al, al\n    stc\n'
+    big = 2**53 + 1   # not a double: only the FILD m64, FISTP m64 pair's kept integer stores it exactly
+    fild = (f'    fninit\n    mov dword [{C.W + 0x50:#x}], {big & 0xffffffff:#x}\n    mov dword [{C.W + 0x54:#x}], {big >> 32:#x}\n'
+            f'    fild qword [{C.W + 0x50:#x}]\n')
+    for name, insn, result, extra in [
+        ('inc', 'inc dword [fs:edi+1]', at1(dword + 1), {}),
+        ('add-imm', 'add dword [fs:edi+1], 5', at1(dword + 5), {}),
+        ('not', 'not dword [fs:edi+1]', at1(~dword), {}),
+        ('neg', 'neg dword [fs:edi+1]', at1(-dword), {}),
+        ('shl', 'shl dword [fs:edi+1], 1', at1(dword << 1), {}),
+        ('lock-add', 'lock add [fs:edi+1], eax', at1(dword + 0x10), {}),
+        ('xadd', 'xadd [fs:edi+1], eax', at1(dword + 0x10), {}),
+        ('lock-cmpxchg-miss', 'lock cmpxchg [fs:edi+1], ecx', VALUE, {}),
+        # Bit 35 from offset 0: the unit is the dword at 4.
+        ('bts-reg', 'bts [fs:edi], eax', VALUE[:4] + bytes([VALUE[4] | 8]) + VALUE[5:], dict(last=7, pre='    mov eax, 0x23\n', eax=0x23)),
+        ('push', 'push dword [fs:edi+1]', VALUE, {}),
+        ('pop', 'pop dword [fs:edi+1]', at1(0x01020304), dict(pre='    push ecx\n', esp=C.US - 4)),
+        # POP computes its destination with the ESP it leaves.
+        ('pop-esp-base', f'pop dword [fs:esp-{C.US - 1:#x}]', at1(0x01020304), dict(pre='    push ecx\n', esp=C.US - 4)),
+        ('movss-store', 'movss [fs:edi+1], xmm1', VALUE[:1] + INITIAL[:4] + VALUE[5:], {}),
+        ('movd-load', 'movd xmm0, [fs:edi+1]', VALUE, {}),
+        ('paddd-mmx', 'paddd mm0, [fs:edi]', VALUE, dict(last=7)),
+        ('movups-load', 'movups xmm0, [fs:edi]', VALUE, dict(last=15)),
+        ('fld', 'fld dword [fs:edi+1]', VALUE, {}),
+        ('fstp', 'fstp qword [fs:edi]', bytes(8) + VALUE[8:], dict(last=7, pre='    fninit\n    fldz\n')),
+        ('fild-fistp', 'fistp qword [fs:edi]', big.to_bytes(8, 'little') + VALUE[8:], dict(last=7, pre=fild)),
+    ]:
+        last, prefix = extra.get('last', 4), regs + extra.get('pre', '')
+        # (The x87 integer pair is formed in ordinary blocks only: alone in a block, FISTP converts the reduced-precision value.)
+        add(f'fs-generic-{name}', insn, limit=last, success=True, prefix=prefix, memory=result, checks=0, whole_blocks=name == 'fild-fistp')
+        frame = {C.REC + 0x28: struct.pack('<Q', extra['esp'])} if 'esp' in extra else None
+        add(f'fs-generic-{name}-over', insn, limit=last - 1, prefix=prefix, rflags=0x10045, eax=extra.get('eax', 0x10),
+            ecx=0x01020304, captured=frame, checks=1)
+    # The FISTP of the pair faults at its operand check twice (the table is edited, then FS reloaded) and is retried:
+    # the integer the FILD read is stored exactly.
+    add('fs-generic-fild-fistp-retried', 'fistp qword [fs:edi]', limit=6, reload_limit=7, success=True, prefix=regs + fild,
+        memory=big.to_bytes(8, 'little') + VALUE[8:], retry_regs={C.REC + 0x48: struct.pack('<I', 0x01020304)}, whole_blocks=True)
+    # Near indirect CALL and JMP read their target through the segment before anything else.
+    for name, insn in [('call', 'call [fs:edi+1]'), ('jmp', 'jmp [fs:edi+1]')]:
+        add(f'fs-generic-{name}-over', insn, prefix=regs, rflags=0x10045, eax=0x10, ecx=0x01020304, checks=1)
+    # BT with a register index: the unit's offset is the effective address plus the signed displacement.
+    add('fs-generic-bt-negative-index', 'bt [fs:edi+4], eax', limit=7, success=True, prefix='    mov eax, -1\n', checks=0, rflags=0x44)
+    add('fs-generic-bt-negative-index-over', 'bt [fs:edi], eax', limit=7, prefix='    mov eax, -1\n', checks=1)
+    add('fs-generic-bt-positive-index-over', 'bt [fs:edi], eax', limit=7, prefix='    mov eax, 64\n', checks=1)
+    # Every addressing form reaches the check with its offset: the last in-range and the first out-of-range one.
+    forms = [('disp32', '[fs:{o:#x}]', ''), ('base', '[fs:ebx]', '    mov ebx, {o:#x}\n'),
+             ('base-index', '[fs:ebx+esi*4]', '    mov ebx, {o:#x} - 8\n    mov esi, 2\n'),
+             ('esp', '[fs:esp]', '    mov esp, {o:#x}\n'), ('ebp', '[fs:ebp+0]', '    mov ebp, {o:#x}\n'),
+             ('wrapping-disp', '[fs:ebx-0x1000]', '    mov ebx, {o:#x} + 0x1000\n'),
+             ('wrapping-sum', '[fs:ebx+0x7fffffff]', '    mov ebx, {o:#x} - 0x7fffffff\n')]
+    for name, operand, setup in forms:
+        for offset, ok in [(4, True), (5, False)]:
+            add(f'fs-generic-address-{name}-{"in" if ok else "over"}', f'mov ecx, {operand.format(o=offset)}', limit=7,
+                prefix=setup.format(o=offset), success=ok, ecx=int.from_bytes(VALUE[4:8], 'little') if ok else None, checks=int(not ok))
+    add('fs-generic-address-moffs-in', 'mov eax, [fs:4]', limit=7, success=True, eax=int.from_bytes(VALUE[4:8], 'little'), checks=0)
+    add('fs-generic-address-moffs-over', 'mov eax, [fs:5]', limit=7, checks=1)
+    add('fs-generic-address-xlat-in', 'fs xlatb', limit=7, success=True, prefix='    mov ebx, 4\n    mov eax, 0xffffff03\n',
+        eax=0xffffff00 | VALUE[7], checks=0)
+    add('fs-generic-address-xlat-over', 'fs xlatb', limit=7, prefix='    mov ebx, 4\n    mov eax, 0xffffff04\n', eax=0xffffff04, checks=1)
+    # Segments the record does not model are the resident's on every access: read-only (reads pass, writes fault),
+    # expand-down, and a one-byte read at offset 0 under a segment whose record is 0.
+    add('fs-generic-readonly-read', 'add ecx, [fs:edi]', access=0xf1, success=True, prefix='    xor ecx, ecx\n',
+        ecx=int.from_bytes(VALUE[:4], 'little'), checks=1)
+    add('fs-generic-readonly-write', 'inc dword [fs:edi]', access=0xf1, checks=1)
+    add('gs-generic-expand-down-read', 'add ecx, [gs:edi+5]', limit=4, access=0xf7, flags=0, segment='gs', success=True,
+        prefix='    xor ecx, ecx\n', ecx=int.from_bytes(VALUE[5:9], 'little'), checks=1)
+    add('gs-generic-expand-down-write-low', 'inc dword [gs:edi+4]', limit=4, access=0xf7, flags=0, segment='gs', checks=1)
+    add('fs-generic-readonly-byte-zero', 'mov cl, [fs:0]', access=0xf1, limit=0, success=True, prefix='    xor ecx, ecx\n',
+        ecx=VALUE[0], checks=1)
+    add('fs-generic-readonly-byte-zero-write', 'mov [fs:0], cl', access=0xf1, limit=0, checks=1)
+    # The same forms through a flat-limit segment with a base (Linux's TLS shape): no check in the code, none decided.
+    add('fs-generic-flat-limit-inc', 'inc dword [fs:edi+1]', limit=0xfffff, flags=12, success=True, memory=at1(dword + 1), checks=0)
+    add('gs-generic-flat-limit-movss', 'movss [gs:edi+1], xmm1', limit=0xfffff, flags=12, segment='gs', success=True,
+        memory=VALUE[:1] + INITIAL[:4] + VALUE[5:], checks=0)
+    # An operand whose bytes wrap from FFFF_FFFFH to linear 0, in range of its segment: completed at the native access,
+    # under a limited segment (the inline check passes: none decided) and under a flat-limit one (no check at all).
+    wrap = dict(base=0xfffffffe, mapped=C.WRAP, kernel_setup=up, success=True)
+    for bits, limit, flags in [('limited', 3, 4), ('flat-limit', 0xfffff, 12)]:
+        add(f'fs-generic-wrapped-load-{bits}', 'add ecx, [fs:edi]', limit=limit, flags=flags, prefix='    xor ecx, ecx\n',
+            ecx=0x44332211, checks=0, **wrap)
+        add(f'fs-generic-wrapped-inc-{bits}', 'inc dword [fs:edi]', limit=limit, flags=flags, checks=0,
+            captured={high: bytes.fromhex('1222'), low: bytes.fromhex('3344')}, **wrap)
+        add(f'fs-generic-wrapped-lock-add-{bits}', 'lock add [fs:edi], eax', limit=limit, flags=flags, prefix='    mov eax, 0x01010101\n',
+            checks=0, captured={high: bytes.fromhex('1223'), low: bytes.fromhex('3445')}, **wrap)
+        add(f'fs-generic-wrapped-movss-load-{bits}', 'movss xmm1, [fs:edi]', limit=limit, flags=flags, checks=0,
+            xmm1=bytes.fromhex('11223344') + bytes(12), **wrap)
+        add(f'fs-generic-wrapped-movss-store-{bits}', 'movss [fs:edi], xmm1', limit=limit, flags=flags, checks=0,
+            captured={high: INITIAL[:2], low: INITIAL[2:4]}, **wrap)
+        add(f'fs-generic-wrapped-fild-{bits}', 'fild word [fs:edi+1]', limit=limit, flags=flags, checks=0, **wrap)
+    # A flat segment's access across 4 GiB is still its limit fault, and the stack's is #SS whatever the operand's segment.
+    add('fs-generic-flat-base-zero-straddle', 'mov ecx, [fs:0xfffffffe]', base=0, limit=0xfffff, flags=12, mapped=C.WRAP,
+        kernel_setup=up, checks=0)
+    add('fs-generic-push-stack-straddle', 'push dword [fs:edi]', fault=12, mapped=C.WRAP, kernel_setup=up,
+        prefix='    mov esp, 2\n', checks=0)
+    add('fs-generic-call-stack-straddle', 'call [fs:edi]', fault=12, mapped=C.WRAP, kernel_setup=up,
+        prefix='    mov esp, 2\n', checks=0)
+    # Recorded deviation (docs/restructure/m2-checkpoint-c-plan.md, "Linear straddles"): under a flat-limit segment
+    # nothing tests the offset, so an operand that runs past offset FFFF_FFFFH is not the #GP x86 gives: the bytes
+    # before the base are read (as main and QEMU do). The base is at least 32, so the access does not also wrap linearly.
+    add('fs-generic-flat-limit-offset-overrun-deviation', 'mov ecx, [fs:0xfffffffe]', base=tls + 2, limit=0xfffff, flags=12,
+        success=True, ecx=int.from_bytes(VALUE[:4], 'little'), checks=0)
+
     return cases
 
 
