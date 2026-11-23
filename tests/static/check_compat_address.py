@@ -78,8 +78,33 @@ def check_forms(compiler, options):
     return errors
 
 
-def main(compiler):
+def check_inline_registers(compiler):
+    # Inspect the actual ARM transfers, including a guest register used as both data and address.
     errors = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for reg, root in enumerate((4, 7, 5, 6, 8, 9, 10, 11)):
+            for opcode in ('648b', '6589'):
+                hexs = opcode + f'{(reg << 3) | 7:02x}'
+                d = verify_precision.compile_(compiler, hexs, '0x401000', ['--bitness', '32'])
+                site, = (s for s in d['sites'] if s['kind'] in ('load', 'store'))
+                code = bytes.fromhex(d['code']['hex'])
+                dis = check_sites.disassemble(code, d['code']['layout']['code_region_end'], pathlib.Path(tmp))
+                at = site['native_offset']
+                rt, = site['data_regs']
+                if site['kind'] == 'store':
+                    if rt != root or not dis[at].startswith(f'str w{root},'):
+                        errors.append(f'{hexs}: store source does not hold its ModRM GPR: {dis[at]}')
+                elif not dis[at].startswith(f'ldr w{rt},') or dis.get(at + 4) != f'mov x{root}, x{rt}':
+                    errors.append(f'{hexs}: missing load result for its ModRM GPR: {dis[at]}, {dis.get(at + 4)}')
+    for hexs in ('64678b0f', '6765890f'):
+        d = verify_precision.compile_(compiler, hexs, '0x401000', ['--bitness', '32'])
+        if d['status'] != 'no_code':
+            errors.append(f'{hexs}: compiled a 16-bit-address dword MOV')
+    return errors
+
+
+def main(compiler):
+    errors = check_inline_registers(compiler)
     for size in ([], ['--max-insts', '1']):
         label = 'single' if size else 'default'
         errors.extend(f'{label}: {message}' for message in check_forms(compiler, size))

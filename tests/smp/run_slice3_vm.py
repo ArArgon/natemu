@@ -1679,7 +1679,11 @@ def cmd_compat_limits(a, host, runtime):
             continue
         for limit in ([], [1]):
             label = f'{name}/{limit[0] if limit else "default"}'
-            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / label, limit + (['--strict-unassigned'] if prog.get('strict_unassigned') else []))
+            extra = limit + (['--strict-unassigned'] if prog.get('strict_unassigned') else [])
+            if 'frame_alias' in prog:
+                extra += ['--guest-state-alias', hex(prog['frame_alias'])]
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / label, extra,
+                                  shape=not prog.get('production_admission'))
             diffs = []
             if rc:
                 diffs.append(f'driver {rc}: {err}')
@@ -1693,7 +1697,13 @@ def cmd_compat_limits(a, host, runtime):
                             diffs.append(f'expected {why} at {rip:#x}, got {got}')
                     elif cpu['stop'] != 'reached' or smp.num(cpu['rip']) != body_end(prog, smp.num(initial['rip'])):
                         diffs.append(f'cpu{i} stopped {cpu["stop"]}/{cpu["reason"]} at {cpu["rip"]}')
-                    if prog['ncpu'] > 1 and not limit and not cpu['stats']['linked']:
+                    if 'segment_views' in prog:
+                        tags = cpu.get('compat_dword_segments')
+                        if tags is None or [smp.num(v) for v in tags] != prog['segment_views'][i]:
+                            diffs.append(f"cpu{i} segment tags {tags}, expected {prog['segment_views'][i]}")
+                    if 'frame_alias' in prog and smp.num(cpu['guest_state_alias']) != prog['frame_alias']:
+                        diffs.append(f"cpu{i} unexpected frame alias {cpu['guest_state_alias']}")
+                    if (prog['ncpu'] > 1 or prog.get('require_link')) and not limit and not cpu['stats']['linked']:
                         diffs.append(f'cpu{i} installed no links in the default run')
                 if 'unassigned_fills' in prog:
                     counts = {smp.num(e['page']): (e['reads'], e['writes']) for e in out.get('unassigned_pages', [])}

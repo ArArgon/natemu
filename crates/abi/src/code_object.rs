@@ -11,7 +11,7 @@
 pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
 pub const VERSION: u32 = 4;
 /// Compatibility objects carry the resident scalar FS/GS check contract.
-pub const COMPAT_VERSION: u32 = 5;
+pub const COMPAT_VERSION: u32 = 6;
 /// SEGMENT.data_reg[0] marks a native store source held live at the descriptor check.
 /// Its low five bits name the ordinary STORE's transfer register.
 pub const SEGMENT_STORE_REGISTER: u8 = 0x40;

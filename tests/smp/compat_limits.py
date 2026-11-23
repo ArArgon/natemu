@@ -21,15 +21,83 @@ def load_bytes(at, value):
                    for j in range(0, len(value), 4))
 
 
+def inline_base_refresh(segment):
+    first, second = C.W + 0x80, C.W + 0x90
+    initial, replacement, write = 0x12345678, 0x89abcdef, 0x18425a7e
+    raw = descriptor(first, 3, access=0xf1)
+
+    def wrmsr(index, value):
+        return f'    mov ecx, {index:#x}\n    mov eax, {value:#x}\n    xor edx, edx\n    wrmsr\n'
+
+    setup = f'''    mov rax, {raw:#x}
+    mov [{C.F['g'] + 0x28:#x}], rax
+    mov dword [{first:#x}], {initial:#x}
+    mov dword [{second:#x}], {replacement:#x}
+    mov eax, {CR2:#x}
+    mov cr2, rax
+'''
+    if segment == 'gs':
+        setup += wrmsr(0xc0000102, second)  # IA32_KERNEL_GS_BASE, exchanged in the first handler
+    change = '    swapgs\n' if segment == 'gs' else wrmsr(0xc0000100, second)  # IA32_FS_BASE
+    init = f'''    mov eax, 0x2b
+    mov {segment}, ax
+    xor edi, edi
+    stc
+    mov edx, {write:#x}
+    jmp short $+2
+'''
+    read = f'    mov ecx, [{segment}:edi]\n    jmp short $+2\n'
+    overrun = f'    mov eax, [{segment}:edi+1]\n    int 0x80\n'
+    read_rip = C.U + len(C.user32(init))
+    fault_rip = C.U + len(C.user32(init + read))
+    store_rip = C.U + len(C.user32(init + read + overrun))
+    user = init + read + overrun + f'    mov [{segment}:edi], edx\n    int 0x80\n'
+
+    # Retry the faulting read across the base update, then revisit the same valid read and
+    # finally try writing within the unchanged read-only limit.
+    handler = f'''    mov rax, cr2
+    mov [{C.REC + 0x100:#x} + rbx], rax
+    cmp qword [rsp], 13
+    jne .fin
+    cmp rbx, 0
+    je .change_base
+    cmp rbx, 0x200
+    je .read_again
+    cmp rbx, 0x400
+    jne .fin
+    mov qword [rsp+16], {store_rip:#x}
+    jmp .resume
+.read_again:
+    mov qword [rsp+16], {read_rip:#x}
+    jmp .resume
+.change_base:
+{change}    mov rcx, [{C.REC + 0x48:#x} + rbx]
+    mov rdx, [{C.REC + 0x50:#x} + rbx]
+    jmp .resume
+'''
+    method = 'swapgs' if segment == 'gs' else 'wrmsr'
+    prog = C.program(f'{segment}-inline-refresh-{method}', setup + C.ENTER() + C.handlers(handler), user)
+    prog['production_admission'] = True
+    expected = {C.LOG: struct.pack('<Q', 4), first: struct.pack('<I', initial), second: struct.pack('<I', replacement)}
+    for i, (rip, word) in enumerate(((fault_rip, initial), (fault_rip, initial),
+                                     (fault_rip, replacement), (store_rip, replacement))):
+        rec = C.REC + 0x200 * i
+        expected[rec] = struct.pack('<7Q', 13, 0, rip, 0xdb, 0x10045, C.US, 0x1b)
+        expected[rec + 0x40] = struct.pack('<3Q', 0x2b, word, write)
+        expected[rec + 0xd0] = struct.pack('<2Q', 0x2b if segment == 'fs' else 0, 0x2b if segment == 'gs' else 0)
+        expected[rec + 0x100] = struct.pack('<Q', CR2)
+    return prog, expected
+
+
 def cases():
     # Each instruction follows a successful load of a real descriptor. A separate register selects the
     # control segment, so mixing the two segments or validating a based linear address fails the case.
     tls = C.W + 0x80
-    cases = []
+    cases = [inline_base_refresh(segment) for segment in ('fs', 'gs')]
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5, production=False, frame_alias=None, require_link=False):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -82,6 +150,12 @@ def cases():
                 for addr, value in (retry_regs or {C.REC + 0x48: struct.pack('<I', 0x12345678)}).items():
                     expected[addr + delta] = value
             expected[C.LOG] = struct.pack('<Q', 3)
+        if production:
+            prog['production_admission'] = True
+        if frame_alias is not None:
+            prog['frame_alias'] = frame_alias
+        if require_link:
+            prog['require_link'] = True
         if fills is not None:
             prog['unassigned_fills'] = fills
         if firmware is not None:
@@ -166,6 +240,26 @@ def cases():
         fault=6, ecx=0x12345678)
     add('fs-generated-retry-after-reload', 'mov ecx, [fs:edi+1]', prefix=seed, success=True,
         ecx=0x55443322, reload_limit=7)
+    # Re-enter a compiled dword MOV loop with each placement of the owner's read-only table.
+    # Preserve live flags across the hot store/load. Both fixture addresses are ordinary guest RAM.
+    loop = (seed + '    mov edx, 5\n    jmp .again\n.again:\n    mov [fs:edi], ecx\n'
+            '    mov ecx, [fs:edi]\n    dec edx\n    jnz .again\n    cmp dl, dl\n    stc\n')
+    for placement, alias in [('after', 0xffff400000001000), ('before', 0xffff40003fe01000)]:
+        add(f'fs-inline-linked-{placement}', 'mov eax, [fs:edi]', prefix=loop, success=True, eax=0x12345678,
+            ecx=0x12345678, memory=bytes.fromhex('78563412') + VALUE[4:], rflags=0x45,
+            frame_alias=alias, production=True, require_link=True)
+    add('gs-inline-hot-write-watch', 'mov [gs:edi], ecx', segment='gs', prefix=seed, fault=1, after_trap=True,
+        kernel_setup=f'    mov eax, {tls:#x}\n    mov dr0, rax\n    mov eax, 0x10001\n    mov dr7, rax\n',
+        memory=bytes.fromhex('78563412') + VALUE[4:], production=True)
+    add('fs-inline-hot-write-pf', 'mov [fs:edi], ecx', base=C.XPAGE, prefix=seed, fault=14, error=6, cr2=C.XPAGE,
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n',
+        ecx=0x12345678, production=True)
+    # Compile and call a user subroutine, update its immediate through a checked FS store, then
+    # call the same entry again. Its result observes normal dirty-code invalidation and relinking.
+    modify = (seed + '    jmp .go\n.callee:\n    mov eax, 0x11111111\n    ret\n.go:\n    call .callee\n'
+              f'    mov edi, .callee + 1 - {C.U:#x}\n')
+    add('fs-inline-hot-code-store', 'mov [fs:edi], ecx\n    call .callee', base=C.U, limit=0xfff, prefix=modify,
+        eax=0x12345678, success=True, production=True)
     # An in-range segment offset locates bytes on the final and first linear pages, in that order.
     high, low = C.HIGH + 4094, C.LOW0
     init = '    mov ax, 0x2211\n    mov rbx, 0xfffffffe\n    mov [rbx], ax\n'

@@ -608,7 +608,7 @@ fn operand_size(c: Code) -> u32 {
 
 /// [`system::ADDRESS32`] or [`system::ADDRESS16`] for a memory operand of that address size (0x67 in 64-bit mode; the
 /// default or 0x67 in 32- and 16-bit code), else 0.
-fn address_size(i: &Instruction) -> u32 {
+pub(crate) fn address_size(i: &Instruction) -> u32 {
     let bytes = (0..i.op_count()).find_map(|k| match i.op_kind(k) {
         OpKind::MemorySegSI | OpKind::MemoryESDI | OpKind::MemorySegDI => Some(2),
         OpKind::MemorySegESI | OpKind::MemoryESEDI | OpKind::MemorySegEDI => Some(4),

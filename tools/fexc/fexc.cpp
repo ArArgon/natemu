@@ -1121,7 +1121,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
     memcpy(f.data(), "NFXOBJ\0\x01", 8);
-    put(8, bitness == 32 ? 5 : 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
+    put(8, bitness == 32 ? 6 : 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
     put(32, Cap.info.TotalLength, 4); put(36, Cap.info.TotalInstructions, 4);
     put(40, f.size(), 4); put(44, code.size(), 4);
     put(48, Cap.prologues[0].second, 4); put(52, marker == UINT64_MAX ? 0xFFFFFFFFull : marker, 4);

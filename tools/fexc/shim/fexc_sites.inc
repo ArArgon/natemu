@@ -321,7 +321,34 @@ DEF_OP(FexcSegmentAddress) {
     Site.base_reg = GetReg(Op->Offset).Idx();
     mov(ARMEmitter::Size::i32Bit, TMP1, GetReg(Op->Offset));
   }
-  b_OrRestart(Label);
+  if (Op->InlineDword) {
+    // The AArch64 backend reserves TMP1..TMP4 from the guest static and dynamic register
+    // files. Keep the input offset in w0 until both cold edges; x1 and x2 are dead between IR ops.
+    using Sz = ARMEmitter::Size;
+    ARMEmitter::ForwardLabel Cold, Joined;
+    // The read-only user dispatcher block is next to x28's 2 MiB, before it only at L2 index 511.
+    and_(Sz::i64Bit, TMP2, STATE, ~uint64_t(0x1fffff));
+    ubfx(Sz::i64Bit, TMP3, STATE, 21, 9);
+    add(Sz::i64Bit, TMP3, TMP3, 1);
+    lsr(Sz::i64Bit, TMP3, TMP3, 9);
+    add(Sz::i64Bit, TMP2, TMP2, 512, true);
+    sub(Sz::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, 22);
+    ldr(TMP2, TMP2, Op->Segment == 4 ? 48 : 80);
+    lsr(Sz::i64Bit, TMP3, TMP2, 32);
+    sub(Sz::i64Bit, TMP3, TMP3, 3);
+    sub(Sz::i64Bit, TMP3, TMP3, TMP1);
+    (void)tbnz(TMP3, 63, &Cold);
+    add(Sz::i32Bit, TMP2, TMP2, TMP1);
+    add(Sz::i64Bit, TMP3, TMP2, 3);
+    (void)tbnz(TMP3, 32, &Cold);
+    mov(Sz::i32Bit, TMP1, TMP2);
+    (void)b(&Joined);
+    (void)Bind(&Cold);
+    b_OrRestart(Label);
+    (void)Bind(&Joined);
+  } else {
+    b_OrRestart(Label);
+  }
   Site.imm = int32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
   mov(ARMEmitter::Size::i32Bit, GetReg(Node), TMP1);
 }

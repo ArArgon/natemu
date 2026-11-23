@@ -151,6 +151,7 @@ impl At {
 /// is one the translator runs. Each pass starts with `find`'s boundary prologue in its order ([`find_from`]); a pass that
 /// cannot run its instruction stops the vCPU ([`stopped`]).
 pub(super) fn run(s: &mut State) {
+    cache::publish_segment_view([0; 2]); // no translated entry while the interpreter owns the CPU
     // (Tests only: the stop made at the interpreter's entry before it ran, `Control::interpreter_off`.)
     if cache::control().interpreter_off != 0 {
         halt(s, if s.cpu.paging().is_none() { stop::UNSUPPORTED_MODE } else { stop::UNSUPPORTED_CODE_MODE })

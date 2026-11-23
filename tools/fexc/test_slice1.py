@@ -677,7 +677,7 @@ class Slice1Cutting(unittest.TestCase):
                 data, rc = run('83c701' + opcode + '83c601', RIP, '--bitness', '32', '--object', str(path))
                 self.assertEqual(rc, 0)
                 obj = check_sites.read_object(path)
-                self.assertEqual(obj['version'], 5)
+                self.assertEqual(obj['version'], 6)
                 self.assertEqual(check_sites.object_vs_json(obj, data), [])
                 site, = (r for r in obj['sites'] if r[5] == 25)
                 desc, = (s for s in data['sites'] if s['kind'] == 'segment')
@@ -685,6 +685,7 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual((site[0], site[1], site[2], site[3], site[4], site[6], site[7], site[9], site[10]),
                                  (desc['native_offset'], desc['guest_offset'], desc['access_native_offset'],
                                   desc['insn_native_offset'], desc['imm'], 4, int(write), 4 if seg == 'fs' else 5, desc['base_reg']))
+                self.assertIsNotNone(check_sites.inline_dword_start(desc, obj['code']))
                 self.assertEqual(verify_precision.verify(data, Path(t))[0], [])
                 binary = path.read_bytes()
                 reply = struct.pack('<5I', 0, 0, len(binary), 0, 0) + binary
@@ -694,6 +695,16 @@ class Slice1Cutting(unittest.TestCase):
                     changed = bytearray(reply)
                     struct.pack_into('<I', changed, at + field, struct.unpack_from('<I', reply, at + field)[0] + 4)
                     self.assertEqual(replay.only_moves(reply, changed), 'a site record differs')
+
+    def test_compat_inline_dword_mov_scope(self):
+        # The guest encoding, rather than access width alone, selects the checked dword path.
+        for opcode, hot in [('648b0f', True), ('65890f', True), ('648b0cfd00000000', True),
+                            ('648a0f', False), ('6566890f', False), ('64a100000000', False),
+                            ('65c70701000000', False), ('65030f', False)]:
+            d, rc = run(opcode, RIP, '--bitness', '32')
+            self.assertEqual(rc, 0, opcode)
+            guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+            self.assertEqual(check_sites.inline_dword_start(guard, bytes.fromhex(d['code']['hex'])) is not None, hot, opcode)
 
     def test_compat_extending_segment_loads(self):
         import verify_precision

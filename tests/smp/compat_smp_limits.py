@@ -6,7 +6,9 @@ from compat_limits import descriptor
 
 
 def cases():
-    return [program(n) for n in (2, 4)]
+    return [program(n) for n in (2, 4)] + [storage(n, "loaded") for n in (2, 4)] + [
+        storage(1, transition) for transition in ("null", "readonly", "reload", "user64")
+    ]
 
 
 def program(n):
@@ -116,4 +118,60 @@ def program(n):
             addr = f['c'] + k * stride
             expected[addr] = struct.pack('<9I', addr if fs_small else fs_word, gs_word if fs_small else addr,
                                          fs_rip if fs_small else gs_rip, 0, 0xdb, 1, return_rip, 0xdb, 3 * (3 + 7))
-    return dict(name=f'c32-per-cpu-fs-gs@{n}', ncpu=n, system=True, bodies=bodies, cpus=cpus, memory=memory), expected
+    return dict(name=f'c32-per-cpu-fs-gs@{n}', ncpu=n, system=True, bodies=bodies, cpus=cpus, memory=memory,
+                segment_views=[[0, 0] for _ in cpus]), expected
+
+def storage(n, transition):
+    """The host reads the stopped vCPU's two read-only tags. Guest instructions never read the view."""
+    P, S = C.P, C.S
+    # The initial 64-bit near jump enters the CPU's kernel bootstrap. IRETQ returns just after
+    # it at CPL3; the end of this initial body is the driver's normal stopped-RIP boundary.
+    entry = C.user32('    jmp edx\n')
+    user = """    mov ax, 0x2b
+    mov fs, ax
+    mov ax, 0x33
+    mov gs, ax
+    mov ecx, 3
+.loop:
+    dec ecx
+    jnz .loop
+"""
+    # Two ordinary return sites per reserved set, separated by 32 KiB (identical dispatch
+    # indices). Indirect calls force real fills/replacements while the descriptor data is live.
+    pages = [0x180000, 0x188000]
+    for page in pages * 2:
+        for offset in (1, 2):
+            user += f'    mov esi, {page + offset:#x}\n    call esi\n'
+    if transition == 'null':
+        user += '    xor eax, eax\n    mov fs, ax\n'
+    elif transition == 'reload':
+        user += '    mov ax, 0x33\n    mov fs, ax\n'
+    elif transition == 'user64':
+        user += '    pushfd\n    push 0x23\n    push .long\n    iretd\nbits 64\n.long:\n'
+    user += '    mov dword [edi], 0x12345678\n    jmp .done\n.done:\n'
+    code = P.asm(f'org {C.U + len(entry):#x}\nbits 32\n' + user)
+    bodies = [dict(addr=hex(C.U), code=(entry + code).hex())]
+    memory, cpus, views, expected = [], [], [], {}
+    for page in pages:
+        memory += [C.entry(C.PTE(page), page | P.LEAF), dict(addr=hex(page+1), data='c3c3')]
+    for i in range(n):
+        fields = S.fields(i)
+        fs = (fields['c'] + 64, 0xfff - 4 * i)
+        gs = (fields['c'] + 128, 0x111 + i)
+        gdt = bytearray(S.gdt_image(i))
+        for sel, (base, limit) in [(0x28, fs), (0x30, gs)]:
+            access = 0xf1 if transition == 'readonly' and sel == 0x28 else 0xf3
+            gdt[sel:sel+8] = descriptor(base, limit, access).to_bytes(8, 'little')
+        memory += S.memory(i, n, gdt=gdt)
+        enter = C.ENTER(f'    mov edi, {fields["c"]:#x}\n', rsp=fields['us'])
+        enter = enter.replace(f'push {C.U:#x}', f'push {C.U + len(entry):#x}')
+        kernel = f'    mov eax, {C.TA:#x}\n    mov cr3, rax\n' + S.SETUP.format(**fields) + enter
+        bodies.append(P.body(P.SYS_CODE(i), P.sys_text(i, kernel)))
+        cpus.append(dict(P.cpu(i, C.U, rdx=P.SYS_CODE(i)), cpl=0))
+        def packed(seg):
+            return seg[1] << 32 | seg[0]
+        views.append([0, 0] if transition == 'user64' else [
+            0 if transition in ('null', 'readonly') else packed(gs if transition == 'reload' else fs), packed(gs)])
+        expected[fields['c']] = struct.pack('<I', 0x12345678)
+    return dict(name=f'c32-segment-storage-{transition}@{n}', ncpu=n, system=True, bodies=bodies,
+                cpus=cpus, memory=memory, segment_views=views), expected

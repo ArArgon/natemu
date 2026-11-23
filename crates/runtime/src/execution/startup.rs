@@ -86,6 +86,7 @@ pub(super) fn init(s: &mut State) {
 /// TLBs: every shadow, every L1 entry and every link into a block no longer current (a global flush, as a paging-control
 /// change makes; [`tlb`]). `Events::halted` is 0 while it runs.
 fn reset(s: &mut State) {
+    cache::publish_segment_view([0; 2]); // INIT can park here before any subsequent native entry
     natemu_abi::power_on::init(&mut s.cpu);
     (s.nmi_blocked, s.sti_shadow, s.mid_string, s.shadow_entry, s.plain_step) = (0, 0, 0, 0, 0);
     (s.debug, s.mailbox) = (0, 0);

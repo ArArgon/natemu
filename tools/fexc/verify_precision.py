@@ -332,6 +332,7 @@ def guards(d, dis, order):
           then `svc #1`) has a canonical RIP or the block's fall-through RIP."""
     out, check_at, ok = run_test(d, dis, order), {}, set()
     cost = {'guard': 0, 'split': 0, 'branch': 0, 'stub': 0}
+    code = bytes.fromhex(d['code']['hex'])
     sites = d['sites']
     stubs = {s['native_offset']: s for s in sites if s['kind'] in STUBS}
     refs = {}
@@ -355,11 +356,11 @@ def guards(d, dis, order):
                 insn = bytes.fromhex(guest['bytes_hex'])
                 if len(insn) >= 5 and 0xa0 <= insn[-5] <= 0xa3 and all(b in (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0xf2, 0xf3) for b in insn[:-5]):
                     imm = int.from_bytes(insn[-4:], 'little')
-                    code = bytes.fromhex(d['code']['hex'])
                     offset_ok = (s['base_reg'] == 0 and int.from_bytes(code[t-8:t-4], 'little') == 0x52800000 | (imm & 0xffff) << 5
                                  and int.from_bytes(code[t-4:t], 'little') == 0x72a00000 | (imm >> 16) << 5)
                 else:
-                    offset_ok = dis.get(t - 4) == f'mov w0, w{s["base_reg"]}'
+                    start = check_sites.inline_dword_start(s, code)
+                    offset_ok = dis.get((t if start is None else start) - 4) == f'mov w0, w{s["base_reg"]}'
                 if (dis.get(t) != f'b {at:#x}' or not offset_ok
                         or s['imm'] != t + 4 or not re.fullmatch(r'mov w[0-9]+, w0', dis.get(t + 4, ''))):
                     out.append(f'stub +{at} (segment): offset or continuation mismatch')
@@ -932,7 +933,7 @@ def verify(d, tmp, insns=None):
             out.append(f'guest +{g}: {len(stores)} store sites')
         if stores and stores[-1]['native_offset'] != max(s['native_offset'] for s in ss):
             out.append(f'guest +{g}: the store site +{stores[-1]["native_offset"]} is not the last access of the instruction')
-    out += code_vs_sites(d['sites'], dis)   # P7, code half, on every compile: no unrecorded or misdescribed access
+    out += code_vs_sites(d['sites'], dis, code)   # P7, code half, on every compile: no unrecorded or misdescribed access
     # P5 (I2): a REP string instruction with RCX = 0 accesses nothing (SDM REP): its `cbz` on RCX's register (x7; I10: `cbz w7`,
     # ECX, with 0x67) to the
     # instruction's end (the next instruction's PC entry, or the literal exit to its RIP) is x86, not a lost access.

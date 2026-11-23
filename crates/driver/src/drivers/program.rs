@@ -3127,6 +3127,7 @@ fn report(
         ymmh: hexes(&ymmh),
         // Test output only: lets probes verify which page is actually mapped rather than testing a stale fixed address.
         guest_state_alias: Hex(control.guest_state_va),
+        compat_dword_segments: compat_dword_segments(area),
         gs_base: Hex(s.cpu.seg[exec::SREG_GS].base),
         kernel_gs_base: Hex(
             msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]
@@ -3289,6 +3290,7 @@ struct CpuResult {
     x87: X87,
     ymmh: Vec<Hex>,
     guest_state_alias: Hex,
+    compat_dword_segments: Option<[Hex; 2]>,
     gs_base: Hex,
     kernel_gs_base: Hex,
     lapic: LapicState,
@@ -3528,6 +3530,22 @@ fn kick_report(area: Area, stops: &execution::Stops) -> Kicks {
         latency_ns: latency(false),
         latency_in_host_ns: latency(true),
     }
+}
+
+/// Stopped-vCPU observation for the storage fixture. A damaged reservation is reported as null
+/// instead of accepting its tag as a segment view.
+fn compat_dword_segments(area: Area) -> Option<[Hex; 2]> {
+    let mut tags = [0; 2];
+    for (tag, slot) in tags.iter_mut().zip(cache::SEGMENT_SLOTS) {
+        let index = cache::SEGMENT_TABLE * cache::L1_ENTRIES + slot;
+        let [value, target]: [u64; 2] = area.read_record(cache::LOOKUP_OFFSET + cache::DL1 + index * 16);
+        let owner: u32 = area.read_record(cache::LOOKUP_OFFSET + cache::L1_OWNERS + index * 4);
+        if owner != 0 || target != cache::CODE_VA + cache::DISPATCH_MISS as u64 {
+            return None;
+        }
+        *tag = value;
+    }
+    Some(tags.map(Hex))
 }
 
 /// Checks that frame padding remains zero outside the admitted guest-state fields. Selected-alias deviation probes
@@ -3865,6 +3883,7 @@ mod json_tests {
             },
             ymmh: (0..32).map(|_| Hex(next())).collect(),
             guest_state_alias: Hex(next()),
+            compat_dword_segments: Some([Hex(1), Hex(2)]),
             gs_base: Hex(next()),
             kernel_gs_base: Hex(u64::MAX),
             lapic: LapicState {
@@ -4025,6 +4044,8 @@ mod json_tests {
             ",\"guest_state_alias\":\"{:#x}\"",
             r.guest_state_alias.0
         );
+        let views = r.compat_dword_segments.as_ref().map_or_else(|| "null".into(), |v| format!("[{}]", list(v)));
+        let _ = write!(out, ",\"compat_dword_segments\":{views}");
         let _ = write!(
             out,
             ",\"gs_base\":\"{:#x}\",\"kernel_gs_base\":\"{:#x}\"",

@@ -231,7 +231,7 @@ def run(hexs, rip, tmp, *extra):
 def read_object(path):
     f = Path(path).read_bytes()
     h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4, 5) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4, 5, 6) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11 on)
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
      sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
@@ -273,17 +273,32 @@ def asm0_cut(p):
     return first_cut(p['asm']) == 0
 
 
-def code_vs_sites(sites, dis):
+def inline_dword_start(site, code):
+    """Recognize the exact compat fast guard. Only its single RO metadata read is a non-guest transfer."""
+    if site['kind'] != 'segment' or site['width'] != 4 or site['segment'] not in ('fs', 'gs'):
+        return None
+    start = site['imm'] - 68
+    if start < site['insn_native_offset'] + 4 or start + 64 > len(code):
+        return None
+    tag_load = 0xf9401821 if site['segment'] == 'fs' else 0xf9402821
+    words = (0x926bab81, 0xd3557782, 0x91000442, 0xd349fc42, 0x91480021, 0xcb025821,
+             tag_load, 0xd360fc22, 0xd1000c42, 0xcb000042, 0xb7f800c2, 0x0b000021,
+             0x91000c22, 0xb7000062, 0x2a0103e0, 0x14000002)
+    return start if struct.unpack_from('<16I', code, start) == words else None
+
+
+def code_vs_sites(sites, dis, code):
     """Messages for every disagreement between the sites and the disassembly `dis` ({offset: text}): a native load/store with a
     base other than x28/sp that is no site, a site not on a load/store, and a site whose width, base, operand form, writeback or
     transfer registers differ from the instruction. Independent of the guest program (needs no `asm`)."""
     out = []
     by_off = {s['native_offset']: s for s in sites if s['kind'] not in STUBS}
+    tag_reads = {start + 24 for site in sites if (start := inline_dword_start(site, code)) is not None}
     native = {}
     for off, text in dis.items():
         a = native_access(text)
         # (`staddb wzr, [xN]`: a split stub's probe of a page, no access of its own: verify_precision.py checks where they are.)
-        if a and a[2] not in ('x28', 'sp') and not x87_slot(dis, off) and not text.startswith('staddb wzr,'):
+        if a and off not in tag_reads and a[2] not in ('x28', 'sp') and not x87_slot(dis, off) and not text.startswith('staddb wzr,'):
             native[off] = a
     for off in sorted(set(native) | set(by_off)):
         a, s = native.get(off), by_off.get(off)
@@ -393,7 +408,7 @@ def check_program(p, tmp):
     end = d['code']['layout']['code_region_end']
     lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
     dis = disassemble(code, end, tmp, lits)
-    problems += [('ERROR', m) for m in code_vs_sites(sites, dis)]
+    problems += [('ERROR', m) for m in code_vs_sites(sites, dis, code)]
 
     # 3. dense vs sparse, and the binary object vs JSON
     if not PROFILE:   # slice1 refuses --sparse-pc

@@ -585,8 +585,23 @@ fn l1_list(t: usize, k: usize) -> *mut u32 {
 fn dl1(t: usize, i: usize) -> *mut [u64; 2] {
     lookup_area::<[u64; 2]>(area::DL1).wrapping_add(t * area::L1_ENTRIES + i)
 }
+/// Publish through the resident-only lookup alias. EL0 sees these two tags read-only. The
+/// target word never changes; a coincidental tag match and an ordinary miss reach the same gate.
+pub fn publish_segment_view(view: [u64; 2]) {
+    for (slot, tag) in area::SEGMENT_SLOTS.into_iter().zip(view) {
+        let word = dl1(area::SEGMENT_TABLE, slot).cast::<u64>();
+        unsafe {
+            if word.read() != tag {
+                word.write(tag);
+            }
+        }
+    }
+}
 /// Empties slot `i` of L1 table `t` (it stays on its table's list if it was, and keeps the set's next-victim bit).
 fn empty_l1(t: usize, i: usize) {
+    if area::segment_slot(t, i) {
+        return; // permanently unowned, even when a context clear scans the complete table
+    }
     unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_FLAGS) };
     unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
 }
@@ -633,7 +648,8 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
     (c.slot_contexts[0], c.l1_slots) = (area::NO_CONTEXT, [0; area::L1_TABLES]);
     for t in 0..area::L1_TABLES {
         for i in 0..area::L1_ENTRIES {
-            unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
+            let tag = if area::segment_slot(t, i) { 0 } else { area::DL1_EMPTY };
+            unsafe { dl1(t, i).write([tag, area::CODE_VA + area::DISPATCH_MISS as u64]) };
         }
     }
     synchronize_code(
@@ -786,7 +802,7 @@ pub fn fill_l1(rip: u64, block: &Block) {
     let want = block.number + 1;
     // The way: one holding the block already (so it is never in both), else an empty one, else the victim by the set's
     // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever.
-    let f = area::l1_fill(o0, o1, want);
+    let f = area::l1_fill_set(t, w1, o0, o1, want);
     let i = [w0, w1][f.way];
     #[cfg(feature = "dispatch-study")]
     if f.victim {

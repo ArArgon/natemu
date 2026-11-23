@@ -615,6 +615,18 @@ pub(crate) mod tests {
                     word(l2 + at * 8),
                     (IPA + (dl1 + k * MIB2) as u64) | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN
                 );
+                // The same virtual offsets select the ordinary supervisor table or the user
+                // segment tags. Neither user tag has a writable EL0 alias in either root.
+                let block_mask = MIB2 as u64 - 1;
+                let next_block = (va & !block_mask) + MIB2 as u64;
+                let base = if next_block >> 21 & 511 == 0 { next_block - 2 * MIB2 as u64 } else { next_block };
+                for slot in natemu_abi::execution::cache::SEGMENT_SLOTS {
+                    let address = base + (slot * 16) as u64;
+                    let pte = word(l2 + ((address >> 21 & 511) as usize) * 8);
+                    assert_eq!(pte & (READ_ONLY | EL0_DATA | PXN | UXN), READ_ONLY | EL0_DATA | PXN | UXN);
+                    assert_eq!((pte & 0x0000_ffff_ffe0_0000) + (address & block_mask),
+                               IPA + (dl1 + k * MIB2 + slot * 16) as u64);
+                }
                 let leaf = next(word(l2 + i * 8));
                 assert_eq!(valid(leaf), [(va >> 12 & 511) as usize]);
                 assert_eq!(word(leaf + (va >> 12 & 511) as usize * 8), (IPA + FRAME_OFFSET as u64) | PAGE | EL0_DATA | PXN | UXN);

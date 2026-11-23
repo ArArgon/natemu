@@ -699,6 +699,8 @@ struct Verifier<'a> {
     bulk: Vec<Range<u32>>,
     /// Stack check runs (fexc --push-run): [`Verifier::aligned`], computed with the code shape (after `stub_checks`).
     aligned_before: Vec<u32>,
+    /// Exactly the read-only tag loads proved by scalar_segment_checks before the per-word pass.
+    segment_view_reads: Vec<u32>,
 }
 
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
@@ -710,8 +712,8 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
     let checked = Code { shape: c.shape || !guarded.is_empty(), ..*c };
     let c = &checked;
     let mut v = Verifier::new(c)?;
-    v.words()?;
     v.scalar_segment_checks(&guarded)?;
+    v.words()?;
     v.exits()?;
     if c.shape {
         v.stub_checks()?;
@@ -740,6 +742,7 @@ struct ScalarOperand {
     write: u8,
     data_reg: u8,
     store_immediate: Option<u32>,
+    inline_dword: bool,
     result_and_length: u8,
     absolute_offset: Option<u32>,
     xlat: bool,
@@ -849,10 +852,14 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             _ => 0,
         });
         let write = u8::from(first_is_memory && result != object::SEGMENT_NATIVE_LOAD);
+        let inline_dword = !c.cpl0 && matches!(i.code(), Code::Mov_rm32_r32 | Code::Mov_r32_rm32);
+        if inline_dword && crate::system::address_size(&i) != natemu_abi::execution::system::ADDRESS32 {
+            return Err("unsupported 16-bit address for compatibility dword MOV".into());
+        }
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
             data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, result_and_length: result | i.len() as u8,
-            xlat,
+            xlat, inline_dword,
         });
     }
     if !guarded.is_empty() {
@@ -865,15 +872,22 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
 
 /// A retained 32-bit block can rewrite a guest-RIP literal slot or a complete MOVZ/MOVK/NOP
 /// sequence at another RIP. A guest-independent store literal must keep both of its native words.
-fn overlaps_rip_relocation32(words: Range<u32>, relocs: &[Reloc]) -> bool {
+fn overlaps_relocation32(words: Range<u32>, relocs: &[Reloc], include_branches: bool) -> bool {
     relocs.iter().any(|r| {
         let bytes = match r.kind {
             object::RELOC_GUEST_RIP_LITERAL => 8,
             object::RELOC_GUEST_RIP_MOVE => 12,
-            _ => return false,
+            object::RELOC_DISPATCH_BRANCH | object::RELOC_PROBE_BRANCH if include_branches => 4,
+            _ => return false, // admit_records rejects other relocation kinds
         };
         r.offset < words.end && r.offset.saturating_add(bytes) > words.start
     })
+}
+
+/// The only edges inside the inline guard are its two cold decisions and the hot join.
+/// All addresses are relative to the first owner calculation, including on retained objects.
+fn inline_dword_edge(start: u32, from: u32, to: u32) -> bool {
+    matches!((from.checked_sub(start), to.checked_sub(start)), (Some(40 | 52), Some(64)) | (Some(60), Some(68)))
 }
 
 impl<'a> Verifier<'a> {
@@ -963,6 +977,7 @@ impl<'a> Verifier<'a> {
             dispatch,
             bulk: Vec::new(),
             aligned_before: Vec::new(),
+            segment_view_reads: Vec::new(),
         };
         // A probing split stub's branch back to its store, and the branch back from the run's end of a top x87 run test:
         // branches like the others for every rule on targets.
@@ -1069,6 +1084,57 @@ impl<'a> Verifier<'a> {
 
     /// Every covered scalar compatibility operand through FS/GS reaches a bank check before its one memory access,
     /// including in production admission. The continuation takes its base from w0, reserved for the resident.
+    fn inline_dword_guard(&self, back: u32, start: u32, segment: u8) -> Result<u32, String> {
+        // The vCPU's x28 page and its neighboring RO block use the same upper L2 table. Index
+        // 511 needs the previous block. Derive the address using scratch x1/x2; w0 stays the
+        // original offset until both cold tests have passed. Every operation preserves NZCV.
+        let slot = natemu_abi::execution::cache::SEGMENT_SLOTS[usize::from(segment - 4)];
+        let words = [
+            0x926b_ab81, // and x1,x28,#~0x1fffff
+            0xd355_7782, 0x9100_0442, 0xd349_fc42, // ubfx x2,x28,#21,#9; add x2,x2,#1; lsr x2,x2,#9
+            0x9148_0021, 0xcb02_5821, // add x1,x1,#2MiB; sub x1,x1,x2,lsl #22
+            0xf940_0021 | ((slot * 2) as u32) << 10, // ldr x1,[x1,#slot*16]
+            0xd360_fc22, 0xd100_0c42, 0xcb00_0042, // lsr x2,x1,#32; sub x2,x2,#3; sub x2,x2,x0
+            0xb7f8_00c2, // tbnz x2,#63,cold
+            0x0b00_0021, 0x9100_0c22, 0xb700_0062, // add w1,w1,w0; add x2,x1,#3; tbnz x2,#32,cold
+            0x2a01_03e0, 0x1400_0002, // mov w0,w1; b back; cold: b SEGMENT (checked below)
+        ];
+        let first = back.checked_sub((words.len() as u32 + 1) * 4).ok_or("short inline segment check")?;
+        if first < start + 4 || words.iter().enumerate().any(|(k, &word)| self.word(first + 4 * k as u32) != word) {
+            return Err("inline segment check differs from the expected dword MOV guard".into());
+        }
+        Ok(first)
+    }
+
+    /// FEX x32::RA, excluding all static roots, compiler scratch x0..x3, x25 and x28.
+    /// The post-guard address and a load awaiting its commit both occupy this register class.
+    fn inline_dword_transfer(&self, op: &ScalarOperand, access: &Site, start: u32, end: u32) -> Result<u32, String> {
+        let dynamic = |r| matches!(r, 12..=17 | 19..=24 | 29..=30);
+        let at = access.native_offset;
+        let Some(Insn::Mem(m)) = self.insn(at) else { return Err("inline dword MOV lacks its transfer".into()); };
+        let root = super::SRA32[usize::from(op.data_reg)];
+        let roots = super::SRA32.iter().fold(0, |mask, reg| mask | (1 << reg));
+        if !dynamic(access.base_reg) || m.vector || m.size != 4 || m.load != (op.write == 0)
+            || m.rt != access.data_reg[0] || m.addr.base != access.base_reg
+            || self.written(roots, start, at)
+        {
+            return Err("inline dword MOV address or architectural register changes before its transfer".into());
+        }
+        if !m.load {
+            // A source that was live before the check is still precisely the guest's static GPR.
+            if m.rt != root { return Err("inline dword store differs from its ModRM source".into()); }
+            return Ok(at);
+        }
+        // A faulting load never writes a guest root. On success the 32-bit value is zero extended,
+        // then the very next word commits it to the ModRM destination before another instruction.
+        let commit = at + 4;
+        let copy = 0xaa00_03e0 | u32::from(m.rt) << 16 | u32::from(root);
+        if !dynamic(m.rt) || commit >= end || self.word(commit) != copy {
+            return Err("inline dword load lacks its ModRM destination commit".into());
+        }
+        Ok(commit)
+    }
+
     fn scalar_segment_checks(&mut self, guarded: &[ScalarOperand]) -> Result<(), String> {
         use object::kind::SEGMENT;
         for op in guarded {
@@ -1111,6 +1177,11 @@ impl<'a> Verifier<'a> {
             if effects.next().is_some() {
                 return Err("extra scalar memory access".into());
             }
+            let back = site.imm as u32;
+            if back % 4 != 0 || back >= access.native_offset { return Err("scalar segment check continuation".into()); }
+            let inline = op.inline_dword.then(|| self.inline_dword_guard(back, p.native_offset, op.segment)).transpose()?;
+            let tag_load = inline.map(|at| at + 6 * 4);
+            if let Some(at) = tag_load { self.segment_view_reads.push(at); }
             let end = self.c.pcs.get(index).map_or_else(
                 || self.c.stubs.first().map_or(self.c.code.len() as u32, |s| s.native_offset),
                 |next| next.native_offset,
@@ -1120,7 +1191,7 @@ impl<'a> Verifier<'a> {
             let run_end = self.run_test().filter(|&e| self.run_end_return(e + 36, ENTRY_OFFSET + 8));
             for at in (p.native_offset..end).step_by(4) {
                 if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
-                if at == access.native_offset || Some(at) == rmw_store { continue; }
+                if at == access.native_offset || Some(at) == rmw_store || Some(at) == tag_load { continue; }
                 match self.insn(at) {
                     // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
                     Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
@@ -1131,12 +1202,10 @@ impl<'a> Verifier<'a> {
                     Some(Insn::Mem(_)) if at >= 16 && (0..5).all(|k| self.word(at - 16 + k * 4) == RUN_END[k as usize])
                         && self.branches_into(at - 16, at).next().is_none() => {}
                     Some(Insn::Mem(_) | Insn::Atomic { .. } | Insn::Swap { .. } | Insn::Literal { .. }) =>
-                        return Err(format!("extra memory operation {:#010x} in scalar instruction at {at:#x}", self.word(at))),
+                        return Err(format!("unrecorded memory access: extra memory operation {:#010x} in scalar instruction at {at:#x}", self.word(at))),
                     _ => {}
                 }
             }
-            let back = site.imm as u32;
-            if back >= access.native_offset { return Err("scalar segment check continuation".into()); }
             let setup = if let Some(offset) = op.absolute_offset {
                 let [lo, hi] = natemu_abi::execution::guest_rip_move32(u64::from(offset), 0);
                 if back < p.native_offset + 12 || site.base_reg != 0 || self.word(back - 12) != lo || self.word(back - 8) != hi {
@@ -1144,14 +1213,15 @@ impl<'a> Verifier<'a> {
                 }
                 back - 12
             } else {
-                if back < p.native_offset + 8 || self.word(back - 8) != 0x2a00_03e0 | (u32::from(site.base_reg) << 16) {
+                let offset_end = inline.unwrap_or(back.saturating_sub(4));
+                if offset_end < p.native_offset + 4 || self.word(offset_end - 4) != 0x2a00_03e0 | (u32::from(site.base_reg) << 16) {
                     return Err("scalar segment check offset register".into());
                 }
-                back - 8
+                offset_end - 4
             };
-            if op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 {
-                // Only these two native effects can be skipped on a successful wrapped read. Prove the
-                // unsigned W-register load, including its exact data register, even with shape checks off.
+            if op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 || (inline.is_some() && op.write == 0) {
+                // A wrapped native-load continuation and an inline MOV result both require the exact
+                // unsigned W load. MOV subsequently commits the entire X register to its guest root.
                 let size = u32::from(op.width.trailing_zeros()) << 30;
                 let registers = u32::from(access.base_reg) << 5 | u32::from(access.data_reg[0]);
                 let word = self.word(access.native_offset);
@@ -1178,17 +1248,30 @@ impl<'a> Verifier<'a> {
                 {
                     return Err("scalar store immediate differs from its x86 operand".into());
                 }
-                if overlaps_rip_relocation32(high - 4..high + 4, self.c.relocs) {
+                if overlaps_relocation32(high - 4..high + 4, self.c.relocs, false) {
                     return Err("scalar store immediate overlaps a guest-RIP relocation".into());
                 }
                 high - 4
             } else { setup };
             let last = rmw_store.unwrap_or(access.native_offset);
+            let sealed_end = if inline.is_some() {
+                let commit = self.inline_dword_transfer(op, access, p.native_offset, end)?;
+                // A retained, placed or shared object may patch guest RIPs, dispatch exits, or
+                // probe branches. No relocation can cover any word of this proof or its transfer.
+                let guarded_words = setup..commit + 4;
+                if overlaps_relocation32(guarded_words, self.c.relocs, true) {
+                    return Err("relocation within inline segment check".into());
+                }
+                commit
+            } else { last };
             if self.instruction(last) != Some((g, p.native_offset)) || self.instruction(access.native_offset) != Some((g, p.native_offset))
                 || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
                 || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
                 || self.written(1 << access.base_reg, back + 4, last)
-                || self.branches_into(setup, last).any(|(from, to)| {
+                || self.branches_into(setup, sealed_end).any(|(from, to)| {
+                    if inline.is_some_and(|start| inline_dword_edge(start, from, to)) {
+                        return false;
+                    }
                     // A successful split probe returns to its store after the segment check already ran.
                     self.probing(from).is_none_or(|(i, k)| k != 4 || self.c.stubs[i].guest_offset2 != last || to != last)
                 })
@@ -1475,6 +1558,7 @@ impl<'a> Verifier<'a> {
                 Insn::Mem(m) => match m.addr.base {
                     28 => self.frame_access(m, at)?,
                     0 if shape && self.x87_slot(m, at) => {}
+                    1 if self.segment_view_reads.binary_search(&at).is_ok() => {}
                     SP if shape => return fail(at, "stack access"),
                     _ if shape && !site(at) => return fail(at, "unrecorded memory access"),
                     _ => {}
@@ -3247,17 +3331,34 @@ mod tests {
     }
 
     #[test]
+    fn only_internal_cold_and_hot_edges_can_join_the_inline_guard() {
+        // Source and target offsets only. Include sources outside the guard in both directions.
+        let start = 20;
+        let permitted = [(60, 84), (72, 84), (80, 88)];
+        for from in (0..=120).step_by(4) {
+            for to in (start..=start + 72).step_by(4) {
+                assert_eq!(inline_dword_edge(start, from, to), permitted.contains(&(from, to)), "{from} -> {to}");
+            }
+        }
+    }
+
+    #[test]
     fn store_literal_words_are_disjoint_from_guest_rip_relocations() {
         // The native literal occupies [20, 28). Check one-word intersections on both sides,
         // complete overlap, and touching endpoints. These are offsets only; no guest is run.
         for (kind, starts) in [
             (object::RELOC_GUEST_RIP_MOVE, &[12, 16, 20, 24][..]),
             (object::RELOC_GUEST_RIP_LITERAL, &[16, 20, 24][..]),
+            (object::RELOC_DISPATCH_BRANCH, &[20, 24][..]),
+            (object::RELOC_PROBE_BRANCH, &[20, 24][..]),
         ] {
             for offset in (4..=32).step_by(4) {
                 let r = Reloc { kind, offset, register: 3, size: if kind == object::RELOC_GUEST_RIP_LITERAL { 8 } else { 0 },
                     reserved: 0, value: 0 };
-                assert_eq!(overlaps_rip_relocation32(20..28, &[r]), starts.contains(&offset), "kind {kind}, offset {offset}");
+                let overlap = starts.contains(&offset);
+                assert_eq!(overlaps_relocation32(20..28, &[r], true), overlap, "guard: kind {kind}, offset {offset}");
+                let rip = matches!(kind, object::RELOC_GUEST_RIP_LITERAL | object::RELOC_GUEST_RIP_MOVE);
+                assert_eq!(overlaps_relocation32(20..28, &[r], false), rip && overlap, "literal: kind {kind}, offset {offset}");
             }
         }
     }
@@ -3509,6 +3610,69 @@ mod tests {
                 assert!(check(&changed).unwrap_err().contains("moffs immediate"), "changed offset byte {pos}");
             }
         }
+        // All modifications below are admission-only, including when optional code shape is off.
+        for hex in ["648b0f", "65890f"] {
+            let (obj, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&obj, 0);
+            let records: Vec<_> = (0..h.sites_count as usize).map(|i| h.sites_offset as usize + i * size_of::<Site>())
+                .map(|off| (off, super::super::record::<Site>(&obj, off))).collect();
+            let (_, access) = records.iter().find(|(_, s)| matches!(s.kind, object::kind::LOAD | object::kind::STORE)).unwrap();
+            let word = |at| u32::from_le_bytes(obj[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+            let is_load = access.kind == object::kind::LOAD;
+            for shape in [false, true] {
+                let check = |o: &[u8]| super::super::admit_mode(o, h.guest_rip, &src, u64::MAX, shape, false, true);
+                check(&obj).unwrap();
+                // The instruction and its matching transfer records agree with one another. They
+                // must also agree with the decoded ModRM register and be live across the guard.
+                for rt in [0u8, 1, 2, 6, 21] {
+                    let at = access.native_offset;
+                    let mut changed = patched((&obj, &src), at, word(at), (word(at) & !31) | u32::from(rt));
+                    for (off, s) in &records {
+                        if s.native_offset == at || s.kind == object::kind::SPLIT && s.guest_offset2 == at {
+                            changed[off + core::mem::offset_of!(Site, data_reg)] = rt;
+                        }
+                    }
+                    assert!(check(&changed).is_err(), "{hex} admitted changed Rt {rt}");
+                }
+                if is_load {
+                    // Preserve all site records, Rn, Rt and the following MOV X. A signed word
+                    // load reads the same four bytes but would commit different high register bits.
+                    let at = access.native_offset;
+                    let signed = 0xb980_0000 | (word(at) & 0x3ff); // LDRSW Xt,[Xn]
+                    let changed = patched((&obj, &src), at, word(at), signed);
+                    assert!(check(&changed).unwrap_err().contains("scalar native load continuation"));
+                    let at = access.native_offset + 4;
+                    for replacement in [word(at) ^ 1, word(at) ^ (1 << 16), MOV_X0] {
+                        let changed = patched((&obj, &src), at, word(at), replacement);
+                        assert!(check(&changed).unwrap_err().contains("ModRM destination commit"));
+                    }
+                }
+            }
+        }
+        // Prefix order does not affect the decoded address size. Keep instruction length,
+        // register, width and FS fixed, replacing the redundant DS override with 67h.
+        for (hex, pos) in [("3e648b0f", 0), ("6464890f", 0)] {
+            let (obj, mut src) = compile(hex, "0x8048000", "32");
+            src[pos] = 0x67;
+            for shape in [false, true] {
+                let e = super::super::admit_mode(&obj, 0x8048000, &src, u64::MAX, shape, false, true).unwrap_err();
+                assert!(e.contains("unsupported 16-bit address"), "{hex}: {e}");
+            }
+        }
+        // Ordinary compatibility blocks also require v6. Default 64-bit code keeps its v4 contract.
+        for (bits, version, hex) in [("32", 6u32, "89d8"), ("64", 4u32, "4889d8")] {
+            let (mut obj, source) = compile(hex, "0x8048000", bits);
+            let h: Header = super::super::record(&obj, 0);
+            assert_eq!(h.version, version);
+            for shape in [false, true] {
+                super::super::admit_mode(&obj, h.guest_rip, &source, u64::MAX, shape, false, bits == "32").unwrap();
+            }
+            obj[8..12].copy_from_slice(&5u32.to_le_bytes());
+            for shape in [false, true] {
+                assert!(super::super::admit_mode(&obj, h.guest_rip, &source, u64::MAX, shape, false, bits == "32")
+                    .unwrap_err().contains("version"));
+            }
+        }
         // The mandatory check is tied to its decoded operand and both native register moves.
         let (o, source) = compile("648b0f", "0x8048000", "32");
         let h: Header = super::super::record(&o, 0);
@@ -3532,7 +3696,12 @@ mod tests {
             assert!(check(&multi, &src).is_err(), "missing MOV boundary");
             let extra = patched((&o, &source), back, u32::from_le_bytes(o[(h.code_offset + back) as usize..][..4].try_into().unwrap()), 0xb940_0084);
             assert!(check(&extra, &source).unwrap_err().contains("unrecorded memory access"));
-            for at in [back - 8, back - 4, back] {
+            // Every instruction, from the original offset to the post-check linear handoff.
+            assert_eq!(h.version, 6);
+            let mut prior = o.clone();
+            prior[8..12].copy_from_slice(&5u32.to_le_bytes());
+            assert!(check(&prior, &source).unwrap_err().contains("version"));
+            for at in (back - 72..=back).step_by(4) {
                 let old = u32::from_le_bytes(o[(h.code_offset + at) as usize..][..4].try_into().unwrap());
                 let changed = patched((&o, &source), at, old, MOV_X0);
                 assert!(check(&changed, &source).is_err(), "absent address check word {at:#x}");

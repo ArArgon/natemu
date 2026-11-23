@@ -300,6 +300,13 @@ pub mod cache {
     pub const L1_TABLES: usize = 4;
     /// Tables per shadow space (privilege class): one 2 MiB block of data tables.
     pub const L1_SPACE_TABLES: usize = 2;
+    /// Two last-probed tags of the first user table hold the resident's current compatibility
+    /// FS/GS dword views. Their native targets are always DISPATCH_MISS; they have no L1 owner.
+    pub const SEGMENT_TABLE: usize = L1_SPACE_TABLES;
+    pub const SEGMENT_SLOTS: [usize; 2] = [L1_WAYS + 1, 2 * L1_WAYS + 1];
+    pub const fn segment_slot(table: usize, slot: usize) -> bool {
+        table == SEGMENT_TABLE && (slot == SEGMENT_SLOTS[0] || slot == SEGMENT_SLOTS[1])
+    }
     /// Whether table `t` serves user (CPL 3) contexts.
     pub const fn l1_user_table(t: usize) -> bool {
         t >= L1_SPACE_TABLES
@@ -495,6 +502,16 @@ pub mod cache {
             L1Fill { way: (b0 != 0) as usize, there: false, victim: false }
         } else {
             L1Fill { way: (o0 & L1_NEXT != 0) as usize, there: false, victim: true }
+        }
+    }
+    /// Two user sets have only their first way available. The spare tag of the other way
+    /// is data, including when it happens to equal the incoming RIP.
+    pub const fn l1_fill_set(table: usize, way1: usize, o0: u32, o1: u32, block: u32) -> L1Fill {
+        if segment_slot(table, way1) {
+            let old = o0 & !L1_FLAGS;
+            L1Fill { way: 0, there: old == block, victim: old != 0 && old != block }
+        } else {
+            l1_fill(o0, o1, block)
         }
     }
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
@@ -3191,6 +3208,22 @@ impl Cpu {
     pub fn null_segment(&self, sreg: usize) -> bool {
         self.code_mode() == Some(CodeMode::Compat32) && self.seg[sreg].attributes & ATTR_P == 0
     }
+    /// The two FS/GS records published only for compatibility-user dword MOV. An inclusive
+    /// limit smaller than three admits no dword at any offset, including the disabled zero record.
+    /// Only present expand-up writable data segments qualify; other forms keep the resident check.
+    pub fn compat_dword_segments(&self) -> [u64; 2] {
+        if self.cpl != 3 || self.efer & EFER_LMA == 0 || self.code_mode() != Some(CodeMode::Compat32) {
+            return [0; 2];
+        }
+        [SREG_FS, SREG_GS].map(|r| {
+            let seg = &self.seg[r];
+            if seg.attributes & 0x9e == ATTR_P | 0x12 && seg.limit >= 3 {
+                u64::from(seg.limit) << 32 | u64::from(seg.base as u32)
+            } else {
+                0
+            }
+        })
+    }
     pub fn code_context(&self) -> u64 {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
@@ -4742,6 +4775,65 @@ mod tests {
 
     /// `l1_fill` modelled as the resident drives it (owner words with the flags, the set's next-victim bit in way 0's
     /// word): the empty way first, fill order after, a block never in both ways, the flags kept.
+    #[test]
+    fn compatibility_dword_view_covers_only_loaded_expand_up_rw_data() {
+        let mut c = crate::power_on::reset();
+        c.cpl = 3;
+        c.efer |= EFER_LMA;
+        c.seg[SREG_CS].attributes = ATTR_D;
+        let fs = &mut c.seg[SREG_FS];
+        fs.base = 0x1_1234_5678;
+        fs.limit = u32::MAX;
+        for a in 0..=255 {
+            c.seg[SREG_FS].attributes = a;
+            let d = c.seg[SREG_FS];
+            let expected = if a & ATTR_P != 0 && a & 0x10 != 0 && a & 0x0c == 0 && a & 2 != 0 {
+                0xffff_ffff_1234_5678
+            } else { 0 };
+            assert_eq!(c.compat_dword_segments()[0], expected, "access byte {a:#x}");
+            if expected != 0 {
+                assert!(d.allows(0xffff_fffc, 4, true, true));
+                assert!(!d.allows(0xffff_fffd, 4, false, true));
+            }
+        }
+        c.seg[SREG_FS].attributes = 0xf3;
+        for limit in 0..=3 {
+            c.seg[SREG_FS].limit = limit;
+            assert_eq!(c.compat_dword_segments()[0] != 0, limit == 3);
+        }
+        c.efer &= !EFER_LMA;
+        assert_eq!(c.compat_dword_segments(), [0; 2]);
+        c.efer |= EFER_LMA;
+        c.seg[SREG_CS].attributes = ATTR_L;
+        assert_eq!(c.compat_dword_segments(), [0; 2]);
+        c.seg[SREG_CS].attributes = ATTR_D;
+        c.cpl = 0;
+        assert_eq!(c.compat_dword_segments(), [0; 2]);
+    }
+
+    #[test]
+    fn segment_view_tags_keep_the_miss_target_and_the_other_way() {
+        use cache::*;
+        assert_eq!(SEGMENT_SLOTS.map(|i| i * 16), [48, 80]);
+        // The host puts all guest/device RAM after all vCPU strides and the pool. The
+        // minimum stride is BACKING_BYTES; the owner-only lookup alias lies inside that stride.
+        let user_table = LOOKUP_OFFSET + DL1 + SEGMENT_TABLE * L1_ENTRIES * 16;
+        assert!(SEGMENT_SLOTS.into_iter().all(|slot| user_table + (slot + 1) * 16 <= super::BACKING_BYTES));
+        for table in 0..L1_TABLES {
+            for set in 0..L1_SETS {
+                let (_, way1) = l1_slots_of(set as u64);
+                let fill = l1_fill_set(table, way1, 7 | L1_NEXT, 0, 9);
+                if table == SEGMENT_TABLE && (set == 1 || set == 2) {
+                    assert_eq!(fill, L1Fill { way: 0, there: false, victim: true });
+                    assert_eq!(l1_fill_set(table, way1, 9 | L1_LISTED, 0, 9),
+                               L1Fill { way: 0, there: true, victim: false });
+                } else {
+                    assert_eq!(fill, L1Fill { way: 1, there: false, victim: false });
+                }
+            }
+        }
+    }
+
     #[test]
     fn l1_fill_order_replacement() {
         use super::cache::*;

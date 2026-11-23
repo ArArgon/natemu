@@ -2111,6 +2111,10 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     crate::perf::enter(crate::perf::ENTER);
     uncached_end(s);
     served(s);
+    // Every segment/base or mode change that returns to native code comes through this full
+    // entry, including a fast SYSRET. A link, fast miss, or precise retry keeps the same hidden
+    // descriptors; while 64-bit code runs (including inline SWAPGS), neither view is published.
+    cache::publish_segment_view(s.cpu.compat_dword_segments());
     s.mid_string = 0; // the next resident entry is at another boundary
     // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
     // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms
