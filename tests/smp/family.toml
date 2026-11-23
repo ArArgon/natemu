@@ -118,3 +118,14 @@ argv = ["tests/smp/run_capacity.py", "--host", "{natemu_host}", "--runtime", "{n
 [suite.cases."capacity-apic"]
 argv = ["tests/smp/run_capacity_apic.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 results = "capacity-apic.json"
+
+# Native observations of compatibility segments. Two seed runs use NATEMU_X86_HOST on an AMD KVM host.
+[[suite]]
+name = "compat-kvm"
+tier = "campaign"
+kind = "judged"
+harness = "runner"
+params = { timeout = 2100 }
+
+[suite.cases."amd-reference"]
+argv = ["tests/smp/run_compat_kvm.py", "--out", "{out}"]

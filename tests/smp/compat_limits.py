@@ -89,7 +89,7 @@ def inline_base_refresh(segment):
     return prog, expected
 
 
-def cases():
+def cases(*, reference_control=False):
     # Each instruction follows a successful load of a real descriptor. A separate register selects the
     # control segment, so mixing the two segments or validating a based linear address fails the case.
     tls = C.W + 0x80
@@ -340,6 +340,15 @@ def cases():
         ecx=2, rflags=0x44, captured=indices(4, tls + 4))
     add('fs-string-repe-fault-flags', 'fs repe cmpsb', limit=0, prefix=regs(0, tls, 3) + '    stc\n',
         ecx=2, rflags=0x10045, captured=indices(1, tls + 1))
+    if reference_control:
+        # The same first comparison and register progress as the segment fault above. Here the
+        # segment permits all elements; paging alone faults on the second FS source byte.
+        missing = C.XPAGE + 4096
+        setup = (f'    mov byte [{missing - 1:#x}], 0x11\n'
+                 f'    and qword [{C.PTE(missing):#x}], -2\n    invlpg [{missing:#x}]\n')
+        add('fs-string-repe-page-flags', 'fs repe cmpsb', base=missing - 1, limit=3, kernel_setup=setup,
+            prefix=regs(0, tls, 3) + '    stc\n', ecx=2, rflags=0x10045, captured=indices(1, tls + 1),
+            fault=14, error=4, cr2=missing)
     # DR0 observes the second operand of the first completed compare. The #DB frame has that
     # iteration's new flags and indices, RF set, and RIP at the unfinished string. A subsequent
     # access fault would instead restore the entry flags (the preceding test sets CF to distinguish).

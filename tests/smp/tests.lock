@@ -7740,6 +7740,11 @@ repro = "71a37c72aa68 program_sha256=cccfcfa2e006e6c15c5fbd77b68017b65d212bb056f
 sha256 = "74ab39e7682f2756e4121b80486e5c0dd142c19398a0615b05f8fdb3304b4cac"
 value = "[\"ok\",[[\"access\",140738562263032,8,true,true]]]"
 
+[answers.29c11ad3e4345d6234591cdafcfd99e57e51f448543baa4f502479ad751e7ac5]
+repro = "655d971809d4 image_sha256=9b83451519efcd28976470b714314e5034ea7ddcde11b76daa8eea751710ba87"
+sha256 = "e890bd20482a58d1a5cfb623a5c9ee601bdf7703919a4626abcc37430245c707"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"0d0000000000000000000000000000002790280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"00000000000000000000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
+
 [answers.29df8d191d6ebbe5987e0013da5534431da03dac5be4ad0dd196aa9a31e00b9b]
 aux = "{\"mask\":3285}"
 repro = "c3bc20463f4a program_sha256=d1da87cdc0c5d2c36815dc4f1ec3ac72f43623ae4b448c1a139b77159b3705fa"
@@ -8919,6 +8924,11 @@ repro = "96d009fa5dfc program_sha256=e804c73ca4d7ac5b021802100f5b50d9a5d6f69b1bf
 sha256 = "136a563b2990d4fdd50b1e55b874c8d1d8c2cbf2895b5791df7a7cfd5dcec286"
 value = "[\"ok\",[[\"access\",2101244,8,false,false]]]"
 
+[answers.31bb7132748ee12f4ed1e7f1bcfec37d281d34f49bef5661e79928588ba1c728]
+repro = "9e5c6795295e image_sha256=07b3bb769366529aa555840e211913ab33e55ec06db8436b78f937b5e07afe7d"
+sha256 = "853432fa0c0ea07a4e6e812d27858fbea93ba0a7af73f3aa3ac3101530e48810"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"800000000000000000000000000000002f90280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"00000000000000000000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
+
 [answers.31ed862b5af1440e3aa105ac5b4343a2deb2a69f4451c766476ceea41b283c3e]
 aux = "{\"mask\":3285}"
 repro = "4d7f338661e2 program_sha256=8b73bae08dc69b248dedcfc52223f0347f2cbaf7e2023ea2418c5f8163143495"
@@ -9337,6 +9347,11 @@ aux = "{\"value\":[\"ok\",[[\"access\",2102863,8,true,false]]]}"
 repro = "a96beed380a4 program_sha256=f9afe29d514d0199424184545d3dfcb06db5c93ce3be7f3c71c22f3e4689f262"
 sha256 = "74be91e5a5410627ba0329483f35e74b02fccaeb0b8fe9f737004e2723fc59cd"
 value = "[\"ok\",[[\"access\",2102863,8,true,false]]]"
+
+[answers.33eecfb21ce65ea781d9d10a382b6759ade2f32897a882f9025f53b5f9935245]
+repro = "a843725aaef1 image_sha256=0192fbeae5b66756b3fa2a0b50f0fed56b6d1b6e73118ee87c66850d5238cc0d"
+sha256 = "853432fa0c0ea07a4e6e812d27858fbea93ba0a7af73f3aa3ac3101530e48810"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"800000000000000000000000000000002f90280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"00000000000000000000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
 
 [answers.3410edeb13c3e67f6fcbce07ab2251057f8659b4474c8908e8dcb11f208a8161]
 aux = "{\"ncpu\":1}"
@@ -16556,6 +16571,11 @@ value = "[\"ok\",[[\"access\",2098756,4,true,false]]]"
 aux = "{\"mask\":3285}"
 repro = "4d7f338661e2 program_sha256=86519ce7c0238d6ec846b8cf65d4ff5a0c784927ce81f490a129f7924e613a96"
 sha256 = "6eff9ce98c98ed113b3a6a8b5fe624f275410dea94b1d2aebf3d0434893c695e"
+
+[answers.5b4ef1004ab54c17b9106badb5bb0938a606af104df71bb62e1aec9045819aaf]
+repro = "ebbf70f4415a image_sha256=ba4d2bfdf9560d7a6bb7180285a92097a8a48a750775ddbfc3fc8a1c75af9a20"
+sha256 = "2775e50770cb660999928eb2237070ba2b05bf491d40e140a79a5f42e48343b3"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"800000000000000000000000000000003090280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"00000000000000000000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
 
 [answers.5bbd31d235d00cfaeb301734b17ee7d9ecd195562a4972624831a13f31586b94]
 aux = "{\"mask\":3285}"
@@ -27064,6 +27084,11 @@ repro = "90ac72fb1409 program_sha256=02acf56ebf13ebf71343c8107bdd5fcba7dd97814b7
 sha256 = "602cfd7b1797fdd130c15146533efbbe55db3204cd29641ff9cca47656fc022c"
 value = "[\"ok\",[[\"access\",140738562164736,8,false,false]]]"
 
+[answers.99866b9c0b817b4f663297d0ad4a87070a400a343442f803e9a15ada39e40078]
+repro = "555e31633615 image_sha256=f9cde58ed64565c6f301d091924716d0369ff4fc7724c89a0e65ba0fb63aec20"
+sha256 = "31098b97d2a561cdfa279acfc1a7faeb25283eb2d31b02fbd40618a128bf58f0"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"0e0000000000000004000000000000003390280000000000db00000000000000\",\"0x282120\":\"4400010000000000\",\"0x282148\":\"02000000\",\"0x282170\":\"0100000000000000\",\"0x282178\":\"81e0280000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"ffffffffffffffff0000000000000000\",\"0x28e040\":\"0050280000000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
+
 [answers.999b409261264f1784343df82ba5a056700541795b07b12e6470a3e854b6d6e7]
 aux = "{\"ncpu\":1}"
 repro = "be3f486a574a image_sha256=0b7ff5fdfca062c6b4a6c6ffdc84dd27aed2927e862708e94605ecb2f43af019"
@@ -35890,6 +35915,11 @@ repro = "cf4185af3aae program_sha256=18b2012b195ca887164f83d3c153eb9593d17cd3599
 sha256 = "eb73ae6b2085cef5ec55d4662f72a2285ac1a1b423d08eaed05a17569f2131b2"
 value = "[\"ok\",[[\"access\",3149813,8,true,true]]]"
 
+[answers.cb5977e555ed48d13a6128b3fcdf13e2f119b708116566d025afaaa01ebcd791]
+repro = "17b9b92b5e7f image_sha256=3dd3b239404467757ea40756c32fceb399ba5265440a212ea2726dfe622f6c7a"
+sha256 = "15e64322aa0f6cdd111e6bd66cfe3af73ddb5fcff59fc5fdf896223fd82cf86b"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"0d0000000000000000000000000000003390280000000000db00000000000000\",\"0x282120\":\"4400010000000000\",\"0x282148\":\"02000000\",\"0x282170\":\"0100000000000000\",\"0x282178\":\"81e0280000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"ffffffffffffffff0000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
+
 [answers.cb6e4e4ae37dbf351cefa58b49d93a1a9fb80cf66e449b2cc5dcde6a9e551a34]
 aux = "{\"mask\":3285}"
 repro = "4d7f338661e2 program_sha256=21148622b10aa1ebd081e2355784f5f5baacf4f255bd06c28dff1fff55e2799d"
@@ -39193,6 +39223,11 @@ aux = "{\"value\":[\"ok\",[[\"access\",140738562439174,2,true,false]]]}"
 repro = "9f300ad299cb program_sha256=b71d2e578e03394a2136342bc8412044fdab02c1c2e947334e1467223d9de313"
 sha256 = "dad1beb56088f0cacf12107c6bf758e411a1efc658fbef93c415a7eb398a5dfe"
 value = "[\"ok\",[[\"access\",140738562439174,2,true,false]]]"
+
+[answers.de515391ef6f8e60a8056cbe79280939ac2691e113290578617329105097cb4d]
+repro = "694c99d4a6ab image_sha256=00422beda7dae7d69e7a78c251ce99d85c55b1882a8c95abac4b7fc6e3cce3ad"
+sha256 = "36475d95f5c3df202168351609fcc8243f70e065a1357587ec38c2c10d5940d1"
+value = "{\"0x20a000\":\"0044\",\"0x20cffe\":\"111b\",\"0x282000\":\"0100000000000000\",\"0x282100\":\"800000000000000000000000000000002c90280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"ffffffffffffffff0000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
 
 [answers.de8c0d14de76a2446d7280204ad1bd143f3f790ce0858e553219925c96c2b079]
 aux = "{\"mask\":3285}"
@@ -43058,6 +43093,11 @@ sha256 = "e4aa3a183a7d48e4ff9f7823b3621173770f9effb08707428b61ae24e91a70a0"
 aux = "{\"mask\":3285}"
 repro = "83b577e68c30 program_sha256=57a35ed3c47ce810183c8bf1e7d37fecb1e4c4a418bd544b27972bd8af103335"
 sha256 = "05cf1834a17d1c3e0dac47fa41d4c468be9ee4659b25430ef9be6a6d1139ae7a"
+
+[answers.f4f4068b72882b1de6551aa289b758b7edccb89ac05b1738f8620a7f0c270019]
+repro = "8781d82bd7ca image_sha256=0a6bcc56085929b0563e9e8a1c3a7887825aa500b15b20be15610e4b88f0ec5e"
+sha256 = "148903309905a6eca7e7daf06dbce5a464845eac0295cc9e5f143166d3462187"
+value = "{\"0x282000\":\"0100000000000000\",\"0x282100\":\"0d0000000000000000000000000000002390280000000000db00000000000000\",\"0x282210\":\"78563412785634127856341278563412\",\"0x282230\":\"ffffffffffffffff0000000000000000\",\"0x28e040\":\"adfbcade00000000\",\"0x28e080\":\"112233445566778899aabbccddeeff00\"}"
 
 [answers.f4f97d311dd20f00733f2010ed875ddc0eb7a8948ccced0292f04b9c45313af5]
 aux = "{\"mask\":3285}"
@@ -46926,6 +46966,19 @@ supplier = "qemu-user"
 view = [
     "rip/0x10000a",
 ]
+
+[repro.17b9b92b5e7f]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "fs-string-repe-fault-flags"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
 
 [repro.17e3300ffc4f]
 args = [
@@ -51652,6 +51705,19 @@ view = [
     "rip/0x100014",
 ]
 
+[repro.555e31633615]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "fs-string-repe-page-flags"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
+
 [repro.55a1311bb7c0]
 args = [
     "-accel",
@@ -52848,6 +52914,19 @@ derived = [
 pin = "qemu-user 7.2 deb12u18"
 supplier = "qemu-user"
 
+[repro.655d971809d4]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "fs-maskmovdqu-zero"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
+
 [repro.6578e49e45ea]
 args = [
     "-accel",
@@ -53151,6 +53230,19 @@ supplier = "qemu-user"
 view = [
     "rip/0x100014",
 ]
+
+[repro.694c99d4a6ab]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "fs-resident-wrapped-word"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
 
 [repro.694fb437df56]
 args = [
@@ -55890,6 +55982,19 @@ view = [
     "rip/0x100ffe",
 ]
 
+[repro.8781d82bd7ca]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "gs-before-unmapped-page"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
+
 [repro.879a125e7a86]
 args = [
     "natemu-reference-v2",
@@ -57425,6 +57530,19 @@ derived = [
 pin = "qemu-user 7.2 deb12u18"
 supplier = "qemu-user"
 
+[repro.9e5c6795295e]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "gs-maskstore-zero"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
+
 [repro.9e8880def8e9]
 args = [
     "natemu-reference-v2",
@@ -58446,6 +58564,19 @@ args = [
 ]
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
+
+[repro.a843725aaef1]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "gs-null-maskstore-zero"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
 
 [repro.a8576925e0e3]
 args = [
@@ -63764,6 +63895,19 @@ derived = [
 ]
 pin = "qemu-user 7.2 deb12u18"
 supplier = "qemu-user"
+
+[repro.ebbf70f4415a]
+cpu = "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"
+cpufamily = "25"
+kernel = "7.0.0-43-generic"
+microcode = "0xa705206"
+model = "117"
+program = "fs-null-gather-zero"
+qemu = "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)"
+stepping = "2"
+supplier = "amd-kvm"
+vendor = "AuthenticAMD"
+virt = "kvm"
 
 [repro.ec080951ba5f]
 args = [
