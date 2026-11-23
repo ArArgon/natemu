@@ -108,7 +108,7 @@ pub mod kind {
     /// `imm` (the word after the stub branch). `guest_offset2` names the native access consuming that result.
     pub const SEGMENT: u8 = 25;
 }
-/// A SEGMENT check whose checked-base move directly precedes its one unsigned GPR load.
+/// A SEGMENT check whose checked-base move directly precedes its unsigned GPR or packed Q load.
 /// On a linear straddle the resident supplies the native transfer and resumes after it.
 pub const SEGMENT_NATIVE_LOAD: u8 = 0x80;
 /// High nibble of SEGMENT.data_reg[1] for a non-LOCK integer ALU memory destination.

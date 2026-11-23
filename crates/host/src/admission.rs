@@ -965,7 +965,7 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
     if s.kind == SEGMENT {
-        return matches!(s.segment, 4 | 5) && matches!(s.width, 1 | 2 | 4)
+        return matches!(s.segment, 4 | 5) && matches!(s.width, 1 | 2 | 4 | 16)
             && s.base_reg < 31 && s.index_reg == object::NO_REG && s.writeback == object::WB_NONE
             && s.rmw == object::RMW_NONE && access.is_some_and(|a| {
                 (match s.data_reg[1] & 0xf0 {
@@ -978,7 +978,10 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
                     && if s.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU {
                         a.kind == LOAD && a.rmw == object::RMW_LOAD
                     } else { a.rmw == object::RMW_NONE }
-                    && a.data_class == object::CLASS_GPR && a.imm == 0 && a.index_reg == object::NO_REG
+                    && if s.width == 16 {
+                        a.kind == LOAD && a.data_class == object::CLASS_FPR && s.data_reg[1] & 0xf0 == object::SEGMENT_NATIVE_LOAD
+                    } else { a.data_class == object::CLASS_GPR }
+                    && a.imm == 0 && a.index_reg == object::NO_REG
                     && a.writeback == object::WB_NONE
             });
     }

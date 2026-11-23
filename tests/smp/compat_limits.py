@@ -97,7 +97,7 @@ def cases():
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5, production=False, frame_alias=None, require_link=False):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False, flags_mask=0x10ed5, production=False, frame_alias=None, require_link=False, ymm1_high=None, fp_controls=None):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -109,6 +109,10 @@ def cases():
                 f'    movdqu xmm1, [{C.W:#x}]\n    movdqu xmm2, [{C.W + 16:#x}]\n'
                 f'    movdqu xmm3, [{C.W + 32:#x}]\n    xor edi, edi\n    xor eax, eax\n'
                 + after_load + prefix)
+        if ymm1_high is not None:
+            user += f'    vinsertf128 ymm1, ymm1, [{C.W + 16:#x}], 1\n'
+        if fp_controls:
+            user += '    int 0x7f\n'
         fault_rip = C.U + len(C.user32(user))
         user += f'    {insn}\n'
         trap_rip = C.U + len(C.user32(user)) if after_trap else fault_rip
@@ -117,6 +121,8 @@ def cases():
         user += '    int 0x80\n'
         rip = C.U + len(C.user32(user)) if success else trap_rip
         saved = f'    mov rax, cr2\n    mov [{C.W + 0x40:#x}], rax\n    jmp .fin\n'
+        if ymm1_high is not None:
+            saved = f'    vextractf128 [{C.W + 0x60:#x}], ymm1, 1\n' + saved
         if firmware is not None:
             saved = f'    xor eax, eax\n    movzx eax, word [rax]\n    mov [{C.W + 0x48:#x}], eax\n' + saved
         if reload_limit is not None:
@@ -127,14 +133,31 @@ def cases():
                      f'    mov [{C.F["g"] + 0x28:#x}], rax\n    jmp .resume\n.reload:\n'
                      f'    cmp qword [{C.LOG:#x}], 2\n    jne .done\n    mov ax, {selector:#x}\n'
                      f'    mov {segment}, ax\n    jmp .resume\n.done:\n' + saved)
-        enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23).replace('    push 2\n', f'    push {enter_flags}\n')
-        prog = C.program(name, C.gate(12, '.v12') + (C.gate(0, '.v0') if fault == 0 else '') + (C.gate(1, '.v1') if fault == 1 else '') + setup + kernel_setup + enter
-                         + C.handlers(saved, xmm=True, vectors=((0,) if fault == 0 else ()) + (1, 6, 12, 13, 14, 128), flags_mask=flags_mask), user, memory=mapped)
+        enter = C.ENTER(cs=0xdb if cpl3_mode == 32 else 0x23, flags=enter_flags)
+        gates = C.gate(12, '.v12')
+        vectors = [1, 6, 12, 13, 14, 128]
+        if fault in (0, 1, 7, 17):
+            gates += C.gate(fault, f'.v{fault}')
+        if fault == 0:
+            vectors.insert(0, 0)
+        elif fault in (7, 17):
+            vectors.append(fault)
+        handlers = C.handlers(saved, xmm=True, vectors=tuple(vectors), flags_mask=flags_mask)
+        if fp_controls:
+            # Set the FP gate after the user seeded its YMM register. Restore it in the fault
+            # handler before the logger reads XMM/YMM, preserving the faulting register bank.
+            enable, restore = fp_controls
+            gates += C.gate(0x7f, '.fpctl', 3)
+            handlers = ('.fpctl:\n    push rax\n' + enable + '    pop rax\n    iretq\n'
+                        + handlers.replace(f'.v{fault}:\n', f'.v{fault}:\n    push rax\n' + restore + '    pop rax\n'))
+        prog = C.program(name, gates + setup + kernel_setup + enter + handlers, user, memory=mapped)
         # Handler offsets are from compat.handlers, the target memory and CR2 are independent of the recorded frame.
         expected = {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128 if success else fault, error, rip,
                                                                      0xdb if cpl3_mode == 32 else 0x23),
                     C.REC + 0x110: xmm1, C.REC + 0x130: xmm3,
                     C.W + 0x40: struct.pack('<Q', cr2), tls: memory}
+        if ymm1_high is not None:
+            expected[C.W + 0x60] = ymm1_high
         if captured:
             expected.update(captured)
         if rflags is not None:
@@ -386,6 +409,46 @@ def cases():
             mapped=C.TOP_ONLY, prefix=seed, ecx=0x12345678, fault=14, error=6 if write else 4, cr2=0,
             kernel_setup=init, captured={high: bytes.fromhex('1122')})
     watch_low = '    xor eax, eax\n    mov dr0, rax\n    mov eax, 0x10001\n    mov dr7, rax\n'
+    # Distinct Q-register bytes span the final and first linear pages; the nonzero YMM
+    # upper sentinel distinguishes a legacy commit, a VEX.128 commit and a pre-commit fault.
+    head, tail = VALUE[:8], VALUE[8:]
+    put_head = f'    mov ebx, 0xfffffff8\n    mov rax, {int.from_bytes(head, "little"):#x}\n    mov [rbx], rax\n'
+    put_tail = f'    xor ebx, ebx\n    mov rax, {int.from_bytes(tail, "little"):#x}\n    mov [rbx], rax\n'
+    quad = dict(base=0xfffffff8, limit=15)
+    for op in ('movups', 'movupd', 'vmovups', 'vmovupd'):
+        high_result = bytes(16) if op.startswith('v') else INDEX
+        segment = 'gs' if op.endswith('d') else 'fs'
+        insn = f'{op} xmm1, [{segment}:edi]'
+        add(f'{segment}-packed-{op}-ordinary', insn, segment=segment, limit=15, success=True,
+            xmm1=VALUE, ymm1_high=high_result)
+        add(f'{segment}-packed-{op}-wrap', insn, segment=segment, **quad, mapped=C.WRAP,
+            kernel_setup=put_head + put_tail, success=True, xmm1=VALUE, ymm1_high=high_result)
+    add('gs-packed-vmovups-indexed', 'vmovups xmm1, [gs:edi+esi*4+8]', segment='gs', base=tls - 24, limit=39,
+        prefix='    mov edi, 8\n    mov esi, 2\n', success=True, xmm1=VALUE, ymm1_high=bytes(16))
+    add('fs-packed-movups-wrap-claimed', 'movups xmm1, [fs:edi]', **quad, mapped=low_apic, kernel_setup=put_head,
+        refuse='crossing', captured={C.HIGH + 4088: head})
+    add('gs-packed-vmovups-short', 'vmovups xmm1, [gs:edi]', segment='gs', base=C.XPAGE, limit=14,
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n', ymm1_high=INDEX)
+    add('fs-packed-movupd-wrap-pf', 'movupd xmm1, [fs:edi]', **quad, mapped=C.TOP_ONLY, kernel_setup=put_head,
+        fault=14, error=4, cr2=0, ymm1_high=INDEX, captured={C.HIGH + 4088: head})
+    add('gs-packed-vmovupd-wrap-watch', 'vmovupd xmm1, [gs:edi]', segment='gs', **quad, mapped=C.WRAP,
+        kernel_setup=put_head + put_tail + watch_low.replace('0x10001', '0x30001'), fault=1, after_trap=True,
+        xmm1=VALUE, ymm1_high=bytes(16))
+    ac_on = '    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n'
+    add('fs-packed-movups-wrap-aligned8-ac', 'movups xmm1, [fs:edi]', **quad, mapped=C.WRAP, enter_flags=0x40002,
+        kernel_setup=put_head + put_tail + ac_on, success=True, xmm1=VALUE, ymm1_high=INDEX)
+    add('gs-packed-vmovups-wrap-misaligned-ac', 'vmovups xmm1, [gs:edi]', segment='gs', base=0xfffffff9, limit=15,
+        mapped=C.TOP_ONLY, enter_flags=0x40002, kernel_setup=ac_on, fault=17, ymm1_high=INDEX)
+    for name, mapping, expected_tail in [('rom', low_rom, rom[:8]), ('unassigned', low_hole, b'\xff' * 8)]:
+        add(f'fs-packed-vmovups-wrap-{name}', 'vmovups xmm1, [fs:edi]', **quad, mapped=mapping, kernel_setup=put_head,
+            firmware=rom if name == 'rom' else None, success=True, xmm1=head + expected_tail, ymm1_high=bytes(16))
+    # The source's limit cannot mask #NM or #UD. Restore FPU access solely to save the frame.
+    ts = ('    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n', '    clts\n')
+    osx = ('    mov rax, cr4\n    btr rax, 18\n    mov cr4, rax\n',
+           '    mov rax, cr4\n    bts rax, 18\n    mov cr4, rax\n')
+    add('fs-packed-movups-ts-before-limit', 'movups xmm1, [fs:edi]', fault=7, fp_controls=ts, ymm1_high=INDEX)
+    add('gs-packed-vmovupd-disabled-before-limit', 'vmovupd xmm1, [gs:edi]', segment='gs', fault=6,
+        fp_controls=osx, ymm1_high=INDEX)
     add('gs-generated-imm-wrapped-watch', 'mov dword [gs:edi], 0x89abcdef', base=0xfffffffe, segment='gs',
         mapped=C.WRAP, fault=1, after_trap=True, kernel_setup=up + watch_low,
         captured={high: bytes.fromhex('efcd'), low: bytes.fromhex('ab89')}, **imm)

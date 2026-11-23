@@ -4077,12 +4077,14 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site, spsr: u64
     unsafe { dispatch(&mut s) }
 }
 
-/// A bank-checked scalar operand whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
+/// A bank-checked operand whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
 /// single architectural access here, before a native store probe or any guest byte is touched.
 fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va: u64, spsr: u64) -> ! {
     let width = u64::from(site.width);
     let write = site.intent == object::INTENT_WRITE;
-    if alignment_check(&s.cpu) != 0 && va & (width - 1) != 0 {
+    // The ordinary MOVUPS-class abort path completes an 8-byte-aligned Q load under #AC.
+    let align = width.min(8);
+    if alignment_check(&s.cpu) != 0 && va & (align - 1) != 0 {
         guest_fault(s, f, b, site, [17, 0, 0]);
     }
     let rmw = site.data_reg[1] & 0xf0 == object::SEGMENT_RMW_ALU;
@@ -4107,6 +4109,7 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
     let reg = usize::from(if rmw { reg & 7 } else { reg & !object::SEGMENT_STORE_REGISTER });
     let old = if native_store { f.x[reg] } else { s.cpu.gpr[reg] };
     let mut value = if write { old.to_le_bytes() } else { [0; 8] };
+    let mut quad = [0; 16];
     let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
         Ok(pages) => pages,
         Err([vector, error, cr2]) if native => guest_fault(s, f, b, site, [vector, cr2, error]),
@@ -4165,10 +4168,13 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
         value = u64::from(result).to_le_bytes();
         segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], true);
         s.cpu.rflags = (s.cpu.rflags & !u64::from(exec::ARITHMETIC)) | u64::from(flags);
-    } else if mixed {
-        segments::copy_mixed(&mut s, gpa, first, &mut value[..width as usize], write);
     } else {
-        segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], write);
+        let bytes = if width == 16 { &mut quad[..] } else { &mut value[..width as usize] };
+        if mixed {
+            segments::copy_mixed(&mut s, gpa, first, bytes, write);
+        } else {
+            segments::copy_ram(&mut s, gpa, first, bytes, write);
+        }
     }
     unsafe { asm!("dsb ish") };
     watch::access(&mut s, va, width, write);
@@ -4176,13 +4182,18 @@ fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site,
         let sites = cache::sites(b);
         let Ok(index) = sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset) else { halt(&s, stop::SITE_MISMATCH) };
         let access = sites[index];
-        // Admission proves exactly MOV wBase,w0, then the recorded unsigned load. Restore their
-        // native outputs in order (the load may reuse its base), then execute the original ALU.
+        // Restore the exact native address and transfer at the step slot's continuation.
+        // A Q load commits its XMM and (for VEX) clears its upper half in the original code.
         unsafe {
             let frame = &raw mut (*shared()).captured;
             (*frame).x[0] = va;
             (*frame).x[usize::from(access.base_reg)] = va;
-            (*frame).x[usize::from(access.data_reg[0])] = u64::from_le_bytes(value);
+            let rt = usize::from(access.data_reg[0]);
+            if width == 16 {
+                (*frame).q[rt] = quad;
+            } else {
+                (*frame).x[rt] = u64::from_le_bytes(value);
+            }
             write_record(record(), &s);
             resume(&s, frame, b.code_va() + u64::from(access.native_offset) + 4, spsr)
         }

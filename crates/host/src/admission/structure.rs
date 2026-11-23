@@ -750,6 +750,8 @@ struct ScalarOperand {
     result_and_length: u8,
     absolute_offset: Option<u32>,
     xlat: bool,
+    vex_qmove: bool,
+    qmove_offset: Option<[u32; 9]>,
 }
 
 fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
@@ -776,6 +778,12 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         let moffs = matches!(i.code(), Code::Mov_AL_moffs8 | Code::Mov_AX_moffs16 | Code::Mov_EAX_moffs32
             | Code::Mov_moffs8_AL | Code::Mov_moffs16_AX | Code::Mov_moffs32_EAX);
         if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
+        let vex_qmove = matches!(i.code(), Code::VEX_Vmovups_xmm_xmmm128 | Code::VEX_Vmovupd_xmm_xmmm128);
+        let qmove = vex_qmove || matches!(i.code(), Code::Movups_xmm_xmmm128 | Code::Movupd_xmm_xmmm128);
+        let encoded = &src[g as usize..decoder.position()];
+        if qmove && encoded[..crate::system::opcode_at(encoded).0].contains(&0x67) {
+            return Err("unsupported 16-bit packed MOV address".into());
+        }
         let xlat = i.code() == Code::Xlat_m8;
         if xlat && (i.memory_base() != Register::EBX || i.memory_index() != Register::AL) {
             return Err("unsupported 16-bit XLAT address".into());
@@ -814,6 +822,7 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
             _ => None,
         };
         let result = match i.code() {
+            _ if qmove => object::SEGMENT_NATIVE_LOAD,
             _ if implicit_group.is_some() => object::SEGMENT_NATIVE_LOAD,
             _ if moffs || store_immediate.is_some() || integer_store.is_some() => 0,
             Code::Cmpxchg_rm8_r8 | Code::Cmpxchg_rm16_r16 | Code::Cmpxchg_rm32_r32 if i.has_lock_prefix() => object::SEGMENT_CMPXCHG,
@@ -874,7 +883,15 @@ fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
         guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
             data_reg: modrm_reg | (rmw_alu.unwrap_or(0) << 3), store_immediate, integer_store, result_and_length: result | i.len() as u8,
-            xlat, inline_dword,
+            xlat, inline_dword, vex_qmove,
+            qmove_offset: qmove.then(|| {
+                let mut terms = [0u32; 9]; // EAX..EDI coefficients and the constant displacement
+                for (reg, factor) in [(i.memory_base(), 1), (i.memory_index(), i.memory_index_scale())] {
+                    if reg != Register::None { terms[reg.number()] += factor; }
+                }
+                terms[8] = i.memory_displacement32();
+                terms
+            }),
         });
     }
     if !guarded.is_empty() {
@@ -1340,6 +1357,8 @@ impl<'a> Verifier<'a> {
             for at in (p.native_offset..end).step_by(4) {
                 if run_end.is_some_and(|e| (e..e + 40).contains(&at)) { continue; }
                 if at == access.native_offset || Some(at) == rmw_store || Some(at) == tag_load { continue; }
+                // The VEX destination's verified upper-half clear occurs only after its Q load.
+                if op.vex_qmove && at == access.native_offset + 4 { continue; }
                 match self.insn(at) {
                     // Frame reads were confined to defined fields by words()/frame_access(). They have no guest memory effect.
                     Some(Insn::Mem(m)) if m.load && m.addr.base == 28 => {}
@@ -1367,7 +1386,7 @@ impl<'a> Verifier<'a> {
                 }
                 offset_end - 4
             };
-            if op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 || (inline.is_some() && op.write == 0) {
+            if op.width != 16 && (op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 || (inline.is_some() && op.write == 0)) {
                 // A wrapped native-load continuation and an inline MOV result both require the exact
                 // unsigned W load. MOV subsequently commits the entire X register to its guest root.
                 let size = u32::from(op.width.trailing_zeros()) << 30;
@@ -1428,6 +1447,9 @@ impl<'a> Verifier<'a> {
                 })
             {
                 return Err("scalar segment check continuation".into());
+            }
+            if op.width == 16 {
+                self.qmove_effect(op, p.native_offset, setup, back, access, end)?;
             }
             if op.xlat {
                 self.xlat_effect(p.native_offset, setup, access, end, site.base_reg)?;
@@ -1497,6 +1519,101 @@ impl<'a> Verifier<'a> {
             && self.word(from) == 0x3400_0140
             && RUN_END.iter().enumerate().all(|(i, &w)| self.word(from + 4 + 4 * i as u32) == w)
             && self.branches_into(from - 4, to - 4).next().is_none()
+    }
+
+    fn qmove_effect(&self, op: &ScalarOperand, start: u32, setup: u32, back: u32, access: &Site, end: u32) -> Result<(), String> {
+        let at = access.native_offset;
+        let rt = u32::from(access.data_reg[0]);
+        let rn = u32::from(access.base_reg);
+        let dst = u32::from(op.data_reg);
+        let commit = at + 4 + u32::from(op.vex_qmove) * 4;
+        // In the compact register allocation v16..v23 are the architectural XMM roots.
+        // A faulting load must only target a temporary. The original native commit updates
+        // the low 128 bits, and only VEX zeros this destination's 16-byte upper slot.
+        let next = commit + 4;
+        let fall_through = self.c.address(u64::from(op.offset) + u64::from(op.result_and_length & 15));
+        // A cut or step block can end without a final PC entry. Its exact fall-through link
+        // must then start immediately after the result, before the out-of-line stubs.
+        if next != end && (next > end || self.link_point(next).is_none_or(|(target, _)| target != fall_through)) {
+            return Err("packed MOV commit does not end at its next PC or fall-through exit".into());
+        }
+        if dst >= 8 || !matches!(rt, 2..=15 | 24..=31) || !matches!(rn, 12..=17 | 19..=24 | 29..=30)
+            || at != back + 4 || self.word(at) != 0x3dc0_0000 | rn << 5 | rt
+            || self.word(commit) != 0x4ea0_1c00 | rt << 16 | rt << 5 | (16 + dst)
+        {
+            return Err("packed MOV needs one Q load and its XMM destination commit".into());
+        }
+        if op.vex_qmove {
+            let offset = frame::AVX_HIGH + dst * 16;
+            if self.word(at + 4) != 0xa900_7f9f | (offset / 8) << 15 {
+                return Err("packed VEX MOV needs the destination's upper-half clear".into());
+            }
+        }
+        // The only branch in the effect leaves for the SEGMENT stub. Pointer materialization
+        // before it and the result commit after it must preserve the other architectural roots.
+        // The step slot can close an inherited x87 run just before SEGMENT. Indexed EAs
+        // have already been formed in dynamic GPRs, which the exact run close leaves intact.
+        let fold = setup.checked_sub(36).filter(|&pos| pos >= start
+            && (0..9).all(|k| self.word(pos + k * 4) == RUN_END[k as usize]));
+        let test = fold.and_then(|pos| pos.checked_sub(8)).filter(|&pos| pos >= start
+            && self.word(pos) == 0x3940_0380 | frame::X87_RUN << 10 && self.word(pos + 4) == 0x3400_0140);
+        let offset = (self.word(setup) >> 16 & 31) as usize;
+        let expected = op.qmove_offset.ok_or("missing packed MOV address")?;
+        if self.qmove_offset(start, test.or(fold).unwrap_or(setup), offset) != Some(expected)
+            || self.branches_into(start, commit).any(|(from, to)| !test.is_some_and(|p| from == p + 4 && to == setup))
+            || overlaps_relocation32(start..commit + 4, self.c.relocs, false)
+            || self.c.relocs.iter().any(|r| (start..=commit).contains(&r.offset))
+        {
+            return Err("unsealed packed MOV address or result".into());
+        }
+        Ok(())
+    }
+
+    /// The address producers for a Q read are affine in the eight 32-bit GPRs. Track their
+    /// coefficients and the constant term modulo 2^32, so an indexed operand with any base,
+    /// scale or displacement must equal the independently decoded ModRM address.
+    fn qmove_offset(&self, mut at: u32, end: u32, offset: usize) -> Option<[u32; 9]> {
+        let mut regs = [None; 32];
+        for (i, &native) in SRA32[..8].iter().enumerate() {
+            let mut value = [0; 9];
+            value[i] = 1;
+            regs[usize::from(native)] = Some(value);
+        }
+        while at < end {
+            let w = self.word(at);
+            let rd = (w & 31) as usize;
+            if !matches!(rd, 12..=17 | 19..=24 | 29..=30) { return None; }
+            if let Some((words, n)) = self.move_sequence(at, rd as u8) {
+                if words.end > end { return None; }
+                let mut value = [0; 9];
+                value[8] = n as u32;
+                regs[rd] = Some(value);
+                at = words.end;
+                continue;
+            }
+            let rn = (w >> 5 & 31) as usize;
+            let rm = (w >> 16 & 31) as usize;
+            let value = if w & 0x7f80_0000 == 0x1100_0000 || w & 0x7f80_0000 == 0x5100_0000 {
+                let mut v = regs[rn]?;
+                let imm = (w >> 10 & 0xfff) << (12 * (w >> 22 & 1));
+                v[8] = if w & (1 << 30) == 0 { v[8].wrapping_add(imm) } else { v[8].wrapping_sub(imm) };
+                v
+            } else if w & 0x7fe0_0000 == 0x0b00_0000 {
+                let shift = w >> 10 & 63;
+                if shift > 3 { return None; }
+                let (a, b) = (regs[rn]?, regs[rm]?);
+                std::array::from_fn(|i| a[i].wrapping_add(b[i] << shift))
+            } else if w & 0xffc0_0000 == 0x5300_0000 {
+                let (r, s) = (w >> 16 & 63, w >> 10 & 63);
+                if !(29..=31).contains(&r) || s + 1 != r { return None; }
+                regs[rn]?.map(|v| v << (32 - r))
+            } else if w & 0x7fe0_ffe0 == 0x2a00_03e0 {
+                regs[rm]?
+            } else { return None; };
+            regs[rd] = Some(value);
+            at += 4;
+        }
+        regs[offset]
     }
 
     fn xlat_effect(&self, start: u32, setup: u32, access: &Site, end: u32, offset: u8) -> Result<(), String> {
@@ -3764,6 +3881,43 @@ mod tests {
                 let mut different_root = obj.clone();
                 different_root[at - 4] ^= 1;
                 assert!(check(&different_root).is_err(), "{hex}: run-close reads another register");
+            }
+        }
+        // Inspect emitted objects only. Q width, temporary, XMM commit and the VEX upper
+        // slot must agree with the decoded guest operand under both admission profiles.
+        for (hex, vex) in [
+            ("640f100f", false), ("65660f104c8f08", false), ("640f100c8500000000", false),
+            ("640f108f00000080", false), ("640f100d07800408", false),
+            ("64c5f8100f", true), ("65c5f91017", true), ("64c4e178100c8578563412", true),
+        ] {
+            let (obj, src) = compile(hex, "0x8048000", "32");
+            let h: Header = super::super::record(&obj, 0);
+            let access = (0..h.sites_count as usize)
+                .map(|i| super::super::record::<Site>(&obj, h.sites_offset as usize + i * size_of::<Site>()))
+                .find(|s| s.kind == object::kind::LOAD).unwrap();
+            let at = access.native_offset;
+            let word = |p| u32::from_le_bytes(obj[(h.code_offset + p) as usize..][..4].try_into().unwrap());
+            for shape in [true, false] {
+                let check = |o: &[u8], bytes: &[u8]| super::super::admit_mode(o, h.guest_rip, bytes, u64::MAX, shape, false, true);
+                check(&obj, &src).unwrap_or_else(|e| panic!("{hex}: {e}"));
+                if hex == "65660f104c8f08" {
+                    for (pos, delta) in [(5, 0x40), (5, 1), (6, 1)] {
+                        let mut other = src.clone();
+                        other[pos] ^= delta;
+                        assert!(check(&obj, &other).is_err(), "different ModRM base, scale or displacement");
+                    }
+                }
+                let commit = at + if vex { 8 } else { 4 };
+                for (p, replacement) in [(at, 0xfd40_0000 | word(at) & 0x3ff), (commit, word(commit) ^ 1), (commit, word(commit) ^ (1 << 16))] {
+                    let changed = patched((&obj, &src), p, word(p), replacement);
+                    assert!(check(&changed, &src).is_err(), "{hex}: changed Q transfer or commit at {p}");
+                }
+                if vex {
+                    for replacement in [word(at + 4) ^ (1 << 16), MOV_X0] {
+                        let changed = patched((&obj, &src), at + 4, word(at + 4), replacement);
+                        assert!(check(&changed, &src).is_err(), "{hex}: lost or misdirected YMM clear");
+                    }
+                }
             }
         }
         let (alu, source) = compile("65330f", "0x8048000", "32");

@@ -706,6 +706,26 @@ class Slice1Cutting(unittest.TestCase):
             guard, = (s for s in d['sites'] if s['kind'] == 'segment')
             self.assertEqual(check_sites.inline_dword_start(guard, bytes.fromhex(d['code']['hex'])) is not None, hot, opcode)
 
+    def test_compat_packed_segment_loads(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as tmp:
+            for form, vex in [('640f100f', False), ('65660f104c9708', False),
+                              ('64c5f8100f', True), ('65c5f91017', True)]:
+                d, rc = run(form, RIP, '--bitness', '32')
+                self.assertEqual(rc, 0)
+                guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                load, = (s for s in d['sites'] if s['kind'] == 'load')
+                self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation'], load['data_class'],
+                                  guard['access_native_offset'], guard['imm'] + 4), (16, 'read', True, 'fpr',
+                                  load['native_offset'], load['native_offset']), form)
+                self.assertEqual(verify_precision.verify(d, Path(tmp))[0], [], form)
+                gated, _ = run(form, RIP, '--bitness', '32', '--avx-gated' if vex else '--sse-gated', '--fs-null', '--gs-null')
+                self.assertEqual(gated['guest']['end']['reason'], 'system_instruction', form)
+                self.assertIs(gated['guest']['end'].get('cut_gated'), True, form)
+            for form in ['640f110f', '640f280f', '64f30f100f', '64f20f100f', '64c5fc100f', '64d907']:
+                d, _ = run(form, RIP, '--bitness', '32')
+                self.assertFalse(any(s['kind'] == 'segment' for s in d.get('sites', [])), form)
+
     def test_compat_extending_segment_loads(self):
         import verify_precision
         with tempfile.TemporaryDirectory() as t:
