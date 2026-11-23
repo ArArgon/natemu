@@ -704,7 +704,7 @@ struct Verifier<'a> {
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
 /// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26).
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
-    let guarded = scalar_movs(c)?;
+    let guarded = scalar_operands(c)?;
     // The guarded slice relies on the existing exact memory-word, split-probe and control-flow
     // verifiers even in production. This also rejects unrecorded native transfers anywhere in its block.
     let checked = Code { shape: c.shape || !guarded.is_empty(), ..*c };
@@ -733,7 +733,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
 
 /// Decode the complete source stream independently of the producer's PC table. A matching prefix
 /// byte inside a displacement or immediate is ordinary data.
-struct ScalarMov {
+struct ScalarOperand {
     offset: u32,
     segment: u8,
     width: u8,
@@ -743,7 +743,7 @@ struct ScalarMov {
     absolute_offset: Option<u32>,
 }
 
-fn scalar_movs(c: &Code) -> Result<Vec<ScalarMov>, String> {
+fn scalar_operands(c: &Code) -> Result<Vec<ScalarOperand>, String> {
     use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
     let src = &c.source[..c.guest_bytes as usize];
     let mut guarded = Vec::new();
@@ -769,6 +769,9 @@ fn scalar_movs(c: &Code) -> Result<Vec<ScalarMov>, String> {
         if moffs && i.memory_displ_size() != 4 { return Err("unsupported 16-bit moffs address".into()); }
         let result = match i.code() {
             _ if moffs => 0,
+            Code::Sub_r8_rm8 | Code::Sub_r16_rm16 | Code::Sub_r32_rm32
+            | Code::Xor_r8_rm8 | Code::Xor_r16_rm16 | Code::Xor_r32_rm32
+            | Code::Cmp_r8_rm8 | Code::Cmp_r16_rm16 | Code::Cmp_r32_rm32 => object::SEGMENT_NATIVE_LOAD,
             Code::Mov_rm8_r8 | Code::Mov_rm16_r16 | Code::Mov_rm32_r32 | Code::Mov_r8_rm8 | Code::Mov_r16_rm16 | Code::Mov_r32_rm32 => 0,
             Code::Movzx_r16_rm8 | Code::Movzx_r16_rm16 => 0x10,
             Code::Movzx_r32_rm8 | Code::Movzx_r32_rm16 => 0x20,
@@ -777,7 +780,7 @@ fn scalar_movs(c: &Code) -> Result<Vec<ScalarMov>, String> {
             _ => continue,
         };
         let write = u8::from(i.op0_kind() == OpKind::Memory);
-        guarded.push(ScalarMov {
+        guarded.push(ScalarOperand {
             offset: g, segment: seg, width: i.memory_size().size() as u8, write, absolute_offset: moffs.then(|| i.memory_displacement32()),
             register: i.op_register(u32::from(write)).number() as u8, result_and_length: result | i.len() as u8,
         });
@@ -981,9 +984,9 @@ impl<'a> Verifier<'a> {
         .then_some(start..end)
     }
 
-    /// Every covered scalar compatibility MOV through FS/GS reaches a bank check before its one memory access,
+    /// Every covered scalar compatibility operand through FS/GS reaches a bank check before its one memory access,
     /// including in production admission. The continuation takes its base from w0, reserved for the resident.
-    fn scalar_segment_checks(&mut self, guarded: &[ScalarMov]) -> Result<(), String> {
+    fn scalar_segment_checks(&mut self, guarded: &[ScalarOperand]) -> Result<(), String> {
         use object::kind::SEGMENT;
         for op in guarded {
             let g = op.offset;
@@ -1020,7 +1023,7 @@ impl<'a> Verifier<'a> {
                     Some(Insn::Mem(_)) if at >= 16 && (0..5).all(|k| self.word(at - 16 + k * 4) == RUN_END[k as usize])
                         && self.branches_into(at - 16, at).next().is_none() => {}
                     Some(Insn::Mem(_) | Insn::Atomic { .. } | Insn::Swap { .. } | Insn::Literal { .. }) =>
-                        return Err(format!("extra memory operation {:#010x} in scalar MOV at {at:#x}", self.word(at))),
+                        return Err(format!("extra memory operation {:#010x} in scalar instruction at {at:#x}", self.word(at))),
                     _ => {}
                 }
             }
@@ -1038,6 +1041,18 @@ impl<'a> Verifier<'a> {
                 }
                 back - 8
             };
+            if op.result_and_length & object::SEGMENT_NATIVE_LOAD != 0 {
+                // Only these two native effects can be skipped on a successful wrapped read. Prove the
+                // unsigned W-register load, including its exact data register, even with shape checks off.
+                let size = u32::from(op.width.trailing_zeros()) << 30;
+                let registers = u32::from(access.base_reg) << 5 | u32::from(access.data_reg[0]);
+                let word = self.word(access.native_offset);
+                if back + 4 != access.native_offset || access.base_reg >= 31 || access.data_reg[0] >= 31
+                    || ![0x3940_0000, 0x3840_0000, 0x08df_fc00, 0x38bf_c000].iter().any(|opcode| word == size | opcode | registers)
+                {
+                    return Err(format!("scalar native load continuation {back:#x} to {:#x}, word {word:#010x}", access.native_offset));
+                }
+            }
             if self.instruction(access.native_offset) != Some((g, p.native_offset))
                 || !matches!(self.insn(back - 4), Some(Insn::B(to)) if to == i64::from(site.native_offset))
                 || self.word(back) != 0x2a00_03e0 | u32::from(access.base_reg)
@@ -3062,6 +3077,25 @@ mod tests {
         }
         let e = admit(&compile("4889d8c3", "0x8048000", "64"), true).expect_err("64-bit code admitted as 32-bit code");
         assert!(e.contains("profile or settings"), "{e}");
+        let (alu, source) = compile("65330f", "0x8048000", "32");
+        let h: Header = super::super::record(&alu, 0);
+        let (site_offset, guard) = (0..h.sites_count as usize)
+            .map(|n| h.sites_offset as usize + n * size_of::<Site>())
+            .map(|at| (at, super::super::record::<Site>(&alu, at)))
+            .find(|(_, s)| s.kind == object::kind::SEGMENT).unwrap();
+        for shape in [false, true] {
+            let check = |bytes: &[u8]| super::super::admit_mode(bytes, h.guest_rip, &source, u64::MAX, shape, false, true);
+            check(&alu).unwrap();
+            let mut changed = alu.clone();
+            changed[site_offset + core::mem::offset_of!(Site, data_reg) + 1] ^= object::SEGMENT_NATIVE_LOAD;
+            assert!(check(&changed).unwrap_err().contains("differs from its x86 operand"));
+            let at = (h.code_offset + guard.guest_offset2) as usize;
+            let mut changed = alu.clone();
+            let word = u32::from_le_bytes(changed[at..at+4].try_into().unwrap());
+            // Another W register of the same width cannot receive the load on the wrapped path.
+            changed[at..at+4].copy_from_slice(&(word ^ 1).to_le_bytes());
+            assert!(check(&changed).is_err());
+        }
         let (moffs, source) = compile("65a178563412", "0x8048000", "32");
         let h: Header = super::super::record(&moffs, 0);
         for shape in [false, true] {

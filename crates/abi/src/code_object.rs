@@ -105,6 +105,10 @@ pub mod kind {
     /// `imm` (the word after the stub branch). `guest_offset2` names the native access consuming that result.
     pub const SEGMENT: u8 = 25;
 }
+/// A SEGMENT check whose checked-base move directly precedes its one unsigned GPR load.
+/// On a linear straddle the resident supplies the native transfer and resumes after it.
+pub const SEGMENT_NATIVE_LOAD: u8 = 0x80;
+
 /// M2 task 4, in the `guest_offset2` slot of an 8-byte store site with a general data register: the store of a FISTP or
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault
 /// there the resident keeps that integer for the instruction's rerun ([`crate::execution::frame::X87_INT`]).

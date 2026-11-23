@@ -418,6 +418,8 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
         if s['kind'] == 'segment' and (rec[7], rec[9], rec[10]) != (int(s['intent'] == 'write'), {'fs': 4, 'gs': 5}.get(s['segment']), s['base_reg']):
             problems.append(('ERROR', f'object site at {s["native_offset"]}: segment operand differs from JSON'))
+        if s['kind'] == 'segment' and bool(rec[17] & 0x80) != s.get('native_load_continuation', False):
+            problems.append(('ERROR', f'object site at {s["native_offset"]}: native load continuation differs from JSON'))
         if rec[24] != int(s['located']) or rec[4] != s['imm']:
             problems.append(('ERROR', f'object site at {s["native_offset"]}: located/imm disagree with JSON'))
         link = s.get('access_native_offset') if s['kind'] in STUBS else s.get('mmio', s['guest_offset2'])   # a stub's guest_offset2 is

@@ -3939,9 +3939,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     Ok(va) => va,
                     Err(e) => guest_fault(s, f, b, &site, e),
                 };
-                // The native MOV is contiguous. A linear straddle requires a two-span access transaction.
+                // The native transfer is contiguous. A linear straddle requires a two-span access transaction.
                 if segments::outside(&s.cpu, va, u64::from(site.width)) {
-                    wrapped_segment_mov(s, f, b, &site, va);
+                    wrapped_segment_access(s, f, b, &site, va, spsr);
                 }
                 let frame = &raw mut (*shared()).captured;
                 (*frame).x[0] = va;
@@ -4073,18 +4073,27 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site, spsr: u64
     unsafe { dispatch(&mut s) }
 }
 
-/// A bank-checked scalar MOV whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
+/// A bank-checked scalar operand whose linear bytes wrap from FFFF_FFFFH to zero. Complete the
 /// single architectural access here, before a native store probe or any guest byte is touched.
-fn wrapped_segment_mov(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va: u64) -> ! {
+fn wrapped_segment_access(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va: u64, spsr: u64) -> ! {
     let width = u64::from(site.width);
     let write = site.intent == object::INTENT_WRITE;
     if alignment_check(&s.cpu) != 0 && va & (width - 1) != 0 {
         guest_fault(s, f, b, site, [17, 0, 0]);
     }
-    // Use owned architectural roots before walking: a write can invalidate its own translated block.
-    bank_at(&mut s, f, b, site);
+    let native = site.data_reg[1] & object::SEGMENT_NATIVE_LOAD != 0;
+    if native && b.flags & cache::STEP == 0 {
+        // The private instruction slot survives page-table A/D writes and delivers data breakpoints
+        // after the native ALU has committed its result and flags.
+        step_from(s, f, b, site);
+    }
+    if !native {
+        // A MOV store can invalidate its own source block. Own its architectural roots before walking.
+        bank_at(&mut s, f, b, site);
+    }
     let gpa = match segments::pages(&mut s, va, width, write, false, segments::OperandRange::Based) {
         Ok(pages) => pages,
+        Err([vector, error, cr2]) if native => guest_fault(s, f, b, site, [vector, cr2, error]),
         Err(e) => {
             deliver(&mut s, Event::Exception(e));
             unsafe { dispatch(&mut s) }
@@ -4109,7 +4118,7 @@ fn wrapped_segment_mov(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va
     let length = result_and_length & 15;
     let reg = usize::from(reg);
     let old = s.cpu.gpr[reg];
-    let mut value = old.to_le_bytes();
+    let mut value = if write { old.to_le_bytes() } else { [0; 8] };
     let first = ((1u64 << 32) - va) as usize;
     // The existing split completion orders the transfer before subsequent guest memory operations.
     unsafe { asm!("dmb ish") };
@@ -4119,6 +4128,22 @@ fn wrapped_segment_mov(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va
         segments::copy_ram(&mut s, gpa, first, &mut value[..width as usize], write);
     }
     unsafe { asm!("dsb ish") };
+    watch::access(&mut s, va, width, write);
+    if native {
+        let sites = cache::sites(b);
+        let Ok(index) = sites.binary_search_by_key(&site.guest_offset2, |a| a.native_offset) else { halt(&s, stop::SITE_MISMATCH) };
+        let access = sites[index];
+        // Admission proves exactly MOV wBase,w0, then the recorded unsigned load. Restore their
+        // native outputs in order (the load may reuse its base), then execute the original ALU.
+        unsafe {
+            let frame = &raw mut (*shared()).captured;
+            (*frame).x[0] = va;
+            (*frame).x[usize::from(access.base_reg)] = va;
+            (*frame).x[usize::from(access.data_reg[0])] = u64::from_le_bytes(value);
+            write_record(record(), &s);
+            resume(&s, frame, b.code_va() + u64::from(access.native_offset) + 4, spsr)
+        }
+    }
     if !write {
         let bits = 64 - width * 8;
         let shifted = u64::from_le_bytes(value) << bits;
@@ -4126,7 +4151,6 @@ fn wrapped_segment_mov(mut s: State, f: &NativeFrame, b: &Block, site: &Site, va
         let dest32 = result_and_length & 0x20 != 0 || width == 4;
         s.cpu.gpr[reg] = if dest32 { loaded as u32 as u64 } else { old & !0xffff | loaded & 0xffff };
     }
-    watch::access(&mut s, va, width, write);
     (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
     s.cpu.rip = segments::wrap(&s.cpu, s.cpu.rip.wrapping_add(u64::from(length)));
     completed(&mut s);

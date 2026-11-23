@@ -1056,6 +1056,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
        .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
       if (s.kind == FEXC_SITE_SEGMENT) {
         j.kv("instruction_length", int(s.data_reg[1] & 15));
+        if (s.data_reg[1] & 0x80) j.kv("native_load_continuation", true);
         if (s.data_reg[1] & 0x30) j.kv("destination_width", s.data_reg[1] & 0x20 ? 4 : 2).kv("signed", bool(s.data_reg[1] & 0x40));
       }
       if (slice1) {

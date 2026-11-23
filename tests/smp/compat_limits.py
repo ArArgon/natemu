@@ -29,7 +29,7 @@ def cases():
 
     def add(name, insn, *, base=tls, limit=3, access=0xf3, flags=4, segment='fs', prefix='', success=False,
             xmm1=INITIAL, xmm3=MASK, memory=VALUE, selector=0x2b, cpl3_mode=32, after_load='', mapped=(),
-            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None):
+            kernel_setup='', enter_flags=2, fault=13, ecx=None, eax=None, reload_limit=None, retry_regs=None, rflags=None, captured=None, error=0, cr2=CR2, after_trap=False, firmware=None, refuse=None, strict=False, fills=None, undefined_af=False):
         raw = descriptor(base, limit, access, flags)
         setup = (f'    mov rax, {raw:#x}\n    mov [{C.F["g"] + 0x28:#x}], rax\n'
                  '    mov rax, cr4\n    bts rax, 9\n    bts rax, 18\n    mov cr4, rax\n'
@@ -44,6 +44,8 @@ def cases():
         fault_rip = C.U + len(C.user32(user))
         user += f'    {insn}\n'
         trap_rip = C.U + len(C.user32(user)) if after_trap else fault_rip
+        if undefined_af:
+            user += '    pushfd\n    and dword [esp], -17\n    popfd\n'
         user += '    int 0x80\n'
         rip = C.U + len(C.user32(user)) if success else trap_rip
         saved = f'    mov rax, cr2\n    mov [{C.W + 0x40:#x}], rax\n    jmp .fin\n'
@@ -340,6 +342,55 @@ def cases():
     add('fs-xsave-wrapped-page', 'xsave [fs:0]', base=0xffffffc0, limit=1023, mapped=C.TOP_ONLY,
         kernel_setup='    mov ebx, 0xffffffd8\n    mov dword [rbx], 0x44332211\n',
         prefix=flags, fault=14, error=6, cr2=0, captured={C.HIGH + 0xfd8: VALUE[:4]})
+    # Unsigned arithmetic here computes the x86 low-width result and defined status bits
+    # independently of the native ALU. XOR leaves AF undefined, and the program masks it out.
+    alu_initial = 0x80000080
+    alu_seed = f'    mov ecx, {alu_initial:#x}\n    cmp al, al\n    stc\n'
+
+    def alu_answer(op, width, src):
+        sign = 1 << (8 * width - 1)
+        mask = 2 * sign - 1
+        lhs = alu_initial & mask
+        value = (lhs ^ src) if op == 'xor' else (lhs - src) & mask
+        flags = int((value & 255).bit_count() % 2 == 0) << 2 | int(value == 0) << 6 | int(bool(value & sign)) << 7
+        if op != 'xor':
+            flags |= int(lhs < src) | ((lhs ^ src ^ value) & 16) | int(bool((lhs ^ src) & (lhs ^ value) & sign)) << 11
+        return (alu_initial if op == 'cmp' else (alu_initial & ~mask) | value), flags
+
+    for seg in ('fs', 'gs'):
+        for op in ('cmp', 'xor', 'sub'):
+            for width, reg in ((1, 'cl'), (2, 'cx'), (4, 'ecx')):
+                at = 4 - width
+                name = f'{seg}-alu-{op}-{reg}'
+                result, flags = alu_answer(op, width, int.from_bytes(VALUE[at:4], 'little'))
+                add(name + '-ok', f'{op} {reg}, [{seg}:edi+{at}]', segment=seg, prefix=alu_seed,
+                    success=True, ecx=result, rflags=flags, undefined_af=op == 'xor')
+                add(name + '-limit', f'{op} {reg}, [{seg}:edi+{at + 1}]', segment=seg, base=C.XPAGE, prefix=alu_seed,
+                    ecx=alu_initial, rflags=0x10045,
+                    kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n')
+            for width, reg, base, src in ((2, 'cx', 0xffffffff, 0x3322), (4, 'ecx', 0xfffffffe, 0x44332211)):
+                result, flags = alu_answer(op, width, src)
+                name = f'{seg}-alu-{op}-{reg}-wrap'
+                add(name, f'{op} {reg}, [{seg}:edi]', segment=seg, base=base, mapped=C.WRAP, access=0xf1,
+                    prefix=alu_seed, success=True, ecx=result, rflags=flags, undefined_af=op == 'xor', kernel_setup=up, captured=have)
+                add(name + '-missing', f'{op} {reg}, [{seg}:edi]', segment=seg, base=base, mapped=C.TOP_ONLY,
+                    prefix=alu_seed, ecx=alu_initial, rflags=0x10045, fault=14, error=4, cr2=0, kernel_setup=init,
+                    captured={high: bytes.fromhex('1122')})
+    alu_result, flags = alu_answer('sub', 4, 0x44332211)
+    add('gs-alu-wrap-rom', 'sub ecx, [gs:edi]', segment='gs', base=0xfffffffe, mapped=low_rom, firmware=rom,
+        prefix=alu_seed, kernel_setup=init, success=True, ecx=alu_result, rflags=flags)
+    # Common i386 TLS spelling: ModRM 00/101 takes the 32-bit literal without a base register.
+    add('gs-alu-xor-absolute-tls', 'xor ecx, [gs:0x14]', base=tls - 0x14, segment='gs', limit=0x17, prefix=alu_seed,
+        success=True, ecx=alu_answer('xor', 4, 0x44332211)[0], rflags=alu_answer('xor', 4, 0x44332211)[1], undefined_af=True)
+    add('fs-alu-cmp-absolute-limit', 'cmp ecx, [fs:0x14]', base=tls - 0x14, limit=0x16,
+        prefix=alu_seed, ecx=alu_initial, rflags=0x10045)
+    add('fs-alu-sub-indexed-pf', 'sub ecx, [fs:edi+esi*4+8]', base=C.XPAGE, limit=19,
+        prefix=alu_seed + '    mov esi, 2\n', ecx=alu_initial, rflags=0x10045, fault=14, error=4, cr2=C.XPAGE + 16,
+        kernel_setup=f'    and qword [{C.PTE(C.XPAGE):#x}], -2\n    invlpg [{C.XPAGE:#x}]\n')
+    # Read/write DR0 on the low half traps after native subtraction and before the next instruction.
+    add('fs-alu-wrap-watch-low', 'sub ecx, [fs:edi]', base=0xfffffffe, mapped=C.WRAP, prefix=alu_seed,
+        kernel_setup=up + watch_low.replace('0x10001', '0x30001'), fault=1, after_trap=True,
+        ecx=alu_result, rflags=flags, captured=have)
     # MOVAPS also needs 16-byte alignment. A flat segment overrun wins even with page zero absent.
     add('ss-flat-range-before-simd-alignment', 'movaps xmm1, [ebp]', prefix='    mov ebp, 0xfffffff8\n',
         fault=12, mapped=C.NOT_MAPPED)

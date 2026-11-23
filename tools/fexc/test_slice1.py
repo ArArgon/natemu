@@ -723,6 +723,22 @@ class Slice1Cutting(unittest.TestCase):
                     self.assertEqual(check_sites.object_vs_json(check_sites.read_object(path), data), [])
                     self.assertEqual(verify_precision.verify(data, Path(t))[0], [], form)
 
+    def test_compat_alu_segment_loads(self):
+        import verify_precision
+        with tempfile.TemporaryDirectory() as t:
+            for opcode in (0x2a, 0x32, 0x3a):
+                for width in (1, 2, 4):
+                    form = bytes([0x65] + ([0x66] if width == 2 else []) + [opcode + (width != 1), 0x0f])
+                    d, rc = run('90' + form.hex() + '90', RIP, '--bitness', '32')
+                    self.assertEqual(rc, 0)
+                    guard, = (s for s in d['sites'] if s['kind'] == 'segment')
+                    load, = (s for s in d['sites'] if s['kind'] == 'load')
+                    self.assertEqual((guard['width'], guard['intent'], guard['native_load_continuation']),
+                                     (width, 'read', True), form)
+                    self.assertEqual((guard['imm'] + 4, guard['access_native_offset']),
+                                     (load['native_offset'], load['native_offset']), form)
+                    self.assertEqual(verify_precision.verify(d, Path(t))[0], [], form)
+
     def test_max_instructions_still_works(self):
         d, rc = run(PRE + PRE, RIP, '--max-insts', '3')
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 3, 'max_instructions'))
