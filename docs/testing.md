@@ -315,9 +315,10 @@ tools/natemu-test run --tier bench -k guest-zstd      # one
 `TESTKIT_BENCH_AT=REV tools/natemu-test run --tier bench ...` measures natemu and its compiler as committed at REV
 instead of the checkout's (built from `git archive`, cached), with the same cases, kernel and image: a baseline for
 the same round. `TESTKIT_BENCH_VCPUS=4` runs the guest benchmarks at 4 vCPUs (default 1). Benchmarks keep the machine
-they always measured: a case that starts the `natemu` CLI gets `--set machine.pvpanic=false --set machine.smbios=false
---set machine.ps2=false` (through its runner's `--natemu-set`) when the build's source tree has those keys, so an older
-build (a `TESTKIT_BENCH_AT` baseline, m1-perf's baseline commit) runs unchanged (`testkit/harness/bench.py`).
+they always measured: a case that starts the `natemu` CLI gets `--set machine.pvpanic=false`, `--set
+machine.smbios=false` and `--set machine.ps2=false` (through its runner's `--natemu-set`), each when the build's source
+tree has that key, so an older build (a `TESTKIT_BENCH_AT` baseline, m1-perf's baseline commit) runs unchanged
+(`testkit/harness/bench.py`).
 
 `tests/bench` wraps the existing `tools/bench` scripts unchanged: the micro-benchmarks against QEMU, the SMP tools, Linux
 boot times, and the guest benchmarks of [benchmarks](benchmarks.md) (12 programs at 1 vCPU, and `zstd` on QEMU for

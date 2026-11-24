@@ -14,10 +14,13 @@ Device-page break stops at Linux's iBFT scan, before the DMI scan; the `--skip-c
 watchdog stop after about 60 s rather than a timeout; IRQ 1 is raised for the controller's own replies (as a real 8042
 and QEMU), and a controller reply over a full output buffer replaces the unread byte (OpenVMM's behaviour; QEMU keeps
 it pending); the bench harness gives its switches to each runner as `--natemu-set KEY=VALUE` (m1-perf's baseline
-build: `--baseline-set`), which the runners pass to natemu as `--set`. The plan was revised November 23 after an
-independent review and a second check (all findings folded in below). Owner direction (same day): build the platform
-devices with the highest return first, in their own track beside multi-BAR PCI and the virtio device interface; natemu
-stays permissively licensed (adapted code is Apache-2.0, BSD or MIT, never GPL/LGPL).
+build: `--baseline-set`), which the runners pass to natemu as `--set`, and checks each key on its own (a
+`machine.K=false` for each of the three the tree's `crates/cli/src/config.rs` names, not all three keyed on `machine.ps2`)
+so this branch's intermediate commits, which have pvpanic or pvpanic and SMBIOS on, keep the benchmark machine. The
+plan was revised November 23 after an independent review and a second check (all findings folded in below). Owner
+direction (same day): build the platform devices with the highest return first, in their own track beside multi-BAR
+PCI and the virtio device interface; natemu stays permissively licensed (adapted code is Apache-2.0, BSD or MIT, never
+GPL/LGPL).
 
 **Goal:** three PC platform devices a guest finds without drivers we ship: a pvpanic device (a guest kernel panic ends
 the run with its own typed stop), SMBIOS tables (the guest sees a vendor, product, processors and memory), and an 8042

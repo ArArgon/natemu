@@ -284,13 +284,30 @@ def test_platform_off_is_a_text_check_of_the_build_source_tree(tmp_path):
     commit = lambda m: (git('add', '-A'), git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', m), git('rev-parse', 'HEAD'))[-1]
     old = commit('no config.rs')
     f.write_text('"machine.vcpus"\n'); without = commit('config.rs without the key')
-    f.write_text('"machine.vcpus"\n"machine.ps2"\n'); keyed = commit('the key')
+    f.write_text('"machine.vcpus"\n"machine.pvpanic"\n"machine.smbios"\n"machine.ps2"\n'); keyed = commit('the keys')
     f.write_text('"machine.vcpus"\n')                                            # the worktree differs from HEAD
     assert [bench.platform_off(r, repo) for r in (old, without, keyed)] == [[], [], three]
     assert bench.platform_off(None, repo) == []
     # This repository: the checkout has the keys; m1-perf's baseline and this plan's base do not.
     assert bench.platform_off() == three
     assert bench.platform_off('ecec5d77') == [] and bench.platform_off('6dfd0634') == []
+
+
+def test_platform_off_is_per_key(tmp_path):
+    """Review of Task 5: a tree with only some of the keys (this branch's own commits before the 8042: pvpanic from
+    5fa3b5d1, SMBIOS from 796f9d7a, each on by default) gets those devices switched off, and only those."""
+    from testkit.harness import bench
+    cfg = tmp_path / 'crates/cli/src/config.rs'; cfg.parent.mkdir(parents=True)
+    cfg.write_text('"machine.vcpus",\n"machine.pvpanic",\n')
+    assert bench.platform_off(root=tmp_path) == ['machine.pvpanic=false']
+    cfg.write_text('"machine.vcpus",\n"machine.pvpanic",\n"machine.smbios",\n')
+    assert bench.platform_off(root=tmp_path) == ['machine.pvpanic=false', 'machine.smbios=false']
+    cfg.write_text('"machine.smbios", "machine.ps2"\n')
+    assert bench.platform_off(root=tmp_path) == ['machine.smbios=false', 'machine.ps2=false']
+    # This branch's history: Task 1 (pvpanic), Task 3 (and SMBIOS), Task 4 (and the 8042).
+    assert bench.platform_off('5fa3b5d1') == ['machine.pvpanic=false']
+    assert bench.platform_off('831593ad') == ['machine.pvpanic=false', 'machine.smbios=false']
+    assert bench.platform_off('bbfed815') == list(bench.PLATFORM_OFF)
 
 
 def test_only_cases_that_start_the_natemu_cli_get_the_switches():
@@ -330,3 +347,19 @@ def test_m1_perf_gets_the_switches_for_its_final_build_only(monkeypatch, tmp_pat
     monkeypatch.setenv(bench.AT_ENV, '6dfd0634')
     old, *_ = run('run3')
     assert '--natemu-set' not in old and '--baseline-set' not in old
+
+
+def test_m1_perf_baseline_with_keys_gets_its_own_switches(monkeypatch, tmp_path):
+    """Review of Task 5: a baseline revision that has some of the keys gets `--baseline-set` for those, beside the
+    final build's `--natemu-set`."""
+    from testkit.harness import bench
+    loaded = _bench_family()
+    monkeypatch.setitem(loaded[1]['m1-perf'].extra['cases']['m1-perf'], 'baseline', '796f9d7a')   # pvpanic and SMBIOS
+    monkeypatch.setitem(globals(), '_bench_family', lambda: loaded)        # the harness fixture runs this suite
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    a, *_ = run('run1')
+    tail = [w for kv in bench.PLATFORM_OFF for w in ('--natemu-set', kv)]
+    base = ['--baseline-set', 'machine.pvpanic=false', '--baseline-set', 'machine.smbios=false']
+    assert a[-len(tail) - len(base):] == tail + base
+    assert a[a.index('--baseline-build') + 1] == str(tmp_path / 'base-796f9d7a')
+

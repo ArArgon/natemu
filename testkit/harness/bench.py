@@ -22,7 +22,7 @@ when a case of the suite uses it (and then prepared before the run starts):
 Benchmarks keep the machine they have always measured: a case that starts the `natemu` CLI (its argv names {natemu} or
 {natemu_entry}, this run's build, or {natemu_baseline}, the case's baseline) gets the platform devices off (pvpanic,
 SMBIOS, the 8042: PLATFORM_OFF) as its runner's `--natemu-set KEY=VALUE` (natemu's `--set`), or `--baseline-set` for the
-baseline build, when that build's source tree has them (platform_off()). Cases that start natemu-host ({host}) need
+baseline build: each device whose key that build's source tree has (platform_off()). Cases that start natemu-host ({host}) need
 nothing: its devices are off unless asked for.
 """
 import json
@@ -99,17 +99,18 @@ def _session(path: pathlib.Path) -> dict:
     except (OSError, ValueError): return {'started': time.time(), 'fresh_done': False, 'done': 0}
 
 
-PLATFORM_OFF = ('machine.pvpanic=false', 'machine.smbios=false', 'machine.ps2=false')
+PLATFORM_KEYS = ('machine.pvpanic', 'machine.smbios', 'machine.ps2')
+PLATFORM_OFF = tuple(f'{k}=false' for k in PLATFORM_KEYS)
 CLI_CONFIG = 'crates/cli/src/config.rs'
-PLATFORM_KEY = 'machine.ps2'
 
 
 def platform_off(rev: str | None = None, root: pathlib.Path | None = None) -> list[str]:
-    """PLATFORM_OFF if the source tree a natemu build came from names `machine.ps2` in crates/cli/src/config.rs, else
-    nothing: the worktree's for this checkout's build (rev None; artifacts.natemu() builds the worktree as it is), the
-    commit's for `rev` (artifacts.natemu_at: a TESTKIT_BENCH_AT round, a case's `baseline`). A text check of the tree,
-    never a run of the build: an older build has no such keys and refuses an unknown --set key, so it gets none (and
-    runs as it always did)."""
+    """`KEY=false` for each of PLATFORM_KEYS that the source tree a natemu build came from names in
+    crates/cli/src/config.rs: the worktree's for this checkout's build (rev None; artifacts.natemu() builds the worktree
+    as it is), the commit's for `rev` (artifacts.natemu_at: a TESTKIT_BENCH_AT round, a case's `baseline`). Per key, so
+    a commit that has some of the devices (each on by default) runs with those off. A text check of the tree, never a
+    run of the build: an older build has no such keys and refuses an unknown --set key, so it gets none (and runs as it
+    always did)."""
     root = root or paths.repo_root()
     if rev is None:
         f = root / CLI_CONFIG
@@ -118,7 +119,7 @@ def platform_off(rev: str | None = None, root: pathlib.Path | None = None) -> li
         # No config.rs at `rev` (an older tree) is no key; an unknown `rev` already fails in artifacts.natemu_at.
         r = subprocess.run(['git', '-C', str(root), 'show', f'{rev}:{CLI_CONFIG}'], capture_output=True, text=True)
         text = r.stdout if r.returncode == 0 else ''
-    return list(PLATFORM_OFF) if PLATFORM_KEY in text else []
+    return [f'{k}=false' for k in PLATFORM_KEYS if k in text]
 
 
 def _platform_args(spec, rev: str | None) -> list[str]:
