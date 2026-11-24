@@ -72,13 +72,20 @@
 //! **Host input** ([`Ps2Input`], cloneable and `Send`): `keyboard` queues set 2 bytes, `mouse` movement with the buttons
 //! held; each takes the controller's lock, queues, refills the output buffer if it is empty and drives IRQ 1 or 12 from
 //! the calling thread, as the UART's receive side does (`uart::feed`), so a key reaches a vCPU halted in HLT without
-//! any guest access. Nothing produces input yet (the display front end will). A producer holds an `Irqs::busy` guard
-//! while input can still arrive, as the UART feeder does, or a run whose vCPUs are all halted ends before the key.
+//! any guest access. A producer holds an `Irqs::busy` guard while input can still arrive, as the UART feeder does, or a
+//! run whose vCPUs are all halted ends before the key.
+//!
+//! **Flow control.** `keyboard` and `mouse` lose what does not fit (the keyboard marks OVERRUN, the mouse's FIFO drops
+//! the packet). A producer that must not lose input (the control API, `crate::control::ps2`) uses `try_keyboard` and
+//! `try_mouse`, which queue a whole key or packet or nothing, and `wait_keyboard` and `wait_mouse`, which retry under
+//! the controller's lock each time the guest reads or writes 60H (a condition variable the vCPU notifies while it holds
+//! the lock it already takes), so the waiting thread never misses the read that makes room and never blocks a vCPU.
 use crate::devices::{At, Device, Devices};
 use crate::irq::Irqs;
 use crate::pm;
-use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::SeqCst};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 mod keyboard;
 mod mouse;
@@ -173,6 +180,8 @@ pub(crate) struct I8042 {
     // Runtime glue
     power: Arc<AtomicU8>,
     irqs: Irqs,
+    /// The drain signal: notified on every guest access to 60H (`Ps2Input::wait_keyboard`).
+    room: Arc<Condvar>,
 
     // Sub-emulators
     keyboard: Ps2Keyboard,
@@ -228,6 +237,7 @@ impl I8042 {
         I8042 {
             power,
             irqs,
+            room: Arc::new(Condvar::new()),
             state: I8042State::new(),
             keyboard: Ps2Keyboard::new(),
             mouse: Ps2Mouse::new(),
@@ -265,6 +275,9 @@ impl Device for I8042 {
         };
         // Populate the next output byte if appropriate.
         self.check_devices_for_output();
+        if offset == 0 {
+            self.room.notify_all();
+        }
         Some(data.into())
     }
 
@@ -301,6 +314,10 @@ impl Device for I8042 {
         // Check to see if the keyboard or mouse
         // have more input for the controller.
         self.check_devices_for_output();
+        if offset == 0 {
+            // A command to the keyboard or mouse may have emptied its queue or started its scanning or reporting.
+            self.room.notify_all();
+        }
         true
     }
 }
@@ -497,10 +514,57 @@ impl I8042 {
 
 /// Host input for the 8042's keyboard and mouse, from any thread (see the module documentation).
 #[derive(Clone)]
-pub struct Ps2Input(Arc<Mutex<I8042>>);
+pub struct Ps2Input(Arc<Mutex<I8042>>, Arc<Condvar>);
 impl Ps2Input {
+    fn new(controller: Arc<Mutex<I8042>>) -> Self {
+        let room = controller.lock().unwrap_or_else(|e| e.into_inner()).room.clone();
+        Ps2Input(controller, room)
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, I8042> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Runs `queue` under the controller's lock until it accepts (true), waiting on the drain signal between tries;
+    /// false once `deadline` passes or `cancel` is set (with [`Ps2Input::wake`]).
+    fn until(&self, deadline: Instant, cancel: &AtomicBool, mut queue: impl FnMut(&mut I8042) -> bool) -> bool {
+        let mut c = self.lock();
+        loop {
+            if queue(&mut c) {
+                c.check_devices_for_output();
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline || cancel.load(SeqCst) {
+                return false;
+            }
+            c = match self.1.wait_timeout(c, deadline - now) {
+                Ok((c, _)) => c,
+                Err(e) => e.into_inner().0,
+            };
+        }
+    }
+    /// Queues all of a key's set 2 bytes, or none (false) when the keyboard does not scan or its queue lacks room for
+    /// all of them: nothing is overwritten with OVERRUN.
+    pub fn try_keyboard(&self, set2: &[u8]) -> bool {
+        self.until(Instant::now(), &AtomicBool::new(true), |c| c.keyboard.try_key(set2))
+    }
+    /// A movement packet ([`Ps2Input::mouse`]'s arguments, each axis within the 9-bit range), or nothing (false) when
+    /// the mouse does not report in stream mode or its FIFO lacks room for the whole packet. A wheel-only movement
+    /// without IntelliMouse mode is accepted and sends nothing.
+    pub fn try_mouse(&self, dx: i16, dy: i16, dz: i8, buttons: u8) -> bool {
+        self.until(Instant::now(), &AtomicBool::new(true), |c| c.mouse.try_movement(dx, dy, dz, buttons))
+    }
+    /// [`Ps2Input::try_keyboard`], retried each time the guest accesses 60H until `deadline` or `cancel`.
+    pub fn wait_keyboard(&self, set2: &[u8], deadline: Instant, cancel: &AtomicBool) -> bool {
+        self.until(deadline, cancel, |c| c.keyboard.try_key(set2))
+    }
+    /// [`Ps2Input::try_mouse`], retried each time the guest accesses 60H until `deadline` or `cancel`.
+    pub fn wait_mouse(&self, dx: i16, dy: i16, dz: i8, buttons: u8, deadline: Instant, cancel: &AtomicBool) -> bool {
+        self.until(deadline, cancel, |c| c.mouse.try_movement(dx, dy, dz, buttons))
+    }
+    /// Wakes every `wait_keyboard` and `wait_mouse`, so one whose `cancel` was just set returns.
+    pub fn wake(&self) {
+        let _c = self.lock();
+        self.1.notify_all();
     }
     /// Queues a key's set 2 bytes (a make code, or F0 and the code for its break; E0-prefixed keys with their prefix)
     /// while the keyboard scans; the controller translates them to set 1 under XLAT.
@@ -509,11 +573,12 @@ impl Ps2Input {
         set2.iter().for_each(|&b| c.keyboard.key(b));
         c.check_devices_for_output();
     }
-    /// Mouse movement: `dx` to the right, `dy` up (the PS/2 mouse's directions), with the buttons now held ([`LEFT`],
-    /// [`RIGHT`], [`MIDDLE`]); a packet is queued while the mouse reports in stream mode.
-    pub fn mouse(&self, dx: i16, dy: i16, buttons: u8) {
+    /// Mouse movement: `dx` to the right, `dy` up (the PS/2 mouse's directions), `dz` the wheel (sent as the fourth byte
+    /// in IntelliMouse mode, dropped otherwise), with the buttons now held ([`LEFT`], [`RIGHT`], [`MIDDLE`]); a packet
+    /// is queued while the mouse reports in stream mode.
+    pub fn mouse(&self, dx: i16, dy: i16, dz: i8, buttons: u8) {
         let mut c = self.lock();
-        c.mouse.movement(dx, dy, buttons);
+        c.mouse.movement(dx, dy, dz, buttons);
         c.check_devices_for_output();
     }
 }
@@ -528,26 +593,25 @@ pub(crate) fn install(devices: &mut Devices, irqs: &Irqs) -> crate::Result<Ps2In
         1,
         Arc::new(Mutex::new(At(controller.clone(), COMMAND_OFFSET))),
     )?;
-    Ok(Ps2Input(controller))
+    Ok(Ps2Input::new(controller))
 }
 
+/// A test 8042 without a VM, for this module's tests and the control API's (`crate::control::ps2`).
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
-    use crate::pm;
 
-    const OBF: u8 = 1;
-    const AUX: u8 = 0x20;
-    const XLAT: u8 = 0x40;
+    pub(crate) const OBF: u8 = 1;
+    pub(crate) const AUX: u8 = 0x20;
 
     /// The 8042 on a registry with the interrupt controllers (no vCPU): its ports through `Devices::port`, IRQ 1 and
     /// 12 through the chipset's input levels.
-    struct Board {
-        devices: Devices,
-        irqs: Irqs,
-        input: Ps2Input,
+    pub(crate) struct Board {
+        pub(crate) devices: Devices,
+        pub(crate) irqs: Irqs,
+        pub(crate) input: Ps2Input,
     }
-    fn board() -> Board {
+    pub(crate) fn board() -> Board {
         let memory = Arc::new(crate::memory::Memory::with_size(4096).unwrap());
         let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
         let mut devices = Devices::new(1 << 30);
@@ -556,22 +620,30 @@ mod tests {
         Board { devices, irqs, input }
     }
     impl Board {
-        fn status(&self) -> u8 {
+        pub(crate) fn status(&self) -> u8 {
             self.devices.port(0, COMMAND_PORT, 1, None).unwrap() as u8
         }
-        fn command(&self, command: u8) {
+        pub(crate) fn command(&self, command: u8) {
             assert_eq!(self.devices.port(0, COMMAND_PORT, 1, Some(command.into())), Ok(0), "{command:#x} refused");
         }
-        fn data(&self, data: u8) {
+        pub(crate) fn data(&self, data: u8) {
             assert_eq!(self.devices.port(0, DATA_PORT, 1, Some(data.into())), Ok(0), "{data:#x} refused");
         }
         /// A controller command with its argument byte.
-        fn command_with(&self, command: u8, data: u8) {
+        pub(crate) fn command_with(&self, command: u8, data: u8) {
             self.command(command);
             self.data(data);
         }
+        /// One byte from 60H, if the status says the output buffer is full: the byte and whether it is the mouse's.
+        pub(crate) fn read(&self) -> Option<(u8, bool)> {
+            let status = self.status();
+            if status & OBF == 0 {
+                return None;
+            }
+            Some((self.devices.port(0, DATA_PORT, 1, None).unwrap() as u8, status & AUX != 0))
+        }
         /// Everything the output buffer delivers, read as a driver does: while the status says it is full.
-        fn drain(&self) -> Vec<u8> {
+        pub(crate) fn drain(&self) -> Vec<u8> {
             let mut out = Vec::new();
             while self.status() & OBF != 0 {
                 assert!(out.len() < 64, "the output buffer never empties: {out:x?}");
@@ -580,7 +652,7 @@ mod tests {
             out
         }
         /// Every byte the mouse answers `bytes` with (each sent with D4).
-        fn mouse(&self, bytes: &[u8]) -> Vec<u8> {
+        pub(crate) fn mouse(&self, bytes: &[u8]) -> Vec<u8> {
             let mut out = Vec::new();
             for &b in bytes {
                 self.command_with(0xd4, b);
@@ -589,10 +661,19 @@ mod tests {
             }
             out
         }
-        fn level(&self, irq: usize) -> bool {
+        pub(crate) fn level(&self, irq: usize) -> bool {
             self.irqs.level(irq)
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::pm;
+
+    const XLAT: u8 = 0x40;
 
     /// Controller self-test AAH answers 55H; the interface tests (keyboard ABH, mouse A9H) answer 00H (no error);
     /// the command byte starts as 47H (both interrupts, system flag, XLAT), as upstream's.
@@ -710,7 +791,7 @@ mod tests {
         assert_eq!(b.mouse(&[0xf3, 200, 0xf3, 80, 0xf3, 100, 0xf2]), [0xfa; 6].iter().copied().chain([0xfa, 0x00]).collect::<Vec<_>>());
         assert_eq!(b.mouse(&[0xf3, 200, 0xf3, 100, 0xf3, 80, 0xf2]), [0xfa; 6].iter().copied().chain([0xfa, 0x03]).collect::<Vec<_>>());
         assert_eq!(b.mouse(&[0xf4]), [0xfa]);
-        b.input.mouse(1, 1, 0);
+        b.input.mouse(1, 1, 0, 0);
         assert_eq!(b.drain(), [0x08, 1, 1, 0]);
         assert_eq!(b.mouse(&[0xff, 0xf2]), [0xfa, 0xaa, 0x00, 0xfa, 0x00]);
     }
@@ -720,21 +801,21 @@ mod tests {
     #[test]
     fn mouse_packet_after_movement_raises_irq12() {
         let b = board();
-        b.input.mouse(5, -3, mouse::LEFT);
+        b.input.mouse(5, -3, 0, mouse::LEFT);
         assert_eq!(b.status() & OBF, 0, "reporting is off after power-on");
         assert_eq!(b.mouse(&[0xf4]), [0xfa]);
         let input = b.input.clone();
-        std::thread::spawn(move || input.mouse(5, -3, mouse::LEFT)).join().unwrap();
+        std::thread::spawn(move || input.mouse(5, -3, 0, mouse::LEFT)).join().unwrap();
         assert!(b.level(12) && !b.level(1), "IRQ 12 from the host thread");
         assert_eq!(b.status() & (OBF | AUX), OBF | AUX);
         assert_eq!(b.drain(), [0x08 | 0x01 | 0x20, 5, 0xfd]);
         assert!(!b.level(12));
         // Beyond the 9-bit range: the overflow bits and the extremes.
-        b.input.mouse(300, -300, mouse::RIGHT | mouse::MIDDLE);
+        b.input.mouse(300, -300, 0, mouse::RIGHT | mouse::MIDDLE);
         assert_eq!(b.drain(), [0x08 | 0x06 | 0x40 | 0x80 | 0x20, 0xff, 0x00]);
         // Remote mode: no packet until read-data (EBH).
         assert_eq!(b.mouse(&[0xf0]), [0xfa]);
-        b.input.mouse(-2, 7, 0);
+        b.input.mouse(-2, 7, 0, 0);
         assert_eq!(b.status() & OBF, 0);
         assert_eq!(b.mouse(&[0xeb]), [0xfa, 0x08 | 0x10, 0xfe, 7]);
     }

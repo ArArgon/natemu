@@ -9,7 +9,8 @@
 // Host input arrives as set 2 bytes through `key` (`super::Ps2Input::keyboard`) instead of the poll of an input source.
 // Changed: the keyboard is a set 2 keyboard (the controller translates to set 1 under XLAT, `super`), so its ID is AB 83
 // (upstream's keyboard sends set 1 itself and answers the translated AB 41); F0 00 answers the current set (2); a
-// scanning flag: F5 stops scanning (host keys are dropped), F4 and FF start it (upstream ignores scanning); F6 keeps it.
+// scanning flag: F5 stops scanning (host keys are dropped), F4 and FF start it (upstream ignores scanning); F6 keeps it;
+// `try_key` queues a whole key or nothing (the control API's flow control).
 
 //! A PS/2 keyboard (IBM's keyboard command set): reset (FA AA), identify (FA AB 83), LEDs, typematic rate, scan code
 //! set (2 only), enable, disable, defaults, echo and resend, every command and argument byte acknowledged with FA, an
@@ -95,6 +96,16 @@ impl Ps2Keyboard {
         } else if let Some(last) = self.state.output_buffer.back_mut() {
             *last = OVERRUN;
         }
+    }
+
+    /// All of a host key's bytes, or none (false) when the keyboard does not scan or the places `key` uses lack room
+    /// for all of them: nothing is overwritten with OVERRUN (natemu's, for the control API's flow control).
+    pub(super) fn try_key(&mut self, codes: &[u8]) -> bool {
+        if !self.scanning || self.state.output_buffer.len() + codes.len() > KEYBOARD_BUFFER_SIZE - 2 {
+            return false;
+        }
+        self.state.output_buffer.extend(codes);
+        true
     }
 
     pub(super) fn output(&mut self) -> Option<u8> {

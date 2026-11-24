@@ -159,17 +159,22 @@ pointer (`pointer_position`) is not defined: PS/2 has none, and an absolute devi
 ### Translation to PS/2 (`crates/host/src/control/ps2.rs`)
 
 - `KeyCode::set2(self) -> &'static [u8]` the make bytes (E0-prefixed keys with E0); a break is F0 before the last
-  byte. `Pause` has no break and its make is the 8-byte sequence; `PrintScreen` is E0 12 E0 7C (break E0 F0 7C E0 F0
-  12).
+  byte. `Pause` has no break and its make is the 8-byte sequence; `PrintScreen` is the table's E0 7C (break E0 F0 7C),
+  without the modifier-dependent codes of the table's Note 1 (a real keyboard's fake-shift E0 12, which Linux ignores).
 - `pointer_motion`, `button` and `scroll` update the server's held buttons and become packets, each axis split into
   steps of at most 255 in magnitude (the mouse clamps beyond 9 bits). `Scroll` needs a wheel byte: the mouse gains
   `dz: i8`, written as the fourth byte (a signed byte, as Linux's psmouse reads ID 3's: scroll dy +1 is byte +1, which
   psmouse reports as REL_WHEEL -1) when the mouse is in IntelliMouse mode and dropped otherwise.
 - `Ps2Input` gains `try_keyboard(&self, set2: &[u8]) -> bool` and `try_mouse(&self, dx, dy, dz, buttons) -> bool`, each
-  queuing all of its bytes or none (the keyboard keeps its two reply places; the mouse its FIFO room), and a drain
-  signal (`Ps2Input::wait_room(&self, deadline) -> bool`, a condvar notified when the guest reads 60H).
-- The server-wide `Held` (key down counts, per-client button masks) decides what to send; a client's disconnect sends
-  only the transitions its leaving causes.
+  queuing all of its bytes or none (the keyboard keeps its two reply places and refuses while it does not scan; the
+  mouse its FIFO room, refusing while it does not stream), and their waiting forms `wait_keyboard(set2, deadline,
+  cancel)` and `wait_mouse(dx, dy, dz, buttons, deadline, cancel)`, which retry under the controller's lock on a
+  condvar notified when the guest accesses 60H (a separate `wait_room` after a refused `try_*` would miss a read
+  between the two), with `wake()` for a cancel.
+- The server-wide `Held` (per key the set of clients holding it, per-client button masks, and what the guest was sent)
+  decides what to send; a client's disconnect sends only the transitions its leaving causes. `control::ps2::Input`
+  holds it with a queue per device and that device's delivery thread (Task 1); after a stall a press whose make was
+  not delivered is undone, a release kept with its break owed and sent once the guest reads again.
 
 ### Server (`crates/host/src/control/mod.rs`)
 
@@ -178,8 +183,8 @@ pointer (`pointer_position`) is not defined: PS/2 has none, and an absolute devi
   notification and closes; dropping it removes the socket.
 - One listener thread, at most 8 clients (a ninth connection is closed at once), each with a reader thread (reads
   lines, decodes, dispatches, waits for input room) and a writer (responses and notifications, `SO_SNDTIMEO` 1 s, 1 MiB
-  cap). One input thread per device drains the server's queues into the 8042, so clients' events interleave per event,
-  never inside a key's bytes.
+  cap). One input thread per device (`control::ps2::Input`, Task 1) drains the server's queues into the 8042, so
+  clients' events interleave per event, never inside a key's bytes.
 - `crates/cli`: `[control] socket = "PATH"` (relative to the file's folder; `--set control.socket=PATH` relative to the
   working directory, as every path key); `serve` after `prepare`, `stopped` when the run returns.
 
@@ -208,7 +213,7 @@ Metal front end needs a Mach port, which a Unix socket cannot carry; the native 
 | `crates/host/src/control/mod.rs` (new) | listener, clients, dispatch, `Target`, `Server` |
 | `crates/host/src/control/protocol.rs` (new) | `Call`, `InputEvent`, `KeyCode`, `MouseButton`, envelopes, errors |
 | `crates/host/src/control/ps2.rs` (new) | key codes to set 2, motion splitting, held-state release |
-| `crates/host/src/ps2.rs`, `crates/host/src/ps2/{keyboard.rs,mouse.rs}` | `try_keyboard`, `try_mouse` (with `dz`), `wait_room`; a crate-visible test constructor of the 8042 without a VM |
+| `crates/host/src/ps2.rs`, `crates/host/src/ps2/{keyboard.rs,mouse.rs}` | `try_keyboard`, `try_mouse` (with `dz`), `wait_keyboard`, `wait_mouse`; a crate-visible test constructor of the 8042 without a VM |
 | `crates/host/src/pm.rs`, `crates/host/src/clock.rs`, `crates/host/src/linux.rs` | `PowerButton` (the PM device sits type-erased inside a `Timer` in `clock.rs`, so the handle is made there and carried on `Board`); `Prepared::power_button()`, `Prepared::irqs()` |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `crates/cli/src/main.rs` | `[control] socket` |
 | `docs/control-api.md` (new), `docs/configuration.md` | the client reference (wire format, methods, codes, examples); the key |
@@ -219,11 +224,14 @@ Metal front end needs a Mach port, which a Unix socket cannot carry; the native 
 
 ### Task 1: protocol types and PS/2 translation
 
-**Files:** `crates/host/src/control/{protocol.rs,ps2.rs}`, `crates/host/src/ps2.rs`, `crates/host/src/ps2/mouse.rs`.
+**Files:** `crates/host/src/control/{mod.rs,protocol.rs,ps2.rs}`, `crates/host/src/ps2.rs`,
+`crates/host/src/ps2/{keyboard.rs,mouse.rs}`.
 
 **Interfaces:** `protocol::{Call, Request, Response, InputEvent, KeyCode, MouseButton, ErrorCode}`;
-`KeyCode::set2(self) -> &'static [u8]`; `ps2::Held` (per-connection state) with `apply(&mut self, &Ps2Input, InputEvent)`
-and `release(&mut self, &Ps2Input)`; `Ps2Input::mouse(dx, dy, dz, buttons)`.
+`KeyCode::set2(self) -> &'static [u8]`; `ps2::Held` (server-wide, keyed by `ClientId`); `ps2::Input::start(Ps2Input,
+stall)` (the per-device queues and delivery threads) with `send(&self, ClientId, &[InputEvent]) -> Result<(),
+SendError>`, `release(&self, ClientId)` and `stop(&self)`; `Ps2Input::mouse(dx, dy, dz, buttons)`, `try_keyboard`,
+`try_mouse`, `wait_keyboard`, `wait_mouse`, `wake`.
 
 - [ ] **Step 1: unit tests**: `wire_names_match_examples` (the three examples above round-trip exactly),
   `params_may_be_omitted` (`quit` with `params` absent, `{}` and `[]` decodes), `decode_errors_keep_the_id` (an unknown

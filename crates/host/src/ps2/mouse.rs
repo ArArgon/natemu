@@ -36,7 +36,8 @@
 // after the IntelliMouse sample-rate sequence 200, 100, 80, whose movement packets then carry a fourth (wheel) byte;
 // wrap mode (EE, left with EC or reset); resend (FE); enable and disable reset the movement counters (upstream keeps
 // them); deltas beyond the 9-bit range send its extremes, -256 and 255, with the overflow bit (upstream: 255 either way);
-// an unknown command is answered FE (upstream acknowledges it).
+// an unknown command is answered FE (upstream acknowledges it); host movement carries a wheel delta, the fourth byte in
+// IntelliMouse mode (dropped otherwise); `try_movement` queues a whole packet or nothing (the control API's flow control).
 
 //! A PS/2 mouse: reset (FA AA 00), set defaults, enable and disable data reporting, sample rate and resolution (each
 //! with its argument byte), scaling 1:1 and 2:1, status request (three bytes), stream and remote mode, read data, get
@@ -102,6 +103,8 @@ pub(super) struct Ps2Mouse {
     curcmd: u8,
     delta_x: i32,
     delta_y: i32,
+    /// The wheel (IntelliMouse mode only).
+    delta_z: i32,
     /// The buttons held, in the packet's order.
     buttons: u8,
     wrap: bool,
@@ -122,6 +125,7 @@ impl Ps2Mouse {
             curcmd: 0,
             delta_x: 0,
             delta_y: 0,
+            delta_z: 0,
             buttons: 0,
             wrap: false,
             id: PS2MOUSE_DEV_ID,
@@ -141,6 +145,7 @@ impl Ps2Mouse {
     fn movement_reset(&mut self) {
         self.delta_x = 0;
         self.delta_y = 0;
+        self.delta_z = 0;
     }
 
     /// One movement packet into the FIFO (if it fits), the deltas then cleared.
@@ -160,8 +165,10 @@ impl Ps2Mouse {
         };
         let val1 = axis(self.delta_x, PS2M_DATA_X_SIGN, PS2M_DATA_X_OFLOW);
         let val2 = axis(self.delta_y, PS2M_DATA_Y_SIGN, PS2M_DATA_Y_OFLOW);
+        // The wheel as a signed byte (Linux's psmouse reads ID 3's fourth byte so).
+        let val3 = self.delta_z.clamp(i8::MIN.into(), i8::MAX.into()) as i8 as u8;
         self.movement_reset();
-        let packet = [val0, val1, val2, 0];
+        let packet = [val0, val1, val2, val3];
         let n = if self.id == INTELLIMOUSE_ID { 4 } else { 3 };
         if self.fifo.len() + n <= PS2MOUSE_FIFOSZ {
             packet[..n].iter().for_each(|&b| self.fifo_put(b));
@@ -287,15 +294,40 @@ impl Ps2Mouse {
         }
     }
 
-    /// Host movement (`dx` right, `dy` up, as the PS/2 mouse counts them) with the buttons now held (`LEFT`, `RIGHT`,
-    /// `MIDDLE`): the deltas accumulate, and in stream mode with reporting enabled (and not in wrap mode) a packet is
-    /// queued (upstream's `ps2mouse_event`). In remote mode the guest reads them with read-data.
-    pub(super) fn movement(&mut self, dx: i16, dy: i16, buttons: u8) {
+    /// Host movement (`dx` right, `dy` up, as the PS/2 mouse counts them; `dz` the wheel) with the buttons now held
+    /// (`LEFT`, `RIGHT`, `MIDDLE`): the deltas accumulate, and in stream mode with reporting enabled (and not in wrap
+    /// mode) a packet is queued (upstream's `ps2mouse_event`). In remote mode the guest reads them with read-data.
+    /// Without IntelliMouse mode the wheel is dropped, and a movement that is only the wheel sends nothing.
+    pub(super) fn movement(&mut self, dx: i16, dy: i16, dz: i8, buttons: u8) {
+        let buttons = buttons & PS2M_DATA_BUTTONS;
+        if self.id != INTELLIMOUSE_ID && dx == 0 && dy == 0 && dz != 0 && buttons == self.buttons {
+            return;
+        }
         self.delta_x += i32::from(dx);
         self.delta_y += i32::from(dy);
-        self.buttons = buttons & PS2M_DATA_BUTTONS;
-        if self.status & (PS2M_STS_ENABLE_DEV | PS2M_STS_REMOTE_MODE) == PS2M_STS_ENABLE_DEV && !self.wrap {
+        if self.id == INTELLIMOUSE_ID {
+            self.delta_z += i32::from(dz);
+        }
+        self.buttons = buttons;
+        if self.streaming() {
             self.movement_get();
         }
+    }
+
+    /// Stream mode with reporting enabled, not in wrap mode: movement becomes packets.
+    fn streaming(&self) -> bool {
+        self.status & (PS2M_STS_ENABLE_DEV | PS2M_STS_REMOTE_MODE) == PS2M_STS_ENABLE_DEV && !self.wrap
+    }
+
+    /// [`Ps2Mouse::movement`] if it queues a whole packet (or, a wheel-only movement without IntelliMouse mode,
+    /// nothing): false, with nothing changed, when the mouse does not stream (its movement would wait for read-data or
+    /// be reset by enable) or its FIFO lacks room for the packet.
+    pub(super) fn try_movement(&mut self, dx: i16, dy: i16, dz: i8, buttons: u8) -> bool {
+        let n = if self.id == INTELLIMOUSE_ID { 4 } else { 3 };
+        if !self.streaming() || self.fifo.len() + n > PS2MOUSE_FIFOSZ {
+            return false;
+        }
+        self.movement(dx, dy, dz, buttons);
+        true
     }
 }
