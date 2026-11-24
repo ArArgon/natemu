@@ -429,7 +429,7 @@ D. **Diagnostics first (owner: yes, better for diagnostics).** Today a Linux boo
    [checkpoint C plan](m2-checkpoint-c-plan.md) defines the order and acceptance cases.
 
    **Checkpoint C, mixed 32/64 in one process:** what the roadmap's far-transfer item asks for, and what Windows' 32-bit
-   layer will need later.
+   layer will need later. Built (November 23, 2026): [findings](m2-checkpoint-c-findings.md).
 6. **Non-flat default 32-bit segments (deferred):** translated code adds the base of a non-flat
    default segment on every access and checks its limit, with the segment shape in the code identity; about 15-23
    agent hours. The trigger to start it is a workload that needs it (Win16 under Wine, DOS emulators). 16-bit code

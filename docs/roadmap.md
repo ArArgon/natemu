@@ -154,6 +154,9 @@ weeks for a first demonstration.
 - **P1** [Checkpoint C](restructure/m2-checkpoint-c-plan.md) covers mixed 32/64 user execution in one process,
   including far transfers between flat code segments and FS/GS limit checks in 32-bit code.
   Windows' 32-bit layer needs the mode-switch path. General non-flat default segments are deferred until a workload needs them.
+  **Built** (branch `m2-checkpoint-c`, November 23, 2026; [findings](restructure/m2-checkpoint-c-findings.md)): far
+  JMP/CALL/RET between 32-bit and 64-bit user code and SYSEXIT to 32-bit code; FS/GS limits checked in 32-bit code,
+  with no check for Linux's thread-data segment; 32-bit addresses wrap exactly in mixed processes.
 - **P1** Narrow boot-time 16- and 32-bit execution, only the sequences that must run:
   the firmware's reset-vector climb to 64-bit mode, the start-up stubs firmware and
   Windows use to bring up extra CPUs, and the short protected-mode stretch before the
