@@ -1,11 +1,17 @@
 # The devices family: stock Linux drivers against natemu's platform devices (pvpanic; SMBIOS, the 8042 and PS/2, and the
 # device work of the multi-BAR PCI and virtio device interface plans as they land), through the `natemu` CLI. Each case
-# is one run of tests/devices/run_platform.py: one VM from the initramfs `run_platform.py prepare` builds (the input
+# (but the devices-console suites', at the end) is one run of tests/devices/run_platform.py: one VM from the initramfs
+# `run_platform.py prepare` builds (the input
 # root's devices-platform/platform, testkit/inputs.py platform_inputs()), judged from the guest's serial markers and the
 # host's exit line. No QEMU answers: nothing is locked (tests.lock has no entries).
 #
 # Adding a case: its `case_<name>` function and dispatch line in run_platform.py's INIT, its CASES entry (kernel command
 # line words and judge), a module it loads in MODULES, a negative control in self_check, and a [suite.cases] entry here.
+#
+# The devices-console suites run tests/devices/run_console.py instead (virtio-console, `[[console]]`; its docstring): one
+# VM from the initramfs `run_console.py prepare` builds (the input root's devices-console/console, console_inputs()),
+# judged from the serial markers, what the console's host end received and the exit line. Adding a console case: its
+# case_<name> and dispatch in run_console.py's INIT, its judge in JUDGES, negative controls in self_check, an entry below.
 [family]
 name = "devices"
 covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crates/host/src/ps2.rs", "crates/host/src/ps2/**",
@@ -20,7 +26,8 @@ covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crate
           "tests/boot/run_l2_iasl.py", "testkit/harness/bench.py", "third_party/openvmm/**", "third_party/freebsd-bhyve/**",
           "crates/host/src/devices.rs", "crates/host/src/irq.rs", "crates/host/src/execution.rs", "crates/host/src/boot/**",
           "tests/devices/**", "tests/lib/**", "testkit/inputs.py",
-          "crates/host/src/pci/**", "crates/host/src/virtio/pci.rs"]
+          "crates/host/src/pci/**", "crates/host/src/virtio/pci.rs", "crates/host/src/virtio/console.rs",
+          "crates/host/src/virtio/model.rs", "crates/host/src/virtio/mod.rs"]
 
 [[suite]]
 name = "devices"
@@ -92,3 +99,71 @@ argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--
 argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
         "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "pci-multibar", "--vcpus", "2",
         "--set", "debug.pci_testdev=true"]
+
+# virtio-console (tests/devices/run_console.py): the cases.
+[[suite]]
+name = "devices-console"
+kind = "judged"
+harness = "runner"
+params = { timeout = 600 }
+needs = { cores = 1, perf = true }
+
+# virtio-console on a host output (run_console.py's docstring): the guest writes a 1 MiB pattern to /dev/hvc0 and
+# powers off. The output is a pipe the runner reads only after the power-off began, so the device's power-off drain
+# must deliver the tail; the runner checks the bytes are exactly the pattern (no CR added) and `natemu: Power(1)`.
+# `-file` writes a regular file instead (created by natemu).
+[suite.cases."console-file-mmio-1"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "mmio", "--cpus", "1"]
+
+[suite.cases."console-file-mmio-2"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "mmio", "--cpus", "2"]
+needs = { cores = 2, perf = true }
+
+[suite.cases."console-file-pci-1"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "pci", "--cpus", "1"]
+smoke = true
+
+[suite.cases."console-file-pci-2"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "pci", "--cpus", "2"]
+needs = { cores = 2, perf = true }
+
+[suite.cases."console-file-pci-1-file"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "pci", "--cpus", "1", "--sink", "file"]
+
+# virtio-console on a Unix socket: the runner connects after the guest's ready marker, sends `ping NONCE` and 4 MiB of
+# pattern, which the guest leaves unread for 3 s (the device must hold input back), then reads and answers with the
+# nonce reversed and the pattern's SHA-256; the runner checks the reply, that the socket is gone after natemu exits,
+# and `natemu: Power(1)`.
+[suite.cases."console-socket-mmio-1"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-socket", "--transport", "mmio", "--cpus", "1"]
+
+[suite.cases."console-socket-mmio-2"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-socket", "--transport", "mmio", "--cpus", "2"]
+needs = { cores = 2, perf = true }
+
+[suite.cases."console-socket-pci-1"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-socket", "--transport", "pci", "--cpus", "1"]
+
+[suite.cases."console-socket-pci-2"]
+argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-socket", "--transport", "pci", "--cpus", "2"]
+needs = { cores = 2, perf = true }
+
+# run_console.py's self-check: the init's shell syntax and its reverse() (run by the host's sh), the patterns, the
+# judges' negative controls; no VM.
+[[suite]]
+name = "devices-console-selfcheck"
+kind = "judged"
+harness = "runner"
+params = { timeout = 120 }
+
+[suite.cases."console-selfcheck"]
+argv = ["tests/devices/run_console.py", "self-check"]

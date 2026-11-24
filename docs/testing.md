@@ -402,7 +402,8 @@ stale or natemu fails only sometimes; rerunning without `--diff` tells them apar
 The inputs those runners read can also be built on any machine instead of copied: `testkit.inputs.root()` makes a cache
 entry laid out like `natemu-raw` (the netboot kernel and initrd, the QEMU reference binary, the virtio block inputs and
 kernel package, the network tools' root, the i7 and s2d program corpora, the fio preparation, a static stress-ng and
-the devices family's initramfs, `tests/devices/run_platform.py prepare`'s folder; no expected answers) from pinned
+the devices family's initramfs, `tests/devices/run_platform.py prepare`'s folder, and its console cases' one,
+`tests/devices/run_console.py prepare`'s; no expected answers) from pinned
 downloads and recipes in the repo (`tools/io/network-rootfs` for the network tools, `tools/io/fio-prep` for Debian's
 fio and its libraries, `tools/io/stress-ng` for stress-ng; each runs in the amd64 Debian container through Rosetta and
 needs Apple's `container`). `testkit.inputs.matrix_inputs()` is `run_io_matrix.py
