@@ -138,8 +138,8 @@ impl Console {
         }))
     }
     /// A console on a Unix socket natemu listens on at `path` (removed when the console ends). A stale socket there
-    /// (nobody listening) is replaced; any other file there is refused. While a client is connected the backend holds
-    /// an `irqs` busy guard: a guest waiting for its input is not ended as all-halted.
+    /// (nobody listening) is replaced; any other file there is refused. The backend holds an `irqs` busy guard for its
+    /// whole life (a client may connect and send at any time): a guest waiting for its input is not ended as all-halted.
     pub(crate) fn socket(path: &Path, irqs: Irqs) -> Result<Arc<Self>> {
         let fail = |e: String| format!("{}: {e}", path.display());
         let listener = listen(path).map_err(fail)?;
@@ -157,9 +157,8 @@ impl Console {
                 shared: shared.clone(),
                 listener,
                 bell,
-                irqs,
+                _arrival: irqs.busy(),
                 client: None,
-                busy: None,
                 input: Vec::new(),
                 delivered: 0,
                 out: Vec::new(),
@@ -307,10 +306,9 @@ struct Socket {
     listener: UnixListener,
     /// The doorbell's read end.
     bell: UnixStream,
-    irqs: Irqs,
+    /// A listening socket can still deliver data (a client may connect at any time): all-HLT is not VM completion.
+    _arrival: Busy,
     client: Option<UnixStream>,
-    /// Held while a client is connected or its bytes wait for the guest.
-    busy: Option<Busy>,
     /// Client bytes read, of which the guest has taken `delivered`.
     input: Vec<u8>,
     delivered: usize,
@@ -332,7 +330,6 @@ impl Socket {
             progress |= self.write();
             progress |= self.read();
             progress |= self.deliver();
-            self.hold();
             let mut fds = vec![
                 poll_fd(self.bell.as_raw_fd(), libc::POLLIN),
                 poll_fd(self.listener.as_raw_fd(), libc::POLLIN),
@@ -441,7 +438,6 @@ impl Socket {
                 continue;
             }
             self.client = Some(stream);
-            self.hold();
         }
         progress
     }
@@ -530,16 +526,6 @@ impl Socket {
         };
         if let Some(port) = resume {
             port.resume(TRANSMITQ);
-        }
-    }
-    /// The busy guard: held while a client is connected or its bytes wait for the guest.
-    fn hold(&mut self) {
-        if self.client.is_some() || self.delivered < self.input.len() {
-            if self.busy.is_none() {
-                self.busy = Some(self.irqs.busy());
-            }
-        } else {
-            self.busy = None;
         }
     }
 }
@@ -854,24 +840,29 @@ mod tests {
         got
     }
 
-    /// What a client sends reaches receiveq; while a client is connected the backend holds a busy guard (a guest
-    /// waiting for its input is not ended as all-halted), and it lets go once the client is gone.
+    /// What a client sends reaches receiveq. The backend holds one busy guard for its whole life, with or without a
+    /// client (a guest waiting for input is not ended as all-halted: a client may connect at any time), and lets go
+    /// when the console ends.
     #[test]
     fn socket_client_bytes_reach_receiveq() {
         let dir = Dir::new();
         let (rig, path, irqs) = socket_rig(&dir);
         rig.run(|rig| {
-            assert_eq!(irqs.live(), 0, "no client: no guard");
+            assert_eq!(irqs.live(), 1, "listening with no client holds the guard");
             let mut client = connect(&path);
             client.write_all(b"hello, guest\n").unwrap();
             rig.post_rx(0, 64);
             rig.post_rx(1, 64);
             rig.kick(0);
             until("received", || rig.received() == b"hello, guest\n");
-            assert_eq!(irqs.live(), 1, "a connected client holds the guard");
+            assert_eq!(irqs.live(), 1, "one guard with a client");
             drop(client);
-            until("guard released", || irqs.live() == 0);
+            transmit(rig, 0x60000, b"gone");
+            until("the hang-up seen", || rig.model.discarded() == 4);
+            assert_eq!(irqs.live(), 1, "the guard outlives the client");
         });
+        drop(rig);
+        assert_eq!(irqs.live(), 0, "released when the console ends");
     }
 
     /// Client bytes beyond what the guest has posted and the receive backlog wait in the backend (and the socket)
@@ -965,7 +956,7 @@ mod tests {
     #[test]
     fn client_reconnect() {
         let dir = Dir::new();
-        let (rig, path, irqs) = socket_rig(&dir);
+        let (rig, path, _irqs) = socket_rig(&dir);
         rig.run(|rig| {
             let mut a = connect(&path);
             a.write_all(b"a").unwrap();
@@ -977,7 +968,6 @@ mod tests {
             drop(a);
             transmit(rig, 0x61000, b"lost!");
             until("discarded", || rig.model.discarded() == 5);
-            until("a's guard released", || irqs.live() == 0);
             let mut b = connect(&path);
             b.write_all(b"b").unwrap();
             rig.post_rx(1, 64);
