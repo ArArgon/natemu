@@ -275,3 +275,47 @@ bound): `zstd` compress 1-4% of EL0 time, `build` and the make step under 1%, `s
   every exit.
 - The hot copy grows by the dead exit words of exits in place: the static case reports hot-copy bytes.
 - A removed word's samples move to the next word: the VM case checks the hot unit's samples as well as the flag share.
+
+## 13. Results (version 0: killed)
+
+Version 0 was built as section 4 describes and measured on the M2 Max. **It is killed by its own static criterion and will
+not merge.**
+
+**Static kill-test, bench case `flag-words-zstd` (M2 Max):** 223 units of the three functions, reachable by literal exits.
+Their summed main path goes from 7234 to 7175 words (−0.82%), short of the 2% the kill-test asks for. The main path is
+counted here from the body's first word through the svc of the exit it reaches, so a `cfinv` that moved into the
+fall-through's exit block still counts. The hand-counted expectation holds: unit 0x44c1e8 goes from 33 to 30 words (30 to
+27 in section 8's body-only count). No unit's main path grows, and `nzcv_save` words are unchanged. The hot copy grows by
+about 2-4% (8364 to 8624 and 16068 to 16716 bytes in the two largest functions). 65 exits got restore words (69 words);
+version 1's skip would be allowed for 20 of them. Most flag words left before a Jcc are live at a fault point on the
+fall-through, which is version 2's kind (section 10).
+
+**VM case `guest-zstd-sample` (M2 Max, one run):** output verified. The compress phases' FEX flag share fell to 10.9 and
+9.9 raw, 2.9 and 4.0 points below section 8's 13.8 and 13.9. That passes the 2-point criterion. The skid-corrected share
+rose, to 25.8 and 25.0 against the 22.8 of section 1. Unit 0x44c1e8 has 6585 block samples over the whole run, against
+7195 (the per-phase check was not made). **Caveat:** these baselines are the plan's kept run at a7cd8e82, not an A/B
+against this branch's base 7a51e342.
+
+**The hot restore:** in 0x44c1e8 the `je` exit block's restore word (`mov x26, x4`) carries 882 samples, and the `jb`
+exit's AF `eor` 99. So the `je` taken edge, or the skid after its data-dependent branch, is far hotter than the 3-10% of
+iterations section 8 assumed. The samples moved off the body's `cfinv` onto the restore rather than going away, which is
+why the corrected share rose.
+
+**What was built and where it lives (neither merged nor pushed):**
+- **Fork:** FEX commit 06f4163e on the local branch `natemu-flag-words` (on 934032e0), in the worktree's own
+  `third_party/FEX`. It holds the B1 CF rule with its single-predecessor hard check and the B2 PF and AF restores.
+- **natemu:** branch `worktree-agent-aec2633970b7d4718` at 45de26a4. It holds the pin, the `--exit-flags` argument in fexc
+  and in the host's TRANSLATION_ARGS, the case `flag-words-zstd`, and the native old-versus-new check `exit-flags-shapes`
+  (a 439-idiom corpus).
+- **Mutations:** `exit-flags-shapes` caught five fork mutations: PF matched through a select's operand, the one-word AF
+  form for `add`/`sub R, S`, the taken exit's CF form not set to S, the fall-through's CF form not set to S, and restore
+  words dropped while the body's copy was removed. AF restored with PF from another instruction is not caught, and cannot
+  be: the guest AF is unchanged either way.
+- **Comparator:** fexc-replay's `only_exit_flags` comparator stayed incomplete. With `--exit-flags` off, every 64-bit reply
+  of the recorded boot is byte-identical to the base compiler's. With it on, the comparator accepts 9479 replies and
+  rejects 39, and **47 one-place mutations of accepted replies go unreported**, from its looser second try that renames
+  temporary registers.
+- **Not done:** the `gen_slice2` flag-exit templates, `flag-exits-irq` and the abi split tests.
+
+**Version 1 (section 5) is not pursued** unless a new measure reopens the question. Weighting by the taken edges' real
+frequency, or a timing A/B in the pooled round, would be such a measure.
