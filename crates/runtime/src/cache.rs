@@ -20,7 +20,7 @@ pub use natemu_abi::execution::cache::{
     ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_BYTES, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL,
     INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, OFF0, OFF1, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
-    PIC_TEST_STR, PIC_TEST_SVC, PIC_TEST_TAIL, PIC_TEST_TAILS, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
+    PIC_TEST_STR, PIC_TEST_SVC, PIC_TEST_LOOKUP, PIC_TEST_TAIL, PIC_TEST_TAILS, PIC_TEST_TRAMPOLINE, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
     STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
@@ -1196,7 +1196,7 @@ pub fn place(
     let c = control();
     let size = placed_size(h);
     let exit_forms = exit_forms as u32 & area::FORMS;
-    let tail = tail_view(0, size, 0, links, dispatch_exit as u32, rep_exits as u32, exit_forms).tail_extent();
+    let tail = tail_view(0, size, 0, links, dispatch_exit as u32, rep_exits as u32, exit_forms).tail_bytes();
     // Perf chunk 10: a template keeps its guest-RIP relocations (packed after its sites); one that cannot be packed is none.
     let reloc = |i: u32| unsafe {
         object
@@ -1295,6 +1295,7 @@ pub fn place(
             core::slice::from_raw_parts(object.add(h.code_offset as usize), size as usize),
         );
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, (size + tail) as usize);
+        tails_counted(placed);
         c.code_used = code_end;
         if placed.hot_size != 0 {
             c.seg.hot_used = placed.hot_body() + u64::from(placed.hot_size);
@@ -1364,7 +1365,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
     let code = start + u64::from(PIC_LEAD);
     // (Indirect plan step 1: its words appended after its code, a shared translation's for its link points too.)
     let view = |links| tail_view(code, t.code_size, PIC, links, t.dispatch_exit, t.rep_exits, t.exit_forms);
-    let code_end = code + u64::from(t.code_size) + u64::from(view(t.links).tail_extent());
+    let code_end = code + u64::from(t.code_size) + u64::from(view(t.links).tail_bytes());
     if code_end > c.code_bytes {
         c.full[0] += 1;
         return None;
@@ -1464,6 +1465,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         (code_end - start) as usize,
     );
     c.code_used = code_end;
+    tails_counted(placed);
     counted(count::SHARES);
     Some(placed)
 }
@@ -1682,10 +1684,10 @@ pub fn copy(
         sites(b).iter().any(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind) && u64::from(s.native_offset) == o)
     });
     let view = tail_view(0, b.code_size, 0, b.links, b.dispatch_exit, b.rep_exits, b.exit_forms);
-    let Some((code, hot)) = reserve(u64::from(b.code_size + view.tail_extent()), want) else {
+    let Some((code, hot)) = reserve(u64::from(b.code_size + view.tail_bytes()), want) else {
         return Ok(None);
     };
-    let code_end = code + u64::from(b.code_size + view.tail_extent());
+    let code_end = code + u64::from(b.code_size + view.tail_bytes());
     let mut links = b.links;
     unsafe {
         copy_record(
@@ -1744,7 +1746,8 @@ pub fn copy(
     }
     let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
     let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
-    if placed.is_some() {
+    if let Some(p) = placed {
+        tails_counted(p);
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
             c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
@@ -1795,10 +1798,10 @@ pub fn copy_pooled(
     );
     let exit_forms = e.exit_forms & area::FORMS;
     let view = tail_view(0, len as u32, 0, e.links, e.dispatch_exit, e.rep_exits, exit_forms);
-    let Some((code, hot)) = reserve(code_size + u64::from(view.tail_extent()), want) else {
+    let Some((code, hot)) = reserve(code_size + u64::from(view.tail_bytes()), want) else {
         return Ok(None);
     };
-    let code_end = code + code_size + u64::from(view.tail_extent());
+    let code_end = code + code_size + u64::from(view.tail_bytes());
     let count = e.relocs_count();
     // (decode bounds the count by `MAX_RELOCS`.)
     let mut relocs = [0u32; MAX_RELOCS as usize];
@@ -1863,7 +1866,8 @@ pub fn copy_pooled(
     }
     let tables = e.tables();
     let placed = unsafe { file(record, tables.as_ptr(), tables.len(), 0) };
-    if placed.is_some() {
+    if let Some(p) = placed {
+        tails_counted(p);
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
             c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
@@ -2223,15 +2227,20 @@ fn append(b: &Block, slot: u64) {
         };
         let words = tail_words(at, slot, b.tail_calls(p));
         unsafe { ((area::CODE_WRITE_VA + at) as *mut [u32; 3]).write_volatile(words) };
-        match p {
-            None if slot != area::DISPATCH_MISS as u64 => {
-                let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-                unsafe { ((area::CODE_WRITE_VA + exit) as *mut u32).write_volatile(branch(exit, at)) };
-                counted(if b.tail_calls(p) { count::TAIL_CALLS } else { count::TAILS });
-            }
-            None => {}
-            Some(_) => counted(count::TAIL_POINTS),
+        if p.is_none() && slot != area::DISPATCH_MISS as u64 {
+            let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
+            unsafe { ((area::CODE_WRITE_VA + exit) as *mut u32).write_volatile(branch(exit, at)) };
         }
+    }
+}
+/// Indirect plan step 1's counters for a block just filed with appended words: its computed exit's (as a jump or a call)
+/// and its link points'.
+fn tails_counted(b: &Block) {
+    if b.tail(None).is_some() {
+        counted(if b.tail_calls(None) { count::TAIL_CALLS } else { count::TAILS });
+    }
+    for _ in (0..MAX_LINK_POINTS).filter(|&k| b.tail(Some(k)).is_some()) {
+        counted(count::TAIL_POINTS);
     }
 }
 /// [`Block::tail`]'s view of a block about to be placed at `code` (`code_size` bytes) with these exits, `flags` its kind
@@ -2555,7 +2564,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     for (k, p) in source.links.iter().enumerate().filter(|&(_, p)| named(p) && unlinked(source, p)) {
         let at = word_at(p);
         let original = word(at);
-        let to = match source.tail(Some(k)) {
+        let w = match source.tail(Some(k)) {
             Some(t) if checked => {
                 // (Its `bl` for the slot now: at placement the context may have had none.)
                 let first = tail_words(t, entry, source.tail_calls(Some(k)))[0];
@@ -2563,11 +2572,13 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
                     rewrite(t, first);
                 }
                 counted(count::TAIL_LINKS);
-                t
+                // Always `b`, never `link_word`'s `nop`: a point's appended entry may follow its `svc` word directly (the
+                // code's last word), and `unlink_word`, `svc_slot` and the host's audit read a checked link as a `b`.
+                branch(at, t)
             }
-            _ => to,
+            _ => link_word(at, to),
         };
-        rewrite(at, link_word(at, to));
+        rewrite(at, w);
         insert(
             LinkRecord {
                 source: source.number,
@@ -3685,6 +3696,17 @@ pub fn tail_for_test(context: u64, pick: u64) -> Option<u64> {
         live = live.or(at);
     }
     live
+}
+
+/// Indirect plan step 1 test ([`area::PIC_TEST_TRAMPOLINE`]): the code-area offset of the hot trampoline of a live split
+/// block of `context` whose computed exit has appended words, among the newest records.
+pub fn trampoline_for_test(context: u64) -> Option<u64> {
+    let count = control().blocks as usize;
+    (count.saturating_sub(1 << 14)..count).rev().map(block).find_map(|b| {
+        let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
+        let at = link_at(b, u64::from(b.dispatch_exit));
+        (b.context == context && b.flags & DEAD == 0 && b.hot_size != 0 && b.tail(None).is_some() && at != exit).then_some(at)
+    })
 }
 
 /// Marks `gpa`'s page as holding this vCPU's translations, before its bytes are copied for a block: from here on a

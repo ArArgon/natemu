@@ -1712,6 +1712,10 @@ def cmd_compat_limits(a, host, runtime):
                         diffs.append(f"cpu{i} asked for {cpu['stats']['requests']} translations, expected {prog['requests']}")
                     if (prog['ncpu'] > 1 or prog.get('require_link')) and not limit and not cpu['stats']['linked']:
                         diffs.append(f'cpu{i} installed no links in the default run')
+                    # Indirect plan step 1: least `natemu_abi::pic::count` counters (appended words, checked links through them).
+                    for k, least in prog.get('pic_min', []):
+                        if cpu['stats']['k1']['pic'][k] < least:
+                            diffs.append(f"cpu{i} pic counter {k} = {cpu['stats']['k1']['pic'][k]}, at least {least}")
                 if 'unassigned_fills' in prog:
                     counts = {smp.num(e['page']): (e['reads'], e['writes']) for e in out.get('unassigned_pages', [])}
                     if counts != prog['unassigned_fills']:

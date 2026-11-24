@@ -2329,6 +2329,27 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
             cache::kick(s.vcpu as usize);
         }
     }
+    // ([`cache::PIC_TEST_LOOKUP`], [`cache::PIC_TEST_TRAMPOLINE`].)
+    let test = cache::control().pic_test;
+    if matches!(test, cache::PIC_TEST_LOOKUP | cache::PIC_TEST_TRAMPOLINE)
+        && s.blocks % 2 == 0
+        && s.shadow_entry == 0
+        && block.flags & cache::STEP == 0
+        && !block.starts_with_rep()
+    {
+        let miss = cache::CODE_VA + cache::DISPATCH_MISS as u64;
+        let at = if test == cache::PIC_TEST_LOOKUP {
+            let slot = cache::dispatcher_for(block.context);
+            (slot != cache::DISPATCH_MISS as u64)
+                .then(|| slot + natemu_abi::execution::cache::SLOT_LOOKUP as u64 + 4 * (s.blocks / 2 % 15))
+        } else {
+            cache::trampoline_for_test(block.context)
+        };
+        if let Some(at) = at {
+            (f.x[0], f.x[1], f.x[2], f.x[30], pc) = (block.rip, miss, f.x[28], miss, cache::CODE_VA + at);
+            cache::kick(s.vcpu as usize);
+        }
+    }
     // (And the `svc`-word links of any block, absolute ones' into position-independent targets included.)
     if cache::control().pic_test == cache::PIC_TEST_SVC && s.blocks % 2 == 0 && cache::arm_svc(code)
     {
@@ -2387,6 +2408,8 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64) -> ! {
         if cache::control().pic_test != 0 {
             (*shared()).initial.x[0] = 0;
             (*shared()).initial.x[1] = 0;
+            (*shared()).initial.x[2] = 0;
+            (*shared()).initial.x[30] = 0;
         }
         // S4: a watched access's software step completed; any other entry abandons a step in flight. AFP accurate chunk 3: the
         // step of an FP trap's re-run is told apart by its marker (`fp::cancel` abandoned one that is not this step, in `finish`).
@@ -2614,22 +2637,14 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         s
     };
     if (cache::DISPATCH_VA..cache::DISPATCH_VA + cache::DISPATCH_BYTES as u64).contains(&elr) {
+        // (Indirect plan step 1: a stop inside a slot's lookup form counted.)
+        let form = (elr - cache::DISPATCH_VA) as usize % natemu_abi::execution::cache::DISPATCH_SLOT_BYTES;
+        if (natemu_abi::execution::cache::SLOT_LOOKUP..natemu_abi::execution::cache::SLOT_RETURN).contains(&form) {
+            cache::control().pic_counts[natemu_abi::pic::count::LOOKUP_STOPS] += 1;
+        }
         let mut s = at_once(s, frame.x[0]);
         completed(&mut s); // a block exited into the dispatcher
         s.stops_dispatch += 1;
-        unsafe { dispatch(&mut s) }
-    }
-    // Indirect plan step 1: in the words appended to a block for an exit (a block boundary: the exit's guest effects are
-    // done and its target is in x0, which they never write), the vCPU stops at once, as in the dispatcher; a dead block's
-    // too (its code still runs until it leaves), so before the dead-block filter below.
-    if let Some((b, _, _)) = cache::tail_at(elr) {
-        let dead = b.flags & cache::DEAD != 0;
-        let mut s = at_once(s, frame.x[0]);
-        completed(&mut s);
-        s.stops_dispatch += 1;
-        let counts = &mut cache::control().pic_counts;
-        counts[natemu_abi::pic::count::TAIL_STOPS] += 1;
-        counts[natemu_abi::pic::count::TAIL_DEAD_STOPS] += u64::from(dead);
         unsafe { dispatch(&mut s) }
     }
     // PIC study (`pic-count` builds): in a link's counting stub, the exit's state: the vCPU stops at the target's start.
@@ -2645,6 +2660,20 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     // the stub's split check: in x0 at the probe's first word, in d0 after it) runs on to an exit, as from inside a block.
     let pc = probe_returns_to(frame, elr);
     let Some(b) = cache::block_at(pc).filter(|b| b.flags & cache::DEAD == 0) else {
+        // Indirect plan step 1: in the words appended to a block for an exit (a block boundary: the exit's guest effects are
+        // done and its target is in x0, which they never write), the vCPU stops at once, as in the dispatcher. `block_at`
+        // holds no appended word, and a dead block's count too (its code still runs until it leaves): looked up here, on
+        // `block_at`'s miss only, and never filtered by death.
+        if let Some((b, _, _)) = cache::tail_at(elr) {
+            let dead = b.flags & cache::DEAD != 0;
+            let mut s = at_once(s, frame.x[0]);
+            completed(&mut s);
+            s.stops_dispatch += 1;
+            let counts = &mut cache::control().pic_counts;
+            counts[natemu_abi::pic::count::TAIL_STOPS] += 1;
+            counts[natemu_abi::pic::count::TAIL_DEAD_STOPS] += u64::from(dead);
+            unsafe { dispatch(&mut s) }
+        }
         bad(s)
     };
     s.irqs_step += u64::from(b.flags & cache::STEP != 0);
@@ -2754,8 +2783,13 @@ unsafe fn stopped(
                     cache::bits32(b.context),
                 )),
                 None if svc => Some(frame.x[0]),
-                None => (b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit))
-                    .then_some(frame.x[0]),
+                None => (b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit)).then(|| {
+                    // (Indirect plan step 1: at the hot trampoline of a computed exit with appended words, counted.)
+                    if b.tail(None).is_some() && at != u64::from(b.code) + u64::from(b.dispatch_exit) {
+                        cache::control().pic_counts[natemu_abi::pic::count::TRAMPOLINE_STOPS] += 1;
+                    }
+                    frame.x[0]
+                }),
             }
         });
     let Some(rip) = rip else {

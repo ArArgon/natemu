@@ -1542,12 +1542,16 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     // PIC study stage 3: an instance's link points are its translation's (which holds the words); the dispatcher slots.
     let slots = (cache::DISPATCH + cache::DISPATCH_SLOT_BYTES) as u64
         ..(cache::DISPATCH + cache::DISPATCH_BYTES) as u64;
-    // Indirect plan step 1: an appended entry's first word at `at`, `w`: `bl` to a bound slot's lookup form (Some(true)) or
-    // `b` to the miss (Some(false)).
-    let lookup_call = |at: u64, w: u32| {
+    // Indirect plan step 1: an appended entry's first word at `at`, `w`, of a block of `context`: `bl` to the lookup form of
+    // the slot serving that context (Some(true)), or `b` to the miss (Some(false)).
+    let lookup_call = |at: u64, w: u32, context: u64| {
         let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+        let serves = |to: u64| {
+            let k = (to - cache::DISPATCH as u64) as usize / cache::DISPATCH_SLOT_BYTES;
+            control.slot_contexts.get(k) == Some(&context)
+        };
         match w >> 26 {
-            0x25 if slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_LOOKUP as u64 => Some(true),
+            0x25 if slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_LOOKUP as u64 && serves(to) => Some(true),
             0x05 if to == cache::DISPATCH_MISS as u64 => Some(false),
             _ => None,
         }
@@ -1558,7 +1562,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     for b in blocks.iter().filter(|b| b.tail_entries() != 0) {
         for point in [None].into_iter().chain((0..exec::MAX_LINK_POINTS).map(Some)) {
             let Some(at) = b.tail(point) else { continue };
-            let bound = lookup_call(at, word(at));
+            let bound = lookup_call(at, word(at), b.context);
             let second = if b.tail_calls(point) { 0xd63f_0020 } else { 0xd61f_0020 };
             let pad = 0x1400_0000 | ((cache::DISPATCH_MISS as u64).wrapping_sub(at + 8) >> 2) as u32 & 0x03ff_ffff;
             if bound.is_none() || word(at + 4) != second || word(at + 8) != pad {
@@ -1625,17 +1629,9 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 let slot =
                     |to: u64| slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == 0;
                 let k = b.links.iter().position(|q| q.offset == p.offset);
-                let own = |to: u64| k.and_then(|k| b.tail(Some(k))) == Some(to) && lookup_call(to, word(to)).is_some();
+                let own = |to: u64| k.and_then(|k| b.tail(Some(k))) == Some(to) && lookup_call(to, word(to), b.context).is_some();
                 if !branch(svc, w).is_some_and(|to| slot(to) || own(to)) {
-                    return Err(format!(
-                        "{}, its checked `svc` word at {svc:#x} {w:#010x} (to {:#x?}; its appended words at {:#x?}; code {:#x} size {:#x}; words {:08x?})",
-                        bad(),
-                        branch(svc, w),
-                        k.and_then(|k| b.tail(Some(k))),
-                        b.code,
-                        b.code_size,
-                        (0..8u64).map(|i| word(u64::from(b.code) + u64::from(p.offset) + 4 * i)).collect::<Vec<_>>()
-                    ));
+                    return Err(format!("{}, its `svc` word {w:#010x}", bad()));
                 }
                 linked.insert((b.number, (svc - u64::from(b.code)) as u32), cache::CHECKED);
                 continue;
@@ -4299,6 +4295,8 @@ pub fn run(
         Ok("tail0") => cache::PIC_TEST_TAIL,
         Ok("tail1") => cache::PIC_TEST_TAIL + 1,
         Ok("tail2") => cache::PIC_TEST_TAIL + 2,
+        Ok("lookup") => cache::PIC_TEST_LOOKUP,
+        Ok("trampoline") => cache::PIC_TEST_TRAMPOLINE,
         Ok(other) => {
             return Err(format!(
                 "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal or tail0-tail2"

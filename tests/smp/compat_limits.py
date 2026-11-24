@@ -1303,6 +1303,7 @@ def cases(*, reference_control=False):
     add('fs-generic-flat-limit-offset-overrun-deviation', 'mov ecx, [fs:0xfffffffe]', base=tls + 2, limit=0xfffff, flags=12,
         success=True, ecx=int.from_bytes(VALUE[:4], 'little'), checks=0)
 
+    cases.append(indirect32())
     return cases
 
 
@@ -1504,3 +1505,51 @@ def mixed_user_shld_6g():
     prog = C.program('mixed-user-shld-6g', C.ENTER(cs=0x23) + C.handlers(), user, memory)
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 14, 4), C.REC + 0x38: struct.pack('<Q', 0x80001000),
                   C.XPAGE: struct.pack('<I', 0x5eed0000)}
+
+
+def indirect32():
+    """Indirect plan step 1 in 32-bit code (natemu only): U's frame holds a library at U + 0x400 and a function at U + 0xf00,
+    and is also mapped at A1 and A2 (two more 32-bit user pages); a trampoline frame T is also mapped at T2. The library, a
+    get-PC thunk and a loop of 64 rounds through three jump sites (`jmp eax`) of 1, 4 and 64 targets and three call sites
+    (`call eax`) of as many (position-independent tables), each target counting its runs in memory (jumps: `jmp edi` back),
+    ends with `jmp ebp`. U calls it at U, three times at A1 (a shared translation), three times through T (`jmp` A1's) and
+    three through T2 (the same bytes: `jmp` A2's, a checked link out of shared code), then T + 0x300 and T2 + 0x300 three
+    times each (`call` the function at A1, A2: a checked link that is a call), storing what the function returns (its
+    alias + 5). Every count, both returns, the end at INT 0x80, and (`pic_min`) appended words for 32-bit jumps, calls and
+    shared link points, with checked links through them."""
+    a1, a2, t, t2 = 0x2a0000, 0x2a1000, 0x2a8000, 0x2a9000
+    jc, cc, res = C.W + 0x400, C.W + 0x500, C.W + 0x600
+    lib = C.U + 0x400
+    call = lambda tag, to: f'    mov ebp, r_{tag}\n    mov eax, {to:#x}\n    jmp eax\nr_{tag}:\n'
+    calls = lambda tag, to: ''.join(call(f'{tag}{r}', to) for r in range(3))
+    main = (call('u', lib) + calls('a', a1 + 0x400) + calls('t', t) + calls('s', t2) + calls('f', t + 0x300)
+            + f'    mov [{res:#x}], eax\n' + calls('g', t2 + 0x300) + f'    mov [{res + 4:#x}], eax\n    int 0x80\n')
+    idx = ('xor eax, eax', 'mov eax, esi\n    and eax, 3', 'mov eax, esi\n    and eax, 63')
+    site = lambda x, table: f'    {x}\n    mov eax, [edx + eax * 4 + ({table} - lib_g)]\n    add eax, edx\n'
+    body = ''.join(site(x, 'lib_jt') + f'    lea edi, [edx + (lib_j{k} - lib_g)]\n    jmp eax\nlib_j{k}:\n' for k, x in enumerate(idx))
+    body += ''.join(site(x, 'lib_ct') + '    call eax\n' for x in idx)
+    text = (main + '    times 0x400 - ($ - $$) db 0xcc\n    call lib_g\nlib_g:\n    pop edx\n    xor esi, esi\nlib_loop:\n' + body
+            + '    inc esi\n    cmp esi, 64\n    jne lib_loop\n    jmp ebp\n    align 4\nlib_jt:\n'
+            + ''.join(f'    dd lib_t{k} - lib_g\n' for k in range(64)) + 'lib_ct:\n' + ''.join(f'    dd lib_f{k} - lib_g\n' for k in range(64))
+            + ''.join(f'lib_t{k}:\n    add dword [{jc + 4 * k:#x}], 1\n    jmp edi\n' for k in range(64))
+            + ''.join(f'lib_f{k}:\n    add dword [{cc + 4 * k:#x}], 1\n    ret\n' for k in range(64))
+            + '    times 0xf00 - ($ - $$) db 0xcc\n    call lib_h\nlib_h:\n    pop eax\n    ret\n')
+    assert len(C.user32(text)) <= 0x1000
+    tramp = bytearray(0x400)
+    tramp[:5] = b'\xe9' + (a1 + 0x400 - (t + 5)).to_bytes(4, 'little', signed=True)
+    tramp[0x300:0x305] = b'\xe8' + (a1 + 0xf00 - (t + 0x305)).to_bytes(4, 'little', signed=True)
+    tramp[0x305:0x307] = b'\xff\xe5'                       # jmp ebp
+    leaf = lambda va, frame: C.entry(C.PTE(va), frame | C.P.LEAF)
+    memory = [P_zero(jc, 0x210), {'addr': f'0x{t:x}', 'data': bytes(tramp).hex(), 'capture': False},
+              leaf(a1, C.U), leaf(a2, C.U), leaf(t2, t)]
+    prog = C.program('indirect32', C.ENTER() + C.handlers('    jmp .fin\n'), text, memory)
+    prog['pic_min'] = [(26, 1), (28, 2), (32, 3), (33, 3), (34, 1), (35, 2)]
+    runs = lambda k: 10 * (64 * (k == 0) + 16 * (k < 4) + 1)
+    counts = b''.join(struct.pack('<I', runs(k)) for k in range(64))
+    end = C.U + len(C.user32(main))
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128, 0, end, 0xdb), jc: counts, cc: counts,
+                  res: struct.pack('<II', a1 + 0xf05, a2 + 0xf05)}
+
+
+def P_zero(at, n):
+    return {'addr': f'0x{at:x}', 'size': n, 'fill': 'zero'}

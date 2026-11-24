@@ -477,14 +477,14 @@ pub mod cache {
             b.rep_exits = 1;
             assert_eq!(b.tail_entries(), 2, "shared: and each link point but a REP self-exit");
             assert_eq!((b.tail(Some(0)), b.tail(Some(1)), b.tail(Some(2))), (None, None, Some(0x2_008c)));
-            assert_eq!((b.tail_bytes(), b.tail_extent()), (24, 24));
+            assert_eq!(b.tail_bytes(), 24);
             assert_eq!(b.tail_word(0x2_0084), Some((None, 1)));
             assert_eq!(b.tail_word(0x2_0094), Some((Some(2), 2)));
             assert_eq!((b.tail_word(0x2_0098), b.tail_word(0x2_007c)), (None, None), "past them, and the code's last word");
-            // A link point whose `svc` word lies past the code: its words start after that word.
-            b.links[2].offset = 0x70;
-            assert_eq!((b.tail(None), b.tail_extent()), (Some(0x2_0084), 28));
-            assert_eq!(b.tail_word(0x2_0080), None, "the `svc` word is no appended word");
+            // A link point whose move and `svc` word end the code: its entry follows them directly.
+            b.links[2].offset = 0x6c;
+            assert_eq!((b.tail(None), b.tail(Some(2))), (Some(0x2_0080), Some(0x2_008c)));
+            assert_eq!(b.tail_word(0x2_007c), None, "the `svc` word is no appended word");
             b.flags = PIC | INSTANCE;
             assert_eq!(b.tail_entries(), 0, "an instance has no code of its own");
         }
@@ -1448,6 +1448,12 @@ pub mod cache {
     /// must take that RIP (the programs' values as without the test; `pic::count::TAIL_STOPS`).
     pub const PIC_TEST_TAIL: u64 = 9;
     pub const PIC_TEST_TAILS: u64 = 3;
+    /// Indirect plan step 1 tests, as [`PIC_TEST_TAIL`]: entered at a word of the lookup form of the context's slot (each in
+    /// turn; x0 the RIP, x1 and x30 the miss, x2 x28's value: were the doorbell late, every path ends at the miss); entered
+    /// at the hot trampoline of a live split block's computed exit that has appended words (x0 the RIP): the stop is armed
+    /// there and taken at the exit with RIP = x0.
+    pub const PIC_TEST_LOOKUP: u64 = 12;
+    pub const PIC_TEST_TRAMPOLINE: u64 = 13;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     /// (Hot/cold layout: a split block's trampolines too.)
     pub const ARMED: usize = 3 * super::MAX_LINK_POINTS + 2;
@@ -1721,20 +1727,11 @@ pub mod cache {
         pub fn tail_bytes(&self) -> u32 {
             TAIL_ENTRY_BYTES * self.tail_entries()
         }
-        /// The code-area offset where its appended words begin: after its code, and after every link point's `svc` word,
-        /// which may lie past the placed code (FEX's last exit's `svc` can be the first word after `code_region_end`): at
-        /// most 16 bytes after the point's first word ([`crate::pic::svc_slot`]), and a checked link patches it there.
+        /// The code-area offset where its appended words begin: right after its code (`code + code_size`; every link
+        /// point's `svc` word is inside it, `pic::link_point`). A point's entry may then follow its `svc` word directly,
+        /// so a checked link's word there is always `b`, never a `nop` (the linker's `link`).
         pub fn tail_start(&self) -> u64 {
-            let svc_end = self.links.iter().filter(|p| p.offset != 0).map(|p| p.offset + 20).max().unwrap_or(0);
-            u64::from(self.code) + u64::from(self.code_size.max(svc_end))
-        }
-        /// The bytes its appended words reserve after its code (`code + code_size`): the gap to [`Block::tail_start`] and
-        /// [`Block::tail_bytes`]; 0 with none.
-        pub fn tail_extent(&self) -> u32 {
-            match self.tail_entries() {
-                0 => 0,
-                _ => (self.tail_start() - u64::from(self.code)) as u32 - self.code_size + self.tail_bytes(),
-            }
+            u64::from(self.code) + u64::from(self.code_size)
         }
         /// The code-area offset of an exit's appended words: link point `k`'s (`Some(k)`, a [`PIC`] block's) or the
         /// computed exit's (`None`); `None` when it has none.

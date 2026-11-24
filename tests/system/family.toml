@@ -248,7 +248,7 @@ argv = ["tests/system/run_k1.py", "--cpus", "1", "2", "--programs", "indirect-si
 needs = { cores = 2, perf = true }
 
 [suite.cases."indirect-stop"]
-argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "tail0,tail1,tail2", "--programs", "indirect-sites,pic-two,pic-write,pic-xwrite,kill-out",
+argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "tail0,tail1,tail2,lookup,trampoline", "--programs", "indirect-sites,pic-two,pic-write,pic-xwrite,kill-out",
         "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 2, perf = true }
 

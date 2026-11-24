@@ -99,7 +99,11 @@ pub mod count {
     pub const TAIL_LINKS: usize = 35;
     pub const TAIL_STOPS: usize = 36;
     pub const TAIL_DEAD_STOPS: usize = 37;
-    pub const COUNTS: usize = 38;
+    /// Stops taken at once inside a slot's lookup form; stops at an armed computed exit's hot trampoline of a block with
+    /// appended words (the tests `PIC_TEST_LOOKUP`, `PIC_TEST_TRAMPOLINE`).
+    pub const LOOKUP_STOPS: usize = 38;
+    pub const TRAMPOLINE_STOPS: usize = 39;
+    pub const COUNTS: usize = 40;
 }
 
 /// The class of a link (source, target): both position-independent and the target starting on the source's start
