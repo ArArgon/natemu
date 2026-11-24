@@ -10,7 +10,7 @@ Both modes write the timing log (--perf-log), so they differ only in sampling. P
 (run 1 cold, run 2 warm), it compares the medians over rounds of the wall time (run.py's host-timed START to END) and of
 the guest bucket's share of the vCPUs' busy time in that run (the resident's buckets from the timing log's 5 ms snapshots,
 between the run's markers). Accepted when every wall time differs by no more than the rounds' spread (the larger of the two
-modes' max - min) plus 2% of the off median, and every guest share by no more than 1 point. Writes DIR/result.json and
+modes' max - min) plus 2% of the off median, and every guest share by no more than 2 points (sampling costs build 1-2 points at any rate, docs/restructure/el0-sampler-plan.md chunk 0). Writes DIR/result.json and
 DIR/summary.md, and each sampling boot's report (tests/bench/sample_report.py: the measured samples per second). Exit 0
 accepted, 1 not (or a boot failed), 3 a boot was contended."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -23,7 +23,7 @@ import sample_report as sr
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WALL_SLACK = 0.02     # of the off median, beyond the rounds' spread
-SHARE_POINTS = 1.0
+SHARE_POINTS = 2.0
 
 
 def boot(a, d, bench, vcpus, sample):

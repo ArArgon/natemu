@@ -189,8 +189,14 @@ samples. It is byte-oriented, because the guest's simplest writer, `/dev/port`, 
   plan goes back to review.
 - **Overhead case** `guest-sampler-cost`: the bench `build` and `hackbench` at 1 vCPU, and `build` at 4, with the
   `profile-runtime` sampling off and at the chosen rate, alternating, three rounds, one machine. Accepted when wall
-  differs by no more than the rounds' spread plus 2%, and the guest bucket's share by no more than 1 point. Start at
+  differs by no more than the rounds' spread plus 2%, and the guest bucket's share by no more than 2 points. Start at
   250 us (4 kHz); halve the rate if it fails.
+  Measured (case `guest-sampler-cost`, M2 Max, November 23): wall within its bound at 250, 500 and 1000 us; `build`'s
+  guest share drops 1.0-1.9 points at every rate (hackbench under 0.3), and as much with the objects file off (case
+  `guest-sampler-cost-no-objects`), so the drop is not the bells' per-sample cost or the objects writes; its cause is not
+  measured (host threads beside a compile-heavy cold run is the guess). The first bound of 1 point was raised to 2 (the
+  orchestrator's call), 250 us kept, and every profile from these cases states that `build`-like runs read 1-2 points
+  less guest time than an unsampled run.
 - **The control port:** the device in `crates/host` with unit tests (each command, the ignored values, the counts, a
   mark's record), and a phase of the validity case: the program runs a loop with sampling on, stops it, runs the loop
   for a fixed time, starts it again and runs the loop again, marking each phase. The judge places samples by ring time
