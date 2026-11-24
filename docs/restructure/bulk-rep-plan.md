@@ -517,3 +517,95 @@ drop the first cut, keep it with the rule relaxed for these rows, or add that lo
 `movs-cpl3-us`, `movs-noncanonical`, `movs-into-noncanonical`, `movs-frame-alias`, `movs-watch-src/dst`, `movs-ac`,
 `movs-wt-wp` as a destination, `movs-smc-*`, `movs-tso` and the M2 device cases; the independent review (task 8).
 `fexc-replay` fails by design (64-bit output changes for every REP MOVSB/MOVSQ compiled with `--bulk`).
+
+## 14. Second cut: eligibility once per instruction (November 24, owner)
+
+**What.** The first cut paid its tests on every element of a copy it declined (and of every short copy), because each
+element re-entered the REP and its bulk setup. `FexcRepMovs` now decides once per pass and moves every element it can prove
+safe inside the block, so a declined or short copy re-enters only at a page crossing:
+
+```
+  lsr x0, x7, #1; cbz x0, S                                     RCX < 2: today's pass alone
+  ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S
+  x1 = min(RCX, the whole elements before RDI's page end, before RSI's)   (2 x 7 words, branch-free as before)
+  cbz x1, S                                                     an element that crosses a page: today's pass
+  lsr x0, x1, #(4 - log2 w); cbz x0, E                          under one round: elements only
+  [w = 8: orr x2, x10, x11; and x2, x2, #7; cbnz x2, E]         rounds only with both pointers 8-aligned
+  sub x2, x11, x10; sub x2, x2, #1; and x2, x2, #0xfff; sub x2, x2, #15; tbnz x2, #63, E    and no overlap in [1, 15]
+  sub x1, x1, x0, lsl #(4 - log2 w)                             the elements left after the rounds
+B: ldp x2, x3, [x10]; stp x2, x3, [x11]; add x10, x10, #16; add x11, x11, #16; sub x7, x7, #16/w; sub x0, x0, #1; cbnz x0, B
+E: cbz x1, S
+L: ldr(b) x2, [x10]; str(b) x2, [x11]; add x10, x10, #w; add x11, x11, #w; sub x7, x7, #1; sub x1, x1, #1; cbnz x1, L
+S: (today's pass: RCX = 0 ends the instruction; else one element, which crosses a page, then the exit to its own RIP)
+```
+
+**Why it is exact.** The element loop is today's element, repeated: it loads RSI's element and stores RDI's, in that order,
+and steps RCX, RSI and RDI after the store, so at each access the registers are an iteration boundary's and every earlier
+element is complete; overlap of any distance is the SDM's (each element reads after the previous one's store). Every element
+lies wholly inside the current page of both pointers (x1 counts whole elements before each page end), so no access crosses
+a page: a fault is the element's own, with the element's CR2, error code and state; a misaligned MOVSQ element is one
+unaligned `ldr`/`str` inside a page, as today's element pass makes it. The rounds are section 5's, now taken only from the
+elements already proven inside both pages. Interrupts and stops are taken at the next exit, at most one page's elements
+later (x1 <= 4096 / w, written by nothing but the loops), the bound chunk 26's loop has; the fast-string bit and DF are
+tested first, so with bit 0 clear or DF = 1 every element is still a boundary of its own. What the loops cannot prove stays
+on today's path: an element that crosses a page (`cbz x1`), RCX < 2, FS/GS, 0x67, F2, MOVSW/MOVSD, 32-bit code; UC and
+device pages (the first access aborts and the instruction is stepped, or refused, as today); steps, TF, data breakpoints
+and alignment checking (no `--bulk`). Admission pins the whole sequence for the width, both backward branches (to the
+`ldp` and to the element `ldr`), the two forward targets (E and S) and all four sites (load pair, store pair, element load
+and store, read and write intent): `bulk_movs_loop`.
+
+**Built** at 84ddcdef (FEX fork 7e03132 on 39eb0db: the op's description, and `fexc_no_bulk_movs`). The recorder records
+the op's four accesses as sites; admission's `bulk_movs_loop` pins the sequence per width (both back edges, the forward
+targets E and S, all four sites).
+
+**Kill-test: kept.** Bench case `guest-repmicro`, M2 Max, three runs a side alternating (before: 18483e79's code through
+`TESTKIT_BENCH_AT`, no bulk at all; after: 84ddcdef), ns per copy, section 8's rule:
+
+| row | before | after | speedup | verdict |
+| --- | ---: | ---: | ---: | --- |
+| movsb-16 | 8.9 (8.6-9.0) | 4.6 (4.6-4.6) | 1.92x | hot |
+| movsb-64 | 23.8 (22.8-29.6) | 5.8 (5.8-5.8) | 4.10x | hot |
+| movsb-128 | 51.6 (50.2-52.1) | 7.1 (7.0-7.1) | 7.28x | hot |
+| movsb-512 | 179.3 (177.4-182.6) | 14.6 (14.4-14.7) | 12.29x | hot |
+| movsb-4096 | 1499.6 (1452.0-1504.1) | 99.0 (98.6-99.3) | 15.15x | ok |
+| movsb-65536 | 23988.6 (23402.5-24207.1) | 1611.2 (1607.5-1629.4) | 14.89x | hot |
+| movsq-64 | 6.5 (6.4-6.5) | 5.8 (5.8-5.8) | 1.12x | hot |
+| movsq-100 | 10.7 (10.6-11.0) | 8.9 (8.9-8.9) | 1.20x | hot |
+| movsq-128 | 10.9 (10.4-10.9) | 7.2 (7.1-7.4) | 1.51x | hot |
+| movsq-512 | 47.9 (45.1-49.0) | 14.8 (14.7-15.1) | 3.25x | hot |
+| movsq-4096 | 421.9 (390.6-424.9) | 98.6 (97.6-102.1) | 4.28x | ok |
+| movsb-1 | 3.8 (3.6-3.9) | 3.8 (3.7-3.8) | 1.00x | ok |
+| movsb-3 | 5.3 (5.1-5.3) | 5.3 (5.3-5.4) | 0.99x | ok |
+| movsb-7 | 6.6 (6.2-6.6) | 6.5 (6.5-6.7) | 1.01x | ok |
+| movsb-15 | 8.9 (8.3-9.0) | 9.1 (9.1-9.2) | 0.98x | ok |
+| movsq-8 | 3.8 (3.5-3.8) | 3.4 (3.4-3.5) | 1.11x | ok |
+| movsq-4096-src4 | 421.0 (391.2-421.5) | 183.0 (181.1-183.1) | 2.30x | ok |
+| movsb-4096-overlap8 | 1556.3 (1464.0-1575.2) | 1335.3 (1318.6-1373.1) | 1.17x | ok |
+| movsq-4096-src808 | 414.8 (392.2-422.3) | 104.9 (104.3-106.3) | 3.95x | ok |
+| movsd-4 | 5.7 (5.6-6.1) | 6.0 (5.6-6.2) | 0.95x | ok |
+| movsd-8 | 6.6 (6.5-7.0) | 6.9 (6.6-7.5) | 0.95x | ok |
+| movsd-12 | 7.3 (7.2-7.5) | 7.6 (7.2-9.0) | 0.96x | ok |
+| movsd-4096 | 911.1 (870.2-926.4) | 914.1 (909.0-916.6) | 1.00x | ok |
+| movsd-4096-off4 | 911.9 (866.9-922.1) | 907.5 (904.3-915.4) | 1.00x | ok |
+
+Every control row is within the rule; the declined rows now gain (MOVSQ from a source 4 mod 8 2.3x, MOVSB with RDI = RSI
++ 8 1.17x), the short ones are unchanged.
+
+**Tests** (84ddcdef): `k2-repmovs` 78 cases, adding to section 13's: faults inside the element loop and of a misaligned
+element crossing a page, a declined MOVSQ under interrupts at random times (`movs-kicks-w8-src4`: no boundary inside
+both pages' interiors), `movs-cpl3-us-src/dst`, `movs-noncanonical-src/dst`, `movs-into-noncanonical`,
+`movs-watch-src/dst`, `movs-ac`, `movs-smc-other/own`, `movs-tso`, `movs-unassigned-src/dst` (an unassigned page as the
+source reads all ones; as the destination it is refused, `unsupported_mmio`, before any effect). Host tests and fixtures
+updated. fexc-replay: `replay.py`'s `only_bulk_movs` bounds the expected difference (NEW's reply holds FexcRepMovs and NEW's
+reply with `--no-bulk-movs` is OLD's, or differs from it only as `only_probes` allows); a request it does not explain
+still counts as a difference.
+
+**Mutations** (scratch builds of the shim and the admission template together, `k2-repmovs`, reverted): overlap skip
+removed (overlap, alias red); overlap on the linear distance (alias); RCX stepped before the store in both loops
+(`movs-loop-dst-readonly`, `movs-noncanonical-dst`, `movs-smc-own`, `movs-unassigned-dst`); RDI's room dropped
+(`movs-dst-unmapped`); fast-string test removed (both `misc-off` kicks); DF test removed (fill); the `ldp` with write
+intent (`movs-first`, `movs-unassigned-src`); bulk in steps (`movs-tf`, `movs-uc-src`); `stp` before `ldp` (39 cases);
+the element loop's store before its load (37 cases). RSI's room dropped stays green, as in section 13 (equivalent).
+
+**Not done:** 9.3's QEMU corpus (an `i2` input and suite seeded against QEMU, gen_i2's deltas, `loopfaults-i2`): over an
+hour with the seeding; the system cases judge against an element-by-element model instead.

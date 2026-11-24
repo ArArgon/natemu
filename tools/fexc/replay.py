@@ -289,9 +289,9 @@ def only_bulk_movs(old, new, answer_without):
 
 
 def only_bulk_read(old, new):
-    """Bulk REP plan (section 14), a request without `--bulk` (a step, or alignment gating): NEW reads the flag for a REP
-    MOVSB/MOVSQ, to decline the loops, so its args_read also has FEXC_ARG_BULK (bit 10, fexc_hook.h); None when that is
-    all that differs."""
+    """Bulk REP plan (section 14): NEW reads `--bulk` for every REP MOVSB/MOVSQ it decodes (a request without the flag: a
+    step, alignment gating; or with it, for an instruction decoded past the block's final end), so its args_read may also
+    have FEXC_ARG_BULK (bit 10, fexc_hook.h) where the reply is otherwise OLD's, byte for byte; None when that is all."""
     u32 = lambda b, o: struct.unpack_from('<I', b, o)[0]
     if len(old) < 20 or len(old) != len(new) or old[:16] != new[:16] or old[20:] != new[20:]: return 'more than args_read differs'
     xo, xn = u32(old, 16), u32(new, 16)
@@ -460,7 +460,7 @@ def main():
             if ro != rn and b'--bulk\0' in args and only_bulk_movs(ro, rn, lambda: answer(new, with_arg(rec, b'--no-bulk-movs\0'))) is None:
                 movs += 1
                 continue
-            if ro != rn and b'--bulk\0' not in args and only_bulk_read(ro, rn) is None:
+            if ro != rn and only_bulk_read(ro, rn) is None:
                 movs += 1
                 continue
             if ro != rn and (why := only_probes(ro, rn)) is not None:
