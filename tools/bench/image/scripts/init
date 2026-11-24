@@ -1,6 +1,6 @@
 #!/bin/sh
 # Benchmark initramfs /init (busybox sh). Kernel command line:
-# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|hackbench32|cray32|cray32-small|sqlite32|startup32|cray32-strict|cray32-strict-small|cray32-sse2|cray32-sse2-small|scimark|scimark32|scimark32-sse2|sampler-check|coldtrip|shell [jobs=N] [natemu.profile=1]
+# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|hackbench32|cray32|cray32-small|sqlite32|startup32|cray32-strict|cray32-strict-small|cray32-sse2|cray32-sse2-small|scimark|scimark32|scimark32-sse2|sampler-check|coldtrip|repmicro|shell [jobs=N] [natemu.profile=1]
 # (jobs defaults to the online CPU count). The benchmark runs twice in the one boot: run 1 (cold) and run 2 (warm; same
 # command, outputs removed or overwritten). Each run prints NATEMU-BENCH-START (run 2: START2), the benchmark's own output and
 # timing (busybox time per phase; a NATEMU-BENCH-PHASE / PHASE2 line after each named phase), NATEMU-BENCH-END (END2) with the
@@ -110,6 +110,9 @@ sampler-check) run() { phase - "sampler_check $r /tmp/sc.sums"; } ;;
 # coldtrip: the cost of one resident trip (src/coldtrip.c: CPUID every K iterations against an inline control, a small and a
 # large code footprint, phases between 100 ms sleeps); tests/bench/coldtrip_report.py reads it with the performance log.
 coldtrip)  run() { phase - "coldtrip $r /tmp/ct.sums"; } ;;
+# repmicro: REP MOVS copies, each row about 50 ms three times (src/repmicro.c; the bulk REP plan's kill-test), the 64-bit
+# build then the -m32 one; tests/bench/repmicro_report.py reads their lines, the destination checksums are compared after END.
+repmicro)  run() { phase - "repmicro $r /tmp/rm.sums && repmicro32 $r /tmp/rm32.sums"; } ;;
 shell)     exec setsid cttyhack sh ;;
 *)         echo "NATEMU-BENCH-ERROR unknown bench=$bench"; poweroff -f ;;
 esac
@@ -149,6 +152,7 @@ verify() {
            got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx $bench $(sed -n 's/^Composite Score: */composite=/p; s/^FFT *Mflops: *\([0-9.]*\).*/fft=\1/p; s/^SOR *Mflops: *\([0-9.]*\).*/sor=\1/p; s/^MonteCarlo: *Mflops: *\([0-9.]*\).*/montecarlo=\1/p; s/^Sparse matmult *Mflops: *\([0-9.]*\).*/sparse=\1/p; s/^LU *Mflops: *\([0-9.]*\).*/lu=\1/p' /tmp/sm.out | tr '\n' ' ')" ;;
     sampler-check) got=$rc:$(cat /tmp/sc.sums); want="0:@SAMPLER_SUMS@" ;;
     coldtrip) got=$rc:$(cat /tmp/ct.sums); want="0:@COLDTRIP_SUMS@" ;;
+    repmicro) got="$rc:$(cat /tmp/rm.sums) $(cat /tmp/rm32.sums)"; want="0:@REPMICRO_SUMS@" ;;
     sqlite32) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx sqlite32 hash=$(sed -n 's/^Verification Hash: //p' /tmp/st.out | tr -d ' ')" ;;
     *)     got=$rc; want=0 ;;
     esac

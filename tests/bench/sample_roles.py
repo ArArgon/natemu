@@ -392,6 +392,25 @@ def x86_rep_string(insn: bytes, bits=64):
     return {0xa4: 'movs', 0xa5: 'movs', 0xaa: 'stos', 0xab: 'stos'}.get(insn[i])
 
 
+def x86_rep_form(insn: bytes, bits=64):
+    """The form of a REP MOVS or STOS (the bulk REP plan's task 0): 'rep movsb', 'rep movsq', ... ('repne' for F2 the last
+    of F2/F3), with ' a32' (0x67) and ' seg' (a segment prefix) after it; None for anything else."""
+    i, rep, a67, seg, opsize = 0, None, False, False, False
+    while i < len(insn) and insn[i] in LEGACY:
+        b = insn[i]
+        if b in (0xf2, 0xf3): rep = 'rep' if b == 0xf3 else 'repne'
+        elif b == 0x67: a67 = True
+        elif b == 0x66: opsize = True
+        elif b != 0xf0: seg = True
+        i += 1
+    rexw = False
+    if bits == 64 and i < len(insn) and 0x40 <= insn[i] <= 0x4f: rexw = bool(insn[i] & 8); i += 1
+    if rep is None or i >= len(insn) or insn[i] not in (0xa4, 0xa5, 0xaa, 0xab): return None
+    op = 'movs' if insn[i] in (0xa4, 0xa5) else 'stos'
+    w = 'b' if insn[i] in (0xa4, 0xaa) else 'q' if rexw else 'w' if opsize else 'd'
+    return f'{rep} {op}{w}' + (' a32' if a67 and bits == 64 else ' a16' if a67 else '') + (' seg' if seg else '')
+
+
 def x86_wide_vector(insn: bytes, bits=64):
     """'vex256' for a VEX instruction with L set, 'evex' for an EVEX one, else None (32-bit code: C4/C5/62 are VEX/EVEX only
     with a register-form next byte)."""

@@ -1,7 +1,7 @@
 #!/bin/bash
 # mkroot.sh BENCHDIR: stage the guest userland in BENCHDIR/rootfs and write BENCHDIR/out/bench.cpio.
 # Inputs (made by build.sh): BENCHDIR/sysroot (Debian trixie packages, dpkg -x), BENCHDIR/out/bin/{zstd,hackbench,locks,
-# luajit,stress-ng,c-ray-mt,c-ray-mt-strict,7zz,speedtest1,x264,sampler_check,coldtrip}, BENCHDIR/src/zstd-1.5.7.tar.gz, BENCHDIR/out/input, BENCHDIR/out/{lj,sphfract,expect-lj.md5,expect-lj-interp.md5,foreman_cif.y4m},
+# luajit,stress-ng,c-ray-mt,c-ray-mt-strict,7zz,speedtest1,x264,sampler_check,coldtrip,repmicro,repmicro32}, BENCHDIR/src/zstd-1.5.7.tar.gz, BENCHDIR/out/input, BENCHDIR/out/{lj,sphfract,expect-lj.md5,expect-lj-interp.md5,foreman_cif.y4m},
 # and init, lj-tasks, memchk + mkcpio.py beside this script.
 set -euo pipefail
 B=$(realpath "$1"); S=$B/sysroot; R=$B/rootfs; here=$(dirname "$(realpath "$0")")
@@ -40,7 +40,7 @@ for x in zstd hackbench locks luajit stress-ng 7zz speedtest1 x264; do ln -s /be
 cp "$B"/out/bin/{hackbench32,speedtest1-32} "$R/bench/bin/"; for x in hackbench32 speedtest1-32; do ln -s /bench/bin/$x "$R/usr/bin/$x"; done
 cp "$B/out/bin/c-ray-mt" "$B/out/bin/c-ray-mt-strict" "$B/out/bin/c-ray-mt32" "$B/out/bin/c-ray-mt32-strict" "$B/out/bin/c-ray-mt32-sse2" "$B/out/sphfract" "$R/bench/"
 cp "$B"/out/bin/{scimark2,scimark2-32,scimark2-32sse2} "$R/bench/bin/"; for x in scimark2 scimark2-32 scimark2-32sse2; do ln -s /bench/bin/$x "$R/usr/bin/$x"; done
-cp "$B"/out/bin/{sampler_check,coldtrip} "$R/bench/bin/"; for x in sampler_check coldtrip; do ln -s /bench/bin/$x "$R/usr/bin/$x"; done
+cp "$B"/out/bin/{sampler_check,coldtrip,repmicro,repmicro32} "$R/bench/bin/"; for x in sampler_check coldtrip repmicro repmicro32; do ln -s /bench/bin/$x "$R/usr/bin/$x"; done
 mkdir -p "$R/bench/lj"; cp "$B"/out/lj/*.lua "$R/bench/lj/"; cp "$here/lj-tasks" "$R/bench/lj/tasks"; cp "$here/lj-tasks-interp" "$R/bench/lj/tasks-interp"; cp "$B/out/expect-lj-interp.md5" "$R/bench/lj/expect-interp.md5"; cp "$B/out/expect-lj.md5" "$R/bench/lj/expect.md5"
 cp "$here/memchk" "$R/bench/memchk"; chmod 755 "$R/bench/memchk"
 tar xzf "$B/src/zstd-1.5.7.tar.gz" -C "$R/bench"

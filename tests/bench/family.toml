@@ -210,6 +210,14 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-
 argv = ["python3", "tests/bench/coldtrip_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
         "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}"]
 
+# The bulk REP plan's kill-test (docs/restructure/bulk-rep-plan.md section 8): the image's repmicro programs (REP MOVSB, MOVSQ
+# and 32-bit MOVSD rows: hot, short, declined; each about 50 ms three times) under the ordinary resident, 1 vCPU; ns per copy
+# per row in OUT/repmicro.report.json (run 2's medians). Its judge checks every row's destination against a byte-by-byte
+# copy (pinned at build time) in both runs; `tests/bench/repmicro_report.py compare` gives the kill-test over runs.
+[suite.cases.guest-repmicro]
+argv = ["python3", "tests/bench/repmicro_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}"]
+
 # Profiles, not timings: where the vCPUs were, sampled every 250 us (the EL0 sampler, docs/restructure/el0-sampler-plan.md
 # chunk 0): the resident built with its `perf` and `profile` features, natemu --profile OUT/NAME (NAME.samples, NAME.objects),
 # natemu.profile=1 on the kernel command line, the timing log. tests/bench/sample_report.py runs the boot, then writes

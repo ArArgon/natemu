@@ -75,7 +75,7 @@ fetch $MIRROR/pool/main/x/x264/x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164
 fetch https://media.xiph.org/video/derf/y4m/foreman_cif.y4m foreman_cif.y4m \
       b0e3c35eff9fe1da91521a02eb9f0e3ef4bc5aec341ecef1567cd87f1711267b
 [ -f locks.c ] || cp "$here/../src/locks.c" .
-cp "$here/../src/sampler_check.c" "$here/../src/coldtrip.c" .
+cp "$here/../src/sampler_check.c" "$here/../src/coldtrip.c" "$here/../src/repmicro.c" .
 # Input: the Silesia files concatenated in name order, first 64 MiB.
 python3 -I -c "
 import zipfile, sys; z = zipfile.ZipFile('silesia.zip')
@@ -96,6 +96,10 @@ $CC -O2 -static -pthread -o "$B/out/bin/locks" locks.c
 # checksums come from native runs here (--sums: the same work, untimed) and go into init with the other expected outputs.
 $CC -O2 -static -o "$B/out/bin/sampler_check" sampler_check.c
 $CC -O2 -static -o "$B/out/bin/coldtrip" coldtrip.c
+# The bulk REP plan's kill-test (docs/restructure/bulk-rep-plan.md section 8): REP MOVS rows, 64-bit and -m32 builds of one
+# source; its --sums (the 64-bit build, both builds' rows, from a byte-by-byte copy) go into init.
+$CC -O2 -static -o "$B/out/bin/repmicro" repmicro.c
+$CC -m32 -O2 -static -o "$B/out/bin/repmicro32" repmicro.c
 rm -rf rt-tests-2.8; tar xzf rt-tests-2.8.tar.gz
 $CC -O2 -static -pthread -DVERSION=2.8 -Wno-incompatible-pointer-types -o "$B/out/bin/hackbench" rt-tests-2.8/src/hackbench/hackbench.c
 # 32-bit builds of three of the programs (M2: 32-bit code under the 64-bit kernel), as Debian builds its i386 packages: gcc -m32 is
@@ -165,6 +169,7 @@ make -s -C lib -j4 libzstd.a CC="$CC" AR=x86_64-linux-gnu-ar CFLAGS="-O0 -ffile-
 bmd5=$(md5sum lib/libzstd.a | cut -d' ' -f1); cd ..
 scsum=$("$B/out/bin/sampler_check" --sums); [ "$scsum" = "$("$B/out/bin/sampler_check" --sums)" ]
 ctsum=$("$B/out/bin/coldtrip" --sums); [ "$ctsum" = "$("$B/out/bin/coldtrip" --sums)" ]
+rmsum=$("$B/out/bin/repmicro" --sums); [ "$rmsum" = "$("$B/out/bin/repmicro" --sums)" ]
 isha=$(sha256sum "$B/out/input" | cut -d' ' -f1)
 # Expected outputs of the new benchmarks, from native runs that must agree with each other (2 runs of the LuaJIT task list at
 # 4 jobs; c-ray at 1 and 4 threads): LuaJIT's per-program outputs (out/expect-lj.md5) and c-ray's PPM md5.
@@ -199,6 +204,6 @@ xm=""; for n in 1 2 3 4 5 6 7 8; do
     xm="$xm -e s/@X264_MD5_$n@/$m/"; done
 sed -e "s/@ZSTD_MD5@/$zmd5/" -e "s/@BUILD_MD5@/$bmd5/" -e "s/@INPUT_SHA@/$isha/g" -e "s/@CRAY_MD5@/$cmd5/" -e "s/@CRAYS_MD5@/$smd5/" \
     -e "s/@IN7_SHA@/$i7sha/" -e "s/@Z7_MD5@/$z7md5/" -e "s/@SQL_HASH@/$sqh/" \
-    -e "s/@SAMPLER_SUMS@/$scsum/" -e "s/@COLDTRIP_SUMS@/$ctsum/" $xm "$here/init" > "$B/init"
-echo "expected: zstd $zmd5 build $bmd5 input sha256 $isha c-ray $cmd5 in7 $i7sha 7z $z7md5 sqlite $sqh x264 $xm c-ray-strict $smd5 sampler-check $scsum coldtrip $ctsum" | tee "$B/out/expected.txt"
+    -e "s/@SAMPLER_SUMS@/$scsum/" -e "s/@COLDTRIP_SUMS@/$ctsum/" -e "s/@REPMICRO_SUMS@/$rmsum/" $xm "$here/init" > "$B/init"
+echo "expected: zstd $zmd5 build $bmd5 input sha256 $isha c-ray $cmd5 in7 $i7sha 7z $z7md5 sqlite $sqh x264 $xm c-ray-strict $smd5 sampler-check $scsum coldtrip $ctsum repmicro $rmsum" | tee "$B/out/expected.txt"
 INIT=$B/init "$here/mkroot.sh" "$B"

@@ -98,6 +98,48 @@ class Reduce(unittest.TestCase):
         self.assertIn('| return hit rate, user and kernel stacks apart, depth 8 / 16 / 32 | 99.0% / 100.0% / 100.0% |', md)
 
 
+def rep_row(op, width, bits, mode, variant, **counts):
+    c = dict.fromkeys(census_report.REP_COUNTS, 0); c.update(counts)
+    return [op, width, bits, mode, variant, *(c[k] for k in census_report.REP_COUNTS)]
+
+
+class Rep(unittest.TestCase):
+    ROWS = [rep_row('movs', 1, 64, 'user', 0, instances=10, bytes=4000, inst_1_16_rounds=6, inst_more=4, bytes_eligible=3000,
+                    bytes_bulk=2800, bytes_aligned8=1000, bytes_overlap=1000),
+            rep_row('movs', 8, 64, 'kernel', 0, instances=2, bytes=1000, inst_more=2, bytes_aligned8=1000, bytes_eligible=1000,
+                    bytes_bulk=990),
+            rep_row('movs', 8, 64, 'user', 0, instances=1, bytes=1000, inst_more=1, bytes_aligned4=1000),     # not 8-aligned
+            rep_row('movs', 1, 64, 'user', 1, instances=1, bytes=5, inst_under_round=1),                      # 0x67: not in the cut
+            rep_row('movs', 4, 32, 'user', 0, instances=4, bytes=400, inst_1_16_rounds=4, bytes_eligible=200, bytes_bulk=200),
+            rep_row('stos', 8, 64, 'kernel', 0, instances=1, bytes=4096, inst_more=1, bytes_eligible=4096, bytes_bulk=4096)]
+
+    def test_the_first_cut_shares_count_64_bit_movsb_and_movsq_bytes_only(self):
+        seg = dict(segment('run1', []), rep=self.ROWS, rep_continued=3)
+        r = census_report.reduce(census(seg), 'run1')['rep']
+        g = r['groups']['first_cut']
+        self.assertEqual(g['total']['bytes'], 4000 + 1000 + 1000 + 5)          # the 0x67 form is a 64-bit MOVSB too
+        self.assertAlmostEqual(g['total']['eligible_share'], 4000 / 6005)
+        self.assertAlmostEqual(g['total']['bulk_share'], 3790 / 6005)
+        self.assertAlmostEqual(g['user']['bulk_share'], 2800 / 5005); self.assertAlmostEqual(g['kernel']['bulk_share'], 0.99)
+        self.assertAlmostEqual(r['groups']['movsd32']['total']['eligible_share'], 0.5)
+        self.assertEqual(r['forms'][0]['form'], 'rep stosq 64-bit kernel')
+        self.assertIn('rep movsb 64-bit user a32', [f['form'] for f in r['forms']])
+        self.assertEqual(r['continued'], 3)
+        md = census_report.markdown(census_report.reduce(census(seg), 'run1'), 'zstd')
+        self.assertIn('| 64-bit MOVSB + MOVSQ: moved in bulk | 55.9% | 99.0% | 63.1% |', md)
+        self.assertIn('| rep movsb 64-bit user | 10 | 0.00 | 0 / 0 / 60 / 40 | 25.0% | 25.0% | 0.0% | 75.0% | 70.0% |', md)
+
+    def test_all_sums_the_forms_of_every_segment(self):
+        a = dict(segment('x', []), rep=self.ROWS[:1], rep_continued=1)
+        b = dict(segment('y', []), rep=self.ROWS[:2], rep_continued=2)
+        r = census_report.reduce(census(a, b), 'all')['rep']
+        self.assertEqual(r['groups']['first_cut']['user']['bytes'], 8000); self.assertEqual(r['continued'], 3)
+
+    def test_no_rep_counts_say_so(self):
+        md = census_report.markdown(census_report.reduce(census(segment('run1', [])), 'run1'), 'x')
+        self.assertIn('No REP MOVS or STOS counted', md)
+
+
 class Check(unittest.TestCase):
     MAP = """
 -- Symbols --------------------------------------------------------------------
@@ -131,8 +173,9 @@ Real              Virtual           Name
                  for k, m, lab, al, tg, ov, fl, *sp in run_census.EXPECTED_SITES]
         seg = {'name': 'program', 'sites': sites, 'ras': copy.deepcopy(run_census.EXPECTED_RAS),
                'ras_split': copy.deepcopy(run_census.EXPECTED_RAS_SPLIT),
-               'insns': {'user': 9000, 'kernel': 40}, **copy.deepcopy(run_census.EXPECTED_COUNTS)}
-        return {'cr3': 'read', 'rip': 'read', 'segments': [{'name': 'boot', 'sites': []}, seg]}, sym
+               'insns': {'user': 9000, 'kernel': 40}, **copy.deepcopy(run_census.EXPECTED_COUNTS),
+               'rep': [[*k, *v] for k, v in run_census.EXPECTED_REP.items()], 'rep_continued': run_census.EXPECTED_REP_CONTINUED, 'rep_df_unknown': 0}
+        return {'cr3': 'read', 'rip': 'read', 'rep': 'read', 'segments': [{'name': 'boot', 'sites': []}, seg]}, sym
 
     def test_the_expected_counts_pass(self):
         data, sym = self.synthetic()
@@ -161,6 +204,18 @@ Real              Virtual           Name
         for s in bad['segments'][1]['sites']:
             if s[2] == 0x108000: s[2] = 0x102000
         self.assertTrue(any('X_call' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['rep'][0][5] = 5                  # S1's 3 instances counted as 2
+        self.assertTrue(any("REP ('movs', 1, 64, 'user', 0)" in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['rep'][1][-1] = 560000            # S2's bulk bytes
+        self.assertTrue(any("REP ('movs', 8, 64" in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['rep'][4][2] = 64                 # S9 counted as 64-bit code
+        self.assertTrue(any('REP' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['rep_continued'] = 0
+        self.assertTrue(any('REP continuations' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['rep_df_unknown'] = 1
+        self.assertTrue(any('REP directions' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['rep'] = 'unavailable'
+        self.assertTrue(any('REP registers' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['name'] = 'boot2'
         self.assertTrue(any('no segment' in p for p in run_census.check_problems(bad, sym)))
         self.assertEqual(seg['name'], 'program')

@@ -21,9 +21,14 @@
 ;           The #PF handler runs at the KBASE alias (kernel) and recurses 10 deep by direct calls: H's user return
 ;           straddles those kernel calls, so the one-stack model at depth 8 finds its stack empty, the split one hits
 ;   G'      a ret that is not its block's first instruction (f9_ret, after an XOR) at two virtual addresses
+;   R       REP strings (the plugin's REP census, EXPECTED_REP): S1 rep movsb of 100 bytes 3 times with the same
+;           registers (3 instances); S2 rep movsq of 70,000 quadwords (QEMU enters it twice: one instance, continued
+;           once); S3 rep movsq from a source 4 mod 8; S4 rep movsb with RDI = RSI + 8 (the overlap skip); S5 rep stosq
+;           with RCX 0; S6 67 rep movsb; S7 rep movsb with DF set; S8 rep movsb from 8 bytes before a page end (8
+;           elements, then 2 rounds); before the kernel phase's calls KS, a kernel rep stosb of 32 bytes
 ;   K       compatibility mode: a far return into a 32-bit code segment, 3 calls through a register (FF D3, each after
 ;           an INC EAX, 40: an instruction of its own in 32-bit code, not a REX prefix) and their 32-bit ret, a direct
-;           far jmp back
+;           far jmp back; first S9, rep movsd of 10 doublewords (32-bit code: CS 0x3b, the check's cs32)
 ;   J       two address spaces: the same call site and ret in each, INT 0x80 switching CR3 between pml4 and pml4b (the
 ;           handler, at KBASE, runs no call or ret: only the interrupt tells the plugin that CR3 may have changed)
 ; then OUT 0xF4 (isa-debug-exit).
@@ -78,7 +83,11 @@ long_entry:                                 ; the plugin's segment "program" sta
         lidt [rel idtr]
         mov rax, KBASE + kcode
 L_kjmp: jmp rax
-kcode:  mov rbx, KBASE + kfunc
+kcode:  mov edi, 0x300000
+        mov ecx, 32
+        xor eax, eax
+KS:     rep stosb
+        mov rbx, KBASE + kfunc
         mov ecx, 7
 kloop:
 K_call: call rbx
@@ -197,6 +206,44 @@ G4_next:
         dec ecx
         jnz g4loop
 
+        cld                                 ; R
+        mov r12d, 3
+r1loop: mov esi, 0x300000
+        mov edi, 0x310000
+        mov ecx, 100
+S1:     rep movsb
+        dec r12d
+        jnz r1loop
+        mov esi, 0x200000
+        mov edi, 0x300000
+        mov ecx, 70000
+S2:     rep movsq
+        mov esi, 0x200004
+        mov edi, 0x300000
+        mov ecx, 4
+S3:     rep movsq
+        mov esi, 0x300000
+        mov edi, 0x300008
+        mov ecx, 64
+S4:     rep movsb
+        xor ecx, ecx
+        mov edi, 0x300000
+S5:     rep stosq
+        mov esi, 0x300000
+        mov edi, 0x310000
+        mov ecx, 5
+S6:     a32 rep movsb
+        std
+        mov esi, 0x300010
+        mov edi, 0x310010
+        mov ecx, 3
+S7:     rep movsb
+        cld
+        mov esi, 0x300ff8
+        mov edi, 0x310100
+        mov ecx, 40
+S8:     rep movsb
+
         push 0x3b                           ; K: code32 DPL3
         lea rax, [rel c32]
         push rax
@@ -242,7 +289,14 @@ f9:     xor eax, eax
 f9_ret: ret
 
 bits 32
-c32:    mov ebx, f32
+c32:    mov ax, 0x23                        ; user data: DS and ES were nulled by the IRETQ to CPL3
+        mov ds, ax
+        mov es, ax
+        mov esi, 0x300000
+        mov edi, 0x310000
+        mov ecx, 10
+S9:     rep movsd
+        mov ebx, f32
         mov ecx, 3
 c32loop:
         inc eax

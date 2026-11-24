@@ -217,6 +217,15 @@ class GuestInstructions(unittest.TestCase):
                                (b'\xf3\x48\x0f\xb8\xc0', 64, None), (b'\xf3\x41\xa4', 32, None)):
             self.assertEqual(R.x86_rep_string(ib, bits), want, ib.hex())
 
+    def test_rep_form(self):
+        for ib, bits, want in ((b'\xf3\xa4', 64, 'rep movsb'), (b'\xf3\x48\xa5', 64, 'rep movsq'), (b'\xf3\xa5', 32, 'rep movsd'),
+                               (b'\x66\xf3\xab', 64, 'rep stosw'), (b'\xf3\x41\xa4', 64, 'rep movsb'),
+                               (b'\x67\xf3\xa4', 64, 'rep movsb a32'), (b'\x67\xf3\xa5', 32, 'rep movsd a16'),
+                               (b'\x64\xf3\xa4', 64, 'rep movsb seg'), (b'\xf2\xa4', 64, 'repne movsb'),
+                               (b'\xf2\xf3\x48\xab', 64, 'rep stosq'), (b'\xf3\xa6', 64, None), (b'\xa4', 64, None),
+                               (b'\xf3\x48\x0f\xb8\xc0', 64, None)):
+            self.assertEqual(R.x86_rep_form(ib, bits), want, ib.hex())
+
     def test_wide_vector(self):
         for ib, bits, want in ((b'\xc5\xfd\x74\x0f', 64, 'vex256'), (b'\xc5\xf9\x74\x0f', 64, None),
                                (b'\xc4\xe2\x7d\x17\xc1', 64, 'vex256'), (b'\x62\xf1\x7d\x28\x74\xc1', 64, 'evex'),

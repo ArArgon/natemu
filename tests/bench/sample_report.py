@@ -248,12 +248,13 @@ class Attribution:
             c, r = next(((c, r) for c, r in codes if c.region_end > reach), max(codes, key=lambda x: x[0].region_end))
             if c:
                 insns, guest, bits = c.word_insns(), r['guest'], 64 if mode(key[2]) == '64' else 32
-                rep, wide = {}, False
+                rep, form, wide = {}, {}, False
                 for g in {x for x in insns if x is not None}:
                     ib = roles_mod.insn_bytes(c, guest, g)
                     if k := roles_mod.x86_rep_string(ib, bits): rep[g] = k
+                    if f := roles_mod.x86_rep_form(ib, bits): form[g] = f
                     wide |= roles_mod.x86_wide_vector(ib, bits) is not None
-                info = dict(roles=roles_mod.roles(c), insns=insns, rep=rep, wide=wide, exits=roles_mod.exit_targets(c),
+                info = dict(roles=roles_mod.roles(c), insns=insns, rep=rep, rep_form=form, wide=wide, exits=roles_mod.exit_targets(c),
                             delta=key[0] - c.rip, guest=guest if privilege(key[2], key[0], True) == 'user' else None)
         self.info_of[key] = info
         return info
@@ -341,6 +342,7 @@ class Attribution:
         samples; the hot-50 share of the top blocks' samples) and the top 30 symbols."""
         by = collections.defaultdict(collections.Counter)
         hot, rep, sym, bins = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
+        forms = collections.Counter()
         skid, skid_hot = collections.Counter(), collections.Counter()
         wide_libc = beyond = unresolved = 0
         for (key, off, probe), n in t.words.items():
@@ -355,6 +357,8 @@ class Attribution:
             if key in top_keys: skid_hot[roles_mod.GROUPS[moved]] += n
             g = self.insn(info, off)
             if info and g in info['rep']: rep[info['rep'][g]] += n
+            if info and g in info.get('rep_form', {}):
+                forms[f"{info['rep_form'][g]} {mode(key[2])}-bit {privilege(key[2], key[0], True)}"] += n
             s = self.symbol(key, info, off)
             sym[s] += n
             bins[s.split(':')[0]] += n
@@ -376,6 +380,7 @@ class Attribution:
             fex_body=pct(groups['fex_body']), fex_flags=pct(groups['fex_flags']), natemu=pct(groups['natemu']),
             hot50_fex_body_pct=round(100 * hot['fex_body'] / hot_total, 2) if hot_total else None,
             hot50_fex_flags_pct=round(100 * hot['fex_flags'] / hot_total, 2) if hot_total else None, fex_mem=pct(allr['fex_mem']))
+        shares['rep_forms'] = {f: pct(n) for f, n in forms.most_common()}
         sg = collections.Counter()
         for r, n in skid.items(): sg[roles_mod.GROUPS[r]] += n
         shares['skid'] = dict(
@@ -820,6 +825,11 @@ def attribution_markdown(rep):
                    f'{p(s["x87_run"])} | '
                    f'{p(s["rep_string"])} | {p(s["glibc_avx2_evex_named"])} | {p(s["libc_wide_vector_blocks"])} | '
                    f'{p(s["kernel_copy_clear"])} | {p(s["hot50_fex_body_pct"])} |')
+    out += ['', 'REP strings by form (prefix, opcode and width, code mode, privilege), % of the phase\'s EL0 samples:', '']
+    for ph in rep['phases']:
+        a = ph.get('attribution')
+        if a and a['shares'].get('rep_forms'):
+            out.append(f'- {ph["name"]}: ' + ', '.join(f'`{f}` {p(v)}' for f, v in a['shares']['rep_forms'].items()))
     out += ['', '### One-word skid correction', '',
             'Each sample also counted on the next word executed (the next word of its block, or a linked exit\'s target '
             'block\'s first body word; sample_roles.NOT_MOVED: the validity case\'s chase phase put 58% of a slow load\'s '

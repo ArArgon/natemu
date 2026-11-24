@@ -406,6 +406,20 @@ class Attribution(Base):
             self.assertIn(heading, md)
         self.assertTrue(any('no --image' in n for n in r['notes']))
 
+    def test_rep_strings_are_split_by_form_mode_and_privilege(self):
+        """The bulk REP plan's task 0 (a): a phase's REP share by form, as % of its EL0 samples."""
+        class T: words = {}
+        info = lambda forms: dict(roles=['fex_mem', 'fex_alu', 'fex_mem'], insns=[0, 0, 2], exits={}, delta=0, guest=None,
+                                  wide=False, rep={g: f.split()[1][:4] for g, f in forms.items()}, rep_form=forms)
+        a = sr.Attribution(None)
+        U, K, B = (0x40_1000, 0x55, USER64), (0xffff_ffff_8100_0000, 0x66, KERNEL64), (0x0804_8000, 0x77, USER32)
+        a.info_of = {U: info({0: 'rep movsb', 2: 'rep movsq'}), K: info({0: 'rep movsq'}), B: info({0: 'rep movsd'})}
+        T.words = {(U, 0, False): 3, (U, 4, False): 2, (U, 8, False): 1, (K, 0, False): 2, (B, 4, False): 2}
+        s = a.phase(T, 20, set())['shares']
+        self.assertEqual(s['rep_forms'], {'rep movsb 64-bit user': 25.0, 'rep movsq 64-bit kernel': 10.0,
+                                          'rep movsd 32-bit user': 10.0, 'rep movsq 64-bit user': 5.0})
+        self.assertEqual((s['rep_movs'], s['rep_string']), (50.0, 50.0))
+
     def test_the_skid_correction_charges_the_next_word_executed(self):
         import test_sample_roles as tr
         import sample_roles
@@ -532,7 +546,7 @@ class Command(Base):
 
 
 class Cost(unittest.TestCase):
-    """run_sampler_cost's verdict: within the rounds' spread plus 2%, and the guest share within a point."""
+    """run_sampler_cost's verdict: within the rounds' spread plus 2%, and the guest share within 2 points."""
 
     def rows(self, off, on, share_off=(50, 50, 50), share_on=(50, 50, 50)):
         out = []

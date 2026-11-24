@@ -224,6 +224,20 @@ EXPECTED_RAS = {'8': {'user': {'hit': _U + 80 - 1, 'miss': 0, 'empty': 41}, 'ker
 EXPECTED_RAS_SPLIT = {'8': {'user': {'hit': _U + 80, 'miss': 0, 'empty': 40}, 'kernel': _K8},
                       '16': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
                       '32': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
+# REP strings (phase R, S9 and KS): (op, width, bits, mode, variant) -> the plugin's counts (census_report.REP_COUNTS order:
+# instances, bytes; instances and bytes by RCX: 0, under a round, 1-16 rounds, more; 8-aligned, 4-aligned, overlap, DF,
+# eligible (instances, bytes each); bulk bytes). Variant 1: the 0x67 prefix.
+EXPECTED_REP = {
+    # S1 x3 (100 bytes: 6 rounds and 4 elements each), S4 (overlap), S7 (DF), S8 (40 bytes: 8 elements to the page end, 2 rounds)
+    ('movs', 1, 64, 'user', 0): [6, 407, 0, 1, 5, 0, 0, 3, 404, 0, 6, 407, 6, 407, 1, 64, 1, 3, 4, 340, 3 * 96 + 32],
+    # S2 (560,000 bytes, page-aligned: each pass's element after a page end puts every second page 8 bytes off), S3 (4 mod 8)
+    ('movs', 8, 64, 'user', 0): [2, 560032, 0, 0, 1, 1, 0, 0, 32, 560000, 1, 560000, 2, 560032, 0, 0, 0, 0, 1, 560000, 558912],
+    ('stos', 8, 64, 'user', 0): [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0],                # S5
+    ('movs', 1, 64, 'user', 1): [1, 5, 0, 1, 0, 0, 0, 5, 0, 0, 1, 5, 1, 5, 0, 0, 0, 0, 0, 0, 0],                # S6
+    ('movs', 4, 32, 'user', 0): [1, 40, 0, 0, 1, 0, 0, 0, 40, 0, 1, 40, 1, 40, 0, 0, 0, 0, 1, 40, 40],          # S9
+    ('stos', 1, 64, 'kernel', 0): [1, 32, 0, 0, 1, 0, 0, 0, 32, 0, 1, 32, 1, 32, 0, 0, 0, 0, 1, 32, 32],        # KS
+}
+EXPECTED_REP_CONTINUED = 1      # S2's second entry (RCX 65,536)
 EXPECTED_COUNTS = {'direct_calls': {'user': 120, 'kernel': 20},
                    'far': {'call': {'user': 2, 'kernel': 0}, 'jmp': {'user': 1, 'kernel': 0}, 'ret': {'user': 3, 'kernel': 0}},
                    'events': {'interrupts': 4, 'exceptions': 4, 'dropped': 1, 'unresolved': 0, 'wide': 0}}
@@ -272,6 +286,14 @@ def check_problems(data: dict, sym: dict) -> list[str]:
         problems.append(f'split return model {seg["ras_split"]}, expected {EXPECTED_RAS_SPLIT}')
     for key, w in EXPECTED_COUNTS.items():
         if seg[key] != w: problems.append(f'{key} {seg[key]}, expected {w}')
+    if data.get('rep') != 'read': problems.append(f'REP registers: {data.get("rep")}')
+    rep = {tuple(r[:5]): r[5:] for r in seg.get('rep', [])}
+    for form in sorted(set(rep) | set(EXPECTED_REP), key=str):
+        if rep.get(form) != EXPECTED_REP.get(form):
+            problems.append(f'REP {form}: {rep.get(form)}, expected {EXPECTED_REP.get(form)}')
+    if seg.get('rep_continued') != EXPECTED_REP_CONTINUED:
+        problems.append(f'REP continuations {seg.get("rep_continued")}, expected {EXPECTED_REP_CONTINUED}')
+    if seg.get('rep_df_unknown') != 0: problems.append(f'REP directions not found {seg.get("rep_df_unknown")}, expected 0')
     if not seg['insns']['kernel'] or not seg['insns']['user']: problems.append(f'instructions {seg["insns"]}')
     return problems
 
@@ -282,7 +304,7 @@ def check(a) -> int:
                    cwd=out, check=True)
     sym = symbols((out / 'census_check.map').read_text())
     census = out / 'census_check.json'
-    cmd = [a.qemu, '-plugin', f'{a.plugin},out={census},mark={sym["long_entry"]:x}:program',
+    cmd = [a.qemu, '-plugin', f'{a.plugin},out={census},mark={sym["long_entry"]:x}:program,cs32=3b',
            '-accel', 'tcg,thread=single', '-cpu', 'max', '-smp', '1', '-m', '64', '-machine', 'pc', '-display', 'none',
            '-nodefaults', '-monitor', 'none', '-serial', 'none', '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04',
            '-no-reboot', '-kernel', str(out / 'census_check.bin')]
