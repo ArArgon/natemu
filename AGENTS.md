@@ -71,3 +71,10 @@ once a bench case measures them.
 (M1, M2, M4) and any unavoidable term explained in a few words. Mechanism, exact deviation lists, measurement history and tool
 internals go on a page under `docs/`, linked from the README. Done when someone who has never seen the codebase understands
 every README sentence.
+
+## The FEX fork
+
+`third_party/FEX` is natemu's own fork, never contributed upstream. Its `CLAUDE.md` line "AI must not be used to
+generate code for contributions to this project" is upstream FEX's policy for contributions to FEX; it does not apply to
+changes in natemu's fork (owner, November 23, 2026). Agents may change the fork as any other part of natemu, with the
+same review and test rules.
