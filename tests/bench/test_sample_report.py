@@ -11,9 +11,11 @@ F = 24_000_000          # ticks per second
 
 
 # --- a writer, as crates/abi/src/sample.rs encodes ----------------------------------------------------------------------
-def el0(time, rip, place, context=0, at=0, frame=0, flags=0, flushes=0, since=0, kind=sr.EL0):
+def el0(time, rip, place, context=0, at=None, frame=0, flags=0, flushes=0, since=0, kind=sr.EL0, raw_at=0):
+    """A resident record; `at` a block sample's native offset (recorded + 4, natemu_abi::sample::at), `raw_at` the field."""
+    if at is not None: raw_at = at + 4
     return (time, rip & ((1 << 48) - 1) | (flushes & 0xfff) << 48 | (flags & 0xf) << 60,
-            context & ((1 << 40) - 1) | (at & 0xffff) << 40 | (place & 0xf) << 56 | (kind & 0xf) << 60, frame | since << 32)
+            context & ((1 << 40) - 1) | (raw_at & 0xffff) << 40 | (place & 0xf) << 56 | (kind & 0xf) << 60, frame | since << 32)
 
 
 def hostrec(kind, time=0, value1=0, value2=0, value3=0, value4=0):
@@ -76,7 +78,7 @@ def standard_run():
           el0(t(4.2), 0x40_2010, sr.DISPATCH, USER64, frame=0x56, flags=sr.CALL_NO << sr.CALL_SHIFT),
           el0(t(4.3), 0xffff_ffff_8100_0000, sr.DISPATCH, 0, flags=sr.CALL_UNKNOWN << sr.CALL_SHIFT),
           el0(t(4.4), 0, 0, since=5, kind=sr.RESIDENT),
-          el0(t(6.5), K, sr.BLOCK, KERNEL64, at=0xfffc, frame=0x1000), el0(t(6.6), K, sr.BLOCK, KERNEL64, at=4, frame=0x1000),
+          el0(t(6.5), K, sr.BLOCK, KERNEL64, at=-4, frame=0x1000), el0(t(6.6), K, sr.BLOCK, KERNEL64, at=4, frame=0x1000),
           el0(t(7.0), B, sr.STEP, USER32, at=0, frame=0x77)]
     v1 = [el0(t(2.5), 0, sr.HEAD, 0, frame=0x40)]
     recs = [header(2), hostrec(sr.CLOCK, T0, value1=1_700_000_000 * 10 ** 9),
@@ -117,11 +119,11 @@ class Base(unittest.TestCase):
 class Format(unittest.TestCase):
     def test_constants_are_the_abi_s(self):
         text = (ROOT / 'crates/abi/src/sample.rs').read_text()
-        const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u32|u64|usize) = ([^;]+);', text)}
+        const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u32|u64|i64|usize) = ([^;]+);', text)}
         num = lambda n: int(const[n].replace('_', ''), 0)
         for n in ('FILE', 'EL0', 'RESIDENT', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
                   'DISPATCH', 'STEP', 'HEAD', 'NO_BLOCK', 'OUTSIDE', 'HOT', 'DEAD', 'CALL_SHIFT', 'CALL_YES', 'CALL_NO',
-                  'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS'):
+                  'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS', 'FAR', 'AT_BIAS'):
             self.assertEqual(getattr(sr, n), num(n), n)
         self.assertEqual(sr.COUNTERS, re.findall(r'"(\w+)"', re.search(r'pub const COUNTERS: \[&str; \d+\] = \[(.*?)\];', text, re.S)[1]))
         for n in sr.COUNTERS: self.assertEqual(sr.COUNTERS.index(n), num('C_' + n.upper()), n)
@@ -137,13 +139,14 @@ class Format(unittest.TestCase):
                                        'guest_insns', 'code_offset', 'code_size', 'body_offset', 'end_marker_offset', 'code_region_end'])
 
     def test_records_decode_at_their_limits(self):
-        w = el0(2 ** 64 - 6, 0xffff_ffff_8100_1234, sr.DISPATCH, context=(1 << 39) | 0x3_0000_0005, at=0xfffc, frame=0x89ab_cdef,
+        w = el0(2 ** 64 - 6, 0xffff_ffff_8100_1234, sr.DISPATCH, context=(1 << 39) | 0x3_0000_0005, raw_at=0xfffc, frame=0x89ab_cdef,
                 flags=sr.HOT | sr.CALL_UNKNOWN << sr.CALL_SHIFT, flushes=0xabc, since=77)
         self.assertEqual(sr.sample(w), dict(time=2 ** 64 - 6, rip=0xffff_ffff_8100_1234, flushes=0xabc, flags=sr.HOT | 3 << 2,
                                             context=(1 << 39) | 0x3_0000_0005, at=0xfffc, place=sr.DISPATCH, kind=sr.EL0,
                                             frame=0x89ab_cdef, since=77))
         self.assertEqual(sr.sample(el0(0, 0x7fff_ffff_f000, sr.BLOCK))['rip'], 0x7fff_ffff_f000)   # a user RIP stays positive
-        self.assertEqual(sr.signed16(0xfffc), -4)
+        self.assertEqual(sr.offset(sr.sample(el0(0, 1, sr.BLOCK, at=-4))), -4)            # a PIC block's full entry word
+        self.assertEqual(sr.offset(sr.sample(el0(0, 1, sr.BLOCK, raw_at=0xffff, flags=sr.FAR))), None)   # saturated
         h = sr.host(hostrec(sr.MARK, 9, 255, (1 << 56) - 1, 3, 0xffff_ffff))
         self.assertEqual(h, dict(kind=sr.MARK, time=9, value1=255, value2=(1 << 56) - 1, value3=3, value4=0xffff_ffff))
 
@@ -227,7 +230,9 @@ class Report(Base):
         k = sr.locate(o, sr.sample(el0(0, 0xffff_ffff_8100_0040, sr.BLOCK, KERNEL64, at=8, frame=0x1000)))
         self.assertEqual((k['how'], k['word']), ('page', b'\xbb' * 4))
         # A PIC block's full entry (-4) and past the code: no word.
-        self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=0xfffc, frame=0x55)))['word'])
+        self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=-4, frame=0x55)))['word'])
+        far = sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, raw_at=0xffff, flags=sr.FAR, frame=0x55)))
+        self.assertEqual((far['how'], far['offset'], far['word']), ('exact', None, None))
         self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=16, frame=0x55)))['word'])
         # Not found: another context, another frame; and places with no block.
         self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER32, at=8, frame=0x55))))

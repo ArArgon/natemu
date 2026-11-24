@@ -119,7 +119,7 @@ def judge_run(n, t, ring, toggles, passes, end):
     # d (recorded)
     d = el0(win(4))
     blk_d, n_d = top_block(d)
-    at = collections.Counter(sr.signed16(s['at']) for s in d if in_block(s) and key(s) == blk_d)
+    at = collections.Counter(sr.offset(s) for s in d if in_block(s) and key(s) == blk_d)
     out['d'] = dict(el0=len(d), block=blk_d and [hex(x) for x in blk_d], block_samples=n_d, at=dict(sorted(at.items())))
     # e
     stop = next((x for x in toggles if t[4] <= x['time'] < t[5] and not x['value2']), None)

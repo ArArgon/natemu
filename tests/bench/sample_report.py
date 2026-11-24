@@ -47,7 +47,8 @@ FILE, EL0, RESIDENT, HALTED, MARK, CLOCK, VCPU, COUNT, TOGGLE, PASS = range(10)
 BLOCK, PROBE, DISPATCH, STEP, HEAD, NO_BLOCK, OUTSIDE = range(1, 8)
 PLACES = {BLOCK: 'block', PROBE: 'probe', DISPATCH: 'dispatch', STEP: 'step', HEAD: 'head', NO_BLOCK: 'no_block',
           OUTSIDE: 'outside'}
-HOT, DEAD = 1, 2
+HOT, DEAD, FAR = 1, 2, 4
+AT_BIAS = 4                 # a block sample's `at` is its native offset + 4 (a PIC block's full entry word, -4, is 0)
 CALL_SHIFT = 2
 CALL_YES, CALL_NO, CALL_UNKNOWN = 1, 2, 3
 CALLS = {0: 'none', CALL_YES: 'return', CALL_NO: 'not_call', CALL_UNKNOWN: 'unknown'}
@@ -82,8 +83,10 @@ def host(w):
     return dict(kind=w[2] >> 60, time=w[0], value1=w[1], value2=w[2] & M56, value3=w[3] & 0xffff_ffff, value4=w[3] >> 32)
 
 
-def signed16(x):
-    return x - 0x10000 if x & 0x8000 else x
+def offset(s):
+    """A block sample's native offset in its block's code (from the object's code byte 0; -4: a PIC block's full entry), or
+    None when it did not fit `at` (FAR)."""
+    return None if s['flags'] & FAR else s['at'] - AT_BIAS
 
 
 def privilege(context, rip, has_context):
@@ -152,18 +155,19 @@ def code_header(obj):
 def locate(objects, s):
     """A block sample's (place BLOCK, PROBE or STEP) object and word: None if the place has no block or no object was
     served for it; else {record, how ('exact' or 'page'), candidates (answers with that key: their bytes differ), offset
-    (the native offset in the object's code, signed: a PIC block's full entry is at -4), word_index, word (its 4 bytes;
-    None outside the code)}. The first candidate is taken. Chunk 1's roles start from this."""
+    (the native offset in the object's code: a PIC block's full entry is at -4; None when it did not fit the record, FAR),
+    word_index, word (its 4 bytes; None outside the code)}. The first candidate is taken. Chunk 1's roles start from this."""
     if s['place'] not in (BLOCK, PROBE, STEP): return None
     hits, how = objects.find(s['rip'], s['frame'], s['context'])
     if not hits: return None
     r = objects.record(hits[0])
-    off = signed16(s['at'])
+    off = offset(s)
     c, word = r['code'], None
-    if c and 0 <= off and off + 4 <= c['code_size']:
+    if c and off is not None and 0 <= off and off + 4 <= c['code_size']:
         base = c['code_offset'] + off
         word = r['object'][base:base + 4] if base + 4 <= len(r['object']) else None
-    return dict(record=r, how=how, candidates=len(hits), offset=off, word_index=off // 4 if off >= 0 else None, word=word)
+    return dict(record=r, how=how, candidates=len(hits), offset=off, word_index=off // 4 if off is not None and off >= 0 else None,
+                word=word)
 
 
 # --- phases ----------------------------------------------------------------------------------------------------------
@@ -368,9 +372,10 @@ class Profile:
                         if inblock:
                             if flags & HOT: t_.flags['hot'] += 1
                             if flags & DEAD: t_.flags['dead'] += 1
+                            if flags & FAR: t_.flags['far'] += 1
                     if key:
                         summ[p].blocks[key] += 1
-                        if p == 0: summ[p].words[(key, w[2] >> 40 & 0xffff)] += 1
+                        if p == 0: summ[p].words[(key, None if flags & FAR else (w[2] >> 40 & 0xffff) - AT_BIAS)] += 1
                 s = series[win]; s['el0'] += 1; s[pname] += 1
                 continue
             if k == VCPU:
@@ -426,7 +431,7 @@ class Profile:
             privilege=dict(t.privilege), privilege_pct={k: pct(n, el0) for k, n in t.privilege.items()},
             modes=dict(t.modes), dispatch_calls={k: t.calls[k] for k in ('return', 'not_call', 'unknown')},
             dispatch_call_pct={k: pct(t.calls[k], t.places['dispatch']) for k in ('return', 'not_call', 'unknown')},
-            hot=t.flags['hot'], dead=t.flags['dead'],
+            hot=t.flags['hot'], dead=t.flags['dead'], far=t.flags['far'],
             since_log2_us={str(k): n for k, n in sorted(t.since.items())})
 
     def report(self, objects=None, top=50):
