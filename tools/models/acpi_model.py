@@ -534,6 +534,13 @@ def decode_resources(buf):
                 break
             if typ == 0x6:
                 items.append(dict(type='Memory32Fixed', rw=bool(body[0] & 1), base=u32(body, 1), len=u32(body, 5), off=i))
+            elif typ in (0x7, 0x8):
+                # DWord / Word Address Space Descriptor (6.4.3.5.2/3): resource type, general flags, type-specific
+                # flags, then granularity, minimum, maximum, translation offset and length.
+                w, rd = (4, u32) if typ == 0x7 else (2, u16)
+                g, lo, hi, tra, n = (rd(body, 3 + w * k) for k in range(5))
+                items.append(dict(type='DWordAddress' if typ == 0x7 else 'WordAddress', rtype=body[0], flags=body[1],
+                                  tflags=body[2], gran=g, min=lo, max=hi, tra=tra, len=n, off=i))
             elif typ == 0x9:
                 cnt = body[1]
                 items.append(dict(type='Interrupt', consumer=bool(body[0] & 1), level=not body[0] & 2,
@@ -576,14 +583,27 @@ def fmt_gas(g):
     return f"space {g['space']} width {g['width']} offset {g['offset']} access {g['access']} addr {g['addr']:#x}"
 
 
-def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False, ps2=False):
+# \_SB.PCI0's _CRS (crates/host/src/boot/acpi.rs `pci0`, ACPI 6.5 6.4.3.5): (type, fields) in order. Address
+# descriptors: producer, PosDecode, MinFixed, MaxFixed (general flags 0x0c), granularity and translation 0.
+PCI0_BUS = ('WordAddress', dict(rtype=2, flags=0x0C, tflags=0, gran=0, min=0, max=0, tra=0, len=1))
+PCI0_CF8 = ('IO', dict(decode16=True, min=0xCF8, max=0xCF8, align=1, len=8))
+PCI0_IO_WINDOW = ('WordAddress', dict(rtype=1, flags=0x0C, tflags=0x03, gran=0, min=0xC000, max=0xFFFF, tra=0,
+                                      len=0x4000))      # EntireRange; only with an I/O BAR (the test function)
+PCI0_MEMORY = ('DWordAddress', dict(rtype=0, flags=0x0C, tflags=0x01, gran=0, min=0xE0000000, max=0xEFFFFFFF, tra=0,
+                                    len=0x10000000))    # non-cacheable, read-write
+
+
+def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False, ps2=False, pci=None):
     """`mailbox`: the MADT has exactly one version-0 multiprocessor wakeup structure (the default), or, False, none
     (boot-interpreter plan section 6: the OS starts its APs with INIT and SIPI). `pvpanic`: the DSDT has exactly one
     QEMU0001 device, whose `_CRS` is only IO (Decode16, 0x505, 0x505, 1, 1) and whose `_STA` is 0x0F, or, False (the
     default), none. `ps2`: the DSDT has exactly one PNP0303 device (`_CRS` IO (Decode16, 0x60, 0x60, 1, 1), IO (Decode16,
     0x64, 0x64, 1, 1), IRQNoFlags () {1}) and one PNP0F13 (`_CRS` IRQNoFlags () {12}) and the FADT's IAPC_BOOT_ARCH has
     the 8042 bit, or, False (the default), neither device nor the bit. The bit is a violation without exactly that
-    pair whatever `ps2` says."""
+    pair whatever `ps2` says. `pci`: None, no PCI bus (no PNP0A03 device); else dict(io_window=bool[, prt=[(slot,
+    GSI)]]): exactly one root bridge \\_SB_.PCI0 whose _CRS is the bus number, the CF8H configuration ports, the I/O
+    window C000H-FFFFH exactly when `io_window`, and the memory window, each descriptor with its exact range; whose
+    _PRT routes INTA# of exactly those slots (when `prt` is given); and no e820 entry over the memory window."""
     img = Image(dump)
     if corrupt:
         corrupt(img)
@@ -1182,10 +1202,50 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False, ps2=
             viol('UID', f'DSDT processor UIDs {sorted(dsdt_uids)} vs MADT {sorted(p["uid"] for p in procs)}')
         if len(set(dsdt_uids)) != len(dsdt_uids):
             viol('UID', f'duplicate DSDT processor UIDs {dsdt_uids}')
+        roots = [p for p, d in devices.items() if d['hid'] == 'PNP0A03']
+        if pci is not None:
+            if roots != ['\\_SB_.PCI0']:
+                viol('PCI0', f'PNP0A03 devices {roots} (exactly one root bridge, \\_SB_.PCI0)')
+            want = [PCI0_BUS, PCI0_CF8] + ([PCI0_IO_WINDOW] if pci['io_window'] else []) + [PCI0_MEMORY]
+            its = crs_items('\\_SB_.PCI0')
+            if its is not None:
+                info['PCI0_CRS'] = its
+                got = [x for x in its if x['type'] != 'End']
+                for x in got:
+                    if 'tra' in x and x['len'] != x['max'] - x['min'] + 1:
+                        viol('PCI0', f'_CRS {x["type"]} at {x["off"]:#x}: length {x["len"]:#x} is not max - min + 1 '
+                                     f'({x["min"]:#x}..{x["max"]:#x})')
+                if len(got) != len(want) or any(x['type'] != t or any(x.get(k) != v for k, v in f.items())
+                                                 for x, (t, f) in zip(got, want)):
+                    seen = [(x['type'], {k: v for k, v in x.items() if k not in ('type', 'off')}) for x in got]
+                    viol('PCI0', f'_CRS descriptors {seen}, expected {want}')
+            prt = obj.get('\\_SB_.PCI0._PRT')
+            if not prt or prt[0] != 'Name' or not isinstance(prt[1], tuple) or prt[1][0] != 'package':
+                viol('PCI0', '\\_SB_.PCI0._PRT missing or not a static package')
+            else:
+                routes = []
+                for e in prt[1][2]:
+                    if not (isinstance(e, tuple) and e[0] == 'package' and len(e[2]) == 4
+                            and all(isinstance(v, int) for v in e[2])):
+                        viol('PCI0', f'_PRT entry {e!r}: not a package of four integers')
+                        continue
+                    a, pin, source, gsi = e[2]
+                    if a & 0xFFFF != 0xFFFF or pin != 0 or source != 0:
+                        viol('PCI0', f'_PRT entry {a:#x} pin {pin} source {source}: any function, INTA#, hardwired')
+                    routes.append((a >> 16, gsi))
+                info['PCI0_PRT'] = routes
+                if 'prt' in pci and sorted(routes) != sorted(pci['prt']):
+                    viol('PCI0', f'_PRT routes (slot, GSI) {sorted(routes)}, expected {sorted(pci["prt"])}')
+            lo, hi = PCI0_MEMORY[1]['min'], PCI0_MEMORY[1]['max'] + 1
+            for s_, size_, t_ in e820:
+                if s_ < hi and lo < s_ + size_:
+                    viol('PCI0', f'e820 entry {s_:#x}+{size_:#x} type {t_} over the PCI memory window {lo:#x}..{hi:#x}')
         for p, d in devices.items():
-            if d['hid'] in ('PNP0103', 'PNP0C0C', 'PNP0C0E', 'PNP0A03', 'PNP0A08', 'PNP0C0A', 'ACPI0013', 'PNP0C80'):
+            if d['hid'] in ('PNP0103', 'PNP0C0C', 'PNP0C0E', 'PNP0A03', 'PNP0A08', 'PNP0C0A', 'ACPI0013',
+                            'PNP0C80') and not (pci is not None and p in roots):
                 viol('DEVICES', f'{p} {d["hid"]}: a device outside the CLM-03-03-69 set')
-        other = {p: d['hid'] for p, d in devices.items() if p not in com and p not in cpus}
+        other = {p: d['hid'] for p, d in devices.items() if p not in com and p not in cpus
+                 and not (pci is not None and p in roots)}
         nf('DSDT other devices', other or 'none', 'devices besides COM1, the RTC, pvpanic, PS/2 and processors',
            'FLAG: CLM-03-03-69 also names LNRO0005 virtio-mmio resources; none described (later chunk?)'
            if not any(d == 'LNRO0005' for d in other.values()) else 'judge: check against claim 69 windows/GSIs')

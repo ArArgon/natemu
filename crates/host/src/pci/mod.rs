@@ -5,6 +5,7 @@
 pub mod configuration;
 pub mod msix;
 pub mod place;
+pub mod testdev;
 
 use crate::devices::{Access, Device, Devices, Direct, mask};
 use configuration::{

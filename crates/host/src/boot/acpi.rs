@@ -58,7 +58,7 @@ pub mod platform {
     pub(crate) const RTC_IRQ: u8 = 8;
     pub(crate) const RTC_CENTURY: u8 = 0x32;
 }
-use crate::pci::platform::WINDOW;
+use crate::pci::platform::{IO_WINDOW, WINDOW};
 use platform::*;
 
 /// The built tables: the RSDP's address, the AP wakeup mailbox page (X4; 0 when the tables have none), and every blob at
@@ -260,10 +260,19 @@ mod aml {
     }
 }
 
+/// The PCI bus as the tables describe it: each INTx function's (slot, GSI) for `_PRT`, and whether the root bridge
+/// forwards the I/O window ([`IO_WINDOW`]: some function has an I/O BAR).
+#[derive(Clone, Copy, Debug)]
+pub struct RootBridge<'a> {
+    pub functions: &'a [(u8, u32)],
+    pub io_window: bool,
+}
+
 /// `\_SB.PCI0` (ACPI 6.5 6.1.5, 6.2.13; PCI Firmware 3.x 4.1): the root bridge of the one bus, with its resources and
-/// the interrupt routing of `pci`, each function's (slot, GSI).
-fn pci0(pci: &[(u8, u32)]) -> Vec<u8> {
+/// the interrupt routing of `root.functions`, each function's (slot, GSI).
+fn pci0(root: RootBridge) -> Vec<u8> {
     use aml::*;
+    let pci = root.functions;
     // WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode, 0, 0, 0, 0, 1): 6.4.3.5.3, type 2, flags 0x0c (bit 0 clear: producer).
     let bus = [
         0x88, 0x0d, 0x00, 0x02, 0x0c, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
@@ -276,7 +285,17 @@ fn pci0(pci: &[(u8, u32)]) -> Vec<u8> {
     for v in [0, WINDOW.0, WINDOW.1 - 1, 0, WINDOW.1 - WINDOW.0] {
         mem.extend(v.to_le_bytes());
     }
-    let crs = [&bus[..], &io, &mem, &[0x79, 0x00]].concat();
+    // With an I/O BAR: WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange, 0, 0xC000, 0xFFFF, 0,
+    // 0x4000): 6.4.3.5.3, type 1, general flags 0x0c, type-specific flags 0x03 (EntireRange).
+    let mut window = Vec::new();
+    if root.io_window {
+        let (first, last) = IO_WINDOW;
+        window = vec![0x88, 0x0d, 0x00, 0x01, 0x0c, 0x03];
+        for v in [0, first, last, 0, last - first + 1] {
+            window.extend(v.to_le_bytes());
+        }
+    }
+    let crs = [&bus[..], &io, &window, &mem, &[0x79, 0x00]].concat();
     // Package (4) { (slot << 16) | 0xFFFF (any function), 0 (INTA#), 0 (hardwired source), GSI } per function (6.2.13).
     let prt = package_of(
         &pci.iter()
@@ -303,7 +322,7 @@ fn pci0(pci: &[(u8, u32)]) -> Vec<u8> {
 
 /// The DSDT (5.2.11.1, revision 2: 64-bit integers): `\_S5`, COM1, the RTC, the `board`'s optional devices and one
 /// processor device per vCPU.
-fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)], board: Board) -> Vec<u8> {
+fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: Option<RootBridge>, board: Board) -> Vec<u8> {
     use aml::*;
     // COM1's resources (6.4): IO (Decode16, 0x3f8, 0x3f8, 1, 8), IRQNoFlags () {4} (edge, active high), end tag.
     let [lo, hi] = COM1_PORT.to_le_bytes();
@@ -386,8 +405,8 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)], board: Board) ->
             &[name(b"_HID", eisa_id("PNP0F13")), name(b"_CRS", buffer(&mou))],
         ));
     }
-    if !pci.is_empty() {
-        sb.push(pci0(pci));
+    if let Some(root) = pci {
+        sb.push(pci0(root));
     }
     for d in virtio {
         // Memory32Fixed(ReadWrite, base, 4096), ExtendedInterrupt(ResourceConsumer,
@@ -472,17 +491,29 @@ pub fn build_with_devices(
     virtio: &[VirtioMmio],
     pci: &[(u8, u32)],
 ) -> Tables {
-    build_tables(vcpus, base, virtio, pci, true, Board::default())
+    let root = RootBridge {
+        functions: pci,
+        io_window: false,
+    };
+    build_tables(
+        vcpus,
+        base,
+        virtio,
+        (!pci.is_empty()).then_some(root),
+        true,
+        Board::default(),
+    )
 }
 
-/// As [`build_with_devices`]; with `mailbox` false, without the multiprocessor wakeup structure and its mailbox page
-/// ([`Tables::mailbox`] 0): the OS then starts its other processors with INIT and SIPI (boot-interpreter plan section 6).
-/// `board` names the optional platform devices the DSDT lists ([`Board`]).
+/// As [`build_with_devices`], with `\_SB.PCI0` when the launch has a bus (`pci`); with `mailbox` false, without the
+/// multiprocessor wakeup structure and its mailbox page ([`Tables::mailbox`] 0): the OS then starts its other
+/// processors with INIT and SIPI (boot-interpreter plan section 6). `board` names the optional platform devices the
+/// DSDT lists ([`Board`]).
 pub fn build_tables(
     vcpus: usize,
     base: u64,
     virtio: &[VirtioMmio],
-    pci: &[(u8, u32)],
+    pci: Option<RootBridge>,
     mailbox: bool,
     board: Board,
 ) -> Tables {
@@ -754,8 +785,8 @@ mod tests {
     fn tables_without_the_mailbox() {
         for n in [1, 2, 4, 64] {
             let (with, without) = (
-                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
-                build_tables(n, ACPI_NVS.0, &[], &[], false, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], None, true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], None, false, Board::default()),
             );
             assert_eq!((without.mailbox, without.rsdp), (0, with.rsdp));
             assert_eq!(without.blobs.len() + 1, with.blobs.len());
@@ -882,6 +913,57 @@ mod tests {
         assert!(!has(d, &[0x89, 6, 0, 1, 1, 16, 0, 0, 0]));
     }
 
+    /// WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange, 0, 0xC000, 0xFFFF, 0, 0x4000), as iasl
+    /// encodes it (ACPI 6.5 6.4.3.5.3).
+    const IO_WINDOW_CRS: [u8; 16] = [
+        0x88, 0x0d, 0x00, 0x01, 0x0c, 0x03, 0, 0, 0x00, 0xc0, 0xff, 0xff, 0, 0, 0x00, 0x40,
+    ];
+
+    #[test]
+    fn pci0_crs_has_io_window_with_io_bars() {
+        // after the configuration ports' IO descriptor, before the memory window
+        let crs = [&PCI0_CRS[..24], &IO_WINDOW_CRS, &PCI0_CRS[24..]].concat();
+        let named = [&b"\x08_CRS\x11\x48\x04\x0a\x44"[..], &crs].concat();
+        for functions in [&[][..], &[(1, 16), (4, 19)]] {
+            let root = RootBridge {
+                functions,
+                io_window: true,
+            };
+            let t = build_tables(1, ACPI_NVS.0, &[], Some(root), true, Board::default());
+            let d = dsdt_of(&t);
+            assert_eq!(sum(d), 0);
+            assert_eq!(count(d, b"PCI0"), 1, "a bus without INTx functions has PCI0 too");
+            assert!(has(d, &named), "_CRS with the I/O window: {functions:?}");
+            assert_eq!(count(d, &IO_WINDOW_CRS[..6]), 1);
+            for &(slot, gsi) in functions {
+                assert!(has(d, &prt_entry(slot, gsi as u8)));
+            }
+            assert_eq!(count(d, &[0x12, 0x0b, 0x04]), functions.len());
+        }
+    }
+
+    #[test]
+    fn pci0_crs_unchanged_without_io_bars() {
+        for functions in [&[(1, 16), (2, 17), (3, 18)][..], &[(4, 16)]] {
+            let root = RootBridge {
+                functions,
+                io_window: false,
+            };
+            let t = build_tables(2, ACPI_NVS.0, &[], Some(root), true, Board::default());
+            let d = dsdt_of(&t);
+            assert!(has(d, &[&b"\x08_CRS\x11\x37\x0a\x34"[..], &PCI0_CRS].concat()));
+            assert!(!has(d, &IO_WINDOW_CRS[..6]), "no WordIO descriptor");
+            assert_eq!(
+                t.blobs,
+                build_with_devices(2, ACPI_NVS.0, &[], functions).blobs
+            );
+        }
+        // no bus: no PCI0, and the tables of a launch without functions
+        let t = build_tables(1, ACPI_NVS.0, &[], None, true, Board::default());
+        assert!(!has(dsdt_of(&t), b"PCI0"));
+        assert_eq!(t.blobs, build_with_devices(1, ACPI_NVS.0, &[], &[]).blobs);
+    }
+
     /// FNV-1a 64 (fixed, so the digests below are stable across runs and toolchains).
     fn fnv(parts: impl IntoIterator<Item = u8>) -> u64 {
         parts.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
@@ -909,7 +991,7 @@ mod tests {
                 let t = build_with_virtio(vcpus, ACPI_NVS.0, m);
                 got.push(digest(&t));
                 // The board without its optional devices builds the same tables.
-                let board = build_tables(vcpus, ACPI_NVS.0, m, &[], true, Board::default());
+                let board = build_tables(vcpus, ACPI_NVS.0, m, None, true, Board::default());
                 assert_eq!(digest(&board), digest(&t));
                 assert_eq!(board.blobs, t.blobs);
             }
@@ -954,8 +1036,8 @@ mod tests {
         };
         for n in [1, 4] {
             let (off, with) = (
-                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
-                build_tables(n, ACPI_NVS.0, &[], &[], true, on),
+                build_tables(n, ACPI_NVS.0, &[], None, true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], None, true, on),
             );
             let (d0, d) = (dsdt_of(&off), dsdt_of(&with));
             assert!(!has(d0, b"QEMU0001") && !has(d0, b"PEVT") && !has(d0, &io));
@@ -998,8 +1080,8 @@ mod tests {
         };
         for n in [1, 4] {
             let (off, with) = (
-                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
-                build_tables(n, ACPI_NVS.0, &[], &[], true, on),
+                build_tables(n, ACPI_NVS.0, &[], None, true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], None, true, on),
             );
             let (d0, d) = (dsdt_of(&off), dsdt_of(&with));
             for absent in [&b"KBD_"[..], b"MOU_", &pnp0303, &pnp0f13] {

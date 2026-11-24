@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """L2 iasl check: the ACPI tables the loader writes (`crates/host/src/boot/acpi.rs`), judged by ACPICA's `iasl`
-(Homebrew `acpica`, 20260408), for N = 1..4 processors, each twice: as the driver's defaults build them (`nN`), and with
-the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the DSDT then lists the
-pvpanic device and the 8042's keyboard and mouse, and the FADT has the 8042 bit; the SMBIOS tables, which must leave the ACPI tables as they are, are in the dump too).
+(Homebrew `acpica`, 20260408), for N = 1..4 processors: as the driver's defaults build them (`nN`), with the board's
+optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the DSDT then lists the pvpanic device
+and the 8042's keyboard and mouse, and the FADT has the 8042 bit; the SMBIOS tables, which must leave the ACPI tables as
+they are, are in the dump too), and with a PCI bus (`nN-pci`, below).
 
     python3 tests/boot/run_l2_iasl.py --out DIR [--host HOST] [--iasl IASL]
 
 For each N the driver's load-only dump (`boot-linux --load-only --vcpus N --dump`) is read; the tables are found from
 `boot_params.acpi_rsdp_addr` (RSDP -> XSDT -> FADT, MADT; FADT -> FACS, DSDT) and written to DIR/nN/*.dat
-(DIR/nN-devices/*.dat). Then:
+(DIR/nN-devices/*.dat, DIR/nN-pci/*.dat). Then:
 - `iasl -d` on the XSDT, FADT, FACS, DSDT and MADT: exit 0, no error/warning/remark in its output, and no `/****`
   diagnostic in the disassembly, with exactly one allowed exception (below);
 - the DSDT recompiled from iasl's own disassembly with `-oa` (no optimisation) equals ours byte for byte, except the
   checksum (byte 9) and the compiler ID/revision (bytes 28..36);
 - iasl's RSDP template (`iasl -T RSDP`) filled with our OEM ID, revision, RSDT/XSDT addresses and length, compiled,
   equals our RSDP byte for byte (iasl computes both checksums).
+
+Then the same for each N with `--rng --transport pci --pci-testdev` (`nN-pci`): a PCI bus with the entropy device and
+the test function, whose `\\_SB.PCI0._CRS` must also equal, byte for byte, the template iasl compiles from its ASL
+(the bus number, the CF8H ports, WordIO C000H-FFFFH and the memory window).
 
 The one exception: the MADT's multiprocessor wakeup structure is the 16-byte version-0 form of ACPI 6.5 (Table 5.43),
 which iasl 20260408 knows only in its 24-byte ACPI 6.6 form (version 1, with ResetVector), so the disassembly ends with
@@ -31,6 +36,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 from raw_root import RAW_ROOT  # noqa: E402
 KERNEL = RAW_ROOT / 'kernel-census-20261028-01/dl/linux'
 ZERO_PAGE = 0x10000
+PCI = ['--rng', '--transport', 'pci', '--pci-testdev']
+# \_SB.PCI0's resources as ACPICA compiles them (ACPI 6.5 6.4.3.5), the I/O window being the test function's.
+PCI0_CRS_ASL = '''DefinitionBlock ("", "DSDT", 2, "NATEMU", "PCI0CRS ", 1) {
+    Name (_CRS, ResourceTemplate () {
+        WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode, 0x0000, 0x0000, 0x0000, 0x0000, 0x0001)
+        IO (Decode16, 0x0CF8, 0x0CF8, 0x01, 0x08)
+        WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange, 0x0000, 0xC000, 0xFFFF, 0x0000, 0x4000)
+        DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite, 0x00000000, 0xE0000000,
+                     0xEFFFFFFF, 0x00000000, 0x10000000)
+    })
+}'''
 MV0 = 'ACPI table terminates in the middle of a data structure!'
 # The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
 DEVICES = ['--pvpanic', '--smbios', '--ps2']
@@ -80,11 +96,12 @@ def problems_in(log):
             or re.search(r'Compilation complete\. [1-9]|[1-9]\d* Errors?|[1-9]\d* Warnings?', line)]
 
 
-def check_n(host, tool, work, n, rng=False, kernel=KERNEL, flags=()):
+def check_n(host, tool, work, n, rng=False, kernel=KERNEL, flags=(), pci=False):
     work.mkdir(parents=True, exist_ok=True)
     dump = work / 'loaded.dump'
     subprocess.run([host, 'unused', 'boot-linux', 'unused', kernel, '--ram', '0x8000000', '--load-only', '--vcpus', str(n),
-                    '--dump', dump] + (['--rng'] if rng else []) + list(flags), capture_output=True, check=True)
+                    '--dump', dump] + (PCI if pci else ['--rng'] if rng else []) + list(flags), capture_output=True,
+                   check=True)
     t = tables(dump.read_bytes())
     dump.unlink()
     v = []
@@ -125,6 +142,14 @@ def check_n(host, tool, work, n, rng=False, kernel=KERNEL, flags=()):
         expected = work / 'virtio.aml'
         if rc or not expected.exists() or expected.read_bytes()[36:] not in t['dsdt'][36:]:
             v.append(f'virtio-rng device differs from ACPICA-compiled resources (exit {rc}): {log[-500:]}')
+    if pci:
+        (work / 'pci0crs.asl').write_text(PCI0_CRS_ASL)
+        rc, log = iasl([tool, '-oa', 'pci0crs.asl'], work)
+        expected = work / 'pci0crs.aml'
+        if rc or not expected.exists():
+            v.append(f'PCI0 _CRS template: compile failed (exit {rc}): {log[-500:]}')
+        elif b'PCI0' not in t['dsdt'] or expected.read_bytes()[36:] not in t['dsdt'][36:]:
+            v.append(f'PCI0 _CRS differs from ACPICA-compiled resources\n iasl {expected.read_bytes()[36:].hex()}')
     rc, log = iasl([tool, '-oa', '-p', 'dsdt-rt', 'dsdt.dsl'], work)
     rt = work / 'dsdt-rt.aml'
     if rc or not rt.exists():
@@ -167,9 +192,10 @@ def main():
     host = o.host or build()
     o.out.mkdir(parents=True, exist_ok=True)
     report = {}
-    for (suffix, flags), n in [(v, n) for v in (('', []), ('-devices', DEVICES)) for n in range(1, 5)]:
+    variants = [('', [], False), ('-devices', DEVICES, False), ('-pci', [], True)]
+    for (suffix, flags, pci), n in [(v, n) for v in variants for n in range(1, 5)]:
         name = f'n{n}{suffix}'
-        v = check_n(host, o.iasl, o.out / name, n, o.rng, o.kernel, flags)
+        v = check_n(host, o.iasl, o.out / name, n, o.rng and not pci, o.kernel, flags, pci)
         report[name] = v
         print(f'{name}: {"pass" if not v else "FAIL"}')
         for x in v:

@@ -124,6 +124,8 @@ struct Wanted {
     rng: Option<Transport>,
     disks: Vec<Transport>,
     net: Option<Transport>,
+    /// The test function ([`Boot::pci_testdev`]).
+    testdev: bool,
 }
 #[cfg(test)]
 impl Wanted {
@@ -134,6 +136,7 @@ impl Wanted {
             rng: rng.then_some(t.rng),
             disks: if disk { vec![t.disk] } else { vec![] },
             net: net.then_some(t.net),
+            testdev: false,
         }
     }
 }
@@ -143,6 +146,8 @@ enum Kind {
     Rng,
     Disk(usize),
     Net,
+    /// The test function's two functions ([`crate::pci::testdev`]): no virtio device, no INTx line.
+    TestDev,
 }
 /// Where one device lives: both the ACPI tables and the device wiring in `prepare` read this, so they cannot disagree.
 #[derive(Clone, Copy, Debug)]
@@ -164,7 +169,8 @@ struct Placed {
 /// launches unchanged) unless an MMIO device holds that line; the other PCI functions take, round robin in slot order,
 /// the lines 16-23 that no MMIO device holds, so they share lines with each other ([`SHARED_INTX`]), never with an MMIO
 /// device. Every line is inside 16-23, as `Virtio::new` asserts. Returned in wiring order: entropy, disk 0, network,
-/// then disks 1 and up.
+/// then disks 1 and up, then the test function ([`Wanted::testdev`]) at the lowest slot no other function holds (its
+/// functions 0 and 1; no INTx line, no `_PRT` entry); none free is an error.
 ///
 /// Per-disk transports exist only in the library: the CLI and the config file have one `transport.disk` for all disks
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
@@ -261,6 +267,23 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
             }
         };
     }
+    if w.testdev {
+        let held: Vec<u8> = out.iter().filter(|p| p.pci).map(|p| p.slot).collect();
+        let slot = (1..32u8)
+            .find(|s| !held.contains(s))
+            .ok_or("debug.pci_testdev: PCI slots 1-31 are all used")?;
+        out.push(Placed {
+            kind: Kind::TestDev,
+            pci: true,
+            slot,
+            res: boot::acpi::VirtioMmio {
+                uid: 0,
+                base: 0,
+                gsi: 0,
+            },
+            intx: 0,
+        });
+    }
     Ok(out)
 }
 
@@ -272,6 +295,8 @@ struct LaunchPlan {
     manifest: Vec<boot::acpi::VirtioMmio>,
     #[allow(dead_code)]
     functions: Vec<(u8, u32)>,
+    /// The root bridge's `_CRS` declares the I/O window: the bus must register it ([`crate::pci::Bus::io_window`]).
+    io_window: bool,
     tables: boot::acpi::Tables,
     layout: Layout,
 }
@@ -310,17 +335,33 @@ fn plan_tables_with(
     let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
     for p in placed {
-        if p.pci {
+        if p.kind == Kind::TestDev {
+            // no INTx line: no `_PRT` entry
+        } else if p.pci {
             functions.push((p.slot, p.intx));
         } else {
             manifest.push(p.res);
         }
     }
     functions.sort_unstable();
-    let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &functions, mailbox, board);
+    // Only the test function has I/O BARs.
+    let io_window = placed.iter().any(|p| p.kind == Kind::TestDev);
+    let root = boot::acpi::RootBridge {
+        functions: &functions,
+        io_window,
+    };
+    let tables = boot::acpi::build_tables(
+        vcpus,
+        rsdp,
+        &manifest,
+        layout.pci.then_some(root),
+        mailbox,
+        board,
+    );
     Ok(LaunchPlan {
         manifest,
         functions,
+        io_window,
         tables,
         layout,
     })
@@ -424,6 +465,10 @@ pub struct Boot {
     /// device); its host input handle is [`Prepared::ps2`]. Without it port 64H is `pm`'s reset-only register. Default
     /// off (the `natemu` CLI turns it on, `machine.ps2`).
     pub ps2: bool,
+    /// Test only (`[debug] pci_testdev`): the PCI test function ([`crate::pci::testdev`], QEMU's `pci-testdev`) as functions
+    /// 0 and 1 of the lowest free PCI slot, with the I/O window it needs; it installs the bus even when every virtio device
+    /// is on MMIO. Default off.
+    pub pci_testdev: bool,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -468,8 +513,42 @@ impl Boot {
             pvpanic: false,
             smbios: false,
             ps2: false,
+            pci_testdev: false,
             firmware: None,
         }
+    }
+
+    /// Where each device goes ([`place`]).
+    fn placed(&self) -> Result<Vec<Placed>> {
+        let t = self.transports;
+        place(&Wanted {
+            rng: self.rng.then_some(t.rng),
+            disks: self.disks.iter().map(|d| d.transport).collect(),
+            net: self.net.then_some(t.net),
+            testdev: self.pci_testdev,
+        })
+    }
+
+    /// The optional platform devices the DSDT lists ([`boot::acpi::Board`]).
+    fn board(&self) -> boot::acpi::Board {
+        boot::acpi::Board {
+            pvpanic: self.pvpanic,
+            ps2: self.ps2,
+        }
+    }
+
+    /// The memory map and the ACPI tables [`Boot::prepare`] would load, built from the device set alone: nothing is
+    /// opened or allocated (the test driver's `boot-linux --load-only`).
+    pub fn tables(&self) -> Result<(Layout, boot::acpi::Tables)> {
+        let plan = plan_tables_with(
+            self.vcpus,
+            self.rsdp,
+            &self.placed()?,
+            self.ram,
+            self.mailbox,
+            self.board(),
+        )?;
+        Ok((plan.layout, plan.tables))
     }
 
     /// Loads everything into a new backing and builds the devices; nothing runs yet.
@@ -489,12 +568,7 @@ impl Boot {
                     .into(),
             );
         }
-        let t = self.transports;
-        let placed = place(&Wanted {
-            rng: self.rng.then_some(t.rng),
-            disks: self.disks.iter().map(|d| d.transport).collect(),
-            net: self.net.then_some(t.net),
-        })?;
+        let placed = self.placed()?;
         layout_of(&placed, self.ram)?; // before require_vcpus and before allocating the RAM
         require_vcpus(self.vcpus)?;
         let backing = execution::prepare_with_pool(
@@ -510,12 +584,9 @@ impl Boot {
             &placed,
             self.ram,
             self.mailbox,
-            boot::acpi::Board {
-                pvpanic: self.pvpanic,
-                ps2: self.ps2,
-            },
+            self.board(),
         )?;
-        let (layout, tables) = (plan.layout, plan.tables);
+        let (layout, tables, io_window) = (plan.layout, plan.tables, plan.io_window);
         let smbios = (self.smbios && !boot::is_multiboot(&self.kernel))
             .then(|| boot::smbios::for_board(self.vcpus, layout, &tables));
         let inputs = Inputs {
@@ -592,6 +663,11 @@ impl Boot {
         let mut bus = crate::pci::Bus::new();
         let mut net = None;
         for p in &placed {
+            if p.kind == Kind::TestDev {
+                bus.add(p.slot, 0, crate::pci::testdev::TestDev::new(0))?;
+                bus.add(p.slot, 1, crate::pci::testdev::TestDev::new(1))?;
+                continue;
+            }
             let gsi = if p.pci { p.intx } else { p.res.gsi } as usize;
             let v = match p.kind {
                 Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
@@ -605,6 +681,7 @@ impl Boot {
                     }
                     disk
                 }
+                Kind::TestDev => unreachable!("added above"),
                 Kind::Net => {
                     let (v, port) = crate::virtio::Virtio::network(
                         irqs.clone(),
@@ -624,6 +701,13 @@ impl Boot {
             virtio.push(v);
         }
         if layout.pci {
+            if bus.io_window() != io_window {
+                return Err(format!(
+                    "internal error: the ACPI tables say the I/O window is {}, the PCI bus {}",
+                    ["absent", "present"][usize::from(io_window)],
+                    ["absent", "present"][usize::from(bus.io_window())]
+                ));
+            }
             bus.install(&mut devices)?;
         }
         devices.strict = self.strict_unassigned;
@@ -670,6 +754,9 @@ impl Boot {
         }
         if self.rng || self.net || !self.disks.is_empty() {
             return Err("a firmware boot has no virtio devices (no disk, network or entropy device)".into());
+        }
+        if self.pci_testdev {
+            return Err("a firmware boot has no PCI bus (debug.pci_testdev)".into());
         }
         if !exec::firmware_size(firmware.image.len() as u64) {
             return Err(format!(
@@ -1507,6 +1594,36 @@ mod tests {
         std::fs::remove_file(&resident).unwrap();
     }
 
+    /// The test function with every virtio device on MMIO: the bus at slot 1 (functions 0 and 1), the memory window and
+    /// the I/O window registered; without it neither.
+    #[test]
+    fn the_test_function_installs_the_bus_and_the_io_window() {
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-testdev-{}.elf", std::process::id()));
+        std::fs::write(
+            &resident,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        for testdev in [true, false] {
+            let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+            (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+            (boot.rng, boot.pci_testdev, boot.strict_unassigned) = (true, testdev, true);
+            let prepared = boot.prepare().unwrap();
+            let d = prepared.devices();
+            assert_eq!(d.find(crate::pci::platform::WINDOW.0.into()).is_some(), testdev);
+            assert!(d.find(crate::virtio::RNG_RESOURCE.base.into()).is_some());
+            assert_eq!(d.port(0, 0xc000, 1, None).is_ok(), testdev, "the I/O window");
+            if testdev {
+                for f in 0..2u64 {
+                    d.port(0, 0xcf8, 4, Some(1 << 31 | 1 << 11 | f << 8)).unwrap();
+                    assert_eq!(d.port(0, 0xcfc, 4, None), Ok(0x0005_1b36), "01.{f}");
+                }
+            }
+        }
+        std::fs::remove_file(&resident).unwrap();
+    }
+
     /// R2's blocker: the chipset must post into the guest memory of the `Prepared` it ends up in, after `prepare`
     /// returned and the value moved (it once kept a pointer to `prepare`'s local backing). No VM: COM1's THRE interrupt
     /// (IER bit 1) raises ISA IRQ 4, which the I/O APIC routes to vCPU 0 as vector 0x41.
@@ -1681,6 +1798,7 @@ mod placement_tests {
             rng: Some(other),
             disks: disks.to_vec(),
             net: Some(other),
+            testdev: false,
         }
     }
     fn lists(n: usize) -> Vec<Vec<Transport>> {
@@ -1877,6 +1995,35 @@ mod placement_tests {
         assert_eq!(place(&wanted(&[Pci; 30], Pci)).unwrap_err(), pci);
         assert_eq!(place(&wanted(&[Pci; 30], Mmio)).unwrap_err(), pci);
         assert_eq!(place(&wanted(&[], Mmio)).unwrap().len(), 2);
+    }
+    /// The test function: the lowest slot no virtio function holds, after the others (which it leaves where they were),
+    /// no `_PRT` entry, the I/O window in the tables, and the bus even with every virtio device on MMIO.
+    #[test]
+    fn the_test_function_takes_the_lowest_free_slot() {
+        let with = |w: Wanted| Wanted { testdev: true, ..w };
+        for (w, slot) in [
+            (wanted(&[], Mmio), 1),
+            (wanted(&[Mmio; 3], Mmio), 1),
+            (Wanted { rng: Some(Pci), disks: vec![], net: None, testdev: false }, 1),
+            (wanted(&[], Pci), 1),
+            (wanted(&[Pci], Pci), 4),
+            (wanted(&[Pci; 3], Pci), 6),
+            (wanted(&[Pci; 28], Pci), 31),
+        ] {
+            let before = place(&w).unwrap();
+            let p = place(&with(w)).unwrap();
+            let t = p.last().unwrap();
+            assert_eq!((t.kind, t.pci, t.slot), (Kind::TestDev, true, slot));
+            assert_eq!(format!("{:?}", &p[..p.len() - 1]), format!("{before:?}"));
+            let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
+            let old = plan_tables(1, boot::ACPI_NVS.0, &before, 1 << 30).unwrap();
+            assert_eq!(plan.functions, old.functions, "no _PRT entry");
+            assert!(plan.io_window && !old.io_window && plan.layout.pci);
+        }
+        assert_eq!(
+            place(&with(wanted(&[Pci; 29], Pci))).unwrap_err(),
+            "debug.pci_testdev: PCI slots 1-31 are all used"
+        );
     }
 }
 

@@ -70,6 +70,8 @@ pub struct Config {
     pub rngs: Vec<Rng>,
     pub check_reuse: bool,
     pub pool: bool,
+    /// Test only: the PCI test function (`natemu::linux::Boot::pci_testdev`).
+    pub pci_testdev: bool,
     pub page_currency: u64,
     pub writable_on_read: bool,
     pub perf_log: Option<PathBuf>,
@@ -115,6 +117,7 @@ impl Config {
             rngs: vec![],
             check_reuse: false,
             pool: true,
+            pci_testdev: false,
             page_currency: natemu::execution::parse_page_currency("on").unwrap(),
             writable_on_read: true,
             perf_log: None,
@@ -231,6 +234,7 @@ struct FRng {
 struct FDebug {
     check_reuse: Option<bool>,
     pool: Option<bool>,
+    pci_testdev: Option<bool>,
     page_currency: Option<String>,
     writable_on_read: Option<bool>,
     perf_log: Option<PathBuf>,
@@ -378,6 +382,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
     if let Some(d) = f.debug {
         cfg.check_reuse = d.check_reuse.unwrap_or(cfg.check_reuse);
         cfg.pool = d.pool.unwrap_or(cfg.pool);
+        cfg.pci_testdev = d.pci_testdev.unwrap_or(cfg.pci_testdev);
         if let Some(v) = d.page_currency {
             cfg.page_currency = crate::parse_page_currency(&v)
                 .map_err(|e| format!("{who}: debug.page_currency: {e}"))?;
@@ -590,7 +595,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 29] = [
+const KEYS: [&str; 30] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -615,6 +620,7 @@ const KEYS: [&str; 29] = [
     "boot.firmware.start",
     "debug.check_reuse",
     "debug.pool",
+    "debug.pci_testdev",
     "debug.page_currency",
     "debug.writable_on_read",
     "debug.perf_log",
@@ -766,6 +772,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         }
         "debug.check_reuse" => cfg.check_reuse = boolish(text).map_err(err)?,
         "debug.pool" => cfg.pool = boolish(text).map_err(err)?,
+        "debug.pci_testdev" => cfg.pci_testdev = boolish(text).map_err(err)?,
         "debug.page_currency" => {
             cfg.page_currency = crate::parse_page_currency(text).map_err(err)?
         }
@@ -995,6 +1002,7 @@ pub fn to_boot(
     boot.net = !cfg.nics.is_empty();
     boot.net_options = cfg.net_options();
     boot.pool = cfg.pool;
+    boot.pci_testdev = cfg.pci_testdev;
     boot.check_reuse = cfg.check_reuse;
     boot.transports = cfg.transports;
     boot.pvpanic = cfg.pvpanic;

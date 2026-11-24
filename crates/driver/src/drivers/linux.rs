@@ -5,7 +5,8 @@
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
-//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--smbios] [--ps2] [--firmware [--firmware-start reset|flat32]]
+//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--smbios] [--ps2] [--transport mmio|pci] [--pci-testdev]
+//!       [--firmware [--firmware-start reset|flat32]]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
@@ -43,6 +44,9 @@
 //! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the
 //! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V
 //! ends the run with the stop `debug_exit` and the result's `debug_exit` [V, (V << 1) | 1] (QEMU's exit status).
+//! `--transport pci` puts the virtio devices (`--rng`) on PCI instead of MMIO (`Boot::transports`); `--pci-testdev`
+//! (test only) adds the PCI test function (`Boot::pci_testdev`: two functions at the lowest free slot, the root bridge's
+//! I/O window). With `--load-only` both shape the tables and the memory map as a run's (`Boot::tables`).
 //!
 //! Platform devices (platform-devices plan; all off by default, so a run without the flags is today's machine):
 //! `--pvpanic` adds the pvpanic device at port 505H (`natemu::pvpanic`) and its `\_SB.PEVT` to the DSDT, in a run and in
@@ -67,6 +71,7 @@
 use super::super::*;
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Stop};
+use natemu::linux::{Transport, Transports};
 use natemu::report::{Hex, hexes};
 use natemu_abi::execution::{self as exec, Cpu, State};
 use natemu_abi::guest_memory::GuestRam;
@@ -186,12 +191,26 @@ pub(crate) struct Args {
     /// The 8042 keyboard controller with a PS/2 keyboard and mouse at ports 60H/64H, in the DSDT as PNP0303 and PNP0F13
     #[arg(long)]
     ps2: bool,
+    /// The virtio devices' transport
+    #[arg(long, value_name = "mmio|pci", default_value = "mmio", value_parser = transport)]
+    transport: Transport,
+    /// Test only: the PCI test function (QEMU's pci-testdev, two functions at the lowest free slot)
+    #[arg(long)]
+    pci_testdev: bool,
     /// IMAGE is a firmware image (the firmware boot mode), not a kernel
     #[arg(long)]
     firmware: bool,
     /// The firmware boot processor's start: reset (the power-on state) or flat32
     #[arg(long, value_name = "reset|flat32", requires = "firmware", value_parser = natemu::boot::firmware::Start::parse)]
     firmware_start: Option<natemu::boot::firmware::Start>,
+}
+
+fn transport(text: &str) -> Result<Transport> {
+    match text {
+        "mmio" => Ok(Transport::Mmio),
+        "pci" => Ok(Transport::Pci),
+        _ => Err(format!("bad transport {text:?}: mmio or pci")),
+    }
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
@@ -230,6 +249,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         pvpanic,
         smbios,
         ps2,
+        transport,
+        pci_testdev,
         firmware,
         firmware_start,
     } = args;
@@ -285,13 +306,20 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
-        let manifest = if rng {
-            vec![natemu::virtio::RNG_RESOURCE]
-        } else {
-            Vec::new()
-        };
-        let board = boot::acpi::Board { pvpanic, ps2 };
-        let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox, board);
+        // The launch's own tables and map: nothing is opened (RUNTIME and FEXC are names only).
+        let (layout, tables) = natemu::linux::Boot {
+            ram,
+            vcpus,
+            rsdp,
+            rng,
+            transports: Transports::all(transport),
+            pci_testdev,
+            mailbox: !no_mailbox,
+            pvpanic,
+            ps2,
+            ..natemu::linux::Boot::new(resident, fexc, Vec::new())
+        }
+        .tables()?;
         let smbios = (smbios && !boot::is_multiboot(&image)).then(|| boot::smbios::for_board(vcpus, layout, &tables));
         let inputs = Inputs {
             image: &image,
@@ -343,6 +371,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         pvpanic,
         smbios,
         ps2,
+        transports: Transports::all(transport),
+        pci_testdev,
         ..if firmware {
             natemu::linux::Boot {
                 firmware: Some(natemu::boot::firmware::Firmware {

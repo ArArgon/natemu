@@ -114,8 +114,17 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `perf_log` | none | Write the timing log to a file |
 | | `inspect` | `true` | SIGINFO (Ctrl-T in a terminal, `kill -INFO`) prints every vCPU's state and the run goes on |
 | | `watchdog` | `60` | Seconds a vCPU may run guest code without a host exit before the run ends with its report; a vCPU waiting that long in the host (outside a compile) is reported once and the run goes on |
+| | `pci_testdev` | `false` | Test option: a PCI test device for guest test programs (see below) |
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
+
+`pci_testdev = true` is a test option, for programs that test how a guest handles PCI devices (such as
+kvm-unit-tests' `pci-testdev` test). It adds QEMU's PCI test device (`pci-testdev`, vendor 1B36H, device 0005H) as
+two functions, 0 and 1, of the lowest PCI slot no other device uses. Each has a memory and an I/O region with a small
+table of tests; function 1 also has a 64 KiB memory region in which every 4-byte word reads as its own offset. The
+guest gets a PCI bus for it even when every other device is on `mmio`, and the bus then also passes the I/O ports
+C000H-FFFFH to its devices. The launch fails when all 31 slots are taken. The register layout is described in
+`crates/host/src/pci/testdev.rs`.
 
 `[boot]` must name exactly one boot method: `[boot.kernel]` or `[boot.firmware]`; `[boot.uefi]` is refused
 for now.

@@ -884,7 +884,12 @@ mod tests {
     #[test]
     fn table_fits_for_64_vcpus() {
         assert_eq!(exec::cache::MAX_VCPUS, 64);
-        let tables = acpi::build_tables(64, ACPI_NVS.0, &[], &[(1, 11), (2, 10)], true, acpi::Board { pvpanic: true, ps2: true });
+        // The largest bus: two INTx functions and the I/O window (an I/O BAR).
+        let pci = acpi::RootBridge {
+            functions: &[(1, 11), (2, 10)],
+            io_window: true,
+        };
+        let tables = acpi::build_tables(64, ACPI_NVS.0, &[], Some(pci), true, acpi::Board { pvpanic: true, ps2: true });
         let at = tables.end().next_multiple_of(16);
         let s = build(&input(64, exec::MAX_GUEST_RAM_BYTES as u64), at);
         assert!(at >= ACPI_NVS.0 && at + s.table.len() as u64 <= ACPI_NVS.1, "{at:#x} + {:#x}", s.table.len());

@@ -6,9 +6,12 @@
 For N = 1..4 runs `natemu-host unused boot-linux unused BZIMAGE --ram 0x8000000 --load-only --vcpus N --dump`, checks
 the dump (table validity, AML decode, MADT/CPUID/mailbox/e820/device agreement) and writes DIR/l2.json plus the DSDT
 listing DIR/dsdt-nN.dsl; then again with `--no-mailbox` (`nN-no-mailbox`: the MADT without the wakeup structure, M2
-Part 2), and again with the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the
-DSDT then lists the pvpanic device and the 8042's keyboard and mouse, and the FADT has the 8042 bit; the SMBIOS tables, which must leave the ACPI tables as they are, are in the dump too). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump, nN-devices.dump)
-files instead of running the driver.
+Part 2), again with the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the
+DSDT then lists the pvpanic device and the 8042's keyboard and mouse, and the FADT has the 8042 bit; the SMBIOS tables,
+which must leave the ACPI tables as they are, are in the dump too), and with `--rng --transport pci --pci-testdev`
+(`nN-pci`: a PCI bus with the entropy device at 00:03.0 and the test function at 00:01.0-1, so `\\_SB.PCI0` with its
+`_PRT` entry and the I/O window in its `_CRS`). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump,
+nN-devices.dump, nN-pci.dump) files instead of running the driver.
 Prints one pass/fail line per N; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, pathlib, subprocess, sys
@@ -21,10 +24,14 @@ from models import acpi_model  # noqa: E402
 RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
 # The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
 DEVICES = ['--pvpanic', '--smbios', '--ps2']
+# The PCI dumps: the entropy device on PCI (slot 3, INTx line 18) and the test function at the lowest free slot (1).
+PCI = ['--rng', '--transport', 'pci', '--pci-testdev']
+PCI_EXPECT = dict(io_window=True, prt=[(3, 18)])
 # Each dump: its name's suffix, the driver's extra flags, and what the model expects.
 VARIANTS = [('', [], dict()),
             ('-no-mailbox', ['--no-mailbox'], dict(mailbox=False)),
-            ('-devices', DEVICES, dict(pvpanic=True, ps2=True))]
+            ('-devices', DEVICES, dict(pvpanic=True, ps2=True)),
+            ('-pci', PCI, dict(pci=PCI_EXPECT))]
 
 
 def main():

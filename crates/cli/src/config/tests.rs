@@ -863,6 +863,26 @@ fn file_forwards_and_debug_values_use_the_old_parsers() {
     assert!(err(load_args(&["--config", "/nonexistent/vm.toml"])).contains("/nonexistent/vm.toml"));
 }
 
+/// `[debug] pci_testdev` (test only): off by default, on from the file or `--set`, carried into the launch.
+#[test]
+fn debug_pci_testdev_is_off_by_default_and_reaches_the_boot() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "RT".into(), vec![7], None).unwrap();
+    let (_, c) = load_file(MIN, &[]);
+    let c = c.unwrap();
+    assert!(!c.pci_testdev && !boot(&c).pci_testdev);
+    assert!(!load_old(&[]).unwrap().pci_testdev);
+    let (_, c) = load_file(&format!("{MIN}[debug]\npool = false\npci_testdev = true\n"), &[]);
+    let c = c.unwrap();
+    assert!(c.pci_testdev && !c.pool && boot(&c).pci_testdev);
+    let (_, c) = load_file(&format!("{MIN}[debug]\npci_testdev = true\n"), &["--set", "debug.pci_testdev=off"]);
+    assert!(!c.unwrap().pci_testdev, "--set overrides the file");
+    assert!(load_old(&["--set", "debug.pci_testdev=on"]).unwrap().pci_testdev);
+    let (_, c) = load_file(&format!("{MIN}[debug]\npci_testdev = \"yes\"\n"), &[]);
+    assert!(err(c).contains("pci_testdev"));
+    assert!(err(load_old(&["--set", "debug.pci_testdev=maybe"])).contains("bad boolean"));
+}
+
 #[test]
 fn a_file_boot_is_the_same_boot_as_the_flags() {
     let _env = lock();
