@@ -276,6 +276,7 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
             kind: Kind::TestDev,
             pci: true,
             slot,
+            // Unused: `res` is read only off PCI, and the test function has no INTx line.
             res: boot::acpi::VirtioMmio {
                 uid: 0,
                 base: 0,

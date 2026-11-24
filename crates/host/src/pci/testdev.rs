@@ -3,7 +3,8 @@
 //! reference for the test table and the BAR sizes (no code copied). The launch puts two such functions in one slot
 //! (functions 0 and 1); guests' PCI tests (kvm-unit-tests' `pci-testdev`) drive them.
 //!
-//! Identity: vendor 1B36H (Red Hat), device 0005H, revision 0, class FFH subclass 0, header type 0, subsystem
+//! Identity: vendor 1B36H (Red Hat), device 0005H, revision 0, class code 00FFH (QEMU's `PCI_CLASS_OTHERS` as the
+//! 16-bit class word: base class 00H, subclass FFH), header type 0, subsystem
 //! 1AF4H:1100H (what QEMU gives a device that names none), no interrupt pin, no capabilities.
 //!
 //! BARs: BAR0 4 KiB of 32-bit memory and BAR1 256 bytes of I/O (QEMU's 2 x 2048 and 2 x 128 bytes), both
@@ -15,26 +16,29 @@
 //!
 //! | Offset | Bytes | Field |
 //! | --- | --- | --- |
-//! | 0 | 1 | test: a write of N selects test N of this BAR (N < 3; any other value selects none); reads the test's index |
+//! | 0 | 1 | test: a byte N written here selects test N of this BAR (N < 3; any other selects none); reads the index |
 //! | 1 | 1 | width of the test's write: 1 (a byte) for every test |
 //! | 2 | 2 | zero |
 //! | 4 | 4 | offset of the test's write in its BAR |
-//! | 8 | 4 | the value it must write: FAH; CEH for a wildcard test, which takes any value and width |
+//! | 8 | 4 | the byte it must write: FAH; CEH for a wildcard test, which takes any byte |
 //! | 12 | 4 | count of the writes that matched since the test was selected |
 //! | 16 | .. | the test's name, NUL-terminated |
 //!
 //! The tests (index, name, offset of the write): on BAR0 0 `mmio-no-eventfd` 800H, 1 `mmio-wildcard-eventfd` 801H, 2
 //! `mmio-datamatch-eventfd` 802H; on BAR1 3 `portio-no-eventfd` 83H, 4 `portio-wildcard-eventfd` 84H, 5
-//! `portio-datamatch-eventfd` 85H (the second half of the BAR, at its index). Selecting a test zeroes its count. A
-//! write at the offset counts when it is one byte of the value (or any write, for a wildcard test). Natemu has no
-//! eventfds: every write reaches the function, so the count is the number of writes made (on QEMU an eventfd KVM
-//! catches leaves it 0; the specification allows both and kvm-unit-tests accepts both).
+//! `portio-datamatch-eventfd` 85H (the second half of the BAR, at its index). Selecting a test zeroes its count.
 //!
-//! As QEMU's device: one selection per function, shared by both BARs (a test selected on BAR1 is read on BAR0 too, and
-//! its write counts on either BAR); with no test selected everything reads 0; a function starts with none. Bytes past
-//! the name read 0. Deviation: a read returns the bytes of the fields it covers, as the specification's little-endian
-//! fields read; QEMU's device returns only the byte at the address, sign-extended, and 0 for a read reaching the name's
-//! last byte.
+//! As QEMU's device, which takes every access as single bytes (its memory core splits wider ones, lowest address
+//! first): a write is judged byte by byte at each byte's address. A byte at offset 0 selects; a byte at the test's
+//! offset counts when it is the data byte (any byte, for a wildcard test). So a 2- or 4-byte write whose byte at the
+//! offset matches counts once, whatever its other bytes, and a wide write at offset 0 selects by its low byte. A read
+//! returns, byte by byte, the bytes of the fields it covers. One selection per function, shared by both BARs (a test
+//! selected on BAR1 is read on BAR0 too, and its byte counts on either BAR); with no test selected everything reads 0;
+//! a function starts with none. Bytes past the name read 0.
+//!
+//! Deviations from QEMU: natemu has no eventfds, so every write reaches the function and the count is the number of
+//! matching writes (on QEMU an eventfd KVM catches leaves it 0; the specification allows both and kvm-unit-tests
+//! accepts both); and function 1's BAR2 contents, which natemu defines (above).
 use super::configuration::{
     PciBarConfiguration, PciBarPrefetchable, PciClassCode, PciConfiguration, PciHeaderType,
     PciSubclass,
@@ -91,8 +95,9 @@ impl TestDev {
             VENDOR,
             DEVICE,
             0,
-            PciClassCode::Other,
-            &Subclass(0),
+            // Class code 00FFH: base class 00H, subclass FFH (QEMU's PCI_CLASS_OTHERS as a 16-bit class word).
+            PciClassCode::TooOld,
+            &Subclass(0xff),
             None,
             PciHeaderType::Device,
             SUBSYSTEM.0,
@@ -180,21 +185,22 @@ impl Function for TestDev {
                     v | u64::from(byte(offset + k).unwrap_or(0)) << (8 * k)
                 }))
             }
-            Some(v) if offset == 0 => {
-                // BAR0's tests are 0-2, BAR1's 3-5.
-                *s = Selected {
-                    test: (v < TESTS.len() as u64).then(|| bar * 3 + v as u8),
-                    count: 0,
-                };
-                Access::Completed(0)
-            }
             Some(v) => {
-                if let Some(t) = s.test {
-                    let h = header(t, 0);
-                    let at = u32::from_le_bytes(h[4..8].try_into().unwrap());
-                    let matches = t % 3 == WILDCARD || size == 1 && v & 0xff == u64::from(h[8]);
-                    if offset == u64::from(at) && matches {
-                        s.count = s.count.wrapping_add(1);
+                // Byte by byte, lowest address first, as QEMU's device takes every access.
+                for k in 0..size {
+                    let byte = (v >> (8 * k)) as u8;
+                    if offset + k == 0 {
+                        // BAR0's tests are 0-2, BAR1's 3-5.
+                        *s = Selected {
+                            test: (usize::from(byte) < TESTS.len()).then(|| bar * 3 + byte),
+                            count: 0,
+                        };
+                    } else if let Some(t) = s.test {
+                        let h = header(t, 0);
+                        let at = u32::from_le_bytes(h[4..8].try_into().unwrap());
+                        if offset + k == u64::from(at) && (t % 3 == WILDCARD || byte == h[8]) {
+                            s.count = s.count.wrapping_add(1);
+                        }
                     }
                 }
                 Access::Completed(0)
@@ -278,7 +284,7 @@ mod tests {
         let d = installed();
         for f in 0..2 {
             assert_eq!(cfg_read(&d, f, 0), 0x0005_1b36, "vendor, device");
-            assert_eq!(cfg_read(&d, f, 2), 0xff00_0000, "class FFH, subclass 0, revision 0");
+            assert_eq!(cfg_read(&d, f, 2), 0x00ff_0000, "class 00H, subclass FFH, revision 0");
             assert_eq!(cfg_read(&d, f, 11), 0x1100_1af4, "subsystem");
             assert_eq!(cfg_read(&d, f, 15) >> 8 & 0xff, 0, "no interrupt pin");
             // BAR0 32-bit memory, BAR1 I/O, placed in their windows
@@ -346,11 +352,27 @@ mod tests {
                     r.write(at + 1, 1, data);
                     r.write(4, 4, at);
                     r.write(at, 1, 0x11);
-                    r.write(at, 2, data);
-                    let more = if n == 1 { 2 } else { 0 };
+                    let more = if n == 1 { 1 } else { 0 };
                     assert_eq!(r.read(12, 4), 16 + more, "{why}: mismatched writes");
+                    // wider writes are judged byte by byte: the byte at the offset counts, once
+                    r.write(at, 2, 0x1100 | data);
+                    r.write(at, 4, 0x2233_4400 | data);
+                    assert_eq!(r.read(12, 4), 18 + more, "{why}: wide writes with the data byte at the offset");
+                    r.write(at, 2, 0xff11);
+                    let more = more + if n == 1 { 1 } else { 0 };
+                    assert_eq!(r.read(12, 4), 18 + more, "{why}: a wide write with another byte at the offset");
+                    // a write covering the offset without starting there: counts by its byte at the offset
+                    r.write(at - 1, 2, 0x11 | u64::from(data) << 8);
+                    r.write(at - 1, 2, 0x1111);
+                    let more = more + if n == 1 { 1 } else { 0 };
+                    assert_eq!(r.read(12, 4), 19 + more, "{why}: a write covering the offset");
                     assert_eq!(r.read(8, 4), data, "{why}: header writes are dropped");
                 }
+                // a wide write at offset 0 selects by its low byte
+                r.write(0, 4, 0x0100_0002);
+                assert_eq!(r.read(0, 1), u64::from(bar * 3 + 2), "{f}.{bar} dword select");
+                r.write(0, 2, 0x0300);
+                assert_eq!(r.read(0, 1), u64::from(bar * 3), "{f}.{bar} word select");
                 // an index past the table selects none
                 r.write(0, 1, 3);
                 assert_eq!((r.read(0, 4), r.read(4, 4)), (0, 0), "{f}.{bar} none");
