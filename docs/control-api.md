@@ -119,8 +119,12 @@ No parameters. Result:
 
 ### `power_button`
 
-Not available yet: it is answered with -32601 (method not found). It will press the VM's power button, which a
-Linux guest normally takes as a request to shut down.
+No parameters. Result: `{}`. It presses the VM's fixed ACPI power button once: the button's status bit (PWRBTN_STS in
+PM1_STS) is set and, if the guest has enabled it (PWRBTN_EN), the guest gets its ACPI interrupt. A Linux guest with the
+ACPI `button` driver reports that as a KEY_POWER press on its "Power Button" input device, which a login manager or
+`acpid` normally turns into a shutdown; natemu itself does nothing more, and a guest that ignores it keeps running.
+Pressing again before the guest has handled the first press changes nothing. If the VM has no power button the answer
+is error -32001 with `data` `{"device": "power_button"}`; every VM natemu builds has one.
 
 ## Input events
 
@@ -226,7 +230,7 @@ natemu waits at most 1 second for the notification to be written; a client that 
 | -32600 | Invalid request: not a request object, `jsonrpc` not `"2.0"`, `method` not a string, `params` neither object nor array, an id that is not a number, string or null, an unknown member, an empty batch |
 | -32601 | Method not found |
 | -32602 | Invalid params: wrong or missing parameters, an unknown event type or key name, a motion beyond 65535; `data` says what |
-| -32001 | The device the request needs is absent: `data` is `{"device": "ps2"}` |
+| -32001 | The device the request needs is absent: `data` is `{"device": "ps2"}` or `{"device": "power_button"}` |
 | -32002 | The run is stopping: the request was not carried out |
 | -32003 | The guest took no input for 5 seconds; the events not yet delivered were dropped |
 

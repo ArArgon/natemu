@@ -226,7 +226,7 @@ Metal front end needs a Mach port, which a Unix socket cannot carry; the native 
 | `crates/host/src/control/protocol.rs` (new) | `Call`, `InputEvent`, `KeyCode`, `MouseButton`, envelopes, errors |
 | `crates/host/src/control/ps2.rs` (new) | key codes to set 2, motion splitting, held-state release; delivery (`Input`: the per-device queues and threads) |
 | `crates/host/src/ps2.rs`, `crates/host/src/ps2/{keyboard.rs,mouse.rs}` | `try_keyboard`, `try_mouse` (with `dz`), `wait_keyboard`, `wait_mouse`; a crate-visible test constructor of the 8042 without a VM |
-| `crates/host/src/pm.rs`, `crates/host/src/clock.rs`, `crates/host/src/linux.rs` | `PowerButton` (the PM device sits type-erased inside a `Timer` in `clock.rs`, so the handle is made there and carried on `Board`); `Prepared::power_button()`, `Prepared::irqs()` |
+| `crates/host/src/pm.rs`, `crates/host/src/clock.rs`, `crates/host/src/linux.rs` | `PowerButton` (the PM device sits type-erased inside a `Timer` in `clock.rs`, so the handle is made there and carried on `Board`); `Prepared::power_button()` (always `Some`: the PM block is on every board), `Prepared::irqs()` |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `crates/cli/src/main.rs` | `[control] socket` |
 | `docs/control-api.md` (new), `docs/configuration.md` | the client reference (wire format, methods, codes, examples); the key |
 | `tests/lib/control_client.py` (new) | a small client for cases |

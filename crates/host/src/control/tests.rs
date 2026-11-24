@@ -50,10 +50,16 @@ struct Rig {
     path: PathBuf,
     board: Board,
     cancel: Canceller,
+    /// The PM device the power button presses (`None`: the board has none).
+    pm: Option<crate::clock::Timer<crate::pm::Pm>>,
     server: Option<Server>,
 }
 
 fn rig(ps2: bool) -> Rig {
+    rig_with(ps2, false)
+}
+
+fn rig_with(ps2: bool, pm: bool) -> Rig {
     let dir = Dir::new();
     let path = dir.path("c.sock");
     let board = board();
@@ -61,14 +67,21 @@ fn rig(ps2: bool) -> Rig {
     board.command_with(0x60, 0x07);
     assert_eq!(board.mouse(&[0xf4]), [0xfa]);
     let cancel = Canceller::detached();
+    let pm = pm.then(|| {
+        crate::clock::Timer::new(
+            crate::pm::Pm::new(&board.irqs, crate::clock::frequency(), Default::default()),
+            "pm-test",
+        )
+    });
     let target = Target {
         ps2: ps2.then(|| board.input.clone()),
+        power_button: pm.as_ref().map(crate::pm::PowerButton::of),
         cancel: cancel.clone(),
         status: StatusSource { vcpus: 2, started: Instant::now() },
         irqs: board.irqs.clone(),
     };
     let server = serve(&path, target).unwrap();
-    Rig { dir, path, board, cancel, server: Some(server) }
+    Rig { dir, path, board, cancel, pm, server: Some(server) }
 }
 
 impl Rig {
@@ -264,8 +277,9 @@ fn protocol_errors() {
     assert_eq!((code(&v), &v["id"]), (-32700, &Value::Null), "invalid UTF-8: {v}");
     let v = c.call(4, "reboot", json!({}));
     assert_eq!(code(&v), -32601);
-    // Task 3 adds the power button; until then the method is not found.
-    assert_eq!(code(&c.call(5, "power_button", json!({}))), -32601);
+    // Without the device: -32001, naming it.
+    let v = c.call(5, "power_button", json!({}));
+    assert_eq!((code(&v), &v["error"]["data"]), (-32001, &json!({"device": "power_button"})));
     let v = c.call(6, "quit", json!({"now": true}));
     assert_eq!(code(&v), -32602);
     assert!(!r.cancel.cancelled(), "a refused quit does not quit");
@@ -515,6 +529,7 @@ fn socket_rules() {
     // A live socket is refused.
     let target = || Target {
         ps2: None,
+        power_button: None,
         cancel: Canceller::detached(),
         status: StatusSource { vcpus: 1, started: Instant::now() },
         irqs: r.board.irqs.clone(),
@@ -549,4 +564,27 @@ fn socket_rules() {
     let e = serve(&long, target()).err().expect("a long path is refused");
     assert!(e.contains("at most 103 bytes"), "{e}");
     assert_eq!(r.board.irqs.live(), busy - 1, "no guard left by a refused serve");
+}
+
+#[test]
+fn power_button_presses() {
+    let r = rig_with(true, true);
+    let pm = r.pm.as_ref().unwrap();
+    let mut c = r.client();
+    let status = || crate::devices::Device::read(&mut *pm.lock(), 0, 0, 2).unwrap();
+    assert_eq!(status() & 1 << 8, 0);
+    let v = c.call(1, "power_button", json!({}));
+    assert_eq!(v["result"], json!({}), "{v}");
+    assert_eq!(status() & 1 << 8, 1 << 8, "PWRBTN_STS set");
+    // Pressing again is harmless, and the status still answers.
+    assert_eq!(c.call(2, "power_button", json!({}))["result"], json!({}));
+    assert_eq!(c.status(3)["state"], "running");
+}
+
+#[test]
+fn power_button_without_the_device_is_refused() {
+    let r = rig(true);
+    let mut c = r.client();
+    let v = c.call(1, "power_button", json!({}));
+    assert_eq!((&v["error"]["code"], &v["error"]["data"]), (&json!(-32001), &json!({"device": "power_button"})), "{v}");
 }

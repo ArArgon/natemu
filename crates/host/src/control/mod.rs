@@ -58,6 +58,8 @@ pub struct StatusSource {
 pub struct Target {
     /// The 8042's host input (`None` without `machine.ps2`: input requests are -32001).
     pub ps2: Option<Ps2Input>,
+    /// The PM block's fixed power button (`None`: `power_button` is -32001).
+    pub power_button: Option<crate::pm::PowerButton>,
     /// `quit` cancels the run with it.
     pub cancel: Canceller,
     pub status: StatusSource,
@@ -68,6 +70,7 @@ pub struct Target {
 /// What the client threads share.
 struct Shared {
     input: Option<ps2::Input>,
+    power_button: Option<crate::pm::PowerButton>,
     cancel: Canceller,
     status: StatusSource,
     /// `quit` was asked or the run ended.
@@ -122,6 +125,7 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
     };
     let shared = Arc::new(Shared {
         input: target.ps2.map(|p| ps2::Input::start(p, ps2::STALL)),
+        power_button: target.power_button,
         cancel: target.cancel,
         status: target.status,
         stopping: AtomicBool::new(false),
@@ -496,8 +500,11 @@ impl Shared {
                 input.send(client, &p.events)?;
                 Ok(json!({}))
             }
-            // Task 3 adds the power button; until then the method is not found.
-            Call::PowerButton => Err(Error::new(ErrorCode::MethodNotFound)),
+            Call::PowerButton => {
+                let button = self.power_button.as_ref().ok_or_else(|| Error::no_device("power_button"))?;
+                button.press();
+                Ok(json!({}))
+            }
             Call::Quit => {
                 self.stopping.store(true, SeqCst);
                 self.cancel.cancel();

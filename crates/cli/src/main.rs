@@ -403,6 +403,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
             path,
             natemu::control::Target {
                 ps2: prepared.ps2().cloned(),
+                power_button: prepared.power_button(),
                 cancel: prepared.canceller(),
                 status: natemu::control::StatusSource {
                     vcpus,

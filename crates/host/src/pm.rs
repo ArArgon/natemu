@@ -11,8 +11,8 @@
 //!
 //! **PM1 event** (4.8.3.1): PM1_STS bits are cleared by writing 1 (any bit, as QEMU); PM1_EN reads back as written
 //! (all 16 bits, as QEMU). The SCI is asserted while a status bit is set with its enable among TMR_EN, GBL_EN,
-//! PWRBTN_EN and RTC_EN (`acpi_update_sci`); only TMR_STS has a source on this board (no power button, global lock
-//! owner or RTC wake). With TMR_EN and TMR_STS clear the next toggle is scheduled on a [`clock::Timer`] thread, which
+//! PWRBTN_EN and RTC_EN (`acpi_update_sci`); TMR_STS and PWRBTN_STS have sources on this board (the timer, and
+//! [`PowerButton::press`] for the host; no global lock owner or RTC wake). With TMR_EN and TMR_STS clear the next toggle is scheduled on a [`clock::Timer`] thread, which
 //! holds an [`Irqs::busy`] guard meanwhile. A write to both halves (32 bits at B000H) is one update.
 //!
 //! **PM1 control** (4.8.3.2.1): SCI_EN is set from reset (ACPI-only mode, no SMI command) and read-only: the hardware
@@ -181,6 +181,28 @@ impl Device for Pm {
         true
     }
 }
+impl Pm {
+    /// The power button's press (ACPI 6.5 4.8.3.1.1: PWRBTN_STS set, the SCI raised if PWRBTN_EN).
+    fn press(&mut self) {
+        self.sts |= PWRBTN;
+        self.update_sci();
+    }
+}
+/// The fixed power button, for a host thread (the control socket's `power_button`): a cloneable handle on the PM device.
+/// A press takes only the PM device's own lock, the one every guest access to B000H takes, so it never holds a vCPU
+/// beyond that.
+#[derive(Clone)]
+pub struct PowerButton(Arc<clock::Inner<Pm>>);
+impl PowerButton {
+    pub(crate) fn of(pm: &clock::Timer<Pm>) -> Self {
+        Self(pm.inner())
+    }
+    /// Presses the button: PWRBTN_STS (bit 8 of PM1_STS) is set, and the SCI (IRQ 9) rises if PWRBTN_EN is set. Pressing
+    /// again while the status is set changes nothing; the guest clears the status by writing 1 to it.
+    pub fn press(&self) {
+        self.0.access(Pm::press);
+    }
+}
 impl Timed for Pm {
     fn next(&self) -> Option<u64> {
         self.busy
@@ -189,5 +211,82 @@ impl Timed for Pm {
     }
     fn fire(&mut self, _at: u64) {
         self.update_sci();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::Timer;
+    use crate::devices::{Device, Devices};
+    use std::sync::Mutex;
+
+    pub(crate) struct Rig {
+        pub(crate) irqs: Irqs,
+        pub(crate) pm: Timer<Pm>,
+    }
+    /// A PM device on a registry with the interrupt controllers (no vCPU): the SCI through the chipset's input level.
+    pub(crate) fn rig() -> Rig {
+        let memory = Arc::new(crate::memory::Memory::with_size(4096).unwrap());
+        let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
+        let mut devices = Devices::new(1 << 30);
+        let irqs = crate::irq::install(&mut devices, &memory, 0, &uart).unwrap();
+        let pm = Timer::new(Pm::new(&irqs, clock::frequency(), Arc::default()), "pm-test");
+        Rig { irqs, pm }
+    }
+    impl Rig {
+        pub(crate) fn sts(&mut self) -> u16 {
+            self.pm.read(0, 0, 2).unwrap() as u16
+        }
+        pub(crate) fn enable(&mut self, en: u16) {
+            assert!(self.pm.write(0, 2, 2, en.into()));
+        }
+    }
+
+    #[test]
+    fn press_sets_pwrbtn_sts() {
+        let mut r = rig();
+        let button = PowerButton::of(&r.pm);
+        assert_eq!(r.sts() & PWRBTN, 0);
+        button.press();
+        assert_eq!(r.sts() & PWRBTN, PWRBTN);
+        // A handle clone and a second press change nothing more.
+        button.clone().press();
+        assert_eq!(r.sts() & PWRBTN, PWRBTN);
+    }
+
+    #[test]
+    fn sci_follows_pwrbtn_en() {
+        let mut r = rig();
+        let button = PowerButton::of(&r.pm);
+        button.press();
+        assert!(!r.irqs.level(9), "no SCI while PWRBTN_EN is clear");
+        r.enable(PWRBTN);
+        assert!(r.irqs.level(9), "the SCI once enabled with the status set");
+        r.enable(0);
+        assert!(!r.irqs.level(9), "disabling drops the line");
+        r.enable(PWRBTN);
+        assert!(r.irqs.level(9));
+        // Pressing with the enable already set raises the line at once.
+        assert!(r.pm.write(0, 0, 2, PWRBTN.into()));
+        assert!(!r.irqs.level(9));
+        button.press();
+        assert!(r.irqs.level(9));
+    }
+
+    #[test]
+    fn write_one_clears_pwrbtn_sts() {
+        let mut r = rig();
+        let button = PowerButton::of(&r.pm);
+        r.enable(PWRBTN);
+        button.press();
+        assert!(r.irqs.level(9));
+        // Writing 0 to the bit, or 1 to another bit, leaves it.
+        assert!(r.pm.write(0, 0, 2, u64::from(RTC)));
+        assert_eq!(r.sts() & PWRBTN, PWRBTN);
+        assert!(r.pm.write(0, 0, 2, PWRBTN.into()));
+        assert_eq!(r.sts() & PWRBTN, 0);
+        assert!(!r.irqs.level(9), "the line follows the status down");
+        assert_eq!(r.pm.read(0, 2, 2), Some(PWRBTN.into()), "PM1_EN is untouched");
     }
 }

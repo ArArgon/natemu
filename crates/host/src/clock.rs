@@ -51,13 +51,13 @@ pub(crate) trait Timed: Device {
     /// Final owned-output drain after the VM stops; default timed sources have no staged output.
     fn shutdown(&mut self) {}
 }
-struct Inner<T> {
+pub(crate) struct Inner<T> {
     device: Mutex<T>,
     changed: Condvar,
     stop: AtomicBool,
 }
 /// Ends a [`Timer`]'s thread without dropping the device: the port bus still reaches it, each access first taking the
-/// events due ([`Timer::access`]), but nothing fires asynchronously any more (R2 review: a run's end).
+/// events due ([`Inner::access`]), but nothing fires asynchronously any more (R2 review: a run's end).
 pub(crate) trait Halt: Send + Sync {
     fn halt(&self);
 }
@@ -131,35 +131,39 @@ impl<T: Timed + 'static> Timer<T> {
     pub(crate) fn halter(&self) -> Arc<dyn Halt> {
         self.inner.clone()
     }
+    /// A handle for another thread's accesses to the device ([`Inner::access`]).
+    pub(crate) fn inner(&self) -> Arc<Inner<T>> {
+        self.inner.clone()
+    }
     /// The device, locked (its thread waits meanwhile).
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
         self.inner.device.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
-impl<T: Timed + 'static> Timer<T> {
+impl<T: Timed + 'static> Inner<T> {
     /// One access to the device: first every event already due (so an access never sees, or overwrites, a state the
     /// thread has not caught up with yet: a reload cannot drop a due edge, a status read sees every flag due); then the
     /// access; the thread is woken only when the next event moved (an access every few microseconds would otherwise
     /// wake it every time).
-    fn access<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let mut d = self.lock();
+    pub(crate) fn access<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut d = self.device.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(at) = d.next().filter(|&at| at <= now()) {
             d.fire(at);
         }
         let before = d.next();
         let r = f(&mut d);
         if d.next() != before {
-            self.inner.changed.notify_one();
+            self.changed.notify_one();
         }
         r
     }
 }
 impl<T: Timed + 'static> Device for Timer<T> {
     fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
-        Timer::access(self, |d| d.read(vcpu, offset, size))
+        self.inner.access(|d| d.read(vcpu, offset, size))
     }
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
-        Timer::access(self, |d| d.write(vcpu, offset, size, value))
+        self.inner.access(|d| d.write(vcpu, offset, size, value))
     }
 }
 impl<T: Timed + 'static> Drop for Timer<T> {
@@ -265,10 +269,16 @@ pub struct TickStats {
 pub struct Board {
     pub pit: Arc<TickStats>,
     pub rtc: Arc<TickStats>,
+    /// The PM block's fixed power button ([`Board::power_button`]).
+    button: crate::pm::PowerButton,
     /// The PIT's, RTC's, PM block's and UART TX threads ([`Board::stop`]).
     timers: Vec<Arc<dyn Halt>>,
 }
 impl Board {
+    /// The fixed power button of the PM block (always present: the PM block is part of every board).
+    pub fn power_button(&self) -> crate::pm::PowerButton {
+        self.button.clone()
+    }
     /// Ends the timed devices' threads (a run's end: no source fires any more; the devices stay readable).
     pub fn stop(&self) {
         self.timers.iter().for_each(|t| t.halt());
@@ -304,6 +314,7 @@ pub fn install(
     devices.register_ports(p::RTC_PORT.into(), p::RTC_PORT_LEN.into(), rtc)?;
     let pm = Timer::new(crate::pm::Pm::new(irqs, f, devices.power.clone()), "pm");
     timers.push(pm.halter());
+    let button = crate::pm::PowerButton::of(&pm);
     let pm: Shared = Arc::new(Mutex::new(pm));
     let at = |offset: u64| -> Shared { Arc::new(Mutex::new(At(pm.clone(), offset))) };
     devices.register_ports(p::PM1A_EVT.into(), p::PM1_EVT_LEN.into(), at(0))?;
@@ -320,6 +331,7 @@ pub fn install(
     Ok(Board {
         pit: pit_stats,
         rtc: rtc_stats,
+        button,
         timers,
     })
 }

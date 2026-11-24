@@ -1437,6 +1437,11 @@ impl Prepared {
     pub fn ps2(&self) -> Option<&crate::ps2::Ps2Input> {
         self.ps2.as_ref()
     }
+    /// The fixed power button of the PM block, which a host thread presses ([`crate::pm::PowerButton::press`]). The PM
+    /// block is on every board, so this is always `Some`; it is an `Option` as the control socket's `Target` is.
+    pub fn power_button(&self) -> Option<crate::pm::PowerButton> {
+        Some(self.board.power_button())
+    }
     /// The interrupt routing, for asynchronous sources and their [`crate::irq::Irqs::busy`] guards (the control API's).
     pub fn irqs(&self) -> &crate::irq::Irqs {
         &self.irqs
