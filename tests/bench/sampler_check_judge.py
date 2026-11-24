@@ -11,14 +11,17 @@ mark to the next mark; phase 7 ends at the next stop (init's, after the run). Sa
 
   a  alu: at least 95% of the window's EL0 samples on one user block (the loop: its body and its linked back edge are one
      block). If this fails twice the plan goes back to review.
-  b  call: dispatcher samples whose target is the callee (the not-a-call target sampled most), none of them marked a return,
-     and samples on the callee's block.
+  b  call: both computed exits of the loop in the dispatcher: the indirect call (call test "not a call"), at least 90% of
+     those to one target, the callee (small_fn: the not-a-call target sampled most), none of the callee's slot samples
+     marked a return; and small_fn's `ret` (call test "call before": its target follows a call); and samples on the
+     callee's block.
   c  cross: samples in a shared probe, at least 95% of them charged to the window's top block (the loop's).
   d  chase: recorded only: where the samples land in the top block (native offset: samples), for the per-word allowance.
   e  ctrl: e1 (mark 5 to the port's stop) and e3 (the port's start to init's stop) hold EL0 samples on phase a's block;
      e2 (stop to start) holds no sample rung after the stop except by the ringing pass in flight at it (a logged pass that
      began before the stop); the stop and the start are the port's (cause port).
-  marks: the seven marks in order in both runs; the control port ignored nothing (sample_report's own check).
+  marks: the seven marks in order in both runs (init's own, 0x80 + the run's number, ignored; an older init's, the run's
+     number before mark 1, is skipped by the search); the control port ignored nothing (sample_report's own check).
 
 Writes NAME.judge.json; exit 0 when the command, the report and every check pass, else the command's status or 1."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -31,6 +34,8 @@ import sample_report as sr
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ALU_SHARE = 95.0
 PROBE_SHARE = 95.0
+CALL_SHARE = 90.0
+INIT_MARKS = 0x80          # init's marks, 0x80 + the run's number: not the program's phases
 SEQUENCE = [1, 2, 3, 4, 5, 6, 7]
 
 
@@ -101,11 +106,15 @@ def judge_run(n, t, ring, toggles, passes, end):
     to_callee = [s for s in disp if s['rip'] == callee]
     marked = collections.Counter(sr.CALLS.get(calls(s)) for s in to_callee)
     on_callee = sum(1 for s in b if in_block(s) and s['rip'] == callee)
+    returns = sum(1 for s in disp if calls(s) == sr.CALL_YES)
+    cshare = round(100 * targets[callee] / sum(targets.values()), 2) if targets else 0.0
     out['b'] = dict(el0=len(b), dispatch=len(disp), callee=callee and hex(callee), slot_samples=len(to_callee),
-                    slot_calls=dict(marked), callee_block_samples=on_callee,
+                    slot_calls=dict(marked), call_share_to_callee=cshare, returns=returns, callee_block_samples=on_callee,
                     dispatch_calls=dict(collections.Counter(sr.CALLS.get(calls(s)) for s in disp)))
     if not to_callee: problems.append(f'run {n} b: no dispatcher sample whose target is an indirect call\'s')
     elif marked.get('return'): problems.append(f'run {n} b: {marked["return"]} of the callee\'s slot samples marked a return')
+    elif cshare < CALL_SHARE: problems.append(f'run {n} b: {cshare}% of the indirect calls\' samples to the callee, want {CALL_SHARE}%')
+    if not returns: problems.append(f'run {n} b: no dispatcher sample of the callee\'s return (call test "call before")')
     if not on_callee: problems.append(f'run {n} b: no sample on the callee\'s block')
     # c
     c = el0(win(3))
@@ -143,7 +152,7 @@ def judge_run(n, t, ring, toggles, passes, end):
 
 def judge(name):
     ring, host = read(name)
-    marks = sorted((h for h in host if h['kind'] == sr.MARK), key=lambda h: h['time'])
+    marks = sorted((h for h in host if h['kind'] == sr.MARK and h['value1'] < INIT_MARKS), key=lambda h: h['time'])
     toggles = sorted((h for h in host if h['kind'] == sr.TOGGLE), key=lambda h: (h['time'], h['value1']))
     passes = [h for h in host if h['kind'] == sr.PASS]
     clocks = [h['time'] for h in host if h['kind'] == sr.CLOCK]

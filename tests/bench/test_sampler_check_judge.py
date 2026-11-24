@@ -8,24 +8,28 @@ import sampler_check_judge as j
 from test_sample_report import el0, hostrec, header, write_samples, USER64, KERNEL64, F
 
 S = F // 10                    # a tenth of a second
-LOOP, CALLEE, CROSS, CHASE = 0x40_1000, 0x40_2100, 0x40_3000, 0x40_4000
+LOOP, CALLEE, RETURN, CROSS, CHASE = 0x40_1000, 0x40_2100, 0x40_2014, 0x40_3000, 0x40_4000
 
 
 def run_records(base, broken=()):
     """One run from `base`: init's mark (the run's number), then phases 1-7 of 1 s each; the port's stop 0.5 s into phase 5
     and its start 0.5 s into phase 6; init's stop after phase 7. One sample every 0.1 s of each window."""
     t = lambda s: base + round(s * 10) * S
-    host = [hostrec(sr.MARK, t(0), value1=1 if base < 150 * F else 2)]
+    host = [hostrec(sr.MARK, t(0), value1=(1 if base < 150 * F else 2) | (0x80 if 'old-init' not in broken else 0))]
     ring = []
     for k in range(1, 8):
         host.append(hostrec(sr.MARK, t(k), value1=k))
     for i in range(10):
         off = 'a' in broken and i < 2
         ring.append(el0(t(1 + i / 10) + S // 2, 0xffff_ffff_8100_0000 if off else LOOP, sr.BLOCK, KERNEL64 if off else USER64, frame=1))
+        # Phase b: the callee's block, the indirect call to it (not a call before the target), its return (a call before).
         if i % 2: ring.append(el0(t(2 + i / 10) + S // 2, CALLEE, sr.BLOCK, USER64, frame=2))
+        elif i % 4 == 0 or 'noret' in broken:
+            call = sr.CALL_YES if 'b' in broken and i == 0 else sr.CALL_NO
+            target = CALLEE if 'other' not in broken or i != 0 else CALLEE + 0x40
+            ring.append(el0(t(2 + i / 10) + S // 2, target, sr.DISPATCH, USER64, frame=2, flags=call << sr.CALL_SHIFT))
         else:
-            call = sr.CALL_YES if 'b' in broken and i % 4 == 0 else sr.CALL_NO
-            ring.append(el0(t(2 + i / 10) + S // 2, CALLEE, sr.DISPATCH, USER64, frame=2, flags=call << sr.CALL_SHIFT))
+            ring.append(el0(t(2 + i / 10) + S // 2, RETURN, sr.DISPATCH, USER64, frame=2, flags=sr.CALL_YES << sr.CALL_SHIFT))
         rip = LOOP if 'c' in broken and i % 2 else CROSS
         ring.append(el0(t(3 + i / 10) + S // 2, rip, sr.PROBE if i % 3 == 0 else sr.BLOCK, USER64, frame=3, at=8))
         ring.append(el0(t(4 + i / 10) + S // 2, CHASE, sr.BLOCK, USER64, frame=4, at=4 * (i % 3)))
@@ -63,10 +67,12 @@ class Judge(unittest.TestCase):
     def test_a_good_run_passes(self):
         r = self.judge()
         self.assertEqual(r['problems'], [])
-        self.assertEqual(r['marks'], [1, 1, 2, 3, 4, 5, 6, 7, 2, 1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(r['marks'], [1, 2, 3, 4, 5, 6, 7] * 2)                  # init's 0x81 and 0x82 left out
         one = r['runs'][1]
         self.assertEqual((one['a']['share'], one['a']['user']), (100.0, True))
-        self.assertEqual((one['b']['callee'], one['b']['slot_samples'], one['b']['callee_block_samples']), (hex(CALLEE), 5, 5))
+        self.assertEqual((one['b']['callee'], one['b']['slot_samples'], one['b']['returns'], one['b']['callee_block_samples']),
+                         (hex(CALLEE), 3, 2, 5))
+        self.assertEqual(one['b']['dispatch_calls'], {'not_call': 3, 'return': 2})
         self.assertEqual((one['c']['probe'], one['c']['share']), (4, 100.0))
         self.assertEqual(one['d']['at'], {0: 4, 4: 3, 8: 3})
         self.assertEqual({k: one['e'][k] for k in ('e1_on_loop', 'e2', 'e2_in_flight', 'e2_stray', 'e3_on_loop')},
@@ -76,7 +82,17 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge(broken2=('a',))['problems'], ['run 2 a: 80.0% of 10 EL0 samples on one user block, want 95.0% or more'])
 
     def test_a_callee_slot_marked_a_return_fails(self):
-        self.assertEqual(self.judge(('b',))['problems'], ["run 1 b: 3 of the callee's slot samples marked a return"])
+        self.assertEqual(self.judge(('b',))['problems'], ["run 1 b: 1 of the callee's slot samples marked a return"])
+
+    def test_an_indirect_call_to_two_targets_fails(self):
+        self.assertEqual(self.judge(('other',))['problems'], ["run 1 b: 66.67% of the indirect calls' samples to the callee, want 90.0%"])
+
+    def test_no_return_sample_fails(self):
+        self.assertEqual(self.judge(('noret',))['problems'], ['run 1 b: no dispatcher sample of the callee\'s return (call test "call before")'])
+
+    def test_an_older_init_s_run_marks_are_skipped(self):
+        r = self.judge(('old-init',), ('old-init',))
+        self.assertEqual((r['problems'], r['marks']), ([], [1, 1, 2, 3, 4, 5, 6, 7, 2, 1, 2, 3, 4, 5, 6, 7]))
 
     def test_probes_charged_elsewhere_fail(self):
         self.assertEqual(self.judge(('c',))['problems'], ["run 1 c: 50.0% of probe samples charged to the loop's block, want 95.0%"])
