@@ -601,7 +601,7 @@ mod tests {
     use super::*;
     use std::vec::Vec;
 
-    use crate::execution::cache::{CODE_VA, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT, PROBES_VA};
+    use crate::execution::cache::{CODE_VA, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT};
     use crate::execution::probe;
 
     /// A code cache of two blocks (one in the step slot), slot contexts and one page of guest RAM.
@@ -678,7 +678,7 @@ mod tests {
         }
         let s = at(STEP_PC, 0, 0);
         assert_eq!((s.place, s.rip, s.flags), (STEP, 0x7000, DEAD));
-        assert_eq!(at(PROBES_VA - 4, 0, 0).place, HEAD, "a gap of the head");
+        assert_eq!(at(CODE_VA + probe::offset(0) + 4, 0, 0).place, HEAD, "an empty probe slot of the head");
         let none = at(BLOCK_PC + 0x1000, 0, 0);
         assert_eq!((none.place, none.frame), (NO_BLOCK, (BLOCK_PC + 0x1000 - CODE_VA) as u32));
         assert_eq!(at(CODE_VA - 4, 0, 0).place, OUTSIDE);
