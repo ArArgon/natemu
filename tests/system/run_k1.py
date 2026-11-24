@@ -399,6 +399,7 @@ def bodies(k, i=0, n=1):
         **pool_bodies(i, n),
         **chunk_bodies(k, i, n),
         **relink_bodies(k, i, n),
+        **ret_bodies(k, i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -1645,7 +1646,7 @@ def program(name, n, k):
         b = {d: (d + F2) | P.LEAF}
         ca, cb = chunk_tables(name, i)
         ra, rb = relink_tables(name, i)
-        a, b = {**a, **ca, **ra}, {**b, **cb, **rb}
+        a, b = {**a, **ca, **ra}, {**b, **cb, **rb, **ret_tables(name, i)}
         out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i, n)[name])))
         out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, **({'switches': [(d + STUB['enter'], 3), (d + STUB['exit'], 0)]} if name in STUB_PROGRAMS else {}),
                                                        **({'posts': [(d + PN, EVENT)], 'quiet': True} if name == 'miss-event' else {})))
@@ -1680,9 +1681,118 @@ def program(name, n, k):
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
             {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic', 'indirect-sites') else [])
-            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n) + relink_memory(name, i)
+            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n) + relink_memory(name, i) + ret_memory(name, i)
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
+
+
+# ---- Return plan (docs/restructure/return-prediction-plan.md section 7): calls and returns paired through the resident's
+# call pairs, pads and stubs; natemu only, judged by their values and the resident's counters. Per CPU (d = SYS_D(i)) a library
+# page at d + RLIB (both tables, identity) holds the functions; the body calls them by direct `call` (another page: links of
+# the CR3 segment, suspended at each CR3 load and relinked when the target is revalidated).
+# - `ret-pairs`: K rounds in A, then in B, then in A again, then under a second code context (MXCSR) and the first again, each
+#   calling: `caller4` (four call sites of one leaf), `rec`
+#   (recursion 80 deep, past the return stack), `getpc` (`call $+5; pop`: a plain jump), `retimm` (`ret 8`), `rewrite` (the
+#   callee rewrites its return address), `ljmp` (a longjmp across two frames), `indir` (`call rax`).
+# - `ret-death`: K rounds of four callers whose `call` is a page's last instruction (the return address the next page's first):
+#   the callee rewrites the return page's code at every eighth call (R1 then returns to new bytes), or the caller's page (the
+#   caller dies with its pad named by R2's entry: `PADS_EMPTIED`; the first two callers run twice a round), or loads table B, where R3's page is another frame (the
+#   return runs B's bytes; links suspended and relinked), or toggles CR4.PGE twice (global flushes).
+RLIB = 0x9000
+RET_F = dict(f=0x0, caller4=0x40, rec=0x100, getpc=0x140, retimm=0x180, rewrite=0x1c0, ljmp=0x200, indir=0x280,
+             g_smc=0x300, g_kill=0x340, g_cr3=0x380, g_pge=0x3c0, c4=0x400)
+RET_CA1, RET_R1, RET_CA2, RET_R2, RET_R3, RET_R3B = 0xa000, 0xb000, 0xc000, 0xd000, 0xe000, 0xf000
+RET_PROGRAMS = ('ret-pairs', 'ret-death')
+
+
+def ret_lib(i):
+    d = P.SYS_D(i)
+    at = lambda name: f'    times {RET_F[name]:#x}-($-$$) int3\n{name}:\n'
+    return P.asm(
+        at('f') + '    lea rax, [rdi + 1]\n    ret\n'
+        + at('caller4') + '    xor esi, esi\n' + ''.join(f'    mov edi, {j}\n    call f\n    add rsi, rax\n' for j in range(1, 5))
+        + '    mov rax, rsi\n    ret\n'
+        + at('rec') + '    test edx, edx\n    jz .z\n    dec edx\n    call rec\n    inc rax\n    ret\n.z:\n    xor eax, eax\n    ret\n'
+        + at('getpc') + '    call .n\n.n:\n    pop rax\n    lea rdx, [rel .n]\n    sub rax, rdx\n    inc rax\n    ret\n'
+        + at('retimm') + '    push 5\n    call .ri\n    ret\n.ri:\n    mov rax, [rsp + 8]\n    ret 8\n'
+        + at('rewrite') + '    call .rw\n    mov eax, 100\n    ret\n.alt:\n    mov eax, 3\n    ret\n.rw:\n    lea rax, [rel .alt]\n    mov [rsp], rax\n    ret\n'
+        + at('ljmp') + '    push rbp\n    mov rbp, rsp\n    call .lj1\n    mov eax, 100\n    pop rbp\n    ret\n.back:\n    mov rsp, rbp\n    pop rbp\n'
+        '    mov eax, 9\n    ret\n.lj1:\n    call .lj2\n    mov eax, 200\n    ret\n.lj2:\n    jmp .back\n'
+        + at('indir') + '    lea rax, [rel f]\n    mov edi, 10\n    call rax\n    ret\n'
+        + at('g_smc') + f'    inc rbp\n    test bpl, 7\n    jnz .s\n    xor byte [{d + RET_R1 + 1:#x}], 3\n.s:\n    ret\n'
+        + at('g_kill') + f'    inc r11\n    test r11b, 7\n    jnz .k\n    mov byte [{d + RET_CA2 + 0x10:#x}], 0x90\n.k:\n    ret\n'
+        + at('g_cr3') + f'    mov rax, {P.SYS_T(i, 1):#x}\n    mov cr3, rax\n    ret\n'
+        + at('g_pge') + '    mov rax, cr4\n    btc rax, 7\n    mov cr4, rax\n    btc rax, 7\n    mov cr4, rax\n    ret\n'
+        + at('c4') + '    mov edi, ecx\n    call g_pge\n    mov eax, 6\n    jmp r13\n')
+
+
+def ret_caller(at, to):
+    """`mov edi, ecx; call to` ending at code address `at` (a page start): its bytes, placed at `at - 7`."""
+    return b'\x89\xcf\xe8' + (to - at).to_bytes(4, 'little', signed=True)
+
+
+def ret_bodies(k, i, n):
+    d, lib = P.SYS_D(i), P.SYS_D(i) + RLIB
+    near = lambda name: f'    call $$+{lib + RET_F[name] - P.SYS_CODE(i):#x}\n'
+    calls = lambda: ''.join(near(f) + f'    add {r}, rax\n' for f, r in (('caller4', 'r8'), ('rec', 'r9'), ('getpc', 'r10'), ('retimm', 'r12'),
+                                                                        ('rewrite', 'r14'), ('ljmp', 'r15'), ('indir', 'rbx')))
+    cr3 = lambda t: f'    mov rax, {P.SYS_T(i, t):#x}\n    mov cr3, rax\n'
+    rounds = lambda tag: f'    mov ecx, {k}\n.{tag}:\n    mov edx, 80\n' + calls() + f'    dec ecx\n    jnz .{tag}\n'
+    jump = lambda tag, to: f'    lea r13, [rel .{tag}]\n    mov rax, {to:#x}\n    jmp rax\n.{tag}:\n'
+    # (Each of the first two callers twice a round, after the round's CR3 loads emptied their entries: the first call's return
+    # fills the pad, the second's callee kills (every fourth round).)
+    death = (f'    xor ebp, ebp\n    xor r11d, r11d\n    mov ecx, {k}\n.l:\n' + jump('c1', d + RET_R1 - 7) + '    add r8, rax\n' + jump('c1b', d + RET_R1 - 7)
+             + '    add r8, rax\n' + jump('c2', d + RET_R2 - 7) + '    add r9, rax\n' + jump('c2b', d + RET_R2 - 7) + '    add r9, rax\n'
+             + jump('c3', d + RET_R3 - 7) + '    add r10, rax\n' + cr3(0) + jump('c4', lib + RET_F['c4']) + '    add r12, rax\n'
+             + '    dec ecx\n    jnz .l\n')
+    # (A second code context: MXCSR's IM clear, with CR4.OSFXSR; then back to the first, whose return addresses' hints name the
+    # second context's callers now, its entries emptied by a CR3 reload: a pad must never be filled across contexts; a last
+    # reload has the `link-check` resident scan the tables.)
+    mx = lambda v: f'    sub rsp, 8\n    mov dword [rsp], {v:#x}\n    ldmxcsr [rsp]\n    add rsp, 8\n'
+    sse = '    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n'
+    return {'ret-pairs': rounds('la') + cr3(1) + rounds('lb') + cr3(0) + rounds('lc') + sse + mx(0x1f00) + rounds('ld') + mx(0x1f80) + cr3(0) + rounds('le') + cr3(0),
+            'ret-death': death}
+
+
+def ret_memory(name, i):
+    if name not in RET_PROGRAMS:
+        return []
+    d = P.SYS_D(i)
+    mem = lambda at, data: {'addr': f'0x{at:x}', 'data': bytes(data).hex(), 'capture': False}
+    lib = d + RLIB
+    out = [mem(lib, ret_lib(i))]
+    if name == 'ret-death':
+        back = lambda k: P.asm(f'mov eax, {k}\njmp r13')
+        out += [mem(d + RET_R1 - 7, ret_caller(d + RET_R1, lib + RET_F['g_smc']) + back(1)),
+                mem(d + RET_R2 - 7, ret_caller(d + RET_R2, lib + RET_F['g_kill']) + back(4)),
+                mem(d + RET_R3 - 7, ret_caller(d + RET_R3, lib + RET_F['g_cr3']) + back(5)),
+                mem(d + RET_R3B, back(7))]
+    return out
+
+
+def ret_tables(name, i):
+    """Table B's overrides: `ret-death`'s R3 page is another frame there."""
+    d = P.SYS_D(i)
+    return {d + RET_R3: (d + RET_R3B) | P.LEAF} if name == 'ret-death' else {}
+
+
+def ret_smc_sum(k):
+    imm, total = 1, 0
+    for call in range(1, 2 * k + 1):
+        if call & 7 == 0:
+            imm ^= 3
+        total += imm
+    return total
+
+
+RET_VALUES = {
+    'ret-pairs': lambda i, k: {'r8': {5 * k * 14}, 'r9': {5 * k * 80}, 'r10': {5 * k}, 'r12': {5 * k * 5}, 'r14': {5 * k * 3},
+                               'r15': {5 * k * 9}, 'rbx': {5 * k * 11}},
+    'ret-death': lambda i, k: {'r8': {ret_smc_sum(k)}, 'r9': {8 * k}, 'r10': {7 * k}, 'r12': {6 * k}},
+}
+# (natemu_abi::pic::count: PAIR_LINKS 40, PAIR_RELINKS 41, PADS_HINTED 44, PADS_EMPTIED 45, PUSH_ENTRIES 46.)
+EITHER.update(RET_VALUES)
+RET_COUNT = {'ret-pairs': [(40, 1), (41, 1), (44, 1), (46, 1)], 'ret-death': [(40, 1), (41, 1), (44, 1), (45, 1), (46, 1)]}
 
 
 # ---- The independent review's adversarial programs (QEMU-compared unless in ADV_EITHER) ----------------------------------
@@ -2158,6 +2268,8 @@ def main():
                 out, problems = run(a, prog, extra, check=check)
                 if name in ('pic-ctx', 'pic-xm'):  # (as `contexts`: once per context)
                     problems = [p for p in problems if 'host requests' not in p]
+                if name in RET_PROGRAMS:  # (a second code context, code rewritten: blocks translated again)
+                    problems = [p for p in problems if 'host requests' not in p]
                 if name == 'contexts':  # its blocks are translated once per context, not once per RIP (the check's count)
                     problems = [p for p in problems if 'host requests' not in p]
                     # The L1 tables of the A/C alternation are kept and switched between, not cleared at every change.
@@ -2196,6 +2308,13 @@ def main():
                             problems.append(f'cpu{v} pic counter {k} = {pic[k]}, want {least}..{most}')
                     if name == 'pic-flush' and c['stats']['flushes'] < 2:
                         problems.append(f"cpu{v} flushes {c['stats']['flushes']}, want the driver's and the program's")
+                # Return plan: the resident counters of the call pairs, pads and stubs (natemu_abi::pic::count, least per CPU).
+                # (Not under a PIC test mode, which changes how blocks are entered: run_pic.py checks its own counters.)
+                for v, c in enumerate(out['cpus'] if out and name in RET_COUNT and not os.environ.get('NATEMU_PIC_TEST') else []):
+                    pic = c['stats']['k1']['pic']
+                    for k, least in RET_COUNT[name]:
+                        if pic[k] < least:
+                            problems.append(f'cpu{v} pic counter {k} = {pic[k]}, want at least {least}')
                 # Perf chunk 11: the record area filled (more links made than it holds, no flush but the driver's first)
                 # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
                 for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):

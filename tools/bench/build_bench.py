@@ -23,6 +23,15 @@ SPEC = {
     'branchy': ('branchy.asm', [], None, 0, dict(rax=0x9e3779b97f4a7c15, rsi=6364136223846793005, rdi=1442695040888963407), ['stack'], 60_000_000),
     'mixed':   ('mixed.asm', [], 13, 0, dict(rsi=BUF, r9=1), ['stack', 'buffer'], 120_000_000),
 }
+# The return plan's in-VM kill-test (docs/restructure/return-prediction-plan.md section 6): call chains of DEPTH levels with
+# CALLERS call sites per level, the bottom making no trip, a CPUID (the resident) or an IN (the host: IOPL 3).
+SEED = 0x9e3779b97f4a7c15
+for _name, _k, _d, _trip, _n in [('chain4-d4', 4, 4, 0, 12_000_000), ('chain4-d16', 4, 16, 0, 3_000_000),
+                                 ('chain4-d32', 4, 32, 0, 1_500_000), ('chain1-d16', 1, 16, 0, 6_000_000),
+                                 ('chain4-d16-cpuid', 4, 16, 1, 400_000), ('chain4-d16-port', 4, 16, 2, 100_000)]:
+    SPEC[_name] = ('callchain.asm', [f'CALLERS={_k}', f'DEPTH={_d}', f'TRIP={_trip}'], None, 1, dict(r9=SEED), ['stack'], _n)
+# RFLAGS other than 0: the port trip runs at CPL 3 with IOPL 3.
+RFLAGS = {'chain4-d16-port': 0x3002}
 REGION = {'stack': dict(addr=STACK, size=0x2000, fill='zero'), 'array': dict(addr=ARRAY, size=0x100000, fill='zero'),
           'buffer': dict(addr=BUF, size=0x10000, fill='lcg', seed=1)}
 
@@ -62,7 +71,7 @@ def build():
         gpr = [init.get(r, 0) for r in REGS]; gpr[REGS.index('rsp')] = STACK_RSP
         out['benchmarks'].append({
             'name': name, 'source': 'bodies/' + src, 'defines': defs, 'code': assemble(src, defs).hex(), 'rip': CODE,
-            'gpr': [f'0x{g:016x}' for g in gpr], 'rflags': 0, 'memory': [REGION[r] for r in regions], 'insns': mnemonics(src),
+            'gpr': [f'0x{g:016x}' for g in gpr], 'rflags': RFLAGS.get(name, 0), 'memory': [REGION[r] for r in regions], 'insns': mnemonics(src),
             'insns_per_iter': per, 'insns_fixed': fixed, 'n_default': n})
     (HERE / 'benchmarks.json').write_text(json.dumps(out, indent=1) + '\n')
 

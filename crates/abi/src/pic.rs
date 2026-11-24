@@ -103,7 +103,25 @@ pub mod count {
     /// appended words (the tests `PIC_TEST_LOOKUP`, `PIC_TEST_TRAMPOLINE`).
     pub const LOOKUP_STOPS: usize = 38;
     pub const TRAMPOLINE_STOPS: usize = 39;
-    pub const COUNTS: usize = 40;
+    /// Return plan (every build): direct calls linked through their block's call pair (`b pair+0`, `bl` the target), and
+    /// relinked so; checked calls from absolute code linked to their slot's call form; return-table entries naming a
+    /// pad, filled at a call's link and from a hint at a miss; entries emptied because their pad's block died; resident
+    /// continuations through the push stub and the pop stub; paths counted unbalanced (a stop inside a lookup form, a
+    /// continuation with a shadow set or into another block than the exit's); stops at a pair's `bl` and at a pad.
+    pub const PAIR_LINKS: usize = 40;
+    pub const PAIR_RELINKS: usize = 41;
+    pub const CALL_FORM_LINKS: usize = 42;
+    pub const PADS_LINKED: usize = 43;
+    pub const PADS_HINTED: usize = 44;
+    pub const PADS_EMPTIED: usize = 45;
+    pub const PUSH_ENTRIES: usize = 46;
+    pub const POP_ENTRIES: usize = 47;
+    pub const UNBALANCED: usize = 48;
+    pub const PAIR_STOPS: usize = 49;
+    pub const PAD_STOPS: usize = 50;
+    /// Of [`UNBALANCED`], the continuations not through a stub because a shadow was set.
+    pub const SHADOW_UNBALANCED: usize = 51;
+    pub const COUNTS: usize = 52;
 }
 
 /// The class of a link (source, target): both position-independent and the target starting on the source's start

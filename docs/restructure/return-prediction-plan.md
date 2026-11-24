@@ -1,6 +1,6 @@
 # Returns predicted by the Arm return stack (plan)
 
-Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 3: revision 2 (the
+Status: the smallest version is built (November 24, 2026, section 14: kill-test, build, tests). Plan of November 23, revision 3: revision 2 (the
 return stack balanced on every path, pads without link records, a host kill-test for mechanism and an in-VM one for the
 decision, the decision read on benchmarks the built version covers) was accepted with fixes by the independent re-review, and
 the fixes are taken in (section 13). Owner decision (November 23): the pad is an "external guarded entry" in INV-03-01's sense,
@@ -312,3 +312,102 @@ said to be a resident trip and a host-served port trip added for HVF exits (6); 
 with stub+4 a safe target, the stubs in the slot area under its stop rule, stops before a push continuing through the stub, the
 stubs unused while `shadow_entry` is set (4.1); `NO_CONTEXT` tables skipped; appended words written per copy (4.2); the
 estimate.
+
+## 14. Findings: the smallest version built (November 24, 2026)
+
+**In-VM kill-test** (bench cases `micro-callchain` and `micro-callchain-base`, `tools/bench/bodies/callchain.asm`, M2 Max,
+one round as section 8 says; base ad452224, the indirect plan's step 1; the fix the build below at 4b0e81c9, before the rebase onto
+bd97a67d and the hint hash fix, neither of which changes these paths: the chains' return addresses never collided in the hint table). Three repetitions per
+case, the slope between N and 2N iterations; ns per iteration median (range), and ns saved per return (a call chain of depth
+D makes D + 1 calls and returns per iteration):
+
+| Case | base | fix | saved per return | bar |
+| --- | ---: | ---: | ---: | --- |
+| `chain4-d4` (4 callers per level, xorshift order, depth 4) | 29.25 (29.20-29.51) | 25.13 (24.64-26.98) | 0.82 | 1.5: **below** |
+| `chain4-d16` | 175.26 (175.08-175.33) | 96.80 (93.51-102.36) | 4.62 | 1.5: passes |
+| `chain4-d32` | 365.38 (365.07-365.70) | 189.68 (189.47-205.19) | 5.32 | 1.5: passes |
+| `chain1-d16` (one caller per level) | 27.30 (27.28-27.60) | 26.00 (25.89-27.84) | +0.08 | loss under 1: passes |
+| `call` (K = 1) | 1.86 (1.80-1.87) | 2.40 (2.39-2.49) | -0.54 per pair | loss under 1: passes |
+| `chain4-d16-cpuid` (CPUID at the bottom: the resident) | 523.81 (523.62-533.36) | 466.81 (466.09-484.43) | 3.35 | |
+| `chain4-d16-port` (IN from port 0x80: an HVF exit) | 1807.96 (1773.16-1810.62) | 1810.39 (1783.86-1818.90) | -0.14 | |
+
+Read: `ret x1` predicts from the return stack in the VM: at depth 16 and 32 a return saves 4.6-5.3 ns (the 1.5 ns bar three
+times over). At depth 4 it saves 0.82: with five returns per iteration and eight random bits, the shared `br` predicts part of
+them from its history. The plan's bar does not say whether it holds at every depth; the owner decides (below). A single caller
+loses nothing (+0.08), the `call` body 0.54 ns per pair (bar 1). The resident's trip (CPUID, EL0 to EL1 and back) keeps most
+of the stack (3.35 of 4.62 at depth 16); an HVF exit clears it (nothing saved): `hackbench`'s kernel side gains from it only
+between host exits.
+
+**Built** (on bd97a67d, step 1 with its review fix: every link to appended words is a real `b`, no gap after the code):
+
+- Admission's hint `FORM_RETURN` (C3, C2) gives a return its slot's return form (`ret x1`); with no slot, slot 0's return form
+  (`adr x1, miss; ret x1`, `RETURN_MISS`). `Block::exit_branch` says where a computed exit goes; `append` writes it per copy, the
+  reuse check compares it.
+- Call pairs (`Block::pair`, 8 bytes right after the appended entries; `Block::tail_extent` = entries + pair) for every block whose hint marks call points: a direct call's
+  link word is `b pair+0` (always a `b`, never `link_word`'s `nop`), pair+0 `bl` to the target's link entry, written first.
+  `link`'s check, `unlink_word` and `relink` go through it (`point_links_to`, `calls_to`); a relinked call still pushes. Local
+  links of shared code use the pair too.
+- A checked call from absolute code goes to its slot's call form (`SLOT_CALL`, 192: `bl` lookup, `blr x1`, `b` miss). An
+  indirect call placed with no slot calls slot 0's lookup form (the miss's words), so it pushes on that path too.
+- Stubs in slot 0 (`PUSH_STUB` `blr x1; b miss`, `POP_STUB` `ret x1`); `State::ras`/`ras_rip` carry the continuation to `enter`,
+  which takes it only with no shadow, at the block's ordinary entry and into the exit's own target (else counted unbalanced).
+  Set by the linker (a call's first execution), `stopped` (a call's or a return's exit word, `exit_ras`), and the stop rules:
+  slot-area forms (return form and pop stub: pop; call form and push stub: push; lookup form: counted), call tails before their
+  `blr`, pair+0 (the RIP from the call point).
+- Pads (absolute code only: a pair's second word, an absolute indirect call tail's third) without link records. Hints
+  (`RET_HINTS`, 4 Ki entries by a multiplicative hash of R, after the data tables, not mapped at EL0) are written at placement
+  (the first build indexed by R's low 12 bits: return addresses at page starts collided, `ret-death` showed it); `fill_l1` and a call's
+  link (`pad_at_link`) name a pad only when the hinted caller is alive, absolute, of the owner's and the table's context, ends at
+  R and has that pad; `set_pad` empties any entry naming the pad with another owner, then writes and synchronizes the word.
+  A dying caller's entries are emptied (`empty_pad_entries`, `NO_CONTEXT` tables skipped).
+- Audits: the host's `check_links` (every call point linked through its pair, pairs, pads, return exits, the call form); the
+  `link-check` resident's `check_tails` and a new `check_l1_targets` at each TLB flush (every entry: its owner's full entry, or the
+  pad of a live block ending at the entry's RIP, of its owner's context, whose word is `b` to that full entry). The
+  `tables-*` checks of `frame-randomization` compare RIP words, not targets: unchanged.
+- Stop rules: call pairs and call tails on `block_at`'s miss path, before the dead-block filter (step 1's rule, moved there by
+  its review fix).
+- Counters `pic::count` 40-51, sampler role `TAIL_PAIR`, test entries `NATEMU_PIC_TEST=ras0..ras3` (14-17).
+
+Deviations: no `ret-pairs` i386 build (32-bit code takes the same paths: `compat32` ran); no signal handler's return in
+`ret-pairs` (K1 bodies run at CPL 0; the longjmp and the rewritten return address are its unmatched returns). A call to a
+SYSCALL target served by `sys_fast` is not continued through the push stub and not counted. `sample_report.py` does not split
+pair samples out yet.
+
+**Tests** (this worktree, M2 Max, narrow runs only, no gate):
+
+| Case | Shows |
+| --- | --- |
+| `system` `ret-pairs` (K1 `ret-pairs`, `ret-death`; 1 and 4 vCPUs, block sizes default and 1) | `ret-pairs`: four call sites of a leaf, recursion 80 deep, `call $+5; pop`, `ret 8`, a rewritten return address, a longjmp across two frames, `call rax`; in table A, B, A, under a second code context (MXCSR) and the first again: exact sums; counters per CPU: 62-67 pair links, 21-24 relinks, 70 pads filled from hints, 62-67 push-stub entries. `ret-death`: the return page rewritten, the caller's page rewritten while its pad is named (12 entries emptied; 212 pads filled), the return page another frame after a CR3 load in the callee, two global flushes: exact sums. |
+| `system` `ret-pairs-lc` | The same and `cr3-relink`, `relink-smc` on the `link-check` resident. |
+| `system` `ret-stop` (`run_pic.py` modes `ras0`-`ras3`, `tail1`; `ret-pairs`, `ret-death`, `indirect-sites`, `miss-boundary`) | Entries through the push stub (24,876) and the pop stub (23,577), at pads (1,470 stops) and pairs (6), between a lookup and its `blr` (tail1); no `BAD_STOP`, every program's values; the shadow entries of `miss-boundary` not through a stub (counted). |
+| Rust units | The forms (call form, stubs, slot 0's return form), the pair, pad and exit layout, the return hint. |
+
+Each new check was shown to fail when it should: the edit applied, the case run through `tools/natemu-test`, reverted.
+
+| Mutation | Red in |
+| --- | --- |
+| `relink` writes a plain `b` to the entry (not through the pair) | `ret-pairs`: `bad_link` (the linker's check of the relinked point), the host audit |
+| The linker enters a call's target directly (no push stub) | `ret-pairs`: push-stub entries 0 |
+| `call $+5` hinted as a call | Rust unit `exit_forms_from_the_last_instruction` |
+| The dead caller's entries not emptied | `ret-pairs-lc`: `link_check` (`check_l1_targets`: a pad of a dead block) |
+| `cut_one` skipping entries that name a pad | `ret-pairs` (`ret-death`, block size 1): the stale pad ran the dead R1 block's old bytes (after the hint fix; before it the entry never held a pad: green, which found the hash defect) |
+| `unlink_word` comparing the link word with the entry | `ret-pairs`: the CR3 load's suspend fails |
+| The pad word not written before the entry (for "written after": single-threaded per-vCPU code, written before the next EL0 entry, so the order alone is not observable) | `ret-pairs-lc`: `link_check` |
+| The pair stop rule behind the dead-block filter | `ret-stop` `ras3`: `bad_stop` at a dead block's pair |
+| The push stub used with `shadow_entry` set | `ret-stop` `ras0`: no shadow entry counted |
+| A pad filled across code contexts (`pad_for`'s context check removed) | **green**: under the mutation the counters are unchanged (70 pads filled), so `ret-pairs` never meets a hint of another context at a miss; the check is not shown by a test (below) |
+
+The mutations were run at the build before the rebase onto bd97a67d, the `cut_one` and context ones again after it and the
+hint fix. Not shown by a test: `pad_for`'s context check. Under its mutation `ret-pairs` fills as many pads as without it, so its
+second-context phase never meets, at a miss in the first context, a hint naming a caller of the second; why (the hint
+overwritten again, or no miss there) was not looked into. The `link-check` scan would catch a pad named across contexts
+(`check_l1_targets` compares the caller's context with the owner's); a program that produces such a hint is still owed.
+
+Narrow runs at the final code (bd97a67d plus this work), all passing: the Rust units (711 passed); `system` 2,462 checks
+(`k1-c1`, `k1-c2@*`, `indirect-*`, `pic-*`, `frame-randomization*`, `compat32*`, `ret-*`); `smp` `coherence`, `contain`,
+`privilege` (626); `faults` `faults@*`, `faults-1@*`, `probes@*` (15,935). Not run: the gate, `programs`, `correctness`, `boot`,
+`io`. The A/B and the profile are the owner's pooled round (section 8).
+
+**For the owner.** (1) The kill-test at depth 4 saves 0.82 ns per return, under the 1.5 ns bar; depths 16 and 32 pass three
+times over. The build went on (the plan's decision case is the deep chain); whether the bar is per depth is the owner's call.
+(2) An HVF exit clears the return stack: no gain across host exits. (3) The context check of the pads has no red test yet.

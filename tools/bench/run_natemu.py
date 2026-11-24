@@ -72,22 +72,27 @@ def main():
                 times[(name, k)].append(dt)
             stats[(name, k)] = st
     results = []
-    print(f"{'bench':9} {'N':>11} {'insns/N':>8} {'ns/insn':>8} {'range%':>7} {'QEMU':>6} {'ratio':>6}  counters at N (= at 2N)")
+    print(f"{'bench':9} {'N':>11} {'insns/N':>8} {'ns/insn':>8} {'range%':>7} {'QEMU':>6} {'ratio':>6} {'ns/iter':>9}  counters at N (= at 2N)")
     for b in benches:
         n = max(1, round(b['n_default'] * a.scale))
         (_, _, i1), (_, _, i2) = cases[(b['name'], n)], cases[(b['name'], 2 * n)]
         slopes = [1e9 * (t2 - t1) / (i2 - i1) for t1, t2 in zip(times[(b['name'], n)], times[(b['name'], 2 * n)])]
         med = statistics.median(slopes)
-        # Computed exits (ret) take the dispatcher every iteration: its hits grow with N; nothing else may.
-        steady = all(stats[(b['name'], n)][x] == stats[(b['name'], 2 * n)][x] for x in STATS)
+        # Computed exits (ret) take the dispatcher every iteration: its hits grow with N; nothing else may (a call chain whose
+        # bottom makes a trip, `-cpuid` or `-port`, enters the linker and a block from the resident at each trip: those grow too).
+        trips = b['name'].endswith(('-cpuid', '-port'))
+        steady = all(stats[(b['name'], n)][x] == stats[(b['name'], 2 * n)][x] for x in STATS if not (trips and x in ('linker', 'blocks')))
+        per_iter = [1e9 * (t2 - t1) / n for t1, t2 in zip(times[(b['name'], n)], times[(b['name'], 2 * n)])]
         r = {'name': b['name'], 'n': n, 'insns': [i1, i2], 'ns_per_insn': {'median': med, 'min': min(slopes), 'max': max(slopes),
-             'range_pct': 100 * (max(slopes) - min(slopes)) / med, 'all': slopes}, 'qemu_ns_per_insn': QEMU.get(b['name']),
+             'range_pct': 100 * (max(slopes) - min(slopes)) / med, 'all': slopes},
+             'ns_per_iter': {'median': statistics.median(per_iter), 'min': min(per_iter), 'max': max(per_iter), 'all': per_iter},
+             'qemu_ns_per_insn': QEMU.get(b['name']),
              'times_s': {'n': times[(b['name'], n)], '2n': times[(b['name'], 2 * n)]},
              'stats': {'n': stats[(b['name'], n)], '2n': stats[(b['name'], 2 * n)]}, 'steady': steady}
         results.append(r)
         q = QEMU.get(b['name'])
         print(f"{b['name']:9} {n:11} {(i2 - i1) / n:8.3f} {med:8.4f} {r['ns_per_insn']['range_pct']:7.2f} {q or 0:6.3f} "
-              f"{med / q if q else 0:6.2f}  {'' if steady else 'NOT STEADY '}{stats[(b['name'], n)]}")
+              f"{med / q if q else 0:6.2f} {r['ns_per_iter']['median']:9.2f}  {'' if steady else 'NOT STEADY '}{stats[(b['name'], n)]}")
     h1 = host_state()
     print('host end:', json.dumps(h1))
     (a.out / 'results.json').write_text(json.dumps({'reps': a.reps, 'scale': a.scale, 'max_block': a.max_block, 'host_start': h0,

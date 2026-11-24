@@ -258,6 +258,28 @@ argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "tail0,tail1,t
         "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 2, perf = true }
 
+# Return plan (docs/restructure/return-prediction-plan.md section 7): `ret-pairs`, K1's call and return forms (four call sites,
+# recursion past the return stack, `call $+5`, `ret imm16`, a rewritten return address, a longjmp, an indirect call) in two
+# address spaces, and `ret-death` (the return page rewritten, the caller killed with its pad named, the return page remapped by
+# a CR3 load, global flushes, between call and return): their values and the counters of call pairs, relinks, pads and push
+# stubs, the host's audit of every pair and pad; at 1 and 4 vCPUs. `ret-pairs-lc`: the same on the `link-check` resident (its
+# scan of every table entry: a pad's block alive, ending at the entry's RIP, its word `b` to the owner). `ret-stop`: entries
+# through the stubs, at pads and pairs (dead blocks' among them) and between a site's lookup and its `blr` with the doorbell
+# rung (run_pic.py's ras and tail1 modes).
+[suite.cases."ret-pairs"]
+argv = ["tests/system/run_k1.py", "--cpus", "1", "4", "--programs", "ret-pairs,ret-death", "--timeout", "900", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."ret-pairs-lc"]
+argv = ["tests/system/run_k1.py", "--cpus", "1", "4", "--programs", "ret-pairs,ret-death,cr3-relink,relink-smc", "--link-check",
+        "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."ret-stop"]
+argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "ras0,ras1,ras2,ras3,tail1", "--programs", "ret-pairs,ret-death,indirect-sites,miss-boundary",
+        "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 2, perf = true }
+
 [suite.cases."pic-and"]
 argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "and", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 2, perf = true }

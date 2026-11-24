@@ -21,7 +21,8 @@ pub use natemu_abi::execution::cache::{
     INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, OFF0, OFF1, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
     PIC_TEST_STR, PIC_TEST_SVC, PIC_TEST_LOOKUP, PIC_TEST_TAIL, PIC_TEST_TAILS, PIC_TEST_TRAMPOLINE, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
-    STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
+    STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE, PIC_TEST_RAS, PIC_TEST_RASES, PUSH_STUB, POP_STUB, SLOT_CALL, SLOT_LOOKUP, SLOT_RETURN, RETURN_MISS,
+    FORM_INDIRECT_CALL, DISPATCH_SLOT_BYTES,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 use natemu_abi::execution::{
@@ -809,6 +810,15 @@ pub fn fill_l1(rip: u64, block: &Block) {
         }
         return;
     }
+    // Return plan: a return address with a valid hint gets the caller's pad, its word written first ([`pad_for`], which
+    // may empty entries of this set: before the set is read).
+    let target = match pad_for(t, rip, block) {
+        Some(pad) => {
+            counted(count::PADS_HINTED);
+            area::CODE_VA + pad
+        }
+        None => code_of(block).full_entry(),
+    };
     let (w0, w1) = area::l1_slots_of(rip);
     let (o0, o1) = unsafe { (l1_owner(t, w0).read(), l1_owner(t, w1).read()) };
     let want = block.number + 1;
@@ -842,7 +852,97 @@ pub fn fill_l1(rip: u64, block: &Block) {
             unsafe { l1_owner(t, w0).write(o0 ^ area::L1_NEXT) };
         }
     }
-    unsafe { dl1(t, i).write([rip, code_of(block).full_entry()]) };
+    unsafe { dl1(t, i).write([rip, target]) };
+}
+
+/// Return plan: hint slot of return address `rip` ([`area::RET_HINTS`]).
+fn ret_hint(rip: u64) -> *mut [u64; 2] {
+    // (A multiplicative hash of every RIP bit: return addresses at page starts, or a page apart, share their low bits.)
+    let i = (rip.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::RET_HINT_ENTRIES.trailing_zeros())) as usize;
+    lookup_area::<[u64; 2]>(area::RET_HINTS).wrapping_add(i)
+}
+/// Return plan: block `b` (just filed) has a pad: its return address's hint names it (an older one at that slot goes).
+fn hint_pad(b: &Block) {
+    if let Some(pad) = b.pad() {
+        unsafe { ret_hint(b.end_rip()).write([b.end_rip(), u64::from(b.number + 1) | pad << 32]) };
+    }
+}
+/// Return plan: the pad an entry of L1 table `t` for `rip`, owned by `owner`, may name now: the hinted caller's, when that
+/// block is alive, absolute, of the table's context and `owner`'s, ends at `rip` and has that pad, and `owner` is an
+/// absolute block with code. Its word is made `b` to `owner`'s full entry first (synchronized; after emptying any entry of
+/// another owner that names the pad: the invariant "an entry (R, pad) exists only while the pad's word is `b` to its
+/// owner's full entry"), so the entry may be written next. `None`: the entry names `owner`'s full entry.
+fn pad_for(t: usize, rip: u64, owner: &Block) -> Option<u64> {
+    let c = control();
+    let [r, v] = unsafe { ret_hint(rip).read() };
+    let (n, pad) = ((v as u32).checked_sub(1)?, v >> 32);
+    if r != rip || n as u64 >= c.blocks || owner.flags & (PIC | INSTANCE | SYSTEM | STEP | DEAD) != 0 || owner.code_size == 0 {
+        return None;
+    }
+    let caller = block(n as usize);
+    if caller.flags & (DEAD | PIC | INSTANCE) != 0
+        || caller.context != owner.context
+        || c.l1_contexts[t] != owner.context
+        || caller.end_rip() != rip
+        || caller.pad() != Some(pad)
+    {
+        return None;
+    }
+    set_pad(pad, rip, owner);
+    Some(pad)
+}
+/// Return plan: makes pad `pad` (of a caller ending at `rip`) `b` to `owner`'s full entry: every table entry for `rip` naming
+/// the pad with another owner is emptied first (none should be: each goes with its owner), then the word is written and
+/// synchronized.
+fn set_pad(pad: u64, rip: u64, owner: &Block) {
+    let want = branch(pad, owner.full_entry() - area::CODE_VA);
+    if word(pad) == want {
+        return;
+    }
+    let (w0, w1) = area::l1_slots_of(rip);
+    for t in (0..area::L1_TABLES).filter(|&t| control().l1_contexts[t] != area::NO_CONTEXT) {
+        for i in [w0, w1] {
+            if unsafe { dl1(t, i).read()[1] } == area::CODE_VA + pad && l1_block(t, i) != owner.number + 1 {
+                empty_l1(t, i);
+            }
+        }
+    }
+    rewrite(pad, want);
+}
+/// Return plan: block `n`, which has a pad, died: every table entry naming the pad goes (two slots of its return address in
+/// each table holding a context; a `NO_CONTEXT` table, stale after a global flush, is cleared before it takes one).
+fn empty_pad_entries(b: &Block) {
+    let Some(pad) = b.pad() else { return };
+    let (w0, w1) = area::l1_slots_of(b.end_rip());
+    for t in (0..area::L1_TABLES).filter(|&t| control().l1_contexts[t] != area::NO_CONTEXT) {
+        for i in [w0, w1] {
+            if unsafe { dl1(t, i).read()[1] } == area::CODE_VA + pad {
+                empty_l1(t, i);
+                counted(count::PADS_EMPTIED);
+            }
+        }
+    }
+}
+/// Return plan, at a direct call's link from absolute code: the current table's entry for the call's return address, when
+/// it names its owner's full entry, names the caller's pad instead ([`pad_for`], the hint being the caller's).
+fn pad_at_link(source: &Block) {
+    let rip = source.end_rip();
+    let t = control().l1_table as usize;
+    let (w0, w1) = area::l1_slots_of(rip);
+    for i in [w0, w1] {
+        let [r, target] = unsafe { dl1(t, i).read() };
+        let o = l1_block(t, i);
+        if r != rip || o == 0 {
+            continue;
+        }
+        let owner = block(o as usize - 1);
+        if target == code_of(owner).full_entry() && owner.rip == rip {
+            if let Some(pad) = pad_for(t, rip, owner) {
+                unsafe { dl1(t, i).write([rip, area::CODE_VA + pad]) };
+                counted(count::PADS_LINKED);
+            }
+        }
+    }
 }
 
 /// Dispatch study (`dispatch-study` builds only: its loads and stores cost measurable time in the `perf` gate builds):
@@ -989,6 +1089,7 @@ pub fn tlb(global: bool) -> Option<u64> {
         check_out_slots();
         check_chains();
         check_tails();
+        check_l1_targets();
     }
     let c = control();
     c.epoch += 1;
@@ -1056,12 +1157,14 @@ pub fn tlb(global: bool) -> Option<u64> {
     #[cfg(feature = "pic-count")]
     prune_tlb(scope)
 }
-/// `link-check` builds, at the start of every TLB flush (indirect plan step 1): every block's appended words are what
-/// [`append`] and [`link`] write, decoded here: each entry `bl` to the lookup form of its context's slot, or `b` to the miss
-/// (none bound at its placement, a computed exit's; or a link point's not linked since), then `blr x1` exactly for a call
-/// of its hint and `br x1` otherwise, then `b` to the miss; a computed exit with them `b` to them when its first word is
-/// that `bl`, else to the miss (a word an armed stop patched is judged by its word before). A shared block's checked link
-/// branches to its point's words. Halts `stop::LINK_CHECK` with the line, the block and the word's offset otherwise.
+/// `link-check` builds, at the start of every TLB flush (indirect plan step 1, return plan): every block's appended words are
+/// what [`append`], [`link`] and a pad's fill write, decoded here: each entry `bl` to the lookup form of its context's slot,
+/// or of slot 0 (none bound at its placement, or a link point's not linked since), then `blr x1` exactly for a call of its
+/// hint and `br x1` otherwise, then `b` to the miss, or for an absolute block's indirect call (its pad) `b` to the miss or to
+/// a live block's full entry; a computed exit with them `b` to them; a return's computed exit `b` to its slot's return form
+/// or slot 0's (a word an armed stop patched is judged by its word before). A shared block's checked link branches to its
+/// point's words. A call pair: `b` to the miss or `bl` to a block's entry, then its pad as above. Halts `stop::LINK_CHECK`
+/// with the line, the block and the word's offset otherwise.
 #[cfg(feature = "link-check")]
 #[track_caller]
 fn check_tails() {
@@ -1071,26 +1174,34 @@ fn check_tails() {
     let word = |at: u64| armed.iter().find(|w| u64::from(w[0]) == at && word(at) == STOP_WORD).map_or_else(|| word(at), |w| w[1]);
     let target = |at: u64| at.wrapping_add((((word(at) << 6) as i32 >> 6) as i64 * 4) as u64);
     let bad = |n: usize, at: u64| -> ! { crate::execution::halt_native([line, n as u64, at], natemu_abi::execution::stop::LINK_CHECK) };
+    let miss = area::DISPATCH_MISS as u64;
+    // (A pad: `b` to the miss, or to the full entry of a block with code.)
+    let pad_ok = |at: u64| {
+        word(at) >> 26 == 0x05
+            && (target(at) == miss
+                || block_at(area::CODE_VA + target(at)).is_some_and(|t| code_of(t).full_entry() == area::CODE_VA + target(at)))
+    };
     for n in 0..c.blocks as usize {
         let b = block(n);
         let slot = (1..area::DISPATCH_SLOTS).find(|&k| c.slot_contexts[k] == b.context).map(slot_at);
         for p in [None].into_iter().chain((0..MAX_LINK_POINTS).map(Some)) {
             let Some(at) = b.tail(p) else { continue };
             let linked = match word(at) >> 26 {
+                0x25 if target(at) == (area::DISPATCH + area::SLOT_LOOKUP) as u64 => false,
                 0x25 => slot.is_some_and(|k| target(at) == k + area::SLOT_LOOKUP as u64),
-                0x05 if target(at) == area::DISPATCH_MISS as u64 => false,
                 _ => bad(n, at),
             };
             if word(at + 4) != if b.tail_calls(p) { BLR_X1 } else { BR_X1 } {
                 bad(n, at + 4)
             }
-            if word(at + 8) >> 26 != 0x05 || target(at + 8) != area::DISPATCH_MISS as u64 {
+            let pad = b.pad() == Some(at + 8);
+            if !(if pad { pad_ok(at + 8) } else { word(at + 8) >> 26 == 0x05 && target(at + 8) == miss }) {
                 bad(n, at + 8)
             }
             match p {
                 None => {
                     let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-                    if word(exit) >> 26 != 0x05 || target(exit) != if linked { at } else { area::DISPATCH_MISS as u64 } {
+                    if word(exit) >> 26 != 0x05 || target(exit) != at {
                         bad(n, exit)
                     }
                 }
@@ -1101,6 +1212,26 @@ fn check_tails() {
                         bad(n, svc)
                     }
                 }
+            }
+        }
+        if b.tail(None).is_none() && b.dispatch_exit != 0 && b.exit_forms & area::FORM_RETURN != 0 && b.code_size != 0 && b.flags & (SYSTEM | STEP | INSTANCE) == 0 {
+            let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
+            let to = target(exit);
+            if word(exit) >> 26 != 0x05
+                || !(to == area::RETURN_MISS as u64 || slot.is_some_and(|k| to == k + area::SLOT_RETURN as u64) || to as usize % area::DISPATCH_SLOT_BYTES == area::SLOT_RETURN && to >= area::DISPATCH as u64 && to < (area::DISPATCH + area::DISPATCH_BYTES) as u64)
+            {
+                bad(n, exit)
+            }
+        }
+        if let Some(pair) = b.pair() {
+            let first = word(pair);
+            let call = first >> 26 == 0x25
+                && block_at(area::CODE_VA + target(pair)).is_some();
+            if !(call || first >> 26 == 0x05 && target(pair) == miss) {
+                bad(n, pair)
+            }
+            if !(if b.pad().is_some() { pad_ok(pair + 4) } else { word(pair + 4) >> 26 == 0x05 && target(pair + 4) == miss }) {
+                bad(n, pair + 4)
             }
         }
     }
@@ -1136,6 +1267,37 @@ fn check_out_slots() {
 /// invariant a missed kill broke, so the start is the check that sees it): each table's list is at most the slots long,
 /// names each slot at most once, and an owner word has [`area::L1_LISTED`] set exactly when its slot is on the list.
 /// Halts `stop::LINK_CHECK` with the line, the table and the slot otherwise.
+/// `link-check` builds, at the start of every TLB flush (return plan): every entry of every table holding a context targets
+/// its owner's full entry, or the pad of a live block whose call returns to the entry's RIP and whose word is `b` to that
+/// full entry (the invariant of the pads). Halts `stop::LINK_CHECK` with the line, the table and the slot otherwise.
+#[cfg(feature = "link-check")]
+#[track_caller]
+fn check_l1_targets() {
+    let c = control();
+    let line = u64::from(core::panic::Location::caller().line());
+    for t in (0..area::L1_TABLES).filter(|&t| c.l1_contexts[t] != area::NO_CONTEXT) {
+        for i in (0..area::L1_ENTRIES).filter(|&i| !area::segment_slot(t, i)) {
+            let o = l1_block(t, i);
+            let [rip, to] = unsafe { dl1(t, i).read() };
+            if o == 0 {
+                continue;
+            }
+            let owner = block(o as usize - 1);
+            let full = code_of(owner).full_entry();
+            let pad_ok = || {
+                pad_owner(to).is_some_and(|caller| {
+                    caller.flags & DEAD == 0
+                        && caller.end_rip() == rip
+                        && caller.context == owner.context
+                        && word(to - area::CODE_VA) == branch(to - area::CODE_VA, full - area::CODE_VA)
+                })
+            };
+            if owner.rip != rip || to != full && !pad_ok() {
+                crate::execution::halt_native([line, t as u64, i as u64], natemu_abi::execution::stop::LINK_CHECK)
+            }
+        }
+    }
+}
 #[cfg(feature = "link-check")]
 #[track_caller]
 fn check_l1_lists() {
@@ -1196,7 +1358,7 @@ pub fn place(
     let c = control();
     let size = placed_size(h);
     let exit_forms = exit_forms as u32 & area::FORMS;
-    let tail = tail_view(0, size, 0, links, dispatch_exit as u32, rep_exits as u32, exit_forms).tail_bytes();
+    let tail = tail_view(0, size, 0, links, dispatch_exit as u32, rep_exits as u32, exit_forms).tail_extent();
     // Perf chunk 10: a template keeps its guest-RIP relocations (packed after its sites); one that cannot be packed is none.
     let reloc = |i: u32| unsafe {
         object
@@ -1278,6 +1440,7 @@ pub fn place(
             size_of::<Site>() * h.sites_count as usize,
             4 * count as usize,
         )?;
+        hint_pad(placed);
         // In increasing order (insertion sort: at most 255; fexc lists them in emission order already).
         let table = sites(placed).as_ptr_range().end.cast::<u32>().cast_mut();
         for (i, r) in packed().take(count as usize).enumerate() {
@@ -1365,7 +1528,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
     let code = start + u64::from(PIC_LEAD);
     // (Indirect plan step 1: its words appended after its code, a shared translation's for its link points too.)
     let view = |links| tail_view(code, t.code_size, PIC, links, t.dispatch_exit, t.rep_exits, t.exit_forms);
-    let code_end = code + u64::from(t.code_size) + u64::from(view(t.links).tail_bytes());
+    let code_end = code + u64::from(t.code_size) + u64::from(view(t.links).tail_extent());
     if code_end > c.code_bytes {
         c.full[0] += 1;
         return None;
@@ -1684,10 +1847,10 @@ pub fn copy(
         sites(b).iter().any(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind) && u64::from(s.native_offset) == o)
     });
     let view = tail_view(0, b.code_size, 0, b.links, b.dispatch_exit, b.rep_exits, b.exit_forms);
-    let Some((code, hot)) = reserve(u64::from(b.code_size + view.tail_bytes()), want) else {
+    let Some((code, hot)) = reserve(u64::from(b.code_size + view.tail_extent()), want) else {
         return Ok(None);
     };
-    let code_end = code + u64::from(b.code_size + view.tail_bytes());
+    let code_end = code + u64::from(b.code_size + view.tail_extent());
     let mut links = b.links;
     unsafe {
         copy_record(
@@ -1748,6 +1911,7 @@ pub fn copy(
     let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
     if let Some(p) = placed {
         tails_counted(p);
+        hint_pad(p);
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
             c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
@@ -1798,10 +1962,10 @@ pub fn copy_pooled(
     );
     let exit_forms = e.exit_forms & area::FORMS;
     let view = tail_view(0, len as u32, 0, e.links, e.dispatch_exit, e.rep_exits, exit_forms);
-    let Some((code, hot)) = reserve(code_size + u64::from(view.tail_bytes()), want) else {
+    let Some((code, hot)) = reserve(code_size + u64::from(view.tail_extent()), want) else {
         return Ok(None);
     };
-    let code_end = code + code_size + u64::from(view.tail_bytes());
+    let code_end = code + code_size + u64::from(view.tail_extent());
     let count = e.relocs_count();
     // (decode bounds the count by `MAX_RELOCS`.)
     let mut relocs = [0u32; MAX_RELOCS as usize];
@@ -1868,6 +2032,7 @@ pub fn copy_pooled(
     let placed = unsafe { file(record, tables.as_ptr(), tables.len(), 0) };
     if let Some(p) = placed {
         tails_counted(p);
+        hint_pad(p);
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
             c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
@@ -2217,9 +2382,11 @@ fn relocate(code: u64, dispatch_exit: u64, to: u64) {
 use area::tail_words;
 /// Indirect plan step 1: writes the words `b` (its record as it will be filed, its code placed at `b.code` and relocated,
 /// not yet synchronized) has appended after its code ([`Block::tail`]), for the slot at `slot` ([`dispatcher_for`] its
-/// context), and makes its computed exit's `b` go to its own words when it has them and a slot (with none it stays `b` to
-/// the miss, [`relocate`]). Always every entry, whatever was in the code area there before (a checked link reaches a link
-/// point's entry only once [`link`] made it, after rewriting its `bl` for the slot then).
+/// context), and makes its computed exit's `b` go where [`Block::exit_branch`] says: its own words when it has them (with
+/// no slot their `bl` names slot 0's lookup form, the miss's), a return to its slot's return form (return plan). Its call
+/// pair (return plan) starts as two `b` to the miss: [`link`] writes its `bl`, a fill its pad. Always every word, whatever
+/// was in the code area there before (a checked link reaches a link point's entry only once [`link`] made it, after
+/// rewriting its `bl` for the slot then).
 fn append(b: &Block, slot: u64) {
     for p in [None].into_iter().chain((0..MAX_LINK_POINTS).map(Some)) {
         let Some(at) = b.tail(p) else {
@@ -2227,10 +2394,15 @@ fn append(b: &Block, slot: u64) {
         };
         let words = tail_words(at, slot, b.tail_calls(p));
         unsafe { ((area::CODE_WRITE_VA + at) as *mut [u32; 3]).write_volatile(words) };
-        if p.is_none() && slot != area::DISPATCH_MISS as u64 {
-            let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-            unsafe { ((area::CODE_WRITE_VA + exit) as *mut u32).write_volatile(branch(exit, at)) };
-        }
+    }
+    if let Some(at) = b.pair() {
+        let miss = area::DISPATCH_MISS as u64;
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut [u32; 2]).write_volatile([branch(at, miss), branch(at + 4, miss)]) };
+    }
+    let to = b.exit_branch(slot);
+    if b.dispatch_exit != 0 && to != slot {
+        let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
+        unsafe { ((area::CODE_WRITE_VA + exit) as *mut u32).write_volatile(branch(exit, to)) };
     }
 }
 /// Indirect plan step 1's counters for a block just filed with appended words: its computed exit's (as a jump or a call)
@@ -2504,12 +2676,9 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     };
     // Indirect plan step 1: a checked link of shared code goes to its point's appended words (a branch of its own, whose
     // `bl` names the slot's lookup form, written below); any other checked link to the slot.
-    let point_entry = |p: &LinkPoint| match source.links.iter().position(|q| q.offset == p.offset).and_then(|k| source.tail(Some(k))) {
-        Some(t) if checked => t,
-        _ => entry,
-    };
     for p in points() {
-        if !unlinked(source, p) && !links_to(word_at(p), point_entry(p)) {
+        let k = source.links.iter().position(|q| q.offset == p.offset).unwrap_or(0);
+        if !unlinked(source, p) && !point_links_to(source, k, word_at(p), entry, checked) {
             return Link::Bad;
         }
     }
@@ -2564,8 +2733,9 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     for (k, p) in source.links.iter().enumerate().filter(|&(_, p)| named(p) && unlinked(source, p)) {
         let at = word_at(p);
         let original = word(at);
-        let w = match source.tail(Some(k)) {
-            Some(t) if checked => {
+        let call = source.call_points() >> k & 1 != 0;
+        let w = match (source.tail(Some(k)), source.pair()) {
+            (Some(t), _) if checked => {
                 // (Its `bl` for the slot now: at placement the context may have had none.)
                 let first = tail_words(t, entry, source.tail_calls(Some(k)))[0];
                 if word(t) != first {
@@ -2575,6 +2745,22 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
                 // Always `b`, never `link_word`'s `nop`: a point's appended entry may follow its `svc` word directly (the
                 // code's last word), and `unlink_word`, `svc_slot` and the host's audit read a checked link as a `b`.
                 branch(at, t)
+            }
+            // Return plan: a checked call from absolute code (no words of its own) goes to its slot's call form, which
+            // calls the lookup form, then `blr x1`: it pushes.
+            _ if checked && call => {
+                counted(count::CALL_FORM_LINKS);
+                branch(at, entry + area::SLOT_CALL as u64)
+            }
+            // Return plan: a direct call's link word is `b` to its pair (always a `b`), whose first word `bl` the target
+            // (written first, so the word is never reached before it).
+            (_, Some(pair)) if call => {
+                let first = area::bl_word(pair, to);
+                if word(pair) != first {
+                    rewrite(pair, first);
+                }
+                counted(count::PAIR_LINKS);
+                branch(at, pair)
             }
             _ => link_word(at, to),
         };
@@ -2597,6 +2783,10 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     }
     if linked != 0 && checked {
         counted(count::CHECKED_LINKS);
+    }
+    // Return plan: the return address's entry, if there, names the caller's pad now.
+    if linked != 0 && source.call_points() != 0 {
+        pad_at_link(source);
     }
     // (Every build: the forms' counts the tests need, local and absolute into shared.)
     #[cfg(not(feature = "pic-count"))]
@@ -2656,6 +2846,34 @@ fn links_to(at: u64, entry: u64) -> bool {
         }
     }
     false
+}
+/// The pair word at `pair` calls `entry`: `bl` to it, or (`pic-count` builds) to a counting stub ending in `b` to it.
+fn calls_to(pair: u64, entry: u64) -> bool {
+    let w = word(pair);
+    if w == area::bl_word(pair, entry) {
+        return true;
+    }
+    #[cfg(feature = "pic-count")]
+    {
+        let s = pair.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+        if w >> 26 == 0x25 && stub_placed(s) && s >= area::HEAD_BYTES as u64 && stub_load(word(s)) && word(s + 12) == branch(s + 12, entry) {
+            return true;
+        }
+    }
+    false
+}
+/// Link point `k` of `source`, whose patched word is at `at`, is linked into `entry` (a checked link's: its slot): as
+/// [`link`] writes it. A checked link: `b` to the point's appended words (shared code), to the slot's call form (a call
+/// from absolute code, return plan), or to the slot. A direct call (return plan): `b` to its pair, whose `bl` calls `entry`.
+/// Else `b` to `entry`.
+fn point_links_to(source: &Block, k: usize, at: u64, entry: u64, checked: bool) -> bool {
+    let call = source.call_points() >> k & 1 != 0;
+    match (source.tail(Some(k)), source.pair()) {
+        (Some(t), _) if checked => links_to(at, t),
+        _ if checked && call => word(at) == branch(at, entry + area::SLOT_CALL as u64),
+        (_, Some(pair)) if call && !checked => word(at) == branch(at, pair) && calls_to(pair, entry),
+        _ => links_to(at, entry),
+    }
 }
 /// PIC study (`pic-count` builds): the live block a counting stub holding native address `pc` enters ([`stub`]): `pc`
 /// in no block, the stub's first word a counter load and its last a `b` to a live block's entry.
@@ -3020,11 +3238,14 @@ fn unlink_word(r: LinkRecord) -> Option<u64> {
             ..(area::DISPATCH + area::DISPATCH_BYTES) as u64;
         let to = destination(at);
         let into = word(at) & 0xfc00_0000 == 0x1400_0000
-            && (slots.contains(&to) && to % area::DISPATCH_SLOT_BYTES as u64 == 0 || source.tail(Some(r.point())) == Some(to));
+            && (slots.contains(&to) && matches!(to as usize % area::DISPATCH_SLOT_BYTES, 0 | area::SLOT_CALL)
+                || source.tail(Some(r.point())) == Some(to));
         return (into && r.original == pic::SVC_LINK).then(|| restore(at));
     }
+    // (Return plan: a direct call's word is `b` to its pair, whose `bl` must call the entry; the pair is left as it is,
+    // unreachable once the word is restored.)
     let entry = link_entry(source, block(r.target as usize));
-    links_to(at, entry).then(|| restore(at))
+    point_links_to(source, r.point(), at, entry, false).then(|| restore(at))
 }
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
@@ -3318,6 +3539,8 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
         unsafe { (*block_ptr(n)).flags |= DEAD };
         c.killed += 1;
         l2_remove(n);
+        // Return plan: no entry leads into a dead block through its pad.
+        empty_pad_entries(&b);
     } else {
         unsafe { (*block_ptr(n)).checked = 0 };
         c.unvalidated += 1;
@@ -3529,7 +3752,21 @@ fn relink(n: usize) {
             control().relink_dropped += 1;
             continue;
         }
-        unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(link_word(word_at, link_entry(source, block(n)))) };
+        // Return plan: a direct call again through its pair, whose `bl` is written (and synchronized) first, so a relinked
+        // call still pushes.
+        let entry = link_entry(source, block(n));
+        let w = match source.pair() {
+            Some(pair) if source.call_points() >> r.point() & 1 != 0 => {
+                let first = area::bl_word(pair, entry);
+                if word(pair) != first {
+                    rewrite(pair, first);
+                }
+                counted(count::PAIR_RELINKS);
+                branch(word_at, pair)
+            }
+            _ => link_word(word_at, entry),
+        };
+        unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(w) };
         batch[held] = word_at as u32;
         held += 1;
         if held == batch.len() {
@@ -3662,6 +3899,11 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
 /// (`None` the computed exit, `Some(k)` link point k) and the word's index in them. They follow its code, before the next
 /// record's: placement order is address order, and a record with no code has the fill point of its making, past them.
 pub fn tail_at(pc: u64) -> Option<(&'static Block, Option<usize>, u32)> {
+    let (b, offset) = placed_before(pc)?;
+    b.tail_word(offset).map(|(p, w)| (b, p, w))
+}
+/// The last block placed at or below native address `pc` (in the code area past its head), with `pc`'s code-area offset.
+fn placed_before(pc: u64) -> Option<(&'static Block, u64)> {
     let offset = pc.checked_sub(area::CODE_VA).filter(|&o| o >= area::HEAD_BYTES as u64)?;
     let count = control().blocks as usize;
     let (mut lo, mut hi) = (0, count);
@@ -3673,10 +3915,54 @@ pub fn tail_at(pc: u64) -> Option<(&'static Block, Option<usize>, u32)> {
             hi = mid;
         }
     }
-    let b = block(lo.checked_sub(1)?);
-    b.tail_word(offset).map(|(p, w)| (b, p, w))
+    Some((block(lo.checked_sub(1)?), offset))
+}
+/// Return plan: the block, dead ones too, whose call pair holds `pc`, and the word (0 its `bl`, 1 its pad).
+pub fn pair_at(pc: u64) -> Option<(&'static Block, u32)> {
+    let (b, offset) = placed_before(pc)?;
+    b.pair_word(offset).map(|w| (b, w))
+}
+/// Return plan: the block whose pad is at native address `pc` (dead ones too).
+#[cfg_attr(not(feature = "link-check"), allow(dead_code))]
+pub fn pad_owner(pc: u64) -> Option<&'static Block> {
+    let (b, offset) = placed_before(pc)?;
+    (b.pad() == Some(offset)).then_some(b)
 }
 
+/// Return plan test ([`area::PIC_TEST_RAS`] + 2 and + 3): the code-area offset of a pad (`pair` false) or a call pair's `bl`
+/// of a block of `entered`'s context among the newest records, a dead block's when one has them, whose word leads to the miss
+/// or into `entered` (a pair's: of a call to `entered`'s RIP), so that a late stop still runs `entered`.
+pub fn ras_for_test(entered: &Block, pair: bool, pick: u64) -> Option<u64> {
+    let count = control().blocks as usize;
+    let miss = area::DISPATCH_MISS as u64;
+    let mut live = None;
+    let mut seen = 0u64;
+    for n in (count.saturating_sub(1 << 14)..count).rev() {
+        let b = block(n);
+        if b.context != entered.context {
+            continue;
+        }
+        let at = if pair {
+            let to_entered = b.links.iter().enumerate().any(|(k, p)| {
+                b.call_points() >> k & 1 != 0 && pic::moved(p.target, b.rip, running_rip(b), bits32(b.context)) == entered.rip
+            });
+            b.pair().filter(|&at| {
+                to_entered && (word(at) == branch(at, miss) || word(at) == area::bl_word(at, code_of(entered).entry() - area::CODE_VA))
+            })
+        } else {
+            b.pad().filter(|&at| word(at) == branch(at, miss) || word(at) == branch(at, code_of(entered).full_entry() - area::CODE_VA))
+        };
+        let Some(at) = at else { continue };
+        if b.flags & DEAD != 0 {
+            return Some(at);
+        }
+        seen += 1;
+        if live.is_none() || seen <= pick % 4 + 1 {
+            live = Some(at);
+        }
+    }
+    live
+}
 /// Indirect plan step 1 test ([`area::PIC_TEST_TAIL`]): the code-area offset of one exit's appended words of a block of
 /// `context` among the newest records, a dead block's when one has them (`pick` chooses among its entries).
 pub fn tail_for_test(context: u64, pick: u64) -> Option<u64> {

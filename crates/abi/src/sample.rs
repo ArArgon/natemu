@@ -172,6 +172,9 @@ pub const TAIL: u8 = 8;
 pub const TAIL_WORD: u16 = 3;
 pub const TAIL_CALL: u16 = 4;
 pub const TAIL_POINT: u16 = 8;
+/// Return plan: in a block's call pair (`cache::Block::pair`): word 0 its `bl`, 1 its pad, with [`TAIL_CALL`]; `rip` is x0
+/// (at the pad, the return address).
+pub const TAIL_PAIR: u16 = 16;
 
 /// `flags` of a sample in a block ([`BLOCK`], [`PROBE`], [`STEP`]): the PC was in the block's hot copy; the block was dead
 /// (its code still ran); its native offset did not fit `at` (saturated).

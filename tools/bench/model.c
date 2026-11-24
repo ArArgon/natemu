@@ -38,6 +38,26 @@ int main(int argc, char **argv) {
             insns += 2;                       /* dec, jnz */
         }
         r[RCX] = 0;
+    } else if (!strncmp(b, "chain", 5)) {
+        /* callchain.asm: chainK-dD[-cpuid|-port]; per iteration a xorshift64 step, then the chain (per level: 4 callers,
+         * selector = r10 & 3, then r10 rotated right by 2; paths of 9, 10, 11, 12 instructions; 1 caller: 3). */
+        int k = 0, depth = 0;
+        if (sscanf(b, "chain%d-d%d", &k, &depth) != 2 || (k != 1 && k != 4) || depth < 1 || depth > 32) return 2;
+        int trip = strstr(b, "-cpuid") ? 1 : strstr(b, "-port") ? 2 : 0;
+        uint64_t bottom = trip == 1 ? 9 : trip == 2 ? 5 : 2, sum = (uint64_t)depth * (depth + 1) / 2;
+        insns = 1;
+        for (uint64_t c = n; c; c--) {
+            r[R9] ^= r[R9] << 13; r[R9] ^= r[R9] >> 7; r[R9] ^= r[R9] << 17;
+            r[R10] = r[R9];
+            insns += 14 + bottom;
+            for (int d = 0; d < depth; d++) {
+                if (k == 4) { insns += 9 + (r[R10] & 3); r[R10] = r[R10] >> 2 | r[R10] << 62; }
+                else insns += 3;
+            }
+            r[RAX] = sum; r[R8] += sum;
+            if (trip) r[RDX] = 0;
+        }
+        r[RCX] = 0;
     } else if (!strcmp(b, "mixed")) {
         if (argc < 20) return 2;
         uint8_t *m = malloc(65536); FILE *f = fopen(argv[19], "rb"); if (!f || fread(m, 1, 65536, f) != 65536) return 3; fclose(f);
