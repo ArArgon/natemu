@@ -325,6 +325,8 @@ class Markers(unittest.TestCase):
         snap = [(0, [0, 0, 0, 0, 0, 0]), (10, [1, 5, 0, 0, 2, 7]), (20, [1, 9, 4, 0, 6, 7])]
         self.assertEqual(sr.buckets_between(snap, 10, 25, names), dict(start=0, guest=8e-9, halted=4e-9))
         self.assertIsNone(sr.buckets_between(snap, 20, 25, names))
+        self.assertEqual(sr.buckets_between(snap, -5, 10, names), dict(start=1e-9, guest=7e-9, halted=7e-9))   # from 0 before the first
+        self.assertIsNone(sr.buckets_between(snap, -9, -5, names))
         self.assertEqual(sr.bucket_names()[:4], ['start', 'guest', 'host', 'halted'])
 
 

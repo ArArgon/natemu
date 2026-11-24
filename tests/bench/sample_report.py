@@ -241,11 +241,13 @@ def bucket_names(root=ROOT):
 
 
 def buckets_between(snap_lines, t0, t1, names):
-    """Seconds per bucket summed over vCPUs between the last snapshots at or before t0 and t1 (ns), or None."""
+    """Seconds per bucket summed over vCPUs between the last snapshots at or before t0 and t1 (ns; before the first snapshot
+    every bucket is 0), or None when no snapshot lies between them."""
     times = [t for t, _ in snap_lines]
     i, j = bisect.bisect_right(times, t0) - 1, bisect.bisect_right(times, t1) - 1
-    if i < 0 or j < 0 or j <= i: return None
-    a, b, n = snap_lines[i][1], snap_lines[j][1], len(names)
+    if j < 0 or j <= i: return None
+    b, n = snap_lines[j][1], len(names)
+    a = snap_lines[i][1] if i >= 0 else [0] * len(b)
     return {k: sum(b[v * n + x] - a[v * n + x] for v in range(len(a) // n)) / 1e9 for x, k in enumerate(names)}
 
 
