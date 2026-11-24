@@ -71,9 +71,6 @@ class Binary(unittest.TestCase):
         cls.text = subprocess.run(['objdump', '-d', '-C', '--no-show-raw-insn', str(RUNTIME)], check=True,
                                   capture_output=True, text=True).stdout
 
-    def problems(self, text):
-        return c.check(text)[1]
-
     def mutate(self, pattern, replacement, count=1):
         text, n = re.subn(pattern, replacement, self.text, count=count, flags=re.M)
         self.assertEqual(n, count, pattern)
@@ -82,15 +79,30 @@ class Binary(unittest.TestCase):
     def test_the_built_runtime_passes(self):
         self.assertEqual(self.problems(self.text), [])
 
-    def resume_time_store(self, store):
-        """The EL0 sampler's resume-time store (`profile` builds) put into this runtime's resume_exception, before `mov x16, x0`."""
-        return self.mutate(r'(<resume_exception>:\n(?:.*\n)*?)(\s*[0-9a-f]+:\s+)(mov\tx16, x0)$',
-                           rf'\1\2mrs\tx10, cntvct_el0\n\2ldr\tx9, 0x1000 <_start>\n\2{store}\n\2\3')
+    def problems(self, text, profile=False):
+        return c.check(text, profile=profile)[1]
 
-    def test_the_samplers_resume_time_store_is_allowed_and_nothing_else(self):
-        self.assertEqual(self.problems(self.resume_time_store('str\tx10, [x9]')), [])
-        self.assertTrue(self.problems(self.resume_time_store('str\tx11, [x9]')))
-        self.assertTrue(self.problems(self.resume_time_store('str\tx10, [x8]')))
+    def resume_time_store(self, store, at=None):
+        """The EL0 sampler's resume-time store (`profile` builds) put into this runtime's resume_exception before `mov x16, x0`,
+        its literal (at 0xfff000) the address `at` (default: Head::resume_time in the study part's first page, 0x7000 into
+        the lookup area: a page-aligned offset)."""
+        tops = c.constants()[0]
+        at = tops['LOOKUP'][0] + 0x7000 + tops['HEAD_RESUME_TIME'] if at is None else at
+        text = self.mutate(r'(<resume_exception>:\n(?:.*\n)*?)(\s*[0-9a-f]+:\s+)(mov\tx16, x0)$',
+                           rf'\1\2mrs\tx10, cntvct_el0\n\2ldr\tx9, 0xfff000 <x>\n\2{store}\n\2\3')
+        return text + f'\n  fff000: 00 00 00 00 \t.word\t{at & 0xffffffff:#010x}\n  fff004: 00 00 00 00 \t.word\t{at >> 32:#010x}\n'
+
+    def test_the_samplers_resume_time_store_only_in_a_profile_build_and_only_to_resume_time(self):
+        tops = c.constants()[0]
+        self.assertEqual(self.problems(self.resume_time_store('str\tx10, [x9]'), profile=True), [])
+        self.assertTrue(self.problems(self.resume_time_store('str\tx10, [x9]')))                   # not a profile build
+        self.assertTrue(self.problems(self.text, profile=True))                                     # a profile build without it
+        self.assertTrue(self.problems(self.resume_time_store('str\tx11, [x9]'), profile=True))
+        self.assertTrue(self.problems(self.resume_time_store('str\tx10, [x8]'), profile=True))
+        lo, hi = tops['LOOKUP']
+        for wrong in (lo + 0x7000 + tops['HEAD_RESUME_TIME'] - 8, hi + tops['HEAD_RESUME_TIME'], tops['EXCEPTION_STACK_TOP']):
+            with self.subTest(hex(wrong)):
+                self.assertTrue(self.problems(self.resume_time_store('str\tx10, [x9]', wrong), profile=True))
 
     def test_corruptions_are_refused(self):
         cases = {

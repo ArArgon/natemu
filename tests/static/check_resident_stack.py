@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Resident stack bound (contract 62) and ERET-path audit (what contract 61 still covers) of the runtime binary.
 
-    python3 tests/static/check_resident_stack.py [RUNTIME]
+    python3 tests/static/check_resident_stack.py [--profile] [RUNTIME]
+
+--profile: RUNTIME is the EL0 sampler's resident (`--features perf,profile`), whose resume_exception also stores CNTVCT to
+Head::resume_time before `mov sp` (refused in any other build).
 
 RUNTIME defaults to target/aarch64-unknown-none/release/natemu-runtime (build it first). Disassembles it with
 `objdump -d -C` and fails (exit 1) on any violation of:
@@ -83,6 +86,16 @@ def constants(root=ROOT):
     stack = re.search(r'pub const STACK_BYTES: usize = (0x[0-9a-f_]+);', abi)
     if not (exc and boot and stack and exc[1] == exc[2]):
         raise SystemExit('stack reservations not found in the host/abi sources: update check_resident_stack.py')
+    # The EL0 sampler's Head::resume_time (profile builds): the lookup area (LOOKUP_VA to the next area's VA) and the
+    # field's offset in the head (its u64 fields in order).
+    vas = {m[1]: private + num(m[2]) for m in re.finditer(r'pub const (\w+_VA): u64 = PRIVATE \+ (0x[0-9a-f_]+);', abi)}
+    head = re.search(r'pub struct Head \{(.*?)\n\}', (root / 'crates/abi/src/sample.rs').read_text(), re.S)
+    fields = re.findall(r'pub (\w+): u64,', head[1]) if head else []
+    if 'LOOKUP_VA' not in vas or 'resume_time' not in fields or len(fields) != len(re.findall(r'pub \w+: ', head[1])):
+        raise SystemExit('the lookup area or Head::resume_time not found in the abi sources: update check_resident_stack.py')
+    lo = vas['LOOKUP_VA']
+    tops['LOOKUP'] = (lo, min(v for v in vas.values() if v > lo))
+    tops['HEAD_RESUME_TIME'] = 8 * fields.index('resume_time')
     return tops, num(exc[1]), num(stack[1])
 
 
@@ -213,8 +226,9 @@ def nested(info, gate):
     return total + worst, problems
 
 
-def eret_problems(funcs, words, tops):
-    """The ERET path, the gates' save sequences and the vectors, instruction by instruction."""
+def eret_problems(funcs, words, tops, profile=False):
+    """The ERET path, the gates' save sequences and the vectors, instruction by instruction. `profile`: the EL0 sampler's
+    resident, whose resume-time store is allowed (and required to store to `Head::resume_time`)."""
     problems = []
     erets = [(n, a) for n, insns in funcs.items() for a, i in insns if i == 'eret']
     body = funcs.get('resume_exception', [])
@@ -231,10 +245,19 @@ def eret_problems(funcs, words, tops):
     skip = lambda n, i: re.sub(rf' 0x[0-9a-f]+ <{n}\+0x[0-9a-f]+>$', ' SKIP', i) if re.match(r'(cbz|tbz) ', i) else i
     got = [skip('resume_exception', re.sub(r'^ldr x9, 0x[0-9a-f]+ <.*', 'ldr x9, LIT', i)) for _, i in body]
     # The EL0 sampler's resident (`profile` feature): CNTVCT stored to `Head::resume_time` after the SPSR, before `mov sp`,
-    # in x9 and x10 only (both loaded from the frame below). Only this exact store is allowed there.
+    # in x9 and x10 only (both loaded from the frame below). Only this exact store is allowed there, only in a `profile`
+    # build (--profile), and only to Head::resume_time: in the vCPU's lookup area, at its offset in the study part's
+    # first page (the study part is page-aligned; its exact offset is a chain of struct sizes the sources do not spell).
     sp_literal = 11
-    if got[7:10] == PROFILE_RESUME_TIME:
-        got = got[:7] + got[10:]; body = body[:7] + body[10:]
+    if profile:
+        if got[7:10] != PROFILE_RESUME_TIME:
+            problems.append(f'resume_exception: no resume-time store after the SPSR ({got[7:10]}), want {PROFILE_RESUME_TIME}')
+        else:
+            at, (lo, hi), off = literal(words, body, 9), tops['LOOKUP'], tops['HEAD_RESUME_TIME']
+            if at is None or not lo <= at < hi or (at - lo) % 4096 != off:
+                problems.append(f'resume_exception: the resume-time store goes to {at and hex(at)}, not Head::resume_time '
+                                f'(lookup area {lo:#x}-{hi:#x}, page offset {off:#x})')
+            got = got[:7] + got[10:]; body = body[:7] + body[10:]
     if got != want:
         diff = next((f'#{k}: `{g}`, want `{w}`' for k, (g, w) in enumerate(zip(got, want)) if g != w),
                     f'{len(got)} instructions, want {len(want)}')
@@ -268,7 +291,7 @@ def eret_problems(funcs, words, tops):
     return problems
 
 
-def check(text, root=ROOT):
+def check(text, root=ROOT, profile=False):
     """(report lines, problems) for an `objdump -d -C --no-show-raw-insn` listing of the runtime."""
     tops, reserve, boot_reserve = constants(root)
     funcs, words = parse(text)
@@ -295,15 +318,18 @@ def check(text, root=ROOT):
         lines.append(f'{entry}: {len(uses)} SP uses or literal loads, budget 0 (SP_EL0)')
         if uses or entry not in funcs:
             problems.append(f'{entry}: uses the stack or a literal ({uses}) or is missing; its budget is 0')
-    problems += eret_problems(funcs, words, tops)
+    problems += eret_problems(funcs, words, tops, profile)
     return lines, list(dict.fromkeys(problems))
 
 
 def main():
-    runtime = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT
+    args = sys.argv[1:]
+    profile = '--profile' in args            # the EL0 sampler's resident (`--features perf,profile`)
+    args = [a for a in args if a != '--profile']
+    runtime = pathlib.Path(args[0]) if args else DEFAULT
     text = subprocess.run(['objdump', '-d', '-C', '--no-show-raw-insn', str(runtime)], check=True,
                           capture_output=True, text=True).stdout
-    lines, problems = check(text)
+    lines, problems = check(text, profile=profile)
     print('\n'.join(lines + [f'FAIL {p}' for p in problems] + ['ok' if not problems else f'{len(problems)} problem(s)']))
     return 1 if problems else 0
 

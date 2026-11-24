@@ -18,7 +18,7 @@ smoke = true
 # The same bounds and ERET audit of the EL0 sampler's resident (`--features perf,profile`: the sample bell's record on the
 # IRQ path, docs/restructure/el0-sampler-plan.md).
 [suite.cases."stack-profile"]
-argv = ["tests/static/check_resident_stack.py", "{runtime_profile}"]
+argv = ["tests/static/check_resident_stack.py", "--profile", "{runtime_profile}"]
 needs = { perf = true }
 
 [suite.cases."barriers"]
