@@ -68,7 +68,10 @@ pub fn place(requests: &[Request]) -> crate::Result<Vec<Placed>> {
             let r = &requests[i];
             (std::cmp::Reverse(r.len), r.slot, r.function, r.bar)
         });
-        // Largest first from an aligned start: every later (smaller, power-of-two) BAR is aligned where the last ended.
+        // Upward, largest first: after the first BAR, every later (smaller, power-of-two) BAR is aligned where the last
+        // ended, so they follow without gaps. The first is aligned up from the window's start, which for memory
+        // (WINDOW.0 + 2 MiB) is only 2 MiB aligned: a larger first BAR leaves a hole below it that nothing fills (one
+        // 128 MiB BAR lands at E8000000H). Accepted: today's BARs are small (at most 64 KiB), so no hole arises.
         let mut next = window.0;
         for i in order {
             let r = &requests[i];
