@@ -1,5 +1,7 @@
 # Guest code review: what natemu runs at EL0, and where its time most likely goes
 
+Status (November 23, 2026): measured again with framework cases; see the [EL0 sampler findings](el0-sampler-findings.md).
+
 November 14, 2026, branch `perf-real-workload` at `4b19f44` (second batch confirmed). Group G of the
 [architecture review](architecture-review-20261113.md) (root cause D). Documenting review: no code change, no VM run.
 The compiler `fexc` (a host process) was run directly on x86 bytes, as the host runs it, and its Arm output read. Evidence
