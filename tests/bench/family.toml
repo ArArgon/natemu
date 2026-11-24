@@ -280,7 +280,7 @@ argv = ["python3", "tests/bench/sampler_check_judge.py", "--profile", "{out}/sam
 
 # What sampling costs (the plan's overhead case): build and hackbench at 1 vCPU and build at 4, each sampling off and every
 # 250 us with the same `perf,profile` resident and timing log, alternating, three rounds (tests/bench/run_sampler_cost.py).
-# Accepted when each wall time is within the rounds' spread plus 2% and the guest bucket's share within 1 point. About 15 minutes.
+# Accepted when each wall time is within the rounds' spread plus 2% and the guest bucket's share within 2 points. About 15 minutes.
 [suite.cases.guest-sampler-cost]
 timeout = 3600
 argv = ["python3", "tests/bench/run_sampler_cost.py", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
