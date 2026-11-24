@@ -398,3 +398,72 @@ argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "natemu", "
 [suite.cases.display-fill-qemu]
 argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "qemu", "--inputs", "{display_inputs}", "--out", "{out}",
         "--qemu", "{qemu_system}"]
+
+
+# The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
+# plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
+# (tests/bench/plugins/indirect.c, artifacts.census_plugin). Counts per guest instruction, not timings: a case claims cores
+# for QEMU's threads, not the whole machine. census-check runs the plugin on a small known program
+# (tests/bench/plugins/census_check.asm) and compares every count; it runs whenever the family does.
+[[suite]]
+name = "census-check"
+kind = "judged"
+harness = "census_harness.py:Census"
+params = { timeout = 600 }
+
+[suite.cases.census-check]
+argv = ["tests/bench/run_census.py", "check", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}"]
+needs = { cores = 1 }
+
+# The benchmarks' census: tools/bench/run.py's QEMU boot (its like-for-like CPU model QCPU) at 1 vCPU with the plugin; the
+# report (OUT/NAME.census.md, NAME.census-report.json) is of run 1, from NATEMU-BENCH-START to END. A boot is capped at
+# 3000 s. io5-solo32-census: run_io5.py's QEMU boot of the 32-bit toolchain build, the plugin's segments its steps, stopped
+# after i386-make or at 2700 s (io5-solo32-qemu's bound); passes when the 64-bit configure finished (reports for each
+# step that did). Profiles of the guest program, not timings, and not on the benchmarks page.
+[[suite]]
+name = "census"
+kind = "bench"
+harness = "census_harness.py:Census"
+tier = "bench"
+params = { timeout = 3600 }
+
+[suite.cases.guest-build-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "build", "--bench", "build", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-hackbench-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "hackbench", "--bench", "hackbench", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-luajit-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "luajit", "--bench", "luajit", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-sqlite-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "sqlite", "--bench", "sqlite", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-zstd-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "zstd", "--bench", "zstd", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-startup32-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "startup32", "--bench", "startup32", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.guest-scimark32-sse2-census]
+argv = ["tests/bench/run_census.py", "guest", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--name", "scimark32-sse2", "--bench", "scimark32-sse2", "--kernel", "{kernel}", "--initrd", "{bench_image}"]
+needs = { cores = 2 }
+
+[suite.cases.io5-solo32-census]
+timeout = 3900
+argv = ["tests/bench/run_census.py", "io5", "--qemu", "{qemu_plugins}", "--plugin", "{census_plugin}", "--out", "{out}",
+        "--inputs", "{io5_inputs}", "--vcpus", "4", "--ram", "8", "--budget", "2700"]
+needs = { cores = 5, network = true }

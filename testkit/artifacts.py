@@ -300,6 +300,95 @@ def qemu_system() -> pathlib.Path:
     return b
 
 
+QEMU_PLUGINS_CONFIGURE = [*QEMU_CONFIGURE, '--enable-plugins']    # plugins need glib's gmodule (Homebrew's glib has it)
+
+
+def _qemu_tree_build(label: str, k: str, configure: list, out: pathlib.Path) -> None:
+    """QEMU from the pinned tarball (resource qemu-src), configured with `configure`, built and installed into `out`, as
+    qemu_system builds it (the same Homebrew dependencies, wheels and build-info.txt). qemu_system keeps its own copy of
+    these steps: its cache key includes its source, so moving them here would rebuild the control group."""
+    decl = resources.declarations()['qemu-src']
+    brew = shutil.which('brew') or '/opt/homebrew/bin/brew'
+    if not os.access(brew, os.X_OK):
+        raise BuildFailure(label, 'needs Homebrew for its build dependencies: brew install ' + ' '.join(QEMU_BUILD_DEPS))
+    prefix = subprocess.run([brew, '--prefix'], capture_output=True, text=True, check=True).stdout.strip()
+    versions = subprocess.run([brew, 'list', '--versions', *QEMU_BUILD_DEPS], capture_output=True, text=True).stdout
+    missing = [d for d in QEMU_BUILD_DEPS if not any(l.split()[:1] == [d] for l in versions.splitlines())]
+    if missing:
+        raise BuildFailure(label, 'missing Homebrew build dependencies: brew install ' + ' '.join(missing))
+    tarball, wheels = resources.fetch('qemu-src'), [resources.fetch(r) for r in QEMU_WHEELS]
+    scratch = paths.cache_root() / 'build-tmp' / f'{label}-{k[:16]}-{os.getpid()}'
+    shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
+    env = dict(os.environ, PATH=f'{prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin')
+    try:
+        _run(['tar', '-xf', tarball, '-C', scratch])
+        src = next(scratch.glob('qemu-*'))
+        for w in wheels: shutil.copy(w, src / 'python' / 'wheels' / w.name)
+        (src / 'build').mkdir(exist_ok=True)
+        _run([src / 'configure', f'--prefix={out}', *configure], cwd=src / 'build', env=env)
+        _run(['make', f'-j{os.cpu_count() or 4}'], cwd=src / 'build', env=env)
+        _run(['make', 'install'], cwd=src / 'build', env=env)
+        cc = subprocess.run(['cc', '--version'], capture_output=True, text=True, env=env).stdout.splitlines()[:1]
+        py = subprocess.run(['python3', '--version'], capture_output=True, text=True, env=env).stdout.strip()
+        (out / 'build-info.txt').write_text(
+            f'source: {decl["urls"][0]} sha256 {decl["sha256"]}\nconfigure: {" ".join(configure)}\n'
+            f'compiler: {" ".join(cc)}\npython: {py}\nhomebrew ({prefix}, not pinned):\n{versions}')
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    for exe in ('qemu-system-x86_64', 'qemu-img'):
+        if not (out / 'bin' / exe).is_file(): raise BuildFailure(label, f'make install left no bin/{exe}')
+
+
+def qemu_plugins() -> pathlib.Path:
+    """The entry of QEMU 11.1.2 built like qemu_system (the same pinned tarball and options) plus --enable-plugins, for
+    the computed-exit census (tests/bench/plugins/indirect.c): bin/qemu-system-x86_64 and include/qemu-plugin.h, the
+    header its plugins are built against. Its own cache key: the control group (qemu_system) is never this build."""
+    import inspect
+    if p := _pinned('qemu-plugins'): return pathlib.Path(p)
+    decls = resources.declarations()
+    for r in ('qemu-src', *QEMU_WHEELS):
+        if r not in decls: raise resources.Unpreparable(r, 'not declared in tests/resources.toml')
+    k = cache.key('qemu-plugins', *(decls[r]['sha256'] for r in ('qemu-src', *QEMU_WHEELS)), *QEMU_PLUGINS_CONFIGURE,
+                  inspect.getsource(qemu_plugins), inspect.getsource(_qemu_tree_build))
+
+    def build(out: pathlib.Path):
+        _qemu_tree_build('qemu-plugins', k, QEMU_PLUGINS_CONFIGURE, out)
+        if not (out / 'include' / 'qemu-plugin.h').is_file(): raise BuildFailure('qemu-plugins', 'no include/qemu-plugin.h')
+
+    e = cache.get_or_build('qemu-plugins', k, build)
+    pin_for_run('qemu-plugins', str(e))
+    return e
+
+
+CENSUS_PLUGIN = 'tests/bench/plugins/indirect.c'
+
+
+def census_plugin() -> pathlib.Path:
+    """The census plugin (CENSUS_PLUGIN) compiled against qemu_plugins()'s qemu-plugin.h and Homebrew's glib headers, as
+    QEMU's own contrib plugins are built on macOS (a bundle whose QEMU symbols resolve when QEMU loads it). Keyed by the
+    plugin's source, the QEMU build and this function."""
+    import inspect
+    if p := _pinned('census-plugin'): return pathlib.Path(p)
+    q = qemu_plugins()
+    src = paths.repo_root() / CENSUS_PLUGIN
+    k = cache.key('census-plugin', src.read_bytes(), str(q), inspect.getsource(census_plugin))
+
+    def build(out: pathlib.Path):
+        brew = shutil.which('brew') or '/opt/homebrew/bin/brew'
+        prefix = subprocess.run([brew, '--prefix'], capture_output=True, text=True, check=True).stdout.strip()
+        env = dict(os.environ, PATH=f'{prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin')
+        glib = _run(['pkg-config', '--cflags', 'glib-2.0'], env=env).stdout.split()
+        cmd = ['cc', '-O2', '-g', '-std=gnu11', '-Wall', '-Werror', '-fPIC', '-bundle', '-Wl,-undefined,dynamic_lookup',
+               f'-I{q / "include"}', *glib, '-o', str(out / 'libindirect.so'), str(src)]
+        _run(cmd, env=env)
+        (out / 'build-info.txt').write_text(f'source: {CENSUS_PLUGIN} sha256 {hashlib.sha256(src.read_bytes()).hexdigest()}\n'
+                                            f'qemu: {q}\ncommand: {" ".join(cmd)}\n')
+
+    f = cache.get_or_build('census-plugin', k, build) / 'libindirect.so'
+    pin_for_run('census-plugin', str(f))
+    return f
+
+
 def compile_cache(n: Natemu) -> pathlib.Path:
     """natemu's own compile cache for this build only (spec R8.8), so builds never share or evict each other's."""
     d = paths.cache_root() / 'compile-cache' / n.key
@@ -464,7 +553,8 @@ def _fex_asm() -> pathlib.Path:
 RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
              'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()],
              'qemu-system': lambda: [qemu_system()], 'fex-asm': lambda: [fex_asm()],
-             'perf-runtime': lambda: [perf_runtime()]}
+             'perf-runtime': lambda: [perf_runtime()], 'qemu-plugins': lambda: [qemu_plugins()],
+             'census-plugin': lambda: [census_plugin()]}
 
 
 def resolve(name: str) -> list[pathlib.Path]:

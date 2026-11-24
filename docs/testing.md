@@ -354,6 +354,14 @@ QEMU, `io5-solo32-profile` writes natemu's timing log (`tests/io/io5_compiles.py
 KVM to record that hash and real x86's times. That last case is marked `remote = true`: nothing runs or is timed on this
 Mac, so it takes one core instead of the whole machine, and it is skipped in any run that is not seeding.
 
+The computed-exit census (`census` suite, [EL0 sampler plan](restructure/el0-sampler-plan.md) chunk 2) counts the
+benchmarks' indirect calls, indirect jumps and returns under QEMU: a QEMU 11.1.2 built with plugins
+(`artifacts.qemu_plugins`, its own cache entry beside the control group's `qemu-system`) runs the guest with the plugin
+`tests/bench/plugins/indirect.c`, and `tests/bench/census_report.py` reduces its counts to target-count shares, the
+return model's hit rates and rates per 1,000 guest instructions (`guest-build-census` and the others; `io5-solo32-census`
+for the i386 toolchain build's steps). They are counts, not timings: each claims a few cores, not the machine. The
+plugin's own check, `census-check`, runs a small program whose every count is known and runs with the family.
+
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not
 in the framework yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.
