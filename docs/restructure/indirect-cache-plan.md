@@ -1,242 +1,228 @@
 # Indirect jumps and calls: a branch per site, then a one-entry inline cache (plan)
 
-Status: plan, November 23, 2026, on `m2-sampler` at d7a662c7. Design only: nothing is built or run for it, and it has not
-been reviewed; an independent design review comes before any code (AGENTS.md). The slot forms and the words appended to a
-block are described once, in the [return prediction plan](return-prediction-plan.md) sections 4.1 and 4.2, and are built by
-whichever of the two plans goes first. That plan's section 3 lists what was read in the code; this one adds what concerns
-indirect sites.
+Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 2, after an
+independent design review (section 12): step 1 accepted with fixes, taken in; step 2 deferred. This plan goes first: it builds
+what the [return prediction plan](return-prediction-plan.md) then uses (the slot's forms, the words appended to a block, `blr`
+at indirect calls). Two plans, not one, because each has its own sampler number, benchmarks and A/B.
 
 ## 1. Why
 
 An indirect `jmp` or `call` leaves its block through the computed exit `mov x0, xR; b <slot>`, and the context's one slot
 ends in `br x1` (crates/runtime/src/cache.rs:682-699). Every indirect site of the context, and every return, shares that
-one branch address. Chunk 28 (an experiment, before the data tables) measured 1-2.4 ns per exit with a predictable target and
-4.9-5.4 ns with a random one, 0 ns at a monomorphic site through a compare and a direct branch, and most of the dispatcher's
-samples on the landing word ([guest-code review](guest-code-review-20261114.md) sections 3 and 6).
-
-Two more streams reach the same `br`:
+branch address. Chunk 28 (an experiment, before the data tables) measured 1-2.4 ns per exit with a predictable target, 4.9-5.4
+ns with a random one, 0 ns at a monomorphic site through a compare and a direct branch, and most of the dispatcher's samples on
+the landing word ([guest-code review](guest-code-review-20261114.md) sections 3 and 6). Two more streams reach the same `br`:
 
 - **Checked links.** A literal exit of shared code to another page keeps its page-relative move and branches to the slot
-  (cache.rs:2300-2312). Its target is fixed per instance: within one process such a site has one target, yet it is
-  predicted through the shared branch. Shared code is most user code of multi-process workloads (`build`, the configure and
-  make steps; [pic32 findings](m2-pic32-findings.md)).
-- **Interpreters.** A threaded interpreter (LuaJIT's, `guest-luajit-interp`) ends each handler with its own indirect jump,
-  so that each jump has its own predictor entry natively; through one shared branch that benefit is gone.
+  (cache.rs:2300-2312). Within one process its target is fixed, yet it is predicted through the shared branch. Shared code is
+  most user code of multi-process workloads ([pic32 findings](m2-pic32-findings.md)).
+- **Interpreters.** A threaded interpreter (`guest-luajit-interp`) ends each handler with its own indirect jump so that each
+  has its own predictor entry natively; through one shared branch that is lost.
 
-The census (bench cases `guest-<b>-census`, QEMU with the census plugin on the M2 Max, run 1 of each benchmark), user code,
-per address space, execution-weighted share of each indirect site's main target: `build` 63% (top two 73%), `luajit` 75%,
-`sqlite` 55%, `startup32` 55%, `hackbench`, `zstd`, `scimark` 97-100%. These are lower bounds (the plugin keeps 4 targets per
-site; 21-35% overflowed on `build`, `luajit`, `sqlite`, `startup32`). With targets relative to the site (what a cache in
-shared code can compare), `build` 57%. Checked links are not in the census: they are natemu's, not the guest's.
+The census (bench cases `guest-<b>-census`, QEMU with the census plugin on the M2 Max, run 1 of each benchmark), user code, per
+address space, execution-weighted share of each site's main target: `build` 63% (top two 73%), `luajit` 75%, `sqlite` 55%,
+`startup32` 55%, `hackbench`, `zstd`, `scimark` 97-100%; lower bounds (4 targets kept per site; 21-35% overflow on the first
+four). With targets relative to the site, `build` 57%. Checked links are natemu's exits and are not in the census.
 
-## 2. The design
+## 2. What exists (read in the code)
 
-**Step 1, a branch per site.** The site's `b` goes to two words appended to its block: `bl <its context's lookup form>; br
-x1`. The lookup form probes the table as the slot does and returns with x1 = the target (or the miss's address; section 4.1
-of the return plan). The `bl`/`ret` pair is predicted perfectly by the return stack, and the site's own `br x1` gets a
-predictor entry of its own. No cache, no fill, no patching, no compare: the target is the table's, as now. For an indirect
-call with return prediction built the words are `bl lookup; blr x1; pad` (the return plan's pad after `blr`); without it,
-`bl lookup; br x1`. A checked link's `svc` word becomes `b` to the same two words.
+- Each vCPU's code area, tables and slots are its own: "Blocks and L1 are this vCPU's own ... so a patch stops no other vCPU"
+  (cache.rs:13-14; crates/abi/src/execution.rs:250-257). Placement is a bump fill (`reserve`, cache.rs:105-112).
+- The slot area: 128 slots of 128 bytes (abi execution.rs:282-287); a slot is bound to a context's table (`bind_slot`,
+  `write_slot`, cache.rs:663-735); a computed exit's `b` is relocated to `dispatcher_for(context)` at placement (cache.rs:738,
+  `relocate` at 2124).
+- Data tables (`area::DL1`, abi execution.rs:341-357): (RIP, target) pairs, EL0 read-only, per privilege class, each held by one
+  context; filled by `fill_l1` with the owner's full entry (cache.rs:789-834).
+- Exits (crates/host/src/admission/structure.rs:22-30): literal exits are link points entered at their first word; one
+  computed exit at most (structure.rs:998-1013); four link points at most (abi execution.rs:2522). "x30 is an ordinary
+  allocator temporary: no `bl` is admitted" (structure.rs:61): nothing lives in x30 at a block boundary.
+- Shared code: an instance has no code (`instance`, cache.rs:1407); the template's full entry takes x0 = the RIP and stores the
+  page base (abi execution.rs:1350-1358); links out of it are local (same page, direct) or checked (cache.rs:2300-2321).
+- Stops: in the slot area the vCPU stops at once with the next RIP in x0 (crates/runtime/src/execution.rs:2583); inside a dead
+  block it halts `BAD_STOP` (execution.rs:2601).
+- The sampler classes a slot-area PC as `DISPATCH` with x0 and a call test (crates/abi/src/sample.rs:156-159, 186-192).
 
-**Step 2, a one-entry inline cache.** The appended words grow a compare against one remembered target and a direct branch
-to it, before the step-1 words:
+## 3. The design
+
+### 3.1 The slot's forms (shared with the return plan)
+
+Each bound slot gets three forms with the same probe:
+
+| Form | Ends in | Used by |
+| --- | --- | --- |
+| ordinary (today's) | `br x1` | anything not changed |
+| lookup | `ret` with x1 = the target; miss: `adr x1, DISPATCH_MISS; ret` | step 1's sites |
+| return | `ret x1`; miss: `adr x1, DISPATCH_MISS; ret x1` | the return plan |
+
+Three forms of 13 words need 256-byte slots: `DISPATCH_BYTES` grows to 32 KiB (the probes and `HEAD_BYTES` move; constants
+with asserts). An unbound slot's lookup form is `adr x1, DISPATCH_MISS; ret`. `write_slot` writes all three under one
+synchronization. No form writes NZCV (gates.S:253-257).
+
+### 3.2 Words appended to a block (shared with the return plan)
+
+The resident appends a few words of its own after a block's placed code (cold side), as it writes the hot copy's trampolines.
+They are resident code, not admitted code, with no guest semantics. The record gains their extent and roles; `block_at` covers
+them. An interrupt on one is a block boundary and stops at once, with the next RIP x0 for every word of this plan; the rule is
+checked before the dead-block filter (execution.rs:2601), as the slot rule is. The sampler gets a place `TAIL` (8) with the
+word's role.
+
+### 3.3 Step 1: a branch per site
+
+| Site | Appended words |
+| --- | --- |
+| `jmp r/m`, a checked link that is not a call | `bl <lookup form>; br x1` |
+| `call r/m`, a checked link that is a call (shared code) | `bl <lookup form>; blr x1;` pad |
+
+The site's `b` (or the checked link's `svc` word) goes to them; a split block's hot trampoline goes to them directly. The
+lookup's `bl`/`ret` pair is predicted by the return stack, and the site's own `br`/`blr` gets a predictor entry of its own. The
+target is the table's, as now: no cache, no fill, no patching, no compare, so absolute and shared code are treated alike.
+
+Calls use `blr` from the start, so that every indirect call pushes on the return stack: the return plan needs every call to
+push (its section 4.1). Until that plan is built nothing pops these pushes (returns still end in `br`); the lookup's pairs nest
+above them and stay predicted, and the stack simply wraps. The pad word is `b DISPATCH_MISS`; nothing reaches it until the
+return plan fills entries naming it. A lookup miss reaches the miss through the site's `br`/`blr x1`, with x0 the target; a
+miss through `blr` has pushed, and the resident enters the target directly.
+
+Admission returns which computed exit and which link point is a call (FF /2, E8) as a hint beside the link points; a wrong hint
+changes only the form, never the target.
+
+### 3.4 Registers, flags, exactness, containment
+
+The words use x0 (the target, never written), x1 and x30 (temporaries at a block boundary) and write no flags. The exit's guest
+effects (the branch-target check, a call's push) are done before the site's `b`, as now. EL0 gains no writable and no new
+readable memory, and every target is the table's: containment is today's.
+
+### 3.5 Stale state
+
+Step 1 holds no state: a flush, a death, a CR3 load or a context change act on the tables as now. A dead block's appended
+words stay until a flush (bump fill) and are reached only from its own exits.
+
+### 3.6 32-bit code, hot/cold, extended blocks
+
+Nothing differs for 32-bit code. A block has one computed exit and up to four link points; only the computed exit and checked
+links get appended words. Extended blocks change nothing.
+
+### 3.7 Why it should not lose
+
+Step 1 adds a predicted `bl`/`ret` to every exit, about half a nanosecond (estimate), where the shared branch already predicted
+the target (a history-based predictor can, for a short pattern). It gains where the shared branch mispredicts and the site's own
+does not. The kill-test measures both.
+
+### 3.8 Step 2, deferred: a one-entry inline cache
+
+Built only if the kill-test and the sampler ask for it after step 1. The appended words grow, before step 1's:
 
 ```
-movz/movk x1, #C           2 words (32-bit), 3 (user or kernel 64-bit, `movn` for the kernel's)
+movz/movk x1, #C           2 words (32-bit), 3 (64-bit; `movn` for kernel addresses)
 eor   x1, x1, x0
 cbnz  x1, L
-b     <C's full entry>     a link: a link record, undone like any other
-L: bl <lookup form>; br x1  step 1
+b     <C's full entry>     a link with a record, undone by `prune` (cache.rs:3174) like any other
+L: step 1's words
 ```
 
-In shared code the compare is page-relative: `ldr x1, [x28, #PAGE_BASE]; sub x1, x0, x1; sub x1, x1, #d; cbnz x1, L; b
-<template's full entry>`, for a target on the source's own page and frames only (the local-link rule, cache.rs:2318-2321),
-whose template is right for every instance. Other targets of shared code are never cached; step 1 serves them.
-
-An indirect call under return prediction has two `bl` sites in step 2 (the hit's `bl <entry>` and the miss path's `blr x1`),
-each needing its own pad, while the table holds one pad per return address: the entry names the hit's pad, and a return after
-a miss is mispredicted. Whether step 2 is worth that for calls, or is kept to jumps and checked links, is the kill-test's
-call variant's question (section 5).
-
-## 3. Details
-
-### 3.1 Sites
-
-Computed exits that are not returns (returns go to the return plan's return form): `jmp r/m` and `call r/m`, near; and, in
-shared code, checked links. Admission's hint says which computed exit is a call (FF /2), as for the return plan (its section
-4.3); a wrong hint changes only the form.
-
-### 3.2 Registers, flags, the return stack
-
-The appended words use x0 (the target, never written), x1 and x30 (temporaries at a block boundary: structure.rs:61, the
-dispatcher's x0-x2 rule, gates.S:253-257) and write no flags. The lookup's `bl`/`ret` are balanced, so they leave the guest's
-return-stack entries as they found them; the return plan's predictions are not disturbed.
-
-### 3.3 Filling (step 2)
-
-An empty cache's first word is `bl DISPATCH_MISS`: the first execution enters the resident with x0 = the target and x30 = the
-cache's second word, which names the site (`block_at(x30)` and the record's tail roles). The resident finds or makes the
-target's block as for any miss, writes the compare and the link to it (absolute: the target's full entry; shared: only if the
-target is local, else it writes the first word as `b L`, step 1 forever), records the link, synchronizes once and enters
-the target. The cache is filled once: a later miss goes to step 1 and changes nothing. It becomes empty again when its link
-is undone (the target died or stopped being current, a CR3 load for a target in another page, a flush), and then fills with
-the next target it meets. So a site's hit rate is the share of the first target it meets after each emptying; the census's
-main-target shares bound it. A miss-counting refill (a counter per site in resident data) is left for later.
-
-### 3.4 Unlinking
-
-The cache's `b <entry>` is a link from the site's block to the target, recorded with its original word (the empty form's
-`bl DISPATCH_MISS`, or `b L`). `prune` (cache.rs:3174) undoes it by the existing rules of its segment; nothing new decides
-when. Once undone, the compare words left behind are dead: both outcomes of `cbnz` reach step 1 or the resident.
-
-### 3.5 Other vCPUs
-
-None run or patch this code: each vCPU's code area is its own (cache.rs:13-14). A peer's write to a code page reaches this
-vCPU as a posted invalidation it takes itself (cache.rs:2866-2900); pool templates are copied into the vCPU's own area before
-they run. A fill or an unlink happens while this vCPU is in the resident, so its several words need no atomicity, only one
-synchronization before the vCPU returns to EL0.
-
-### 3.6 Code synchronization on fill
-
-Each fill writes 5-8 words and synchronizes them: `dc cvau` is skipped when CTR_EL0.IDC is set, `ic ivau` when DIC is set,
-then `dsb ish; isb` (cache.rs:2070-2105; the resident reads CTR_EL0 once at start). About 200 ns on an M4 (layout page
-section 2), plus the trip into the resident (microseconds). One fill per site per emptying: the same order as the trips that
-link literal exits today. Step 1 writes code only at placement, with the block.
-
-### 3.7 Containment
-
-EL0 gains nothing it can write. The cache's target is a link to an admitted block's full entry in the site's context, made
-and undone by the resident with a record; the compare guarantees x0 = C (absolute) or x0 = page base + d (shared). The
-shared form reads `PAGE_BASE` in the guest-state page, which the guest can overwrite (the G1 deviation, [boot features
-plan](boot-features-plan.md)); shared code's own literal moves and local links already rely on it in the same way, so a guest
-that overwrites it misdirects only its own execution, into admitted template code at a page it chose, as today. Step 1's
-target is the table's. Nothing here is trusted from guest-writable memory beyond what shared code already reads.
-
-### 3.8 Stale state
-
-| Event | What happens |
-| --- | --- |
-| Flush | everything starts empty |
-| The target dies or stops being current | `prune` undoes the cache's link; the cache is empty |
-| The site's block dies | its links are undone as its other links are; its bytes stay until a flush |
-| CR3 load | links from another page into non-global targets undone, as now; step 1 has no state |
-| Another code context or CPL | the site's block runs only in its context; its lookup form is its context's slot |
-
-### 3.9 Exactness
-
-None changes: the exit's guest effects (the branch-target check, a call's push) are done before the site's `b`, as now.
-
-### 3.10 32-bit code, hot/cold, extended blocks
-
-32-bit targets compare in two words. The appended words follow the block's whole code in the cold side; a split block's hot
-trampoline to its computed exit is pointed at them directly. A block has one computed exit and up to four link points, so at
-most five sites; only checked links and the computed exit get appended words. Extended blocks change nothing.
-
-### 3.11 Stops and the sampler
-
-At every appended word x0 is the target, so an interrupt there stops at once with the next RIP x0, as in the slot area
-(execution.rs:2583). The sampler's `TAIL` place (return plan section 4.11) carries the word's role (lookup pair, cache
-compare, cache branch); the lookup form's own samples stay `DISPATCH`.
-
-### 3.12 Admission and fexc
-
-fexc does not change; admission returns the call/jump hint only. All appended words are resident code. A fexc variant
-(placeholder words emitted after each computed exit) would add admission rules and change every answer and the cache key for
-no gain.
-
-### 3.13 Why it should not lose
-
-Step 1 adds a `bl` and a `ret` (both predicted) to every exit: about half a nanosecond (estimate) where the shared branch
-already predicted the target, which a branch history can do for a site with a short pattern. It gains where the shared branch
-mispredicts and the site's own does not. Step 2 saves the probe on a hit and costs the compare on a miss (three to five
-words), plus the fills. The kill-test measures all three against today.
+- **Shared code:** a page-relative compare (`ldr x1, [x28, #PAGE_BASE]; sub x1, x0, x1; sub x1, x1, #d; cbnz x1, L; b
+  <template's full entry>`), only for a target on the source's own page and frames (the local-link rule, cache.rs:2318-2321).
+  `PAGE_BASE` is in the guest-state page, which the guest can overwrite (G1, [boot features plan](boot-features-plan.md));
+  shared code's own moves and local links already trust it the same way, so an overwrite misdirects only the guest's own
+  execution into admitted code, as today.
+- **Filling:** an empty cache's first word is `bl DISPATCH_MISS`; the resident takes the miss with x0 = the target and x30 = the
+  cache's next word. x30 is guest-influenced (structure.rs:61: any block may write it), so the resident fills only if x30 lies in
+  the appended words of a live block, at a cache role, that cache is empty, and the block's context is the current one;
+  otherwise it serves an ordinary miss. It fills once per emptying (the link undone): no refill counter.
+- **Sync:** one synchronization per fill (`dc cvau` skipped with CTR_EL0.IDC, `ic ivau` with DIC, then `dsb ish; isb`;
+  cache.rs:2070-2105), about 200 ns on an M4 (layout page section 2), plus the trip. Other vCPUs neither run nor patch this code
+  (cache.rs:13-14; peers post invalidations, cache.rs:2866-2900), and the vCPU is in the resident, so the words need no
+  atomicity.
+- **Calls:** the hit's `bl <entry>` and the miss's `blr x1` would need a pad each while the table holds one per return address;
+  the kill-test's call variant says whether step 2 is kept to jumps and checked links.
 
 ## 4. Smallest useful version first
 
-Step 1 for computed exits and checked links, in absolute and shared code alike: it compares nothing, so the page-relative
-question does not arise. With it come the slot's lookup form and the appended words, if the return plan has not built them.
-Left for later: step 2 (absolute first, then shared local targets), a refill policy, caches in the hot stream.
+Step 1 for computed exits and checked links, in absolute and shared code, with `blr` for calls; with it the slot's lookup and
+return forms (the return form unused until the return plan), the appended words, their stop rule and the sampler place. Order:
+this, then the return plan on top, sharing the lookup form; step 2 later, if at all.
 
-## 5. Kill-test (before any natemu change, under an hour)
+## 5. Kill-test
 
-The `host-dispatch-micro` case of the return plan (its section 6), with indirect variants: V0 (today: every site `b slot`,
-the slot's `br`), step 1 (`bl lookup; br x1` per site), step 2 (the cache, filled with each site's main target, step 1 behind
-it), and the same three for indirect calls whose callee returns through the return plan's form (pads after `blr` and after
-the cache's `bl`). Sites: 64, each with 4 targets drawn with the census's main-target shares (0.55, 0.63, 0.75, 0.97, and 1.0), and an
-interpreter pattern (64 handlers, each jumping to the next by a fixed Markov table, as a bytecode stream does). Kill step 1
-if it saves less than 1 ns per exit at 0.63 and 0.75 or loses more than 0.5 ns at 1.0; build step 2 only if it saves 1 ns or
-more per exit over step 1 at 0.75. After step 1 is built, an early check in the VM: `guest-luajit-interp` and `guest-luajit`,
-base and fix, one round; stop and look again if neither moves beyond its spread.
+**Host part (under an hour, before any natemu change):** `host-dispatch-micro`, a case in `tests/bench` (a generator writing the
+assembly and a small C driver timing with `mach_absolute_time`, built with the Xcode command-line tools the README requires;
+exclusive; five rounds, variants alternating; ns per exit with the spread across rounds). Labelled host-native, run on the M2
+Max, never on the benchmarks page. The return plan's variants share it. Indirect variants: V0 (every site `b slot`, the slot's
+`br`), step 1, step 2 (filled with each site's main target); for jumps and for calls. Sites: 64, each with 4 targets at the
+census's main-target shares (0.55, 0.63, 0.75, 0.97, 1.0), visited in a short period (64) and a long one (64 Ki or more), and an
+interpreter pattern (64 handlers jumping by a fixed Markov table). Kill step 1 if it saves less than 1 ns per exit at 0.63 and
+0.75 in the long period, or loses more than 0.5 ns at 1.0; step 2 is considered only if it saves 1 ns or more over step 1 at
+0.75.
+
+**In-VM check (after step 1 is built):** `guest-luajit-interp` and `guest-luajit`, base and fix, one round on the M2 Max; stop
+and look again if neither moves beyond its spread.
 
 ## 6. Tests
 
-Existing families: `faults` (indirect `jmp`/`call` forms, the branch-target #GP before the push, at block sizes default and
-1), `system` (`frame-randomization`; `run_k1.py` and the relink mutations for links), `smp` (`coherence`, `contain`,
-`privilege`), `programs`, `correctness`, `boot`, `io`, the Rust units, the `link-check` resident build.
+Existing families: `faults` (indirect `jmp`/`call` forms, the branch-target #GP before the push, block sizes default and 1),
+`system` (`frame-randomization` and its `tables-*` checks; `run_k1.py` and the relink mutations), `smp` (`coherence`,
+`contain`, `privilege`), `programs`, `correctness`, `boot`, `io`, the Rust units, the `link-check` build.
 
 New cases, each shown to fail when it should:
 
 | Case | Shows | Fails under the mutation |
 | --- | --- | --- |
-| `system` `indirect-sites`: a jump table and a call table with sites of 1, 4 and 64 targets, in 64-bit and i386 builds, in a shared library mapped at two addresses by two processes | every target reached; counters show per-site exits and, in step 2, hits | step 2 caching a non-local target in shared code; the compare word for a 64-bit target truncated to 32 bits |
-| `system` `indirect-death`: targets rewritten (SMC) and remapped (CR3) between executions, at 1 and 4 vCPUs | no cached link survives its target | `prune` skipping cache links (`link-check` halts) |
-| `system` `indirect-stop`: interrupts landing on each appended word | the stop is at x0's RIP | the stop rule at appended words removed |
-| Rust unit: the forms' words (a decoder test over every form, both widths, both compare kinds) | the words branch where they should | each form's branch offset off by one word |
+| `system` `indirect-sites`, 64-bit and i386 builds: a jump table and a call table with sites of 1, 4 and 64 targets, in a shared library mapped at two addresses by two processes | every target reached; counters show per-site exits | a call site given `br` (the push-count check); the lookup form's miss returning a stale x1 |
+| `system` `indirect-stop`: interrupts landing on each appended word, including in a block killed meanwhile | the stop is at x0's RIP, no `BAD_STOP` | the appended-word rule after the dead filter |
+| Rust unit: every form's words (decoder test, both widths) | the words branch where they should | a branch offset off by one word |
 
-While iterating: `tools/natemu-test run tests/system -k 'indirect- or relink'`, `tests/faults -k 'jmp or call'`, the Rust
-units; the affected tier (`tools/natemu-test run`) at the end of the task, since every computed exit changes.
+While iterating: `tools/natemu-test run tests/system -k 'indirect- or relink'`, `tests/faults -k 'jmp or call'`, the Rust units;
+the affected tier (`tools/natemu-test run`) at the end, since every computed exit and the slots change.
 
 ## 7. Runs (fixed budget)
 
-On the M2 Max; its numbers are evidence for the commit message, never the benchmarks page.
-
 | Run | What | Budget |
 | --- | --- | --- |
-| Kill-test | `host-dispatch-micro` (shared with the return plan) | in its 10 minutes |
-| Census addition | per-site last-target and first-target models for indirect sites (what step 1 and step 2 predict), in the same plugin change as the return plan's | in its hour |
-| In-VM early check | `guest-luajit-interp`, `guest-luajit`, base and fix, one round | 20 min |
-| A/B, step 1 | base and fix alternating, three rounds (`TESTKIT_BENCH_AT`): `guest-luajit-interp`, `guest-luajit`, `guest-build`, `guest-sqlite`, `guest-startup32`; the noise is the spread across rounds | about 1.5 h |
-| A/B, step 2 | if built: the same cases, step 1 as the base | about 1.5 h |
-| Profile | one `guest-startup32-profile` run with the fix: the slot's non-return share should fall | 10 min |
-| Gate | once, over both plans, at the end | (the return plan's) |
-| Benchmarks page | only if a page number moves beyond its noise: those cases on the M4, base and fix alternating, three rounds | owner schedules the M4 |
+| Host kill-test | `host-dispatch-micro` (indirect and return variants) | 10 min exclusive |
+| In-VM check | `guest-luajit-interp`, `guest-luajit`, base and fix | 20 min |
+| Iteration | narrow runs; the affected tier once | no heavy runs |
+| A/B | M2 Max, base and fix alternating, three rounds (`TESTKIT_BENCH_AT`): `guest-luajit-interp`, `guest-luajit`, `guest-build`, `guest-sqlite`, `guest-startup32`; noise is the spread across rounds; flush counts reported | about 1.5 h |
+| Profile | `guest-startup32-profile` with the fix: the slot's non-return share should fall, the site words' share show | 10 min |
+| Gate | once, over both plans, after the return plan | one gate |
+| Benchmarks page | only if a number moves beyond its noise: those cases on the M4, alternating, three rounds | owner schedules the M4 |
 
 ## 8. Estimate (agent hours, low confidence)
 
-Step 1, if the return plan has built the appended words and slot forms: lookup form 1, sites and checked links 2, stops and
-sampler roles 1, tests and mutations 2, review fixes 1: about 7 hours (about 11 if it goes first and builds them). Step 2:
-cache forms 2, fill path 3, link records 2, shared compare 2, tests 3, review 2: about 14 hours.
+Slot forms 2, appended words and records 2.5, sites and checked links 2, stops and sampler place 1, the kill-test case 1, tests
+and mutations 2, review fixes 1: about 11 hours. Step 2, if ever: about 14 more.
 
 ## 9. Risks
 
-- The shared branch already predicts most sites through its history: step 1 then costs half a nanosecond per exit for
-  nothing. The kill-test's V0 at 1.0 and the interpreter pattern decide.
-- Appended words on every computed exit and checked link grow the code area (the cache's limit): 8-12 bytes per such block,
-  more flushes; the A/B reports flush counts.
-- Step 2's sticky fill keeps a minority target on a site whose first target was rare; its hit rate may sit well below the
-  census share.
-- Step 2's link records add to the record area's load (reclaims), and its fills add trips into the resident.
-- The new resident paths (stops at appended words, the fill) sit beside the linker's subtlest code.
+- The shared branch already predicts most sites through its history: step 1 costs half a nanosecond per exit for nothing (the
+  kill-test's 1.0 share and short period).
+- Appended words on every computed exit and checked link grow the code area, the cache's limit: 8-12 bytes per such block; the
+  A/B reports flushes.
+- `blr` pushes with no pop until the return plan lands: harmless by design (3.3), but a measured loss would show it.
+- The stop rule at appended words is new resident code next to the linker's.
 
 ## 10. Decision: the sampler number
 
-Step 1: build it when the slot's samples whose target fails the call test (`DISPATCH`, call test no: indirect exits and
-checked links) are 3% or more of EL0 samples on one of `guest-luajit-interp`, `guest-luajit`, `guest-build`, `guest-sqlite`,
-`guest-startup32`, and the kill-test passes. Step 2: the [sampler plan](el0-sampler-plan.md)'s rule (line 274: the slot and
-its landing words 8% or more of EL0 samples on `build` or a make step, and the main-target share 60% or more), read after step
-1 on the lookup form, the sites' `br` and their landing words; today `build` (63%) and `luajit` (75%) meet the share and
-`sqlite` and `startup32` (55%) do not. Under 3%: recorded and left.
+Step 1: build it when the slot's samples whose target fails the call test (`DISPATCH`, call test no: indirect exits and checked
+links) are 3% or more of EL0 samples on a profiled benchmark, and the host kill-test passes. Existing profile cases:
+`guest-startup32-profile`, `guest-cray32-small-profile`, `guest-hackbench32-profile`, `guest-scimark*-profile`; `luajit`,
+`luajit-interp` and `sqlite` need a `-profile` case each (one case in `tests/bench/family.toml`, as the others). Step 2: the
+[sampler plan](el0-sampler-plan.md)'s rule (line 274: slot and landing words 8% or more on `build` or a make step, main-target
+share 60% or more), read after step 1 on the lookup form, the sites' branches and their landing words. Under 3%: recorded and
+left.
 
-## 11. What is verified and what is not
+## 11. Verified and not
 
-Read in the code: as the return plan's section 12, and checked links' form and the local-link rule (cache.rs:2300-2321),
-`PAGE_BASE` in the guest-state page and the shared full entry (abi execution.rs:1350-1358, cache.rs:1506-1540), the posted
-invalidations (cache.rs:2866-2900), the code synchronization (cache.rs:2070-2105). Not verified: how Apple cores predict a
-shared indirect branch with history (the kill-test measures it); the cost of a fill on the M2 Max; the share of exits that are
-checked links (the profile will show it once the forms are apart).
+Read in the code: everything cited with file and line. Not verified: how Apple cores predict a shared indirect branch with
+history (the kill-test measures it); a fill's cost on the M2 Max; the share of slot exits that are checked links (the profile
+shows it once the forms are apart).
 
-## 12. Open questions for the owner
+Defaults taken from the review (no longer open questions): a branch per site first, the cache second; checked links included;
+appended resident words instead of a fexc change; the slot area at 32 KiB; `host-dispatch-micro` as a bench case; step 2's fill
+once per emptying, with x30 validated.
 
-1. Step 1 is not an inline cache but a branch per site, the cache coming second if the kill-test asks for it: agreed?
-2. Checked links of shared code in this plan (they are natemu's exits, not the guest's indirect branches): agreed?
-3. Step 2's fill once per emptying, no refill counter: enough for a first version?
+## 12. Review
+
+Independent design review (Fable, November 23) of revision 1: step 1 accept with fixes, step 2 defer. Taken in: `blr` at
+indirect calls from step 1 on, so every call pushes (the return plan's balance rule), and this plan first; step 2's x30
+validated before a fill (live block, cache role, empty, current context); the stop rule before the dead-block filter; the
+decision read from profile cases; the census addition dropped; the kill-test's short and long periods; the estimate.

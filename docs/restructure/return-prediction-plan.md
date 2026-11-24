@@ -1,395 +1,279 @@
 # Returns predicted by the Arm return stack (plan)
 
-Status: plan, November 23, 2026, on `m2-sampler` at d7a662c7. Design only: nothing is built, nothing was run for it, and
-it has not been reviewed. Before anything is built it takes an independent design review (AGENTS.md), and the sampler
-number in section 11 must be met. The companion plan for indirect `jmp`/`call`, [indirect-cache-plan.md](indirect-cache-plan.md),
-uses the same two pieces of machinery (the slot forms of section 4.1 and the words appended to a block of section 4.2);
-they are described once, here.
-
-Why two plans and not one: the two fixes are decided by different sampler numbers, target different benchmarks and are
-measured by separate A/Bs; the indirect plan's first step is a few hours and may well go first. What they share is
-small and is built by whichever goes first.
+Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 2, after an
+independent design review (section 13) that asked for rework: the return stack is kept balanced on every path, pads keep no
+link records, the kill-test is split into a host part (mechanism) and an in-VM part (the decision), and the decision is read
+on benchmarks the built version covers. It comes second: the [indirect plan](indirect-cache-plan.md)'s step 1 goes first and
+builds what both use (the slot's lookup form, the words appended to a block, `blr` at indirect calls); this plan adds to it.
 
 ## 1. Why
 
-Every guest `ret` leaves its block through a computed exit: `mov x0, xR; b <slot>`, where the slot (one per code context)
-probes the context's data table (`area::DL1`) and ends in `br x1` (`cache::write_slot`, crates/runtime/src/cache.rs:663-715,
-the 13 words at 682-699). One `br` serves every return of the context, so its target is a function of the guest RIP that
-the branch predictor sees through one branch address. The [layout page](translated-code-layout.md) (section 7, line 117)
-puts a return at about 9 ns more than a jump-linked block. Chunk 28's microbenchmark (an experiment, before the data tables)
-measured a dispatcher exit at 1-2.4 ns with a predictable target and 4.9-5.4 ns with a random one, and 77-80% of the
-dispatcher's samples on the word the `br` lands on ([guest-code review](guest-code-review-20261114.md) section 3, item 1):
-the cost is the misprediction, not the probe.
+Every guest `ret` leaves its block through a computed exit, `mov x0, xR; b <slot>`; the slot (one per code context) probes
+the context's data table (`area::DL1`) and ends in `br x1` (`cache::write_slot`, crates/runtime/src/cache.rs:663-715, the 13
+words at 682-699). One `br` serves every return of the context. The [layout page](translated-code-layout.md) (line 117) puts a
+return at about 9 ns more than a jump-linked block; chunk 28 (an experiment, before the data tables) measured an exit at
+1-2.4 ns with a predictable target and 4.9-5.4 ns with a random one, most of the dispatcher's samples on the landing word
+([guest-code review](guest-code-review-20261114.md) section 3, item 1): the cost is the misprediction.
 
-The census (bench cases `guest-<b>-census`, QEMU with the census plugin on the M2 Max, run 1 of each benchmark) gives the
-returns: 9 M (`scimark32-sse2`) to 720 M (`startup32`) per run, about 13-100 M per second at natemu's 1-vCPU times, and a
-model return stack per vCPU with user and kernel kept apart hits 99.7% or more at depth 16 on every benchmark (97% or more at
-depth 8). `hackbench`'s returns are 90% kernel.
+The census (bench cases `guest-<b>-census`, QEMU with the census plugin on the M2 Max, run 1 of each benchmark): 9 M
+(`scimark32-sse2`) to 720 M (`startup32`) returns per run, about 13-100 M per second at natemu's 1-vCPU times; a model return
+stack per vCPU with user and kernel kept apart hits 99.7% or more at depth 16 (97% at depth 8). `hackbench`'s returns are 90%
+kernel. A hardware return stack is one per core and mixes user, kernel and the resident, so the census is an upper bound.
 
-An earlier experiment that paired returns with calls lost time on 64-bit code ([task 4 findings](m2-task4-findings.md),
-lines 447-453); its record was not found. Section 4.15 says why this design should not lose, and section 6 measures it
-before anything else is built.
+An earlier return-pairing experiment lost time on 64-bit code ([task 4 findings](m2-task4-findings.md), lines 447-453); its
+record was not found. Section 4.9 lists what can make pairing lose and what this design does about each.
 
 ## 2. The design in one paragraph
 
-A call is linked as `bl` instead of `b`, so the core's own return-address stack (the RAS: pushed by `bl`/`blr`, popped by
-`ret`) records the host address of the word after it, a *pad*. A return goes, as now, to its context's slot, which probes the
-same data table and ends in `ret x1` instead of `br x1`. For a return address R the table holds the pad of the call that
-returns to R. So the `ret`'s target comes from the resident-written table, exactly as today, and the RAS only predicts it:
-when the guest's calls and returns pair up, the prediction is right and the return costs the probe and two direct branches.
-Nothing new is stored at a call, nothing EL0 can write is ever trusted, and when the prediction is wrong the return costs
-what it costs today. The resident does it alone: no fexc change, no new admitted instruction.
+Every call is made with `bl` or `blr`, so the core's return-address stack (the RAS) holds the host address of the word after
+it, a *pad*; every return goes to a slot form ending in `ret x1`, so it pops. The return form probes the same data table as
+today, and for a return address R in absolute code the table holds R's pad, whose word is a branch to R's block. So the
+target comes from the resident-written table as now, the RAS only predicts it, and when calls and returns pair the return is
+predicted. Nothing new is stored at a call and nothing EL0 can write is trusted. The resident does it alone.
 
 ## 3. What exists (read in the code)
 
-- The code area, the data tables and the dispatcher slots are the vCPU's own: "Blocks and L1 are this vCPU's own (its code
-  area is backed by its own memory), so a patch stops no other vCPU" (cache.rs:13-14; layout in
-  crates/abi/src/execution.rs:250-257). No other vCPU runs or patches this code. Placement is a bump fill (`reserve`,
-  cache.rs:105-112).
-- Data tables (`area::DL1`, abi execution.rs:341-357): table t, entry i = (RIP, address to branch to); EL0 read-only, each
-  shadow space maps only its own privilege class's two tables ([layout page](translated-code-layout.md) section 2). A table
-  holds one code context (`select_l1`, cache.rs:756); a context's slot names its table (`bind_slot`, cache.rs:718). An
-  entry's owner (block number + 1) is kept beside it (`l1_owner`, cache.rs:571); `fill_l1` writes `(rip,
-  code_of(block).full_entry())` (cache.rs:789-834); `cut_one` empties every entry its block owns when the block dies or
-  stops being current (cache.rs:3142-3168); a CR3 load empties the listed non-global entries; a table changing hands is
-  cleared (`clear_l1`, cache.rs:609).
-- The slot area: 128 slots of 128 bytes (`DISPATCH_BYTES` 0x4000, `DISPATCH_SLOT_BYTES` 128, abi execution.rs:282-287);
-  a computed exit's `b` is relocated at placement to `dispatcher_for(context)` (cache.rs:738, `relocate` at 2124).
-- Exits ([admission's structure rules](../../crates/host/src/admission/structure.rs), lines 22-30): a literal exit is a
-  link point, a guest-RIP move into x0 then `svc #LINK`, entered only at its first word, which the linker rewrites to `b`
-  the target's entry (`link`, cache.rs:2292). At most one computed exit per block (structure.rs:998-1013), at most
-  `MAX_LINK_POINTS` = 4 link points (abi execution.rs:2522). "x30 is an ordinary allocator temporary: no `bl` is admitted"
-  (structure.rs:61): x30 holds nothing at a block boundary.
-- Link records keep the original word and are undone by `prune` (cache.rs:3174) when the source or target dies or the
-  target stops being current, by segment (abi execution.rs:753-760); `link-check` builds verify them
-  (`check_no_dead_links`, cache.rs:3100).
-- Shared position-independent code ([pic32 findings](m2-pic32-findings.md), [reuse32 findings](m2-reuse32-findings.md)):
-  an instance has no code of its own (`instance`, cache.rs:1407); its template's full entry, `and x0, x0, #!0xfff; str x0,
-  [x28, #PAGE_BASE]`, takes x0 = the RIP (abi execution.rs:1350-1358); links out of shared code to another page are *checked*:
-  the exit's move stays and its `svc` word becomes `b` to the dispatcher slot (cache.rs:2300-2312). Shared code is not split
-  hot/cold.
-- Interrupts: in the slot area the vCPU stops at once with the next RIP in x0 (`interrupted`, crates/runtime/src/
-  execution.rs:2583); inside a block the stop is armed by patching its exits (`arm`, cache.rs:2167).
-- The sampler classes a PC in the slot area as `DISPATCH` with x0 as the target and a call test on the bytes before it
-  (crates/abi/src/sample.rs:156-159, 186-192, `call_test` at 371).
+The indirect plan's section 2 lists the slot area, the per-vCPU code area, the tables and their owners, link points, x30 as
+a temporary and shared code's checked links, with file and line. In addition:
+
+- A table entry is emptied by its owner: `cut_one` when the owner dies or stops being current (cache.rs:3142-3168), the TLB
+  path for listed entries whose owner is not current (cache.rs:1000-1012), `clear_l1` when a table changes hands
+  (cache.rs:609), a flush. There are four tables (`L1_TABLES`, abi execution.rs:300), two per privilege class; `select_l1`
+  clears one when a fifth context takes it (cache.rs:756-786).
+- Link records are keyed by link point (`Block::out`, abi execution.rs:1256-1259); `relink` halts `BAD_LINK` unless the point
+  names the target's RIP (cache.rs:3355-3360); links enter through `link_entry`, which may skip the target's x87 run test
+  depending on the source (cache.rs:2280-2287). So a pad cannot be a link record: it is entered from the callee's return, not
+  from its own block, and has no link point.
+- Placement is a bump fill (`reserve`, cache.rs:105-112): a dead block's bytes stay until a flush.
+- An interrupt inside a dead block halts `BAD_STOP` (`interrupted`, execution.rs:2601); in the slot area the vCPU stops at
+  once with the next RIP in x0 (execution.rs:2583).
+- Supervisor code is never shared (`shares`, abi execution.rs:1170-1176: user contexts only).
 
 ## 4. The design
 
-### 4.1 The slot's forms (shared with the indirect plan)
+### 4.1 Every call pushes, every return pops
 
-Each bound slot gets three forms, all probing the same table with the same first words:
+The RAS does not resynchronize: a pop without a push, or a push without a pop, mispredicts every enclosing return until it
+drains. So the design is balanced on every path, not only the common one:
 
-| Form | Ends in | Used by |
-| --- | --- | --- |
-| ordinary (today's) | `br x1` (both ways) | computed exits not changed, checked links not changed |
-| return | `ret x1` (both ways); miss: `b DISPATCH_MISS` | returns (section 4.3) |
-| lookup | `ret` with x1 = the target (miss: x1 = `CODE_VA + DISPATCH_MISS`) | the indirect plan's per-site branch |
+| Path | How it pushes or pops |
+| --- | --- |
+| Direct call, linked | the link word becomes `b pair`; the call pair appended to the block is `pair+0: bl <T's entry>`, `pair+4:` the pad; a split block's hot trampoline goes to `pair+0` directly |
+| Indirect call, checked link that is a call (shared code) | the indirect plan's step 1: `bl lookup; blr x1;` pad |
+| Local link that is a call (shared code) | the call pair, `bl` to the target's body |
+| A call the resident continues before its `bl`/`blr` ran (its first execution, a stop at its exit, a target it cannot link); a miss reached through the site's `blr x1` has pushed already and is entered directly | the resident resumes at a *push stub* in the code area's head, `blr x1` with x1 = the target's full entry and x0 its RIP, never by entering the target itself |
+| Return | the return form: both ways `ret x1`; its miss is `adr x1, DISPATCH_MISS; ret x1`, so a miss pops too |
+| A return the resident continues before its `ret x1` ran (a stop at a ret exit); a miss has popped through its stub and is entered directly | the resident resumes at a *pop stub*, `ret x1` with x1 = the full entry it chose and x0 its RIP |
+| Call to the next instruction (`call $+5; pop`) | linked as plain `b`: it never returns |
 
-Three forms of 13 words do not fit 128 bytes: the slot grows to 256 bytes and `DISPATCH_BYTES` to 32 KiB (the probes and
-`HEAD_BYTES` move with it; they are constants with asserts). An unbound slot's return form is `b DISPATCH_MISS`, its lookup
-form `adr x1, DISPATCH_MISS; ret`. `write_slot` writes all three under one synchronization, as it writes one today. None of
-these words writes NZCV (the dispatcher's rule, gates.S:253-257).
+Left unbalanced: the single-step slot's block, and calls or returns the resident emulates (system cuts, the interpreter).
+Their count is reported; the kill-test prices an unbalanced call (section 6). Because every context's calls push, the return
+form is used for every return. Admission's hint (the ending instruction is a near `ret`, a near call, `call $+5`) chooses the
+forms; a wrong hint costs time, not correctness, since every form's target is the table's or a link's.
 
-### 4.2 Words appended to a block (shared with the indirect plan)
+### 4.2 Pads, and the invariant that makes them safe
 
-The resident appends a few words of its own after a block's placed code (in the segment's code side, cold), as it writes the
-hot copy's trampolines today. They are resident code, not admitted code, and have no guest semantics: each is reached from a
-known place and leads to a block entry, a slot or the resident. The record gains their extent (`tail` bytes), and
-`block_at` covers them. For a return-predicting call they are two words, the *call pair*:
+A pad is one resident word. It has no link record and no state of its own that anything trusts. The invariant:
 
-```
-pair+0:  bl  <T's entry>         (linked), the call's literal exit word branching here
-pair+4:  b   DISPATCH_MISS        (the pad, unlinked)  or  b <X's full entry> (the pad, linked)
-```
+> A table entry (R, p) with p a pad exists only while p's word is `b <full_entry(owner)>`, where the owner is R's current
+> block in the table's context, which owns the entry.
 
-Words appended per block: 2 for a call (this plan), 2-3 for a computed exit or checked link (the indirect plan).
+- Filling writes the pad word (and synchronizes it), then the entry. It happens (a) when a direct call in absolute code is
+  linked and R's block is current, and (b) on a miss for R, from a resident-private *hint* table (direct-mapped by R, 4 Ki
+  entries of (caller block, pad offset, context)). A hint is used only if the caller is alive, its block end is R, the context
+  is the table's, and the block the miss just found for R is the one the pad will name. `fill_l1` consults the hint, so an
+  ordinary fill for R does not replace a valid pad.
+- The pad always names `full_entry(owner)`: the full entry runs the x87 run test whoever returns (no `link_entry` skip).
+- Emptying needs nothing new: entries are emptied by their owner (`cut_one`, the TLB path, `clear_l1`, a flush). After that
+  the pad word is stale but unreachable: nothing in any block branches to it, and a return reaches it only through an entry.
+  A speculative path through a stale RAS entry is squashed.
+- When the caller dies, the resident empties the entries naming its pad (two slots for R in each of the four tables, those
+  whose target is the pad), so no entry leads into a dead block. The stop rule for appended words (4.5) also stands before the
+  dead-block filter, as the slot rule does.
+- Only absolute code gets pads in this plan. A return to a caller in shared code finds R's ordinary entry: it pops, and is
+  predicted wrong, as today.
 
-### 4.3 Calls, returns and pads
+A predicted return runs the ret's pop and checks (unchanged), `b slot`, the probe, `ret x1` (predicted), the pad's `b`, R's
+entry.
 
-- **Which exits.** Admission already decodes a block's ending instruction (`branch_target`, admission.rs:787-800). It
-  returns two more facts with the link points: the computed exit is a near `ret` (`C3`, `C2 iw`, with prefixes), and a link
-  point is a near direct call's target (`E8`) whose block end R is the return address. These are hints: section 4.4 shows
-  that nothing depends on them for containment or exactness. A call to the next instruction (`call $+5; pop`, which never
-  returns) is not a call here: linking it as `bl` would push an entry no `ret` pops.
-- **Returns.** A ret block's computed exit is relocated to its context's return form instead of the ordinary one.
-- **Calls.** When the call's link point is linked to T, the resident writes pair+0 as `bl <T's entry>` (the entry `link_entry`
-  chooses) and the link word as `b pair+0`. In a split block the hot copy's trampoline to the exit is rewritten to `b
-  pair+0` too, so a linked call is still one hop in the hot stream. Unlinking restores the link word (and the trampoline),
-  as now; pair+0 is then unreachable.
-- **Pads.** The pad is reached only through a table entry. Unlinked it is `b DISPATCH_MISS`, which with x0 = R is an
-  ordinary dispatcher miss. Linked it is `b <X's full entry>`, where X is the code of R's current block in the caller's
-  context (absolute code: R's block; an instance: its template, whose full entry takes x0 = R). The pad's link is a link
-  record like any other (source the caller, target X, segment by the usual rules), so `prune` restores it to `b
-  DISPATCH_MISS` when X dies or stops being current, when the caller dies, at CR3 loads for links from another page, and at a
-  flush.
-- **Filling.** A table entry `(R, pad)` is written only while the pad is linked to the full entry of R's current block in
-  that table's context, with R's block as the entry's owner (so `cut_one` empties it whenever R's block dies or stops being
-  current). The resident writes it (a) when it links a call and R's block is current, linking the pad first, and (b) on a
-  dispatcher miss for R, from a small resident-private *pad hint* table (direct-mapped by R, 4 Ki entries of (caller block,
-  pad offset, context)), which `fill_l1` also consults so that an ordinary fill for R does not replace a valid pad. A hint
-  is checked against the records before use (caller alive, its block end R, same context); a stale hint costs nothing but
-  the miss it was consulted on.
-- **Shared code (second step, section 5).** In the smallest version a call in shared code keeps its checked link and pads
-  are made only for absolute code. The second step links a checked call's `svc` word as `b pair'` with pair' = `bl <lookup
-  form>; blr x1; pad` (the indirect plan's form), makes hints per instance (`instance` knows R_i = its RIP + guest bytes),
-  and links a shared pad only to a template on the caller's own frames (the local-link rule, cache.rs:2318-2321), whose code
-  is right for every instance. For any other R the instance's entry stays the ordinary one: correct, unpredicted.
+### 4.3 Containment
 
-A predicted return then runs: the ret's pop and checks (unchanged), `b slot`, the probe (8 words, two loads), `ret x1`
-(predicted), the pad's `b` (direct), X's entry (in shared code its two words). A call runs one more taken branch than now
-when the hot trampoline cannot be rewritten (an unsplit block).
+EL0 gains no writable and no new readable memory: the tables are the existing ones, and a pad's address is a code-area
+address of the vCPU's own blocks of the same class, as the entries user code can already read there are (layout page section
+2). There is no stack of host addresses in guest-writable memory, which the guest-state page rule forbids ([boot features
+plan](boot-features-plan.md), G1: "no emulator-trusted value lives there"). By the invariant, the slot's compare of the entry's
+RIP with x0, and the per-context tables, a return reaches R's admitted code in its own context through its full entry, or the
+resident with x0 = R. The `link-check` build scans the tables: every target is its owner's full entry, or a pad of a live
+block whose end is the entry's RIP and whose word is `b <full_entry(owner)>`. The existing table checks (`tables-*` in
+`frame-randomization`, `check_l1_lists`, cache.rs:1079) assume target = owner's full entry and are extended the same way.
 
-### 4.4 Containment: nothing EL0 can write is trusted
+Against [INV-03-01](../research/investigations/INV-03-01.md) (lines 5671-5681): an entry holds the guest return identity and a
+target that is a resident trampoline of one direct branch to an external guarded entry, filled and emptied by the resident.
+The reviewer recommends accepting this as that rule's "external guarded entry" with the invariant above written into it; the
+ruling is the owner's (section 12). No other CPU loads these targets (per-vCPU code), so the rule's in-flight census is empty.
 
-EL0 gains no writable memory and no readable memory: the tables are the existing ones, and a pad's address is a code-area
-address of the vCPU's own blocks of the same privilege class, like the block entries user code can already read there
-(layout page section 2). So guest code can see pads but forge nothing: there is no stack of host addresses in guest-writable
-memory, which is what the guest-state page rule forbids ([boot features plan](boot-features-plan.md), the G1 decision: "no
-emulator-trusted value lives there").
-
-The invariants, each kept by the resident and checked by `link-check` builds and the cases of section 7:
-
-1. Every table entry's target is a block's full entry (as now) or a pad.
-2. An entry `(R, p)` with p a pad exists only while p is linked to the full entry of R's current block's code in the
-   table's context, and is owned by that block (emptied with it by `cut_one`, by a CR3 load if it is not global, by
-   `clear_l1`, by a flush).
-3. A pad is either `b DISPATCH_MISS` or `b <full entry>`; it is undone only by `prune`, which leaves `b DISPATCH_MISS`.
-4. A pad is reached only through a table entry (nothing in a block branches to the appended words but its own link word,
-   and that one to pair+0 only). Speculation along a stale RAS entry is squashed; it has no architectural effect.
-5. The slot compares the entry's RIP with x0 before branching, so at a pad x0 = R exactly.
-
-So a return reaches only R's admitted code in its own context, through its full entry, or the resident with x0 = R. This is
-the shape [INV-03-01](../research/investigations/INV-03-01.md) (lines 5671-5681) permits for a return-prediction cache: an
-entry with the guest return identity and a target that leads to a guarded external entry, filled and emptied by the
-resident; no unchecked native continuation. The pad is a resident trampoline inside the caller's code range, not a block
-entry; the review should confirm that this reading of "external guarded entry" is acceptable. Other CPUs never load these
-targets (the code is per vCPU), so INV-03-01's in-flight census is empty.
-
-A wrong hint (a `ret` classed as a jump, a jump classed as a call) changes only which slot form or link form is used. Each
-form's target is the table's or the link's, so a wrong hint costs time, never correctness.
-
-### 4.5 Stale entries
+### 4.4 Stale state and unpaired returns
 
 | Event | What happens |
 | --- | --- |
-| Flush | code area, tables, link records and hints all start empty, as now |
-| Unlinking a call (T dies) | the link word is restored; the pad is untouched and stays valid |
-| R's block dies or stops being current | `cut_one` empties `(R, pad)` (owner); `prune` restores the pad |
-| The caller dies | `prune` restores the pad (its source is dead); the caller's bytes are not reused before a flush; a ret through a remaining entry reaches `b DISPATCH_MISS` and is refilled once |
-| CR3 load | non-global entries emptied (listed); links from another page into non-global targets pruned, as now |
-| CPL change, other code context | another table and slot; the RAS is not separated by privilege, so a stale prediction is a mispredict, not an error |
-| A table given to another context | `clear_l1` before the slot is rebound, as now |
+| Flush | everything starts empty |
+| T dies (the call's target) | the call's link word is restored; pair+0 is unreachable; the pad is untouched |
+| R's block dies or stops being current; CR3 load; table handover | its entry is emptied by owner; the pad word is stale and unreachable |
+| The caller dies | the entries naming its pad are emptied |
+| CPL change, another context | another table; a stale RAS entry is a mispredict |
 
-### 4.6 Unwinding and other unpaired returns
+`longjmp`, C++ exceptions, signal returns, retpolines and return thunks, coroutines and `switch_to` make returns that do not
+match the last call. Each is correct (the table is indexed by the RIP popped); the RAS mispredicts and stays offset until it
+drains, as on a native core. A deep resident or kernel path can overwrite the oldest guest entries; whether HVF or the core
+clears the RAS at an exception or `eret` is not known. The in-VM check (section 6) measures it.
 
-`longjmp`, C++ exceptions, signal handlers returning through `__restore_rt`, retpolines and return thunks that rewrite the
-return address, coroutines and the kernel's `switch_to` all make returns that do not match the last call. The table is
-indexed by the RIP actually popped, so each is correct; the RAS mispredicts, as a native core does on the same code, and may
-stay offset until it drains. The RAS is one per core, shared with the resident's own Rust calls and with kernel code: a deep
-resident or kernel path can overwrite the oldest guest entries. Its depth, and whether HVF or the core clears it at an
-exception or `eret`, are not known (unverified); the kill-test measures both on the host. The census's split model (user
-and kernel apart, 99.7% at depth 16) is therefore an upper bound.
+### 4.5 Exactness, 32-bit code, layout, stops, the sampler
 
-### 4.7 Exactness
+- **Exactness.** No new guest-visible effect: a call's push and its fault happen in the body as now; `bl` runs at the exit and
+  writes only x30, no guest state; the ret's pop and branch-target check come before the slot.
+- **32-bit code.** The same; R is the zero-extended 32-bit address; `ret imm16` is a return; get-PC thunks pair.
+- **Hot/cold, extended blocks.** A call ends a unit, so a block has one call pair, after its whole code in the cold side.
+  Later: the pair in the hot stream, and a target's hot copy following the caller's so that `bl` falls into it with no pad.
+- **Stops.** Appended words are block boundaries: an interrupt there stops at once (pad: next RIP x0 = R; pair+0: the call's
+  target from the link point's record, x0 not being set there), checked before the dead-block filter (execution.rs:2601).
+  `arm` patches the link word and the computed exit as now.
+- **The sampler.** The return form is in the slot area (`DISPATCH`, with the call test); appended words use the indirect
+  plan's `TAIL` place with the roles pair and pad.
 
-No new guest-visible effect: the call's push, its fault and the guest's stack write order are the block's, unchanged; the
-`bl` runs after the body, at the exit, and writes only x30, which is no guest state. The `ret`'s pop and branch-target check
-are unchanged and come before the slot. A fault, an interrupt or a stop anywhere sees the same guest state as now.
+### 4.6 PAC and a software return stack
 
-### 4.8 32-bit code
+A stack of (guest return address, host continuation) written by each call into EL0-writable memory would need the
+continuation authenticated (a guest store reaches any EL0-writable page since E3), as the [phase 2 backlog](perf-phase2-plan.md)
+(lines 379-386) proposed with PAC; it costs a store and a sign per call and a register or memory for the stack pointer, and a
+`br` at the return site still mispredicts for many callers unless `bl`/`ret` are used. Whether HVF exposes PAuth is not known
+(natemu reads `ID_AA64ISAR1_EL1`, admission.rs:22-28, but no PAuth field). This design needs neither; the backlog item is
+dropped if the kill-test passes.
 
-The same. R is the 32-bit return address zero-extended, as the table already keys 32-bit RIPs; `ret imm16` is a return;
-`call $+5` (older 32-bit PIC) is excluded (section 4.3); the get-PC thunks pair normally. The segment slots of the first user
-table (`SEGMENT_SLOTS`, abi execution.rs:303-306) always target the miss and are untouched.
+### 4.7 Admission and fexc
 
-### 4.9 Hot/cold layout and extended blocks
+fexc does not change. Admission returns hints only (4.1). Pads, call pairs, the stubs and the return form are resident code,
+as the slots are; the code-shape ban on `bl`/`ret` (structure.rs:39) stays a rule about fexc's output.
 
-A call ends a unit, so a block has at most one call pair, after its whole code in the cold side; the hot copy's trampoline to
-the call exit is rewritten to the pair when the call is linked (section 4.3). The pad is in cold code: one cold line per
-return while it is hot in the cache. Later, the pair can move into the hot stream (it is resident-written, like the
-trampolines), and when a target's hot copy follows the caller's (the layout already allows it, abi execution.rs:1361-1366),
-`bl` falls straight into R's entry and needs no pad. Extended blocks change nothing: their conditional exits come before the
-call.
+### 4.8 What is left for later
 
-### 4.10 Stops, interrupts, single-step
+Pads in shared code (a pad names a template's full entry, only for R on the caller's own frames, hints per instance), pairs in
+the hot stream, the fall-through layout.
 
-Appended words are block boundaries: an interrupt with the PC on one stops at once, as in the slot area (execution.rs:2583):
-at a pad with the next RIP x0 (= R), at pair+0 with the call's target T from the link point's record (x0 is not set there,
-the move was skipped). `arm` patches the link word and the computed exit as now, which is enough: the pair is reached only
-from the link word, the pad only from a slot. The single-step slot's block keeps today's exits.
+### 4.9 Why it should not lose time
 
-### 4.11 The sampler
-
-The return form lies in the slot area, so its samples stay `DISPATCH` with the call test (sample.rs:405-440); the report
-splits the slot's offset into its three forms. Appended words get a new place, `TAIL` (8; `place` has 4 bits), with the
-word's role (pair, pad) and the block's fields: today they would land as `BLOCK` offsets past the object's code, which the
-report cannot map. The [sampler plan](el0-sampler-plan.md) section 7's return share is then read with the new place.
-
-### 4.12 A software return stack, and PAC
-
-The other shape, a per-vCPU stack of (guest return address, host continuation) written by each call into EL0-writable
-memory, needs the continuation authenticated, because a guest store reaches any EL0-writable page (no address guard since
-E3, [boot features plan](boot-features-plan.md)). The [phase 2 backlog](perf-phase2-plan.md) (lines 379-386) proposed PAC for
-that: sign the continuation at the call with a key the resident sets, authenticate at the return. It costs a store and a
-sign at every call, a stack pointer kept in a register FEX would have to give up, or in memory (a load and a store more per call), and a
-`br` from the return's own site, which is still mispredicted for a function with many callers unless `bl`/`ret` are used as
-here. Whether HVF exposes PAuth to the guest and lets EL1 set `SCTLR_EL1.EnIA` and the keys is not known: natemu reads
-`ID_AA64ISAR1_EL1` through HVF (admission.rs:22-28) but checks no PAuth field (unverified). This design needs neither.
-FEX upstream's own call-return stack keeps unchecked host addresses on such a stack; INV-03-01 refused importing it.
-
-### 4.13 Admission and fexc
-
-fexc does not change. Admission gains no rule: it returns the two hints of section 4.3 beside the link points and the
-dispatch branch, and they bear on nothing it proves. The appended words, the slot forms, `bl` and `ret` are resident code,
-as the slots and trampolines are; the code-shape check's ban on `bl`/`br`/`ret` (structure.rs:39) stays a rule about fexc's
-output. The alternative, fexc emitting a placeholder word after each call exit and marking returns, would add admission
-rules (the placeholder exactly there, reached by nothing, never executed as fexc code) and change every answer and the
-persistent cache's key; it buys nothing the resident cannot do.
-
-### 4.14 Why it should not lose time
-
-What can make return pairing slower than today, and what this design does about each:
-
-| Cost | Here |
+| What made pairing lose | Here |
 | --- | --- |
-| A store and pointer update at every call (a software stack) | none |
-| A mispredicted `ret` where today's `br` was predicted | the `ret` is predicted when calls pair; when they do not, it mispredicts where the `br` mostly did too; a function with one caller is predicted by both, and then this design pays the next row |
-| Extra taken branches | the pad's `b` on return; on a call, none in split blocks, one in unsplit ones (about 0.25-0.5 ns each, estimate) |
-| Extra words in every block | 2 per call block, cold |
-| A miss dearer than today | a miss is today's miss |
-| Invalidation work at CR3 loads or context changes | none beyond today's table emptying |
+| A store and pointer update per call | none |
+| Unbalanced pushes and pops | balanced on every path (4.1); the rest counted and priced |
+| A `ret` mispredicted where today's `br` was predicted | only when calls do not pair; a single-caller return is predicted by both and pays the next row |
+| Extra taken branches | the pad's `b` on return, in unsplit blocks the link word's `b` to the pair |
+| Extra words | 2 per call block, cold |
+| A dearer miss | the miss pops through a stub: one more `ret` than today's miss |
 
-The loss case is code whose returns the current `br` already predicts (one caller, or a short repeating pattern its history
-learns): the extra branch then costs a little. The micro body `call` (tools/bench/bodies/call.asm, one call site) is that
-case and is expected to slow slightly. The kill-test measures it.
+The loss case is a return the current `br` already predicts (one caller, a short pattern): bounded by the kill-test's K = 1
+threshold.
 
 ## 5. Smallest useful version first
 
-Absolute code only, which covers the kernel (global, never shared), and every process whose code has no second address:
-`scimark32-sse2`, `sqlite`, `zstd`, `luajit`, `hackbench`'s kernel side. In it: the return form (4.1), the call pair and pads
-with their link records (4.2, 4.3), the pad hints, the stop rule at appended words (4.10), the sampler place (4.11), and the
-admission hints. Left for later: shared code (the second step of 4.3, which `build`, `startup32` and the configure/make steps
-need, their libraries being shared across processes), pairs in the hot stream and the fall-through layout (4.9), dropping the
-pair+0 hop in unsplit blocks.
+On top of the indirect plan's step 1: call pairs for direct calls in absolute code and for local calls in shared code, the push
+and pop stubs, `call $+5` as `b`, the return form for every return, pads and hints in absolute code, the stop rule, the dead
+caller's entries emptied, the `link-check` table scan, the counters (pads filled and hit, unbalanced paths, refills after a
+table handover). It covers the kernel and every process whose code has one address: `scimark32-sse2`, `scimark32`, `sqlite`,
+`zstd`, `hackbench`'s kernel side. Multi-process user code (`build`, `startup32`, configure and make) stays balanced but
+unpredicted until pads in shared code.
 
-If the kill-test shows the per-site branch of the indirect plan applied to returns (`bl lookup; br x1`, "A0" below) within
-0.5 ns of the RAS form at the callers the census reports, A0 is built instead: it needs no pads, no links and no hints, and
-comes with the indirect plan's first step.
+## 6. Kill-test
 
-## 6. Kill-test (before any natemu change, under an hour)
+**Host part, mechanism only (under an hour, before any natemu change).** The indirect plan's `host-dispatch-micro` case
+(`tests/bench`, M2 Max, labelled host-native, never on the benchmarks page), return variants: V0 (today: `b` calls, the slot's
+`br x1`), A (pairs, `ret x1` to the pad), A0 (the return site's own `bl lookup; br x1`). Callers K = 1, 2, 4, 16, 64, visited in
+a short period (64) and a long one (64 Ki or more); a variant with 1 call in 8 not pushing, to price an unbalanced path; a
+recursion sweep for the RAS depth; a system call at the bottom of a chain of depth D = 4 to 32, measuring the unwind's cost
+against D. It answers: does `ret x1` predict from the RAS, how deep is it, what does K = 1 lose, what does an unbalanced call
+cost, does a kernel round trip clear it. Stop if `ret x1` is not predicted from the RAS, or if K = 1 loses more than 1 ns per
+pair; choose A0 if within 0.5 ns of A at K = 4 and 16 in the long period.
 
-A host-native microbenchmark, as the S2g attribution ran FEX blocks on the host (tools/bench/attribution): the same timing as
-in the VM for linked loops (guest-code review section 1). It is a framework case from the start, so its numbers can decide:
-`host-dispatch-micro` in `tests/bench` (a generator writing the assembly, a small C driver timing with
-`mach_absolute_time`, built with the Xcode command-line tools the README requires; exclusive; five rounds, variants
-alternating; the result is ns per call/return pair with the spread across rounds). Shared with the indirect plan's
-kill-test.
-
-Variants, each with a table laid out as `DL1` (two ways, the slot's exact 13 words) and a leaf function of a few ALU words:
-
-- V0, today: calls `b`, the leaf's return through the ordinary form (`br x1`) to the continuation.
-- A: calls through the pair (`b pair; bl leaf; pad: b cont`), return form `ret x1` to the pad.
-- A0: return through `bl lookup; br x1` at the leaf's return site.
-- Callers: K = 1, 2, 4, 16, 64 call sites, visited in a fixed pseudo-random order by an indirect jump that every variant
-  pays alike (and a variant with no call measures it). A recursion sweep (depth 4 to 128) finds the RAS depth. A variant
-  makes a system call (`getpid`) every 64 calls, to see whether the RAS survives a kernel round trip (only indicative: an
-  HVF guest's `eret` from EL1 is another path).
-
-Kill A if at K = 4 it saves less than 1.5 ns per pair over V0, or if at K = 1 it loses more than 1 ns. Prefer A0 if within
-0.5 ns of A at K = 4 and 16. After the smallest version is built, a second early check in the VM: `micro-natemu` (its `call`
-body) and `guest-scimark32-sse2` (Monte Carlo is calls and returns, task 4 findings line 447), one round each, base against
-the fix; stop and look again if Monte Carlo gains less than 10%.
+**In-VM part, the decision (after the smallest version).** Only the VM answers what EL0 to the resident at EL1 and back, and
+HVF's exits, do to the RAS. A new micro body (`tools/bench/bodies/callchain.asm`, run by `micro-natemu`): a call chain of depth
+D = 4, 16, 32 whose bottom makes a resident trip (`cpuid`, a system cut), and the same chain without the trip; plus the
+existing `call` body (K = 1). Base and fix, one round on the M2 Max. Stop if the chain without a trip saves less than 1.5 ns
+per return, or if `call` loses more than 1 ns per pair; if the chain with a trip saves nothing at D = 16, record that the RAS
+does not survive a trip and expect no gain on `hackbench`.
 
 ## 7. Tests
 
-Existing families that cover it: `faults` (every stack and call/ret form, at block sizes default and 1: exactness of calls and
-returns), `system` (`frame-randomization` and its `tables-*` checks of what EL0 reads in the tables; the K1 and relink cases
-of `run_k1.py` and the relink mutations, `run_relink_mutations.py`, for links and their records), `smp` (`privilege`,
-`coherence`, `contain`: CPL switches, cross-vCPU invalidation, forged branches), `programs`, `correctness`, `boot`, `io`
-(the io5 boots), the Rust units (`unit` family: abi, runtime, host), and the `link-check` resident build.
+Existing families: `faults` (every stack and call/ret form at block sizes default and 1), `system` (`frame-randomization` and
+its `tables-*` checks, `run_k1.py`, the relink mutations), `smp` (`privilege`, `coherence`, `contain`), `programs`,
+`correctness`, `boot`, `io`, the Rust units, the `link-check` build.
 
 New cases, each shown to fail when it should (a mutation in `run_relink_mutations.py` or a negative unit test):
 
 | Case | Shows | Fails under the mutation |
 | --- | --- | --- |
-| `system` `ret-pairs`: a guest program with calls from K sites, recursion past 64, `longjmp`, a signal handler's return, a return address rewritten on the stack, `call $+5; pop` | every return lands right; the counters show pads filled and hit | a pad filled while unlinked; a pad linked to a block of another context; `call $+5` linked as `bl` |
-| `system` `ret-death`: the callee's and the return's pages rewritten (SMC) and remapped (CR3) between call and return, at 1 and 4 vCPUs | the return re-translates; no entry names a dead block | `cut_one` not emptying pad entries; `prune` skipping pad records (`link-check` halts) |
-| `system` `ret-stop`: interrupts timed to land on a pad and on pair+0 (the timer at fine steps, as the stop cases do) | the stop is taken at R and at T | the stop rule at appended words removed |
-| `system` `ret-32`: the same program built for i386 | 32-bit returns and `ret imm16` | (as `ret-pairs`) |
-| Rust unit: table entry invariants (4.4, 1-5) over a model of fills and deaths | each invariant | each invariant's code path broken in turn |
-| Rust unit: the sampler's `TAIL` place and the report's mapping | appended words are placed and mapped | the place dropped |
+| `system` `ret-pairs`, 64-bit and i386 builds: calls from K sites, recursion past 64, `longjmp`, a signal handler's return, a rewritten return address, `call $+5; pop`, `ret imm16` | every return lands right; counters show pads filled and hit and no unbalanced path but the listed ones | pad word written after the entry; a pad naming a block of another context; `call $+5` as `bl`; a resident continuation entering a call's target directly |
+| `system` `ret-death`: callee and return pages rewritten (SMC) and remapped (CR3) between call and return, the caller killed while its pad is filled, at 1 and 4 vCPUs | no entry names a dead block or a stale pad (`link-check` scan) | the dead caller's entries not emptied; `cut_one` skipping pad entries |
+| `system` `ret-stop`: interrupts landing on a pad, on pair+0, on the stubs, and on a dead caller's pad | the stop is taken at R or T, no `BAD_STOP` | the appended-word rule after the dead filter |
+| Rust unit: the invariant over a model of fills, deaths and handovers | each part of 4.2 | each code path broken in turn |
 
-While iterating: `tools/natemu-test run tests/system -k 'ret- or relink'`, `tests/faults -k 'call or ret'`, the Rust units.
-At the end of the task, since this changes the dispatcher, the tables and every block's exits: `tools/natemu-test run` (the
-affected tier). The gate once, over both plans (section 8).
+While iterating: `tools/natemu-test run tests/system -k 'ret- or relink'`, `tests/faults -k 'call or ret'`, the Rust units; the
+affected tier (`tools/natemu-test run`) at the end, since every exit and the tables change. One gate, over both plans.
 
 ## 8. Runs (fixed budget)
 
-Machine: the M2 Max (main runner) for the kill-test and the A/B; numbers there are evidence for the commit message, never the
-benchmarks page.
-
 | Run | What | Budget |
 | --- | --- | --- |
-| Kill-test | `host-dispatch-micro`, once | 10 min exclusive |
-| Census addition | a last-target-per-site model for returns in the census plugin (what a per-site branch predicts: A0's and today's best case), with its `census-check` case; then the census cases once | 1 h of QEMU time (2 cores per case) |
-| In-VM early check | `micro-natemu`, `guest-scimark32-sse2`, base and fix, one round | 20 min |
-| Iteration | narrow runs (section 7); the affected tier once at the end | as needed, no heavy runs |
-| A/B | base and fix on the M2 Max, alternating, three rounds (`TESTKIT_BENCH_AT`): `guest-scimark32-sse2`, `guest-hackbench`, `guest-sqlite`, `guest-startup32`, `guest-build`, `micro-natemu`; the noise is the spread across rounds | about 2 h |
-| Profile | one `guest-startup32-profile` and one `guest-scimark32-sse2-profile` run with the fix: the slot's return share should fall | 20 min |
+| Host kill-test | `host-dispatch-micro`, return variants (in the indirect plan's run) | 10 min exclusive |
+| In-VM check | `micro-natemu` with `callchain` and `call`, base and fix | 20 min |
+| Iteration | narrow runs; the affected tier once | no heavy runs |
+| A/B | M2 Max, base (indirect step 1) and fix, alternating, three rounds (`TESTKIT_BENCH_AT`): `guest-scimark32-sse2`, `guest-scimark32`, `guest-sqlite`, `guest-hackbench`, `micro-natemu`; noise is the spread across rounds; flush counts, reclaims and table refills reported | about 1.5 h |
+| Profile | `guest-scimark32-sse2-profile` with the fix: the return share of slot samples should fall | 10 min |
 | Gate | once, over both plans, at the end | one gate |
-| Benchmarks page | only if a page number moves beyond its noise: those cases on the M4 (the control-group machine), base and fix alternating, three rounds | owner schedules the M4 |
-
-The second step (shared code) gets its own A/B of `guest-build`, `guest-startup32` and the `io5-solo32` steps' bench case,
-inside the same gate.
+| Benchmarks page | only if a number moves beyond its noise: those cases on the M4, alternating, three rounds | owner schedules the M4 |
 
 ## 9. Estimate (agent hours, low confidence)
 
-Smallest version: kill-test case 1 (shared with the indirect plan); admission hints and their transport 2; slot forms 2;
-call pair, pads, link records, hints, `fill_l1` 6; stops at appended words 1.5; sampler place and report 1.5; tests and
-mutations 4; review fixes 2: about 20 hours. Shared code: 6-8 more. A0 instead of A: about 3 on top of the indirect plan's
-first step.
+On top of the indirect plan's step 1: call pairs and stubs 3, return form 1, pads, hints and the invariant's emptying 3, stops
+1, `link-check` scan and table checks 1.5, the `callchain` body 1, tests and mutations 3, review fixes 1.5: about 15 hours.
+Pads in shared code: 5-6 more.
 
 ## 10. Risks
 
-- The RAS does not survive the resident's trips, or HVF clears it at `eret`: kernel-heavy and syscall-heavy code gains little.
-  The kill-test's system-call variant and the in-VM check show it.
-- Single-caller returns get slightly slower (section 4.14): a net loss on code where most returns are already predicted.
-- Appended words grow the code area, which is the cache's limit ("the code area ... is now the limit", abi
-  execution.rs:335-336): more flushes. 8 bytes per call block, a few percent of placed bytes (estimate); the A/B reports
-  flush counts.
-- Pad links add up to one link record per call block: more reclaims when the records fill (`Control::reclaims`). The A/B
-  reports them.
-- The stop rule at appended words, the pad hints and the record extent are new resident paths, close to the linker's
-  subtlest code. The `link-check` build, the relink mutations and the new cases are the defence.
-- The smallest version leaves the multi-process workloads (`build`, configure/make) mostly to the second step.
-- The earlier, unrecorded experiment may have lost for a reason not listed in section 4.14.
+- The RAS does not survive the resident's trips or HVF's exits: kernel- and syscall-heavy code gains little (the in-VM check).
+- Paths left unbalanced (single-step, emulated calls) are more frequent than expected; the counters and the A/B show it.
+- Single-caller returns get slightly slower (bounded by the K = 1 thresholds).
+- The four tables are cleared at a handover between contexts: pads are refilled from hints after each; the A/B counts refills.
+- Appended words grow the code area, the cache's limit (abi execution.rs:335-336): the A/B reports flushes.
+- The new resident paths (stubs, the stop rule, hints) sit beside the linker's subtlest code.
+- The earlier, unrecorded experiment may have lost for a reason not in section 4.9.
 
 ## 11. Decision: the sampler number
 
-Build it when, on at least one of `guest-scimark32-sse2`, `guest-startup32`, `guest-build`, `guest-sqlite`, `guest-hackbench`,
-the slot's samples whose target passes the call test (`DISPATCH`, call test yes) plus the first-word samples of blocks whose
-RIP passes it (the landing words) are 3% or more of EL0 samples, and the kill-test passes. Expected gain: about 0.6-0.8 of
-that share (the landing words' part of the slot's cost, chunk 28), less the extra branch on returns already predicted.
-Under 3% everywhere: recorded and left, as the [sampler plan](el0-sampler-plan.md)'s last rule says. (That plan's 5% rule,
-line 275, was the trigger to design; this is the bar to build, set by the A/B's noise of about 1-2%.)
+Build it when the slot's samples whose target passes the call test (`DISPATCH`, call test yes) plus the first-word samples of
+blocks at return addresses are 3% or more of EL0 samples on a benchmark the smallest version covers: `scimark32-sse2`,
+`scimark32` or `hackbench`'s kernel side from the existing profile cases (`guest-scimark32-sse2-profile`,
+`guest-scimark32-profile`, `guest-hackbench32-profile`), or `sqlite` once a `guest-sqlite-profile` case is added (one case in
+`tests/bench/family.toml`); and the host kill-test passes. `build`'s share is shared code and does not count for this version.
+Under 3%: recorded and left ([sampler plan](el0-sampler-plan.md) section 7, last rule).
 
-## 12. What is verified and what is not
+## 12. Verified, unverified, and the owner's question
 
-Read in the code (file:line above): the slot's words and binding, the tables' layout, ownership, filling and emptying, the
-per-vCPU code area, placement by bump fill, x30 as a temporary with no `bl` admitted, at most one computed exit and four
-link points, shared code's full entry and checked links, the stop rule in the slot area, the sampler's places and call test,
-the code synchronization's IDC/DIC handling (cache.rs:2080-2105).
+Read in the code: everything cited above with file and line. Not verified: the RAS's depth on Apple cores; whether `ret x1`
+predicts from it; whether an exception, `eret` or an HVF exit clears it; whether HVF exposes PAuth; that no path but a flush
+reuses a dead block's bytes (placement reads so); the branch costs in 4.9 (estimates).
 
-Not verified: the RAS's depth on Apple cores; whether `ret x1` (not x30) is predicted from the RAS on them; whether an
-exception or `eret` under HVF clears it; whether HVF exposes PAuth; that nothing reuses a dead block's bytes before a flush
-(placement reads so, not checked against every path); that the resident never resumes at an appended word after a trip
-other than through the stop rule; the per-branch costs in section 4.14 (estimates).
+Defaults taken from the review: the resident appends words instead of a fexc change; a single-caller loss is accepted within
+the K = 1 thresholds; the slot area grows to 32 KiB (the indirect plan); the PAC backlog item is dropped if the kill-test
+passes; `host-dispatch-micro` is a bench case. The owner's call: **the pad as INV-03-01's "external guarded entry"**, with the
+invariant of 4.2 written into that rule (the reviewer recommends accepting).
 
-## 13. Open questions for the owner
+## 13. Review
 
-1. The resident appending words to placed blocks (a record field and a sampler place) instead of a fexc change: agreed?
-2. A small loss on single-caller returns (the `call` micro) for gains on returns with many callers: acceptable?
-3. The slot area doubled to 32 KiB (three forms per context), or fewer slots (64 contexts)?
-4. The pad as a resident trampoline inside the caller's code range: does it meet INV-03-01's "external guarded entry"?
-5. The PAC return-address cache in the phase 2 backlog: drop it, since this design needs no authentication?
-6. `host-dispatch-micro` as a bench case: a host-native number, never on the benchmarks page; acceptable as the kill-test?
+Independent design review (Fable, November 23) of revision 1: rework. Taken in: the return stack balanced on every path,
+including indirect calls (`blr`, so the indirect plan's lookup form comes first), the first execution and other resident
+continuations of a call (push stub), a return-form miss (a `ret x1` stub), with the unbalanced rest counted (4.1); the decision
+read on benchmarks the built version covers, not `build` (11); the kill-test split into a host part that gives mechanism facts
+(caller periods short and long, an unbalanced variant, a system call at the bottom of a chain of depth D) and an in-VM part with
+a body that trips to the resident at depth, where the stop threshold now is (6); pads without link records, under one invariant
+emptied by owner, with the full entry always (4.2); a dead caller's entries emptied and the stop rule before the dead filter
+(4.2, 4.5); the four tables' handover refills counted, the existing table checks extended, `ret-32` folded into `ret-pairs`,
+the census addition dropped, the order (indirect step 1 first) and the estimate.
