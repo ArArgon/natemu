@@ -10,6 +10,12 @@ fatal: folded in. Owner
 direction (same day): plan the device-memory track (proposed as "zero-copy DMA") separately and have it reviewed.
 Research for this plan changed its scope; the Decision section says how and why, and the owner may reject that change.
 
+As built (November 23, 2026): implemented on branch `claude/virtio-model-d26cc7` (commits `e4701a6e`..`afada82e` and
+the fix wave on top); this page now states what was built. It deviates from the reviewed plan in: the 64 KiB bounds on
+a model's messages and replies (the interface), the socket backend's busy guard held for its whole life, the PCI
+console's slot (after the disks'), `boot/acpi.rs` left unchanged, the guest modules (`virtio_mmio` is a module), and
+both guest cases' inputs and method (Task 2 and Task 3 Step 5). The integration gate (Task 3 Step 6) is still to run.
+
 **Goal:** one small interface through which a new virtio device (virtio-console now, vsock next, later sound, input
 and GPU) plugs into natemu's existing virtio owner and its windowless guest-memory copies, plus virtio-console as its
 first consumer: a second guest console on a host file or a Unix socket.
@@ -70,8 +76,9 @@ sequential reads, or network TX/RX; or when a device's payload volume (display) 
   only record state and signal the model's own thread; they never call `ModelPort` and never block. `Model::request`
   and `Model::drain` run without the state lock, return promptly and never wait for the guest or a backend.
   `ModelPort` holds a `Weak<Virtio>` (as `PacketPort` does), so the `Arc<dyn Model>` inside `Virtio` forms no cycle.
-- Backend I/O runs on the model's own thread; while it may deliver data it holds an `irqs.busy()` guard (as
-  `PacketPort` does), so a guest waiting for input is not ended as all-halted.
+- Backend I/O runs on the model's own thread, which holds an `irqs.busy()` guard for its whole life (as `PacketPort`
+  does; the console's socket backend holds it also while no client is connected, since one may connect and send), so
+  a guest waiting for input is not ended as all-halted.
 - Guest-visible behaviour follows virtio 1.2; where it leaves a choice, QEMU's `virtio-serial`/`virtconsole`, except
   as stated (the console offers no MULTIPORT and no EMERG_WRITE, which QEMU offers by default).
 - Rust unit tests run in the framework as one unit (`tools/natemu-test run tests/unit -k rust`, item `rust/all`); a
@@ -107,6 +114,8 @@ sequential reads, or network TX/RX; or when a device's payload volume (display) 
 pub(crate) enum Direction { DeviceReads, DeviceWrites }
 pub(crate) struct QueueSpec { pub max: u16, pub direction: Direction, pub stream: bool }
 pub(crate) enum Reply { Done(Option<Vec<u8>>), Busy }
+pub(super) const BACKLOG: usize = 64 * 1024;            // a DeviceWrites queue's backlog; also the largest message
+pub(super) const REPLY: usize = 64 * 1024;              // the largest reply
 pub(crate) trait Model: Send + Sync {
     fn device_id(&self) -> u32;                         // virtio 1.2 §5
     fn features(&self) -> u64;                          // offered, besides VERSION_1
@@ -119,7 +128,7 @@ pub(crate) trait Model: Send + Sync {
     /// set and is offered again after `ModelPort::resume(queue)`; a device reset or stop drops it (its chain is never
     /// completed, as a reset abandons any unfinished request), and no piece of an old incarnation reaches a new one.
     /// `Done(reply)`: the reply (at most `writable` bytes) goes to the chain's writable part with the last piece;
-    /// earlier pieces return `Done(None)`.
+    /// earlier pieces return `Done(None)`. `writable` is at most REPLY (64 KiB); a longer reply is cut and counted.
     fn request(&self, queue: u16, readable: &[u8], last: bool, writable: usize) -> Reply;
     fn started(&self, port: ModelPort);                 // DRIVER_OK; under the state lock: record and signal only
     fn reset(&self);                                    // device reset; under the state lock: record and signal only
@@ -130,7 +139,7 @@ pub struct ModelPort { /* Weak<Virtio> and the incarnation */ }
 impl ModelPort {
     /// For a DeviceWrites queue: takes as many bytes as fit in posted buffers and the queue's bounded backlog
     /// (stream queues split across chains; a message queue takes a message whole or not at all) and returns the
-    /// count taken; 0 after the device was reset.
+    /// count taken; 0 after the device was reset. A message over 64 KiB (BACKLOG) is taken, dropped and counted.
     pub fn deliver(&self, queue: u16, bytes: &[u8]) -> usize;
     pub fn on_ready(&self, ready: impl Fn() + Send + Sync + 'static);   // buffers were posted (under the lock)
     pub fn resume(&self, queue: u16);                   // a Busy request may be offered again
@@ -142,10 +151,12 @@ impl ModelPort {
 devices; net keeps its queue-0 behaviour through the same arrays. `queue_max` becomes per queue (`Snapshot::new`,
 `check_rings`, the queue-ready write). Stream delivery adds one `Request` outcome: commit the filled chains and keep
 the remainder at the front of that queue's backlog under the same identity. A message that does not fit a posted
-chain is dropped and counted, as net drops a frame (`lost`). The power-off drain (`drain`, near line 1566) polls
-`Model::drain` until true before it reports the device quiet. A model's `drain` must turn true within its own stated
-grace (the console: 2 s), discarding and counting what its backend did not take by then, so a stalled backend never
-turns a guest power-off into a fatal error (net's 10 s backend bound, which ends the process, does not apply).
+chain is dropped and counted, as net drops a frame (`lost`); so is a message over `BACKLOG` (64 KiB: one copy must
+hold a message and its publication), at `deliver`, and a reply over `REPLY` (64 KiB) is cut to it and counted. The
+power-off drain (`drain`, near line 1566) polls `Model::drain` until true before it reports the device quiet. A
+model's `drain` must turn true within its own stated grace (the console: 2 s), discarding and counting what its
+backend did not take by then, so a stalled backend never turns a guest power-off into a fatal error (net's 10 s
+backend bound, which ends the process, does not apply).
 
 ### virtio-console
 
@@ -160,9 +171,14 @@ turns a guest power-off into a fatal error (net's 10 s backend bound, which ends
 - Configuration: `[[console]]` with `id` and exactly one of `output`, `socket`; transport key
   `machine.transport.console` (added to `Transports`, `Wanted` and the transport key list in `config.rs`). Placement
   in `linux.rs`: MMIO takes the next MMIO page and uid after the disks' and the first free GSI in 16-23 (none free:
-  launch error); PCI takes the first free slot (none free, for example 29 PCI disks: launch error).
+  launch error); PCI takes the slot after the disks' (the k-th PCI console slot 3 + max(p, 1) + k, p the PCI disks; not
+  the first free slot, so a console keeps its slot when a NIC is added), and none left (for example 29 PCI disks) is a
+  launch error. The ACPI entries of an MMIO console come from the generic MMIO manifest placement, so
+  `boot/acpi.rs` is unchanged.
 - PCI class 07H (communication), subclass 80H (other), as QEMU's virtio-serial-pci.
-- The guest kernel (Debian 6.12.107+deb13-amd64) has `CONFIG_VIRTIO_CONSOLE=y`: no module to load.
+- The guest kernel (Debian 6.12.107+deb13-amd64) has `CONFIG_VIRTIO_CONSOLE=y` and `CONFIG_VIRTIO_PCI=y`, but
+  `CONFIG_VIRTIO_MMIO=m`: the guest cases' initramfs carries the stock `virtio_mmio` module and the init runs
+  `modprobe virtio_mmio`.
 
 ## File structure
 
@@ -172,7 +188,7 @@ turns a guest power-off into a fatal error (net's 10 s backend bound, which ends
 | `crates/host/src/virtio/mod.rs` | `Profile::Model`, per-queue receive state, pieces, drain |
 | `crates/host/src/virtio/pci.rs` | class codes from `Model::pci_class` |
 | `crates/host/src/virtio/console.rs` (new) | the console `Model` and its two backends |
-| `crates/host/src/linux.rs`, `crates/host/src/boot/acpi.rs` | placement, MMIO ACPI entries |
+| `crates/host/src/linux.rs` | placement; MMIO ACPI entries through the generic manifest (`boot/acpi.rs` unchanged) |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `docs/configuration.md` | `[[console]]`, transport key |
 | `tests/devices/run_console.py`, `tests/devices/family.toml` | guest cases `console-file`, `console-socket` (the family the platform-devices plan creates; this plan creates it if it lands first) |
 
@@ -185,7 +201,7 @@ turns a guest power-off into a fatal error (net's 10 s backend bound, which ends
 **Interfaces:** produces the items above and `Virtio::model(irqs: Irqs, gsi: usize, model: Arc<dyn Model>) ->
 Arc<Virtio>`.
 
-- [ ] **Step 1: unit tests** with a test model (an echo device: transmit on queue 1 is delivered back on queue 0
+- [x] **Step 1: unit tests** with a test model (an echo device: transmit on queue 1 is delivered back on queue 0
   through its port), on the virtio test rig (`virtio/testing.rs`): `features_and_config_reach_the_driver`,
   `request_reply_lands_in_writable_part`, `deliver_fills_posted_buffers_in_order`,
   `stream_delivery_splits_across_chains`, `message_too_large_is_dropped_and_counted`,
@@ -194,57 +210,78 @@ Arc<Virtio>`.
   request held `Busy` with no `resume` does not delay a device reset; break: keep it in the in-flight set),
   `drain_waits_for_model` (S5 does not report quiet while `drain` is false), `pci_class_from_model`. The existing
   entropy, block and net unit tests stay unchanged.
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; the new tests FAIL in junit.xml (the rest pass).
-- [ ] **Step 3: implement**; the receive path is parameterized by queue, not copied.
-- [ ] **Step 4: run** the same (all PASS), then `tools/natemu-test run tests/io` (PASS, behaviour unchanged). Show
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; the new tests FAIL in junit.xml (the rest pass).
+- [x] **Step 3: implement**; the receive path is parameterized by queue, not copied.
+- [x] **Step 4: run** the same (all PASS), then `tools/natemu-test run tests/io` (PASS, behaviour unchanged). Show
   `reset_drops_queued_host_data`, `deliver_takes_what_fits_and_reports_it` and
   `large_transmit_chain_is_delivered_in_pieces` fail against the breaks named in Review Focus.
-- [ ] **Step 5: commit** `virtio: a Model interface for devices on owned buffers`.
+- [x] **Step 5: commit** `virtio: a Model interface for devices on owned buffers`.
 
 ### Task 2: virtio-console with a file backend
 
-**Files:** create `virtio/console.rs`, `tests/devices/run_console.py`; modify `linux.rs`, `boot/acpi.rs`,
-`config.rs`, `config/tests.rs`, `docs/configuration.md`, `tests/devices/family.toml`.
+**Files:** create `virtio/console.rs`, `tests/devices/run_console.py`; modify `linux.rs` (as built: not
+`boot/acpi.rs`), `config.rs`, `config/tests.rs`, `docs/configuration.md`, `tests/devices/family.toml`.
 
 **Interfaces:** `run_console.py prepare` builds a BusyBox initramfs from the framework's inputs as
-`tests/io/run_virtio_rng.py prepare` does (no module needed); `run_console.py run --case console-file|console-socket
---transport mmio|pci --cpus N`, judged from the host's output file or socket and its exit line; `self-check`.
+`tests/io/run_virtio_rng.py prepare` does (as built: with the `virtio_mmio` module); `run_console.py run --case
+console-file|console-socket --transport mmio|pci --cpus N`, judged from the host's output file or socket and its exit
+line; `self-check`.
 
-- [ ] **Step 1: unit tests** `console_offers_no_features_and_zero_config`, `transmit_appends_to_output_file`,
+- [x] **Step 1: unit tests** `console_offers_no_features_and_zero_config`, `transmit_appends_to_output_file`,
   `transmit_backlog_turns_busy_at_1_mib`, `mmio_without_free_gsi_is_refused`, and in `config/tests.rs`
   `console_needs_exactly_one_of_output_socket`, `console_transport_key`.
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
-- [ ] **Step 5: guest case `console-file`** (MMIO and PCI, 1 and 2 vCPUs): the init writes a 1 MiB pattern to
-  `/dev/hvc0` with `dd`, then powers off. Whether `dd`'s return means the device has consumed every byte depends on
-  the guest driver (virtio_console's `put_chars` appears to wait for the device to return each buffer; `hvc_close`
-  may wait only about 10 ms): the implementer confirms it in `drivers/char/virtio_console.c` and
-  `drivers/tty/hvc/hvc_console.c` and, if it does not hold, adds an explicit drain wait to the init; the method is
-  pinned in the runner's docstring; the runner checks the output
-  file holds exactly the pattern and the run ends with `Power(1)`. Show it fails with `Model::drain` returning true
-  at once (the tail is lost) and passes here.
-- [ ] **Step 6: commit** `virtio-console: a second console on a host file`.
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
+- [x] **Step 5: guest case `console-file`** (MMIO and PCI, 1 and 2 vCPUs). As built, two sinks: by default the
+  console's output is a fifo the runner holds open and reads only 0.5 s after the guest's `reboot: Power down` line on
+  COM1, with a 256 KiB pattern: the backend can put only the pipe's buffer (8 KiB) into it before then, so the rest
+  reaches the runner only through the power-off drain (2 s grace), and a drain that returns at once loses the tail;
+  `--sink file` writes the whole 1 MiB (the device's `TX_BUFFER`) to a regular file natemu creates. The init opens
+  `/dev/hvc0` on descriptor 3 and keeps it open (hvc resets its termios when the last descriptor closes), sets it
+  `stty raw -echo`, writes the pattern with `dd bs=4096`, drains it (`stty -g` and back, TCSADRAIN) and powers off
+  with nothing waiting in between. `dd`'s exit proves delivery: hvc_write hands at most a page to virtio_console's
+  `put_chars`, which spins until the device returns the buffer, so `dd` returns only once the model holds every byte
+  (`hvc_close`'s 10 ms never applies, the descriptor staying open). The method and the driver-source findings are
+  pinned in `tests/devices/run_console.py`'s docstring. The runner checks the bytes are exactly the pattern (no CR
+  added), nothing was reported discarded, and the run ends with `Power(1)`; `result.json` records the drain's timing
+  margin. Shown to fail with `Model::drain` returning true at once (run 20261123-230735-d383) and pass here.
+- [x] **Step 6: commit** `virtio-console: a second console on a host file`.
 
 ### Task 3: the socket backend
 
 **Files:** modify `virtio/console.rs`, `config.rs`, `tests/devices/run_console.py`.
 
-- [ ] **Step 1: unit tests** `socket_client_bytes_reach_receiveq`, `socket_input_respects_deliver_count`,
+- [x] **Step 1: unit tests** `socket_client_bytes_reach_receiveq`, `socket_input_respects_deliver_count`,
   `transmit_without_client_is_counted`, `client_reconnect`, `one_client_at_a_time` (a second connection is refused
   while one is open), `poweroff_with_stalled_client` (a connected client that stops reading: S5 still ends with
   `Power(1)` within the 2 s grace, the discarded bytes counted).
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
-- [ ] **Step 5: guest case `console-socket`**: the runner makes the socket in a short private directory
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
+- [x] **Step 5: guest case `console-socket`**: the runner makes the socket in a short private directory
   (`tempfile.mkdtemp(prefix='nm-')` under the system temporary directory, removed afterwards, because run folders can
   exceed `sun_path`'s 104 bytes), connects after the guest's ready marker on the serial console, sends
-  `ping <nonce>\n` followed by 256 KiB of pattern; the init reads them from `/dev/hvc0` and writes back the nonce
-  reversed and the pattern's SHA-256; the runner checks both. Show it fails with `deliver` ignoring its count (input
-  bytes lost under backpressure) and passes here.
-- [ ] **Step 6: run** `tools/natemu-test run` then `--gate`; PASS.
-- [ ] **Step 7: commit** `virtio-console: an interactive console on a Unix socket`.
+  `ping <nonce>\n` followed by 4 MiB of pattern and never half-closes; the init reads the line, then pauses 3 s without
+  reading (so the input fills the guest's receive buffers, about 1.7 MiB, and `deliver` must take less than it is
+  offered), reads exactly the pattern from `/dev/hvc0` and writes back the nonce reversed and the pattern's SHA-256;
+  the runner checks both and that the socket was removed. As built, not 256 KiB with no pause: that input passed
+  against the break (run 20261123-231432-ce74), because the guest took it as fast as it came. Shown to fail with
+  `deliver` ignoring its count (input bytes lost under backpressure; run 20261123-230905-9014) and pass here.
+- [ ] **Step 6: run** `tools/natemu-test run` then `--gate`; PASS. (As built: the unit and devices runs passed; the
+  gate is still to run, once for the integration branch, on the M4.)
+- [x] **Step 7: commit** `virtio-console: an interactive console on a Unix socket`.
 
 ## Follow-up (own plan)
 
 virtio-vsock on `Model` (message queues, the event queue, guest CID in config), with OpenVMM's connection logic
 (`vm/devices/virtio/virtio_vsock/src/{connections.rs,ring.rs,spec.rs,unix_relay.rs}` at `5d6ab1cf`, MIT) adapted onto
-`ModelPort` and host Unix sockets; then systemd's `vmm.notify_socket` for test readiness. The bench case that would
+`ModelPort` and host Unix sockets; then systemd's `vmm.notify_socket` for test readiness.
+
+What the vsock plan inherits from this interface as built:
+
+- A message queue's `deliver` takes a message whole or not at all, and the owner drops (and counts) a message that
+  does not fit the chain it lands in; the model cannot learn the next posted chain's size beforehand. vsock has no
+  retransmit, so one dropped RW packet corrupts its connection's stream. The vsock plan needs a way to size packets
+  to the chain: a "room of the next posted chain" query on `ModelPort`, or a message mode that fits a message to the
+  chain (splitting an RW payload, as stream delivery splits bytes).
+- A `Busy` answer parks the request and stops the whole transmit queue until `resume`, not only the connection it
+  belongs to. Under vsock's credit flow control a peer sends only what the other side has room for, so this should
+  not stall unrelated connections; the vsock plan states it and checks it. The bench case that would
 trigger a zero-copy plan (per-request copy share) belongs with the next I/O performance work.

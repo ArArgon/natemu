@@ -20,9 +20,11 @@ natemu boots the unmodified Debian 13 cloud image with networking and a disk. It
 
 - **Booting:** no BIOS or UEFI. natemu starts a Linux kernel directly, so installer ISOs and bootloaders do not work.
 - **Devices:** serial console, network, disk images (raw or qcow2; several, some read-only, from a `--config` file, see
-  [docs/configuration.md](docs/configuration.md)) and a random-number device only. A launch with a `--config` file uses a PCI
-  bus by default; one without it uses MMIO devices (PCI with `--virtio-transport pci`). No display, keyboard, sound, USB or
-  shared folders.
+  [docs/configuration.md](docs/configuration.md)), a second console and a random-number device only. The second console,
+  also set in the `--config` file, writes what the guest prints there to a file on the Mac, or lets a program on the
+  Mac type into it and read its output through a Unix socket (a connection point that looks like a file). A launch
+  with a `--config` file uses a PCI bus by default; one without it uses MMIO devices (PCI with
+  `--virtio-transport pci`). No display, keyboard, sound, USB or shared folders.
 - **Networking:** IPv4 only, through NAT, with port forwarding. No IPv6 or bridged networking.
 - **CPU:** 64-bit programs only. No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
 - **Performance:** Linux's default Meltdown protection is slow under natemu; see

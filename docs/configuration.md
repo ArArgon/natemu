@@ -171,7 +171,12 @@ open is closed at once. While nobody is connected, what the guest writes is drop
 wait, and natemu says at exit on standard error how many bytes it dropped. After the program
 disconnects, the next one to connect gets the guest's later output. A connected program that stops
 reading makes the guest wait, as a slow terminal does; at power-off natemu waits for it at most 2
-seconds.
+seconds. A program that closes its sending half counts as disconnected and receives nothing after
+that, so `echo cmd | socat - UNIX-CONNECT:console.sock` gets no reply: use an interactive client.
+
+Unless the guest sets `/dev/hvc0` to raw mode (for example `stty -F /dev/hvc0 raw`), Linux's terminal
+layer adds a carriage return before every line feed the guest writes, so the file or the connected
+program receives CR LF line ends.
 
 ```toml
 [[console]]
