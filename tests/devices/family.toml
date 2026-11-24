@@ -184,8 +184,9 @@ harness = "runner"
 params = { timeout = 600 }
 needs = { cores = 1, perf = true }
 
-# Every KeyCode pressed and released in one send_input: the keyboard's EV_KEY events are the Linux KEY_* of the runner's
-# table, in order; then a second client holds ShiftLeft and disconnects: the release arrives. Ends with quit.
+# Every KeyCode pressed and released, KEYS_PER_SEND keys per send_input, each part reported by the guest before the
+# next: the keyboard's EV_KEY events are the Linux KEY_* of the runner's table, in order; then a second client holds
+# ShiftLeft and disconnects: the release arrives; then the sentinel KeyZ tap ends the stream. Ends with quit.
 [suite.cases."control-keyboard"]
 argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
         "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-keyboard", "--vcpus", "1"]
@@ -196,7 +197,8 @@ argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--r
         "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-keyboard", "--vcpus", "2"]
 needs = { cores = 2, perf = true }
 
-# dx 1000 sums to REL_X 1000, dy 40 is REL_Y +40, scroll dy 3 is REL_WHEEL -3 and -3 is +3, each button down and up.
+# dx 1000 sums to REL_X 1000, dy 40 is REL_Y +40, scroll dy 3 is REL_WHEEL -3 and -3 is +3, each button down and up;
+# the sentinel left click ends the stream.
 [suite.cases."control-mouse"]
 argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
         "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-mouse", "--vcpus", "1"]

@@ -89,8 +89,9 @@ dependencies). Python client for tests in `tests/lib`. New dependencies are allo
   by OVERRUN or dropped by a full FIFO (Task 1 `queue_waits_for_room`; break: call `keyboard`/`mouse` without waiting
   for room). A guest's evdev reader cannot see that many at once: natemu passes bytes on as fast as the guest reads
   60H, so one `send_input`'s keys arrive as one run of interrupts, and evdev keeps 64 events per keyboard reader and
-  drops them all beyond that (SYN_DROPPED). Task 4 `control-keyboard` therefore sends 6 keys per `send_input` (found
-  in Task 4: one `send_input` of all 208 transitions lost all but the last few, at 1 and 2 vCPUs).
+  drops what had piled up beyond that (SYN_DROPPED). Task 4 `control-keyboard` therefore sends 6 keys per
+  `send_input` (found in Task 4: one `send_input` of all 208 transitions lost all but the last few in
+  `control-keyboard` at 1 and 2 vCPUs on the M4).
 - **Large pointer motion:** a `pointer_motion` of dx 1000 must move the guest pointer 1000 units, not 255 with the
   overflow bit (the mouse clamps beyond 9 bits, `ps2/mouse.rs` `movement_get`): the server splits it into packets of at
   most 255 (Task 1 `motion_splits_into_nine_bit_packets`, Task 4 `control-mouse`; break: one packet).
@@ -218,7 +219,9 @@ A display adds methods; it does not change these. `snapshot { "format": "png" }`
 `SCM_RIGHTS` on the same `sendmsg` as the response line (a client that asks for it must read with `recvmsg`, Python
 `socket.recv_fds`; a buffered `readline` or `socat` loses the descriptor): the mapped device memory's shared-memory object
 (`docs/restructure/mapped-device-memory-plan.md`, `DeviceMemory::fd`), for the client to `mmap` read-only. A
-`display_changed` notification announces a mode change; the client asks for a new `framebuffer`. An IOSurface for a
+`display_changed` notification announces a mode change; the client asks for a new `framebuffer`. A `snapshot` answer
+(a base64 PNG) can exceed the 1 MiB `OUTPUT_CAP` (`crates/host/src/control/mod.rs`), which is a queueing policy and
+not a protocol bound (`docs/control-api.md`, Limits): the display plan raises the cap for that answer or exempts it. An IOSurface for a
 Metal front end needs a Mach port, which a Unix socket cannot carry; the native front end decides that (out of scope).
 
 ## File structure

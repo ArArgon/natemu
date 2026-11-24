@@ -15,29 +15,33 @@ The guest observer: the init finds each device's /dev/input/eventN in /proc/bus/
 by their serio Phys, the power button by its Name) and prints every 24-byte `struct input_event` (x86-64: 16 bytes of
 timeval, u16 type, u16 code, s32 value) on COM1 with BusyBox `hexdump -v -e` as `CONTROL-EV DEV TIME TYPE CODE VALUE`.
 The keyboard's and mouse's readers are a background `cat` from the device to a file in the initramfs (it takes
-everything queued in one read, so a reader on the serial console cannot hold evdev back) and `tail -f` of that file into
-a hexdump writing to the console (a tty: line-buffered, one write per event line). The init prints CONTROL-READY only once each cat holds its device
-open (its /proc/PID/fd/0), from when evdev queues every event for it, so nothing the runner sends after READY is
-missed. A SYN_DROPPED in any stream fails the case. Kernel messages are
-kept off the console (printk level 1) so they cannot split an event line. The power button's reader is the init
-itself (`dd bs=24 count=1` per event from a descriptor kept open, so it can act on KEY_POWER). The judges compare
-parsed events, never timing: EV_KEY presses (1) and releases (0) (autorepeats, 2, are left out), EV_REL movements
+everything queued in one read, so a reader on the serial console cannot hold evdev back) and `tail -f` of that file
+into a hexdump writing to the console (a tty: line-buffered, one write per event line). The init prints CONTROL-READY
+only once each cat holds its device open (its /proc/PID/fd/0), from when evdev queues every event for it, so nothing
+the runner sends after READY is missed. A SYN_DROPPED in any stream fails the case. Kernel messages are kept off the
+console (printk level 1) so they cannot split an event line. The power button's reader is the init itself
+(`dd bs=24 count=1` per event from a descriptor kept open, so it can act on KEY_POWER). The judges compare parsed
+events, never timing: EV_KEY presses (1) and releases (0) (autorepeats, 2, are left out), EV_REL movements
 summed over each run of one axis; EV_SYN, EV_MSC and EV_LED are not judged.
 
 Cases (each ends as the judge expects: `quit`, so `stopped: cancelled` and exit status 2, unless it says otherwise):
 - control-keyboard: every KeyCode's press and release, KEYS_PER_SEND keys per `send_input`, each after the guest
   reported the one before; the keyboard's events must be exactly KEY_CODES' presses and releases in order. Then a
   second client presses ShiftLeft, and once the guest reported the press, disconnects: the release must arrive.
+  Then a third client taps KeyZ, the sentinel: the stream must end with it, so an extra event before it (a second
+  release at the disconnect, say) fails the case.
   Why in parts: natemu passes a key's bytes on as fast as the guest reads 60H, so a send_input's keys reach the guest
-  as one run of interrupts in which no user process runs, and evdev keeps at most 64 events per reader for this
-  keyboard (8 packets of the device's hint, here 8 events, and at least 64: drivers/input/evdev.c
-  evdev_compute_buffer_size, drivers/input/input.c input_estimate_events_per_packet); with more it drops them all
-  and reports SYN_DROPPED. Every transition is three events here (MSC_SCAN, the key, SYN_REPORT), so one
-  send_input of all 208 transitions loses all but the last few (seen at 1 and 2 vCPUs, run 20261124-112535-ca8c).
-  That all of them reach the 8042 in order is Task 1's queue_waits_for_room.
+  as one run of interrupts and the reader does not get to run before evdev's buffer fills. evdev keeps at most 64
+  events per reader for this keyboard (8 packets of the device's hint, here 8 events, and at least 64:
+  drivers/input/evdev.c evdev_compute_buffer_size, drivers/input/input.c input_estimate_events_per_packet); with more
+  it drops what had piled up and reports SYN_DROPPED. Every transition is three events here (MSC_SCAN, the key,
+  SYN_REPORT), so one send_input of all 208 transitions loses all but the last few (seen in control-keyboard at 1 and
+  2 vCPUs on the M4, when it sent everything at once). That all of them reach the 8042 in order is Task 1's
+  queue_waits_for_room.
 - control-mouse: dx 1000 (REL_X summing to 1000: natemu splits it into packets of at most 255), dy 40 (REL_Y +40:
   the API's dy is downward like Linux's, PS/2's upward), scroll dy 3 (REL_WHEEL -3), each button down and up
-  (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE), scroll dy -3 (REL_WHEEL +3), each its own `send_input`.
+  (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE), scroll dy -3 (REL_WHEEL +3), each its own `send_input`; then the sentinel, a
+  left click from a fresh client, which must end the stream.
 - control-power-button: `power_button`; the "Power Button" device (Phys LNXPWRBN/button/input0, the fixed button) must
   report KEY_POWER down and up, then the init powers off: `stopped: power_off`, `natemu: Power(1)`, exit status 0.
 - control-status (with --set machine.ps2=false): `query_status` while running (protocol 1, running, the vCPUs, no
@@ -136,6 +140,10 @@ MOUSE_STEPS = [
       for b, code in (('left', BTN_LEFT), ('right', BTN_RIGHT), ('middle', BTN_MIDDLE)) for p in (True, False)],
     ([{'type': 'scroll', 'dy': -3}], [(EV_REL, REL_WHEEL, 3)]),
 ]
+# The sentinels: sent by a fresh client once everything else arrived, they must end the stream (an extra event before
+# them fails the case).
+SENTINEL_KEY, KEY_SENTINEL = 'KeyZ', KEY_CODES['KeyZ'][1]
+MOUSE_SENTINEL = ([{'type': 'button', 'button': 'left', 'pressed': p} for p in (True, False)], [(EV_KEY, BTN_LEFT, 1), (EV_KEY, BTN_LEFT, 0)])
 # The format of one event's line after `CONTROL-EV DEV `: timeval as four hex words, then type, code, value.
 EVENT_FORMAT = r'4/4 "%08x" 1/2 " %u" 1/2 " %u" 1/4 " %d" "\n"'
 
@@ -299,11 +307,14 @@ def merged(evs: list) -> list:
 
 
 def keyboard_expected() -> list:
-    return [(code, v) for _, code in KEY_CODES.values() for v in (1, 0)] + [(KEY_LEFTSHIFT, 1), (KEY_LEFTSHIFT, 0)]
+    """Every key's press and release, ShiftLeft's press and its release at the disconnect, the sentinel's tap."""
+    return ([(code, v) for _, code in KEY_CODES.values() for v in (1, 0)] + [(KEY_LEFTSHIFT, 1), (KEY_LEFTSHIFT, 0)]
+            + [(KEY_SENTINEL, 1), (KEY_SENTINEL, 0)])
 
 
 def mouse_expected() -> list:
-    return [e for _, want in MOUSE_STEPS for e in want]
+    """Each step's events, then the sentinel's click."""
+    return [e for _, want in MOUSE_STEPS for e in want] + MOUSE_SENTINEL[1]
 
 
 def input_devices(serial: str) -> list:
@@ -365,8 +376,10 @@ def judge_keyboard(run: Run) -> list:
     if run.control.get('shift') != {}: errors.append(f'the ShiftLeft press answered {run.control.get("shift")!r}')
     got, want = keys(events(run.serial, 'keyboard')), keyboard_expected()
     errors += compare(got, want, 'keyboard EV_KEY presses and releases')
-    if got[:len(want) - 2] == want[:-2] and got[len(want) - 2:] != want[-2:]:
-        errors.append(f'after the table: {got[len(want) - 2:]}, expected ShiftLeft down and, at the disconnect, up')
+    if got[:len(want) - 4] == want[:-4] and got[len(want) - 4:] != want[-4:]:
+        errors.append(f'after the table: {got[len(want) - 4:]}, expected ShiftLeft down, at the disconnect up, then the '
+                      f'sentinel {SENTINEL_KEY} down and up')
+    if run.control.get('sentinel') != {}: errors.append(f'the sentinel answered {run.control.get("sentinel")!r}')
     names = {code: (name, k) for k, (name, code) in KEY_CODES.items()}
     if wrong := sorted({f'{names[w[0]][1]} gave {g[0]} not {names[w[0]][0]} ({w[0]})' for g, w in zip(got, want)
                         if g != w and w[0] in names and g[1] == w[1]}):
@@ -380,6 +393,7 @@ def judge_mouse(run: Run) -> list:
         errors.append(f'no input device on {MOUSE_PHYS} listed')
     answers = run.control.get('steps', [])
     if answers != [{}] * len(MOUSE_STEPS): errors.append(f'the steps answered {answers}, expected {{}} each')
+    if run.control.get('sentinel') != {}: errors.append(f'the sentinel answered {run.control.get("sentinel")!r}')
     errors += compare(merged(events(run.serial, 'mouse')), mouse_expected(), 'mouse EV_KEY and summed EV_REL')
     return errors + cancelled(run)
 
@@ -476,7 +490,11 @@ def drive_keyboard(d: Driver):
     d.control['shift'] = answer(lambda: holder.send_input([key('ShiftLeft', True)]))
     d.until(lambda t: len(keys(events(t, 'keyboard'))) >= len(want) - 1, QUIET_SECONDS, 'the ShiftLeft press from the guest')
     holder.close()                  # held: natemu must release it
-    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= len(want), QUIET_SECONDS, 'the ShiftLeft release after the disconnect')
+    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= len(want) - 2, QUIET_SECONDS, 'the ShiftLeft release after the disconnect')
+    last = d.connect()
+    d.control['sentinel'] = answer(lambda: last.send_input(tap(SENTINEL_KEY)))
+    d.until(lambda t: keys(events(t, 'keyboard'))[-1:] == want[-1:], QUIET_SECONDS, f'the sentinel {SENTINEL_KEY} from the guest')
+    last.close()
     vm.close()
     d.quit()
 
@@ -485,7 +503,12 @@ def drive_mouse(d: Driver):
     vm = d.ready()
     d.control['steps'] = [answer(lambda s=s: vm.send_input(s)) for s, _ in MOUSE_STEPS]
     want = mouse_expected()
-    d.until(lambda t: len(merged(events(t, 'mouse'))) >= len(want), QUIET_SECONDS, 'every mouse step from the guest')
+    d.until(lambda t: len(merged(events(t, 'mouse'))) >= len(want) - 2, QUIET_SECONDS, 'every mouse step from the guest')
+    last = d.connect()
+    d.control['sentinel'] = answer(lambda: last.send_input(MOUSE_SENTINEL[0]))
+    d.until(lambda t: len(merged(events(t, 'mouse'))) >= len(want) and merged(events(t, 'mouse'))[-1:] == want[-1:],
+            QUIET_SECONDS, 'the sentinel click from the guest')
+    last.close()
     vm.close()
     d.quit()
 
@@ -681,13 +704,13 @@ def self_check_judges() -> int:
     host = 'natemu: Cancelled\n'
     quit = {'quit': {}, 'stopped': 'cancelled'}
     good_kb = Run('control-keyboard', 2, serial('control-keyboard', 2, '\n'.join(kb_lines) + '\n', kb_listing), host, 2, False,
-                  dict(quit, sends=[{}] * -(-len(KEY_CODES) // KEYS_PER_SEND), shift={}))
+                  dict(quit, sends=[{}] * -(-len(KEY_CODES) // KEYS_PER_SEND), shift={}, sentinel={}))
     mouse_listing = f'CONTROL-INPUT N: Name="ImPS/2 Generic Wheel Mouse"\nCONTROL-INPUT P: Phys={MOUSE_PHYS}\nCONTROL-INPUT \n'
     m_lines = [ev_line('mouse', EV_REL, REL_X, 255)] * 3 + [ev_line('mouse', EV_REL, REL_X, 235), ev_line('mouse', EV_SYN, 0, 0),
                                                              ev_line('mouse', EV_REL, REL_Y, 40)]
     m_lines += [ev_line('mouse', t, c, v) for t, c, v in mouse_expected()[2:]]
     good_mouse = Run('control-mouse', 1, serial('control-mouse', 1, '\n'.join(m_lines) + '\n', mouse_listing), host, 2, False,
-                     dict(quit, steps=[{}] * len(MOUSE_STEPS)))
+                     dict(quit, steps=[{}] * len(MOUSE_STEPS), sentinel={}))
     p_listing = f'CONTROL-INPUT N: Name="{POWER_NAME}"\nCONTROL-INPUT P: Phys={POWER_PHYS}\nCONTROL-INPUT \n'
     p_body = '\n'.join([ev_line('power', EV_KEY, KEY_POWER, 1), ev_line('power', EV_SYN, 0, 0), ev_line('power', EV_KEY, KEY_POWER, 0),
                         ev_line('power', EV_SYN, 0, 0), 'CONTROL-POWEROFF', 'CONTROL-PASS', 'reboot: Power down']) + '\n'
@@ -700,6 +723,7 @@ def self_check_judges() -> int:
     for good in (good_kb, good_mouse, good_power, good_status):
         assert not CASES[good.case].judge(good), (good.case, CASES[good.case].judge(good))
     swap = lambda r, old, new: dataclasses.replace(r, serial=r.serial.replace(old, new, 1))
+    rswap = lambda r, old, new: dataclasses.replace(r, serial=new.join(r.serial.rsplit(old, 1)))     # the last one
     ctl = lambda r, **kw: dataclasses.replace(r, control=dict(r.control, **kw))
     drop = lambda r, *keys: dataclasses.replace(r, control={k: v for k, v in r.control.items() if k not in keys})
     kb = lambda code, v: ev_line('keyboard', EV_KEY, code, v) + '\n'
@@ -725,6 +749,12 @@ def self_check_judges() -> int:
         'quit failed': ctl(good_kb, quit={'code': -32002, 'data': None}),
         'host line': dataclasses.replace(good_kb, stderr='natemu: Power(1)\n', returncode=0),
         'timeout': dataclasses.replace(good_kb, timeout=True),
+        'second release at the disconnect': rswap(good_kb, kb(KEY_SENTINEL, 1), kb(KEY_LEFTSHIFT, 0) + kb(KEY_SENTINEL, 1)),
+        'no sentinel': dataclasses.replace(good_kb, serial=good_kb.serial[:good_kb.serial.rindex(kb(KEY_SENTINEL, 1))]),
+        'sentinel failed': ctl(good_kb, sentinel={'code': -32002, 'data': None}),
+        'extra mouse packet': rswap(good_mouse, ev_line('mouse', EV_KEY, BTN_LEFT, 1) + '\n' + ev_line('mouse', EV_KEY, BTN_LEFT, 0) + '\n',
+                                   ev_line('mouse', EV_REL, REL_X, 1) + '\n' + ev_line('mouse', EV_KEY, BTN_LEFT, 1) + '\n'
+                                   + ev_line('mouse', EV_KEY, BTN_LEFT, 0) + '\n'),
         'reader fell behind': swap(good_kb, kb(48, 0), ev_line('keyboard', EV_SYN, SYN_DROPPED, 0) + '\n' + kb(48, 0)),
         # control-mouse
         'dy not negated': swap(good_mouse, ev_line('mouse', EV_REL, REL_Y, 40), ev_line('mouse', EV_REL, REL_Y, -40)),
@@ -756,7 +786,8 @@ def self_check_judges() -> int:
     }
     for what, r in bad.items(): assert CASES[r.case].judge(r), f'{what}: passed'
     expect = {'one key wrong (KEY_A as KEY_Q)': 'KeyA gave 16 not KEY_A (30)', 'dy not negated': "(2, 1, -40)",
-              'no release at the disconnect': 'at the disconnect', 'reader fell behind': 'SYN_DROPPED', 'two buttons': 'expected one on', 'driver error': 'driver:'}
+              'no release at the disconnect': 'at the disconnect', 'reader fell behind': 'SYN_DROPPED', 'second release at the disconnect': 'after the table',
+              'extra mouse packet': '13 events, expected 12', 'two buttons': 'expected one on', 'driver error': 'driver:'}
     for what, words in expect.items():
         assert any(words in e for e in CASES[bad[what].case].judge(bad[what])), (what, CASES[bad[what].case].judge(bad[what]))
     return len(bad)

@@ -67,18 +67,25 @@ class Control:
             if not line: raise Closed('natemu closed the control connection')
         return json.loads(line)
 
-    def call(self, method: str, params=None):
-        """Sends a request and returns its result; raises RpcError for an error answer, Closed if none comes."""
+    def call(self, method: str, params=None, timeout: float | None = None):
+        """Sends a request and returns its result; raises RpcError for an error answer, Closed if none comes, and
+        TimeoutError if `timeout` seconds pass first (the connection is then unusable: close it)."""
         self.next_id += 1
         request = {'jsonrpc': '2.0', 'id': self.next_id, 'method': method}
         if params is not None: request['params'] = params       # never "params": null (that is -32600)
-        self._send(request)
-        while True:
-            message = self.read()
-            if isinstance(message, dict) and 'id' in message and message['id'] == self.next_id:
-                if 'error' in message: raise RpcError(message['error'])
-                return message['result']
-            self.notifications.append(message)
+        self.sock.settimeout(timeout)
+        try:
+            self._send(request)
+            while True:
+                message = self.read()
+                if isinstance(message, dict) and 'id' in message and message['id'] == self.next_id:
+                    if 'error' in message: raise RpcError(message['error'])
+                    return message['result']
+                self.notifications.append(message)
+        except socket.timeout as e:
+            raise TimeoutError(f'no answer to {method} within {timeout} s') from e
+        finally:
+            if self.sock.fileno() >= 0: self.sock.settimeout(None)
 
     def notify(self, method: str, params=None):
         """Sends a notification: carried out, never answered."""
@@ -104,8 +111,8 @@ class Control:
             self.sock.settimeout(None)
         return self.stopped()
 
-    def send_input(self, events: list):
-        return self.call('send_input', {'events': events})
+    def send_input(self, events: list, timeout: float | None = None):
+        return self.call('send_input', {'events': events}, timeout)
 
 
 def key(code: str, pressed: bool) -> dict:
@@ -139,5 +146,15 @@ def text_events(text: str) -> list:
     return events
 
 
-def type_text(vm: Control, text: str):
-    return vm.send_input(text_events(text))
+# Characters per send_input in type_text. natemu passes keys on as fast as the guest reads them, and a Linux evdev reader
+# (a display server) keeps only 64 events, about 10 keys, so a long string in one send_input can lose keys there
+# (docs/control-api.md, Flow control). tests/devices/run_control.py sends 6 keys per part for the same reason.
+TYPE_TEXT_CHARS = 6
+
+
+def type_text(vm: Control, text: str, chars: int = TYPE_TEXT_CHARS, pause: float = 0.05):
+    """Types `text` on a US layout, `chars` characters per send_input with `pause` seconds between parts, so a guest
+    program reading evdev gets to read each part before the next arrives."""
+    for at in range(0, len(text), chars):
+        if at: time.sleep(pause)
+        vm.send_input(text_events(text[at:at + chars]))
