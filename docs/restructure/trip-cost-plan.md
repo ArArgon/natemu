@@ -1,6 +1,6 @@
 # The resident trip's cost: the gate, the return path and the footprint (plan)
 
-Status: design, not built (November 23, 2026), branch `m2-sampler` at d3f2fe4d; revised after an independent review (SPSR is not passed from the gate, kill-tests by three alternating runs, the FPCR skip dropped, helper trips owned here). It answers the row "trip cost times
+Status: steps 0, 1.1-1.2 and 2 built and kept, X1 measured, 1.4 killed, 1.3 and 3 not built, 5 a follow-up (November 24, 2026: section 11). Designed November 23, 2026, branch `m2-sampler` at d3f2fe4d; revised after an independent review (SPSR is not passed from the gate, kill-tests by three alternating runs, the FPCR skip dropped, helper trips owned here). It answers the row "trip cost times
 trips >= 10% of configure's guest bucket" of the [sampler findings](el0-sampler-findings.md) (section 7: **build**, the
 resident's return path and footprint; the gate is the larger part) and the owner's decisions under it: fixes are pooled
 (no A/B per fix; one combined A/B and profile round at the end, with the gate), each fix is correct first and
@@ -390,3 +390,80 @@ Steps 0-3, X1 and reviews: about 15 hours, plus machine time for 12 coldtrip run
   cold state today. The gap is the floor (section 2.1) and the two FPCR writes, which X1 prices.
 - Step 5: up to about 3.1 s on configure if the dominant helper kind is most of the 14.1 M (each trip removed saves its
   whole 220 ns or so): the largest item in this plan, sized by step 0.
+
+## 11. Results (November 24, 2026, M2 Max)
+
+**Step 0 (built).** `io5-solo32-profile` (M2 Max, at bd97a67d plus step 0), the use launch, summed over its 4 vCPUs (K1 `systems.from`):
+**`string` 172,422,367, `x87` 2,260,186** (their sum equals the `helper` bucket's entry count exactly, 174,682,553), so
+PCMPxSTRx is 98.7% of the helper trips; the helper bucket took 23.4 vCPU-s of that launch. (The verify launch: 224,195 and 7.)
+Per step is not split (the counts are launch-wide); configure's 14.1 M helper trips are the findings' estimate. T11 is the
+`faults` `i6b-cases` row `helper-counts` (37 FSINs and 23 PCMPISTRIs counted exactly under the `perf` resident; the X87
+counter moved into the STRING arm turns it red: x87 60, string 0).
+
+**Experiment X1 (built, measured, reverted).** Not a coldtrip variant: the turn-around
+needs a trip the gate can recognize and resume without harm, and the guest cannot issue a new `svc` immediate, so the
+`x1-floor` resident turns `svc #STRING` (PCMPISTRI's helper) around in the gate, the variant in the control's low 3 bits,
+measured as `k2-cost` rows do (wall clock, slope per iteration at 1,000,000 and 2,000,000 iterations, the production
+`pcmpistri`, `div`, `cpuid` and `nop` rows beside it): system case `x1-floor`, three runs at f8240469 (bd97a67d plus step 0
+and X1), 9 slopes a row. An
+experiment: ns per iteration, mean (min), difference to (a) with 3 standard errors of the difference:
+
+| Row | ns | vs (a) | 3 SE |
+| --- | ---: | ---: | ---: |
+| (a) turned around as every trip | 69.6 (65.9) | | |
+| (b) without the two FPCR writes | 67.6 (66.2) | -2.0 | 2.5 |
+| (a) + `msr spsel, #1` | 66.9 (65.7) | -2.7 | 2.6 |
+| (a) + FPSR, same value | 76.0 (74.4) | **+6.4** | 2.8 |
+| (a) + FPCR, same value (0) | 72.7 (70.3) | +3.0 | 2.9 |
+| (a) + ELR_EL1, same value | 71.6 (66.6) | +1.9 | 3.3 |
+| (a) + SP_EL0, same value | 68.8 (65.5) | -0.8 | 3.1 |
+| production: PCMPISTRI's helper trip | 115.1 (114.6) | | |
+| production: `div` (128/64) | 127.9 (101.6) | | |
+| production: `cpuid` | 340.2 (335.6) | | |
+
+Read: the floor (the hardware's exception entry and `eret` and the full save and restore, plus the loop's own words) is
+about 66-70 ns of wall time per trip, most of any trip's gate; PCMPISTRI's Rust service, the copies and its pcmpstr add
+about 45 ns, division's about 58. The two FPCR writes are not resolved (-2.0 against 2.5): under the 5 ns that would ask
+for a lazy-FPCR note, so none is written. SPSel costs nothing measurable: **step 1.3 is not built**. A same-value FPSR
+write costs 6.4 ns (beyond 3 SE and over 3 ns): **step 1.4 qualifies** and gets its own kill-test.
+
+The kill-tests below ran after the rebase onto 161176fb (bulk REP MOVS), each "before" the tip the step was built on;
+profiles on the M2 Max, three alternating runs a side, never page numbers.
+
+**Step 1.1 and 1.2 (kept).** `guest-coldtrip-profile`, before 161176fb, after 9d1ee344, 18 counted rounds a
+side: `gate_ns` 56.8 (min 52.5, sd 2.9) to 53.6 (min 51.0, sd 2.4), **-3.2 ns** against 3 SE 2.7 and the 3 ns minimum
+(passes, at the edge); `cold_ns` -4.5 (3 SE 15.3) and `trip_small_ns` -5.7 (3 SE 5.3) not resolved. T1 red (the checker's
+unit test; K1 `k1-c1`, 192 failures), T2 red (the checker's unit test), T3 red (`k1-c1`, 314 failures), T4 red on this
+M2 in the faults `*-m2f` cases (AFP hidden from fexc: failures and timeouts), so it is not only an M1 mutation.
+
+**Step 1.3 (SPSel): not built** (X1: no measurable cost). **Step 1.4 (the FPSR skip): built, killed and
+reverted.** Before 9d1ee344, after bd4a22e7: `gate_ns` 54.8 (min 50.3, sd 3.2) to 54.5 (min 50.7, sd 3.2),
+-0.3 against 3 SE 3.2. X1 priced an added same-value write; skipping the one the restore makes saves nothing measurable.
+Its skip-target check went with it (T8 was red in the checker on a skip moved by one word; T9 not run, the step reverted).
+
+**Step 2 (kept).** `k2-cost` (production resident, wall clock), before 1e1e4138, after f8bf8a46, 9 slopes a
+side: `div` 115.8 (min 105.2, sd 7.4) to 85.5 (min 68.4, sd 8.9), **-30.3 ns** against 3 SE 11.5 and the 10 ns minimum;
+the control `cpuid` +2.5 (3 SE 13.5), `nop` -2.9 (8.5), `syscall` +4.8 (30.5): unmoved. T5 red (`k2-cost` `div`: the loop
+count check; the programs `fix` and `seed` corpora stay green: none of their divisions takes the helper), T6 red
+(programs `i6b`, 23 failures).
+
+**Step 3 (the footprint): not built.** Its kill-test cannot resolve the effect it expects. The plan sized its threshold
+from `cold_ns`'s stdev of 7.0; in the six-run kill-tests above it was 11-17 per round, so 3 SE of the difference is
+13-15 ns, against an expected gain at the low end of 0-10 ns (minimum 7). Built, it would be killed whatever it did. It
+would also put `link_section` attributes on about 30 functions in `cache.rs` and `execution.rs`, which return prediction
+and the split-check work are changing now. Follow-up: build it when a measurement can see 7 ns of cold state: a coldtrip
+with more counted rounds (`ROUNDS` in `coldtrip.c` is 3 a run, and the image must be rebuilt to change it), or a cold-state
+row that repeats the large footprint's K = 1 and 2 phases only.
+
+**Step 5: a follow-up, not built here.** Step 0 shows one kind dominating: PCMPxSTRx's `svc #STRING` is 98.7% of the
+helper trips (172.4 M in io5's use launch). The removal is neither small nor exact enough for this plan: inline lowering
+in fexc (the intermediate result as a pure function of two vectors, the control and two lengths:
+`natemu_abi::strings::pcmpstr`) or a stack-free routine in the code area, either needing its own design note, a fexc
+change and its own corpus. Step 2 already takes the copies off these trips (wall clock: about 45 ns of the 115 ns
+PCMPISTRI trip in X1 was the resident's service and the copies). At about 115 ns a trip, 172 M trips are about 20 vCPU-s
+of the use launch (the helper bucket measured 23.4): the largest single item in this plan, as section 10 expected.
+Owner of the next step: a design note for PCMPxSTRx inline in fexc.
+
+Commits after the rebase onto 54335cb8 (the measurements above ran at their pre-rebase twins): step 0 7fc685b5, X1
+7be2ee39 and its revert bd2dc379, step 1.1-1.2 30e87e6c (measured as 9d1ee344), step 1.4 93bff736 and its revert
+439d3a10 (measured as bd4a22e7 against 9d1ee344), step 2 07354bd4 (measured as f8bf8a46 against 1e1e4138).
