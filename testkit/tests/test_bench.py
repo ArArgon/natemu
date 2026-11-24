@@ -264,3 +264,69 @@ def test_a_case_may_set_its_own_timeout():
     fam, suites = _bench_family()
     assert HARNESS.case_timeout(fam, suites['io5'], 'io5-solo32-qemu') == 3900
     assert HARNESS.case_timeout(fam, suites['io5'], 'io5-solo') is None
+
+
+def test_platform_off_is_a_text_check_of_the_build_source_tree(tmp_path):
+    """Platform-devices plan, Task 5: the three switches for a source tree whose crates/cli/src/config.rs names
+    `machine.ps2`, none for one without (an older build refuses an unknown --set key); the worktree for this checkout's
+    build, a commit for TESTKIT_BENCH_AT and a case's baseline."""
+    from testkit.harness import bench
+    three = ['machine.pvpanic=false', 'machine.smbios=false', 'machine.ps2=false']
+    cfg = tmp_path / 'tree' / 'crates/cli/src/config.rs'
+    assert bench.platform_off(root=tmp_path / 'tree') == []                     # no config.rs at all
+    cfg.parent.mkdir(parents=True); cfg.write_text('const KEYS: &[&str] = &["machine.vcpus", "machine.ram"];\n')
+    assert bench.platform_off(root=tmp_path / 'tree') == []
+    cfg.write_text('const KEYS: &[&str] = &["machine.vcpus", "machine.pvpanic", "machine.smbios", "machine.ps2"];\n')
+    assert bench.platform_off(root=tmp_path / 'tree') == three
+    repo = tmp_path / 'repo'; f = repo / 'crates/cli/src/config.rs'; f.parent.mkdir(parents=True)
+    git = lambda *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+    git('init', '-q'); (repo / 'README').write_text('x')
+    commit = lambda m: (git('add', '-A'), git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', m), git('rev-parse', 'HEAD'))[-1]
+    old = commit('no config.rs')
+    f.write_text('"machine.vcpus"\n'); without = commit('config.rs without the key')
+    f.write_text('"machine.vcpus"\n"machine.ps2"\n'); keyed = commit('the key')
+    f.write_text('"machine.vcpus"\n')                                            # the worktree differs from HEAD
+    assert [bench.platform_off(r, repo) for r in (old, without, keyed)] == [[], [], three]
+    assert bench.platform_off(None, repo) == []
+    # This repository: the checkout has the keys; m1-perf's baseline and this plan's base do not.
+    assert bench.platform_off() == three
+    assert bench.platform_off('ecec5d77') == [] and bench.platform_off('6dfd0634') == []
+
+
+def test_only_cases_that_start_the_natemu_cli_get_the_switches():
+    """Which bench cases get `--natemu-set` (the CLI: run.py and boot.py with --emu natemu, run_io5.py with --backend
+    natemu, run_paper.py, run_m1_perf.py's final build) and which nothing (natemu-host, QEMU, the x86 machine); for an
+    older build (a TESTKIT_BENCH_AT round at this plan's base) none at all, and m1-perf's baseline never."""
+    from testkit.harness import bench
+    _, suites = _bench_family()
+    switches = [w for kv in bench.PLATFORM_OFF for w in ('--natemu-set', kv)]
+    cli, other = set(), set()
+    for s in suites.values():
+        for name, spec in s.extra['cases'].items():
+            a = spec['argv']
+            starts_cli = (any(a[i:i + 2] in (['--emu', 'natemu'], ['--backend', 'natemu']) for i in range(len(a)))
+                          or any(x.endswith(('run_paper.py', 'run_m1_perf.py')) for x in a))
+            got = bench._platform_args(spec, None)
+            (cli if starts_cli else other).add(name)
+            assert got == (switches if starts_cli else []), (name, got)
+            assert bench._platform_args(spec, '6dfd0634') == [], name
+            assert not starts_cli or '{host}' not in ' '.join(a), name
+    assert {'boot-natemu', 'guest-zstd', 'guest-paper', 'io5-solo', 'm1-perf'} <= cli
+    assert {'micro-natemu', 'compat-tls-natemu', 'mixed-far-natemu', 'guest-zstd-qemu', 'io5-solo32-reference'} <= other
+    assert not cli & other
+
+
+def test_m1_perf_gets_the_switches_for_its_final_build_only(monkeypatch, tmp_path):
+    """Through the harness: the final build (this checkout) gets the switches, the baseline (ecec5d77, no keys) none, a
+    piece still ends in --limit 1, and a TESTKIT_BENCH_AT round at an older commit starts without them."""
+    from testkit.harness import bench
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    a, *_ = run('run1')
+    tail = [w for kv in bench.PLATFORM_OFF for w in ('--natemu-set', kv)]
+    assert a[-len(tail):] == tail and '--baseline-set' not in a
+    p, *_ = run('run2', case='m1-perf/piece-00', rc=4)
+    assert p[-2:] == ['--limit', '1'] and p[-2 - len(tail):-2] == tail
+    monkeypatch.setattr(artifacts, 'fexc_at', lambda rev: tmp_path / 'fexc')
+    monkeypatch.setenv(bench.AT_ENV, '6dfd0634')
+    old, *_ = run('run3')
+    assert '--natemu-set' not in old and '--baseline-set' not in old

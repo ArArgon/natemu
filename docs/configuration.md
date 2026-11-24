@@ -84,6 +84,9 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | `[machine]` | `ram` | `2G` | Guest RAM: a size string (as `--ram`) or an integer of bytes |
 | | `vcpus` | `1` | Processors |
 | | `transport` | all `pci` with a file | `disk`, `nic`, `rng`, each `"mmio"` or `"pci"` |
+| | `pvpanic` | `true` | The pvpanic device (ACPI `QEMU0001`, port 505H): a guest kernel panic ends the run (`natemu: Power(4)`, exit status 2) |
+| | `smbios` | `true` | SMBIOS 3.0 tables naming the machine `natemu` (what `dmidecode` and `/sys/class/dmi/id` show), the entry point at F0000H; a firmware boot ignores it |
+| | `ps2` | `true` | An 8042 controller with a PS/2 keyboard and mouse (no host input reaches them yet); `false` leaves port 64H a reset-only register |
 | `[serial]` | `output` | standard output | A file path, or the word `stdout` |
 | | `stdin` | `false` | Feed standard input to COM1 |
 | `[engine]` | `fexc` | none (required) | The fexc compiler |
@@ -158,7 +161,8 @@ A device is addressed by its id: `--set disk.root.path=other.raw`, `--set disk.t
 `--set nic.net0.forward=tcp:2222:22,8080:80` (a comma-separated list). `--set` can change a listed
 device but cannot create one. Setting one key twice on the command line (by flag, `--set`, or
 both) is an error. `--disk`, `--net` and `--rng` are refused when the file lists devices of that
-kind. `--set machine.transport` takes both `nic=` and the old `net=`.
+kind. `--set machine.transport` takes both `nic=` and the old `net=`. `--set machine.pvpanic=false`,
+`--set machine.smbios=false` and `--set machine.ps2=false` turn those devices off (the benchmarks run with all three off).
 
 ## Deprecated environment variables
 
@@ -200,6 +204,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
 | `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
 | `--set machine.ram: set twice on the command line` | A key given twice |
+| `--set machine.ps2: bad boolean "maybe": 1/0, yes/no, on/off or true/false` | A switch (`machine.pvpanic`, `machine.smbios`, `machine.ps2`, ...) given something else |
 | `--disk: the config file lists [[disk]] devices; use --set disk.ID.path=... or edit the file` | Flag and file disagree on who owns the devices |
 | `c.toml: disk "a" is its own backing file` | `backing` and `path` are one file |
 | `c.toml: the backing file of disk "a" is disk "b", which is writable; ...` | A base must not change under its overlay |

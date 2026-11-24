@@ -18,6 +18,12 @@ when a case of the suite uses it (and then prepared before the run starts):
     {qemu_system}       the pinned qemu-system-x86_64 binary
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
     {resume_dir}        a results folder kept across runs, the same while the case and what it names are (resume_dir())
+
+Benchmarks keep the machine they have always measured: a case that starts the `natemu` CLI (its argv names {natemu} or
+{natemu_entry}, this run's build, or {natemu_baseline}, the case's baseline) gets the platform devices off (pvpanic,
+SMBIOS, the 8042: PLATFORM_OFF) as its runner's `--natemu-set KEY=VALUE` (natemu's `--set`), or `--baseline-set` for the
+baseline build, when that build's source tree has them (platform_off()). Cases that start natemu-host ({host}) need
+nothing: its devices are off unless asked for.
 """
 import json
 import os
@@ -93,6 +99,38 @@ def _session(path: pathlib.Path) -> dict:
     except (OSError, ValueError): return {'started': time.time(), 'fresh_done': False, 'done': 0}
 
 
+PLATFORM_OFF = ('machine.pvpanic=false', 'machine.smbios=false', 'machine.ps2=false')
+CLI_CONFIG = 'crates/cli/src/config.rs'
+PLATFORM_KEY = 'machine.ps2'
+
+
+def platform_off(rev: str | None = None, root: pathlib.Path | None = None) -> list[str]:
+    """PLATFORM_OFF if the source tree a natemu build came from names `machine.ps2` in crates/cli/src/config.rs, else
+    nothing: the worktree's for this checkout's build (rev None; artifacts.natemu() builds the worktree as it is), the
+    commit's for `rev` (artifacts.natemu_at: a TESTKIT_BENCH_AT round, a case's `baseline`). A text check of the tree,
+    never a run of the build: an older build has no such keys and refuses an unknown --set key, so it gets none (and
+    runs as it always did)."""
+    root = root or paths.repo_root()
+    if rev is None:
+        f = root / CLI_CONFIG
+        text = f.read_text(errors='replace') if f.is_file() else ''
+    else:
+        # No config.rs at `rev` (an older tree) is no key; an unknown `rev` already fails in artifacts.natemu_at.
+        r = subprocess.run(['git', '-C', str(root), 'show', f'{rev}:{CLI_CONFIG}'], capture_output=True, text=True)
+        text = r.stdout if r.returncode == 0 else ''
+    return list(PLATFORM_OFF) if PLATFORM_KEY in text else []
+
+
+def _platform_args(spec, rev: str | None) -> list[str]:
+    """The runner options that turn the platform devices off in the case's natemu CLI builds (module docstring)."""
+    out = []
+    if _uses(spec, 'natemu') or _uses(spec, 'natemu_entry'):
+        out += [w for kv in platform_off(rev) for w in ('--natemu-set', kv)]
+    if _uses(spec, 'natemu_baseline'):
+        out += [w for kv in platform_off(spec['baseline']) for w in ('--baseline-set', kv)]
+    return out
+
+
 VCPUS_ENV = 'TESTKIT_BENCH_VCPUS'  # {vcpus} in a case's argv (the guest benchmarks): 1 unless set
 AT_ENV = 'TESTKIT_BENCH_AT'      # a revision: the run measures natemu and fexc as committed there (the same cases and inputs)
 
@@ -146,7 +184,7 @@ class Bench:
     def _subst(self, s, d):
         return s.format(**d)
 
-    def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False) -> dict:
+    def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False, platform=()) -> dict:
         vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host, 'vcpus': os.environ.get(VCPUS_ENV, '1'),
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
@@ -156,6 +194,7 @@ class Bench:
         if _uses(spec, 'qemu_system'): vals['qemu_system'] = artifacts.qemu_system() / 'qemu-system-x86_64'
         if _uses(spec, 'qemu_img'): vals['qemu_img'] = artifacts.qemu_system() / 'qemu-img'
         ident = {k: str(v) for k, v in vals.items() if k not in ('out', 'raw') and _uses(spec, k)}
+        if platform: ident['platform'] = ' '.join(platform)      # the switches are part of what a resumed record measured
         for p, name in INPUTS.items():
             if not _uses(spec, p): continue
             src = INPUT_FNS[name]()
@@ -179,7 +218,8 @@ class Bench:
         from testkit import runloop
         from testkit.sched.pool import raw_root
         n, fexc = artifacts.natemu(), artifacts.fexc()
-        if rev := os.environ.get(AT_ENV): n, fexc = artifacts.natemu_at(rev), artifacts.fexc_at(rev)     # a baseline round
+        rev = os.environ.get(AT_ENV) or None
+        if rev: n, fexc = artifacts.natemu_at(rev), artifacts.fexc_at(rev)     # a baseline round
         h = host.detect()
         out = {}
         for it in batch:
@@ -188,6 +228,9 @@ class Bench:
             d.mkdir(parents=True, exist_ok=True)
             raw = raw_root()
             piece = spec is not keyspec
+            platform = _platform_args(keyspec, rev)       # after the case's own words, before a piece's --limit 1
+            k = len(keyspec['argv'])
+            spec = dict(spec, argv=[*spec['argv'][:k], *platform, *spec['argv'][k:]])
             if piece:            # one session file per case and run: pieces run in any order
                 sf = d.parent / f'{base}.session.json'; sess = _session(sf)
                 fresh = bool(config and config.getoption('fresh')) and not sess['fresh_done']     # once, whichever piece is first
@@ -197,7 +240,7 @@ class Bench:
                 sf.write_text(json.dumps(sess))
             else:
                 fresh = bool(config and config.getoption('fresh'))
-            vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh)
+            vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh, platform)
             where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:

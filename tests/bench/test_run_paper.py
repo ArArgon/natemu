@@ -34,6 +34,12 @@ class Options(unittest.TestCase):
         self.assertEqual(run_paper.phase_command(self.args(True), 'disk', 'bench-1')[-2:], ['--perf-log', pathlib.Path('out/perf-bench-1.log')])
         self.assertNotIn('--perf-log', run_paper.phase_command(self.args(False), 'disk', 'bench-1'))
 
+    def test_natemu_set_is_passed_on_as_set(self):
+        """The bench harness's platform-device switches (testkit/harness/bench.py) reach natemu as --set."""
+        args = self.args(False); args.natemu_set = ['machine.ps2=false', 'machine.smbios=false']
+        self.assertEqual(run_paper.natemu_command(args, 'disk')[-4:], ['--set', 'machine.ps2=false', '--set', 'machine.smbios=false'])
+        self.assertNotIn('--set', run_paper.natemu_command(self.args(False), 'disk'))
+
     def test_a_hidden_afp_must_show_in_the_startup_line(self):
         t = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, t, True)
         (t / 'stderr-bench-1.log').write_text('natemu: cpu: x86-64-v3\nnatemu: fp: fast mode\n')

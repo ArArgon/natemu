@@ -49,6 +49,15 @@ argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--
         "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "platform", "--vcpus", "2"]
 needs = { cores = 2, perf = true }
 
+# The three devices off (Task 5), the machine every benchmark keeps: no SMBIOS (no `DMI:` line in dmesg, the kernel's
+# `DMI not present or invalid.`, no /sys/firmware/dmi/entries), no serio port, no QEMU0001, PNP0303 or PNP0F13 among the
+# ACPI devices; `reboot -f` with reboot=k (FEH to port 64H, the PM device's reset-only register) ends the run with
+# Power(2).
+[suite.cases."platform-off"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "platform-off",
+        "--set", "machine.pvpanic=false", "--set", "machine.smbios=false", "--set", "machine.ps2=false"]
+
 # The runner's self-check: the init's shell syntax, every case's dispatch, the judges' negative controls; no VM.
 [[suite]]
 name = "devices-selfcheck"

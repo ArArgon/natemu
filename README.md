@@ -158,7 +158,8 @@ A launch can also be described in a TOML file (`--config FILE`), which adds seve
 read-only disks; see [docs/configuration.md](docs/configuration.md).
 
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
-2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error.
+2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error. If the guest's Linux kernel crashes (a kernel
+panic), natemu ends the run with status 2 instead of leaving the guest hanging.
 
 When natemu stops for any reason other than a power-off, a reboot or Ctrl-C, it prints on standard error where the processor was: the
 address of the guest instruction, its bytes and the registers. If the guest seems stuck, press Ctrl-T in the terminal

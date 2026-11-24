@@ -38,7 +38,7 @@ KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e
 # (serio, libps2 and i8042 are built in: CONFIG_SERIO_I8042=y, CONFIG_SERIO_LIBPS2=y).
 MODULES = ('pvpanic_mmio', 'psmouse')
 APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'ls', 'basename', 'readlink', 'dmesg', 'sync',
-           'poweroff', 'sleep', 'stty')
+           'poweroff', 'reboot', 'sleep', 'stty')
 VM_SECONDS = 120
 CMDLINE = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 PVPANIC_CAPABILITY = '/sys/bus/platform/devices/QEMU0001:00/capability'
@@ -53,6 +53,10 @@ PS2_KEYBOARD = ('AT Translated Set 2 keyboard', 'isa0060/serio0/input0')
 PS2_MOUSE_PHYS = 'isa0060/serio1/input0'
 PS2_PNP = re.compile(r'i8042: PNP: PS/2 Controller \[.*\] at 0x60,0x64 irq 1,12$')
 PS2_FAILURES = re.compile(r"i8042: Can't read CTR|psmouse.*failed", re.I)
+# platform-off: ACPI device ids that are there only with a platform device on (pvpanic; the 8042's keyboard and mouse),
+# and one that is always there (the ACPI namespace root), so an empty or missing listing cannot pass.
+DEVICE_HIDS = ('QEMU0001', 'PNP0303', 'PNP0F13')
+ACPI_ROOT = 'LNXSYSTM:00'
 
 INIT = r'''#!/bin/sh
 export PATH=/bin
@@ -107,9 +111,27 @@ case_platform() {
   pass
 }
 
+# platform-off: the three devices off (--set machine.pvpanic=false, machine.smbios=false, machine.ps2=false). No SMBIOS:
+# the kernel's DMI scan finds nothing (its dmesg lines; no /sys/firmware/dmi/entries); no 8042: no serio port; no
+# pvpanic and no PS/2 device among the ACPI devices. Then `reboot -f` (reboot=k: the kernel writes FEH to port 64H, the
+# PM device's reset-only register) must end the run with Power(2).
+case_platform_off() {
+  dmesg | grep -e 'SMBIOS' -e 'DMI' | while read -r line; do echo "PLATFORM-DMESG $line"; done
+  if test -e /sys/firmware/dmi/entries; then echo PLATFORM-DMI-ENTRIES present; else echo PLATFORM-DMI-ENTRIES absent; fi
+  test -d /sys/bus/serio/devices || fail "/sys/bus/serio/devices missing (no serio bus)"
+  echo PLATFORM-SERIO $(ls /sys/bus/serio/devices)
+  test -d /sys/bus/acpi/devices || fail "/sys/bus/acpi/devices missing (no ACPI)"
+  echo PLATFORM-ACPI $(ls /sys/bus/acpi/devices)
+  echo PLATFORM-TRIGGER reboot
+  drain_console || fail console-drain
+  reboot -f
+  fail reboot-returned
+}
+
 case "$name" in
   pvpanic-panic) case_pvpanic_panic;;
   platform) case_platform;;
+  platform-off) case_platform_off;;
   *) fail "unknown case '$name'";;
 esac
 fail "case $name returned"
@@ -213,6 +235,30 @@ def judge_ps2(run: Run) -> list:
     return errors
 
 
+def judge_platform_off(run: Run) -> list:
+    """The devices off: no SMBIOS (no `DMI:` line, the kernel's `DMI not present or invalid.`, no
+    /sys/firmware/dmi/entries), no serio port, none of DEVICE_HIDS among the ACPI devices; `reboot -f` ends with Power(2)."""
+    errors = common(run)
+    dmesg = [re.sub(r'^\[[^]]*\] ?', '', l) for l in re.findall(r'^PLATFORM-DMESG (.*)$', run.serial, re.M)]
+    if found := [l for l in dmesg if l.startswith('DMI:') or re.match(r'SMBIOS .*present', l)]:
+        errors.append(f'SMBIOS found with machine.smbios=false: {found}')
+    if 'DMI not present or invalid.' not in dmesg:
+        errors.append(f'no "DMI not present or invalid." in dmesg (its DMI and SMBIOS lines: {dmesg})')
+    if (entries := re.findall(r'^PLATFORM-DMI-ENTRIES (\w+)$', run.serial, re.M)) != ['absent']:
+        errors.append(f'/sys/firmware/dmi/entries {entries or "not reported"}, expected absent')
+    serio = re.findall(r'^PLATFORM-SERIO(.*)$', run.serial, re.M)
+    if [s.split() for s in serio] != [[]]:
+        errors.append(f'serio devices {serio or "not listed"}, expected none (machine.ps2=false)')
+    acpi = [s.split() for s in re.findall(r'^PLATFORM-ACPI(.*)$', run.serial, re.M)]
+    if len(acpi) != 1 or ACPI_ROOT not in acpi[0]:
+        errors.append(f'ACPI devices {acpi or "not listed"}: expected one listing with {ACPI_ROOT}')
+    elif on := [d for d in acpi[0] if d.split(':')[0] in DEVICE_HIDS]:
+        errors.append(f'ACPI devices {on} with the platform devices off')
+    if run.after_trigger is None: errors.append('the guest never reached the reboot (PLATFORM-TRIGGER)')
+    errors += stopped(run, 'natemu: Power(2)', 2)
+    return errors
+
+
 @dataclasses.dataclass(frozen=True)
 class Case:
     words: tuple                    # kernel command line words beyond CMDLINE and platform_case=NAME
@@ -222,6 +268,7 @@ class Case:
 CASES = {
     'pvpanic-panic': Case(('panic=0',), judge_pvpanic_panic),
     'platform': Case((), judge_platform),
+    'platform-off': Case(('reboot=k',), judge_platform_off),
 }
 TRIGGER = re.compile(r'^PLATFORM-TRIGGER ', re.M)
 
@@ -451,8 +498,45 @@ def self_check():
     for what, r in platform_bad.items(): assert judge(r), f'platform {what}: passed'
     assert any('PS/2 mouse' in e for e in judge(platform_bad['no mouse'])), judge(platform_bad['no mouse'])
     assert any('SMBIOS 3.0.0' in e for e in judge(platform_bad['no SMBIOS line'])), judge(platform_bad['no SMBIOS line'])
-    print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad)} negative judge controls '
-          'passed; no VM launched.')
+    # platform-off: a passing log, then each device left on and each other thing it checks broken.
+    serial = (f'PLATFORM-BEGIN case=platform-off cpus=1 kernel={KVER}\n'
+              'PLATFORM-DMESG [    0.000000] DMI not present or invalid.\n'
+              'PLATFORM-DMI-ENTRIES absent\nPLATFORM-SERIO\n'
+              'PLATFORM-ACPI LNXCPU:00 LNXPWRBN:00 LNXSYBUS:00 LNXSYSTM:00 PNP0103:00 PNP0A03:00 PNP0B00:00 PNP0C0F:00\n'
+              'PLATFORM-TRIGGER reboot\n[    1.234567] reboot: Restarting system\n')
+    good = Run('platform-off', 1, serial, 'natemu: Power(2)\n', 2, False, 0.4)
+    judge = CASES['platform-off'].judge
+    assert not judge(good), judge(good)
+    swap = lambda old, new: dataclasses.replace(good, serial=good.serial.replace(old, new))
+    smbios_on = ('PLATFORM-DMESG [    0.000000] SMBIOS 3.0.0 present.\n'
+                 f'PLATFORM-DMESG [    0.000000] DMI: natemu natemu x86-64, BIOS natemu 0.1.0 {BIOS_DATE}\n')
+    off_bad = {'SMBIOS on': swap('PLATFORM-DMESG [    0.000000] DMI not present or invalid.\n', smbios_on),
+               'DMI line': swap('DMI not present or invalid.', f'DMI: natemu natemu x86-64, BIOS natemu 0.1.0 {BIOS_DATE}'),
+               'SMBIOS line': swap('PLATFORM-DMI-ENTRIES', 'PLATFORM-DMESG [    0.0] SMBIOS 2.8 present.\nPLATFORM-DMI-ENTRIES'),
+               'no DMI scan line': swap('PLATFORM-DMESG [    0.000000] DMI not present or invalid.\n', ''),
+               'entries': swap('ENTRIES absent', 'ENTRIES present'),
+               'no entries line': swap('PLATFORM-DMI-ENTRIES absent\n', ''),
+               'PS/2 on': swap('PLATFORM-SERIO\n', 'PLATFORM-SERIO serio0 serio1\n'),
+               'no serio line': swap('PLATFORM-SERIO\n', ''),
+               'pvpanic on': swap('PNP0C0F:00', 'PNP0C0F:00 QEMU0001:00'),
+               'keyboard device': swap('PNP0B00:00', 'PNP0303:00 PNP0B00:00'),
+               'mouse device': swap('PNP0C0F:00', 'PNP0C0F:00 PNP0F13:00'),
+               'no ACPI root': swap(' LNXSYSTM:00', ''),
+               'no ACPI line': dataclasses.replace(good, serial=re.sub(r'^PLATFORM-ACPI.*\n', '', serial, flags=re.M)),
+               'guest failure': swap('PLATFORM-TRIGGER reboot', 'PLATFORM-FAIL reboot-returned'),
+               'no trigger': dataclasses.replace(good, after_trigger=None),
+               'S5': dataclasses.replace(good, stderr='natemu: Power(1)\n', returncode=0),
+               'panic': dataclasses.replace(good, stderr='natemu: Power(4)\n'),
+               'stopped': dataclasses.replace(good, stderr='natemu: memory fetch at 0xffff0\n'),
+               'status': dataclasses.replace(good, returncode=0),
+               'timeout': dataclasses.replace(good, timeout=True, stderr='natemu: Cancelled\n'),
+               'other case': swap('case=platform-off', 'case=platform')}
+    for what, r in off_bad.items(): assert judge(r), f'platform-off {what}: passed'
+    assert any('SMBIOS found' in e for e in judge(off_bad['SMBIOS on'])), judge(off_bad['SMBIOS on'])
+    assert any('QEMU0001' in e for e in judge(off_bad['pvpanic on'])), judge(off_bad['pvpanic on'])
+    assert any('serio' in e for e in judge(off_bad['PS/2 on'])), judge(off_bad['PS/2 on'])
+    print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad) + len(off_bad)} negative '
+          'judge controls passed; no VM launched.')
 
 
 def main():

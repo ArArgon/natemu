@@ -3,6 +3,7 @@
 
     tests/bench/run_paper.py run --inputs IO5_INPUTS --paper-inputs PAPER_INPUTS --out DIR --fexc FEXC --natemu NATEMU --runtime RUNTIME
                              [--vcpus 4] [--ram 2] [--starts 2] [--boots 3] [--speculation-barriers] [--perf-log]
+                             [--natemu-set KEY=VALUE ...]  (passed on to natemu as --set KEY=VALUE)
 
 The guest is the stock Debian 13 cloud image IO5 boots (tests/io/run_io5.py: its prepared disk.raw, kernel and initramfs,
 input io5-inputs), cloned per run and grown to 16 GiB, booted 1 + BOOTS times through the serial console:
@@ -126,7 +127,8 @@ def natemu_command(args, disk):
     return [args.natemu, '--runtime', args.runtime, '--fexc', args.fexc, '--kernel', args.inputs / 'vmlinuz',
             '--initrd', args.inputs / 'initrd.img', '--cmdline', CMDLINE, '--ram', f'{args.ram}G', '--vcpus', str(args.vcpus),
             '--serial-stdin', '--disk', disk, '--net', '--rng', '--compile-cache', 'off'] + \
-           (['--speculation-barriers'] if args.speculation_barriers else [])
+           (['--speculation-barriers'] if args.speculation_barriers else []) + \
+           [w for kv in getattr(args, 'natemu_set', []) for w in ('--set', kv)]
 
 
 def phase_command(args, disk, phase):
@@ -244,6 +246,7 @@ def main():
     r.add_argument('--speculation-barriers', action='store_true',
                    help="natemu's page-walk barriers: the CPU reports RDCL_NO, so Linux runs without PTI (README)")
     r.add_argument('--perf-log', action='store_true', help="natemu's timing log of each boot, OUT/perf-PHASE.log (a profile, not a timing)")
+    r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     args = a.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     return run(args)

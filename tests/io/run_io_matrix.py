@@ -420,7 +420,7 @@ def run(args):
                 command = [str(binary), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.inputs / 'linux'),
                     '--initrd', str(args.inputs / 'bootstrap.cpio'), '--disk', str(image), '--vcpus', str(args.cpus), '--ram', '2G',
                     '--compile-cache', 'off', '--serial', str(case / 'serial.log'), '--cmdline', cmdline] + (['--virtio-transport', 'pci'] if pci else []) + \
-                    (overlay_set(base) if overlay else [])
+                    (overlay_set(base) if overlay else []) + [w for kv in args.natemu_set for w in ('--set', kv)]
             else:
                 command = [str(binary), '-machine', 'pc-i440fx-11.1', '-accel', 'tcg,thread=multi', '-cpu', 'max', '-smp', str(args.cpus),
                     '-m', '2048', '-nodefaults', '-display', 'none', '-monitor', 'none', '-no-reboot', '-serial', 'file:' + str(case / 'serial.log'),
@@ -556,6 +556,7 @@ def main():
     for n in ('executable', 'inputs', 'out', 'lock'): a.add_argument('--' + n, type=Path, required=True)
     for n in ('runtime', 'fexc', 'build-manifest'): a.add_argument('--' + n, type=Path)
     a.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default), qcow2 or overlay: see the module docstring')
+    a.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     args = p.parse_args()
     for k, v in vars(args).items():
         if isinstance(v, Path): setattr(args, k, v.resolve())

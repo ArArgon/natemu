@@ -131,3 +131,20 @@ class RetryBefore(unittest.TestCase):
             run_m1_perf.execute(args, t, plan)        # A-0 failed again now (2000): not retried; A-1 runs
             run_m1_perf.execute(args, t, plan)        # nothing left to run: the verdict
             self.assertEqual(runs, ['A-0', 'A-1'])
+
+
+class BuildSettings(unittest.TestCase):
+    def test_each_build_gets_its_own_natemu_set(self):
+        """--natemu-set goes to the final build's runs and --baseline-set to the baseline's, as the runners' --natemu-set
+        (the bench harness turns the platform devices off where a build has them)."""
+        import types
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import run_m1_perf
+        args = types.SimpleNamespace(baseline_dir='B', final_dir='F', fexc='fexc', inputs='in', io5_inputs='io5', lock='lock',
+                                     natemu_set=['machine.ps2=false'], baseline_set=[])
+        for setup, kind in (('final-raw', 'matrix'), ('io5-raw', 'io5')):
+            cmd = run_m1_perf.command(args, dict(setup=setup, kind=kind), 'out')
+            self.assertEqual(cmd[-2:], ['--natemu-set', 'machine.ps2=false'])
+        self.assertNotIn('--natemu-set', run_m1_perf.command(args, dict(setup='base-raw', kind='matrix'), 'out'))
+        args.baseline_set = ['machine.x=1']
+        self.assertEqual(run_m1_perf.command(args, dict(setup='base-raw', kind='matrix'), 'out')[-2:], ['--natemu-set', 'machine.x=1'])

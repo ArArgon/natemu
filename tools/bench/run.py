@@ -4,7 +4,7 @@ measurement, verification and record are that script's, natemu now runs as the `
 
     python3 tools/bench/run.py --out DIR --name NAME --emu natemu|qemu-multi|qemu-single|qemu-multi-max --vcpus N
         --bench BENCH --kernel BZIMAGE --initrd CPIO [--jobs J] [--fexc FEXC] [--natemu STUB] [--runtime FILE]
-        [--compile-cache DIR|off] [--cap SECONDS] [--qemu QEMU] [--append WORDS] [--perf-log]
+        [--compile-cache DIR|off] [--cap SECONDS] [--qemu QEMU] [--append WORDS] [--perf-log] [--natemu-set KEY=VALUE ...]
 
 The guest runs the benchmark twice (run 1 cold, run 2 warm), each timed on the host from its NATEMU-BENCH-START line to its
 NATEMU-BENCH-END line on the serial console (START2/END2 for run 2; boot excluded) and verified (VERIFY / VERIFY2). A
@@ -17,7 +17,8 @@ the guest's own guest_s and rc). Record fields: `wall_s` / `guest_s` / `phases` 
 The serial file is polled every 50 ms; every 0.5 s `vms.sh` lists foreign VM processes (another natemu stub, natemu-host
 or QEMU, not this boot's own children), recorded as `contended`. natemu: the stub (`--natemu`, default
 target/release/natemu; its resident `--runtime`, default the one built beside it), `--fexc` required; the compile cache
-is `--compile-cache` when given, else the stub's default (its NATEMU_COMPILE_CACHE fallback included). QEMU: TCG
+is `--compile-cache` when given, else the stub's default (its NATEMU_COMPILE_CACHE fallback included); each
+`--natemu-set KEY=VALUE` is passed on as `--set KEY=VALUE`. QEMU: TCG
 thread=multi or single, the board and CPU model of natemu-raw/qcmp-20261103-01 (`-max`: `-cpu max`). JOBS defaults to
 VCPUS. The guest powers off after its last VERIFY line; the whole boot (both runs) is capped at `--cap` s (default 600): a
 capped boot is recorded (`capped`, `capped_in`: the run it was in, `at_least_s`: how long that run had lasted). Exit 0 verified
@@ -78,6 +79,7 @@ def main():
     ap.add_argument('--perf-log', action='store_true', help='natemu: write its timing log to OUT/NAME.perf (a profile, not a timing: pass a `perf` resident as --runtime)')
     ap.add_argument('--append', default='', help='more words for the kernel command line (e.g. vdso32=0: 32-bit programs then make their system calls by INT 0x80)')
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
+    ap.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     a = ap.parse_args()
     if a.ram < 2 or a.ram % 2: ap.error('--ram must be a positive multiple of 2 MiB')
     out, name, emu, n, bench, cap = a.out, a.name, a.emu, a.vcpus, a.bench, a.cap
@@ -92,7 +94,8 @@ def main():
     if emu == 'natemu':
         if not a.fexc: ap.error('--emu natemu needs --fexc')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
-               '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else [])]
+               '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else []),
+               *(w for kv in a.natemu_set for w in ('--set', kv))]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', f'{QMACHINE},hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
                '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,

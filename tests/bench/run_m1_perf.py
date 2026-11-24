@@ -11,7 +11,9 @@
 Inputs (plan, smoke, full) default to natemu-raw (RAW_ROOT); each can be given instead, as tools/natemu-test's bench case
 `m1-perf` does with builds and inputs it made itself: --baseline-build/--final-build DIR (a natemu build laid out like
 cargo's target folder; old names --baseline-dir/--final-dir), --fexc, --fio-prep, --block-inputs (what the matrix inputs
-are prepared from, into --inputs), --io5-inputs. Under a caller that already holds the VM lock (NATEMU_VM_LOCK_HELD) the
+are prepared from, into --inputs), --io5-inputs. `--natemu-set KEY=VALUE` (the final build) and `--baseline-set KEY=VALUE`
+(the baseline build) are passed on to that build's runs as the runners' --natemu-set (natemu's `--set KEY=VALUE`): the
+bench harness turns the platform devices off with them in a build that has them. Under a caller that already holds the VM lock (NATEMU_VM_LOCK_HELD) the
 driver does not take it again.
 
 Sets (full --sets, default A,BC,D):
@@ -19,7 +21,8 @@ Sets (full --sets, default A,BC,D):
   BC  final raw vs final qcow2 (preallocated) vs final overlay (empty overlay on the raw base), 3 runs each, interleaved
       (the raw side is its own fresh set of runs in this session, not reused from A)
   D   IO5 (4 vCPUs, --solo-build, --mitigations-off) once raw and once overlay with the final binary; compared on solo-build make
-The matrix is 2 vCPUs on the PCI transport, the same command line for every setup (only --image-format differs).
+The matrix is 2 vCPUs on the PCI transport, the same command line for every setup (only --image-format and a build's own
+--natemu-set differ).
 
 Judging. Per job: median/min/max of the runs, noise = (max-min)/median (the largest over the raw setups), ratio of medians in the
 direction of performance (throughput higher is better; latency and time lower is better). A loss no larger than the noise is
@@ -98,6 +101,9 @@ def command(args, spec, out, manifest='MANIFEST'):
     binary, runtime = paths(args, spec['setup'])
     fmt = SETUPS[spec['setup']][1]
     flags = ['--image-format', fmt] if fmt != 'raw' else []   # raw: no flag, so baseline and final lines are identical
+    # but for the build's own settings (bench harness: the platform devices off where the build has them)
+    sets = args.baseline_set if SETUPS[spec['setup']][0] == 'baseline' else args.natemu_set
+    flags += [w for kv in sets for w in ('--natemu-set', kv)]
     if spec['kind'] == 'matrix':
         return [sys.executable, IO / 'run_io_matrix.py', 'run', '--backend', 'natemu', '--transport', 'pci', '--cpus', '2',
                 '--executable', binary, '--runtime', runtime, '--fexc', args.fexc, '--inputs', args.inputs, '--out', out,
@@ -437,6 +443,8 @@ def main():
         s.add_argument('--final-commit', help='commit of the final binary (default: this checkout HEAD)')
         s.add_argument('--sets', default='A,BC,D', help='comma list of A, BC, D')
         s.add_argument('--dir', type=Path); s.add_argument('--retry-failed', action='store_true', help='rerun runs recorded as failed')
+        s.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help="the final build's runs: natemu's --set KEY=VALUE")
+        s.add_argument('--baseline-set', action='append', default=[], metavar='KEY=VALUE', help="the baseline build's runs: natemu's --set KEY=VALUE")
         if name == 'full':
             s.add_argument('--limit', type=int, help=f'run at most N pending runs, then exit {INCOMPLETE} if runs are left '
                            '(the test framework runs the case as pieces of one run each)')

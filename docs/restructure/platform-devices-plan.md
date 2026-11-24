@@ -3,12 +3,21 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Status: revised November 23, 2026, after an independent review (accept with required changes: six blocking findings
-on the F0000H page, test selection, the L2 checks, the pvpanic sysfs value, PS/2 input delivery and the benchmark
-control group, all folded in below); a second check found the L2 and benchmark fixes needed `natemu-host` flags
-(it has no `--set`) and a harness rule for older builds, and the legacy ROM page a named write path: folded in. Owner direction (same day): build the platform devices with the highest return
-first, in their own track beside multi-BAR PCI and the virtio device interface; natemu stays permissively licensed
-(adapted code is Apache-2.0, BSD or MIT, never GPL/LGPL).
+Status: built November 24, 2026 (Tasks 1-5, branch `claude/platform-devices-c98b44` from `m2-peripherals` 6dfd0634,
+commits from 5fa3b5d1 on); the gate is the integration gate of the peripherals round, still to run. Built as planned:
+pvpanic at port 505H (a panic is `Power(4)`), SMBIOS 3.0 with its entry point in a read-only legacy ROM page at F0000H,
+an 8042 with a PS/2 keyboard and mouse (adapted from OpenVMM and bhyve), the three `[machine]` keys on in the CLI and
+off in `natemu-host` unless `--pvpanic`, `--smbios` or `--ps2`, and the `tests/devices` family (`pvpanic-panic`,
+`platform[1]`, `platform[2]`, `platform-off`; smoke has `pvpanic-panic` and `platform[1]`), whose initramfs lives in the
+shared input root. Where it departed: the legacy ROM page is data only (a fetch from it stops as not RAM); Task 3's
+Device-page break stops at Linux's iBFT scan, before the DMI scan; the `--skip-capability` demonstration ends with a
+watchdog stop after about 60 s rather than a timeout; IRQ 1 is raised for the controller's own replies (as a real 8042
+and QEMU), and a controller reply over a full output buffer replaces the unread byte (OpenVMM's behaviour; QEMU keeps
+it pending); the bench harness gives its switches to each runner as `--natemu-set KEY=VALUE` (m1-perf's baseline
+build: `--baseline-set`), which the runners pass to natemu as `--set`. The plan was revised November 23 after an
+independent review and a second check (all findings folded in below). Owner direction (same day): build the platform
+devices with the highest return first, in their own track beside multi-BAR PCI and the virtio device interface; natemu
+stays permissively licensed (adapted code is Apache-2.0, BSD or MIT, never GPL/LGPL).
 
 **Goal:** three PC platform devices a guest finds without drivers we ship: a pvpanic device (a guest kernel panic ends
 the run with its own typed stop), SMBIOS tables (the guest sees a vendor, product, processors and memory), and an 8042

@@ -4,17 +4,18 @@ record are that script's, natemu now runs as the `natemu` stub with named argume
 
     python3 tools/bench/boot.py --out DIR --name NAME --emu natemu|qemu-multi|qemu-single --vcpus N --kernel BZIMAGE
         [--initrd FILE] [--kaslr] [--cache warm|off --cache-dir DIR] [--fexc FEXC] [--natemu STUB] [--runtime FILE]
-        [--qemu QEMU]
+        [--qemu QEMU] [--natemu-set KEY=VALUE ...]
 
 The same harness for both emulators: the serial file polled every 50 ms from process start to the end-point line
 ("VFS: Unable to mount root fs" without an initrd, the Debian installer's "Select a language" with it), then SIGINT;
 nothing else polled on either side but `vms.sh` every 0.5 s for a foreign VM process (another natemu stub, natemu-host or
 QEMU, not this boot's own children), recorded as `contended`. natemu: the stub (`--natemu`, default target/release/natemu;
 its resident `--runtime`, default the one built beside it), `--fexc` required; `--cache warm` uses the compile cache
-`--cache-dir`, `off` none (`--compile-cache off`). QEMU: -nodefaults, the pc board without HPET, i8042 and vmport (natemu
-has none; PIC, PIT, RTC, I/O APIC and the PIIX4 PM block stay), COM1 only, the CPU model closest to natemu's profile that
-TCG boots (QCPU). Exit 0 reached, 1 not, 3 reached but contended. Appends one JSON line to DIR/boots.jsonl; serial to
-DIR/NAME.serial. Run it under the VM lock with no other VM running.
+`--cache-dir`, `off` none (`--compile-cache off`); each `--natemu-set KEY=VALUE` is passed on as `--set KEY=VALUE`.
+QEMU: -nodefaults, the pc board without HPET, i8042 and vmport (natemu has none in a benchmark: the bench harness turns
+its 8042 off; PIC, PIT, RTC, I/O APIC and the PIIX4 PM block stay), COM1 only, the CPU model closest to natemu's
+profile that TCG boots (QCPU). Exit 0 reached, 1 not, 3 reached but contended. Appends one JSON line to DIR/boots.jsonl;
+serial to DIR/NAME.serial. Run it under the VM lock with no other VM running.
 """
 import argparse, json, os, pathlib, re, signal, subprocess, sys, time
 
@@ -45,6 +46,7 @@ def main():
     ap.add_argument('--natemu', default=str(ROOT / 'target/release/natemu'))
     ap.add_argument('--runtime')
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
+    ap.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     a = ap.parse_args()
     out, name, emu, n, initrd, kaslr, cache = a.out, a.name, a.emu, a.vcpus, a.initrd, a.kaslr, a.cache
     cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off' + ('' if kaslr else ' nokaslr')
@@ -55,7 +57,8 @@ def main():
     if emu == 'natemu':
         if not a.fexc or (cache == 'warm' and not a.cache_dir): ap.error('--emu natemu needs --fexc (and --cache-dir with --cache warm)')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--cmdline', cmdline,
-               '--vcpus', n] + (['--initrd', initrd] if initrd else []) + ['--serial', serial, '--compile-cache', a.cache_dir if cache == 'warm' else 'off']
+               '--vcpus', n] + (['--initrd', initrd] if initrd else []) + ['--serial', serial, '--compile-cache', a.cache_dir if cache == 'warm' else 'off',
+                                                       *(w for kv in a.natemu_set for w in ('--set', kv))]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', 'pc,hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}", '-cpu', QCPU,
                '-m', '2048', '-smp', n, '-kernel', a.kernel, '-append', cmdline, '-display', 'none', '-monitor', 'none',

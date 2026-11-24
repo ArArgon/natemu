@@ -332,7 +332,8 @@ def command(args, disk, cache, phase='use'):
                 '--serial-stdin', '--disk', disk, '--net', '--rng', '--compile-cache', cache] + \
                (overlay_set(args.inputs / 'disk.raw') if getattr(args, 'image_format', 'raw') == 'overlay' else []) + \
                (['--speculation-barriers'] if args.speculation_barriers else []) + \
-               (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else [])
+               (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else []) + \
+               [w for kv in getattr(args, 'natemu_set', []) for w in ('--set', kv)]
     if args.backend == 'kvm':   # the x86 reference machine: Debian's QEMU (the run's snapshot) in the builds' container, as ltp32's reference boots
         qemu = ('qemu-system-x86_64 -enable-kvm -cpu host,-pku -nodefaults -display none -serial stdio -no-reboot '
                 f'-m {args.ram * 1024} -smp {args.vcpus} -kernel /b/vmlinuz -initrd /b/initrd.img -append {shlex.quote(cmdline)} '
@@ -653,6 +654,7 @@ def main():
     r.add_argument('--perf-log', action='store_true', help='natemu: write each launch\'s timing log to OUT/perf-PHASE.log')
     r.add_argument('--lock', type=Path, default=VM_LOCK); r.add_argument('--keep-disk', action='store_true')
     r.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default), qcow2 or overlay (see the docstring)')
+    r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     f = sub.add_parser('profile', help='one step per boot from a snapshot disk, with the timing log')
     f.add_argument('--snapshot', type=Path, required=True); f.add_argument('--inputs', type=Path, required=True)
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,
