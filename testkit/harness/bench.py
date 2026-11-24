@@ -12,6 +12,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {runtime_perf}      the resident built with its `perf` feature (artifacts.perf_runtime), for profile cases
     {runtime_profile}   the resident built with its `perf` and `profile` features (artifacts.profile_runtime), for
                         sampling cases (the EL0 sampler: `--sample-us`)
+    {sample_us}         the sampling cases' interval in us: SAMPLE_US, or TESTKIT_SAMPLE_US for one run
     {natemu_entry}      this checkout's natemu build folder, laid out like cargo's target folder (artifacts.natemu)
     {natemu_baseline}   the same for the case's `baseline` revision (artifacts.natemu_at)
     {fio_prep} {block_inputs} {io5_inputs}   writable clones, in the case folder, of inputs.fio_prep(),
@@ -137,6 +138,8 @@ def _platform_args(spec, rev: str | None) -> list[str]:
 
 
 VCPUS_ENV = 'TESTKIT_BENCH_VCPUS'  # {vcpus} in a case's argv (the guest benchmarks): 1 unless set
+SAMPLE_US_ENV = 'TESTKIT_SAMPLE_US'  # {sample_us} in a case's argv (the EL0 sampler's interval in us): SAMPLE_US unless set
+SAMPLE_US = '250'
 AT_ENV = 'TESTKIT_BENCH_AT'      # a revision: the run measures natemu and fexc as committed there (the same cases and inputs)
 
 
@@ -191,7 +194,7 @@ class Bench:
         return s.format(**d)
 
     def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False, platform=()) -> dict:
-        vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host, 'vcpus': os.environ.get(VCPUS_ENV, '1'),
+        vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host, 'vcpus': os.environ.get(VCPUS_ENV, '1'), 'sample_us': os.environ.get(SAMPLE_US_ENV, SAMPLE_US),
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry

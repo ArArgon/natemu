@@ -220,49 +220,49 @@ argv = ["python3", "tests/bench/coldtrip_report.py", "run", "--out", "{out}", "-
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample", "--markers", "{out}/build-sample.markers.tsv", "--perf", "{out}/build-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-hackbench-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-luajit-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/luajit-sample", "--markers", "{out}/luajit-sample.markers.tsv", "--perf", "{out}/luajit-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-sqlite-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/sqlite-sample", "--markers", "{out}/sqlite-sample.markers.tsv", "--perf", "{out}/sqlite-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-zstd-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/zstd-sample", "--markers", "{out}/zstd-sample.markers.tsv", "--perf", "{out}/zstd-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-startup32-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/startup32-sample", "--markers", "{out}/startup32-sample.markers.tsv", "--perf", "{out}/startup32-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "startup32",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-scimark32-sse2-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/scimark32-sse2-sample", "--markers", "{out}/scimark32-sse2-sample.markers.tsv", "--perf", "{out}/scimark32-sse2-sample.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32-sse2",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-build-sample-4]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample-4", "--markers", "{out}/build-sample-4.markers.tsv", "--perf", "{out}/build-sample-4.perf", "--kernel", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample-4", "--emu", "natemu", "--vcpus", "4", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
-        "--compile-cache", "off", "--sample-us", "250"]
+        "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 # The sampler's validity case (the plan's chunk 0): the image's sampler_check program (bench=sampler-check: a one-block loop,
 # an indirect call, a page-crossing store, cache-missing loads, the control port's stop and start), sampled every 250 us,
@@ -276,7 +276,7 @@ argv = ["python3", "tests/bench/sampler_check_judge.py", "--profile", "{out}/sam
         "--perf", "{out}/sampler-check-sample.perf", "--require-place", "probe",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "sampler-check-sample", "--emu", "natemu", "--vcpus", "1",
         "--bench", "sampler-check", "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}",
-        "--runtime", "{runtime_profile}", "--compile-cache", "off", "--sample-us", "250"]
+        "--runtime", "{runtime_profile}", "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 # What sampling costs (the plan's overhead case): build and hackbench at 1 vCPU and build at 4, each sampling off and every
 # 250 us with the same `perf,profile` resident and timing log, alternating, three rounds (tests/bench/run_sampler_cost.py).
@@ -284,7 +284,7 @@ argv = ["python3", "tests/bench/sampler_check_judge.py", "--profile", "{out}/sam
 [suite.cases.guest-sampler-cost]
 timeout = 3600
 argv = ["python3", "tests/bench/run_sampler_cost.py", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
-        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--sample-us", "250", "--rounds", "3",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--sample-us", "{sample_us}", "--rounds", "3",
         "--configs", "build:1,hackbench:1,build:4"]
 
 [suite.cases.guest-zstd-qemu]
@@ -399,7 +399,7 @@ argv = ["python3", "tests/bench/sample_report.py", "--window", "10", "--kernel",
         "--profile", "{out}/io5/sample-verify", "--markers", "{out}/io5/markers-verify.tsv", "--perf", "{out}/io5/perf-verify.log",
         "--", "python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
         "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
-        "--i386", "--sample-us", "250", "--lock", "{out}/vm.lock"]
+        "--i386", "--sample-us", "{sample_us}", "--lock", "{out}/vm.lock"]
 
 [suite.cases.io5-solo32-qemu]
 timeout = 3900
