@@ -273,7 +273,7 @@ the normal build with sampling off against the parent, three alternating rounds,
 
 | Measured | Then |
 | --- | --- |
-| Slot plus its landing words 8% or more of EL0 samples on `build` or a `make` step, and 60% or more of indirect `jmp`/`call` executions at one-target sites | design an inline cache per site |
+| Slot plus its landing words 8% or more of EL0 samples on `build` or a `make` step, and each site's main target taking 60% or more of indirect `jmp`/`call` executions (execution-weighted top-1 share, per address space and by code with targets relative to the site) | design an inline cache per site |
 | Returns 5% or more of EL0 samples, and the depth-16 return model hits 90% or more | design return prediction; first find the record of the earlier return-pairing experiment that lost time on 64-bit code (the [task 4 findings](m2-task4-findings.md) point to "the translated-code experiments", the November 15-19 series, whose [page](translated-code-layout.md) does not record it) |
 | FEX's own body 60% or more of the hot blocks' samples | a FEX code-quality track goes to the owner, with the guest bucket against the real-x86 reference case's step times beside it |
 | Split checks and probes 3% or more | look at which stores keep their own check (bases `--push-run`'s dataflow cannot show aligned) |
