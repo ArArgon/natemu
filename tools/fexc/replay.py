@@ -256,6 +256,38 @@ def parse(reply):
     return reply[:20], reply[20:at], h, o[u32(h, 40):][:u32(h, 44)], table(64, 40), table(72, 12), table(80, 16)
 
 
+def with_arg(record, arg: bytes):
+    """A recorded request with one more NUL-terminated argument after its arguments (fexc.cpp --serve's body: u32 length,
+    u32 arguments' length, the arguments, the rest)."""
+    body = record[4:]
+    n = struct.unpack_from('<I', body, 0)[0]
+    body = struct.pack('<I', n + len(arg)) + body[4:4 + n] + arg + body[4 + n:]
+    return struct.pack('<I', len(body)) + body
+
+
+# Bulk REP plan (section 14): FexcRepMovs's first word and its two flag-byte loads, in order (fexc_sites.inc).
+MOVS_WORDS = (0xd341fce0, 0x39501f80, 0x394feb80)
+
+
+def has_bulk_movs(reply) -> bool:
+    """The reply's code holds FexcRepMovs (its first word, then its fast-string and DF loads)."""
+    p = parse(reply)
+    if not p: return False
+    code, words = p[3], MOVS_WORDS
+    w = [struct.unpack_from('<I', code, o)[0] for o in range(0, len(code) - 3, 4)]
+    return any(w[i] == words[0] and w[i + 2] == words[1] and w[i + 4] == words[2] for i in range(len(w) - 4))
+
+
+def only_bulk_movs(old, new, answer_without):
+    """Bulk REP plan (section 14): an intended change of 64-bit output, bounded here. None when NEW's reply holds FexcRepMovs
+    and NEW's reply to the same request with `--no-bulk-movs` (FexcRepMovs not emitted) is OLD's, or differs from it only as
+    only_probes allows; else what differs. So every other word of the reply is OLD's."""
+    if not has_bulk_movs(new): return 'no FexcRepMovs in the new reply'
+    without = answer_without()
+    if without == old: return None
+    return None if only_probes(old, without) is None else 'differs without FexcRepMovs too'
+
+
 def only_moves(old, new):
     """32-bit code shared position-independent (fexc: every guest-RIP move of 32-bit code is `movz w; movk w, lsl #16;
     nop`, FEX's InsertGuestRIPMove under fexc_bits32): None when NEW's reply is OLD's but for that, else what else
@@ -386,7 +418,7 @@ def main():
     stream = a.stream or record(a)
     old, new = serve(a.old), serve(a.fexc)
     old32 = serve(a.old32) if a.old32 else None
-    n = differ = n32 = probes = 0
+    n = differ = n32 = probes = movs = 0
     same32 = moves32 = differ32 = uncaught = 0
     size32 = [0, 0]   # the 32-bit replies' code bytes, OLD32's and NEW's
     code_size = lambda r: (lambda p: len(p[3]) if p else 0)(parse(r))
@@ -415,6 +447,9 @@ def main():
                             if uncaught <= 5: print(f'request {n} (32-bit): mutations {missed} not reported')
                 continue
             ro, rn = answer(old, rec), answer(new, rec)
+            if ro != rn and b'--bulk\0' in args and only_bulk_movs(ro, rn, lambda: answer(new, with_arg(rec, b'--no-bulk-movs\0'))) is None:
+                movs += 1
+                continue
             if ro != rn and (why := only_probes(ro, rn)) is not None:
                 differ += 1
                 if differ <= 5:
@@ -425,7 +460,8 @@ def main():
         if p: p.stdin.close(); p.wait()
     same = os.path.realpath(a.old) == os.path.realpath(a.fexc)
     print(f'replay: {n} requests ({stream.stat().st_size >> 20} MiB), {differ} differences' +
-          (f'; {probes} more replies differ only by split stubs that probe (M2 task 4: only_probes)' if probes else '') + (' (OLD is NEW: the self-check only)' if same else '') +
+          (f'; {probes} more replies differ only by split stubs that probe (M2 task 4: only_probes)' if probes else '') +
+          (f'; {movs} more differ only by bulk REP MOVS (only_bulk_movs)' if movs else '') + (' (OLD is NEW: the self-check only)' if same else '') +
           (f'; {n32} of them for 32-bit code, answered by NEW only (none compared: --old32 compares them)' if n32 and not old32 else ''))
     if old32:
         growth = 100 * (size32[1] - size32[0]) / max(size32[0], 1)

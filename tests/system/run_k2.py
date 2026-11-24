@@ -1804,6 +1804,9 @@ def repmovs(a, report):
                 ('movs-both', 8, 0xf00, 0x4f00, 64, ['unmap 0x401000', 'unmap 0x405000'], (14, D + 0x1000, 4)),
                 ('movs-first', 1, 0x1000, 0x5000, 0x40, ['unmap 0x401000'], (14, D + 0x1000, 4)),
                 ('movs-src-cross-w8', 8, 0xff8, 0x4000, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-misaligned-src-unmapped', 8, 0xf04, 0x4f00, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-misaligned-dst-unmapped', 8, 0xf00, 0x4f04, 64, ['unmap 0x405000'], (14, D + 0x5000, 6)),
+                ('movs-loop-dst-readonly', 8, 0x4, 0x5000, 64, ['readonly 0x405000'], (14, D + 0x5000, 7)),
                 ('movs-src-cross-w1', 1, 0xff3, 0x4000, 0x100, ['unmap 0x401000'], (14, D + 0x1000, 4)),
                 ('movs-src-readonly', 8, 0xf00, 0x4f00, 64, ['readonly 0x401000'], None)):
             code, lab = asm(f'mov rsi, {D + so:#x}\nmov rdi, {D + do:#x}\nmov rcx, {n}\nx: rep movs{"b" if w == 1 else "q"}\nnop', labels=True)
@@ -1859,7 +1862,7 @@ def repmovs(a, report):
             if got != want: problems.append(f'#DB (RIP, RCX, RSI) {[(hex(r), c, hex(s)) for r, c, s in got]}')
         record(f'movs-tf-{block}', problems)
     R = 20_000
-    def kicks(w, block, misc_off):
+    def kicks(w, block, misc_off, soff=0):
         n = 65536 // w
         h64 = (f'h64:\npush rax\npush rbx\npush rdx\ninc qword ptr [{CNT:#x}]\nlea rbx, [rip + x]\ncmp rbx, [rsp + 24]\njne 9f\n'
                f'inc qword ptr [{CNT + 8:#x}]\nmov rbx, rdi\nsub rbx, {DST:#x}\nshr rbx, {w.bit_length() - 1}\nadd rbx, rcx\ncmp rbx, {n}\njne 81f\n'
@@ -1872,10 +1875,10 @@ def repmovs(a, report):
                f'8: inc qword ptr [{CNT + 16:#x}]\n9: push rcx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rcx\npop rdx\npop rbx\npop rax\niretq\n')
         off = 'mov ecx, 0x1a0\nrdmsr\nand eax, -2\nwrmsr\n' if misc_off else ''
         # r12 this round's source, r13 the last round's (two buffers whose every byte differs).
-        code, lab = asm(setup + off + f'sti\nxor r15d, r15d\nmov r12, {SRC2:#x}\nmov r13, {SRC:#x}\n1: xchg r12, r13\nmov rsi, r12\nmov rdi, {DST:#x}\nmov ecx, {n}\n'
+        code, lab = asm(setup + off + f'sti\nxor r15d, r15d\nmov r12, {SRC2 + soff:#x}\nmov r13, {SRC + soff:#x}\n1: xchg r12, r13\nmov rsi, r12\nmov rdi, {DST:#x}\nmov ecx, {n}\n'
                         f'x: rep movs{"b" if w == 1 else "q"}\ninc r15\ncmp r15, {R}\njb 1b\ncli\njmp done\n' + h1 + h64 + 'done: nop', labels=True)
-        tag = f'movs-kicks-w{w}{"-misc-off" if misc_off else ""}'
-        s1 = pattern(0x10000, 5)
+        tag = f'movs-kicks-w{w}{"-misc-off" if misc_off else ""}{f"-src{soff}" if soff else ""}'
+        s1 = pattern(0x10010, 5)
         s2 = bytes(b ^ 0x5a for b in s1)
         out, err = go(tag, idt_text(code, lab, f'memory {SRC:#x} {s1.hex()}\nmemory {SRC2:#x} {s2.hex()}\nregion {DST & ~0xfff:#x} 0x11000\n'), block,
                       ['--kick-vcpu', '0', '--kick-events', '0x40', '--kicks', '3000', '--kick-every-us', '20', '--kick-jitter-us', '200'])
@@ -1891,6 +1894,7 @@ def repmovs(a, report):
     for block in (None, 1):
         for w in (1, 8): kicks(w, block, False)
     for w in (1, 8): kicks(w, None, True)
+    for block in (None, 1): kicks(8, block, False, soff=4)   # section 14: a declined MOVSQ, element by element in the block
     # UC and WT source pages (PCD|PWT: PAT entry 3, UC; PWT: entry 1 made WT): copied, every element run alone.
     for name, prelude, bits in (('movs-uc-src', '', 0x18), ('movs-wt-src', 'mov ecx, 0x277\nmov eax, 0x00050406\nmov edx, 0x00070406\nwrmsr\n', 0x8)):
         code = asm(prelude + f'mov rsi, {D:#x}\nmov rdi, {D + 0x4000:#x}\nmov ecx, 512\nrep movsq\nnop')
@@ -1911,6 +1915,117 @@ def repmovs(a, report):
         out, err = go(f'movs-linked-{n}', f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n})}\ncode {code.hex()}\nregion 0x3e0000 0x10000\nregion {D:#x} 0x100000\n', None)
         entries[n] = out and out['stop'] == 'reached' and out['stats']['linker']
     record('movs-linked', [] if entries[2000] and entries[2000] == entries[4000] else [f'linker entries {entries}'], {'linker': entries})
+
+    # CPL 3 faults at a page reached inside the block (#PF P|W|U on the destination, P|U on the source), non-canonical pointers
+    # (#GP(0), nothing done), and a destination running from the last canonical page into the non-canonical half (#GP(0) after
+    # the page's 512 elements, RCX 1).
+    TOP = 0x7ffffffff000
+    for name, rsi, rdi, count, extra, want in (
+            ('movs-cpl3-us-dst', D + 0x40, D + 0x4f00, 64, f'entry {D + 0x5000:#x} 1 clear 0x4\n', (14, D + 0x5000, 0x7, 64 - 32, D + 0x40 + 256, D + 0x5000)),
+            ('movs-cpl3-us-src', D + 0xf00, D + 0x4040, 64, f'entry {D + 0x1000:#x} 1 clear 0x4\n', (14, D + 0x1000, 0x5, 64 - 32, D + 0x1000, D + 0x4040 + 256)),
+            ('movs-noncanonical-src', 0x800000000000, D + 0x4000, 100, '', (13, 0, 0, 100, 0x800000000000, D + 0x4000)),
+            ('movs-noncanonical-dst', D, 0x800000000000, 100, '', (13, 0, 0, 100, D, 0x800000000000)),
+            ('movs-into-noncanonical', D, TOP, 513, f'memory {TOP:#x} {bytes(0x1000).hex()}\n', (13, 0, 0, 1, D + 0x1000, 0x800000000000))):
+        code, lab = asm(f'mov rsi, {rsi:#x}\nmov rdi, {rdi:#x}\nmov rcx, {count}\nx: rep movsq\nnop', labels=True)
+        src = pattern(0x2000, 11)
+        for block in (None, 1):
+            out, err = go(name, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {src.hex()}\n'
+                          f'memory {D + 0x4000:#x} {bytes(0x2000).hex()}\n{extra}', block)
+            problems = stopped(out, err, 'guest_fault')
+            if not problems:
+                g = [int(x, 0) for x in out['gpr']]
+                f = [int(x, 0) for x in out['fault']]
+                got = (f[0], f[1], f[2] & 0xf, g[1], g[6], g[7])
+                written = membytes(out, TOP, 0x1000) == src[:0x1000] if name == 'movs-into-noncanonical' else True
+                if got != want or int(out['rip'], 0) != CODE + lab['x'] or not written:
+                    problems.append(f'(vector, CR2, error, RCX, RSI, RDI) {[hex(v) for v in got]}, want {[hex(v) for v in want]}, '
+                                    f'rip {out["rip"]}, page written {written}')
+            record(f'{name}-{block}', problems)
+    # Data breakpoints (DR0, 8 bytes): a read/write one on the source's 3rd quadword, a write one on the destination's: one
+    # #DB after that iteration, at the REP with RCX and RSI past it (no `--bulk` with a breakpoint armed: today's path).
+    for name, addr, rw in (('movs-watch-src', SRC + 16, 3), ('movs-watch-dst', DST + 16, 1)):
+        for block in (None, 1):
+            code, lab = asm(setup + f'mov rax, {addr:#x}\nmov dr0, rax\nmov eax, {0xc0001 | rw << 16:#x}\nmov dr7, rax\nmov rsi, {SRC:#x}\n'
+                            f'mov rdi, {DST:#x}\nmov ecx, 64\nx: rep movsq\nxor eax, eax\nmov dr7, rax\njmp done\n' + h1 + 'h64:\niretq\ndone: nop', labels=True)
+            out, err = go(name, idt_text(code, lab, f'memory {SRC:#x} {pattern(0x200, 13).hex()}\nmemory {DST & ~0xfff:#x} {bytes(0x2000).hex()}\n'), block)
+            problems = stopped(out, err)
+            if not problems:
+                got = (q(out, CNT), q(out, DBG), q(out, DBG + 8), q(out, DBG + 16))
+                want = (1, CODE + lab['x'], 61, SRC + 24)
+                if got != want or membytes(out, DST, 512) != pattern(0x200, 13):
+                    problems.append(f'#DB (count, RIP, RCX, RSI) {[hex(v) for v in got]}, want {[hex(v) for v in want]}')
+            record(f'{name}-{block}', problems)
+    # Alignment checking (CR0.AM at CPL 0, then CPL 3 with RFLAGS.AC through the driver's switch): a MOVSQ whose source is 4 mod
+    # 8 takes #AC(0) at its first element, nothing written.
+    ac_head = asm('mov rax, cr0\nbts rax, 18\nmov cr0, rax')
+    body, labels = asm(f'mov rsi, {D + 4:#x}\nmov rdi, {D + 0x4000:#x}\nmov ecx, 8\nx: rep movsq\nnop', labels=True)
+    ac_code = ac_head + bytes([0x90]) + body
+    for block in (None, 1):
+        out, err = go('movs-ac', f'rip {CODE:#x}\nrflags 0x40002\ncpl 0\nswitch {CODE + len(ac_head):#x} 3\n{gprs({})}\n'
+                      f'code {ac_code.hex()}\nmemory {D:#x} {pattern(0x1000, 17).hex()}\nmemory {D + 0x4000:#x} {bytes(0x1000).hex()}\n', block)
+        problems = stopped(out, err, 'guest_fault')
+        if not problems:
+            f = [int(x, 0) for x in out['fault']]
+            if f != [17, 0, 0, CODE + len(ac_head) + 1 + labels['x']] or membytes(out, D + 0x4000, 64) != bytes(64):
+                problems.append(f'fault {out["fault"]}')
+        record(f'movs-ac-{block}', problems)
+    # Writes into translated code: REP MOVSB of 64 NOPs over code already run on another page, and over the code after the REP
+    # on its own page: the new code runs.
+    X = 0x200000
+    nops = bytes([0x90]) * 64
+    xcode = asm('mov eax, 1\nret\n.fill 58, 1, 0xcc\nmov eax, 2\nret')
+    for block in (None, 1):
+        code = asm(f'mov eax, {X:#x}\ncall rax\nmov r12d, eax\nmov esi, {D:#x}\nmov edi, {X:#x}\nmov ecx, 64\nrep movsb\nmov eax, {X:#x}\ncall rax\nmov r13d, eax\nnop')
+        out, err = go('movs-smc-other', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nbody {X:#x} {xcode.hex()}\nentry {X:#x} 1 set 2\n'
+                      f'memory {D:#x} {nops.hex()}\nregion 0x3e0000 0x10000\n', block)
+        problems = stopped(out, err)
+        if not problems:
+            g = [int(x, 0) for x in out['gpr']]
+            if (g[12], g[13]) != (1, 2): problems.append(f'r12 {g[12]} r13 {g[13]}')
+        record(f'movs-smc-other-{block}', problems)
+        code = asm(f'lea rdi, [rip + t]\nmov esi, {D:#x}\nmov ecx, 64\nrep movsb\n.p2align 4\nt: mov eax, 1\njmp d\n.fill 57, 1, 0xcc\nmov eax, 2\nd: nop')
+        out, err = go('movs-smc-own', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nentry {CODE:#x} 1 set 2\nmemory {D:#x} {nops.hex()}\n', block)
+        problems = stopped(out, err)
+        if not problems and int(out['gpr'][0], 0) != 2: problems.append(f"rax {out['gpr'][0]}")
+        record(f'movs-smc-own-{block}', problems)
+    # TSO as a second vCPU sees it: vCPU 0 fills SRC with round r (REP STOSQ), copies it into BUF by REP MOVSQ, then stores r into
+    # FLAG; vCPU 1 reads FLAG (f), then every quadword of BUF, which must be >= f.
+    FLAG, R2, BUF = 0x3c0000, 20_000, 0x500000
+    c0 = asm(f'xor ebx, ebx\n1: inc rbx\nmov rax, rbx\nmov rdi, {BUF + 0x10000:#x}\nmov ecx, 2048\nrep stosq\nmov rsi, {BUF + 0x10000:#x}\n'
+             f'mov rdi, {BUF:#x}\nmov ecx, 2048\nrep movsq\nmov [{FLAG:#x}], rbx\ncmp rbx, {R2}\njb 1b\nnop')
+    c1 = asm(f'xor r9d, r9d\nxor r10d, r10d\n1: mov rbx, [{FLAG:#x}]\ntest rbx, rbx\njz 1b\nmov rsi, {BUF:#x}\nmov ecx, 2048\n'
+             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp rbx, {R2}\njb 1b\nnop')
+    for block in (None, 1):
+        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x14000\nmemory {FLAG:#x} {bytes(8).hex()}\nregion 0x3e0000 0x10000\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncpu\nrip 0x110000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
+        out, err = go('movs-tso', text, block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            c, peer = out['cpus']
+            stale, scans = int(peer['gpr'][9], 0), int(peer['gpr'][10], 0)
+            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans < 10:
+                problems.append(f"stops {c['stop']} / {peer['stop']} stale quadwords {stale} scans {scans}")
+        record(f'movs-tso-{block}', problems)
+    # Device-side pages: an unassigned page (reads all ones, natively through the shared ones page; writes refused) as the
+    # source, copied as ones at every block size; as the destination, refused (`unsupported_mmio`) before any effect, RIP at
+    # the REP and RCX/RSI/RDI unchanged, as the element pass's store is.
+    DEV, GPA = 0x200000, 0xfeb0_0000
+    for name, rsi, rdi in (('movs-unassigned-src', DEV, D + 0x4000), ('movs-unassigned-dst', D, DEV)):
+        code, lab = asm(f'mov rsi, {rsi:#x}\nmov rdi, {rdi:#x}\nmov ecx, 256\nx: rep movsq\nnop', labels=True)
+        for block in (None, 1):
+            out, err = go(name, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {pattern(0x1000, 19).hex()}\n'
+                          f'memory {D + 0x4000:#x} {bytes(0x1000).hex()}\nmmio {DEV:#x} {GPA:#x} unassigned\n', block)
+            if name.endswith('src'):
+                problems = stopped(out, err)
+                if not problems and membytes(out, D + 0x4000, 0x800) != b'\xff' * 0x800: problems.append('not all ones')
+            else:
+                problems = [f'driver: {err}'] if not out else []
+                if out:
+                    g = [int(x, 0) for x in out['gpr']]
+                    if (out['stop'], out.get('reason', '').split()[:1]) != ('resident', ['unsupported_mmio']) or int(out['rip'], 0) != CODE + lab['x'] \
+                            or (g[1], g[6], g[7]) != (256, D, DEV):
+                        problems.append(f"stop {out['stop']} {out.get('reason')} rip {out['rip']} RCX RSI RDI {g[1], hex(g[6]), hex(g[7])}")
+            record(f'{name}-{block}', problems)
     report['repmovs'] = {'runs': runs, 'failures': failures}
     return failures
 

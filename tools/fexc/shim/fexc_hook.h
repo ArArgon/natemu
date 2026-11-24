@@ -251,6 +251,9 @@ inline FexcArg<bool, FEXC_ARG_PUSH_RUN> fexc_push_run;
 // alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
 // first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).
 inline FexcArg<bool, FEXC_ARG_BULK> fexc_bulk;
+// Bulk REP plan (section 14): `--no-bulk-movs`, for tools/fexc/replay.py only (the host never sends it): `--bulk` without
+// FexcRepMovs, so a reply that differs from the old compiler's is checked to differ by that op alone.
+inline bool fexc_no_bulk_movs;
 // Profile slice1 (perf chunk 15): the request is at CPL 0 (`--cpl0`, from the host; never for a single-instruction step):
 // the one-byte CLI and STI are translated inline (patch 0031, `FexcInterruptFlagOp`; the rules are `Cut`'s).
 inline FexcArg<bool, FEXC_ARG_CPL0> fexc_cpl0;

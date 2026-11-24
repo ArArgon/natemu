@@ -6385,8 +6385,9 @@ mod tests {
         assert!(e.contains("--bulk"), "{e}");
     }
 
-    /// Bulk REP plan (9.1): with `--bulk`, REP MOVSB and MOVSQ in 64-bit code get the bulk loop, with two sites: the `ldp` a
-    /// 16-byte load-pair site with read intent on RSI's register, the `stp` the store pair after it on RDI's. None for MOVSW,
+    /// Bulk REP plan (9.1, section 14): with `--bulk`, REP MOVSB and MOVSQ in 64-bit code get the bulk loops, with four sites:
+    /// the `ldp` a 16-byte load-pair site with read intent on RSI's register, the `stp` the store pair after it on RDI's, then
+    /// the element loop's load and store of one element. None for MOVSW,
     /// MOVSD, 0x67, FS or GS, F2 (REP for MOVS too, not this cut), F2 and F3 both, no REP, 32-bit code, or without the flag;
     /// a bulk object is refused for a request without it. (DS, ES, CS and SS prefixes do nothing in 64-bit mode: the loop.)
     #[test]
@@ -6431,12 +6432,17 @@ mod tests {
                 .iter()
                 .position(|s| s.kind == object::kind::LOAD_PAIR)
                 .unwrap_or_else(|| panic!("{code:02x?}: no load-pair site"));
-            let (l, st) = (ss[i], ss[i + 1]);
+            // Section 14: the rounds' pair, then the element loop's load and store (the element's width).
+            let w = if code.last() == Some(&0xa4) { 1 } else { 8 };
+            let (l, st, el, es) = (ss[i], ss[i + 1], ss[i + 2], ss[i + 3]);
             assert!(
                 (l.width, l.intent, l.data_class) == (16, object::INTENT_READ, object::CLASS_GPR)
                     && (st.kind, st.width, st.intent) == (object::kind::STORE_PAIR, 16, object::INTENT_WRITE)
+                    && (el.kind, el.width, el.intent) == (object::kind::LOAD, w, object::INTENT_READ)
+                    && (es.kind, es.width, es.intent) == (object::kind::STORE, w, object::INTENT_WRITE)
                     && st.native_offset == l.native_offset + 4
-                    && (l.base_reg, st.base_reg) == (10, 11),
+                    && es.native_offset == el.native_offset + 4
+                    && (l.base_reg, st.base_reg, el.base_reg, es.base_reg) == (10, 11, 10, 11),
                 "{code:02x?}"
             );
         }

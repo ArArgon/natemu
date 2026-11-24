@@ -644,50 +644,82 @@ fn x86_rep_movs(insn: &[u8]) -> Option<u32> {
         _ => None,
     }
 }
+/// Bulk REP plan (section 14): how a word of [`bulk_movs_words`] is compared: exactly, or as a cbz/cbnz/tbnz to the sequence's
+/// end (S), to its element loop's entry (E), or back to the rounds' `ldp` (B) or the element `ldr` (L).
+#[derive(Clone, Copy, PartialEq)]
+enum Movs {
+    Word,
+    ToEnd,
+    ToElements,
+    BackRounds,
+    BackElement,
+}
 /// Bulk REP plan: FexcRepMovs's words for `w`-byte elements (RCX x7, RSI x10, RDI x11, x28 the state frame; see
-/// `fexc_sites.inc`). The `ldp` is 7 words from the end, the `stp` 6.
-fn bulk_movs_words(w: u32) -> Vec<(u32, Bulk)> {
-    use Bulk::*;
-    let s = 4 - w.trailing_zeros();
-    let mut v = vec![(0xd340_fce1 | s << 16, Word), (0xb400_0001, Skip)]; // lsr x1, x7, #s; cbz x1, S
-    if w > 1 {
-        // orr x0, x10, x11; and x0, x0, #7; cbnz x0, S
-        v.extend([(0xaa0b_0140, Word), (0x9240_0800, Word), (0xb500_0000, Skip)]);
-    }
-    v.extend([
-        (0xcb0a_0160, Word),                                       // sub x0, x11, x10
-        (0xd100_0400, Word),                                       // sub x0, x0, #1
-        (0x9240_2c00, Word),                                       // and x0, x0, #0xfff
-        (0xd100_3c00, Word),                                       // sub x0, x0, #15
-        (0xb7f8_0000, Skip),                                       // tbnz x0, #63, S
+/// `fexc_sites.inc`), and the indices of the rounds' `ldp` (B), the element loop's entry `cbz x1` (E) and its `ldr` (L).
+fn bulk_movs_words(w: u32) -> (Vec<(u32, Movs)>, usize, usize, usize) {
+    use Movs::*;
+    let (lw, sr) = (w.trailing_zeros(), 4 - w.trailing_zeros());
+    let mut v = vec![
+        (0xd341_fce0, Word),                                       // lsr x0, x7, #1
+        (0xb400_0000, ToEnd),                                      // cbz x0, S
         (0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5, Word), // ldrb w0, [x28, #fast_strings]
-        (0x3400_0000, Skip),                                       // cbz w0, S
+        (0x3400_0000, ToEnd),                                      // cbz w0, S
         (0x3940_0000 | frame::DF << 10 | 28 << 5, Word),           // ldrb w0, [x28, #df]
-        (0x3638_0000 | 1 << 24, Skip),                             // tbnz w0, #7, S
-    ]);
-    for and in [0x9240_2d60, 0x9240_2d40] {
-        // and x0, x11 | x10, #0xfff; then x1 = min(x1, that page's rounds)
+        (0x3638_0000 | 1 << 24, ToEnd),                            // tbnz w0, #7, S
+    ];
+    // x1 = min(x7 | x1, the whole elements before x11's | x10's page end)
+    let lsr = 0xd340_fc00 | lw << 16; // lsr x0, x0, #log2 w
+    for (and, first) in [(0x9240_2d60, true), (0x9240_2d40, false)] {
         v.extend([
-            (and, Word),
-            (0x5282_0002, Word), // movz w2, #0x1000
-            (0xcb00_0040, Word), // sub x0, x2, x0
-            (0xd344_fc00, Word), // lsr x0, x0, #4
-            (0xcb00_0022, Word), // sub x2, x1, x0
-            (0x8a82_fc42, Word), // and x2, x2, x2, asr #63
-            (0x8b02_0001, Word), // add x1, x0, x2
+            (and, Word),                                              // and x0, x11 | x10, #0xfff
+            (0x5282_0002, Word),                                      // movz w2, #0x1000
+            (0xcb00_0040, Word),                                      // sub x0, x2, x0
+            (lsr, Word),                                              // lsr x0, x0, #log2 w
+            (if first { 0xcb00_00e2 } else { 0xcb00_0022 }, Word),   // sub x2, x7 | x1, x0
+            (0x8a82_fc42, Word),                                      // and x2, x2, x2, asr #63
+            (0x8b02_0001, Word),                                      // add x1, x0, x2
         ]);
     }
     v.extend([
-        (0xb400_0001, Skip),                  // cbz x1, S
-        (0xa940_0d42, Word),                  // ldp x2, x3, [x10]
-        (0xa900_0d62, Word),                  // stp x2, x3, [x11]
-        (0x9100_414a, Word),                  // add x10, x10, #16
-        (0x9100_416b, Word),                  // add x11, x11, #16
-        (0xd100_00e7 | (16 / w) << 10, Word), // sub x7, x7, #16/w
-        (0xd100_0421, Word),                  // sub x1, x1, #1
-        (0xb500_0001, Back),                  // cbnz x1, L (the ldp)
+        (0xb400_0001, ToEnd),                     // cbz x1, S
+        (0xd340_fc20 | sr << 16, Word),           // lsr x0, x1, #(4 - log2 w)
+        (0xb400_0000, ToElements),                // cbz x0, E
     ]);
-    v
+    if w > 1 {
+        // orr x2, x10, x11; and x2, x2, #7; cbnz x2, E
+        v.extend([(0xaa0b_0142, Word), (0x9240_0842, Word), (0xb500_0002, ToElements)]);
+    }
+    v.extend([
+        (0xcb0a_0162, Word),                      // sub x2, x11, x10
+        (0xd100_0442, Word),                      // sub x2, x2, #1
+        (0x9240_2c42, Word),                      // and x2, x2, #0xfff
+        (0xd100_3c42, Word),                      // sub x2, x2, #15
+        (0xb7f8_0002, ToElements),                // tbnz x2, #63, E
+        (0xcb00_0021 | sr << 10, Word),           // sub x1, x1, x0, lsl #(4 - log2 w)
+    ]);
+    let b = v.len();
+    v.extend([
+        (0xa940_0d42, Word),                      // ldp x2, x3, [x10]
+        (0xa900_0d62, Word),                      // stp x2, x3, [x11]
+        (0x9100_414a, Word),                      // add x10, x10, #16
+        (0x9100_416b, Word),                      // add x11, x11, #16
+        (0xd100_00e7 | (16 / w) << 10, Word),     // sub x7, x7, #16/w
+        (0xd100_0400, Word),                      // sub x0, x0, #1
+        (0xb500_0000, BackRounds),                // cbnz x0, B
+    ]);
+    let e = v.len();
+    let (ld, st) = if w == 1 { (0x3940_0142, 0x3900_0162) } else { (0xf940_0142, 0xf900_0162) };
+    v.extend([
+        (0xb400_0001, ToEnd),                     // E: cbz x1, S
+        (ld, Word),                               // L: ldr(b) x2, [x10]
+        (st, Word),                               // str(b) x2, [x11]
+        (0x9100_014a | w << 10, Word),            // add x10, x10, #w
+        (0x9100_016b | w << 10, Word),            // add x11, x11, #w
+        (0xd100_04e7, Word),                      // sub x7, x7, #1
+        (0xd100_0421, Word),                      // sub x1, x1, #1
+        (0xb500_0001, BackElement),               // cbnz x1, L
+    ]);
+    (v, b, e, e + 1)
 }
 /// How a stub is reached: the words `start..=end` end in its branch; `cond` is the normalized conditional branch
 /// (the far form `!cond +8; b stub` normalized to `cond`), `None` for a plain `b`.
@@ -1227,54 +1259,65 @@ impl<'a> Verifier<'a> {
         .then_some(start..end)
     }
 
-    /// Bulk REP plan (first cut, section 6): the backward branch at `at` to `to` is the back edge of a bulk REP MOVS loop
-    /// (fexc_sites.inc `FexcRepMovs`) in a 64-bit object: the words before and after it are exactly that sequence for the
-    /// width of the REP MOVSB/MOVSQ holding them ([`x86_rep_movs`]), its `ldp` that instruction's recorded load-pair site of
-    /// 16 bytes with read intent and its `stp` the store-pair site, the back edge to the `ldp`, and no branch from outside
-    /// enters it. Returns the sequence's native range. So x1 is min(RCX's rounds, the rounds before RDI's page end, those
-    /// before RSI's) <= 256, decremented once a round and written by nothing else: the loop ends, every `ldp` stays inside
-    /// RSI's page and every `stp` inside RDI's (no split check), and the overlap, alignment, fast-string and DF skips are
-    /// there, word for word.
+    /// Bulk REP plan (section 14): the backward branch at `at` to `to` is one of the two back edges of a bulk REP MOVS
+    /// sequence (fexc_sites.inc `FexcRepMovs`) in a 64-bit object: the words around it are exactly that sequence for the width
+    /// of the REP MOVSB/MOVSQ holding them ([`x86_rep_movs`]), its four accesses that instruction's recorded sites (the `ldp` a
+    /// 16-byte load pair and the element `ldr` a load, both read; the `stp` and the element `str` stores), the back edges to
+    /// the `ldp` and to the element `ldr`, and no branch from outside enters it (its forward branches go to its end or to its
+    /// element loop's entry). Returns the sequence's native range. So x1 is min(RCX, the whole elements before RDI's page end,
+    /// those before RSI's) <= 4096 / w, and the rounds' count x0 = x1's rounds, each decremented once a pass and written by
+    /// nothing else: the loops end, every access stays inside its pointer's page (no split check), and the rounds run only
+    /// past the alignment and overlap skips, word for word.
     fn bulk_movs_loop(&self, at: u32, to: u32) -> Option<Range<u32>> {
         if self.c.bits32 {
             return None;
         }
         let (g, _) = self.instruction(at)?;
-        let words = bulk_movs_words(x86_rep_movs(self.guest_insn(g))?);
+        let (words, b, e, l) = bulk_movs_words(x86_rep_movs(self.guest_insn(g))?);
         let n = words.len() as u32 * 4;
-        let start = (at + 4).checked_sub(n).filter(|&s| s >= ENTRY_OFFSET)?;
-        let (end, ldp) = (start + n, start + n - 28);
-        let exact = words.iter().enumerate().all(|(i, &(w, to))| {
-            let o = start + 4 * i as u32;
-            self.word(o)
-                == match to {
-                    Bulk::Word => w,
-                    Bulk::Skip => with_offset(w, end as i64 - o as i64),
-                    Bulk::Back => with_offset(w, ldp as i64 - o as i64),
-                }
-        });
-        let site = |o: u32| {
-            self.c
-                .accesses
-                .binary_search_by_key(&o, |s| s.native_offset)
-                .ok()
-                .map(|i| &self.c.accesses[i])
-                .filter(|s| s.guest_offset == g && s.width == 16 && s.data_class == object::CLASS_GPR)
-        };
-        let inside = (start..end)
-            .step_by(4)
-            .all(|o| self.instruction(o).is_some_and(|(h, _)| h == g));
-        let sealed = self
-            .branches
-            .iter()
-            .all(|&(src, t)| !(start < t && t < end) && !(start <= src && src < end && t != end));
-        (exact
-            && to == ldp
-            && inside
-            && sealed
-            && site(ldp).is_some_and(|s| s.kind == object::kind::LOAD_PAIR && s.intent == object::INTENT_READ)
-            && site(ldp + 4).is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.intent == object::INTENT_WRITE))
-        .then_some(start..end)
+        // `at` is the rounds' back edge (index e - 1) or the element loop's (the last word).
+        [(e - 1) as u32, words.len() as u32 - 1].into_iter().find_map(|k| {
+            let start = at.checked_sub(4 * k).filter(|&s| s >= ENTRY_OFFSET)?;
+            let (end, rounds, entry, element) = (start + n, start + 4 * b as u32, start + 4 * e as u32, start + 4 * l as u32);
+            let exact = words.iter().enumerate().all(|(i, &(w, kind))| {
+                let o = start + 4 * i as u32;
+                self.word(o)
+                    == match kind {
+                        Movs::Word => w,
+                        Movs::ToEnd => with_offset(w, end as i64 - o as i64),
+                        Movs::ToElements => with_offset(w, entry as i64 - o as i64),
+                        Movs::BackRounds => with_offset(w, rounds as i64 - o as i64),
+                        Movs::BackElement => with_offset(w, element as i64 - o as i64),
+                    }
+            });
+            let site = |o: u32, kind: u8, width: u8, intent: u8| {
+                self.c
+                    .accesses
+                    .binary_search_by_key(&o, |s| s.native_offset)
+                    .ok()
+                    .map(|i| &self.c.accesses[i])
+                    .is_some_and(|s| {
+                        (s.guest_offset, s.kind, s.width, s.intent, s.data_class) == (g, kind, width, intent, object::CLASS_GPR)
+                    })
+            };
+            let width = if words[l].0 & 0xffc0_0000 == 0x3940_0000 { 1 } else { 8 };
+            let inside = (start..end)
+                .step_by(4)
+                .all(|o| self.instruction(o).is_some_and(|(h, _)| h == g));
+            let sealed = self.branches.iter().all(|&(src, t)| {
+                let from_inside = start <= src && src < end;
+                if from_inside { t == end || t == entry } else { !(start < t && t < end) }
+            });
+            (exact
+                && to == if at == start + 4 * (e as u32 - 1) { rounds } else { element }
+                && inside
+                && sealed
+                && site(rounds, object::kind::LOAD_PAIR, 16, object::INTENT_READ)
+                && site(rounds + 4, object::kind::STORE_PAIR, 16, object::INTENT_WRITE)
+                && site(element, object::kind::LOAD, width, object::INTENT_READ)
+                && site(element + 4, object::kind::STORE, width, object::INTENT_WRITE))
+            .then_some(start..end)
+        })
     }
 
     /// Code shape: how each stub is reached (exactly one branch).
@@ -4135,72 +4178,75 @@ mod tests {
         let fast = find(STOSQ, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5) + 4;
         validated(STOSQ, fast, 0x3400_0260, MOV_X0, Some("not forward"));
     }
-    /// Bulk REP plan (9.1): a bulk REP MOVS loop (fexc `--bulk`: `mov ecx, 64; rep movsq`, `mov ecx, 256; rep movsb`) is
-    /// admitted with and without the code shape; its back edge only with every word of FexcRepMovs exact for the
-    /// instruction's width and both its sites recorded as they are.
+    /// Bulk REP plan (9.1, section 14): a bulk REP MOVS sequence (fexc `--bulk`: `mov ecx, 64; rep movsq`, `mov ecx, 256;
+    /// rep movsb`) is admitted with and without the code shape; its back edges only with every word of FexcRepMovs exact for
+    /// the instruction's width and its four sites recorded as they are.
     #[test]
     fn bulk_rep_movs_loops_are_pinned() {
         const MOVSQ: (&[u8], &[u8]) = fixture!("rep-movsq-bulk");
         const MOVSB: (&[u8], &[u8]) = fixture!("rep-movsb-bulk");
-        let find = |f: (&[u8], &[u8]), word: u32| -> u32 {
-            let h: Header = super::super::record(f.0, 0);
-            let code = &f.0[h.code_offset as usize..][..h.code_region_end as usize];
-            (0..code.len() as u32)
-                .step_by(4)
-                .find(|&o| code[o as usize..o as usize + 4] == word.to_le_bytes())
-                .expect("word")
-        };
-        let nop = |f, at| validated(f, at, u32::from_le_bytes(f.0[at as usize + 128..][..4].try_into().unwrap()), MOV_X0, Some("not forward"));
+        let word = |f: (&[u8], &[u8]), at: u32| u32::from_le_bytes(f.0[128 + at as usize..][..4].try_into().unwrap());
         for (f, w) in [(MOVSQ, 8u32), (MOVSB, 1)] {
             admit(f).unwrap();
             admit_with(f, false).unwrap();
             let h: Header = super::super::record(f.0, 0);
             assert_eq!(h.code_offset, 128);
-            let ldp = find(f, 0xa940_0d42);
-            let lsr = find(f, 0xd340_fce1 | (4 - w.trailing_zeros()) << 16);
-            let sub15 = find(f, 0xd100_3c00);
-            let fast = find(f, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5);
-            let df = find(f, 0x3940_0000 | frame::DF << 10 | 28 << 5);
-            let back = find(f, 0xd100_0421) + 4;
-            let back_word = u32::from_le_bytes(f.0[back as usize + 128..][..4].try_into().unwrap());
-            for (at, old, new) in [
-                (find(f, 0x9240_2d40), 0x9240_2d40, 0x9240_2d60), // RSI's room dropped (RDI's twice)
-                (find(f, 0x9240_2d60), 0x9240_2d60, 0x9240_2d40), // RDI's room dropped (RSI's twice)
-                (find(f, 0x9240_2c00), 0x9240_2c00, 0x9240_1c00), // the overlap mask 0xff, not 0xfff
-                (find(f, 0xd100_3c00), 0xd100_3c00, 0xd100_4000), // the overlap bound 16, not 15
-                (ldp, 0xa940_0d42, 0xa941_0d42),                   // the ldp off its site ([x10, #16])
-                (find(f, 0xd100_00e7 | (16 / w) << 10), 0xd100_00e7 | (16 / w) << 10, 0xd100_00e7 | (32 / w) << 10), // RCX's step
-                (find(f, 0x9100_414a), 0x9100_414a, 0x9100_814a), // RSI stepped by 32
-                (back, back_word, back_word + 0x20),               // the back edge to the stp
-                (lsr - 4, u32::from_le_bytes(f.0[lsr as usize + 124..][..4].try_into().unwrap()), 0x1400_0000 | (ldp - (lsr - 4)) / 4), // a branch from outside into the loop
-            ] {
-                validated(f, at, old, new, Some("not forward"));
+            let (words, b, e, l) = super::bulk_movs_words(w);
+            let start = (0..h.code_region_end - 8)
+                .step_by(4)
+                .find(|&o| word(f, o) == words[0].0 && word(f, o + 8) == words[2].0)
+                .expect("the sequence");
+            let at = |i: usize| start + 4 * i as u32;
+            let idx = |x: u32| words.iter().position(|&(v, _)| v == x).unwrap();
+            let refuse = |i: usize, new: u32| validated(f, at(i), word(f, at(i)), new, Some("not forward"));
+            // Words changed: each room from the other pointer (one page's room twice), the min made max (`bic`), the overlap
+            // mask 0xff and its bound 16, an access off its site, a pointer or RCX stepped by another amount, each back edge
+            // one word on.
+            refuse(idx(0x9240_2d60), 0x9240_2d40);
+            refuse(idx(0x9240_2d40), 0x9240_2d60);
+            refuse(idx(0x8a82_fc42), 0x8aa2_fc42);
+            refuse(idx(0x9240_2c42), 0x9240_1c42);
+            refuse(idx(0xd100_3c42), 0xd100_4042);
+            refuse(b, 0xa941_0d42);
+            refuse(l, words[l].0 | 1 << 10);
+            refuse(l + 1, words[l + 1].0 | 1 << 10);
+            refuse(b + 2, 0x9100_814a);
+            refuse(l + 2, 0x9100_014a | (2 * w) << 10);
+            refuse(b + 4, 0xd100_00e7 | (32 / w) << 10);
+            refuse(l + 4, 0xd100_08e7);
+            refuse(e - 1, word(f, at(e - 1)) + 0x20);
+            refuse(words.len() - 1, word(f, at(words.len() - 1)) + 0x20);
+            // Each skip removed: RCX < 2's, the fast-string bit's, DF's, the crossing element's, the rounds' count,
+            // (MOVSQ) the alignment's, the overlap's, the element loop's entry; the overlap skip retargeted into the rounds.
+            for (i, &(_, kind)) in words.iter().enumerate() {
+                if matches!(kind, super::Movs::ToEnd | super::Movs::ToElements) {
+                    refuse(i, MOV_X0);
+                }
             }
-            // Each skip removed: the count's (first), the overlap's, the fast-string bit's and DF's.
-            for at in [lsr + 4, sub15 + 4, fast + 4, df + 4] {
-                nop(f, at);
-            }
-            // The ldp's record with write intent, or as a plain load: refused.
+            let tb = idx(0xd100_3c42) + 1;
+            refuse(tb, 0xb7f8_0002 | ((at(b) - at(tb)) / 4) << 5);
+            // A branch from outside (the word before the sequence) into the element loop.
+            validated(f, start - 4, word(f, start - 4), 0x1400_0000 | (at(l) - (start - 4)) / 4, Some("not forward"));
+            // The sites: the ldp with write intent or as a plain load, the element load as a store, the element store read.
             let sites = h.sites_offset as usize;
-            let i = (0..h.sites_count as usize)
-                .find(|&i| {
-                    let s: object::Site = super::super::record(f.0, sites + i * std::mem::size_of::<object::Site>());
-                    s.kind == object::kind::LOAD_PAIR
-                })
-                .unwrap();
-            let at = sites + i * std::mem::size_of::<object::Site>();
-            for (field, value) in [
-                (std::mem::offset_of!(object::Site, intent), object::INTENT_WRITE),
-                (std::mem::offset_of!(object::Site, kind), object::kind::LOAD),
+            let size = std::mem::size_of::<object::Site>();
+            let site_at = |o: u32| {
+                (0..h.sites_count as usize)
+                    .find(|&i| super::super::record::<object::Site>(f.0, sites + i * size).native_offset == o)
+                    .unwrap()
+            };
+            for (o, field, value) in [
+                (at(b), std::mem::offset_of!(object::Site, intent), object::INTENT_WRITE),
+                (at(b), std::mem::offset_of!(object::Site, kind), object::kind::LOAD),
+                (at(l), std::mem::offset_of!(object::Site, kind), object::kind::STORE),
+                (at(l + 1), std::mem::offset_of!(object::Site, intent), object::INTENT_READ),
             ] {
                 let mut bad = f.0.to_vec();
-                bad[at + field] = value;
-                assert!(admit_with((&bad, f.1), false).is_err(), "field {field}");
+                bad[sites + site_at(o) * size + field] = value;
+                assert!(admit_with((&bad, f.1), false).is_err(), "site at {o:#x}, field {field}");
             }
         }
-        // The alignment test dropped (MOVSQ: its cbnz).
-        nop(MOVSQ, find(MOVSQ, 0x9240_0800) + 4);
-        // The loop under other bytes: MOVSQ's code for `rep movsd` (REX.W dropped: a 40 REX), or with F2 for F3.
+        // The code under other bytes: `rep movsd` (REX.W dropped: a 40 REX), or F2 for F3.
         for src in [&[0xb9, 0x40, 0, 0, 0, 0xf3, 0x40, 0xa5][..], &[0xb9, 0x40, 0, 0, 0, 0xf2, 0x48, 0xa5]] {
             let e = admit_with((MOVSQ.0, src), false).unwrap_err();
             assert!(e.contains("not forward"), "{e}");
