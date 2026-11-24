@@ -101,6 +101,11 @@ exception_capture:
     mrs x9, spsr_el1
     and x9, x9, #0xf0000000
     str x9, [sp, #{nzcv_offset}]
+    // Trip-cost plan step 1.2: ESR, FAR and ELR read once, for `finish` (they cannot change before `returned`: interrupts
+    // are masked and a nested fault halts). Not SPSR: `fp_cancel` may rewrite it (`returned` reads its own).
+    mrs x2, esr_el1
+    mrs x3, far_el1
+    mrs x4, elr_el1
     mov x0, sp
     mov x1, #1
     bl finish
@@ -154,6 +159,11 @@ irq_gate:
     mrs x9, spsr_el1
     and x9, x9, #0xf0000000
     str x9, [sp, #{nzcv_offset}]
+    // Trip-cost plan step 1.2: ESR, FAR and ELR read once, for `finish` (they cannot change before `returned`: interrupts
+    // are masked and a nested fault halts). Not SPSR: `fp_cancel` may rewrite it (`returned` reads its own).
+    mrs x2, esr_el1
+    mrs x3, far_el1
+    mrs x4, elr_el1
     mov x0, sp
     mov x1, #3
     bl finish
@@ -209,35 +219,21 @@ resume_exception:
     ldp q26, q27, [x16, #({q_offset}+416)]
     ldp q28, q29, [x16, #({q_offset}+448)]
     ldp q30, q31, [x16, #({q_offset}+480)]
-    ldr x0, [x16, #0]
-    ldr x1, [x16, #8]
-    ldr x2, [x16, #16]
-    ldr x3, [x16, #24]
-    ldr x4, [x16, #32]
-    ldr x5, [x16, #40]
-    ldr x6, [x16, #48]
-    ldr x7, [x16, #56]
-    ldr x8, [x16, #64]
-    ldr x9, [x16, #72]
-    ldr x10, [x16, #80]
-    ldr x11, [x16, #88]
-    ldr x12, [x16, #96]
-    ldr x13, [x16, #104]
-    ldr x14, [x16, #112]
-    ldr x15, [x16, #120]
+    ldp x0, x1, [x16, #0]
+    ldp x2, x3, [x16, #16]
+    ldp x4, x5, [x16, #32]
+    ldp x6, x7, [x16, #48]
+    ldp x8, x9, [x16, #64]
+    ldp x10, x11, [x16, #80]
+    ldp x12, x13, [x16, #96]
+    ldp x14, x15, [x16, #112]
     ldr x17, [x16, #136]
-    ldr x18, [x16, #144]
-    ldr x19, [x16, #152]
-    ldr x20, [x16, #160]
-    ldr x21, [x16, #168]
-    ldr x22, [x16, #176]
-    ldr x23, [x16, #184]
-    ldr x24, [x16, #192]
-    ldr x25, [x16, #200]
-    ldr x26, [x16, #208]
-    ldr x27, [x16, #216]
-    ldr x28, [x16, #224]
-    ldr x29, [x16, #232]
+    ldp x18, x19, [x16, #144]
+    ldp x20, x21, [x16, #160]
+    ldp x22, x23, [x16, #176]
+    ldp x24, x25, [x16, #192]
+    ldp x26, x27, [x16, #208]
+    ldp x28, x29, [x16, #224]
     ldr x30, [x16, #240]
     ldr x16, [x16, #128]
     eret

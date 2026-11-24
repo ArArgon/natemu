@@ -88,17 +88,17 @@ unsafe extern "C" fn runtime_main() -> ! {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
+unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64, esr: u64, far: u64, elr: u64) -> ! {
     unsafe {
         let s = shared();
         // Perf chunk 22: a literal exit or a dispatcher miss is served from the gate's frame alone (`linker`, `missed`);
         // the copy is for the entries that may resume generated code mid-block (`resume` and its callers).
         execution::fp_cancel(frame as *mut NativeFrame, fault);
-        if !(fault == 1 && execution::frame_only()) {
+        if !(fault == 1 && execution::frame_only(esr)) {
             copy_frame(&raw mut (*s).captured, frame);
         }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
-            execution::returned(frame as *mut NativeFrame, fault);
+            execution::returned(frame as *mut NativeFrame, fault, esr, far, elr);
         }
         stop(PANIC, 11);
     }

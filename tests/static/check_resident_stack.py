@@ -240,8 +240,9 @@ def eret_problems(funcs, words, tops, profile=False):
              'msr elr_el1, x1', 'msr spsr_el1, x2', 'mov x16, x0', 'ldr x9, [x16, #0xf8]', 'msr sp_el0, x9',
              'ldr x9, LIT', 'mov sp, x9', 'ldr x9, [x16, #0x308]', 'msr fpcr, x9', 'ldr x9, [x16, #0x310]',
              'msr fpsr, x9'] + [f'ldp q{2 * i}, q{2 * i + 1}, [x16, {o(256 + 32 * i)}]' for i in range(16)] +
-            [f'ldr x{r}, [x16{", " + o(8 * r) if r else ""}]' for r in range(31) if r != 16] +
-            ['ldr x16, [x16, #0x80]', 'eret'])
+            [f'ldp x{r}, x{r + 1}, [x16{", " + o(8 * r) if r else ""}]' for r in range(0, 16, 2)] + ['ldr x17, [x16, #0x88]'] +
+            [f'ldp x{r}, x{r + 1}, [x16, {o(8 * r)}]' for r in range(18, 30, 2)] +
+            ['ldr x30, [x16, #0xf0]', 'ldr x16, [x16, #0x80]', 'eret'])    # (trip-cost plan step 1.1: pairs, x16 the base last)
     skip = lambda n, i: re.sub(rf' 0x[0-9a-f]+ <{n}\+0x[0-9a-f]+>$', ' SKIP', i) if re.match(r'(cbz|tbz) ', i) else i
     got = [skip('resume_exception', re.sub(r'^ldr x9, 0x[0-9a-f]+ <.*', 'ldr x9, LIT', i)) for _, i in body]
     # The EL0 sampler's resident (`profile` feature): CNTVCT stored to `Head::resume_time` after the SPSR, before `mov sp`,
@@ -277,7 +278,8 @@ def eret_problems(funcs, words, tops, profile=False):
         # Both gates are exception entries (on SP_EL1): NZCV from SPSR.
         flags = ['mrs x9, spsr_el1', 'and x9, x9, #0xf0000000']
         want = (['sub sp, sp, #0x320'] + saves + ['mrs x9, sp_el0', 'str x9, [sp, #0xf8]'] + flags +
-                ['str x9, [sp, #0x300]', 'mov x0, sp', f'mov x1, #{kind:#x}', 'bl FINISH', 'b SELF'])
+                ['str x9, [sp, #0x300]', 'mrs x2, esr_el1', 'mrs x3, far_el1', 'mrs x4, elr_el1',   # (step 1.2: for `finish`)
+                 'mov x0, sp', f'mov x1, #{kind:#x}', 'bl FINISH', 'b SELF'])
         got = [re.sub(r'^bl 0x[0-9a-f]+ <finish>$', 'bl FINISH',
                       re.sub(rf'^b 0x[0-9a-f]+ <{gate}\+0x[0-9a-f]+>$', 'b SELF', skip(gate, i))) for _, i in funcs.get(gate, [])]
         if got[:len(want)] != want or any(i != 'nop' for i in got[len(want):]):

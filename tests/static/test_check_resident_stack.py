@@ -106,8 +106,11 @@ class Binary(unittest.TestCase):
 
     def test_corruptions_are_refused(self):
         cases = {
-            'a dropped GPR restore': (r'^.*ldr\tx5, \[x16, #0x28\]\n', ''),
-            'a restore from the wrong slot': (r'(ldr\tx7, \[x16, #)0x38\]', r'\g<1>0x40]'),
+            'a dropped GPR restore': (r'^.*ldp\tx4, x5, \[x16, #0x20\]\n', ''),
+            'a restore from the wrong slot': (r'(ldp\tx6, x7, \[x16, #)0x30\]', r'\g<1>0x40]'),
+            # Trip-cost plan T1, T2 (step 1.1): a pair from x12's slot; the base x16 restored before x17.
+            'a pair from the wrong slot': (r'(ldp\tx14, x15, \[x16, #)0x70\]', r'\g<1>0x60]'),
+            'x16 before x17': (r'^(\s*[0-9a-f]+:\s+)ldr\tx17, \[x16, #0x88\]$', r'\1ldr\tx16, [x16, #0x80]'),
             'a second ERET': (r'^(\s*[0-9a-f]+:\s+)mov\tx16, x0$', r'\1eret'),
             'an unsaved register in a gate': (r'^.*stp\tq30, q31, \[sp, #0x2e0\]\n', ''),
             'an indirect call in reachable code': (r'^(\s*[0-9a-f]+:\s+)mov\tx0, sp$', r'\1blr\tx8'),
