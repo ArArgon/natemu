@@ -24,7 +24,9 @@ natemu boots the unmodified Debian 13 cloud image with networking and a disk. It
   bus by default; one without it uses MMIO devices (PCI with `--virtio-transport pci`). No display, keyboard, sound, USB or
   shared folders.
 - **Networking:** IPv4 only, through NAT, with port forwarding. No IPv6 or bridged networking.
-- **CPU:** 64-bit programs only. No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
+- **CPU:** 64-bit and 32-bit (i386) Linux programs, including programs that switch between the two. Not 16-bit
+  programs, nor 32-bit ones that use the old segmented memory model (16-bit Windows programs under Wine, DOS
+  emulators). No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
 - **Performance:** Linux's default Meltdown protection is slow under natemu; see
   [Performance](#performance-and-cpu-vulnerability-mitigations) for the fix.
 
