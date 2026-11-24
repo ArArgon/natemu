@@ -718,6 +718,9 @@ pub mod cache {
         /// The fast miss path's entry (fast-miss plan section 5): before its checks, with the target and the state record as the
         /// miss left them.
         pub const MISS_FAST_CHECK: u64 = 13;
+        /// Mapped device memory's install (`execution.rs` `install_mapped`): after the region table's read, before the
+        /// shadow's install (the holder race: a remap published while a vCPU is held here).
+        pub const MAPPED_BEFORE_INSTALL: u64 = 14;
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
     }
 
@@ -1116,6 +1119,9 @@ pub mod cache {
         /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows installed onto a mapped region's
         /// pages (a plain counter in every build; zero in a VM without regions). Appended.
         pub mapped_installs: u64,
+        /// Mapped device memory: remap shootdowns this vCPU ran (`cache::remap_shootdown`, after a port or device exit that
+        /// spanned a publish of the region table). Appended.
+        pub remaps: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32

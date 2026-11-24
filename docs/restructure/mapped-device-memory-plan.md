@@ -68,7 +68,7 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - The region set is fixed at launch (which functions have mapped BARs and their sizes); only bases and enables change
   at run time; at most 8 regions, total at most the PCI window's 256 MiB.
 - **No cost on RAM paths:** every audited site tests RAM first and consults the region table only for a page that is
-  not RAM; RAM installs do not read the table; the remap trigger is one load of `seq` per port or device exit. Tasks 2
+  not RAM; RAM installs do not read the table; the remap trigger is two loads of `seq` per port or device exit (before the request and once it is answered). Tasks 2
   and 3 each end with an A/B (below) that shows no benchmark moves beyond its noise.
 - The host never waits for a vCPU inside a device handler (`devices.rs` contract): the remap wait runs in the
   resident, as the split-lock owner's does.
@@ -87,7 +87,7 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - **A vCPU installing a shadow while the table changes:** B is held between its table read and its install while A
   moves the region; B must not keep a shadow of the old base (Task 3 `install_races_publish`, driven by an
   `io-test-hooks` point between the read and the install, as `BEFORE_SPLIT` and `AFTER_ACK` drive their races; break:
-  call `holding()` after the table read instead of before).
+  call `holding()` after the table read and the hold point instead of before).
 - **A halted peer holding shadows of the old base** drops them before it next runs guest code (Task 3
   `halted_peer_drops_on_wake`; break: skip peers whose `IoWindow.quiescent` is 1 in the shootdown).
 - **Page-crossing and string stores into a region:** an unaligned 16-byte store across two pages of one region and an
@@ -183,8 +183,24 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   operations (`transitions.rs`) stop at a mapped page as at a device's, and a LOCK crossing 16 bytes there is refused.
 - **Remap trigger:** after any exit whose device access may have changed the table, `REQUEST_PORT` or
   `REQUEST_DEVICE` answered `DONE` (also after `PENDING` polls), the resident compares `MappedRegions.seq` with its value
-  before the request; if it moved, it runs `cache::remap_shootdown()` before resuming the guest. No completion flag is
-  needed, so a configuration write (ports) and a test device's MMIO `MOVE` register are covered alike.
+  before the request; if it moved, it runs `cache::remap_shootdown()` and resets its own shadows before resuming the
+  guest. No completion flag is needed, so a configuration write (ports) and a test device's MMIO `MOVE` register are
+  covered alike. Only a publish made during some vCPU's port or device exit triggers it: the publisher must be a device
+  handler running on that exit (the bus's configuration writes are); a publish from any other host thread is never seen.
+- **Ordering:** a Dekker pairing. The installer stores its holding flag, `fence(SeqCst)`, reads the table; the mover
+  (after the publish, which its own exit made) runs `fence(SeqCst)`, then per peer loads the reset counter and then the
+  flag (SeqCst). Either the mover sees the flag (the peer is asked), or the peer's table read follows the publish. The
+  counter is read before the flag: a peer found with a clear flag between a reset and its next `holding()` reads the
+  table afterwards, and a counter that moves after the mover's load moved after its fence, so every later table read of
+  that peer sees the publish.
+- **Completions that read the table and then wait** (`split`, `vector_aligned`, `wrapped_load`, the interpreter's
+  `Mem::check`): `split_wait` may serve a peer's shadow drop, a remap's shootdown among them, so a class read before it
+  can name a table older than a completed remap. With a mapped page among its classes and the shadow generation moved
+  since its walks, the completion retries the instruction; RAM-only completions never retry. A page that the walk found in no region but that is in one at the all-ones step (`mmio::ones`,
+  `install_ones`) was published meanwhile: every shadow goes and the access retries (the reset moves the generation, so
+  the no-progress test does not stop it); `wrapped_load`'s mixed path instead reads it as all-ones, a read linearized
+  before the publish. The interpreter makes all of an instruction's checks again when a reset since its first check
+  could have staled a region any of them found.
 - **`remap_shootdown`:** `split_begin`'s scan without taking the split lock: post `SHADOWS` to every peer whose
   `SPLIT[3+p]` holding flag is set (now set by mapped and all-ones installs too), kick them, wait for each one's reset
   counter to move while serving its own peer requests, then reset its own shadows. Termination is `split_begin`'s: a
@@ -199,11 +215,15 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - **Driver test device** (`crates/driver/src/drivers/test_devices.rs`, for bare programs under `natemu-host
   run-program`, as the `--device-at` cases in `tests/system/run_l3.py`): `--mapped-at GPA,LEN` (repeatable, in table
   order; regions may overlap each other and the xAPIC page) creates a region enabled at a base, plus
-  `--mapped-control-at GPA` region 0's control page with 8-byte registers `MOVE` (+0, write a new base; 0 disables:
-  Task 3's, refused until then), `SUM` (+8, read: the host's 64-bit sum of the region's words) and `FILL` (+16, write:
+  `--mapped-control-at GPA` region 0's control page with 8-byte registers `MOVE` (+0, write a new base, published into
+  the table from the handler (`Backing::mapped_table`, an owned handle); 0 disables; a base is allowed when page-aligned,
+  below FEC00000H and the firmware image, every page outside RAM, the legacy ROM range, the test devices' pages and the
+  control page, else refused), `SUM` (+8, read: the host's 64-bit sum of the region's words) and `FILL` (+16, write:
   the host fills the region, word k = value XOR k * 9E3779B97F4A7C15H). The output gains `mapped` (per region: the
-  accesses to its range that reached the host, its sum through `view()`, its nonzero words) and per vCPU
-  `mapped_installs` (`cache::Control::mapped_installs`). This exercises the resident without PCI; the cases are
+  table's final `base` and `enabled`, the accesses to its initial range that reached the host, its sum through
+  `view()`, its nonzero words, `publishes`) and per vCPU `mapped_installs` (`cache::Control::mapped_installs`) and
+  `remaps` (`cache::Control::remaps`). `--mapped-hold SIG,ACK,GO,DONE` (io-test-hooks build) drives
+  `install_races_publish`: vCPU 1 held at `MAPPED_BEFORE_INSTALL` until the move's publish and then until DONE or 300 ms. This exercises the resident without PCI; the cases are
   `tests/system/run_mapped.py`'s, one framework case each.
 - **`SUM` reads through `view()`**, the second mapping, never the main one: each case that checks `SUM` also checks
   that guest stores reach another mapping of the object.
@@ -292,14 +312,15 @@ device's `MOVE` register.
 - [ ] **Step 1: bare-program SMP cases** at 2 and 4 vCPUs: `remap_is_visible_after_flag` and `install_races_publish`
   (Review Focus); `halted_peer_drops_on_wake` (B halts holding a shadow of the region, A moves it and sends B an IPI; B
   reads the old address: all-ones); `disable_then_enable` (`MOVE 0` makes the range read all-ones and drop stores;
-  moving back restores the same bytes); `remap_under_load` (four vCPUs storing to the region in a loop while one moves
-  it 1,000 times; after the last move and a rendezvous, the old bases read all-ones from every vCPU, each word holds a
-  value one of the writers stored, the host's `SUM` equals the sum the guest computes, the host's publish count is
+  moving back restores the same bytes); `remap_under_load` (four vCPUs storing to the region in a loop, at each of its
+  three bases, while one of them, vCPU 0, moves it among them 1,000 times; after the last move and a rendezvous, the old bases read all-ones from every vCPU, each word holds
+  its writer's last store (made after the last move), the host's `SUM` equals the sum the guest computes, the host's publish count is
   1,000 and `remaps` is at least 1,000: any vCPU whose exit spans a publish also shoots down). A store racing a move may
-  land at either base or be dropped by the window: all legal.
+  land at either base or be dropped by the window: all legal. (As built: the 2- and 4-vCPU variants are sub-cases of
+  one framework case per name, each at block sizes default and 1; `remap_under_load` runs at 4.)
 - [ ] **Step 2: run**; FAIL. **Step 3: implement** (including the `io-test-hooks` point `MAPPED_BEFORE_INSTALL`).
   **Step 4: run**; PASS. Show `remap_is_visible_after_flag` fails when only the moving vCPU drops its shadows,
-  `install_races_publish` fails with `holding()` moved after the table read, and `halted_peer_drops_on_wake` fails when
+  `install_races_publish` fails with `holding()` moved after the table read and the hold point (at the read itself the flag is set before the mover scans, so that placement cannot fail; the held vCPU first resets its shadows by toggling CR4.PGE, since any RAM install sets the flag), and `halted_peer_drops_on_wake` fails when
   the shootdown skips quiescent peers.
 - [ ] **Step 4b: A/B** as in Task 2 (the remap trigger adds a load to every port and device exit).
 - [ ] **Step 5: commit** `runtime: a mapped region moves with a VM-wide shadow shootdown`.

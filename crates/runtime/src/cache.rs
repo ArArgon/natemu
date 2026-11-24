@@ -3635,6 +3635,15 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
     }
     split_word(1).store((gpa[0] >> 12) + 1, SeqCst);
     split_word(2).store((gpa[1] >> 12) + 1, SeqCst);
+    shoot_peers(vcpus, &mut serve);
+}
+/// Makes every other vCPU that may hold a shadow (its holding flag set) drop all of them ([`SHADOWS`], a kick) and waits
+/// for each one's reset counter to move, calling `serve` meanwhile (two vCPUs shooting each other down both progress).
+/// Each peer's counter is read before its flag (both SeqCst, after the caller's publication): a peer found with its flag
+/// clear either holds nothing, or is between a reset (flag cleared, then the counter moved) and its next `holding()`,
+/// after which it reads the published state anew. A vCPU that stopped for good reset first (`execution.rs`
+/// `halt`): its flag is clear and it is never waited for. Halted peers are woken by the kick and counted by counter.
+fn shoot_peers(vcpus: usize, serve: &mut impl FnMut()) {
     let mut counts = [0; area::MAX_VCPUS];
     let mut requested = 0u64;
     for p in (0..vcpus).filter(|&p| p != vcpu()) {
@@ -3645,7 +3654,7 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
         requested |= 1 << p;
         ask_shadows(p);
     }
-    // Let peers reset concurrently; serialize only the locked memory access.
+    // Let peers reset concurrently.
     while requested != 0 {
         let p = requested.trailing_zeros() as usize;
         while resets_of(p) == counts[p] {
@@ -3654,6 +3663,22 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
         }
         requested &= requested - 1;
     }
+}
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): the region table moved during this vCPU's port or
+/// device exit ([`area::MappedRegions`]' `seq` changed across it). Makes every peer that may hold a shadow built from the old
+/// table drop all of its shadows and waits for each ([`shoot_peers`]; `serve` while waiting); the caller then resets its
+/// own. No split lock is taken: concurrent remaps (every vCPU whose exit spanned the publish runs one) and split locks
+/// wait for each other only through served shadow requests. After it and the caller's reset, no vCPU holds a shadow built
+/// from a table older than the one this vCPU saw after its exit.
+///
+/// Ordering (a Dekker pairing with the install protocol, `mmio::mapped`: holding flag store, `fence(SeqCst)`, table
+/// read): the publication (the host's seqlock stores, made before this vCPU's exit returned, or seen through `seq`) is
+/// followed here by `fence(SeqCst)`, then each peer's flag is loaded (SeqCst). Either this load sees a peer's flag, so the
+/// peer is asked and its shadows go, or the peer's table read follows the publication and sees the new table.
+pub fn remap_shootdown(vcpus: usize, mut serve: impl FnMut()) {
+    core::sync::atomic::fence(SeqCst);
+    shoot_peers(vcpus, &mut serve);
+    control().remaps += 1;
 }
 pub fn split_end() {
     unsafe { asm!("dsb ish") };

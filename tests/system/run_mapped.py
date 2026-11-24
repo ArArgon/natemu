@@ -31,6 +31,21 @@ on RAM (permissions).
 - `overlapping_regions_pick_lowest`: two overlapping regions: the lowest-numbered table entry (the first `--mapped-at`)
   holds the shared range.
 
+Task 3, moving and disabling region 0 (the control page's `MOVE`), at 2 and 4 vCPUs (vCPU 0 moves):
+- `remap_is_visible_after_flag`: the peers shadow the region, spin on a flag in RAM (translated code, no exit); vCPU 0
+  moves the region and sets the flag; every vCPU then reads the old base (all-ones) and the new one (the region).
+- `install_races_publish` (io-test-hooks build): vCPU 1 is held between its table read and its install
+  (`MAPPED_BEFORE_INSTALL`, `--mapped-hold`) while vCPU 0 moves the region: vCPU 0's shootdown waits for it (the
+  controller sees no flag before its release), and vCPU 1 then reads the old base as all-ones.
+- `halted_peer_drops_on_wake`: the peers halt holding a shadow of the region; vCPU 0 moves it (the host's halt hint at
+  the publish shows every peer parked) and sends each an IPI; woken, each reads the old base (all-ones) and the new one.
+- `disable_then_enable`: `MOVE 0` makes the range read all-ones and drop stores on every vCPU; moving it back restores the
+  same bytes.
+- `remap_under_load` (4 vCPUs): every vCPU stores its own word at the region's three bases in a loop while vCPU 0 moves
+  the region among them 1,000 times; after the last move and a rendezvous the old bases read all-ones from every vCPU,
+  each word holds its writer's last store, the host's `SUM` equals the guest's sum, the host published 1,000 times and
+  the vCPUs ran at least 1,000 remaps (vCPU 0 at least one per move).
+
 Writes DIR/mapped.json and results.json; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, os, pathlib, sys
@@ -40,6 +55,7 @@ sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT
 import ref, run_slice1_vm as vm  # noqa: E402
 import case_results  # noqa: E402
 from run_slice3_vm import driver  # noqa: E402
+from run_k1 import hooks_build  # noqa: E402 (the io-test-hooks host and resident, for install_races_publish)
 
 # A CPL 0 program on its own tables (as run_l3.py's pages): 0-4 MiB identity in 2 MiB pages, then 4 KiB pages at WINDOW
 # (slot k at WINDOW + 0x1000 k) onto any guest-physical page; PD entry 3 (linear 0x600000) names a region page as its
@@ -48,7 +64,8 @@ TABLES, WINDOW, BUF, RAMPG, RAMPERM, GDTPTR = 0x300000, 0x400000, 0x3d0000, 0x3c
 R0, LEN, CTL = 0xD000_0000, 0x20_0000, 0xD100_0000
 MASK64 = 2**64 - 1
 FLAGS = 0x67           # P, R/W, U/S, A, D (executable: no NX)
-SUM, FILL = 8, 16      # the control page's registers (test_devices::MappedControl)
+MOVE, SUM, FILL = 0, 8, 16   # the control page's registers (test_devices::MappedControl)
+ONES = MASK64
 BLOCKS = (None, 1)
 
 
@@ -113,13 +130,15 @@ def installs(c):
     return [] if (c.get('mapped_installs') or 0) > 0 else [f"mapped_installs {c.get('mapped_installs')}"]
 
 
-def run(a, name, text, extra, block):
+def run(a, name, text, extra, block, hooks=False):
     w = a.out / name / f'block-{block}'
+    host, runtime = hooks_build(a) if hooks else (a.host, a.runtime)
     for attempt in range(2):  # one retry on a concurrent hv_vm_create (0xfae94007)
-        rc, out, err = driver(a.host, a.runtime, a.fexc, text, w, ([block] if block else []) + list(extra), timeout=120)
+        rc, out, err = driver(host, runtime, a.fexc, text, w, ([block] if block else []) + list(extra), timeout=300)
         if rc == 0 or 'fae94007' not in str(err): break
     if rc != 0:
         return None, [f'driver {rc}: {str(err).strip()[-400:]}']
+    out['_stderr'] = err
     return out, []
 
 
@@ -402,9 +421,198 @@ def interpreter():
              refused('interp_memory', None))]
 
 
+# ---- Task 3: moving and disabling a region (SMP) -------------------------------------------------------------------
+# Region 0 at P (the `--mapped-at` base), moved by vCPU 0 through the control page's MOVE (slot 31); slots 0, 1, 2 map
+# page 0 at P, Q and R. RAM page SYNC holds the programs' words: READY[v] +8v, FLAG +0x100, FLAG2 +0x108, DONE[v]
+# +0x200 + 8v, WOKEN[v] +0x300 + 8v, the hold's SIG/ACK/GO +0x400.., the bases table +0x500, the IDTR +0x800; IDT a page.
+P, Q, R = R0, R0 + 0x40_0000, R0 + 0x80_0000
+SYNC, IDT = 0x390000, 0x380000
+READY, FLAG, FLAG2, DONE, WOKEN, SIG, ACK, GO, BASES, IDTR = (SYNC, SYNC + 0x100, SYNC + 0x108, SYNC + 0x200, SYNC + 0x300,
+                                                             SYNC + 0x400, SYNC + 0x408, SYNC + 0x410, SYNC + 0x500, SYNC + 0x800)
+SMP_SLOTS = {0: (P, FLAGS), 1: (Q, FLAGS), 2: (R, FLAGS), 31: (CTL, FLAGS)}
+VALUE = 0x1234_5678_9abc_def0
+
+
+def smp_description(texts, slots=SMP_SLOTS):
+    """vCPU v runs texts[v] (CPL 0, on the tables, its own stack), each ending halted."""
+    q = lambda *v: b''.join(x.to_bytes(8, 'little') for x in v)  # noqa: E731
+    sync = bytearray(0x1000)
+    sync[0x500:0x518] = q(P, Q, R)
+    sync[0x800:0x80a] = (0xfff).to_bytes(2, 'little') + IDT.to_bytes(8, 'little')
+    memory = [*tables(slots), (SYNC, bytes(sync)), (IDT, bytes(0x1000))]
+    memory += [(pg, b'\0') for pg in (RAMPG, RAMPERM, RAMPERM + 0x1000, GDTPTR)]
+    code = [ref.assemble(f'mov rax, {TABLES:#x}\nmov cr3, rax\n' + x + '\nhlt') for x in texts]
+    head = 'identity\n' + ''.join(f'body {0x100000 + 0x10000 * v:#x} {c.hex()}\n' for v, c in enumerate(code))
+    head += 'region 0x3e0000 0x8000\n' + ''.join(f'memory {a:#x} {d.hex()}\n' for a, d in memory)
+    gpr = lambda v: ' '.join(['0'] * 4 + [hex(0x3e0f00 + 0x1000 * v)] + ['0'] * 11)  # noqa: E731
+    return head + ''.join(f'cpu\nrip {0x100000 + 0x10000 * v:#x}\nrflags 0x2\ncpl 0\nsse 1\ngpr {gpr(v)}\n' for v in range(len(texts)))
+
+
+def wait_word(at, label, value=None):
+    """Spins until the word at `at` is `value` (default: nonzero)."""
+    return (f'{label}: cmp qword ptr [{at:#x}], 0\nje {label}b\n' if value is None else
+            f'{label}: cmp qword ptr [{at:#x}], {value}\njne {label}b\n')
+
+
+def move(base):
+    return f'mov rsi, {va(31):#x}\nmov rax, {base:#x}\nmov qword ptr [rsi + {MOVE}], rax\n'
+
+
+def reads_after():
+    """r8: the old base's word 0, r9: the new base's (page slots 0 and 1)."""
+    return f'mov r8, qword ptr [{va(0):#x}]\nmov r9, qword ptr [{va(1):#x}]\n'
+
+
+def smp_check(n, want, publishes, base, remaps=1, extra=lambda o: []):
+    def check(o):
+        p = []
+        for v, c in enumerate(o['cpus']):
+            p += [f'cpu{v} ' + x for x in halted(c)]
+            p += [f'cpu{v} {r} {reg(c, r):#x} != {x:#x}' for r, x in want(v).items() if reg(c, r) != x]
+        r = o['mapped'][0]
+        if r['publishes'] != publishes: p.append(f"publishes {r['publishes']} != {publishes}")
+        if int(r['base'], 0) != base or not r['enabled']: p.append(f"region at {r['base']} enabled {r['enabled']}, want {base:#x}")
+        if (o['cpus'][0].get('remaps') or 0) < remaps: p.append(f"cpu0 remaps {o['cpus'][0].get('remaps')} < {remaps}")
+        return p + extra(o)
+    return check
+
+
+def visible():
+    out = []
+    for n in (2, 4):
+        a = (f'mov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\nmov qword ptr [rbx], rax\n'
+             + ''.join(wait_word(READY + 8 * v, 1, 1) for v in range(1, n)) + move(Q) + f'mov qword ptr [{FLAG:#x}], 1\n' + reads_after())
+        peer = lambda v: (f'mov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\n1: cmp qword ptr [rbx], rax\njne 1b\n'  # noqa: E731
+                          f'mov qword ptr [{READY + 8 * v:#x}], 1\n' + wait_word(FLAG, 2) + reads_after())
+        out.append((f'remap_is_visible_after_flag/n{n}', smp_description([a] + [peer(v) for v in range(1, n)]), MAPPED,
+                    smp_check(n, lambda v: {'r8': ONES, 'r9': VALUE}, 1, Q)))
+    return out
+
+
+def races():
+    out = []
+    for n in (2, 4):
+        a = (f'mov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\nmov qword ptr [rbx], rax\n'
+             + ''.join(wait_word(READY + 8 * v, 1, 1) for v in range(2, n)) + wait_word(GO, 2) + move(Q)
+             + f'mov qword ptr [{FLAG:#x}], 1\n' + reads_after())
+        # Toggling CR4.PGE first (a global TLB flush) resets all of vCPU 1's shadows, which clears its holding flag (any
+        # RAM install sets it): its table read at the hold is then the only thing that can have set it.
+        held = (f'mov qword ptr [{SIG:#x}], 1\n' + wait_word(ACK, 1)
+                + f'mov rax, cr4\nxor rax, 0x80\nmov cr4, rax\nxor rax, 0x80\nmov cr4, rax\nmov r10, qword ptr [{va(0):#x}]\n'
+                + wait_word(FLAG, 2) + reads_after())
+        peer = lambda v: (f'mov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\n1: cmp qword ptr [rbx], rax\njne 1b\n'  # noqa: E731
+                          f'mov qword ptr [{READY + 8 * v:#x}], 1\n' + wait_word(FLAG, 2) + reads_after())
+        def hold(o):
+            line = next((x for x in o['_stderr'].splitlines() if x.startswith('mapped-hold: ')), None)
+            if line is None: return ['no mapped-hold line']
+            h = json.loads(line[len('mapped-hold: '):])
+            want = {'reached': True, 'published': True, 'done_before_release': False, 'hits': 1, 'timeout': 0}
+            return [f'hold {k} {h.get(k)} != {x}' for k, x in want.items() if h.get(k) != x]
+        out.append((f'install_races_publish/n{n}', smp_description([a, held] + [peer(v) for v in range(2, n)]),
+                    MAPPED + ['--mapped-hold', f'{SIG:#x},{ACK:#x},{GO:#x},{FLAG:#x}'],
+                    smp_check(n, lambda v: {'r8': ONES, 'r9': VALUE}, 1, Q, extra=hold), 'hooks'))
+    return out
+
+
+X2APIC = 'mov ecx, 0x1b\nrdmsr\nor eax, 0xc00\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nxor edx, edx\nwrmsr\n'
+
+
+def halted_peer():
+    out = []
+    for n in (2, 4):
+        a = (X2APIC + f'mov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\nmov qword ptr [rbx], rax\n'
+             + ''.join(wait_word(READY + 8 * v, 1, 1) for v in range(1, n))
+             + 'mov ecx, 5000000\n2: dec ecx\njnz 2b\n' + move(Q)  # (the peers' HLT reached meanwhile)
+             + ''.join(f'mov ecx, 0x830\nmov eax, 0x40\nmov edx, {v}\nwrmsr\n' for v in range(1, n))
+             + ''.join(wait_word(DONE + 8 * v, 3) for v in range(1, n)) + reads_after())
+        def peer(v):
+            return (X2APIC + 'lea rax, [rip + isr]\nmov dx, cs\n'
+                    f'mov rdi, {IDT + 16 * 0x40:#x}\nmov word ptr [rdi], ax\nmov word ptr [rdi + 2], dx\nmov word ptr [rdi + 4], 0x8e00\n'
+                    'shr rax, 16\nmov word ptr [rdi + 6], ax\nshr rax, 16\nmov dword ptr [rdi + 8], eax\nmov dword ptr [rdi + 12], 0\n'
+                    f'lidt [{IDTR:#x}]\nmov rbx, {va(0):#x}\nmov rax, {VALUE:#x}\n1: cmp qword ptr [rbx], rax\njne 1b\n'
+                    f'mov qword ptr [{READY + 8 * v:#x}], 1\nsti\n2: hlt\ncmp qword ptr [{WOKEN + 8 * v:#x}], 0\nje 2b\ncli\n'
+                    + reads_after() + f'mov qword ptr [{DONE + 8 * v:#x}], 1\nhlt\n'
+                    # (One IDT for all peers, whose last gate wins: the handler finds its vCPU by its x2APIC ID.)
+                    f'isr: push rax\npush rcx\npush rdx\nmov ecx, 0x802\nrdmsr\nmov qword ptr [{WOKEN:#x} + rax * 8], 1\nmov ecx, 0x80b\nxor eax, eax\n'
+                    'xor edx, edx\nwrmsr\npop rdx\npop rcx\npop rax\niretq')
+        # The peers must really be parked in their HLT at the move (the host's halt hint at the publish), else the case
+        # would only test a shootdown of running peers.
+        def parked(o, n=n):
+            got = o['mapped'][0]['halted_at_publish']
+            return [] if all(v in got for v in range(1, n)) else [f'peers not halted at the move: halted {got}']
+        out.append((f'halted_peer_drops_on_wake/n{n}', smp_description([a] + [peer(v) for v in range(1, n)]), MAPPED,
+                    smp_check(n, lambda v: {'r8': ONES, 'r9': VALUE}, 1, Q, extra=parked)))
+    return out
+
+
+def disable_enable():
+    out = []
+    for n in (2, 4):
+        a = (f'mov rbx, {va(0):#x}\nmov qword ptr [rbx], 0x55\nmov qword ptr [rbx + 8], 0x66\n'
+             + ''.join(wait_word(READY + 8 * v, 1, 1) for v in range(1, n)) + move(0) + f'mov qword ptr [{FLAG:#x}], 1\n'
+             'mov r8, qword ptr [rbx]\nmov qword ptr [rbx], 0x99\nmov r9, qword ptr [rbx]\n'
+             + ''.join(wait_word(DONE + 8 * v, 2) for v in range(1, n)) + move(P) + f'mov qword ptr [{FLAG2:#x}], 1\n'
+             'mov r10, qword ptr [rbx]\nmov r11, qword ptr [rbx + 8]\n')
+        peer = lambda v: (f'mov rbx, {va(0):#x}\n1: cmp qword ptr [rbx + 8], 0x66\njne 1b\nmov qword ptr [{READY + 8 * v:#x}], 1\n'  # noqa: E731
+                          + wait_word(FLAG, 2) + 'mov r8, qword ptr [rbx]\nmov qword ptr [rbx + 8], 0x77\nmov r9, qword ptr [rbx + 8]\n'
+                          f'mov qword ptr [{DONE + 8 * v:#x}], 1\n' + wait_word(FLAG2, 3) + 'mov r10, qword ptr [rbx]\nmov r11, qword ptr [rbx + 8]\n')
+        model = bytearray(LEN)
+        model[0:16] = (0x55).to_bytes(8, 'little') + (0x66).to_bytes(8, 'little')
+        out.append((f'disable_then_enable/n{n}', smp_description([a] + [peer(v) for v in range(1, n)]), MAPPED,
+                    smp_check(n, lambda v: {'r8': ONES, 'r9': ONES, 'r10': 0x55, 'r11': 0x66}, 2, P, remaps=2,
+                              extra=lambda o, model=model: region_problems(o, 0, model, accesses=False)[0])))
+    return out
+
+
+MOVES = 1000
+
+
+def under_load():
+    n = 4
+    def stores(v):
+        return ''.join(f'mov qword ptr [{va(k) + 8 * v:#x}], rax\n' for k in range(3))
+    def writer(v, body):
+        # r12: this writer's stores; word v of the region holds (v + 1) << 48 | its store count. After the stop flag, one
+        # last round (it lands at the final base); then the rendezvous and the reads of the old bases (P and R).
+        return (f'xor r12d, r12d\nmov r13, {(v + 1) << 48:#x}\n5: inc r12\nlea rax, [r13 + r12]\n' + stores(v) + body
+                + f'inc r12\nlea rax, [r13 + r12]\n' + stores(v) + f'mov qword ptr [{DONE + 8 * v:#x}], 1\n'
+                + ''.join(wait_word(DONE + 8 * u, 7) for u in range(n))
+                + f'mov r8, qword ptr [{va(0):#x}]\nmov r9, qword ptr [{va(2):#x}]\nmov r10, qword ptr [{va(1) + 8 * v:#x}]\n')
+    mover = writer(0, f'inc r14\nmov rax, r14\nxor edx, edx\nmov ecx, 3\ndiv rcx\nmov rax, qword ptr [{BASES:#x} + rdx * 8]\n'
+                      f'mov rsi, {va(31):#x}\nmov qword ptr [rsi + {MOVE}], rax\ncmp r14, {MOVES}\njne 5b\n'
+                      f'mov qword ptr [{FLAG:#x}], 1\n')
+    # vCPU 0 then sums page 0 of the final base (the region's only nonzero words) and reads the host's SUM.
+    mover += (f'xor ebx, ebx\nmov rsi, {va(1):#x}\nmov ecx, 512\n8: add rbx, qword ptr [rsi]\nadd rsi, 8\ndec ecx\njnz 8b\n'
+              f'mov rsi, {va(31):#x}\nmov rax, qword ptr [rsi + {SUM}]\n')
+    peers = [writer(v, f'cmp qword ptr [{FLAG:#x}], 0\nje 5b\n') for v in range(1, n)]
+    final = (P, Q, R)[MOVES % 3]
+    def check(o):
+        cs = o['cpus']
+        p = []
+        for v, c in enumerate(cs):
+            p += [f'cpu{v} ' + x for x in halted(c)]
+            if (reg(c, 'r8'), reg(c, 'r9')) != (ONES, ONES): p.append(f'cpu{v} old bases read {reg(c, "r8"):#x} {reg(c, "r9"):#x}')
+            last = (v + 1) << 48 | reg(c, 'r12')
+            if reg(c, 'r10') != last: p.append(f'cpu{v} word {v} reads {reg(c, "r10"):#x}, its last store {last:#x}')
+        r = o['mapped'][0]
+        model = bytearray(LEN)
+        for v, c in enumerate(cs):
+            model[8 * v:8 * v + 8] = ((v + 1) << 48 | reg(c, 'r12')).to_bytes(8, 'little')
+        rp, total = region_problems(o, 0, model, accesses=False)
+        p += rp
+        if (reg(cs[0], 'rax'), reg(cs[0], 'rbx')) != (total, total): p.append(f"SUM {reg(cs[0], 'rax'):#x}, guest sum {reg(cs[0], 'rbx'):#x}, want {total:#x}")
+        if r['publishes'] != MOVES: p.append(f"publishes {r['publishes']} != {MOVES}")
+        if int(r['base'], 0) != final or not r['enabled']: p.append(f"region at {r['base']}, want {final:#x}")
+        remaps = [c.get('remaps') or 0 for c in cs]
+        if remaps[0] < MOVES or sum(remaps) < MOVES: p.append(f'remaps {remaps}')
+        return p
+    return [('remap_under_load', smp_description([mover] + peers), MAPPED, check)]
+
+
 CASES = {'mapped-load-store': load_store, 'mapped-permissions': permissions, 'mapped-host-fill': host_fill,
          'mapped-uc': uncached, 'mapped-refusals': refusals, 'mapped-interpreter': interpreter, 'lapic_beats_mapped_region': lapic,
-         'overlapping_regions_pick_lowest': overlapping}
+         'overlapping_regions_pick_lowest': overlapping, 'remap_is_visible_after_flag': visible, 'install_races_publish': races,
+         'halted_peer_drops_on_wake': halted_peer, 'disable_then_enable': disable_enable, 'remap_under_load': under_load}
 
 
 def main():
@@ -412,13 +620,14 @@ def main():
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--host'); ap.add_argument('--runtime')
+    ap.add_argument('--hooks-host', type=pathlib.Path); ap.add_argument('--hooks-runtime', type=pathlib.Path)
     ap.add_argument('--only', type=lambda s: s.split(','), default=list(CASES))
     a = ap.parse_args()
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     a.out.mkdir(parents=True, exist_ok=True)
     report, failures = {'cases': []}, []
     for group in a.only:
-        for name, text, extra, check in CASES[group]():
+        for name, text, extra, check, *hooks in CASES[group]():
             for block in BLOCKS:
                 if isinstance(text, dict):  # variants of one program, judged together
                     outs, problems = {}, []
@@ -428,7 +637,7 @@ def main():
                     problems = problems or check(outs)
                     detail = {t: o and {k: o['cpus'][0].get(k) for k in ('stop', 'reason', 'rip', 'fault')} for t, o in outs.items()}
                 else:
-                    o, problems = run(a, name, text, extra, block)
+                    o, problems = run(a, name, text, extra, block, bool(hooks))
                     problems = problems or check(o)
                     detail = o and {k: o.get('cpus', [o])[0].get(k) for k in ('stop', 'reason', 'rip', 'fault', 'mmio', 'mapped_installs')} | {'mapped': [{k: r[k] for k in ('base', 'accesses', 'sum')} for r in o.get('mapped', [])]}
                 report['cases'].append({'name': f'{name}/block-{block}', 'detail': detail, 'problems': problems})

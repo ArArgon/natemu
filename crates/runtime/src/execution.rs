@@ -4345,6 +4345,7 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
         step_from(s, f, b, site)
     }
     let (mut gpa, mut class) = ([0; 2], [Class::Other; 2]);
+    let generation = s.shadow_generation;
     for (k, va) in [address, 0].into_iter().enumerate() {
         let Some((pa, c)) = translate(&mut s, f, b, site, va, if rmw { Access::Write } else { Access::Read }) else {
             unsafe {
@@ -4373,6 +4374,12 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
         }
     }
     split_wait(&mut s, &gpa);
+    if reclassify(&s, generation, &class) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, elr, spsr)
+        }
+    }
     let mut bytes = [0u8; 32];
     unsafe { asm!("dmb ish") };
     match &memory {
@@ -4444,6 +4451,7 @@ unsafe fn vector_aligned(
     let mut gpa = [0; 2];
     let mut class = [Class::Ram(false); 2];
     let mut uncached = false;
+    let generation = s.shadow_generation;
     // Complete all walks before touching data, so a fault on the second page leaves the entire access uncommitted.
     for (k, va) in touched.into_iter().enumerate() {
         if let Some(va) = va {
@@ -4469,6 +4477,12 @@ unsafe fn vector_aligned(
         mmio::device(s, f, b, site, Some(gpa[0]).filter(|_| touched[1].is_none()))
     };
     split_wait(&mut s, &gpa[..1 + usize::from(touched[1].is_some())]);
+    if reclassify(&s, generation, &class) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, elr, spsr)
+        }
+    }
     let head = width.min((4096 - (address & 4095)) as usize);
     let parts = [(gpa[0], head), (gpa[1], width - head)];
     let mut bytes = [0u8; 32];
@@ -4598,6 +4612,7 @@ unsafe fn split(
     }
     // A contended walk resumes at the stub, which takes this path again.
     let p = crate::perf::enter(crate::perf::SHADOW);
+    let generation = s.shadow_generation;
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
     crate::perf::leave(p);
     let [Some((gpa0, c0)), Some((gpa1, c1))] = gpa else {
@@ -4619,6 +4634,12 @@ unsafe fn split(
     }
     let gpa = [gpa0, gpa1];
     split_wait(&mut s, &gpa);
+    if reclassify(&s, generation, &[c0, c1]) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, again, spsr)
+        }
+    }
     // One data register: a general one, or the low `width` bytes of a vector one (I5a); or MOVAPS m128's X-register pair
     // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike); or a VEX.256 operand's Q-register pair
     // (I8: `stp qA, qB`, 32 bytes, low half first).
@@ -4889,11 +4910,12 @@ pub(super) fn split_wait(s: &mut State, gpa: &[u64]) {
 /// L3 (amendment): shadows linear page `va` (of an unassigned guest-physical page) read-only onto the all-ones page; on
 /// table capacity exhaustion evicts every shadow once and retries.
 /// Mapped device memory: never onto a page of an enabled region (`gpa`'s; the table read after this vCPU's holding flag
-/// is set, `mmio::mapped`, so a remap's shootdown sees this shadow): then nothing is installed and the retried access
-/// classifies the page again.
+/// is set, `mmio::mapped`, so a remap's shootdown sees this shadow): then nothing is installed and every shadow goes (the
+/// region was published after the caller classified the page, a remap race), so the retried access is progress
+/// (`access_aborted`'s no-progress test sees the generation move) and classifies the page again.
 fn install_ones(s: &mut State, va: u64, gpa: u64) {
     if mmio::mapped(gpa).is_some() {
-        return;
+        return reset_shadows(s);
     }
     if tables::install_ones(s.cpu.cpl, va).is_ok() {
         return;
@@ -4907,6 +4929,41 @@ fn install_ones(s: &mut State, va: u64, gpa: u64) {
     if tables::install_ones(s.cpu.cpl, va).is_err() {
         halt(s, stop::SHADOW)
     }
+}
+
+/// Mapped device memory, the remap trigger (docs/restructure/mapped-device-memory-plan.md): the region table's `seq`,
+/// read before a port or device request ([`remapped`] compares it once the request is answered).
+pub(super) fn mapped_seq() -> u64 {
+    cache::mapped_regions().seq.load(core::sync::atomic::Ordering::Acquire)
+}
+/// After a port or device exit answered `DONE` (its polls included): if the region table's `seq` moved since `before`
+/// (this exit's device published, or another vCPU's did meanwhile), runs the remap shootdown and resets this vCPU's own
+/// shadows before the guest runs again. One load of `seq` here, one before the request; a VM without regions never
+/// publishes after its start, so `seq` never moves there.
+pub(super) fn remapped(s: &mut State, before: u64) {
+    if mapped_seq() != before {
+        remap(s)
+    }
+}
+#[cold]
+#[inline(never)]
+fn remap(s: &mut State) {
+    let vcpus = s.vcpus as usize;
+    cache::remap_shootdown(vcpus, || {
+        let bits = cache::take_shadows();
+        if bits != 0 {
+            serve_peers(s, bits)
+        }
+    });
+    reset_shadows(s);
+}
+/// A completion that read the region table (a [`Class::Mapped`] page among `class`) and then waited ([`split_wait`],
+/// which may serve a peer's shadow drop: a remap's shootdown among them) accesses the region only if no reset came in
+/// between (`generation`, the shadow generation before its walks); else its classes may name a table older than a remap
+/// that has since completed, and it retries the instruction (the retry walks and classifies again). RAM-only accesses never
+/// retry: RAM does not move.
+fn reclassify(s: &State, generation: u64, class: &[Class]) -> bool {
+    s.shadow_generation != generation && class.iter().any(|c| matches!(c, Class::Mapped(_)))
 }
 
 /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows linear page `va`, which the walk `t`
@@ -4924,7 +4981,9 @@ fn install_mapped(s: &mut State, va: u64, t: &paging::Translation, access: Acces
         && (access == Access::Write || cache::control().writable_on_read_off == 0);
     let global = t.global && s.cpu.cr4 & CR4_PGE != 0;
     let mut region = mmio::mapped(t.gpa)?;
-    // (Task 3's race hook between the table read and the install goes here: `io_test::MAPPED_BEFORE_INSTALL`.)
+    // The holder race's test point: held here, after the table read, while a peer publishes and shoots down.
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::MAPPED_BEFORE_INSTALL);
     let mut evicted = false;
     loop {
         match tables::install(s.cpu.cpl, va, &region.memory(), t.gpa, writable, global) {

@@ -140,6 +140,15 @@ pub(super) fn ones(
     touched: [Option<u64>; 2],
     device: [Option<u64>; 2],
 ) -> bool {
+    // Mapped device memory: the caller's walk found these pages in no enabled region (or found this vCPU's APIC page or
+    // ROM, which decode first: `translate`); one found in a region now was published since (a remap race). Every shadow
+    // goes and `true` is returned: `access_aborted` then retries the access, classifying the page again (the reset moves
+    // the generation, so the retry is progress); `wrapped_load` goes on and reads the page as all-ones (its copy reads a
+    // page outside RAM so), a read that linearizes before the publish (legal: it raced the move).
+    if device.iter().flatten().any(|&g| !super::lapic::claims(g) && !rom(g) && mapped(g).is_some()) {
+        super::reset_shadows(s);
+        return true;
+    }
     readable_pages(s, touched, device).unwrap_or_else(|why| refuse(*s, f, b, site, why))
 }
 
@@ -364,6 +373,8 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     let value = match image.or_else(|| local(&mut s, gpa, width, data)) {
         Some(v) => v,
         None => unsafe {
+            // Mapped device memory: the region table's `seq` before the request (compared once it is answered).
+            let seq = super::mapped_seq();
             let done = read_record(exchange()).completed;
             let request = Mmio {
                 gpa,
@@ -392,7 +403,7 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                 // until the accepted access finishes and dispatch selects the next instruction.
                 reset_shadows(&mut s);
             }
-            loop {
+            let value = loop {
                 match m.status {
                     status::DONE => break m.value,
                     status::UNASSIGNED | status::DEVICE | status::FAILED => {
@@ -420,7 +431,11 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                     halt(&s, stop::BAD_REPLY)
                 }
                 m = read_record(exchange());
-            }
+            };
+            // The access (its polls included) spanned a publish of the region table (a test device's `MOVE`, a BAR
+            // write): no vCPU keeps a shadow of the old table before this one runs the guest again.
+            super::remapped(&mut s, seq);
+            value
         },
     };
     // Committed: the load's register with x86's merge, RIP past the instruction (it completed: shadows and RF end with it).

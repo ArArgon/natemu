@@ -61,6 +61,21 @@ pub struct Backing {
     /// The template pool's writer, shared by the run's compilers ([`Compiler::pool`]); `None`: no pool in this backing.
     pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
+fn mapped_regions(memory: &Memory) -> &cache::MappedRegions {
+    let at = cache::GLOBAL_OFFSET + cache::MAPPED;
+    assert!(at % 8 == 0 && at + size_of::<cache::MappedRegions>() <= memory.1);
+    // SAFETY: inside the backing, aligned, plain atomics shared with the residents.
+    unsafe { &*memory.0.add(at).cast::<cache::MappedRegions>() }
+}
+/// The region table of a backing, owned ([`Backing::mapped_table`]).
+#[derive(Clone)]
+pub struct MappedTable(Arc<Memory>);
+impl std::ops::Deref for MappedTable {
+    type Target = cache::MappedRegions;
+    fn deref(&self) -> &cache::MappedRegions {
+        mapped_regions(&self.0)
+    }
+}
 /// Mapped device memory: every region of `plan` gets its table entry, disabled (its alias and length, base 0), before any
 /// vCPU exists, so the table's `seq` is nonzero exactly when the VM has regions: a resident that reads `seq` 0 (no
 /// region, the default launch, which publishes nothing) skips the holding flag safely, as no publish can ever follow
@@ -102,10 +117,13 @@ impl Backing {
     }
     /// The region table in the global area, which the host alone writes (`MappedRegions::publish`).
     pub fn mapped_regions(&self) -> &cache::MappedRegions {
-        let at = cache::GLOBAL_OFFSET + cache::MAPPED;
-        assert!(at % 8 == 0 && at + size_of::<cache::MappedRegions>() <= self.memory.1);
-        // SAFETY: inside the backing, aligned, plain atomics shared with the residents.
-        unsafe { &*self.memory.0.add(at).cast::<cache::MappedRegions>() }
+        mapped_regions(&self.memory)
+    }
+    /// The region table as an owned handle (it keeps the backing mapped): for a device that publishes from its handler
+    /// (the PCI bus, a test device). A publish made in a vCPU's port or device exit is what the resident's remap trigger
+    /// sees (`seq` moved across the exit); one made by any other thread is not.
+    pub fn mapped_table(&self) -> MappedTable {
+        MappedTable(self.memory.clone())
     }
     /// Guest RAM through the host's alias.
     ///

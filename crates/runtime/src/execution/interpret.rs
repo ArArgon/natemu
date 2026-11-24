@@ -473,6 +473,9 @@ fn execute(s: &mut State, paging: Option<paging::Control>, i: &Insn) -> Result<(
         data: true,
         count: 0,
         stopped: [0; 2],
+        checks: [(0, 0, false); 4],
+        checked: 0,
+        generation: 0,
     };
     let done = exec::step(&mut cpu, ctx, i, &mut m);
     let stopped = m.stopped;
@@ -598,6 +601,12 @@ struct Mem<'a> {
     count: usize,
     /// A memory stop's linear address and guest-physical page.
     stopped: [u64; 2],
+    /// Mapped device memory: the instruction's checks so far (linear, size, write; one per check, so never more than
+    /// `pages`) and the shadow generation when its first check began. A reset served while a later check waits (a remap's
+    /// shootdown) may stale an earlier check's region: then every check is made again ([`Memory::check`]).
+    checks: [(u32, u32, bool); 4],
+    checked: usize,
+    generation: u64,
 }
 /// The classes of [`Mem::pages`]' pages: guest RAM, and the firmware image (read as RAM, a store to it dropped); neither is
 /// unassigned.
@@ -672,6 +681,14 @@ impl Memory for Mem<'_> {
             };
         }
         let n = 1 + usize::from(next.is_some());
+        if self.checked == 0 {
+            self.generation = self.s.shadow_generation;
+        }
+        if self.checked == self.checks.len() {
+            halt(self.s, stop::INTERP_BUG)
+        }
+        self.checks[self.checked] = (linear, size, write);
+        self.checked += 1;
         let c = cache::control();
         let owed = c.uncached_count != 0 || c.uncached_fence != 0;
         let mut uncached = false;
@@ -722,6 +739,16 @@ impl Memory for Mem<'_> {
             unsafe { asm!("dmb ish") };
         }
         split_wait(self.s, &gpa[..n]);
+        // Mapped device memory: a reset since the instruction's first check (a remap's shootdown served in a wait) may
+        // have staled a region any of its checks found; the core has committed nothing yet (every check comes first), so
+        // the instruction's checks are all made again, as `execution.rs` `reclassify` retries a completion.
+        if self.s.shadow_generation != self.generation && self.pages[..self.count].iter().any(|e| e[1] & 3 == MAPPED) {
+            let (checks, checked) = (self.checks, self.checked);
+            (self.count, self.checked) = (0, 0);
+            for &(l, n, w) in &checks[..checked] {
+                self.check(l, n, w)?;
+            }
+        }
         Ok(())
     }
     fn read(&mut self, linear: u32, size: u8) -> u32 {
