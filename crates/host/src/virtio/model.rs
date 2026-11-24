@@ -26,9 +26,11 @@ use std::{
     time::Duration,
 };
 
-/// The most bytes a DeviceWrites queue holds for the guest beyond its posted buffers (a message queue: or one message,
-/// when it holds none).
+/// The most bytes a DeviceWrites queue holds for the guest beyond its posted buffers; also the largest message (one
+/// copy must hold a message and its publication).
 pub(super) const BACKLOG: usize = 64 * 1024;
+/// The most bytes of a reply a model may give (`Model::request`'s `writable` is at most this).
+pub(super) const REPLY: usize = 64 * 1024;
 /// The most messages a message queue holds.
 const MESSAGES: usize = 64;
 
@@ -73,8 +75,9 @@ pub(crate) trait Model: Send + Sync {
     /// set and is offered again after `ModelPort::resume(queue)`; a device reset or stop drops it (its chain is never
     /// completed, as a reset abandons any unfinished request), and no piece of an old incarnation reaches a new one.
     /// `Done(reply)`: the reply (at most `writable` bytes) goes to the chain's writable part with the last piece;
-    /// earlier pieces return `Done(None)`. Runs without the state lock; returns promptly and never waits for the
-    /// guest or a backend.
+    /// earlier pieces return `Done(None)`. `writable` is the writable part's size, at most `REPLY` (64 KiB); a longer
+    /// reply is cut to it and counted. Runs without the state lock; returns promptly and never waits for the guest
+    /// or a backend.
     fn request(&self, queue: u16, readable: &[u8], last: bool, writable: usize) -> Reply;
     /// DRIVER_OK: `port` serves this incarnation. Under the state lock: record and signal only (never a port call).
     fn started(&self, port: ModelPort);
@@ -96,7 +99,7 @@ pub struct ModelPort {
 impl ModelPort {
     /// For a DeviceWrites queue: takes as many bytes as fit in posted buffers and the queue's bounded backlog
     /// (stream queues split across chains; a message queue takes a message whole or not at all) and returns the
-    /// count taken; 0 after the device was reset.
+    /// count taken; 0 after the device was reset. A message over `BACKLOG` bytes is taken and dropped (counted).
     pub fn deliver(&self, queue: u16, bytes: &[u8]) -> usize {
         let Some(device) = self.device.upgrade() else {
             return 0;
@@ -125,7 +128,10 @@ impl ModelPort {
                 Arrival::Packet(_) => 0,
             })
             .sum();
-        let taken = if spec.stream {
+        let taken = if !spec.stream && bytes.len() > BACKLOG {
+            hosted.lost.fetch_add(1, SeqCst);
+            bytes.len()
+        } else if spec.stream {
             let n = bytes.len().min(BACKLOG.saturating_sub(held));
             match backlog.back_mut() {
                 // The owner takes a queue's whole run at once: append to it.
@@ -136,15 +142,15 @@ impl ModelPort {
                 _ => {}
             }
             n
-        } else if backlog.len() < MESSAGES && (held + bytes.len() <= BACKLOG || backlog.is_empty())
-        {
+        } else if backlog.len() < MESSAGES && held + bytes.len() <= BACKLOG {
             backlog.push_back((id, Arrival::Bytes(bytes.to_vec())));
             bytes.len()
         } else {
             0
         };
         // A request of this queue in flight re-notifies itself while data waits (`finish_request`).
-        if taken > 0 && !s.notified[q] && !s.queue_active(q) && !s.rx_starved[q] {
+        let queued = !s.received[q].is_empty();
+        if taken > 0 && queued && !s.notified[q] && !s.queue_active(q) && !s.rx_starved[q] {
             s.notified[q] = true;
             device.busy(&mut s);
             device.wake.ring();
@@ -191,7 +197,8 @@ pub(super) struct Hosted {
     this: OnceLock<Weak<Virtio>>,
     /// The model's doorbell ([`ModelPort::on_ready`]).
     ready: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Messages dropped because the posted chain could not hold them whole.
+    /// Messages dropped because they were over `BACKLOG` or the posted chain could not hold them whole, and replies cut
+    /// to `REPLY`.
     pub lost: AtomicU64,
 }
 impl Hosted {
@@ -322,7 +329,11 @@ impl Virtio {
             ));
         }
         let total: usize = readable.iter().map(|d| d.len() as usize).sum();
-        let room: usize = writable.iter().map(|d| d.len() as usize).sum();
+        let room = writable
+            .iter()
+            .map(|d| d.len() as usize)
+            .sum::<usize>()
+            .min(REPLY);
         loop {
             let piece = match request.piece.take() {
                 Some(piece) => piece,
@@ -354,8 +365,10 @@ impl Virtio {
                 Reply::Done(_) if !last => request.offset += piece.len(),
                 Reply::Done(reply) => {
                     let mut reply = reply.unwrap_or_default();
-                    debug_assert!(reply.len() <= room, "a model reply larger than its buffers");
-                    reply.truncate(room);
+                    if reply.len() > room {
+                        hosted.lost.fetch_add(1, SeqCst);
+                        reply.truncate(room);
+                    }
                     let writes = scatter(writable, &reply);
                     if writes.len() + 4 > MAX_SPANS {
                         return Ok(Request::Invalid(
@@ -973,6 +986,45 @@ mod tests {
             assert_eq!(rig.element(0, 0), (0, 4));
             assert_eq!(rig.received(), b"fits");
             assert_eq!(lost(&rig.d), 1);
+        });
+    }
+    #[test]
+    fn message_over_one_copy_is_dropped_and_counted() {
+        let rig = Rig::new(false);
+        rig.run(|rig| {
+            // One receive chain of 40 x 32 KiB (1.25 MiB) could hold the message, but one copy could not.
+            let buffers: Vec<_> = (0..40).map(|i| (BIG + i * 0x8000, 0x8000, true)).collect();
+            rig.post(0, &buffers);
+            rig.kick(0);
+            let port = rig.port();
+            let big = pattern(MAX_BYTES + 100 * 1024, 5);
+            assert_eq!(port.deliver(0, &big), big.len(), "taken whole");
+            assert_eq!(lost(&rig.d), 1, "and dropped");
+            assert_eq!(port.deliver(0, b"small"), 5);
+            until("the next message", || rig.used(0) == 1);
+            assert_eq!(rig.element(0, 0), (0, 5));
+            assert_eq!(rig.get(BIG, 5), b"small");
+            assert!(!rig.needs_reset());
+        });
+    }
+    #[test]
+    fn reply_over_its_bound_is_cut_and_counted() {
+        let rig = Rig::new(true);
+        rig.model.echo.store(false, SeqCst);
+        // The model answers more than it was offered: 1.5 MiB into a 2 MiB writable part.
+        *rig.model.reply.lock().unwrap() = Some(pattern(3 << 19, 6));
+        rig.put(TX, b"?");
+        rig.run(|rig| {
+            let mut buffers = vec![(TX, 1, false)];
+            buffers.extend((0..32).map(|i| (BIG + i * 0x10000, 0x10000, true)));
+            let head = rig.post(1, &buffers);
+            rig.kick(1);
+            until("TX used", || rig.used(1) == 1);
+            assert_eq!(rig.model.offered(), [(1, b"?".to_vec(), true, REPLY)]);
+            assert_eq!(rig.element(1, 0), (head.into(), REPLY as u32));
+            assert!(rig.get(BIG, REPLY) == pattern(3 << 19, 6)[..REPLY]);
+            assert_eq!(lost(&rig.d), 1);
+            assert!(!rig.needs_reset());
         });
     }
     #[test]
