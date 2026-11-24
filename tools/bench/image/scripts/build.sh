@@ -75,6 +75,7 @@ fetch $MIRROR/pool/main/x/x264/x264_0.164.3108+git31e19f9.orig.tar.gz x264_0.164
 fetch https://media.xiph.org/video/derf/y4m/foreman_cif.y4m foreman_cif.y4m \
       b0e3c35eff9fe1da91521a02eb9f0e3ef4bc5aec341ecef1567cd87f1711267b
 [ -f locks.c ] || cp "$here/../src/locks.c" .
+cp "$here/../src/sampler_check.c" "$here/../src/coldtrip.c" .
 # Input: the Silesia files concatenated in name order, first 64 MiB.
 python3 -I -c "
 import zipfile, sys; z = zipfile.ZipFile('silesia.zip')
@@ -91,6 +92,10 @@ done
 export PATH=$S/usr/bin:$PATH LD_LIBRARY_PATH=$NL
 CC="x86_64-linux-gnu-gcc-14 --sysroot=$S"; CXX="x86_64-linux-gnu-g++-14 --sysroot=$S"
 $CC -O2 -static -pthread -o "$B/out/bin/locks" locks.c
+# The EL0 sampler plan's programs (docs/restructure/el0-sampler-plan.md): its validity phases and chunk 3's trip cost. Their
+# checksums come from native runs here (--sums: the same work, untimed) and go into init with the other expected outputs.
+$CC -O2 -static -o "$B/out/bin/sampler_check" sampler_check.c
+$CC -O2 -static -o "$B/out/bin/coldtrip" coldtrip.c
 rm -rf rt-tests-2.8; tar xzf rt-tests-2.8.tar.gz
 $CC -O2 -static -pthread -DVERSION=2.8 -Wno-incompatible-pointer-types -o "$B/out/bin/hackbench" rt-tests-2.8/src/hackbench/hackbench.c
 # 32-bit builds of three of the programs (M2: 32-bit code under the 64-bit kernel), as Debian builds its i386 packages: gcc -m32 is
@@ -158,6 +163,8 @@ rm -rf zstd-lib; mkdir zstd-lib; tar xzf zstd-1.5.7.tar.gz -C zstd-lib --strip-c
 make -s -C lib -j4 libzstd.a CC="$CC" AR=x86_64-linux-gnu-ar CFLAGS="-O0 -ffile-prefix-map=$PWD/=" \
      ZSTD_LEGACY_SUPPORT=0 ZSTD_LIB_DICTBUILDER=0 >/dev/null
 bmd5=$(md5sum lib/libzstd.a | cut -d' ' -f1); cd ..
+scsum=$("$B/out/bin/sampler_check" --sums); [ "$scsum" = "$("$B/out/bin/sampler_check" --sums)" ]
+ctsum=$("$B/out/bin/coldtrip" --sums); [ "$ctsum" = "$("$B/out/bin/coldtrip" --sums)" ]
 isha=$(sha256sum "$B/out/input" | cut -d' ' -f1)
 # Expected outputs of the new benchmarks, from native runs that must agree with each other (2 runs of the LuaJIT task list at
 # 4 jobs; c-ray at 1 and 4 threads): LuaJIT's per-program outputs (out/expect-lj.md5) and c-ray's PPM md5.
@@ -191,6 +198,7 @@ xm=""; for n in 1 2 3 4 5 6 7 8; do
     m=$(taskset -c 0-3 x264 --preset slower --crf 23 --threads $n --asm MMX2,SSE2Fast,SSSE3,SSE4.2,AVX,FMA3,BMI2,AVX2 -o /tmp/x264.out "$B/out/foreman_cif.y4m" 2>/dev/null; md5sum < /tmp/x264.out | cut -d' ' -f1)
     xm="$xm -e s/@X264_MD5_$n@/$m/"; done
 sed -e "s/@ZSTD_MD5@/$zmd5/" -e "s/@BUILD_MD5@/$bmd5/" -e "s/@INPUT_SHA@/$isha/g" -e "s/@CRAY_MD5@/$cmd5/" -e "s/@CRAYS_MD5@/$smd5/" \
-    -e "s/@IN7_SHA@/$i7sha/" -e "s/@Z7_MD5@/$z7md5/" -e "s/@SQL_HASH@/$sqh/" $xm "$here/init" > "$B/init"
-echo "expected: zstd $zmd5 build $bmd5 input sha256 $isha c-ray $cmd5 in7 $i7sha 7z $z7md5 sqlite $sqh x264 $xm c-ray-strict $smd5" | tee "$B/out/expected.txt"
+    -e "s/@IN7_SHA@/$i7sha/" -e "s/@Z7_MD5@/$z7md5/" -e "s/@SQL_HASH@/$sqh/" \
+    -e "s/@SAMPLER_SUMS@/$scsum/" -e "s/@COLDTRIP_SUMS@/$ctsum/" $xm "$here/init" > "$B/init"
+echo "expected: zstd $zmd5 build $bmd5 input sha256 $isha c-ray $cmd5 in7 $i7sha 7z $z7md5 sqlite $sqh x264 $xm c-ray-strict $smd5 sampler-check $scsum coldtrip $ctsum" | tee "$B/out/expected.txt"
 INIT=$B/init "$here/mkroot.sh" "$B"

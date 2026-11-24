@@ -186,7 +186,17 @@ say() { echo "IO5 $*"; echo "IO5 $*" >> $L/markers; }
 now() { date +%s.%N; }
 T0=$(now)
 since() { awk "BEGIN{printf \"%.1f\", $(now)-$1}"; }
-span() { local n=$1 s=$(now) r; shift; if "$@" > $L/$n.log 2>&1; then r=ok; else r=fail:$?; fi
+# natemu.profile=1 (sampling runs only; docs/restructure/el0-sampler-plan.md section 3): the kernel's _text once (for the
+# KASLR slide), and around each step a start (port F8H, 1), a mark (F9H: the step's number, "IO5 mark N STEP") and a stop
+# (F8H, 2), through /dev/port. The device is never probed: without the word no port is touched. The steps that run at once
+# (make, download and generate) share one window and mark, "combined" (PROF_HELD set: their own spans write nothing).
+PROF=0; grep -qw natemu.profile=1 /proc/cmdline && PROF=1; PROFN=0
+port() { printf "\\$(printf %03o $2)" | dd of=/dev/port bs=1 seek=$1 count=1 conv=notrunc 2>/dev/null; }
+prof() { [ $PROF = 1 ] && [ -c /dev/port ] || return 0
+         case $1 in start) port 248 1;; stop) port 248 2;; mark) port 249 $(($2 % 256));; esac; }
+pstep() { [ $PROF = 1 ] && [ -z "${PROF_HELD:-}" ] || return 0; PROFN=$((PROFN+1)); prof start; prof mark $PROFN; say mark $PROFN $1; }
+pend() { [ $PROF = 1 ] && [ -z "${PROF_HELD:-}" ] || return 0; prof stop; }
+span() { local n=$1 s=$(now) r; shift; pstep $n; if "$@" > $L/$n.log 2>&1; then r=ok; else r=fail:$?; fi; pend
          say step $n $r $(since $s) start=$(awk "BEGIN{printf \"%.1f\", $s-$T0}"); }
 run() { bash -o pipefail -c "$1"; }
 DEVS='pkg-config xz-utils libssl-dev zlib1g-dev libffi-dev libbz2-dev liblzma-dev libsqlite3-dev libreadline-dev uuid-dev libgdbm-dev libncurses-dev'
@@ -212,6 +222,10 @@ i386() {   # --i386: Debian's i386 userland in /i386 (debootstrap, same snapshot
   umount -R /i386/dev /i386/proc
 }
 say begin $P cpus=$(nproc) mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) kernel=$(uname -r)
+if [ $PROF = 1 ]; then
+  say ktext $(grep -m1 ' _text$' /proc/kallsyms | cut -d' ' -f1)
+  [ -c /dev/port ] && say profile port=/dev/port || say profile no-dev-port: the control port cannot be written
+fi
 say system $(systemctl is-system-running --wait) boot=$(systemd-analyze | head -1 | sed 's/.*= //; s/ //g')
 say pti $(grep -c ' pti' /proc/cpuinfo | head -1) meltdown=$(tr ' ' _ < /sys/devices/system/cpu/vulnerabilities/meltdown)
 if [ $P = use ]; then
@@ -234,6 +248,7 @@ if [ $P = use ]; then
   mkdir -p /data/dl /data/gen; rm -f /tmp/make.done; s=$(now)
   if [ "@I386@" = 1 ]; then i386   # the 64-bit make alone (no loops, no tests), then the same build by an i386 userland
   else
+  pstep combined; PROF_HELD=1   # one sampling window for the three steps that run at once
   ( span make run 'cd /build/Python-3.13.18 && make -j$(nproc)'; touch /tmp/make.done ) &
   span download run 'n=0; while :; do f=/data/dl/linux-$((n % 4)).tar.xz
       curl -fsS https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz -o $f && echo "$KSHA  $f" | sha256sum -c || exit 1
@@ -241,7 +256,7 @@ if [ $P = use ]; then
   span generate run 'n=0; while :; do for i in $(seq 8); do head -c 256M /dev/urandom > /data/gen/f$i || exit 1; done
       cd /data/gen && sha256sum f? > SUMS && sync && echo 3 > /proc/sys/vm/drop_caches && sha256sum -c --quiet SUMS || exit 1
       n=$((n+1)); [ -e /tmp/make.done ] && break; done; echo rounds=$n' &
-  wait; say combined $(since $s) download_$(tail -1 $L/download.log) generate_$(tail -1 $L/generate.log)
+  wait; PROF_HELD=; pend; say combined $(since $s) download_$(tail -1 $L/download.log) generate_$(tail -1 $L/generate.log)
   span pytest run "cd /build/Python-3.13.18 && ./python -m test -j\$(nproc) @PYTESTS@"
   say pytest-result $(grep -E '^Result: ' $L/pytest.log | tail -1 | tr ' ' _)
   fi

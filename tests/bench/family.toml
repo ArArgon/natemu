@@ -201,6 +201,15 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--compile-cache", "off", "--perf-log"]
 
+# The cost of one resident trip to guest code (docs/restructure/el0-sampler-plan.md, chunk 3): the image's coldtrip program
+# (CPUID every K iterations against an inline control, a small and a large code footprint, 100 ms halted gaps between phases)
+# under the `perf` resident; tests/bench/coldtrip_report.py places each phase in the log's 5 ms bucket snapshots and gives
+# the guest bucket's ns per trip: the gate's fixed cost and the cold state's (OUT/coldtrip.report.json). A profile, not a
+# timing; its judge checks the program's sums, the trip counts against K and the resident's CPUID count.
+[suite.cases.guest-coldtrip-profile]
+argv = ["python3", "tests/bench/coldtrip_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
