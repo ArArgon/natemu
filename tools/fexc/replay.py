@@ -288,6 +288,16 @@ def only_bulk_movs(old, new, answer_without):
     return None if only_probes(old, without) is None else 'differs without FexcRepMovs too'
 
 
+def only_bulk_read(old, new):
+    """Bulk REP plan (section 14), a request without `--bulk` (a step, or alignment gating): NEW reads the flag for a REP
+    MOVSB/MOVSQ, to decline the loops, so its args_read also has FEXC_ARG_BULK (bit 10, fexc_hook.h); None when that is
+    all that differs."""
+    u32 = lambda b, o: struct.unpack_from('<I', b, o)[0]
+    if len(old) < 20 or len(old) != len(new) or old[:16] != new[:16] or old[20:] != new[20:]: return 'more than args_read differs'
+    xo, xn = u32(old, 16), u32(new, 16)
+    return None if not xo & 1 << 10 and xn == xo | 1 << 10 else 'args_read differs otherwise'
+
+
 def only_moves(old, new):
     """32-bit code shared position-independent (fexc: every guest-RIP move of 32-bit code is `movz w; movk w, lsl #16;
     nop`, FEX's InsertGuestRIPMove under fexc_bits32): None when NEW's reply is OLD's but for that, else what else
@@ -450,6 +460,9 @@ def main():
             if ro != rn and b'--bulk\0' in args and only_bulk_movs(ro, rn, lambda: answer(new, with_arg(rec, b'--no-bulk-movs\0'))) is None:
                 movs += 1
                 continue
+            if ro != rn and b'--bulk\0' not in args and only_bulk_read(ro, rn) is None:
+                movs += 1
+                continue
             if ro != rn and (why := only_probes(ro, rn)) is not None:
                 differ += 1
                 if differ <= 5:
@@ -461,7 +474,7 @@ def main():
     same = os.path.realpath(a.old) == os.path.realpath(a.fexc)
     print(f'replay: {n} requests ({stream.stat().st_size >> 20} MiB), {differ} differences' +
           (f'; {probes} more replies differ only by split stubs that probe (M2 task 4: only_probes)' if probes else '') +
-          (f'; {movs} more differ only by bulk REP MOVS (only_bulk_movs)' if movs else '') + (' (OLD is NEW: the self-check only)' if same else '') +
+          (f'; {movs} more differ only by bulk REP MOVS (only_bulk_movs, only_bulk_read)' if movs else '') + (' (OLD is NEW: the self-check only)' if same else '') +
           (f'; {n32} of them for 32-bit code, answered by NEW only (none compared: --old32 compares them)' if n32 and not old32 else ''))
     if old32:
         growth = 100 * (size32[1] - size32[0]) / max(size32[0], 1)
