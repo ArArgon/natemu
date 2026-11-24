@@ -362,6 +362,12 @@ return model's hit rates and rates per 1,000 guest instructions (`guest-build-ce
 for the i386 toolchain build's steps). They are counts, not timings: each claims a few cores, not the machine. The
 plugin's own check, `census-check`, runs a small program whose every count is known and runs with the family.
 
+The `-sample` cases (`guest-build-sample` and the other guest benchmarks, `guest-build-sample-4`, `io5-solo32-sample`) are
+profiles of where the vCPUs were, from natemu's EL0 sampler ([plan](restructure/el0-sampler-plan.md)): the resident built with
+its `perf` and `profile` features, `--sample-us 250` on the runner, then `tests/bench/sample_report.py`, which writes
+`NAME.report.json` and `NAME.report.md` beside `NAME.samples` and `NAME.objects` in the case's folder (samples by kind and
+place per phase, the top blocks). `guest-sampler-cost` measures what sampling costs: off against on, alternating, three rounds.
+
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not
 in the framework yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.

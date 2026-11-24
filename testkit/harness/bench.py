@@ -10,6 +10,8 @@ Placeholders (in argv, env and needs): {out} {fexc} {natemu} {runtime} {host} {k
 when a case of the suite uses it (and then prepared before the run starts):
     {bench_image}       the benchmark initramfs (artifacts.bench_image)
     {runtime_perf}      the resident built with its `perf` feature (artifacts.perf_runtime), for profile cases
+    {runtime_profile}   the resident built with its `perf` and `profile` features (artifacts.profile_runtime), for
+                        sampling cases (the EL0 sampler: `--sample-us`)
     {natemu_entry}      this checkout's natemu build folder, laid out like cargo's target folder (artifacts.natemu)
     {natemu_baseline}   the same for the case's `baseline` revision (artifacts.natemu_at)
     {fio_prep} {block_inputs} {io5_inputs}   writable clones, in the case folder, of inputs.fio_prep(),
@@ -172,6 +174,7 @@ class Bench:
         for spec in suite.extra.get('cases', {}).values():
             if _uses(spec, 'bench_image'): reqs.append(Requirement('artifact', 'bench-image'))
             if _uses(spec, 'runtime_perf'): reqs.append(Requirement('artifact', 'perf-runtime'))
+            if _uses(spec, 'runtime_profile'): reqs.append(Requirement('artifact', 'profile-runtime'))
             if _uses(spec, 'natemu_baseline'): reqs.append(Requirement('natemu-at', spec['baseline']))
             reqs += [Requirement('input', n) for p, n in INPUTS.items() if _uses(spec, p)]
             if _uses(spec, 'qemu_img') or _uses(spec, 'qemu_system'): reqs.append(Requirement('artifact', 'qemu-system'))
@@ -193,6 +196,7 @@ class Bench:
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry
         if _uses(spec, 'runtime_perf'): vals['runtime_perf'] = artifacts.perf_runtime()
+        if _uses(spec, 'runtime_profile'): vals['runtime_profile'] = artifacts.profile_runtime()
         if _uses(spec, 'natemu_baseline'): vals['natemu_baseline'] = artifacts.natemu_at(spec['baseline']).entry
         if _uses(spec, 'qemu_system'): vals['qemu_system'] = artifacts.qemu_system() / 'qemu-system-x86_64'
         if _uses(spec, 'qemu_img'): vals['qemu_img'] = artifacts.qemu_system() / 'qemu-img'

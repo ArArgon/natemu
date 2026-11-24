@@ -5,6 +5,7 @@ measurement, verification and record are that script's, natemu now runs as the `
     python3 tools/bench/run.py --out DIR --name NAME --emu natemu|qemu-multi|qemu-single|qemu-multi-max --vcpus N
         --bench BENCH --kernel BZIMAGE --initrd CPIO [--jobs J] [--fexc FEXC] [--natemu STUB] [--runtime FILE]
         [--compile-cache DIR|off] [--cap SECONDS] [--qemu QEMU] [--append WORDS] [--perf-log] [--natemu-set KEY=VALUE ...]
+        [--sample-us N]
 
 The guest runs the benchmark twice (run 1 cold, run 2 warm), each timed on the host from its NATEMU-BENCH-START line to its
 NATEMU-BENCH-END line on the serial console (START2/END2 for run 2; boot excluded) and verified (VERIFY / VERIFY2). A
@@ -25,6 +26,13 @@ capped boot is recorded (`capped`, `capped_in`: the run it was in, `at_least_s`:
 (or QEMU capped: a result, "> cap"), 1 not reached or not verified (natemu capped included), 3 contended. A QEMU record
 names its version, machine type and CPU model (`qemu`). Appends one JSON line to DIR/bench.jsonl; serial to
 DIR/NAME.serial. Run it under the VM lock (`/usr/bin/lockf -k .../natemu-raw/.vm.lock`) with no other VM running.
+
+`--sample-us N` (natemu; a profile, not a timing: pass a resident built with its `perf` and `profile` features as --runtime)
+samples where each vCPU is every N us (natemu `--profile DIR/NAME --profile-us N`: DIR/NAME.samples and DIR/NAME.objects,
+docs/restructure/el0-sampler-plan.md), adds `natemu.profile=1` to the kernel command line (the guest's sign that the control
+port is there) and implies --perf-log. With --perf-log, every NATEMU-BENCH line is stamped on arrival in DIR/NAME.markers.tsv
+(CLOCK_UPTIME_RAW ns, the timing log's and the samples' clock, then the line), from which tests/bench/sample_report.py cuts the
+boot into phases.
 """
 import argparse, json, os, pathlib, re, signal, subprocess, sys, time
 
@@ -80,11 +88,16 @@ def main():
     ap.add_argument('--append', default='', help='more words for the kernel command line (e.g. vdso32=0: 32-bit programs then make their system calls by INT 0x80)')
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
     ap.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
+    ap.add_argument('--sample-us', type=int, help='natemu: sample every vCPU every N us into OUT/NAME.samples and OUT/NAME.objects (a profile; implies --perf-log; pass a `perf,profile` resident as --runtime)')
     a = ap.parse_args()
+    if a.sample_us is not None:
+        if a.emu != 'natemu' or a.sample_us < 1: ap.error('--sample-us N: natemu only, N at least 1')
+        a.perf_log = True
     if a.ram < 2 or a.ram % 2: ap.error('--ram must be a positive multiple of 2 MiB')
     out, name, emu, n, bench, cap = a.out, a.name, a.emu, a.vcpus, a.bench, a.cap
     jobs = a.jobs or n
-    cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr bench={bench} jobs={jobs}' + (' ' + a.append if a.append else '')
+    cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr bench={bench} jobs={jobs}' + (' ' + a.append if a.append else '') + \
+        (' natemu.profile=1' if a.sample_us else '')
     os.makedirs(out, exist_ok=True)
     serial = f'{out}/{name}.serial'
     if os.path.exists(serial): os.remove(serial)
@@ -95,7 +108,8 @@ def main():
         if not a.fexc: ap.error('--emu natemu needs --fexc')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
                '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else []),
-               *(w for kv in a.natemu_set for w in ('--set', kv))]
+               *(w for kv in a.natemu_set for w in ('--set', kv)),
+               *(['--profile', f'{out}/{name}', '--profile-us', str(a.sample_us)] if a.sample_us else [])]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', f'{QMACHINE},hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
                '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,
@@ -105,9 +119,12 @@ def main():
     # Trailing spaces distinguish START/START2; timestamps are read ends, not pre-process-query times.
     M = {k: None for k in ('START ', 'END ', 'START2 ', 'END2 ')}; text = ''; others = set(); last = 0.0; seen = [[], []]
     bounds = {}; phase_bounds = [[], []]; previous_read_start = t0
+    # Profile runs (--perf-log, --sample-us): each NATEMU-BENCH line's arrival on the timing log's and the samples' clock
+    # (CLOCK_UPTIME_RAW ns), which cut them into phases.
+    stamps = open(f'{out}/{name}.markers.tsv', 'w') if a.perf_log else None; stamped = 0
 
     def read_serial():
-        nonlocal text, previous_read_start
+        nonlocal text, previous_read_start, stamped
         before = time.monotonic()
         try:
             with open(serial, errors='replace') as f: data = f.read()
@@ -118,6 +135,11 @@ def main():
         bracket = dict(lower_s=previous_read_start, upper_s=after, read_start_s=before)
         previous_read_start = before
         text = data[:data.rfind('\n') + 1]   # defer partial lines until their terminating newline arrives
+        if stamps:
+            lines = text.splitlines(); ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+            for line in lines[stamped:]:
+                if 'NATEMU-BENCH-' in line: stamps.write(f'{ns}\t{line[line.index("NATEMU-BENCH-"):].strip()}\n')
+            stamped = len(lines); stamps.flush()
         for k in M:
             if M[k] is None and 'NATEMU-BENCH-' + k in text:
                 M[k] = after; bounds[k] = bracket
@@ -139,6 +161,7 @@ def main():
         except subprocess.TimeoutExpired: p.kill(); p.wait()
     read_serial()   # the process can append its last markers just before exiting
     total = time.monotonic() - t0
+    if stamps: stamps.close()
 
     def elapsed_bounds(a, b):
         return [b['lower_s'] - a['upper_s'], b['upper_s'] - a['lower_s']] if a is not None and b is not None else None
@@ -166,6 +189,7 @@ def main():
                            phases=phase_bounds[0], phases2=phase_bounds[1]),
                total_s=round(total, 3), cpus=re.findall(r'cpus=(\d+)', text)[:1], contended=sorted(others), rc=p.returncode,
                cmd=[str(c) for c in cmd], stderr=pathlib.Path(f'{out}/{name}.stderr').read_text()[-300:])
+    if a.sample_us: rec['sample_us'] = a.sample_us
     rec['fp_traps'] = fp_traps(pathlib.Path(f'{out}/{name}.stderr').read_text())
     rec['system_counts'] = system_counts(pathlib.Path(f'{out}/{name}.stderr').read_text())
     if emu != 'natemu':

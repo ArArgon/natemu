@@ -11,7 +11,8 @@ A passed case's output folder is deleted when it ends (`drop_outputs`); a failed
     [[suite]] kind = "judged"  harness = "runner"
     [suite.cases.<name>]  argv = ["tests/<family>/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw}: the input root,
                           {natemu_entry}, {natemu_host}, {natemu_stub}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
-                          unittests/ASM at the pin; {fexc_base}: fexc as the checkout's merge base with main has it)
+                          unittests/ASM at the pin; {fexc_base}: fexc as the checkout's merge base with main has it;
+                          {runtime_profile}: the resident built with its `perf` and `profile` features)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
                           (the judge sees exit 1; judge_on_zero = true also sends it exit 0: a negative control)
                           timeout = N  (seconds, this case only; else the suite's params.timeout, default 3600)
@@ -206,6 +207,9 @@ class Runner:
             # ponytail: built here, at its case's turn (about 30 s once per base, then cached), not among the requirements:
             # those are per suite, and one case of one suite wants it.
             if any('{fexc_base}' in x for x in spec['argv']): extra['fexc_base'] = artifacts.fexc_at(artifacts.base_rev())
+            # {runtime_profile}: the resident built with its `perf` and `profile` features (the static stack check of the
+            # sampler's IRQ path); built at its case's turn, as {fexc_base}.
+            if any('{runtime_profile}' in x for x in spec['argv']): extra['runtime_profile'] = artifacts.profile_runtime()
             argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_stub=n.stub, natemu_runtime=n.runtime,
                              raw=root, **extra) for a in spec['argv']]
             if argv[0].endswith('.py'): argv = [sys.executable, *argv]

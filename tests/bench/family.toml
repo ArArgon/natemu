@@ -210,6 +210,68 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-
 argv = ["python3", "tests/bench/coldtrip_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
         "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}"]
 
+# Profiles, not timings: where the vCPUs were, sampled every 250 us (the EL0 sampler, docs/restructure/el0-sampler-plan.md
+# chunk 0): the resident built with its `perf` and `profile` features, natemu --profile OUT/NAME (NAME.samples, NAME.objects),
+# natemu.profile=1 on the kernel command line, the timing log. tests/bench/sample_report.py runs the boot, then writes
+# NAME.report.json and NAME.report.md: samples by kind and place per phase (boot, run1 and its phases, run2, ...), the top blocks.
+# Their buckets are perturbed by sampling: reported, never a decision (the unperturbed -profile cases above decide).
+[suite.cases.guest-build-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample", "--markers", "{out}/build-sample.markers.tsv", "--perf", "{out}/build-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-hackbench-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-luajit-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/luajit-sample", "--markers", "{out}/luajit-sample.markers.tsv", "--perf", "{out}/luajit-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-sqlite-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/sqlite-sample", "--markers", "{out}/sqlite-sample.markers.tsv", "--perf", "{out}/sqlite-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-zstd-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/zstd-sample", "--markers", "{out}/zstd-sample.markers.tsv", "--perf", "{out}/zstd-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "zstd",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-startup32-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/startup32-sample", "--markers", "{out}/startup32-sample.markers.tsv", "--perf", "{out}/startup32-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "startup32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-scimark32-sse2-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/scimark32-sse2-sample", "--markers", "{out}/scimark32-sse2-sample.markers.tsv", "--perf", "{out}/scimark32-sse2-sample.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32-sse2",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+[suite.cases.guest-build-sample-4]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample-4", "--markers", "{out}/build-sample-4.markers.tsv", "--perf", "{out}/build-sample-4.perf",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample-4", "--emu", "natemu", "--vcpus", "4", "--bench", "build",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--compile-cache", "off", "--sample-us", "250"]
+
+# What sampling costs (the plan's overhead case): build and hackbench at 1 vCPU and build at 4, each sampling off and every
+# 250 us with the same `perf,profile` resident and timing log, alternating, three rounds (tests/bench/run_sampler_cost.py).
+# Accepted when each wall time is within the rounds' spread plus 2% and the guest bucket's share within 1 point. About 15 minutes.
+[suite.cases.guest-sampler-cost]
+timeout = 3600
+argv = ["python3", "tests/bench/run_sampler_cost.py", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--sample-us", "250", "--rounds", "3",
+        "--configs", "build:1,hackbench:1,build:4"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
@@ -311,6 +373,18 @@ argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--input
         "--natemu", "{natemu}", "--runtime", "{runtime_perf}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
         "--i386", "--perf-log", "--lock", "{out}/vm.lock"]
 
+# A profile, not a timing: io5-solo32 sampled every 250 us (the EL0 sampler; the `perf,profile` resident, natemu.profile=1 on the
+# kernel command line, the timing log): OUT/io5/sample-PHASE.samples and .objects per launch, then
+# tests/bench/sample_report.py's report of each, the use launch cut into its steps (configure, make, i386-configure, i386-make)
+# and 10 s windows.
+[suite.cases.io5-solo32-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--window", "10",
+        "--profile", "{out}/io5/sample-use", "--markers", "{out}/io5/markers-use.tsv", "--perf", "{out}/io5/perf-use.log",
+        "--profile", "{out}/io5/sample-verify", "--markers", "{out}/io5/markers-verify.tsv", "--perf", "{out}/io5/perf-verify.log",
+        "--", "python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
+        "--i386", "--sample-us", "250", "--lock", "{out}/vm.lock"]
+
 [suite.cases.io5-solo32-qemu]
 timeout = 3900
 argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "qemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
@@ -407,7 +481,6 @@ argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "natemu", "
 [suite.cases.display-fill-qemu]
 argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "qemu", "--inputs", "{display_inputs}", "--out", "{out}",
         "--qemu", "{qemu_system}"]
-
 
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin

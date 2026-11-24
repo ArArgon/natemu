@@ -5,6 +5,7 @@
     python3 tests/io/run_io5.py prepare --inputs DIR
     python3 tests/io/run_io5.py run --backend natemu|qemu|kvm --inputs DIR --out DIR [--fexc FEXC] [--vcpus 4] [--ram 8]
                                  [--speculation-barriers] [--mitigations-off] [--solo-build] [--i386] [--transport mmio|pci]
+                                 [--sample-us N]
 
 prepare downloads and verifies the image (Debian's SHA512SUMS), extracts its /boot kernel and initramfs, and fetches the
 CPython 3.13.18 source (pinned SHA-256; signed by its release manager, checked when pinned).
@@ -36,6 +37,11 @@ makes the same source (`linux32 chroot /i386`: steps i386-configure and i386-mak
 with --backend kvm records: the same boots on the x86 machine NATEMU_X86_HOST under KVM (the same kernel, disk and script; the
 disk stays there, so its launches get the console checks only), whose step times are the build's times on real x86 (result.json
 `reference_host`: that machine's load and other containers before and after each boot; `times_indicative` if it was not idle).
+
+run --sample-us N (natemu; a profile, not a timing: the resident built with its `perf` and `profile` features as --runtime):
+each launch samples every vCPU every N us into OUT/sample-PHASE.samples and OUT/sample-PHASE.objects (natemu --profile,
+docs/restructure/el0-sampler-plan.md), with the timing log (--perf-log implied) and natemu.profile=1 on the kernel command
+line; tests/bench/sample_report.py cuts the use launch into its steps from markers-use.tsv.
 
 run --image-format qcow2 (default raw; the raw records stay comparable): natemu's qcow2 disk. INPUTS/disk.qcow2 is made once from
 disk.raw (`qemu-img convert -O qcow2 -o preallocation=metadata`, then `qemu-img resize --preallocation=metadata` to 16 GiB, so
@@ -346,7 +352,7 @@ def prepare(inputs):
 
 
 def command(args, disk, cache, phase='use'):
-    cmdline = CMDLINE + (' mitigations=off' if args.mitigations_off else '')
+    cmdline = CMDLINE + (' mitigations=off' if args.mitigations_off else '') + (' natemu.profile=1' if getattr(args, 'sample_us', None) else '')
     if args.backend == 'natemu':
         return [getattr(args, 'natemu', None) or ROOT / 'target/release/natemu'] + (['--runtime', args.runtime] if getattr(args, 'runtime', None) else []) + ['--fexc', args.fexc, '--kernel', args.inputs / 'vmlinuz', '--initrd',
                 args.inputs / 'initrd.img', '--cmdline', cmdline, '--ram', f'{args.ram}G', '--vcpus', str(args.vcpus),
@@ -355,7 +361,8 @@ def command(args, disk, cache, phase='use'):
                (['--speculation-barriers'] if args.speculation_barriers else []) + \
                (['--virtio-transport', 'pci'] if getattr(args, 'transport', 'mmio') == 'pci' else []) + \
                (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else []) + \
-               [w for kv in getattr(args, 'natemu_set', []) for w in ('--set', kv)]
+               [w for kv in getattr(args, 'natemu_set', []) for w in ('--set', kv)] + \
+               (['--profile', args.out / f'sample-{phase}', '--profile-us', str(args.sample_us)] if getattr(args, 'sample_us', None) else [])
     if args.backend == 'kvm':   # the x86 reference machine: Debian's QEMU (the run's snapshot) in the builds' container, as ltp32's reference boots
         qemu = ('qemu-system-x86_64 -enable-kvm -cpu host,-pku -nodefaults -display none -serial stdio -no-reboot '
                 f'-m {args.ram * 1024} -smp {args.vcpus} -kernel /b/vmlinuz -initrd /b/initrd.img -append {shlex.quote(cmdline)} '
@@ -503,7 +510,7 @@ def run(args):
     clone(args.inputs / PYTHON, serve / 'py.tar.xz')
     server, host = serve_files(serve)
     result = {'image_format': args.image_format, 'transport': args.transport, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
-              'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
+              'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, 'sample_us': args.sample_us, 'command': [str(c) for c in command(args, disk, 'CACHE')],
               'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None,
               'qemu': subprocess.run([QEMU, '--version'], capture_output=True, text=True).stdout.splitlines()[0] if args.backend == 'qemu' else None, 'phases': {}}
     try:
@@ -675,6 +682,8 @@ def main():
     r.add_argument('--solo-build', action='store_true', help='diagnostic: after the manifest, configure and make the source again alone')
     r.add_argument('--i386', action='store_true', help='the 32-bit toolchain build: configure and make alone (no loops or tests), then again by a Debian i386 userland installed in /i386')
     r.add_argument('--perf-log', action='store_true', help='natemu: write each launch\'s timing log to OUT/perf-PHASE.log')
+    r.add_argument('--sample-us', type=int, help='natemu: sample every vCPU every N us into OUT/sample-PHASE.samples and .objects '
+                   '(EL0 sampler; a profile; implies --perf-log; pass a `perf,profile` resident as --runtime); adds natemu.profile=1 to the kernel command line')
     r.add_argument('--lock', type=Path, default=VM_LOCK); r.add_argument('--keep-disk', action='store_true')
     r.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default), qcow2 or overlay (see the docstring)')
     r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
@@ -696,6 +705,9 @@ def main():
     args = a.parse_args()
     if args.cmd == 'prepare': prepare(args.inputs); return 0
     if args.cmd == 'profile': signal.signal(signal.SIGTERM, lambda *_: sys.exit(3)); return profile(args)
+    if args.sample_us is not None:
+        if args.backend != 'natemu' or args.sample_us < 1: a.error('--sample-us N: natemu only, N at least 1')
+        args.perf_log = True
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(3))
     return run(args)
 
