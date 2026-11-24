@@ -200,3 +200,11 @@ and aborts (10.2 M).
 What the decisions rest on, and what would move them: configure's and hackbench's EL0 tables describe a minority of
 their EL0 time (section 1), so no verdict reads them; a sampler that places those samples (section 1's fix) would let the
 configure steps be read. The FEX-body row needs a tighter skid model before `build` can be decided.
+
+## Owner decisions (November 23)
+
+- Build every fix whose row reads "Build": indirect step 1, return prediction, the resident's trip cost (return path
+  and footprint), bulk REP string operations, flag words, and page-crossing checks. Correctness first.
+- Pool them: no A/B per fix; one combined A/B against this page's commit and one profile round over all of them at the
+  end, with the gate. Each fix keeps its own kill-test and correctness tests.
+- No FEX code-quality track for now.
