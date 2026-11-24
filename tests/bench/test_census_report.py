@@ -26,7 +26,8 @@ SITES = [
     ['call', 'user', 0x1000, 0x401000, 0x9000, 0, 60, 0, [[0x402000, 60]]],                   # one target
     ['jmp', 'user', 0x1000, 0x401100, 0x9100, 0, 30, 0, [[0x403000, 10], [0x403100, 20]]],    # two
     ['jmp', 'user', 0x1000, 0x401200, 0x9200, 1, 10, 2, [[1, 2], [2, 2], [3, 2], [4, 2]]],    # 5+ (overflow)
-    ['call', 'user', 0x2000, 0x401000, 0x9000, 0, 40, 0, [[0x502000, 40]]],                   # same code, another process
+    ['call', 'user', 0x2000, 0x501000, 0x9000, 0, 40, 0, [[0x502000, 40]]],                   # same code, another process
+                                                                                              # and load address
     ['call', 'kernel', 0, 0xffffffff81000000, 0x7000, 0, 50, 0, [[0xffffffff81001000, 50]]],
     ['ret', 'user', 0x1000, 0x402000, 0x9300, 0, 100, 0, [[0x401005, 100]]],
     ['ret', 'kernel', 0, 0xffffffff81001000, 0x7100, 0, 20, 0, [[0xffffffff81000005, 20]]],
@@ -41,19 +42,27 @@ class Reduce(unittest.TestCase):
     def setUp(self):
         self.r = census_report.reduce(census(segment('boot', []), segment('run1', SITES)), 'run1')
 
-    def test_shares_of_indirect_executions_by_target_count(self):
+    def test_main_target_shares_are_execution_weighted(self):
         u = self.r['modes']['user']['indirect']
         self.assertEqual(u['execs'], 140)
-        self.assertEqual(u['execs_by_targets'], {'1': 100, '2': 30, '3': 0, '4': 0, '5+': 10})
-        self.assertAlmostEqual(u['share_1'], 100 / 140); self.assertAlmostEqual(u['share_2'], 30 / 140)
+        self.assertAlmostEqual(u['top1'], (60 + 20 + 2 + 40) / 140); self.assertAlmostEqual(u['top2'], (60 + 30 + 4 + 40) / 140)
+        self.assertAlmostEqual(u['overflow'], 2 / 140)
         t = self.r['modes']['total']['indirect']
-        self.assertEqual(t['execs'], 190); self.assertAlmostEqual(t['share_1'], 150 / 190)
-        self.assertEqual(self.r['modes']['kernel']['indirect']['share_1'], 1.0)
+        self.assertEqual(t['execs'], 190); self.assertAlmostEqual(t['top1'], (122 + 50) / 190)
+        self.assertEqual(self.r['modes']['kernel']['indirect']['top1'], 1.0)
+        self.assertAlmostEqual(self.r['modes']['user']['indirect_jmp']['top1'], 22 / 40)
 
-    def test_by_physical_code_the_two_processes_share_one_site(self):
-        u = self.r['modes']['user']['indirect_by_code']
-        self.assertEqual(u['sites_by_targets'], {'1': 0, '2': 2, '3': 0, '4': 0, '5+': 1})
-        self.assertAlmostEqual(u['share_2'], 130 / 140)
+    def test_a_site_with_one_dominant_target_counts_by_its_share_not_its_class(self):
+        r = census_report.reduce(census(segment('run1', [['jmp', 'user', 1, 0x10, 0, 0, 1000, 0, [[7, 999], [8, 1]]]])), 'run1')
+        u = r['modes']['user']['indirect']
+        self.assertAlmostEqual(u['top1'], 0.999); self.assertEqual(u['one_target_sites'], 0.0)
+
+    def test_by_code_targets_relative_to_the_site_merge_load_addresses(self):
+        u = self.r['modes']['user']['indirect_by_code']        # 0x401000 -> 0x402000 and 0x501000 -> 0x502000: one target
+        self.assertEqual(u['sites'], 3)
+        self.assertAlmostEqual(u['top1'], (100 + 20 + 2) / 140)
+        self.assertEqual(u['sites_by_targets'], {'1': 1, '2': 1, '3': 0, '4': 0, '5+': 1})
+        self.assertAlmostEqual(self.r['modes']['user']['indirect_call_by_code']['top1'], 1.0)
 
     def test_rets_return_model_and_rates_per_instruction(self):
         u, k, t = (self.r['modes'][m] for m in ('user', 'kernel', 'total'))
@@ -61,7 +70,7 @@ class Reduce(unittest.TestCase):
         self.assertAlmostEqual(u['ras']['8']['hit_rate'], 0.8); self.assertAlmostEqual(u['ras']['32']['hit_rate'], 0.95)
         self.assertAlmostEqual(t['ras']['8']['hit_rate'], 100 / 120)
         self.assertAlmostEqual(u['ras_split']['8']['hit_rate'], 0.99); self.assertAlmostEqual(t['ras_split']['8']['hit_rate'], 119 / 120)
-        self.assertAlmostEqual(u['indirect_call']['share_1'], 1.0); self.assertAlmostEqual(u['indirect_jmp']['share_2'], 0.75)
+        self.assertAlmostEqual(u['indirect_call']['one_target_sites'], 1.0); self.assertAlmostEqual(u['indirect_jmp']['two_target_sites'], 0.75)
         self.assertAlmostEqual(u['per_1000']['indirect'], 14.0); self.assertAlmostEqual(u['per_1000']['ret'], 10.0)
         self.assertAlmostEqual(k['per_1000']['direct_call'], 2.5); self.assertAlmostEqual(t['per_1000']['indirect'], 1000 * 190 / 14000)
 
@@ -80,10 +89,13 @@ class Reduce(unittest.TestCase):
 
     def test_markdown_names_the_decision_rows(self):
         md = census_report.markdown(self.r, 'build')
-        self.assertIn('| indirect executions at 1-target sites | 71.4% | 100.0% | 78.9% |', md)
-        self.assertIn('| return model hit rate, depth 16 | 90.0% | 100.0% | 91.7% |', md)
-        self.assertIn('| split return model (user, kernel apart), depth 8 | 99.0% | 100.0% | 99.2% |', md)
-        self.assertIn('|   indirect jmps at 1 / 2-target sites | 0.0% / 75.0% |  | 0.0% / 75.0% |', md)
+        self.assertIn('| indirect executions to the main target / top two, per address space | 87.1% / 95.7% | 100.0% / 100.0% '
+                      '| 90.5% / 96.8% |', md)
+        self.assertIn('|   jmps | 55.0% / 85.0% |  | 55.0% / 85.0% |', md)
+        self.assertIn('| secondary: indirect executions at sites that saw exactly one target | 71.4% | 100.0% | 78.9% |', md)
+        self.assertIn('| return hit rate, one stack, depth 8 / 16 / 32 | 80.0% / 90.0% / 95.0% | 100.0% / 100.0% / 100.0% '
+                      '| 83.3% / 91.7% / 95.8% |', md)
+        self.assertIn('| return hit rate, user and kernel stacks apart, depth 8 / 16 / 32 | 99.0% / 100.0% / 100.0% |', md)
 
 
 class Check(unittest.TestCase):
@@ -109,13 +121,14 @@ Real              Virtual           Name
 
     def synthetic(self):
         """The plugin's output the check expects, made from EXPECTED_* and made-up addresses."""
-        names = {lab for _, _, lab, _, tg, _, _ in run_census.EXPECTED_SITES for lab in [lab, *(t for t, _ in tg)]}
+        names = {lab for _, _, lab, _, tg, *_ in run_census.EXPECTED_SITES for lab in [lab, *(t for t, _ in tg)]}
         sym = {n: 0x100000 + 0x10 * i for i, n in enumerate(sorted(names))}
-        sym.update(KBASE=0xffffffff80000000, ALIAS=0x400000, HALIAS=0x600000, pml4=0x103000, mb_header=0x100000,
-                   image_end=0x108000)
+        sym.update(KBASE=0xffffffff80000000, ALIAS=0x400000, HALIAS=0x600000, pml4=0x103000, pml4b=0x108000,
+                   mb_header=0x100000, image_end=0x109000)
         a = lambda lab, al: sym[lab] + (sym[al] if al else 0)
-        sites = [[k, m, 0x102000 if m == 'user' else 0, a(lab, al), 0, fl, sum(tg.values()) + ov, ov,
-                  [[a(t, tal), c] for (t, tal), c in tg.items()]] for k, m, lab, al, tg, ov, fl in run_census.EXPECTED_SITES]
+        sites = [[k, m, (sym[sp[0]] if sp else 0x103000) & ~0x1fff if m == 'user' else 0, a(lab, al), 0, fl,
+                  sum(tg.values()) + ov, ov, [[a(t, tal), c] for (t, tal), c in tg.items()]]
+                 for k, m, lab, al, tg, ov, fl, *sp in run_census.EXPECTED_SITES]
         seg = {'name': 'program', 'sites': sites, 'ras': copy.deepcopy(run_census.EXPECTED_RAS),
                'ras_split': copy.deepcopy(run_census.EXPECTED_RAS_SPLIT),
                'insns': {'user': 9000, 'kernel': 40}, **copy.deepcopy(run_census.EXPECTED_COUNTS)}
@@ -143,7 +156,11 @@ Real              Virtual           Name
         bad = copy.deepcopy(data); bad['segments'][1]['sites'][13][5] = 0               # E2's REX flag lost
         self.assertTrue(any('E2' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['sites'][4][2] = 0                # user site without its CR3
-        self.assertTrue(any('asid' in p for p in run_census.check_problems(bad, sym)))
+        self.assertTrue(any('A_call' in p and 'only in address spaces' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data)                                                       # one address space for J
+        for s in bad['segments'][1]['sites']:
+            if s[2] == 0x108000: s[2] = 0x102000
+        self.assertTrue(any('X_call' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['name'] = 'boot2'
         self.assertTrue(any('no segment' in p for p in run_census.check_problems(bad, sym)))
         self.assertEqual(seg['name'], 'program')

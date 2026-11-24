@@ -2,11 +2,17 @@
 """The computed-exit census reduced to the decision numbers (docs/restructure/el0-sampler-plan.md, chunk 2 and section
 7), from the census plugin's JSON (tests/bench/plugins/indirect.c) of one segment (a benchmark's run 1, an io5 step):
 
-- indirect jmp and call executions at sites with one target and with two (and three, four, five or more), user, kernel
-  and total; each also with the sites keyed by their physical code instead of their address space and address (natemu
-  shares translated code between processes by frame, so an inline cache in shared code sees every process's targets);
-- ret executions, and the return-stack model's hit rate at depths 8, 16 and 32 (a pop of an empty stack is a miss):
-  one stack per vCPU, and split (one per vCPU and mode, so a system call's kernel calls do not overwrite user entries);
+- the D1 input: the share of indirect jmp and call executions that go to their site's main target (top-1) and to its
+  two most frequent targets (top-2), execution-weighted, user, kernel and total. Per address space (a site is its
+  address space and address), and by code: sites merged by their physical code with each target taken relative to the
+  site's own address (target - pc), as natemu's translated code is shared between processes by frame and its
+  position-independent templates would compare page-relative targets. The plugin keeps the first 4 targets a site
+  instance saw and counts the rest as overflow, so top-1 and top-2 are lower bounds, by at most the overflow share
+  (also given). The share at sites that saw exactly one target is kept as a secondary row (it falls with run length:
+  a site going to one target 99.9% of the time is not in it);
+- ret executions, and the return-stack model's hit rate at depths 8, 16 and 32 (a pop of an empty stack is a miss),
+  for user and kernel returns apart: one stack per vCPU, and split (one per vCPU and mode, so a system call's kernel
+  calls do not overwrite user entries);
 - each per 1,000 guest instructions executed (time under TCG means nothing here).
 
     python3 tests/bench/census_report.py CENSUS.json [--window run1] [--json OUT.json]
@@ -45,17 +51,29 @@ def regroup(ss: list[dict], key) -> list[dict]:
     return list(out.values())
 
 
+def top(site: dict, n: int) -> int:
+    """Executions to the site's n most frequent kept targets."""
+    return sum(sorted((c for _, c in site['targets']), reverse=True)[:n])
+
+
 def by_targets(ss: list[dict]) -> dict:
     execs = sum(s['execs'] for s in ss)
+    share = lambda n: n / execs if execs else None
     cls = {c: sum(s['execs'] for s in ss if distinct(s) == c) for c in CLASSES}
-    return {'execs': execs, 'sites': len(ss), 'execs_by_targets': cls,
-            'sites_by_targets': {c: sum(1 for s in ss if distinct(s) == c) for c in CLASSES},
-            'share_1': cls['1'] / execs if execs else None, 'share_2': cls['2'] / execs if execs else None,
-            'share_le2': (cls['1'] + cls['2']) / execs if execs else None}
+    return {'execs': execs, 'sites': len(ss),
+            'top1': share(sum(top(s, 1) for s in ss)), 'top2': share(sum(top(s, 2) for s in ss)),
+            'overflow': share(sum(s['overflow'] for s in ss)),
+            'execs_by_targets': cls, 'sites_by_targets': {c: sum(1 for s in ss if distinct(s) == c) for c in CLASSES},
+            'one_target_sites': share(cls['1']), 'two_target_sites': share(cls['2'])}
 
 
 def physical(s: dict) -> tuple:
     return (s['kind'], s['mode'], s['phys'] or s['pc'])
+
+
+def relative(ss: list[dict]) -> list[dict]:
+    """The sites with each target as its distance from the site's own address."""
+    return [dict(s, targets=[(t - s['pc'], c) for t, c in s['targets']]) for s in ss]
 
 
 def merge_segments(segs: list[dict], name: str) -> dict:
@@ -101,7 +119,9 @@ def reduce(data: dict, window: str) -> dict:
             'insns': insns,
             'indirect': by_targets(ind), 'indirect_call': by_targets([s for s in ind if s['kind'] == 'call']),
             'indirect_jmp': by_targets([s for s in ind if s['kind'] == 'jmp']),
-            'indirect_by_code': by_targets(regroup(ind, physical)),
+            'indirect_by_code': by_targets(regroup(relative(ind), physical)),
+            'indirect_call_by_code': by_targets(regroup(relative([s for s in ind if s['kind'] == 'call']), physical)),
+            'indirect_jmp_by_code': by_targets(regroup(relative([s for s in ind if s['kind'] == 'jmp']), physical)),
             'ret': by_targets([s for s in mine if s['kind'] == 'ret']),
             **{key: {d: {**v, 'hit_rate': v['hit'] / sum(v.values()) if sum(v.values()) else None} for d, v in ras[key].items()}
                for key in RAS},
@@ -112,7 +132,7 @@ def reduce(data: dict, window: str) -> dict:
 
 
 def _pct(x): return '' if x is None else f'{100 * x:.1f}%'
-def _pair(b): return '' if b['share_1'] is None else f"{_pct(b['share_1'])} / {_pct(b['share_2'])}"
+def _pair(b): return '' if b['top1'] is None else f"{_pct(b['top1'])} / {_pct(b['top2'])}"
 def _num(x): return '' if x is None else f'{x:.2f}'
 
 
@@ -121,18 +141,22 @@ def markdown(r: dict, name: str) -> str:
     rows = [('guest instructions', lambda v: f'{v["insns"]:,}'),
             ('indirect jmp + call per 1,000 instructions', lambda v: _num(v['per_1000']['indirect'])),
             ('  of which calls', lambda v: _num(v['per_1000']['indirect_call'])),
-            ('indirect executions at 1-target sites', lambda v: _pct(v['indirect']['share_1'])),
-            ('indirect executions at 2-target sites', lambda v: _pct(v['indirect']['share_2'])),
-            ('  indirect calls at 1 / 2-target sites', lambda v: _pair(v['indirect_call'])),
-            ('  indirect jmps at 1 / 2-target sites', lambda v: _pair(v['indirect_jmp'])),
-            ('indirect executions at 1-target sites, by physical code', lambda v: _pct(v['indirect_by_code']['share_1'])),
-            ('indirect executions at 2-target sites, by physical code', lambda v: _pct(v['indirect_by_code']['share_2'])),
+            ('indirect executions to the main target / top two, per address space', lambda v: _pair(v['indirect'])),
+            ('  calls', lambda v: _pair(v['indirect_call'])),
+            ('  jmps', lambda v: _pair(v['indirect_jmp'])),
+            ('indirect executions to the main target / top two, by code (targets relative to the site)',
+             lambda v: _pair(v['indirect_by_code'])),
+            ('  calls', lambda v: _pair(v['indirect_call_by_code'])),
+            ('  jmps', lambda v: _pair(v['indirect_jmp_by_code'])),
+            ('indirect executions beyond the 4 kept targets (bound on the above)', lambda v: _pct(v['indirect']['overflow'])),
+            ('secondary: indirect executions at sites that saw exactly one target', lambda v: _pct(v['indirect']['one_target_sites'])),
             ('indirect sites (1 / 2 / 3 / 4 / 5+ targets)', lambda v: ' / '.join(str(v['indirect']['sites_by_targets'][c]) for c in CLASSES)),
             ('ret per 1,000 instructions', lambda v: _num(v['per_1000']['ret'])),
             ('direct call per 1,000 instructions', lambda v: _num(v['per_1000']['direct_call']))]
-    rows += [(f'return model hit rate, depth {d}', lambda v, d=d: _pct(v['ras'][d]['hit_rate'])) for d in DEPTHS]
-    rows += [(f'split return model (user, kernel apart), depth {d}', lambda v, d=d: _pct(v['ras_split'][d]['hit_rate']))
-             for d in DEPTHS]
+    rows += [('return hit rate, one stack, depth 8 / 16 / 32',
+              lambda v: ' / '.join(_pct(v['ras'][d]['hit_rate']) for d in DEPTHS)),
+             ('return hit rate, user and kernel stacks apart, depth 8 / 16 / 32',
+              lambda v: ' / '.join(_pct(v['ras_split'][d]['hit_rate']) for d in DEPTHS))]
     out = [f'### Census {name}, segment {r["window"]}', '', '| | user | kernel | total |', '| --- | ---: | ---: | ---: |']
     out += [f'| {label} | ' + ' | '.join(f(m[k]) for k in ('user', 'kernel', 'total')) + ' |' for label, f in rows]
     out += ['', f'CR3 {r["cr3"]}; RIP {r["rip"]}; events {r["events"]}.', '']

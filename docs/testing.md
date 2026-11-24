@@ -357,7 +357,7 @@ Mac, so it takes one core instead of the whole machine, and it is skipped in any
 The computed-exit census (`census` suite, [EL0 sampler plan](restructure/el0-sampler-plan.md) chunk 2) counts the
 benchmarks' indirect calls, indirect jumps and returns under QEMU: a QEMU 11.1.2 built with plugins
 (`artifacts.qemu_plugins`, its own cache entry beside the control group's `qemu-system`) runs the guest with the plugin
-`tests/bench/plugins/indirect.c`, and `tests/bench/census_report.py` reduces its counts to target-count shares, the
+`tests/bench/plugins/indirect.c`, and `tests/bench/census_report.py` reduces its counts to the shares of indirect executions going to each site's main target and top two, the
 return model's hit rates and rates per 1,000 guest instructions (`guest-build-census` and the others; `io5-solo32-census`
 for the i386 toolchain build's steps). They are counts, not timings: each claims a few cores, not the machine. The
 plugin's own check, `census-check`, runs a small program whose every count is known and runs with the family.
