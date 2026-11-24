@@ -617,7 +617,7 @@ impl Boot {
                 }
             };
             if p.pci {
-                bus.add(p.slot, v.pci(p.slot))?;
+                bus.add(p.slot, 0, v.pci(p.slot))?;
             } else {
                 devices.register(p.res.base.into(), 4096, v.device())?;
             }

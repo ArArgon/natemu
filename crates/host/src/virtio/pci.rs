@@ -48,7 +48,7 @@ use crate::{
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{
-        AtomicBool, AtomicU32, AtomicU64,
+        AtomicBool, AtomicU32,
         Ordering::{Relaxed, SeqCst},
     },
 };
@@ -80,7 +80,9 @@ const ISR_CFG: u8 = 3;
 const DEVICE_CFG: u8 = 4;
 /// VIRTIO_MSI_NO_VECTOR (virtio 1.2 4.1.5.1.2).
 pub(super) const NO_VECTOR: u16 = 0xffff;
-/// Command register bits (PCI 3.0 6.2.2): Memory Space, Bus Master, Interrupt Disable.
+/// Command register bits (PCI 3.0 6.2.2): Memory Space (the tests' driver sets it; `Bars::publish` reads it), Bus
+/// Master, Interrupt Disable.
+#[cfg(test)]
 const MEMORY: u16 = 1 << 1;
 const BUS_MASTER: u16 = 1 << 2;
 const INTX_DISABLE: u16 = 1 << 10;
@@ -88,8 +90,8 @@ const INTX_DISABLE: u16 = 1 << 10;
 const INTERRUPT_STATUS: u32 = 1 << 19;
 /// Interrupt Pin 1 = INTA# (PCI 3.0 6.2.4), in bits 15:8 of configuration register 15.
 const INTA: u32 = 1 << 8;
-/// [`Transport::bar`] while memory decoding is off.
-const NO_BAR: u64 = u64::MAX;
+/// The function's one BAR request: BAR0, 32-bit memory.
+const REQUESTS: [(u8, bus::BarKind, u64); 1] = [(0, bus::BarKind::Mem32, BAR_LEN)];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -142,8 +144,8 @@ pub(super) struct Transport {
     msix: Arc<Mutex<MsixConfig>>,
     /// The ISR (`State::interrupt`), stored under the state lock: read by configuration accesses, which never take it.
     isr: AtomicU32,
-    /// BAR0's base while memory decoding is on, else [`NO_BAR`]; stored under the configuration lock.
-    bar: AtomicU64,
+    /// BAR0 as it decodes, published under the configuration lock.
+    bars: bus::Bars,
     /// The command register's Bus Master bit, stored under the configuration lock; MSI-X's gate (`set_gate`): a
     /// message is sent or released only while it is set, else held pending, without the configuration lock on the
     /// delivery path. The device itself keeps processing requests (QEMU blocks DMA instead).
@@ -348,7 +350,7 @@ impl Virtio {
             config: Mutex::new(config),
             msix,
             isr: AtomicU32::new(0),
-            bar: AtomicU64::new(NO_BAR),
+            bars: bus::Bars::new(&REQUESTS),
             bus_master,
             irqs: self.irqs.clone(),
             gsi: self.gsi,
@@ -476,14 +478,8 @@ impl bus::Function for PciFunction {
         let mut config = lock(&t.config);
         // A moved BAR is read back from the configuration below, so the reprogramming list is not needed.
         let _ = config.write_config_register(reg_idx, offset, data);
-        let bar = match config.command() & MEMORY {
-            0 => NO_BAR,
-            // The live register, as hardware decodes it after any write width (the cached `get_bar_addr` follows
-            // only dword writes); bits below the size are ignored, and a size probe's 0xFFFF_8000 lies outside the
-            // window, so the BAR then decodes nothing (PCI 3.0 6.2.5.1).
-            _ => u64::from(config.read_reg(4) & !(BAR_LEN as u32 - 1)),
-        };
-        t.bar.store(bar, SeqCst);
+        // From the live register, masked to the size; a size probe then decodes nothing (`Bars::publish`).
+        t.bars.publish(&config);
         let master = config.command() & BUS_MASTER != 0;
         t.intx_off
             .store(config.command() & INTX_DISABLE != 0, SeqCst);
@@ -495,16 +491,19 @@ impl bus::Function for PciFunction {
         t.follow(&msix);
         t.drive(&msix);
     }
-    fn bar(&self) -> Option<u64> {
-        let bar = self.transport().bar.load(SeqCst);
-        (bar != NO_BAR).then_some(bar)
+    fn bars(&self) -> [Option<bus::Bar>; bus::BARS] {
+        self.transport().bars.get()
     }
-    fn bar_len(&self) -> u64 {
-        BAR_LEN
+    fn bar_requests(&self) -> Vec<(u8, bus::BarKind, u64)> {
+        REQUESTS.to_vec()
     }
-    /// One BAR0 access. An offset or width no structure defines reads zero and ignores a write (the stated leniency:
+    fn assign(&self, index: u8, base: u64) {
+        let t = self.transport();
+        t.bars.assign(&mut lock(&t.config), index, base);
+    }
+    /// One BAR0 access (BAR0 is the function's only BAR, so `_bar` is 0). An offset or width no structure defines reads zero and ignores a write (the stated leniency:
     /// it does not stop the vCPU).
-    fn bar_access(&self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access {
+    fn bar_access(&self, vcpu: usize, _bar: u8, offset: u64, size: u64, value: Option<u64>) -> Access {
         let d = &self.0;
         let done = Access::Completed(0);
         match offset {
@@ -551,7 +550,7 @@ impl bus::Function for PciFunction {
             _ => done,
         }
     }
-    fn bar_poll(&self, vcpu: usize, token: u64) -> Access {
+    fn bar_poll(&self, vcpu: usize, _bar: u8, token: u64) -> Access {
         self.0.poll(vcpu, token)
     }
     fn quiesce(&self) -> crate::Result<bool> {
@@ -588,6 +587,10 @@ mod tests {
         let f = d.pci_with(slot, Arc::new(move |a, v| log.lock().unwrap().push((a, v))));
         Driver { d, f, sent }
     }
+    /// BAR0's decoding base.
+    fn bar0(f: &PciFunction) -> Option<u64> {
+        f.bars()[0].map(|b| b.base)
+    }
     /// Entry i's message: physical destination i, vector 0x40 + i.
     fn message(i: u64) -> (u64, u32) {
         (0xfee0_0000 | i << 12, 0x40 + i as u32)
@@ -603,14 +606,14 @@ mod tests {
             self.cfg_write(4, &bits.to_le_bytes());
         }
         fn read(&self, offset: u64, size: u64) -> u64 {
-            match self.f.bar_access(0, offset, size, None) {
+            match self.f.bar_access(0, 0, offset, size, None) {
                 Access::Completed(v) => v,
                 other => panic!("read {offset:#x}/{size}: {other:?}"),
             }
         }
         fn write(&self, offset: u64, size: u64, value: u64) {
             assert_eq!(
-                self.f.bar_access(0, offset, size, Some(value)),
+                self.f.bar_access(0, 0, offset, size, Some(value)),
                 Access::Completed(0),
                 "write {offset:#x}/{size}"
             );
@@ -732,7 +735,7 @@ mod tests {
             );
             assert_eq!(rig.cfg(0x10), 0xe001_0000, "BAR0: slot 1, 32-bit memory");
             assert_eq!(rig.cfg(4) & 0xffff, 0, "decoding and bus mastering off");
-            assert_eq!(rig.f.bar(), None);
+            assert_eq!(bar0(&rig.f), None);
             let caps = rig.caps();
             let ids: Vec<u8> = caps.iter().map(|c| c.1).collect();
             assert_eq!(ids, [0x11, 9, 9, 9, 9]);
@@ -754,7 +757,7 @@ mod tests {
                 let (offset, length) = (rig.cfg(at + 8), rig.cfg(at + 12));
                 assert_eq!(bar, 0);
                 assert_eq!(length, 0x1000);
-                assert!(u64::from(offset + length) <= rig.f.bar_len());
+                assert!(u64::from(offset + length) <= rig.f.bar_requests()[0].2);
                 if cfg_type == 2 {
                     assert_eq!((len, rig.cfg(at + 16)), (20, 4), "notify_off_multiplier");
                 } else {
@@ -846,7 +849,7 @@ mod tests {
     #[test]
     fn negotiation_reaches_driver_ok_with_exact_field_widths() {
         let rig = rng(true);
-        assert_eq!(rig.f.bar(), Some(0xe001_0000));
+        assert_eq!(bar0(&rig.f), Some(0xe001_0000));
         assert_eq!(rig.read(0x12, 2), 1, "num_queues");
         let s = rig.d.lock();
         assert_eq!(s.status, 15);
@@ -960,7 +963,7 @@ mod tests {
         let old = rig.d.lock().identity(0);
         // A request in flight: the reset waits for it, and its completion meanwhile raises nothing.
         rig.d.lock().in_flight.push(old);
-        let Access::Deferred(token) = rig.f.bar_access(1, 0x14, 1, Some(0)) else {
+        let Access::Deferred(token) = rig.f.bar_access(1, 0, 0x14, 1, Some(0)) else {
             panic!("reset did not wait for the request in flight");
         };
         complete_as(&rig.d, &mut rig.d.lock(), old);
@@ -969,7 +972,7 @@ mod tests {
             s.retire(old);
             rig.d.retire_reset(&mut s);
         }
-        assert_eq!(rig.f.bar_poll(1, token), Access::Completed(0));
+        assert_eq!(rig.f.bar_poll(1, 0, token), Access::Completed(0));
         complete_as(&rig.d, &mut rig.d.lock(), old);
         assert!(rig.sent().is_empty());
         assert_eq!(rig.read(ISR, 1), 0);
@@ -1037,7 +1040,7 @@ mod tests {
             let _held = rig.d.state.lock().unwrap();
             // TX (queue 1) at 0x3004, as a 16-bit write of its index.
             assert_eq!(
-                rig.f.bar_access(0, NOTIFY + 4, 2, Some(1)),
+                rig.f.bar_access(0, 0, NOTIFY + 4, 2, Some(1)),
                 Access::Completed(0)
             );
         }
@@ -1120,18 +1123,18 @@ mod tests {
             block.publish(block.read_request(0));
             assert!(block.kick());
             until("inline call", || block.disk.calls() == 1);
-            let Access::Deferred(reset) = rig.f.bar_access(1, 0x14, 1, Some(0)) else {
+            let Access::Deferred(reset) = rig.f.bar_access(1, 0, 0x14, 1, Some(0)) else {
                 panic!("the reset did not wait for the call");
             };
-            let Access::Deferred(read) = rig.f.bar_access(2, 0x14, 1, None) else {
+            let Access::Deferred(read) = rig.f.bar_access(2, 0, 0x14, 1, None) else {
                 panic!("a read behind the reset did not wait");
             };
-            assert!(matches!(rig.f.bar_poll(1, reset), Access::Deferred(_)));
+            assert!(matches!(rig.f.bar_poll(1, 0, reset), Access::Deferred(_)));
             block.disk.hold(false);
             until("reset retired", || {
-                rig.f.bar_poll(1, reset) == Access::Completed(0)
+                rig.f.bar_poll(1, 0, reset) == Access::Completed(0)
             });
-            assert_eq!(rig.f.bar_poll(2, read), Access::Completed(0));
+            assert_eq!(rig.f.bar_poll(2, 0, read), Access::Completed(0));
         });
         assert_eq!(block.r.lock().generation, 1);
         assert_eq!(block.used_index(), 0);
@@ -1396,7 +1399,7 @@ mod tests {
         let rig = attach(block.r.clone());
         let mut devices = crate::devices::Devices::new(1 << 30);
         let mut b = bus::Bus::new();
-        b.add(1, rig.f.clone()).unwrap();
+        b.add(1, 0, rig.f.clone()).unwrap();
         b.install(&mut devices).unwrap();
         block.disk.hold(true);
         block.run(|block| {
@@ -1447,7 +1450,7 @@ mod tests {
     fn window(rig: &Driver) -> (crate::devices::Devices, impl Fn(u64, u64) -> u64) {
         let mut devices = crate::devices::Devices::new(1 << 30);
         let mut b = bus::Bus::new();
-        b.add(1, rig.f.clone()).unwrap();
+        b.add(1, 0, rig.f.clone()).unwrap();
         b.install(&mut devices).unwrap();
         let base = u64::from(bus::platform::WINDOW.0);
         let direct = devices
@@ -1491,14 +1494,14 @@ mod tests {
             for &(offset, bytes) in writes {
                 rig.cfg_write(offset, bytes);
             }
-            assert_eq!(rig.f.bar(), Some(base));
+            assert_eq!(bar0(&rig.f), Some(base));
             assert_eq!(rig.cfg(0x10), base as u32);
             assert_eq!(read(base + num_queues, 2), 1, "{base:#x}");
             assert_eq!(read(old + num_queues, 2), 0xffff, "{old:#x} after the move");
             old = base;
         }
         rig.command(0);
-        assert_eq!(rig.f.bar(), None);
+        assert_eq!(bar0(&rig.f), None);
         assert_eq!(read(old + num_queues, 2), 0xffff);
     }
     #[test]

@@ -285,6 +285,13 @@ argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--input
         "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
         "--solo-build", "--lock", "{out}/vm.lock"]
 
+# io5-solo with the devices on the PCI transport (run_io5.py --transport pci: virtio-PCI functions, as under QEMU): every disk,
+# network and entropy access then goes through the PCI bus's BAR decoding, which io5-solo (MMIO) never reaches.
+[suite.cases.io5-solo-pci]
+argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",
+        "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}", "--vcpus", "4", "--ram", "8", "--mitigations-off",
+        "--solo-build", "--transport", "pci", "--lock", "{out}/vm.lock"]
+
 # The 32-bit toolchain build (M2 checkpoint B; run_io5.py --i386): in one boot, CPython's configure and make -j4 by the 64-bit
 # userland (steps configure, make; nothing else running) and by a Debian i386 userland debootstrapped into /i386 (steps
 # i386-configure, i386-make), whose python must then give the x86 reference machine's answers. -qemu: the same under QEMU TCG

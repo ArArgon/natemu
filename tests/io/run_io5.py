@@ -4,7 +4,7 @@
 
     python3 tests/io/run_io5.py prepare --inputs DIR
     python3 tests/io/run_io5.py run --backend natemu|qemu|kvm --inputs DIR --out DIR [--fexc FEXC] [--vcpus 4] [--ram 8]
-                                 [--speculation-barriers] [--mitigations-off] [--solo-build] [--i386]
+                                 [--speculation-barriers] [--mitigations-off] [--solo-build] [--i386] [--transport mmio|pci]
 
 prepare downloads and verifies the image (Debian's SHA512SUMS), extracts its /boot kernel and initramfs, and fetches the
 CPython 3.13.18 source (pinned SHA-256; signed by its release manager, checked when pinned).
@@ -45,7 +45,11 @@ the run measures steady state, not allocation; the seconds go in result.json), c
 the launch records `offline_skipped` and runs console_checks instead: kernel and journal error lines from the console and (verify boot) no journal recovery, but NOT e2fsck -fn, the superblock state or the files copied out. --keep-disk keeps the qcow2; `profile` steps need a raw snapshot. --image-format overlay:
 a new, empty 16 GiB qcow2 overlay over INPUTS/disk.raw made per run (`qemu-img create -b -F raw`; past the base's end it
 reads zeros), given as --disk with --set disk.disk0.backing=INPUTS/disk.raw; the same checks as qcow2, plus disk.raw's hash
-unchanged after each launch. Needs qemu-img."""
+unchanged after each launch. Needs qemu-img.
+
+run --transport pci (natemu only; default mmio, natemu's transport without a configuration file): the disk, network and
+entropy devices attach as virtio-PCI functions (`--virtio-transport pci`), as QEMU's do; bench case io5-solo-pci, which
+times the PCI bus's BAR decoding on every device access."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse
 import fcntl
@@ -332,6 +336,7 @@ def command(args, disk, cache, phase='use'):
                 '--serial-stdin', '--disk', disk, '--net', '--rng', '--compile-cache', cache] + \
                (overlay_set(args.inputs / 'disk.raw') if getattr(args, 'image_format', 'raw') == 'overlay' else []) + \
                (['--speculation-barriers'] if args.speculation_barriers else []) + \
+               (['--virtio-transport', 'pci'] if getattr(args, 'transport', 'mmio') == 'pci' else []) + \
                (['--perf-log', args.out / f'perf-{phase}.log'] if args.perf_log else []) + \
                [w for kv in getattr(args, 'natemu_set', []) for w in ('--set', kv)]
     if args.backend == 'kvm':   # the x86 reference machine: Debian's QEMU (the run's snapshot) in the builds' container, as ltp32's reference boots
@@ -460,6 +465,7 @@ def judge(work, phase, code, timed_out, i386=False, reference=False):
 
 
 def run(args):
+    if args.transport == 'pci' and args.backend != 'natemu': raise SystemExit('--transport pci is a natemu option')
     overlay = check_image_format(args.image_format) == 'overlay'
     qcow = args.image_format != 'raw'
     args.out.mkdir(parents=True)
@@ -479,7 +485,7 @@ def run(args):
     (serve / 'check.py').write_text(CHECK)
     clone(args.inputs / PYTHON, serve / 'py.tar.xz')
     server, host = serve_files(serve)
-    result = {'image_format': args.image_format, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
+    result = {'image_format': args.image_format, 'transport': args.transport, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
               'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None,
               'qemu': subprocess.run([QEMU, '--version'], capture_output=True, text=True).stdout.splitlines()[0] if args.backend == 'qemu' else None, 'phases': {}}
@@ -655,6 +661,7 @@ def main():
     r.add_argument('--lock', type=Path, default=VM_LOCK); r.add_argument('--keep-disk', action='store_true')
     r.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default), qcow2 or overlay (see the docstring)')
     r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
+    r.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='natemu virtio transport (see the docstring)')
     f = sub.add_parser('profile', help='one step per boot from a snapshot disk, with the timing log')
     f.add_argument('--snapshot', type=Path, required=True); f.add_argument('--inputs', type=Path, required=True)
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,
