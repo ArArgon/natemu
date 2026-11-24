@@ -218,8 +218,9 @@ Bench case `compat-tls-natemu`; Apple M4; natemu 670fab60; November 23, 2026. Na
 | dword load and store | 0.173 | 0.179 | 0.564 | 0.557 |
 | mixed forms | 0.219 | 0.254 | 0.626 | not run |
 
-Checking the limit costs about 0.4 ns per access. Linux's shape costs nothing measurable on the dword loop and about 15%
-on the mixed loop, beyond the samples' spread. A read-only or expand-down FS or GS segment (no known program uses one) is
+Checking the limit costs about 0.4 ns per access. Through Linux's 4 GiB FS, which compiles to the same
+code as on main (no check, the base added from the loaded segment), the dword loop is level with flat DS and the mixed
+loop about 15% slower, beyond the samples' spread: that is the base addition, not the limit check. A read-only or expand-down FS or GS segment (no known program uses one) is
 checked by natemu's in-VM runtime on every access instead, which is far slower; [the checkpoint C
 findings](restructure/m2-checkpoint-c-findings.md#performance) say by how much.
 

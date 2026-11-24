@@ -169,7 +169,7 @@ numbers.
 page](../benchmarks.md#32-bit-code-fs-and-gs-accesses-and-switching-modes) (Apple M4, natemu 670fab60, November 23,
 2026). In short: through a 4 KiB-limited FS or GS an access costs about 0.56
 ns against 0.17 ns through flat DS, so the inline check adds about 0.4 ns; through Linux's 4 GiB FS the dword loop is
-level with flat DS and the mixed loop about 15% slower. A far transfer between the modes costs at most about 450 ns.
+level with flat DS and the mixed loop about 15% slower (that FS code is main's: the base addition, no check). A far transfer between the modes costs at most about 450 ns.
 Neither can run before this work, so they are first-correct baselines. That a clear "limited" bit costs nothing rests
 on the byte comparison with `main`'s compiler and on the 32-bit numbers above matching `main`'s.
 
