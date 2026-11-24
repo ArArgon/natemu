@@ -554,7 +554,7 @@ and alignment checking (no `--bulk`). Admission pins the whole sequence for the 
 `ldp` and to the element `ldr`), the two forward targets (E and S) and all four sites (load pair, store pair, element load
 and store, read and write intent): `bulk_movs_loop`.
 
-**Built** at 84ddcdef (FEX fork 7e03132 on 39eb0db: the op's description, and `fexc_no_bulk_movs`). The recorder records
+**Built** at 84ddcdef, fexc-replay's bound after it (FEX fork 7e03132 on 39eb0db: the op's description, and `fexc_no_bulk_movs`). The recorder records
 the op's four accesses as sites; admission's `bulk_movs_loop` pins the sequence per width (both back edges, the forward
 targets E and S, all four sites).
 
@@ -597,8 +597,9 @@ both pages' interiors), `movs-cpl3-us-src/dst`, `movs-noncanonical-src/dst`, `mo
 `movs-watch-src/dst`, `movs-ac`, `movs-smc-other/own`, `movs-tso`, `movs-unassigned-src/dst` (an unassigned page as the
 source reads all ones; as the destination it is refused, `unsupported_mmio`, before any effect). Host tests and fixtures
 updated. fexc-replay: `replay.py`'s `only_bulk_movs` bounds the expected difference (NEW's reply holds FexcRepMovs and NEW's
-reply with `--no-bulk-movs` is OLD's, or differs from it only as `only_probes` allows); a request it does not explain
-still counts as a difference.
+reply with `--no-bulk-movs` is OLD's, or differs from it only as `only_probes` allows; `only_bulk_read`: a reply that is
+OLD's byte for byte but for args_read's bulk bit, which NEW reads for every REP MOVSB/MOVSQ it decodes); a request neither
+explains still counts as a difference. At 84ddcdef: 54,998 requests, 0 differences, 138 explained.
 
 **Mutations** (scratch builds of the shim and the admission template together, `k2-repmovs`, reverted): overlap skip
 removed (overlap, alias red); overlap on the linear distance (alias); RCX stepped before the store in both loops
