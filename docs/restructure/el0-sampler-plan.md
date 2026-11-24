@@ -174,7 +174,7 @@ samples. It is byte-oriented, because the guest's simplest writer, `/dev/port`, 
   log, where the stats land). The report gives the measured samples per second, not the requested rate.
 - **Report** `tests/bench/sample_report.py` (refuses to run outside the framework): per case, per vCPU and summed, per
   phase: samples by kind, EL0 samples by place and by role, user and kernel, the top 50 blocks and symbols, the cumulative
-  curve, lost samples. Writes `NAME.report.json`, a Markdown table, and an HTML page (section 5). Unit tests on synthetic
+  curve, lost samples. Writes `NAME.report.json` and a Markdown table. Unit tests on synthetic
   rings and objects (`tests/bench/test_sample_report.py`, run by the `unit` family).
 - **Cases** `guest-<b>-sample` at 1 vCPU for `build`, `hackbench`, `luajit`, `sqlite`, `zstd`, `startup32` and
   `scimark32-sse2`; `guest-build-sample-4` at `--vcpus 4`; `io5-solo32-sample` (its four steps as phases). Placed with the
@@ -257,9 +257,7 @@ fills the decision table. The guest-code review gets one status line pointing at
 
 ## 5. The explainer page
 
-The report's HTML page, one per run, readable without knowing the code: a timeline per vCPU (EL0, resident or host, halted;
-and inside EL0, the roles), stacked; the top functions; and the hottest blocks, each shown as its x86 instructions beside
-their Arm words, every word coloured by role and shaded by its samples, with a sentence on what each role is for.
+Dropped (owner, November 23): the report's JSON and Markdown tables are the output.
 
 ## 6. Owner decision: a run-time switch in the normal resident
 
