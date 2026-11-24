@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tests/system/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2,verw,gather] [--n 100000] [--reps 3]
+    tests/system/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,repmovs,cr2,verw,gather] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -47,6 +47,9 @@
 - `repbulk` (perf chunk 26): REP STOS stored in bulk inside a page keeps the SDM's semantics: every width, alignment, count,
   page crossing and DF; faults mid-string; interrupts at random times; TF; a data breakpoint; UC memory; writes into
   translated code (see `repbulk`).
+- `repmovs` (the bulk REP plan's first cut): REP MOVSB and MOVSQ copied in bulk inside both pages keep the SDM's semantics:
+  every alignment pairing, count, page crossing, overlap and alias against an element-by-element model; faults on either
+  side; interrupts at random times; TF; UC and WT sources (see `repmovs`).
 - `cr2` (perf chunk 26): MOV r64, CR2 translated inline at CPL 0 reads CR2 after #PF deliveries (nested too), MOV to CR2, under
   TF; at CPL 3 it is #GP(0), as is a guest load from the frame alias (see `cr2`).
 - `verw` (perf P2): VERW m16 translated inline at CPL 0 gives the SDM's ZF for every selector class, form and table change,
@@ -1667,6 +1670,251 @@ def repbulk(a, report):
     return failures
 
 
+def movs_model(mem: bytearray, base: int, rsi: int, rdi: int, rcx: int, w: int, df: bool) -> tuple:
+    """The SDM's REP MOVS, element by element over `mem` (bytes from linear `base`): (RSI, RDI, RCX) after it."""
+    step = -w if df else w
+    for _ in range(rcx):
+        mem[rdi - base:rdi - base + w] = mem[rsi - base:rsi - base + w]
+        rsi, rdi = rsi + step, rdi + step
+    return rsi, rdi, 0
+
+
+def repmovs(a, report):
+    """The bulk REP plan's first cut (docs/restructure/bulk-rep-plan.md section 9.2): REP MOVSB and MOVSQ copied in bulk inside
+    both pages keep the SDM's semantics, judged against an element-by-element model of REP MOVS (movs_model) or by the SDM,
+    natemu only, at block sizes default and 1:
+    - `movs-fill-wN` (MOVSB, MOVSQ): source and destination at page offsets 0, 3, 8, 0xff0, 0xff8, 0x808 in eight pairings,
+      counts 0, 1, a round less one, a round, one more, 100 and two pages and 3; DF = 1 twice; 0x67 once: RSI, RDI and RCX
+      and every byte of both areas as the model's. `movs-fs` (CPL 0): an FS source, as the model at FS's base.
+    - `movs-overlap-wN`: RDI - RSI in -17, -16, -15, -1, 0, 1..17, 31, 32, 4095, 4097 bytes, counts 24, 100 and 300: every
+      byte as the model's (the replicated patterns for 1..15, which a round must not form).
+    - `movs-alias`: one frame at two linear pages 0x10000 apart (the second PTE's frame bit cleared), RDI - RSI = 0x10000 + d
+      for d in 1..17: as the model on the frame.
+    - Faults: `movs-src-unmapped` (the source's second page not present: #PF without W at the source element, RCX/RSI/RDI
+      there, every earlier element written), `movs-dst-unmapped`, `movs-dst-readonly` (#PF with W), `movs-both` (both
+      second pages not present: the source is reported), `movs-src-cross-wN` (the source a few bytes before its missing
+      page, the destination at a page start: the source's room alone ends the rounds), `movs-src-readonly` (no fault),
+      `movs-first` (nothing written).
+    - `movs-kicks-wN` and `movs-kicks-wN-misc-off`: 20,000 rounds of a 64 KiB REP MOVS from one of two source buffers (by
+      round) at page offset 0 into a destination at 0x808, under interrupts at random times: at each one taken at the REP,
+      RCX + (RDI - DST) / w is the count, RSI - SRC = RDI - DST, the byte before RDI this round's source's, the one at RDI the
+      last round's, RF set; with fast strings on no boundary taken lies inside both pages' interiors (16 bytes from either
+      pointer's page boundary); with IA32_MISC_ENABLE bit 0 cleared more than half do.
+    - `movs-tf` (#DB after each of 5 MOVSQ iterations), `movs-uc-src` and `movs-wt-src` (UC and WT source pages: every element
+      alone; copied), `movs-linked` (`rep_movs_alternative`'s shape, `rep movsq` then a byte tail, N and 2N times: linker
+      entries do not grow with N)."""
+    asm, failures, runs = ref.assemble, [], []
+    D, RES = 0x400000, 0x3c0000
+    pattern = lambda n, salt: bytes((k * 7 + salt * 13 + (k >> 8) + 1) & 0xff for k in range(n))
+    def record(tag, problems, extra=None):
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, **(extra or {})})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'repmovs {tag}: {problems}')
+    def go(tag, text, block, extra=()):
+        _, out, err = driver(a, text, a.out / 'repmovs' / f'{tag}-{block}', [*([block] if block else []), '--watchdog-ms', '120000', *extra])
+        return out, err
+    def membytes(out, addr, n):
+        got = bytearray()
+        for m in sorted(out['memory'], key=lambda m: int(m['addr'], 0)):
+            lo, data = int(m['addr'], 0), bytes.fromhex(m['data'])
+            if lo <= addr + len(got) < lo + len(data):
+                k = addr + len(got) - lo
+                got += data[k:k + n - len(got)]
+        return bytes(got)
+    def stopped(out, err, want='reached'):
+        if not out: return [f'driver: {err}']
+        return [] if out['stop'] == want else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')}"]
+    def copies(tag, block, items, size, cpl0=False, prelude=''):
+        """items: (rsi, rdi, rcx, w, mode) with mode '' | 'df' | 'a32' | 'fs:BASE'; each in its own `size`-byte area at
+        D + i * size, both pointers absolute. Checks every area and each copy's RSI, RDI, RCX against the model."""
+        body = prelude
+        for i, (rsi, rdi, rcx, w, mode) in enumerate(items):
+            sfx = 'b' if w == 1 else 'q'
+            op = {'a32': '.byte 0x67, 0xf3, ' + ('0xa4' if w == 1 else '0x48, 0xa5'),
+                  'fs': '.byte 0x64, 0xf3, ' + ('0xa4' if w == 1 else '0x48, 0xa5')}.get(mode.split(':')[0], f'rep movs{sfx}')
+            src = rsi - int(mode.split(':')[1], 0) if mode.startswith('fs:') else rsi
+            body += (f'mov rsi, {src:#x}\nmov rdi, {rdi:#x}\nmov rcx, {rcx}\n' + ('std\n' if mode == 'df' else '') + op + '\n'
+                     + ('cld\n' if mode == 'df' else '') + f'mov [{RES + 24 * i:#x}], rsi\nmov [{RES + 24 * i + 8:#x}], rdi\n'
+                     f'mov [{RES + 24 * i + 16:#x}], rcx\n')
+        code = asm(body + 'nop')
+        areas = [pattern(size, i) for i in range(len(items))]
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\n' + ('cpl 0\n' if cpl0 else '')
+                + f'memory {RES:#x} {bytes(24 * len(items)).hex()}\n' + ''.join(f'memory {D + size * i:#x} {areas[i].hex()}\n' for i in range(len(items))))
+        out, err = go(tag, text, block)
+        problems = stopped(out, err)
+        if not problems:
+            for i, (rsi, rdi, rcx, w, mode) in enumerate(items):
+                base, want = D + size * i, bytearray(areas[i])
+                regs = movs_model(want, base, rsi, rdi, rcx, w, mode == 'df')
+                if mode.startswith('fs:'): regs = (regs[0] - int(mode.split(':')[1], 0), *regs[1:])
+                if mode == 'a32': regs = tuple(r & 0xffffffff for r in regs)
+                got_regs = tuple(int.from_bytes(membytes(out, RES + 24 * i + 8 * k, 8), 'little') for k in range(3))
+                if got_regs != regs:
+                    problems.append(f'copy {i} {(hex(rsi), hex(rdi), rcx, w, mode)}: RSI RDI RCX {[hex(r) for r in got_regs]}, want {[hex(r) for r in regs]}')
+                got = membytes(out, base, size)
+                if got != bytes(want):
+                    k = next(k for k in range(size) if k >= len(got) or got[k] != want[k])
+                    problems.append(f'copy {i} {(hex(rsi), hex(rdi), rcx, w, mode)}: byte {base + k:#x} {got[k] if k < len(got) else None}, want {want[k]:#x}')
+        record(tag, problems[:6])
+    for block in (None, 1):
+        for w in (1, 8):
+            r = 16 // w
+            counts = [0, 1, r - 1, r, r + 1, 100, 0x2000 // w + 3]
+            pairs = [(0, 0), (3, 8), (8, 3), (0xff0, 0), (0, 0xff8), (0xff8, 0xff0), (0x808, 0), (0, 0x808)]
+            items = [(D + 0x8000 * i + so, D + 0x8000 * i + 0x4000 + do, n, w, '')
+                     for i, ((so, do), n) in enumerate((p, n) for p in pairs for n in counts)]
+            k = len(items)
+            items += [(D + 0x8000 * k + 0x1800, D + 0x8000 * k + 0x4800, 300 // w + 7, w, 'df'),
+                      (D + 0x8000 * (k + 1) + 0x1004, D + 0x8000 * (k + 1) + 0x5000, 9, w, 'df'),
+                      (D + 0x8000 * (k + 2) + 0x10, D + 0x8000 * (k + 2) + 0x4020, 50, w, 'a32')]
+            copies(f'movs-fill-w{w}-{block}', block, items, 0x8000)
+            # overlap: dst - src = d inside one area of 4 pages, the source at 0x1000 + 40.
+            ds = [-17, -16, -15, -1, 0, *range(1, 18), 31, 32, 4095, 4097]
+            items = [(D + 0x4000 * i + 0x1028, D + 0x4000 * i + 0x1028 + d, n, w, '')
+                     for i, (d, n) in enumerate((d, n) for d in ds for n in (24, 100, 300))]
+            copies(f'movs-overlap-w{w}-{block}', block, items, 0x4000)
+        FSB = 0x10000
+        copies(f'movs-fs-{block}', block, [(D + 0x20, D + 0x2040, 100, 1, f'fs:{FSB:#x}'), (D + 0x4008, D + 0x6000, 64, 8, f'fs:{FSB:#x}')],
+               0x4000, cpl0=True, prelude=f'mov ecx, 0xc0000100\nmov eax, {FSB:#x}\nxor edx, edx\nwrmsr\n')
+        # alias: D + 0x10000 is mapped to D's frame; copies from D + x to D + 0x10000 + x + d (physically d above).
+        A = D + 0x10000
+        for w in (1, 8):
+            body, items = '', [(D + 0x80 + 0xc0 * j, A + 0x80 + 0xc0 * j + d, 40 // w + 3, w) for j, d in enumerate(range(1, 18))]
+            for i, (rsi, rdi, n, _) in enumerate(items):
+                body += f'mov rsi, {rsi:#x}\nmov rdi, {rdi:#x}\nmov rcx, {n}\nrep movs{"b" if w == 1 else "q"}\n'
+            code = asm(body + 'nop')
+            frame = pattern(0x1000, 99)
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {frame.hex()}\nmemory {A:#x} {bytes(0x1000).hex()}\n'
+                    f'identity\nentry {A:#x} 1 clear 0x10000\n')
+            out, err = go(f'movs-alias-w{w}', text, block)
+            problems = stopped(out, err)
+            if not problems:
+                want = bytearray(frame)
+                for rsi, rdi, n, _ in items: movs_model(want, D, rsi, rdi - 0x10000, n, w, False)
+                got = membytes(out, D, 0x1000)
+                if got != bytes(want):
+                    k = next(k for k in range(0x1000) if got[k] != want[k])
+                    problems.append(f'frame byte {D + k:#x} {got[k]:#x}, want {want[k]:#x}')
+            record(f'movs-alias-w{w}-{block}', problems)
+        # faults: source in D's pages 0-1, destination in pages 4-5; the second page of either (or both) changed.
+        for name, w, so, do, n, muts, vec_cr2_err in (
+                ('movs-src-unmapped', 8, 0xf00, 0x4f00, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-dst-unmapped', 1, 0xf03, 0x4f00, 0x300, ['unmap 0x405000'], (14, D + 0x5000, 6)),
+                ('movs-dst-readonly', 8, 0xf00, 0x4f00, 64, ['readonly 0x405000'], (14, D + 0x5000, 7)),
+                ('movs-both', 8, 0xf00, 0x4f00, 64, ['unmap 0x401000', 'unmap 0x405000'], (14, D + 0x1000, 4)),
+                ('movs-first', 1, 0x1000, 0x5000, 0x40, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-src-cross-w8', 8, 0xff8, 0x4000, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-src-cross-w1', 1, 0xff3, 0x4000, 0x100, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-src-readonly', 8, 0xf00, 0x4f00, 64, ['readonly 0x401000'], None)):
+            code, lab = asm(f'mov rsi, {D + so:#x}\nmov rdi, {D + do:#x}\nmov rcx, {n}\nx: rep movs{"b" if w == 1 else "q"}\nnop', labels=True)
+            src, dst = pattern(0x2000, 1), pattern(0x2000, 2)
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {src.hex()}\nmemory {D + 0x4000:#x} {dst.hex()}\n'
+                    + ''.join(m + '\n' for m in muts))
+            out, err = go(name, text, block)
+            problems = stopped(out, err, 'reached' if vec_cr2_err is None else 'guest_fault')
+            if not problems:
+                g = [int(x, 0) for x in out['gpr']]
+                mem = bytearray(src + bytes(0x2000) + dst)
+                if vec_cr2_err is None:
+                    regs, done = movs_model(mem, D, D + so, D + do, n, w, False), n
+                else:
+                    f = [int(x, 0) for x in out['fault']]
+                    if (f[0], f[1], f[2] & 7) != vec_cr2_err or int(out['rip'], 0) != CODE + lab['x']:
+                        problems.append(f'fault {out["fault"]} rip {out["rip"]}, want (vector, CR2, error) {[hex(v) for v in vec_cr2_err]}')
+                    cr2 = vec_cr2_err[1]
+                    done = (cr2 - D - (so if cr2 < D + 0x4000 else do)) // w
+                    regs = movs_model(mem, D, D + so, D + do, done, w, False)[:2] + (n - done,)
+                if (g[6], g[7], g[1]) != regs:
+                    problems.append(f'RSI RDI RCX {[hex(v) for v in (g[6], g[7], g[1])]}, want {[hex(v) for v in regs]}')
+                got = membytes(out, D + 0x4000, 0x1000 if any('0x405000' in m for m in muts) and 'readonly' not in ' '.join(muts) else 0x2000)
+                if got != bytes(mem[0x4000:0x4000 + len(got)]):
+                    problems.append(f'destination: not exactly the {done} elements done')
+            record(f'{name}-{block}', problems)
+    # CPL 0 with the program's own IDT, as repbulk: tf, kicks.
+    TABLES, IDTR, DBG, CNT = 0x300000, 0x300800, 0x300900, 0x300b00
+    SRC, SRC2, DST = 0x500000, 0x520000, 0x540808
+    def idt_text(code, lab, extra_lines=''):
+        at = lambda l: CODE + lab[l]
+        gates = bytearray(16 * 0x41)
+        for v in (1, 0x40):
+            h = at(f'h{v}')
+            gates[16 * v:16 * v + 16] = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(CNT + 0x40 - TABLES - len(tables))
+        return (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nsvr 0x1ff\nmemory {TABLES:#x} {tables.hex()}\n'
+                f'region 0x3e0000 0x10000\n{extra_lines}')
+    setup = 'lidt [0x300800]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n'
+    h1 = (f'h1:\npush rax\npush rbx\nmov rbx, [{CNT:#x}]\ncmp rbx, 8\njae 2f\nshl rbx, 6\nmov rax, [rsp + 16]\nmov [{DBG:#x} + rbx], rax\n'
+          f'mov [{DBG + 8:#x} + rbx], rcx\nmov [{DBG + 16:#x} + rbx], rsi\n2: inc qword ptr [{CNT:#x}]\nxor eax, eax\nmov dr6, rax\n'
+          'pop rbx\npop rax\niretq\n')
+    def q(out, addr): return int.from_bytes(membytes(out, addr, 8), 'little')
+    for block in (None, 1):
+        code, lab = asm(setup + f'mov rsi, {SRC:#x}\nmov rdi, {DST:#x}\nmov ecx, 5\npushfq\nor qword ptr [rsp], 0x100\npopfq\nx: rep movsq\n'
+                        'y: pushfq\nand qword ptr [rsp], -0x101\npopfq\njmp done\n' + h1 + 'h64:\niretq\ndone: nop', labels=True)
+        out, err = go('movs-tf', idt_text(code, lab, f'memory {SRC:#x} {pattern(64, 3).hex()}\nregion {DST & ~0xfff:#x} 0x2000\n'), block)
+        problems = stopped(out, err)
+        if not problems:
+            got = [(q(out, DBG + 64 * k), q(out, DBG + 64 * k + 8), q(out, DBG + 64 * k + 16)) for k in range(5)]
+            want = [(CODE + lab['x'], 4 - k, SRC + 8 * (k + 1)) for k in range(4)] + [(CODE + lab['y'], 0, SRC + 40)]
+            if got != want: problems.append(f'#DB (RIP, RCX, RSI) {[(hex(r), c, hex(s)) for r, c, s in got]}')
+        record(f'movs-tf-{block}', problems)
+    R = 20_000
+    def kicks(w, block, misc_off):
+        n = 65536 // w
+        h64 = (f'h64:\npush rax\npush rbx\npush rdx\ninc qword ptr [{CNT:#x}]\nlea rbx, [rip + x]\ncmp rbx, [rsp + 24]\njne 9f\n'
+               f'inc qword ptr [{CNT + 8:#x}]\nmov rbx, rdi\nsub rbx, {DST:#x}\nshr rbx, {w.bit_length() - 1}\nadd rbx, rcx\ncmp rbx, {n}\njne 81f\n'
+               f'mov rbx, rdi\nsub rbx, {DST:#x}\nmov rdx, rsi\nsub rdx, r12\ncmp rbx, rdx\njne 81f\n'
+               f'cmp rdi, {DST:#x}\nje 3f\nmov dl, [rsi - 1]\ncmp byte ptr [rdi - 1], dl\njne 82f\ntest qword ptr [rsp + 40], 0x10000\njz 83f\n'
+               f'mov rbx, rdi\nand ebx, 4095\ncmp ebx, 16\njb 3f\ncmp ebx, 4080\njae 3f\nmov rbx, rsi\nand ebx, 4095\ncmp ebx, 16\njb 3f\n'
+               f'cmp ebx, 4080\njae 3f\ninc qword ptr [{CNT + 24:#x}]\n'
+               f'3: test rcx, rcx\njz 9f\ntest r15, r15\njz 9f\nmov rbx, rsi\nsub rbx, r12\nadd rbx, r13\nmov dl, [rbx]\ncmp byte ptr [rdi], dl\nje 9f\n'
+               f'jmp 8f\n81: inc qword ptr [{CNT + 32:#x}]\njmp 8f\n82: inc qword ptr [{CNT + 40:#x}]\njmp 8f\n83: inc qword ptr [{CNT + 48:#x}]\n'
+               f'8: inc qword ptr [{CNT + 16:#x}]\n9: push rcx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rcx\npop rdx\npop rbx\npop rax\niretq\n')
+        off = 'mov ecx, 0x1a0\nrdmsr\nand eax, -2\nwrmsr\n' if misc_off else ''
+        # r12 this round's source, r13 the last round's (two buffers whose every byte differs).
+        code, lab = asm(setup + off + f'sti\nxor r15d, r15d\nmov r12, {SRC2:#x}\nmov r13, {SRC:#x}\n1: xchg r12, r13\nmov rsi, r12\nmov rdi, {DST:#x}\nmov ecx, {n}\n'
+                        f'x: rep movs{"b" if w == 1 else "q"}\ninc r15\ncmp r15, {R}\njb 1b\ncli\njmp done\n' + h1 + h64 + 'done: nop', labels=True)
+        tag = f'movs-kicks-w{w}{"-misc-off" if misc_off else ""}'
+        s1 = pattern(0x10000, 5)
+        s2 = bytes(b ^ 0x5a for b in s1)
+        out, err = go(tag, idt_text(code, lab, f'memory {SRC:#x} {s1.hex()}\nmemory {SRC2:#x} {s2.hex()}\nregion {DST & ~0xfff:#x} 0x11000\n'), block,
+                      ['--kick-vcpu', '0', '--kick-events', '0x40', '--kicks', '3000', '--kick-every-us', '20', '--kick-jitter-us', '200'])
+        problems = stopped(out, err)
+        taken = {}
+        if out:
+            taken = {k: q(out, CNT + 8 * i) for i, k in enumerate(('all', 'at_rep', 'bad', 'mid_page', 'bad_count', 'bad_before', 'bad_rf'))}
+            at_rep, mid = taken['at_rep'], taken['mid_page']
+            grouping = mid > at_rep // 2 if misc_off else mid == 0
+            if not problems and (int(out['gpr'][15], 0) != R or taken['bad'] or at_rep < 50 or not grouping):
+                problems.append(f"r15 {out['gpr'][15]} taken {taken}")
+        record(f'{tag}-{block}', problems, {'taken': taken})
+    for block in (None, 1):
+        for w in (1, 8): kicks(w, block, False)
+    for w in (1, 8): kicks(w, None, True)
+    # UC and WT source pages (PCD|PWT: PAT entry 3, UC; PWT: entry 1 made WT): copied, every element run alone.
+    for name, prelude, bits in (('movs-uc-src', '', 0x18), ('movs-wt-src', 'mov ecx, 0x277\nmov eax, 0x00050406\nmov edx, 0x00070406\nwrmsr\n', 0x8)):
+        code = asm(prelude + f'mov rsi, {D:#x}\nmov rdi, {D + 0x4000:#x}\nmov ecx, 512\nrep movsq\nnop')
+        src = pattern(0x1000, 7)
+        for block in (None, 1):
+            out, err = go(name, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nmemory {D:#x} {src.hex()}\n'
+                          f'memory {D + 0x4000:#x} {bytes(0x1000).hex()}\nentry {D:#x} 1 set {bits:#x}\n', block)
+            problems = stopped(out, err)
+            if not problems:
+                steps = out['stats'].get('k1', {}).get('uncached', {}).get('steps', 0)
+                if membytes(out, D + 0x4000, 0x1000) != src or (name == 'movs-uc-src' and steps < 512):
+                    problems.append(f'copy differs or uncached steps {steps}')
+            record(f'{name}-{block}', problems)
+    code = asm('lea rbx, [rip + cp]\n1: mov esi, 0x400000\nmov edi, 0x480000\ncall rbx\ndec r8\njnz 1b\njmp done\n'
+               'cp: mov ecx, 12\nrep movsq\nmov ecx, 4\nrep movsb\nret\ndone: nop')
+    entries = {}
+    for n in (2000, 4000):
+        out, err = go(f'movs-linked-{n}', f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n})}\ncode {code.hex()}\nregion 0x3e0000 0x10000\nregion {D:#x} 0x100000\n', None)
+        entries[n] = out and out['stop'] == 'reached' and out['stats']['linker']
+    record('movs-linked', [] if entries[2000] and entries[2000] == entries[4000] else [f'linker entries {entries}'], {'linker': entries})
+    report['repmovs'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def cr2(a, report):
     """Perf chunk 26: MOV r64, CR2 at CPL 0 is translated inline (a load of the guest-state field the resident writes at every
     entry into a CPL-0 block). Judged by the SDM (MOV from CR: Vol.2; CR2: Vol.3 2.5, 4.7, 7.15 #PF), natemu only, at block
@@ -2538,7 +2786,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw', 'gather'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'repmovs', 'cr2', 'verw', 'gather'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cost-rows', type=lambda s: s.split(','), default=None, help='cost: only these rows')
@@ -2562,6 +2810,7 @@ def main():
     if 'stifirst' in a.only: failures += stifirst(a, report)
     if 'stmxcsr' in a.only: failures += stmxcsr(a, report)
     if 'repbulk' in a.only: failures += repbulk(a, report)
+    if 'repmovs' in a.only: failures += repmovs(a, report)
     if 'cr2' in a.only: failures += cr2(a, report)
     if 'verw' in a.only: failures += verw(a, report)
     if 'gather' in a.only: failures += gather(a, report)

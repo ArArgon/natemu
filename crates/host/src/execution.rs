@@ -6357,10 +6357,10 @@ mod tests {
                 && block(&mut c, &[0x66, 0xf3, 0xab]).bulk
                 && block(&mut c, &[0xf3, 0xaa]).bulk
         );
-        // 0x67 (EDI/ECX), MOVS, and other code: no loop.
+        // 0x67 (EDI/ECX), MOVSD (no bulk REP plan loop), and other code: no loop.
         for code in [
             &[0x67, 0xf3, 0x48, 0xab][..],
-            &[0xf3, 0x48, 0xa5],
+            &[0xf3, 0xa5],
             &[0x48, 0xab, 0xc3],
             &[0x90, 0xc3],
         ] {
@@ -6380,6 +6380,86 @@ mod tests {
         assert!(!block(&mut c, &stos).bulk);
         let e = c
             .answered(&Answer::Object(o), &stos, 0x1000, &mut (), None, None)
+            .err()
+            .unwrap();
+        assert!(e.contains("--bulk"), "{e}");
+    }
+
+    /// Bulk REP plan (9.1): with `--bulk`, REP MOVSB and MOVSQ in 64-bit code get the bulk loop, with two sites: the `ldp` a
+    /// 16-byte load-pair site with read intent on RSI's register, the `stp` the store pair after it on RDI's. None for MOVSW,
+    /// MOVSD, 0x67, FS or GS, F2 (REP for MOVS too, not this cut), F2 and F3 both, no REP, 32-bit code, or without the flag;
+    /// a bulk object is refused for a request without it. (DS, ES, CS and SS prefixes do nothing in 64-bit mode: the loop.)
+    #[test]
+    fn bulk_rep_movs_only_when_asked() {
+        use natemu_abi::code_object::{self as object, Header, Site};
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.shape = true;
+        let block = |c: &mut super::Compiler, code: &[u8]| match c
+            .compile(code, 0x1000, false, &mut ())
+            .unwrap()
+        {
+            Code::Block(b) => b,
+            _ => panic!("{code:02x?}"),
+        };
+        // (F2 MOVS is not translated as a block at all: no loop either.)
+        let bulk = |c: &mut super::Compiler, code: &[u8]| {
+            matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::Block(b) if b.bulk)
+        };
+        let answer_of = |c: &super::Compiler, code: &[u8]| {
+            let Answer::Object(o) = c.answers.find(code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else {
+                panic!()
+            };
+            o
+        };
+        let sites = |o: &[u8]| -> Vec<Site> {
+            let h: Header = unsafe { std::ptr::read_unaligned(o.as_ptr().cast()) };
+            (0..h.sites_count as usize)
+                .map(|i| unsafe {
+                    std::ptr::read_unaligned(o[h.sites_offset as usize + i * std::mem::size_of::<Site>()..].as_ptr().cast())
+                })
+                .collect()
+        };
+        let (movsb, movsq) = ([0xf3, 0xa4], [0xf3, 0x48, 0xa5]);
+        c.bulk = true;
+        for code in [&movsb[..], &movsq, &[0x66, 0xf3, 0x48, 0xa5], &[0x3e, 0xf3, 0xa4], &[0xf3, 0x41, 0xa4]] {
+            assert!(block(&mut c, code).bulk, "{code:02x?}");
+            let ss = sites(&answer_of(&c, code));
+            let i = ss
+                .iter()
+                .position(|s| s.kind == object::kind::LOAD_PAIR)
+                .unwrap_or_else(|| panic!("{code:02x?}: no load-pair site"));
+            let (l, st) = (ss[i], ss[i + 1]);
+            assert!(
+                (l.width, l.intent, l.data_class) == (16, object::INTENT_READ, object::CLASS_GPR)
+                    && (st.kind, st.width, st.intent) == (object::kind::STORE_PAIR, 16, object::INTENT_WRITE)
+                    && st.native_offset == l.native_offset + 4
+                    && (l.base_reg, st.base_reg) == (10, 11),
+                "{code:02x?}"
+            );
+        }
+        for code in [
+            &[0x66, 0xf3, 0xa5][..],
+            &[0xf3, 0xa5],
+            &[0x67, 0xf3, 0xa4],
+            &[0x64, 0xf3, 0xa4],
+            &[0x65, 0xf3, 0x48, 0xa5],
+            &[0xf2, 0xa4],
+            &[0xf2, 0xf3, 0xa4],
+            &[0xa4, 0xc3],
+        ] {
+            assert!(!bulk(&mut c, code), "{code:02x?}");
+        }
+        c.bits32 = true;
+        assert!(!bulk(&mut c, &[0xf3, 0xa4]));
+        c.bits32 = false;
+        let o = answer_of(&c, &movsq);
+        c.bulk = false;
+        assert!(!block(&mut c, &movsb).bulk && !block(&mut c, &movsq).bulk);
+        let e = c
+            .answered(&Answer::Object(o), &movsq, 0x1000, &mut (), None, None)
             .err()
             .unwrap();
         assert!(e.contains("--bulk"), "{e}");

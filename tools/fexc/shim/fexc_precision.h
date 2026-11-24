@@ -25,7 +25,7 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO: case OP_ATOMICSWAP: return true;
   // Perf chunk 26: a bulk REP STOS's stores (a site); it also writes RCX's and RDI's static registers itself, so as for every
   // access no value is coalesced into a static register across it, and the incoming flags stay live there.
-  case OP_FEXCREPSTOS: return true;
+  case OP_FEXCREPSTOS: case OP_FEXCREPMOVS: return true;   // (bulk REP plan: REP MOVS too, and RSI's static register)
   // LOCK read-modify-writes (I3)
   case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND: case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR:
   case OP_ATOMICFETCHXOR: case OP_ATOMICFETCHNEG: case OP_CAS: case OP_CASPAIR: return true;
@@ -1195,7 +1195,7 @@ inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
   case OP_RMIFNZCV: case OP_CONDADDNZCV: case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS:
   case OP_ADCNZCV: case OP_SBBNZCV: case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ:
   case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS: case OP_FCMP: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
-  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCX87SVC:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCREPMOVS: case OP_FEXCX87SVC:
   case OP_FEXCFMACHECK:
     return true;
   default: return false;

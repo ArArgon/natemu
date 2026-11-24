@@ -764,6 +764,67 @@ DEF_OP(FexcRepStos) {
   (void)cbnz(X, TMP2, &Loop);
   (void)Bind(&Skip);
 }
+// Bulk REP plan (docs/restructure/bulk-rep-plan.md, first cut): REP MOVSB and MOVSQ in bulk inside both pages (FEX's
+// `FexcRepMovs`, before the one-element pass; only with `--bulk`, in 64-bit addressing, F3 alone, no FS/GS). With RCX
+// holding n >= 1 whole 16-byte rounds, for MOVSQ RSI and RDI 8-aligned (each 8-byte half of a pair then one element,
+// single-copy atomic), RDI - RSI outside [1, 15] modulo 4096 (a round's load would precede an earlier element's store into
+// its own bytes; the page offset is the same in every mapping of a frame, so this covers aliases), the fast-string bit set
+// and DF = 0: min(n, the rounds before RDI's page end, those before RSI's) rounds of `ldp` from RSI then `stp` to RDI, RSI and
+// RDI + 16 and RCX - 16 / w after each store. At either access RCX/RSI/RDI are an iteration boundary's and no element after
+// it is written; the source is read before the destination is written, as each element is. The cheapest test that most often
+// fails is first: a declined copy pays the words before its skip on every element. No flags change; only x0-x3, RCX, RSI
+// and RDI are written. Admission pins these words (structure.rs, `bulk_movs_loop`).
+//   lsr x1, x7, #(4 - log2 w); cbz x1, S; [w = 8: orr x0, x10, x11; and x0, x0, #7; cbnz x0, S;]
+//   sub x0, x11, x10; sub x0, x0, #1; and x0, x0, #0xfff; sub x0, x0, #15; tbnz x0, #63, S;
+//   ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S;
+//   and x0, x11, #0xfff; movz w2, #0x1000; sub x0, x2, x0; lsr x0, x0, #4; sub x2, x1, x0; and x2, x2, x2, asr #63; add x1, x0, x2;
+//   and x0, x10, #0xfff; movz w2, #0x1000; sub x0, x2, x0; lsr x0, x0, #4; sub x2, x1, x0; and x2, x2, x2, asr #63; add x1, x0, x2;
+//   cbz x1, S; L: ldp x2, x3, [x10]; stp x2, x3, [x11]; add x10, x10, #16; add x11, x11, #16; sub x7, x7, #16/w; sub x1, x1, #1;
+//   cbnz x1, L; S:
+DEF_OP(FexcRepMovs) {
+  const auto Op = IROp->C<IR::IROp_FexcRepMovs>();
+  const uint32_t W = Op->Width;
+  const auto RCX = StaticRegisters[X86State::REG_RCX].X(), RSI = StaticRegisters[X86State::REG_RSI].X(),
+             RDI = StaticRegisters[X86State::REG_RDI].X();
+  constexpr auto X = ARMEmitter::Size::i64Bit;
+  ARMEmitter::ForwardLabel Skip;
+  ARMEmitter::BackwardLabel Loop;
+  lsr(X, TMP2, RCX, 4 - FEXCore::ilog2(W));
+  (void)cbz(X, TMP2, &Skip);
+  if (W > 1) {
+    orr(X, TMP1, RSI, RDI);
+    and_(X, TMP1, TMP1, 7);
+    (void)cbnz(X, TMP1, &Skip);
+  }
+  sub(X, TMP1, RDI, RSI);
+  sub(X, TMP1, TMP1, 1);
+  and_(X, TMP1, TMP1, 0xfff);
+  sub(X, TMP1, TMP1, 15);
+  (void)tbnz(TMP1, 63, &Skip);
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[FEXC_FAST_STRINGS_LOC]));
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &Skip);
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[X86State::RFLAG_DF_RAW_LOC]));
+  (void)tbnz(TMP1, 7, &Skip);
+  for (const auto P : {RDI, RSI}) {   // x1 = min(x1, the rounds before P's page end)
+    and_(X, TMP1, P, 0xfff);
+    movz(ARMEmitter::Size::i32Bit, TMP3, 0x1000);
+    sub(X, TMP1, TMP3, TMP1);
+    lsr(X, TMP1, TMP1, 4);
+    sub(X, TMP3, TMP2, TMP1);
+    and_(X, TMP3, TMP3, TMP3, ARMEmitter::ShiftType::ASR, 63);
+    add(X, TMP2, TMP1, TMP3);
+  }
+  (void)cbz(X, TMP2, &Skip);
+  (void)Bind(&Loop);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, RSI);
+  stp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, RDI);
+  add(X, RSI, RSI, 16);
+  add(X, RDI, RDI, 16);
+  sub(X, RCX, RCX, 16 / W);
+  sub(X, TMP2, TMP2, 1);
+  (void)cbnz(X, TMP2, &Loop);
+  (void)Bind(&Skip);
+}
 // DPPS's first add level, between VFAddV's two `faddp` (SDM DPPS: "Exceptions are determined separately for each add and
 // multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
 // exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.
@@ -1312,6 +1373,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     S.kind = FEXC_SITE_ATOMIC; S.width = uint8_t(2 * IR::OpSizeToSize(IROp->ElementSize)); S.intent = 1;
     break;
   case IROps::OP_FEXCREPSTOS:   // perf chunk 26: the bulk loop's `stp` (found below), at an iteration boundary
+  case IROps::OP_FEXCREPMOVS:   // bulk REP plan: the same, and its `ldp` (the word before the `stp`, recorded below)
     S.kind = FEXC_SITE_STORE_PAIR; S.width = 16; S.intent = 1; S.data_class = 0;
     break;
   case IROps::OP_ATOMICFETCHNEG: {
@@ -1373,7 +1435,18 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   // (Perf chunk 26: a bulk REP STOS's stores leave RCX/RDI at an iteration boundary, so the one-element pass after them still
   // starts from the state at the instruction: they do not count as committed effects.)
   if ((S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
-       S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) && IROp->Op != IROps::OP_FEXCREPSTOS) FexcStoreSeen = true;
+       S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) && IROp->Op != IROps::OP_FEXCREPSTOS &&
+      IROp->Op != IROps::OP_FEXCREPMOVS) FexcStoreSeen = true;
+  // Bulk REP plan (4.2): a bulk REP MOVS loop has two accesses in one op: the `stp` (S) and, the word before it, the `ldp` of
+  // the round's 16 source bytes, a load-pair site with read intent on RSI's register (recorded first: sites are in native order).
+  if (IROp->Op == IROps::OP_FEXCREPMOVS && S.located) {
+    uint32_t w;
+    std::memcpy(&w, CodeData.BlockBegin + S.native_offset - 4, 4);
+    FexcSiteInfo L = S;
+    L.kind = FEXC_SITE_LOAD_PAIR; L.intent = 0; L.native_offset = S.native_offset - 4;
+    L.base_reg = uint8_t((w >> 5) & 31); L.data_reg[0] = uint8_t(w & 31); L.data_reg[1] = uint8_t((w >> 10) & 31);
+    fexc_sites.push_back(L);
+  }
   // M2 task 4 (fexc_hook.h): the store of a FISTP m64 that stores its block's FILD m64's integer.
   if (S.kind == FEXC_SITE_STORE && S.width == 8 && S.data_class == 0 && fexc_x87_int_pair.count(Entry + FexcGuest)) S.guest_offset2 = FEXC_X87_INT64;
   FexcX87SiteCheck();

@@ -626,6 +626,69 @@ fn bulk_words(w: u32) -> Vec<(u32, Bulk)> {
     ]);
     v
 }
+/// Bulk REP plan (first cut): the element width of a REP MOVSB or MOVSQ that fexc may give a bulk loop: F3 among the legacy
+/// prefixes, no F2, 67, FS or GS (64-bit mode ignores the other segment prefixes, and FEX's decoder records none of them);
+/// A4, or REX.W A5. `None` for anything else.
+fn x86_rep_movs(insn: &[u8]) -> Option<u32> {
+    let (o, rex) = crate::system::opcode_at(insn);
+    let prefixes = &insn[..o];
+    if !prefixes.contains(&0xf3)
+        || prefixes.iter().any(|p| matches!(p, 0xf2 | 0x67 | 0x64 | 0x65))
+        || o + 1 != insn.len()
+    {
+        return None;
+    }
+    match insn[o] {
+        0xa4 => Some(1),
+        0xa5 if rex & 8 != 0 => Some(8),
+        _ => None,
+    }
+}
+/// Bulk REP plan: FexcRepMovs's words for `w`-byte elements (RCX x7, RSI x10, RDI x11, x28 the state frame; see
+/// `fexc_sites.inc`). The `ldp` is 7 words from the end, the `stp` 6.
+fn bulk_movs_words(w: u32) -> Vec<(u32, Bulk)> {
+    use Bulk::*;
+    let s = 4 - w.trailing_zeros();
+    let mut v = vec![(0xd340_fce1 | s << 16, Word), (0xb400_0001, Skip)]; // lsr x1, x7, #s; cbz x1, S
+    if w > 1 {
+        // orr x0, x10, x11; and x0, x0, #7; cbnz x0, S
+        v.extend([(0xaa0b_0140, Word), (0x9240_0800, Word), (0xb500_0000, Skip)]);
+    }
+    v.extend([
+        (0xcb0a_0160, Word),                                       // sub x0, x11, x10
+        (0xd100_0400, Word),                                       // sub x0, x0, #1
+        (0x9240_2c00, Word),                                       // and x0, x0, #0xfff
+        (0xd100_3c00, Word),                                       // sub x0, x0, #15
+        (0xb7f8_0000, Skip),                                       // tbnz x0, #63, S
+        (0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5, Word), // ldrb w0, [x28, #fast_strings]
+        (0x3400_0000, Skip),                                       // cbz w0, S
+        (0x3940_0000 | frame::DF << 10 | 28 << 5, Word),           // ldrb w0, [x28, #df]
+        (0x3638_0000 | 1 << 24, Skip),                             // tbnz w0, #7, S
+    ]);
+    for and in [0x9240_2d60, 0x9240_2d40] {
+        // and x0, x11 | x10, #0xfff; then x1 = min(x1, that page's rounds)
+        v.extend([
+            (and, Word),
+            (0x5282_0002, Word), // movz w2, #0x1000
+            (0xcb00_0040, Word), // sub x0, x2, x0
+            (0xd344_fc00, Word), // lsr x0, x0, #4
+            (0xcb00_0022, Word), // sub x2, x1, x0
+            (0x8a82_fc42, Word), // and x2, x2, x2, asr #63
+            (0x8b02_0001, Word), // add x1, x0, x2
+        ]);
+    }
+    v.extend([
+        (0xb400_0001, Skip),                  // cbz x1, S
+        (0xa940_0d42, Word),                  // ldp x2, x3, [x10]
+        (0xa900_0d62, Word),                  // stp x2, x3, [x11]
+        (0x9100_414a, Word),                  // add x10, x10, #16
+        (0x9100_416b, Word),                  // add x11, x11, #16
+        (0xd100_00e7 | (16 / w) << 10, Word), // sub x7, x7, #16/w
+        (0xd100_0421, Word),                  // sub x1, x1, #1
+        (0xb500_0001, Back),                  // cbnz x1, L (the ldp)
+    ]);
+    v
+}
 /// How a stub is reached: the words `start..=end` end in its branch; `cond` is the normalized conditional branch
 /// (the far form `!cond +8; b stub` normalized to `cond`), `None` for a plain `b`.
 use natemu_abi::execution::RUN_END;
@@ -1083,7 +1146,7 @@ impl<'a> Verifier<'a> {
         }
         v.branches.extend(returns);
         for (at, t) in back {
-            let words = v.bulk_loop(at, t).ok_or(format!(
+            let words = v.bulk_loop(at, t).or_else(|| v.bulk_movs_loop(at, t)).ok_or(format!(
                 "branch at {at:#x} to {t:#x}: not forward to an instruction of the code region"
             ))?;
             v.bulk.push(words);
@@ -1161,6 +1224,56 @@ impl<'a> Verifier<'a> {
             && inside
             && sealed
             && site.is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.guest_offset == g))
+        .then_some(start..end)
+    }
+
+    /// Bulk REP plan (first cut, section 6): the backward branch at `at` to `to` is the back edge of a bulk REP MOVS loop
+    /// (fexc_sites.inc `FexcRepMovs`) in a 64-bit object: the words before and after it are exactly that sequence for the
+    /// width of the REP MOVSB/MOVSQ holding them ([`x86_rep_movs`]), its `ldp` that instruction's recorded load-pair site of
+    /// 16 bytes with read intent and its `stp` the store-pair site, the back edge to the `ldp`, and no branch from outside
+    /// enters it. Returns the sequence's native range. So x1 is min(RCX's rounds, the rounds before RDI's page end, those
+    /// before RSI's) <= 256, decremented once a round and written by nothing else: the loop ends, every `ldp` stays inside
+    /// RSI's page and every `stp` inside RDI's (no split check), and the overlap, alignment, fast-string and DF skips are
+    /// there, word for word.
+    fn bulk_movs_loop(&self, at: u32, to: u32) -> Option<Range<u32>> {
+        if self.c.bits32 {
+            return None;
+        }
+        let (g, _) = self.instruction(at)?;
+        let words = bulk_movs_words(x86_rep_movs(self.guest_insn(g))?);
+        let n = words.len() as u32 * 4;
+        let start = (at + 4).checked_sub(n).filter(|&s| s >= ENTRY_OFFSET)?;
+        let (end, ldp) = (start + n, start + n - 28);
+        let exact = words.iter().enumerate().all(|(i, &(w, to))| {
+            let o = start + 4 * i as u32;
+            self.word(o)
+                == match to {
+                    Bulk::Word => w,
+                    Bulk::Skip => with_offset(w, end as i64 - o as i64),
+                    Bulk::Back => with_offset(w, ldp as i64 - o as i64),
+                }
+        });
+        let site = |o: u32| {
+            self.c
+                .accesses
+                .binary_search_by_key(&o, |s| s.native_offset)
+                .ok()
+                .map(|i| &self.c.accesses[i])
+                .filter(|s| s.guest_offset == g && s.width == 16 && s.data_class == object::CLASS_GPR)
+        };
+        let inside = (start..end)
+            .step_by(4)
+            .all(|o| self.instruction(o).is_some_and(|(h, _)| h == g));
+        let sealed = self
+            .branches
+            .iter()
+            .all(|&(src, t)| !(start < t && t < end) && !(start <= src && src < end && t != end));
+        (exact
+            && to == ldp
+            && inside
+            && sealed
+            && site(ldp).is_some_and(|s| s.kind == object::kind::LOAD_PAIR && s.intent == object::INTENT_READ)
+            && site(ldp + 4).is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.intent == object::INTENT_WRITE))
         .then_some(start..end)
     }
 
@@ -4021,6 +4134,77 @@ mod tests {
         );
         let fast = find(STOSQ, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5) + 4;
         validated(STOSQ, fast, 0x3400_0260, MOV_X0, Some("not forward"));
+    }
+    /// Bulk REP plan (9.1): a bulk REP MOVS loop (fexc `--bulk`: `mov ecx, 64; rep movsq`, `mov ecx, 256; rep movsb`) is
+    /// admitted with and without the code shape; its back edge only with every word of FexcRepMovs exact for the
+    /// instruction's width and both its sites recorded as they are.
+    #[test]
+    fn bulk_rep_movs_loops_are_pinned() {
+        const MOVSQ: (&[u8], &[u8]) = fixture!("rep-movsq-bulk");
+        const MOVSB: (&[u8], &[u8]) = fixture!("rep-movsb-bulk");
+        let find = |f: (&[u8], &[u8]), word: u32| -> u32 {
+            let h: Header = super::super::record(f.0, 0);
+            let code = &f.0[h.code_offset as usize..][..h.code_region_end as usize];
+            (0..code.len() as u32)
+                .step_by(4)
+                .find(|&o| code[o as usize..o as usize + 4] == word.to_le_bytes())
+                .expect("word")
+        };
+        let nop = |f, at| validated(f, at, u32::from_le_bytes(f.0[at as usize + 128..][..4].try_into().unwrap()), MOV_X0, Some("not forward"));
+        for (f, w) in [(MOVSQ, 8u32), (MOVSB, 1)] {
+            admit(f).unwrap();
+            admit_with(f, false).unwrap();
+            let h: Header = super::super::record(f.0, 0);
+            assert_eq!(h.code_offset, 128);
+            let ldp = find(f, 0xa940_0d42);
+            let lsr = find(f, 0xd340_fce1 | (4 - w.trailing_zeros()) << 16);
+            let sub15 = find(f, 0xd100_3c00);
+            let fast = find(f, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5);
+            let df = find(f, 0x3940_0000 | frame::DF << 10 | 28 << 5);
+            let back = find(f, 0xd100_0421) + 4;
+            let back_word = u32::from_le_bytes(f.0[back as usize + 128..][..4].try_into().unwrap());
+            for (at, old, new) in [
+                (find(f, 0x9240_2d40), 0x9240_2d40, 0x9240_2d60), // RSI's room dropped (RDI's twice)
+                (find(f, 0x9240_2d60), 0x9240_2d60, 0x9240_2d40), // RDI's room dropped (RSI's twice)
+                (find(f, 0x9240_2c00), 0x9240_2c00, 0x9240_1c00), // the overlap mask 0xff, not 0xfff
+                (find(f, 0xd100_3c00), 0xd100_3c00, 0xd100_4000), // the overlap bound 16, not 15
+                (ldp, 0xa940_0d42, 0xa941_0d42),                   // the ldp off its site ([x10, #16])
+                (find(f, 0xd100_00e7 | (16 / w) << 10), 0xd100_00e7 | (16 / w) << 10, 0xd100_00e7 | (32 / w) << 10), // RCX's step
+                (find(f, 0x9100_414a), 0x9100_414a, 0x9100_814a), // RSI stepped by 32
+                (back, back_word, back_word + 0x20),               // the back edge to the stp
+                (lsr - 4, u32::from_le_bytes(f.0[lsr as usize + 124..][..4].try_into().unwrap()), 0x1400_0000 | (ldp - (lsr - 4)) / 4), // a branch from outside into the loop
+            ] {
+                validated(f, at, old, new, Some("not forward"));
+            }
+            // Each skip removed: the count's (first), the overlap's, the fast-string bit's and DF's.
+            for at in [lsr + 4, sub15 + 4, fast + 4, df + 4] {
+                nop(f, at);
+            }
+            // The ldp's record with write intent, or as a plain load: refused.
+            let sites = h.sites_offset as usize;
+            let i = (0..h.sites_count as usize)
+                .find(|&i| {
+                    let s: object::Site = super::super::record(f.0, sites + i * std::mem::size_of::<object::Site>());
+                    s.kind == object::kind::LOAD_PAIR
+                })
+                .unwrap();
+            let at = sites + i * std::mem::size_of::<object::Site>();
+            for (field, value) in [
+                (std::mem::offset_of!(object::Site, intent), object::INTENT_WRITE),
+                (std::mem::offset_of!(object::Site, kind), object::kind::LOAD),
+            ] {
+                let mut bad = f.0.to_vec();
+                bad[at + field] = value;
+                assert!(admit_with((&bad, f.1), false).is_err(), "field {field}");
+            }
+        }
+        // The alignment test dropped (MOVSQ: its cbnz).
+        nop(MOVSQ, find(MOVSQ, 0x9240_0800) + 4);
+        // The loop under other bytes: MOVSQ's code for `rep movsd` (REX.W dropped: a 40 REX), or with F2 for F3.
+        for src in [&[0xb9, 0x40, 0, 0, 0, 0xf3, 0x40, 0xa5][..], &[0xb9, 0x40, 0, 0, 0, 0xf2, 0x48, 0xa5]] {
+            let e = admit_with((MOVSQ.0, src), false).unwrap_err();
+            assert!(e.contains("not forward"), "{e}");
+        }
     }
     #[test]
     fn link_point_form_is_pinned() {
