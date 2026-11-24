@@ -466,7 +466,7 @@ sources; linked); `k2-repbulk` unchanged; `census-check` with ten REP instances 
 | overlap on the linear distance (no `and #0xfff`) | `movs-alias-w1/w8` |
 | RCX stepped before the store | `movs-dst-unmapped`, `movs-first`, `movs-uc-src` |
 | the destination's room dropped | `movs-dst-unmapped` |
-| the source's room dropped | none: a load crossing into the next page aborts and the instruction is stepped from the round's boundary, so it stays exact (only slower); `movs-src-cross-w1/w8` pin that exactness |
+| the source's room dropped | none, and wrongly called equivalent here (review B2, section 14): `movs-src-cross-w1/w8` had destinations their overlap skip declined, so no round ran; a round's `ldp` crossing into a missing page delivers #PF from the round's start (the runtime walks both pages; only UC pages are stepped). Their destinations moved, they are red under this mutation (section 14) |
 | fast-string test removed | `movs-kicks-w1/w8-misc-off` |
 | DF test removed | `movs-fill-w1/w8` |
 | the `ldp` with write intent | `movs-first` (#PF with W) |
@@ -526,6 +526,7 @@ safe inside the block, so a declined or short copy re-enters only at a page cros
 
 ```
   lsr x0, x7, #1; cbz x0, S                                     RCX < 2: today's pass alone
+  tbnz x7, #63, S                                               RCX >= 2^63: today's pass (the mins are signed; review B1)
   ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S
   x1 = min(RCX, the whole elements before RDI's page end, before RSI's)   (2 x 7 words, branch-free as before)
   cbz x1, S                                                     an element that crosses a page: today's pass
@@ -546,7 +547,7 @@ lies wholly inside the current page of both pointers (x1 counts whole elements b
 a page: a fault is the element's own, with the element's CR2, error code and state; a misaligned MOVSQ element is one
 unaligned `ldr`/`str` inside a page, as today's element pass makes it. The rounds are section 5's, now taken only from the
 elements already proven inside both pages. Interrupts and stops are taken at the next exit, at most one page's elements
-later (x1 <= 4096 / w, written by nothing but the loops), the bound chunk 26's loop has; the fast-string bit and DF are
+later (x1 <= 4096 / w since RCX < 2^63 there, written by nothing but the loops), the bound chunk 26's loop has; the fast-string bit and DF are
 tested first, so with bit 0 clear or DF = 1 every element is still a boundary of its own. What the loops cannot prove stays
 on today's path: an element that crosses a page (`cbz x1`), RCX < 2, FS/GS, 0x67, F2, MOVSW/MOVSD, 32-bit code; UC and
 device pages (the first access aborts and the instruction is stepped, or refused, as today); steps, TF, data breakpoints
@@ -606,7 +607,27 @@ removed (overlap, alias red); overlap on the linear distance (alias); RCX steppe
 (`movs-loop-dst-readonly`, `movs-noncanonical-dst`, `movs-smc-own`, `movs-unassigned-dst`); RDI's room dropped
 (`movs-dst-unmapped`); fast-string test removed (both `misc-off` kicks); DF test removed (fill); the `ldp` with write
 intent (`movs-first`, `movs-unassigned-src`); bulk in steps (`movs-tf`, `movs-uc-src`); `stp` before `ldp` (39 cases);
-the element loop's store before its load (37 cases). RSI's room dropped stays green, as in section 13 (equivalent).
+the element loop's store before its load (37 cases). RSI's room dropped stayed green there; that was a test gap, not an
+equivalence (review B2: see the review fixes below).
 
 **Not done:** 9.3's QEMU corpus (an `i2` input and suite seeded against QEMU, gen_i2's deltas, `loopfaults-i2`): over an
 hour with the seeding; the system cases judge against an element-by-element model instead.
+
+**Review fixes** (independent review of 84ddcdef; FEX fork 934032e on 7e03132: the dispatcher's comment only).
+- B1: the branch-free min is signed, valid only below 2^63, and the second cut had dropped the first cut's shift of RCX:
+  with RCX = 2^64 - 1 or 2^63 + 4096, x1 stayed RCX through both mins (unbounded loops, rounds and elements across page
+  ends without a split check). FexcRepMovs now declines RCX >= 2^63 (`tbnz x7, #63, S`, pinned; the old sequence is
+  refused); `movs-rcx-ones` (MOVSB, RCX = 2^64 - 1) and `movs-rcx-2e63` (MOVSQ, 2^63 + 4096) at misaligned offsets with the
+  destination's next page missing pin it. The mutation removing the test turns `movs-rcx-ones` red (rounds straddle the
+  page); `movs-rcx-2e63` stays green under it (its misaligned MOVSQ runs in the element loop, whose crossing store faults
+  from that element's own boundary), but the loop's bound is gone there too, which admission's pinned word now refuses.
+- B2: RSI's room is not equivalent: a crossing load in RAM is completed or faulted from the site's state (the runtime walks
+  both pages), so with RSI's room dropped a round's `ldp` into a missing page delivers #PF with RSI/RCX at the round's start.
+  The source-crossing cases' destinations now sit at 0x100 into their page (RDI - RSI outside [1, 15] mod 4096), so rounds
+  would run but for RSI's room; that mutation turns all four (`movs-src-cross-w1/w8`, both block sizes) red.
+- Final checks at the review commit: `k2-repmovs` (87 cases), `k2-repbulk`, unit (Rust and Python), `fexc-replay`
+  (55,186 requests, 0 differences, 137 explained) and `boot-smoke` pass.
+- Minor: the TSO cases (`tso`, `movs-tso`) run the writer until the observer has scanned 20 times (no fixed round count to
+  race at block size 1); `movs-uc-dst`, `movs-wt-wp-dst` and `movs-src-into-noncanonical` added.
+- Owed before the pooled gate: 9.3's QEMU corpus (`i2` input and suite, gen_i2's deltas, `loopfaults-i2`: mid-string fault
+  state against QEMU's), not done in this round.

@@ -662,6 +662,7 @@ fn bulk_movs_words(w: u32) -> (Vec<(u32, Movs)>, usize, usize, usize) {
     let mut v = vec![
         (0xd341_fce0, Word),                                       // lsr x0, x7, #1
         (0xb400_0000, ToEnd),                                      // cbz x0, S
+        (0xb7f8_0007, ToEnd),                                      // tbnz x7, #63, S (the mins below are signed)
         (0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5, Word), // ldrb w0, [x28, #fast_strings]
         (0x3400_0000, ToEnd),                                      // cbz w0, S
         (0x3940_0000 | frame::DF << 10 | 28 << 5, Word),           // ldrb w0, [x28, #df]
@@ -1264,8 +1265,8 @@ impl<'a> Verifier<'a> {
     /// of the REP MOVSB/MOVSQ holding them ([`x86_rep_movs`]), its four accesses that instruction's recorded sites (the `ldp` a
     /// 16-byte load pair and the element `ldr` a load, both read; the `stp` and the element `str` stores), the back edges to
     /// the `ldp` and to the element `ldr`, and no branch from outside enters it (its forward branches go to its end or to its
-    /// element loop's entry). Returns the sequence's native range. So x1 is min(RCX, the whole elements before RDI's page end,
-    /// those before RSI's) <= 4096 / w, and the rounds' count x0 = x1's rounds, each decremented once a pass and written by
+    /// element loop's entry). Returns the sequence's native range. So, RCX being below 2^63 there (its `tbnz x7, #63`; the
+    /// branch-free mins are signed), x1 is min(RCX, the whole elements before RDI's page end, those before RSI's) <= 4096 / w, and the rounds' count x0 = x1's rounds, each decremented once a pass and written by
     /// nothing else: the loops end, every access stays inside its pointer's page (no split check), and the rounds run only
     /// past the alignment and overlap skips, word for word.
     fn bulk_movs_loop(&self, at: u32, to: u32) -> Option<Range<u32>> {
@@ -4194,7 +4195,7 @@ mod tests {
             let (words, b, e, l) = super::bulk_movs_words(w);
             let start = (0..h.code_region_end - 8)
                 .step_by(4)
-                .find(|&o| word(f, o) == words[0].0 && word(f, o + 8) == words[2].0)
+                .find(|&o| word(f, o) == words[0].0 && word(f, o + 12) == words[3].0)
                 .expect("the sequence");
             let at = |i: usize| start + 4 * i as u32;
             let idx = |x: u32| words.iter().position(|&(v, _)| v == x).unwrap();

@@ -766,7 +766,7 @@ DEF_OP(FexcRepStos) {
 }
 // Bulk REP plan (docs/restructure/bulk-rep-plan.md, section 14): REP MOVSB and MOVSQ moved inside the block, decided once per
 // pass (FEX's `FexcRepMovs`, before the one-element pass; only with `--bulk`, in 64-bit addressing, F3 alone, no FS/GS).
-// With RCX >= 2, IA32_MISC_ENABLE's fast-string bit set (the resident's flag byte: grouping iterations, here for interrupts,
+// With 2 <= RCX < 2^63 (the branch-free min below is signed), IA32_MISC_ENABLE's fast-string bit set (the resident's flag byte: grouping iterations, here for interrupts,
 // only then, SDM Vol.1 7.3.9.3) and DF = 0: x1 = min(RCX, the whole elements before RDI's page end, those before RSI's), so
 // every access below lies inside both pages. Of those x1 elements, whole 16-byte rounds go first when there is one, MOVSQ's
 // pointers are both 8-aligned and RDI - RSI is outside [1, 15] modulo 4096 (a round's load would precede an earlier element's
@@ -775,7 +775,7 @@ DEF_OP(FexcRepStos) {
 // after each store, so at every access they are an iteration boundary's and no later element is written. An element that
 // would cross a page is left to the pass after the op. The cheapest test that most often fails is first. No flags change;
 // only x0-x3, RCX, RSI and RDI are written. Admission pins these words (structure.rs, `bulk_movs_loop`).
-//   lsr x0, x7, #1; cbz x0, S; ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S;
+//   lsr x0, x7, #1; cbz x0, S; tbnz x7, #63, S; ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S;
 //   and x0, x11, #0xfff; movz w2, #0x1000; sub x0, x2, x0; lsr x0, x0, #log2 w; sub x2, x7, x0; and x2, x2, x2, asr #63; add x1, x0, x2;
 //   and x0, x10, #0xfff; movz w2, #0x1000; sub x0, x2, x0; lsr x0, x0, #log2 w; sub x2, x1, x0; and x2, x2, x2, asr #63; add x1, x0, x2;
 //   cbz x1, S; lsr x0, x1, #(4 - log2 w); cbz x0, E; [w = 8: orr x2, x10, x11; and x2, x2, #7; cbnz x2, E;]
@@ -793,6 +793,7 @@ DEF_OP(FexcRepMovs) {
   ARMEmitter::BackwardLabel Rounds, Element;
   lsr(X, TMP1, RCX, 1);
   (void)cbz(X, TMP1, &Skip);
+  (void)tbnz(RCX, 63, &Skip);   // (review B1) RCX >= 2^63: the branch-free min below holds only under 2^63
   ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[FEXC_FAST_STRINGS_LOC]));
   (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &Skip);
   ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[X86State::RFLAG_DF_RAW_LOC]));

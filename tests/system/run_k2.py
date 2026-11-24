@@ -1650,20 +1650,21 @@ def repbulk(a, report):
                     problems.append(f"stop {out['stop']} {out.get('reason')} (vector, CR2, error, RCX, RDI) {[hex(v) if v is not None else None for v in got]}, want {[hex(v) for v in want]}, page written {written}")
             record(f'{name}-{block}', problems)
     # Review: TSO as a second vCPU sees it: vCPU 0 stores round r over 16 KiB by REP STOSQ, then r into FLAG; vCPU 1 reads FLAG
-    # (f) and then every quadword of the buffer, which must all be >= f (x86 orders each store before the later flag store).
-    FLAG, R2 = 0x3c0000, 20_000
-    c0 = asm(f'xor eax, eax\n1: inc rax\nmov rdi, {BUF:#x}\nmov ecx, 2048\nrep stosq\nmov [{FLAG:#x}], rax\ncmp rax, {R2}\njb 1b\nnop')
+    # (f) and then every quadword of the buffer, which must all be >= f (x86 orders each store before the later flag store);
+    # vCPU 0 runs until vCPU 1 has scanned SCANS times.
+    FLAG, SCANS = 0x3c0000, 20      # vCPU 1 scans SCANS times, then sets FLAG + 8, which ends vCPU 0
+    c0 = asm(f'xor eax, eax\n1: inc rax\nmov rdi, {BUF:#x}\nmov ecx, 2048\nrep stosq\nmov [{FLAG:#x}], rax\ncmp qword ptr [{FLAG + 8:#x}], 0\nje 1b\nnop')
     c1 = asm(f'xor r9d, r9d\nxor r10d, r10d\n1: mov rbx, [{FLAG:#x}]\ntest rbx, rbx\njz 1b\nmov rsi, {BUF:#x}\nmov ecx, 2048\n'
-             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp rbx, {R2}\njb 1b\nnop')
+             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp r10, {SCANS}\njb 1b\nmov qword ptr [{FLAG + 8:#x}], 1\nnop')
     for block in (None, 1):
-        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x4000\nmemory {FLAG:#x} {bytes(8).hex()}\nregion 0x3e0000 0x10000\n'
+        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x4000\nmemory {FLAG:#x} {bytes(16).hex()}\nregion 0x3e0000 0x10000\n'
                 f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncpu\nrip 0x110000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
         out, err = go('tso', text, block)
         problems = [f'driver: {err}'] if not out else []
         if out:
             c, peer = out['cpus']
             stale, scans = int(peer['gpr'][9], 0), int(peer['gpr'][10], 0)
-            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans < 10:
+            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans != SCANS:
                 problems.append(f"stops {c['stop']} / {peer['stop']} stale quadwords {stale} scans {scans}")
         record(f'tso-{block}', problems)
     report['repbulk'] = {'runs': runs, 'failures': failures}
@@ -1693,7 +1694,9 @@ def repmovs(a, report):
     - Faults: `movs-src-unmapped` (the source's second page not present: #PF without W at the source element, RCX/RSI/RDI
       there, every earlier element written), `movs-dst-unmapped`, `movs-dst-readonly` (#PF with W), `movs-both` (both
       second pages not present: the source is reported), `movs-src-cross-wN` (the source a few bytes before its missing
-      page, the destination at a page start: the source's room alone ends the rounds), `movs-src-readonly` (no fault),
+      page, the destination 0x100 into a page: the source's room alone keeps a round off the missing page),
+      `movs-rcx-ones`, `movs-rcx-2e63` (RCX = 2^64 - 1 and 2^63 + 4096 at misaligned offsets, the destination's next page
+      missing: today's pass, #PF at the element), `movs-src-readonly` (no fault),
       `movs-first` (nothing written).
     - `movs-kicks-wN` and `movs-kicks-wN-misc-off`: 20,000 rounds of a 64 KiB REP MOVS from one of two source buffers (by
       round) at page offset 0 into a destination at 0x808, under interrupts at random times: at each one taken at the REP,
@@ -1803,11 +1806,13 @@ def repmovs(a, report):
                 ('movs-dst-readonly', 8, 0xf00, 0x4f00, 64, ['readonly 0x405000'], (14, D + 0x5000, 7)),
                 ('movs-both', 8, 0xf00, 0x4f00, 64, ['unmap 0x401000', 'unmap 0x405000'], (14, D + 0x1000, 4)),
                 ('movs-first', 1, 0x1000, 0x5000, 0x40, ['unmap 0x401000'], (14, D + 0x1000, 4)),
-                ('movs-src-cross-w8', 8, 0xff8, 0x4000, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-src-cross-w8', 8, 0xff8, 0x4100, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
                 ('movs-misaligned-src-unmapped', 8, 0xf04, 0x4f00, 64, ['unmap 0x401000'], (14, D + 0x1000, 4)),
                 ('movs-misaligned-dst-unmapped', 8, 0xf00, 0x4f04, 64, ['unmap 0x405000'], (14, D + 0x5000, 6)),
                 ('movs-loop-dst-readonly', 8, 0x4, 0x5000, 64, ['readonly 0x405000'], (14, D + 0x5000, 7)),
-                ('movs-src-cross-w1', 1, 0xff3, 0x4000, 0x100, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-src-cross-w1', 1, 0xff3, 0x4100, 0x100, ['unmap 0x401000'], (14, D + 0x1000, 4)),
+                ('movs-rcx-ones', 1, 0x803, 0x4f05, 2 ** 64 - 1, ['unmap 0x405000'], (14, D + 0x5000, 6)),
+                ('movs-rcx-2e63', 8, 0x4, 0x4f04, 2 ** 63 + 4096, ['unmap 0x405000'], (14, D + 0x5000, 6)),
                 ('movs-src-readonly', 8, 0xf00, 0x4f00, 64, ['readonly 0x401000'], None)):
             code, lab = asm(f'mov rsi, {D + so:#x}\nmov rdi, {D + do:#x}\nmov rcx, {n}\nx: rep movs{"b" if w == 1 else "q"}\nnop', labels=True)
             src, dst = pattern(0x2000, 1), pattern(0x2000, 2)
@@ -1896,7 +1901,8 @@ def repmovs(a, report):
     for w in (1, 8): kicks(w, None, True)
     for block in (None, 1): kicks(8, block, False, soff=4)   # section 14: a declined MOVSQ, element by element in the block
     # UC and WT source pages (PCD|PWT: PAT entry 3, UC; PWT: entry 1 made WT): copied, every element run alone.
-    for name, prelude, bits in (('movs-uc-src', '', 0x18), ('movs-wt-src', 'mov ecx, 0x277\nmov eax, 0x00050406\nmov edx, 0x00070406\nwrmsr\n', 0x8)):
+    WTWP = 'mov ecx, 0x277\nmov eax, 0x00050406\nmov edx, 0x00070406\nwrmsr\n'   # PAT entries 1 and 2 made WT and WP
+    for name, prelude, bits in (('movs-uc-src', '', 0x18), ('movs-wt-src', WTWP, 0x8)):
         code = asm(prelude + f'mov rsi, {D:#x}\nmov rdi, {D + 0x4000:#x}\nmov ecx, 512\nrep movsq\nnop')
         src = pattern(0x1000, 7)
         for block in (None, 1):
@@ -1907,6 +1913,21 @@ def repmovs(a, report):
                 steps = out['stats'].get('k1', {}).get('uncached', {}).get('steps', 0)
                 if membytes(out, D + 0x4000, 0x1000) != src or (name == 'movs-uc-src' and steps < 512):
                     problems.append(f'copy differs or uncached steps {steps}')
+            record(f'{name}-{block}', problems)
+    # UC and WT/WP destination pages: copied, every element's store run alone (`uncached.steps`), WT and WP seen.
+    src = pattern(0x2000, 23)
+    for name, prelude, entries, n in (('movs-uc-dst', '', f'entry {D + 0x4000:#x} 1 set 0x18\n', 512),
+                                      ('movs-wt-wp-dst', WTWP, f'entry {D + 0x4000:#x} 1 set 0x8\nentry {D + 0x5000:#x} 1 set 0x10\n', 1024)):
+        code = asm(prelude + f'mov rsi, {D:#x}\nmov rdi, {D + 0x4000:#x}\nmov ecx, {n}\nrep movsq\nnop')
+        for block in (None, 1):
+            out, err = go(name, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nmemory {D:#x} {src.hex()}\n'
+                          f'memory {D + 0x4000:#x} {bytes(0x2000).hex()}\n{entries}', block)
+            problems = stopped(out, err)
+            if not problems:
+                k1 = out['stats'].get('k1', {})
+                steps, types = k1.get('uncached', {}).get('steps', 0), k1.get('memory_types', {})
+                if membytes(out, D + 0x4000, 8 * n) != src[:8 * n] or steps < n or (name == 'movs-wt-wp-dst' and not (types.get('WT') and types.get('WP'))):
+                    problems.append(f'copy differs, uncached steps {steps} or types {types}')
             record(f'{name}-{block}', problems)
     code = asm('lea rbx, [rip + cp]\n1: mov esi, 0x400000\nmov edi, 0x480000\ncall rbx\ndec r8\njnz 1b\njmp done\n'
                'cp: mov ecx, 12\nrep movsq\nmov ecx, 4\nrep movsb\nret\ndone: nop')
@@ -1925,7 +1946,8 @@ def repmovs(a, report):
             ('movs-cpl3-us-src', D + 0xf00, D + 0x4040, 64, f'entry {D + 0x1000:#x} 1 clear 0x4\n', (14, D + 0x1000, 0x5, 64 - 32, D + 0x1000, D + 0x4040 + 256)),
             ('movs-noncanonical-src', 0x800000000000, D + 0x4000, 100, '', (13, 0, 0, 100, 0x800000000000, D + 0x4000)),
             ('movs-noncanonical-dst', D, 0x800000000000, 100, '', (13, 0, 0, 100, D, 0x800000000000)),
-            ('movs-into-noncanonical', D, TOP, 513, f'memory {TOP:#x} {bytes(0x1000).hex()}\n', (13, 0, 0, 1, D + 0x1000, 0x800000000000))):
+            ('movs-into-noncanonical', D, TOP, 513, f'memory {TOP:#x} {bytes(0x1000).hex()}\n', (13, 0, 0, 1, D + 0x1000, 0x800000000000)),
+            ('movs-src-into-noncanonical', TOP, D + 0x4000, 513, f'memory {TOP:#x} {pattern(0x1000, 11).hex()}\n', (13, 0, 0, 1, 0x800000000000, D + 0x5000))):
         code, lab = asm(f'mov rsi, {rsi:#x}\nmov rdi, {rdi:#x}\nmov rcx, {count}\nx: rep movsq\nnop', labels=True)
         src = pattern(0x2000, 11)
         for block in (None, 1):
@@ -1936,7 +1958,8 @@ def repmovs(a, report):
                 g = [int(x, 0) for x in out['gpr']]
                 f = [int(x, 0) for x in out['fault']]
                 got = (f[0], f[1], f[2] & 0xf, g[1], g[6], g[7])
-                written = membytes(out, TOP, 0x1000) == src[:0x1000] if name == 'movs-into-noncanonical' else True
+                written = (membytes(out, TOP, 0x1000) == src[:0x1000] if name == 'movs-into-noncanonical' else
+                           membytes(out, D + 0x4000, 0x1000) == pattern(0x1000, 11) if name == 'movs-src-into-noncanonical' else True)
                 if got != want or int(out['rip'], 0) != CODE + lab['x'] or not written:
                     problems.append(f'(vector, CR2, error, RCX, RSI, RDI) {[hex(v) for v in got]}, want {[hex(v) for v in want]}, '
                                     f'rip {out["rip"]}, page written {written}')
@@ -1990,20 +2013,20 @@ def repmovs(a, report):
         record(f'movs-smc-own-{block}', problems)
     # TSO as a second vCPU sees it: vCPU 0 fills SRC with round r (REP STOSQ), copies it into BUF by REP MOVSQ, then stores r into
     # FLAG; vCPU 1 reads FLAG (f), then every quadword of BUF, which must be >= f.
-    FLAG, R2, BUF = 0x3c0000, 20_000, 0x500000
+    FLAG, SCANS, BUF = 0x3c0000, 20, 0x500000
     c0 = asm(f'xor ebx, ebx\n1: inc rbx\nmov rax, rbx\nmov rdi, {BUF + 0x10000:#x}\nmov ecx, 2048\nrep stosq\nmov rsi, {BUF + 0x10000:#x}\n'
-             f'mov rdi, {BUF:#x}\nmov ecx, 2048\nrep movsq\nmov [{FLAG:#x}], rbx\ncmp rbx, {R2}\njb 1b\nnop')
+             f'mov rdi, {BUF:#x}\nmov ecx, 2048\nrep movsq\nmov [{FLAG:#x}], rbx\ncmp qword ptr [{FLAG + 8:#x}], 0\nje 1b\nnop')
     c1 = asm(f'xor r9d, r9d\nxor r10d, r10d\n1: mov rbx, [{FLAG:#x}]\ntest rbx, rbx\njz 1b\nmov rsi, {BUF:#x}\nmov ecx, 2048\n'
-             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp rbx, {R2}\njb 1b\nnop')
+             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp r10, {SCANS}\njb 1b\nmov qword ptr [{FLAG + 8:#x}], 1\nnop')
     for block in (None, 1):
-        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x14000\nmemory {FLAG:#x} {bytes(8).hex()}\nregion 0x3e0000 0x10000\n'
+        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x14000\nmemory {FLAG:#x} {bytes(16).hex()}\nregion 0x3e0000 0x10000\n'
                 f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncpu\nrip 0x110000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
         out, err = go('movs-tso', text, block)
         problems = [f'driver: {err}'] if not out else []
         if out:
             c, peer = out['cpus']
             stale, scans = int(peer['gpr'][9], 0), int(peer['gpr'][10], 0)
-            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans < 10:
+            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans != SCANS:
                 problems.append(f"stops {c['stop']} / {peer['stop']} stale quadwords {stale} scans {scans}")
         record(f'movs-tso-{block}', problems)
     # Device-side pages: an unassigned page (reads all ones, natively through the shared ones page; writes refused) as the

@@ -265,7 +265,7 @@ def with_arg(record, arg: bytes):
     return struct.pack('<I', len(body)) + body
 
 
-# Bulk REP plan (section 14): FexcRepMovs's first word and its two flag-byte loads, in order (fexc_sites.inc).
+# Bulk REP plan (section 14): FexcRepMovs's first word and its two flag-byte loads, three and five words on (fexc_sites.inc).
 MOVS_WORDS = (0xd341fce0, 0x39501f80, 0x394feb80)
 
 
@@ -275,7 +275,7 @@ def has_bulk_movs(reply) -> bool:
     if not p: return False
     code, words = p[3], MOVS_WORDS
     w = [struct.unpack_from('<I', code, o)[0] for o in range(0, len(code) - 3, 4)]
-    return any(w[i] == words[0] and w[i + 2] == words[1] and w[i + 4] == words[2] for i in range(len(w) - 4))
+    return any(w[i] == words[0] and w[i + 3] == words[1] and w[i + 5] == words[2] for i in range(len(w) - 5))
 
 
 def only_bulk_movs(old, new, answer_without):
