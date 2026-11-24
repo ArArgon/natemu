@@ -562,7 +562,7 @@ mod tests {
     use super::*;
     use crate::devices::{Device, Direct};
     use configuration::{PciBarConfiguration, PciBarPrefetchable};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
     /// A function with movable BARs that records its accesses: writes are stored (`bar << 48 | offset << 8 | value`),
     /// reads return `id << 32 | bar << 24 | offset`, a read at [`DEFER`] defers with token 5, and polls are stored
@@ -1427,5 +1427,70 @@ mod tests {
         assert!(assign(0, 1 << 32), "a 32-bit BAR above 4 GiB");
         assert!(assign(4, 0x1_0000_c000), "an I/O BAR above 4 GiB");
         assert!(assign(0, 0xe000_0800), "unaligned");
+    }
+
+    /// A [`Stub`] that counts its `bars()` calls: the decode's cost is one call per present function.
+    struct Counting {
+        inner: Arc<Stub>,
+        calls: AtomicUsize,
+    }
+    impl Function for Counting {
+        fn config_read(&self, reg_idx: usize) -> u32 {
+            self.inner.config_read(reg_idx)
+        }
+        fn config_write(&self, reg_idx: usize, offset: u64, data: &[u8]) {
+            self.inner.config_write(reg_idx, offset, data)
+        }
+        fn bars(&self) -> [Option<Bar>; BARS] {
+            self.calls.fetch_add(1, SeqCst);
+            self.inner.bars()
+        }
+        fn bar_requests(&self) -> Vec<(u8, BarKind, u64)> {
+            self.inner.bar_requests()
+        }
+        fn assign(&self, index: u8, base: u64) {
+            self.inner.assign(index, base)
+        }
+        fn bar_access(&self, vcpu: usize, bar: u8, offset: u64, size: u64, value: Option<u64>) -> Access {
+            self.inner.bar_access(vcpu, bar, offset, size, value)
+        }
+        fn bar_poll(&self, vcpu: usize, bar: u8, token: u64) -> Access {
+            self.inner.bar_poll(vcpu, bar, token)
+        }
+        fn quiesce(&self) -> crate::Result<bool> {
+            self.inner.quiesce()
+        }
+    }
+
+    /// An access walks the present functions once each, calling `bars()` once per function it reaches, not once per
+    /// slot, function or BAR entry of the bus (the walk is over `Bus::into_parts`' flattened list).
+    #[test]
+    fn decode_calls_bars_once_per_present_function() {
+        // functions on non-adjacent slots, slot 3 multi-function (functions 0 and 1)
+        let at = [(3u8, 0u8, bar(3)), (3, 1, bar(5)), (9, 0, bar(9)), (20, 0, bar(20)), (31, 0, bar(31))];
+        let fs: Vec<Arc<Counting>> = at
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, _, base))| {
+                Arc::new(Counting { inner: Stub::new(i as u64 + 1, base), calls: AtomicUsize::new(0) })
+            })
+            .collect();
+        let placed: Vec<(u8, u8, Arc<dyn Function>)> =
+            at.iter().zip(&fs).map(|(&(s, n, _), f)| (s, n, f.clone() as Arc<dyn Function>)).collect();
+        let calls = || fs.iter().map(|f| f.calls.swap(0, SeqCst)).collect::<Vec<_>>();
+        let w = win_at(&placed);
+        let io = io_at(&placed);
+        // the last present function decodes: every function's bars() once
+        assert_eq!(read(&w, bar(31) + 0x10, 4), 5 << 32 | 0x10);
+        assert_eq!(calls(), [1; 5]);
+        // nothing decodes: every function once again
+        assert_eq!(read(&w, BASE + 0x3f_0000, 4), ONES);
+        assert_eq!(calls(), [1; 5]);
+        // the first decodes: the walk stops there
+        assert_eq!(read(&w, bar(3) + 8, 4), 1 << 32 | 8);
+        assert_eq!(calls(), [1, 0, 0, 0, 0]);
+        // the I/O window walks the same list, once per function
+        assert!(io.decode(0x1000, 4).is_none());
+        assert_eq!(calls(), [1; 5]);
     }
 }

@@ -48,8 +48,9 @@ reads zeros), given as --disk with --set disk.disk0.backing=INPUTS/disk.raw; the
 unchanged after each launch. Needs qemu-img.
 
 run --transport pci (natemu only; default mmio, natemu's transport without a configuration file): the disk, network and
-entropy devices attach as virtio-PCI functions (`--virtio-transport pci`), as QEMU's do; bench case io5-solo-pci, which
-times the PCI bus's BAR decoding on every device access."""
+entropy devices attach as virtio-PCI functions (`--virtio-transport pci`), as QEMU's do, so that every device access goes through
+the PCI bus's BAR decoding. No bench case runs it by default (the bench tier has no opt-in case); one is the io5-solo case with
+`--transport pci` added to its command line."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse
 import fcntl
