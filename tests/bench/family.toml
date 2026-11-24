@@ -263,6 +263,20 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sam
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "250"]
 
+# The sampler's validity case (the plan's chunk 0): the image's sampler_check program (bench=sampler-check: a one-block loop,
+# an indirect call, a page-crossing store, cache-missing loads, the control port's stop and start), sampled every 250 us,
+# then sample_report.py and tests/bench/sampler_check_judge.py, which places the samples by the program's marks: at least
+# 95% of the loop's EL0 samples on its block; the callee's slot samples not marked returns; probe samples charged to the
+# store's block; where the cache-missing loop's samples land (recorded); no ring while stopped but the pass in flight, and
+# samples on the loop before the stop and after the start. A crossing store under sampling is also the case of the bell's
+# return through a probe (a probe PC mapped to its block before a wanted stop is armed again): the boot must not halt.
+[suite.cases.guest-sampler-check-sample]
+argv = ["python3", "tests/bench/sampler_check_judge.py", "--profile", "{out}/sampler-check-sample", "--markers", "{out}/sampler-check-sample.markers.tsv",
+        "--perf", "{out}/sampler-check-sample.perf", "--require-place", "probe",
+        "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "sampler-check-sample", "--emu", "natemu", "--vcpus", "1",
+        "--bench", "sampler-check", "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}",
+        "--runtime", "{runtime_profile}", "--compile-cache", "off", "--sample-us", "250"]
+
 # What sampling costs (the plan's overhead case): build and hackbench at 1 vCPU and build at 4, each sampling off and every
 # 250 us with the same `perf,profile` resident and timing log, alternating, three rounds (tests/bench/run_sampler_cost.py).
 # Accepted when each wall time is within the rounds' spread plus 2% and the guest bucket's share within 1 point. About 15 minutes.
