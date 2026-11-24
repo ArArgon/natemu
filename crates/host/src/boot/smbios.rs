@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn table_fits_for_64_vcpus() {
         assert_eq!(exec::cache::MAX_VCPUS, 64);
-        // The largest bus: two INTx functions and the I/O window (an I/O BAR).
+        // A bus with two INTx functions and the I/O window (an I/O BAR): a larger DSDT than a bus without one.
         let pci = acpi::RootBridge {
             functions: &[(1, 11), (2, 10)],
             io_window: true,
