@@ -2611,6 +2611,12 @@ pub mod probe {
             None => pc,
         }
     }
+    /// The resume after an interrupt that asks nothing of generated code (a spurious INTID, a sample bell; the resident's
+    /// `resume_interrupted`): with a stop wanted, the word whose block is armed again ([`returns_to`]: never a probe, where no
+    /// block is and the arm would fail); `None` when no stop is wanted.
+    pub fn rearm_at(stop_wanted: bool, pc: u64, x0: u64, d0: u64) -> Option<u64> {
+        stop_wanted.then(|| returns_to(pc, x0, d0))
+    }
     /// The stub's first word: `adr x0, to` at `at`, if `to` is within reach.
     pub const fn adr_x0(at: u64, to: u64) -> Option<u32> {
         let d = to.wrapping_sub(at) as i64;

@@ -2511,8 +2511,9 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
 /// the probe (the code area's head holds no block, so [`resume`] would halt `BAD_STOP` there) but its store's block, found
 /// through x0 or d0 as [`interrupted`] does.
 unsafe fn resume_interrupted(s: &State, frame: &NativeFrame, elr: u64, spsr: u64) -> ! {
-    if s.stop_wanted != 0 {
-        if !cache::block_at(probe_returns_to(frame, elr)).is_some_and(cache::arm) {
+    let d0 = u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8]));
+    if let Some(pc) = natemu_abi::execution::probe::rearm_at(s.stop_wanted != 0, elr, frame.x[0], d0) {
+        if !cache::block_at(pc).is_some_and(cache::arm) {
             halt(s, stop::BAD_STOP)
         }
         cache::control().rearms += 1;

@@ -11,6 +11,14 @@
 //! `write` with acquire, copies the records up to it and publishes `read` (release). When the ring is full a record is not
 //! written and `lost` counts it.
 //!
+//! **What a sample's time can and cannot say.** `ring_time` is one word per vCPU: a bell still pending when the next pass
+//! stores its own ring time (the vCPU stayed in the resident or the host longer than an interval, the two rings merging on
+//! the edge-triggered SPI) is recorded with the later time, so its `since` is understated, and when that later store falls
+//! after the vCPU's resume a bell pending through the resident is placed at EL0 on the resume PC (a window of about one
+//! interval after a long stay outside generated code). The host counts the bells it rings ([`C_RINGS`]); a ring to a vCPU
+//! that has ended without `Events::halted` set (its run over, the others still running) is counted but never taken, so the
+//! rings and the bells taken ([`C_BELLS`], [`C_BELLS_IN_WAIT`]) are compared as a bound, never exactly.
+//!
 //! **A record** is four little-endian u64 words (see [`Sample`] for the resident's kinds, [`HostRecord`] for the host's):
 //!
 //! | Bytes | Field |
@@ -100,7 +108,9 @@ pub const MARK: u8 = 4;
 /// A clock pair, at the start and at each drain: `time` CNTVCT, `value1` the wall clock (ns since the UNIX epoch), `value2`
 /// the drain's number (0 at the start).
 pub const CLOCK: u8 = 5;
-/// The next `value4` records are vCPU `value3`'s ring records; `value1` its `Head::lost` then, `value2` its `Head::write`.
+/// The next `value4` records are vCPU `value3`'s ring records; `value1` its `Head::lost`, `value2` its `Head::write`, both
+/// read after the drain: `write` may already be ahead of the records drained (the resident kept writing), and `lost` counts
+/// up to then.
 pub const VCPU: u8 = 6;
 /// At the end: vCPU `value3`'s (u32::MAX: the run's) counter `value4` ([`COUNTERS`]) is `value1`.
 pub const COUNT: u8 = 7;
@@ -136,11 +146,12 @@ pub const COUNTERS: [&str; 11] = [
 ];
 
 /// Where an [`EL0`] sample's PC was (bits 56-59 of word 2), and what `at` and `frame` hold there.
-/// In a block's code: `at` the native offset (i16, from the block's code: the object's code byte 0; a [`crate::execution::cache::PIC`]
-/// block's full entry is at -4), `frame` its first source frame (`source_gpa[0] >> 12`).
+/// In a block's code: `at` the native offset plus [`AT_BIAS`] (the offset from the block's code, the object's code byte 0; a
+/// [`crate::execution::cache::PIC`] block's full entry word is at -4, so `at` 0), saturated at `u16::MAX` with [`FAR`] set
+/// outside that range; `frame` its first source frame (`source_gpa[0] >> 12`).
 pub const BLOCK: u8 = 1;
 /// In a shared probe of a page-crossing store: charged to the store's block (its fields, as [`BLOCK`]), `at` the native
-/// offset its probe returns to.
+/// offset its probe returns to (as [`BLOCK`]'s).
 pub const PROBE: u8 = 2;
 /// In the dispatcher or a dispatcher slot: `rip` the target (x0), `at` the PC's offset from `cache::DISPATCH`, `context`
 /// the slot's context and `frame` the target block's first source frame when the slot has a context and a current block
@@ -154,9 +165,24 @@ pub const HEAD: u8 = 5;
 pub const NO_BLOCK: u8 = 6;
 pub const OUTSIDE: u8 = 7;
 
-/// `flags`: the PC was in the block's hot copy; the block was dead (its code still ran).
+/// `flags` of a sample in a block ([`BLOCK`], [`PROBE`], [`STEP`]): the PC was in the block's hot copy; the block was dead
+/// (its code still ran); its native offset did not fit `at` (saturated).
 pub const HOT: u8 = 1;
 pub const DEAD: u8 = 2;
+pub const FAR: u8 = 4;
+/// `at` of a block's word: its native offset + 4.
+pub const AT_BIAS: i64 = 4;
+/// `at` and the [`FAR`] flag of native offset `offset`.
+pub const fn at(offset: i64) -> (u16, u8) {
+    let x = offset.saturating_add(AT_BIAS);
+    if x >= 0 && x < u16::MAX as i64 {
+        (x as u16, 0)
+    } else if x < 0 {
+        (0, FAR)
+    } else {
+        (u16::MAX, FAR)
+    }
+}
 /// `flags` bits 2-3 of a [`DISPATCH`] sample: the bytes before the target end a call (the target is a return address),
 /// they do not, or the test could not be made (no current block for the target, the bytes cross into another page, no
 /// RAM there).
@@ -339,17 +365,169 @@ const fn ff_length(modrm: u8, sib: u8) -> usize {
     };
     2 + sib_bytes + disp
 }
-/// The call test of a target at `rip` whose page's guest bytes `page` gives (its first source frame's page), or
-/// [`CALL_UNKNOWN`] when the bytes before it lie in the page before.
-pub fn call_test(rip: u64, page: Option<&[u8]>) -> u8 {
-    let o = (rip & 0xfff) as usize;
-    match page {
-        Some(p) if o >= BEFORE && p.len() >= o => {
-            let mut b = [0; BEFORE];
-            b.copy_from_slice(&p[o - BEFORE..o]);
-            if call_before(&b) { CALL_YES } else { CALL_NO }
+/// The call test of a dispatcher target at `rip` whose first source page is the guest-physical page `page`: the bytes
+/// before it, read by `read(gpa, out)` (the resident: through its RAM alias, never a guest walk, which sets A bits and can
+/// fault), or [`CALL_UNKNOWN`] when they lie in the page before or cannot be read. The resident's one implementation.
+pub fn call_test(page: u64, rip: u64, read: impl FnOnce(u64, &mut [u8; BEFORE]) -> bool) -> u8 {
+    let o = rip & 0xfff;
+    if o < BEFORE as u64 {
+        return CALL_UNKNOWN;
+    }
+    let mut b = [0; BEFORE];
+    if !read(page & !0xfff | (o - BEFORE as u64), &mut b) {
+        return CALL_UNKNOWN;
+    }
+    if call_before(&b) { CALL_YES } else { CALL_NO }
+}
+
+/// What the resident knows of the block holding a PC (`cache::block_at`, `cache::native_offset`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockView {
+    pub rip: u64,
+    pub context: u64,
+    /// Its first source page (`source_gpa[0]`).
+    pub frame: u64,
+    /// The PC's native offset in its whole code (from its code's first byte: -4 is a PIC block's full entry).
+    pub offset: i64,
+    pub hot: bool,
+    pub step: bool,
+    pub dead: bool,
+}
+/// The resident's code cache and guest RAM as [`record`] asks them.
+pub trait Places {
+    /// The block whose code holds `pc` (the step slot's block included), dead ones too.
+    fn block(&self, pc: u64) -> Option<BlockView>;
+    /// Dispatcher slot `k`'s code context (`Control::slot_contexts`; `cache::NO_CONTEXT`: none).
+    fn slot_context(&self, k: usize) -> u64;
+    /// The first source page of the block current for (`rip`, `context`), found with no walk (`cache::current_at`).
+    fn target(&self, rip: u64, context: u64) -> Option<u64>;
+    /// [`BEFORE`] bytes of guest RAM at `gpa` (false: not RAM).
+    fn read(&self, gpa: u64, out: &mut [u8; BEFORE]) -> bool;
+}
+/// The record of a bell taken from generated code before `elr` at CNTVCT `t0` (x0 and d0 its frame's), the host having rung
+/// at `rung` and generated code resumed last at `resumed`; `flushes` the vCPU's cache flush count. Rung before the last
+/// resume, it was pending while the vCPU was outside generated code ([`RESIDENT`]); otherwise it says where generated code
+/// was ([`EL0`]): a block (a shared probe charged to its store's), the dispatcher (its target and the call test), or
+/// elsewhere in the code area.
+pub fn record(rung: u64, resumed: u64, t0: u64, flushes: u64, elr: u64, x0: u64, d0: u64, p: &impl Places) -> Sample {
+    use crate::execution::cache::{
+        CODE_BYTES_MAX, CODE_VA, DISPATCH_BYTES, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT,
+    };
+    let since = |from: u64| t0.saturating_sub(from).min(u32::MAX as u64) as u32;
+    let mut s = Sample { time: rung, ..Sample::default() };
+    if rung < resumed {
+        (s.kind, s.since) = (RESIDENT, since(rung));
+        return s;
+    }
+    (s.kind, s.since, s.flushes) = (EL0, since(resumed), (flushes & 0xfff) as u16);
+    let x = elr.wrapping_sub(CODE_VA);
+    if x >= CODE_BYTES_MAX as u64 {
+        (s.place, s.frame) = (OUTSIDE, x as u32);
+        return s;
+    }
+    if (DISPATCH_VA..DISPATCH_VA + DISPATCH_BYTES as u64).contains(&elr) {
+        (s.place, s.at, s.rip) = (DISPATCH, (elr - DISPATCH_VA) as u16, x0);
+        // Slot 0 (the dispatcher itself) serves every context without a slot: the target's context is not known there.
+        let k = (elr - DISPATCH_VA) as usize / DISPATCH_SLOT_BYTES;
+        let context = if k == 0 { NO_CONTEXT } else { p.slot_context(k) };
+        let page = if context == NO_CONTEXT { None } else { p.target(x0, context) };
+        let call = match page {
+            Some(page) => {
+                (s.context, s.frame) = (context, (page >> 12) as u32);
+                call_test(page, x0, |gpa, out| p.read(gpa, out))
+            }
+            None => CALL_UNKNOWN,
+        };
+        s.flags = call << CALL_SHIFT;
+        return s;
+    }
+    let probe = crate::execution::probe::at(elr).is_some();
+    let pc = crate::execution::probe::returns_to(elr, x0, d0);
+    let Some(b) = p.block(pc) else {
+        (s.place, s.frame) = (if x < HEAD_BYTES as u64 { HEAD } else { NO_BLOCK }, x as u32);
+        return s;
+    };
+    s.place = if probe {
+        PROBE
+    } else if b.step {
+        STEP
+    } else {
+        BLOCK
+    };
+    (s.rip, s.context, s.frame) = (b.rip, b.context, (b.frame >> 12) as u32);
+    let (at, far) = at(b.offset);
+    s.at = at;
+    s.flags = far | if b.hot { HOT } else { 0 } | if b.dead { DEAD } else { 0 };
+    s
+}
+
+/// The GIC CPU interface as the bell protocol uses it (the resident: ISR_EL1.I, ICC_IAR1_EL1, ICC_EOIR1_EL1).
+pub trait Gic {
+    /// An interrupt is signalled (ISR_EL1.I).
+    fn signalled(&mut self) -> bool;
+    /// Acknowledges the highest pending one: its INTID (1020-1023: spurious).
+    fn acknowledge(&mut self) -> u64;
+    /// Ends `intid`.
+    fn end(&mut self, intid: u64);
+}
+/// The vCPU's bell state ([`Head::bell`], [`Head::held`], [`Head::bells_in_wait`]).
+pub trait Bells {
+    /// The bell's INTID (0: none).
+    fn bell(&self) -> u64;
+    /// Takes the INTID held for [`next`], if any.
+    fn held(&mut self) -> Option<u64>;
+    fn hold(&mut self, intid: u64);
+    /// A bell taken in a wait.
+    fn in_wait(&mut self);
+}
+/// `intid` is the sample bell `bell` (0: none).
+#[inline(always)]
+pub const fn is_bell(bell: u64, intid: u64) -> bool {
+    bell != 0 && intid == bell
+}
+/// In a wait, with an interrupt signalled: ends every pending sample bell (counted, no wake). True when nothing else was
+/// pending; false when another interrupt was, acknowledged here and held for [`next`] (while it is active no interrupt of
+/// its priority is signalled, so [`next`] takes it first).
+pub fn bells_only(g: &mut impl Gic, b: &mut impl Bells) -> bool {
+    loop {
+        if !g.signalled() {
+            return true;
         }
-        _ => CALL_UNKNOWN,
+        let intid = g.acknowledge();
+        if intid >= 1020 {
+            return true;
+        }
+        if !is_bell(b.bell(), intid) {
+            b.hold(intid);
+            return false;
+        }
+        g.end(intid);
+        b.in_wait();
+    }
+}
+/// The next interrupt `acknowledge` serves (the caller ends it): a held one first, else one acknowledged now; sample bells
+/// on the way are ended and counted as taken in a wait. `None` when nothing (or only a spurious INTID) is pending.
+#[inline(always)]
+pub fn next(g: &mut impl Gic, b: &mut impl Bells) -> Option<u64> {
+    loop {
+        let intid = match b.held() {
+            Some(intid) => intid,
+            None => {
+                if !g.signalled() {
+                    return None;
+                }
+                g.acknowledge()
+            }
+        };
+        if intid >= 1020 {
+            return None;
+        }
+        if is_bell(b.bell(), intid) {
+            g.end(intid);
+            b.in_wait();
+            continue;
+        }
+        return Some(intid);
     }
 }
 
@@ -398,9 +576,22 @@ impl Ring {
         self.word(HEAD_READ).store(w, Release);
         w - r
     }
+    /// The head, word by word (each an atomic load: the resident and the host write its words while it is read).
     pub fn head(&self) -> Head {
-        // SAFETY: the head's words, each read on its own.
-        unsafe { self.base.cast::<Head>().read_volatile() }
+        let w = |offset: usize| self.word(offset).load(Acquire);
+        Head {
+            magic: w(HEAD_MAGIC),
+            write: w(HEAD_WRITE),
+            read: w(HEAD_READ),
+            lost: w(HEAD_LOST),
+            bell: w(HEAD_BELL),
+            ring_time: w(HEAD_RING_TIME),
+            resume_time: w(HEAD_RESUME_TIME),
+            bells: w(core::mem::offset_of!(Head, bells)),
+            bells_in_wait: w(core::mem::offset_of!(Head, bells_in_wait)),
+            unknown_calls: w(core::mem::offset_of!(Head, unknown_calls)),
+            held: w(core::mem::offset_of!(Head, held)),
+        }
     }
 }
 
@@ -409,6 +600,196 @@ mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    use crate::execution::cache::{CODE_VA, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT, PROBES_VA};
+    use crate::execution::probe;
+
+    /// A code cache of two blocks (one in the step slot), slot contexts and one page of guest RAM.
+    struct Fake {
+        page: Vec<u8>,
+    }
+    const BLOCK_PC: u64 = CODE_VA + HEAD_BYTES as u64 + 0x1000;
+    const STEP_PC: u64 = CODE_VA + 0x40;
+    const TARGET: u64 = 0x40_1123;
+    impl Places for Fake {
+        fn block(&self, pc: u64) -> Option<BlockView> {
+            let view = BlockView { rip: 0xffff_ffff_8100_0040, context: 0x5, frame: 0x12_3000, ..BlockView::default() };
+            match pc {
+                p if (BLOCK_PC - 4..BLOCK_PC + 0x100).contains(&p) => {
+                    Some(BlockView { offset: p.wrapping_sub(BLOCK_PC) as i64, hot: p >= BLOCK_PC + 0x80, ..view })
+                }
+                p if p == STEP_PC => Some(BlockView { rip: 0x7000, step: true, dead: true, ..view }),
+                _ => None,
+            }
+        }
+        fn slot_context(&self, k: usize) -> u64 {
+            if k == 2 { 0x9 } else { NO_CONTEXT }
+        }
+        fn target(&self, rip: u64, context: u64) -> Option<u64> {
+            (rip & !0xff == TARGET & !0xff && context == 0x9).then_some(0x77_7000)
+        }
+        fn read(&self, gpa: u64, out: &mut [u8; BEFORE]) -> bool {
+            if gpa & !0xfff != 0x77_7000 {
+                return false;
+            }
+            out.copy_from_slice(&self.page[(gpa & 0xfff) as usize..][..BEFORE]);
+            true
+        }
+    }
+    fn fake() -> Fake {
+        let mut page = std::vec![0x90u8; 4096];
+        page[(TARGET & 0xfff) as usize - 5] = 0xe8; // a call before the target: a return address
+        Fake { page }
+    }
+
+    /// Where `record` places a bell: rung before the last resume it is the resident's (since from the ring); otherwise in
+    /// a block (offset biased, the hot copy flagged; a PIC full entry at 0), in a probe charged to its store's block through
+    /// x0 then d0, in a dispatcher slot with the target and its call test (unknown in slot 0, in a slot without a context
+    /// and without a current block), in the step slot's block (dead flagged), in the head, in no block, outside the area.
+    #[test]
+    fn a_bell_is_placed_where_generated_code_was() {
+        let p = fake();
+        let at = |elr: u64, x0: u64, d0: u64| record(1000, 900, 1100, 0x1abc, elr, x0, d0, &p);
+        let r = record(800, 900, 1100, 7, BLOCK_PC, 0, 0, &p);
+        assert_eq!(r, Sample { time: 800, kind: RESIDENT, since: 300, ..Sample::default() });
+        let b = at(BLOCK_PC + 0x10, 0, 0);
+        assert_eq!((b.kind, b.place, b.since, b.time, b.flushes), (EL0, BLOCK, 200, 1000, 0xabc));
+        assert_eq!((b.rip, b.context, b.frame, b.at, b.flags), (0xffff_ffff_8100_0040, 5, 0x123, 0x14, 0));
+        let hot = at(BLOCK_PC + 0x90, 0, 0);
+        assert_eq!((hot.at, hot.flags), (0x94, HOT));
+        assert_eq!(at(BLOCK_PC - 4, 0, 0).at, 0, "a PIC block's full entry");
+        // A probe: at its first word the store's block is x0's, after it d0's.
+        let thunk = CODE_VA + probe::offset(probe::index(false, 3, 8).unwrap());
+        let first = at(thunk, BLOCK_PC + 0x20, 0);
+        assert_eq!((first.place, first.at, first.rip), (PROBE, 0x24, 0xffff_ffff_8100_0040));
+        let later = at(thunk + 8, 0, BLOCK_PC + 0x30);
+        assert_eq!((later.place, later.at), (PROBE, 0x34));
+        let lost = at(thunk + 8, BLOCK_PC, 0x1234);
+        assert_eq!((lost.place, lost.frame), (HEAD, (thunk + 8 - CODE_VA) as u32), "d0 names no block");
+        // The dispatcher: slot 2 has a context and a current block for the target, whose bytes end a call.
+        let slot = DISPATCH_VA + 2 * DISPATCH_SLOT_BYTES as u64 + 4;
+        let d = at(slot, TARGET, 0);
+        assert_eq!((d.place, d.rip, d.at, d.context, d.frame), (DISPATCH, TARGET, (slot - DISPATCH_VA) as u16, 9, 0x777));
+        assert_eq!(d.flags >> CALL_SHIFT, CALL_YES);
+        assert_eq!(at(slot, TARGET + 0x10, 0).flags >> CALL_SHIFT, CALL_NO, "not after a call");
+        for (elr, x0) in [(DISPATCH_VA + 4, TARGET), (slot + DISPATCH_SLOT_BYTES as u64, TARGET), (slot, 0x40_2000)] {
+            let u = at(elr, x0, 0);
+            assert_eq!((u.place, u.flags >> CALL_SHIFT, u.context, u.frame), (DISPATCH, CALL_UNKNOWN, 0, 0), "{elr:#x}");
+        }
+        let s = at(STEP_PC, 0, 0);
+        assert_eq!((s.place, s.rip, s.flags), (STEP, 0x7000, DEAD));
+        assert_eq!(at(PROBES_VA - 4, 0, 0).place, HEAD, "a gap of the head");
+        let none = at(BLOCK_PC + 0x1000, 0, 0);
+        assert_eq!((none.place, none.frame), (NO_BLOCK, (BLOCK_PC + 0x1000 - CODE_VA) as u32));
+        assert_eq!(at(CODE_VA - 4, 0, 0).place, OUTSIDE);
+    }
+
+    /// `at` holds a native offset + 4; one that does not fit is saturated and flagged, never wrapped.
+    #[test]
+    fn a_native_offset_past_at_saturates() {
+        assert_eq!(at(-4), (0, 0));
+        assert_eq!(at(0x7ff0), (0x7ff4, 0));
+        assert_eq!(at(0xfffa), (0xfffe, 0));
+        assert_eq!(at(0xfffb), (u16::MAX, FAR));
+        assert_eq!(at(0x1_0004), (u16::MAX, FAR));
+        assert_eq!(at(-8), (0, FAR));
+    }
+
+    /// A GIC with pending INTIDs (in priority order), as the resident's registers show them.
+    #[derive(Default)]
+    struct G {
+        pending: Vec<u64>,
+        ended: Vec<u64>,
+        active: Option<u64>,
+    }
+    impl Gic for G {
+        fn signalled(&mut self) -> bool {
+            // While one is active (not ended) no interrupt of its priority is signalled.
+            self.active.is_none() && !self.pending.is_empty()
+        }
+        fn acknowledge(&mut self) -> u64 {
+            if !self.signalled() {
+                return 1023;
+            }
+            let i = self.pending.remove(0);
+            self.active = Some(i);
+            i
+        }
+        fn end(&mut self, intid: u64) {
+            assert_eq!(self.active.take(), Some(intid), "ends only the active one");
+            self.ended.push(intid);
+        }
+    }
+    /// The bell state of a vCPU whose bell is `bell`.
+    #[derive(Default)]
+    struct B {
+        bell: u64,
+        held: Option<u64>,
+        in_wait: u64,
+    }
+    impl Bells for B {
+        fn bell(&self) -> u64 {
+            self.bell
+        }
+        fn held(&mut self) -> Option<u64> {
+            self.held.take()
+        }
+        fn hold(&mut self, intid: u64) {
+            self.held = Some(intid);
+        }
+        fn in_wait(&mut self) {
+            self.in_wait += 1;
+        }
+    }
+    const BELL: u64 = 200;
+    /// `acknowledge`'s loop as the resident runs it: each INTID `next` gives is served, then ended by the caller.
+    fn acknowledge(g: &mut G, b: &mut B) -> Vec<u64> {
+        let mut served = Vec::new();
+        while let Some(i) = next(g, b) {
+            served.push(i);
+            g.end(i);
+        }
+        served
+    }
+
+    /// A wait takes bells without a wake: with only bells pending all are ended and counted; a doorbell behind a bell is
+    /// held (acknowledged, not ended) and `acknowledge` serves it first, then ends the bell after it and serves nothing
+    /// twice; nothing pending is no wake; without a bell (0) every INTID is a doorbell, as in a build without the sampler.
+    #[test]
+    fn waits_take_bells_and_hold_the_rest() {
+        let (mut g, mut b) = (G { pending: std::vec![BELL, BELL], ..G::default() }, B { bell: BELL, ..B::default() });
+        assert!(bells_only(&mut g, &mut b));
+        assert_eq!((g.ended.as_slice(), b.in_wait, b.held), (&[BELL, BELL][..], 2, None));
+        let (mut g, mut b) = (G { pending: std::vec![BELL, 40, BELL], ..G::default() }, B { bell: BELL, ..B::default() });
+        assert!(!bells_only(&mut g, &mut b), "a doorbell is a wake");
+        assert_eq!((g.ended.as_slice(), b.held, g.active), (&[BELL][..], Some(40), Some(40)));
+        assert!(!g.signalled(), "the held doorbell is active: nothing else is signalled");
+        assert_eq!(acknowledge(&mut g, &mut b), [40]);
+        assert_eq!((g.ended.as_slice(), b.in_wait, g.pending.len(), b.held), (&[BELL, 40, BELL][..], 2, 0, None));
+        let (mut g, mut b) = (G::default(), B { bell: BELL, ..B::default() });
+        assert!(bells_only(&mut g, &mut b));
+        assert!(acknowledge(&mut g, &mut b).is_empty());
+        // No bell: `next` is the plain loop and the bell's INTID is served like any other.
+        let (mut g, mut b) = (G { pending: std::vec![BELL, 40], ..G::default() }, B::default());
+        assert_eq!(acknowledge(&mut g, &mut b), [BELL, 40]);
+        assert_eq!(b.in_wait, 0);
+        assert!(!is_bell(0, 0) && is_bell(BELL, BELL) && !is_bell(BELL, 40));
+    }
+
+    /// The resume after a spurious INTID or a bell arms a wanted stop in the block the PC runs on in: the store's block for
+    /// a probe PC (x0, then d0), the PC's own elsewhere; nothing without a stop wanted.
+    #[test]
+    fn a_wanted_stop_is_armed_in_the_probe_store_s_block() {
+        let thunk = CODE_VA + probe::offset(probe::index(true, 7, 4).unwrap());
+        assert_eq!(probe::rearm_at(true, thunk, BLOCK_PC, 1), Some(BLOCK_PC));
+        assert_eq!(probe::rearm_at(true, thunk + 4, 1, BLOCK_PC + 8), Some(BLOCK_PC + 8));
+        assert_eq!(probe::rearm_at(true, BLOCK_PC + 12, 1, 2), Some(BLOCK_PC + 12));
+        assert_eq!(probe::rearm_at(false, thunk, BLOCK_PC, 1), None);
+        // The armed word's block is one: a probe PC itself would find none (the resume would halt BAD_STOP).
+        let p = fake();
+        assert!(p.block(probe::rearm_at(true, thunk + 4, 1, BLOCK_PC + 8).unwrap()).is_some());
+        assert!(p.block(thunk + 4).is_none());
+    }
 
     /// Every field of a resident record survives encode and decode at its limits (a kernel RIP sign-extended from bit 47, a
     /// 40-bit context, the 12-bit flush count wrapping), and the kind sits where host records keep theirs.
@@ -504,14 +885,20 @@ mod tests {
         ] {
             assert!(!ends(other), "{other:x?}");
         }
-        // The test on a page: a target fewer than 15 bytes into its page, or no RAM there, is unknown.
+        // The test on a page (the resident's own): read at the target block's frame and the target's offset, 15 bytes
+        // back; a target fewer than 15 bytes into its page, or no RAM there, is unknown.
         let mut page = std::vec![0x90u8; 4096];
         page[0x100 - 5] = 0xe8;
-        assert_eq!(call_test(0x7000_0100, Some(&page)), CALL_YES);
-        assert_eq!(call_test(0x7000_0200, Some(&page)), CALL_NO);
-        assert_eq!(call_test(0x7000_000e, Some(&page)), CALL_UNKNOWN);
-        assert_eq!(call_test(0x7000_000f, Some(&page)), CALL_NO);
-        assert_eq!(call_test(0x7000_0100, None), CALL_UNKNOWN);
+        let read = |gpa: u64, out: &mut [u8; BEFORE]| {
+            assert_eq!(gpa & !0xfff, 0x5_5000, "the target block's frame");
+            out.copy_from_slice(&page[(gpa & 0xfff) as usize..][..BEFORE]);
+            true
+        };
+        assert_eq!(call_test(0x5_5000, 0x7000_0100, read), CALL_YES);
+        assert_eq!(call_test(0x5_5000, 0x7000_0200, read), CALL_NO);
+        assert_eq!(call_test(0x5_5000, 0x7000_000e, read), CALL_UNKNOWN);
+        assert_eq!(call_test(0x5_5000, 0x7000_000f, read), CALL_NO);
+        assert_eq!(call_test(0x5_5000, 0x7000_0100, |_, _| false), CALL_UNKNOWN);
     }
 
     #[test]

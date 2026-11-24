@@ -2,19 +2,43 @@
 //! each vCPU's sample bell (an SPI of its own, its INTID in `Head::bell`); a bell taken from generated code writes one record
 //! to the vCPU's ring and resumes it ([`sample`], `execution::interrupted`): no bank, no stop, no arm. A bell taken in a wait
 //! is only counted ([`wfi`], [`bells_only`], `events::acknowledge`), so it neither wakes the vCPU nor shifts halt polling.
-//! Without the feature every function here is empty or constant and adds no code.
+//! The decisions (where a sample is, what a wait does with a bell) are `natemu_abi::sample`'s, unit-tested there; this
+//! module gives them the cache, guest RAM and the GIC's registers. Without the feature [`Bells`] has no bell and every
+//! function here is empty or constant, adding no code.
 #[cfg(all(feature = "profile", feature = "pcid-study"))]
 compile_error!("`profile` and `pcid-study` both use the study part of the lookup area (`cache::PCID_STUDY`)");
+
+/// The GIC CPU interface's registers (enabled at start).
+pub struct Gic;
+impl natemu_abi::sample::Gic for Gic {
+    #[inline(always)]
+    fn signalled(&mut self) -> bool {
+        let isr: u64;
+        // SAFETY: reads the pending-interrupt status.
+        unsafe { core::arch::asm!("isb", "mrs {}, isr_el1", out(reg) isr) };
+        isr & 1 << 7 != 0
+    }
+    #[inline(always)]
+    fn acknowledge(&mut self) -> u64 {
+        let intid: u64;
+        // SAFETY: ICC_IAR1_EL1.
+        unsafe { core::arch::asm!("mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
+        intid
+    }
+    #[inline(always)]
+    fn end(&mut self, intid: u64) {
+        // SAFETY: ICC_EOIR1_EL1.
+        unsafe { core::arch::asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) };
+    }
+}
+
 #[cfg(feature = "profile")]
 mod on {
     use crate::cache;
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use natemu_abi::NativeFrame;
-    use natemu_abi::execution::cache::{
-        CODE_BYTES_MAX, CODE_VA, DEAD, DISPATCH_BYTES, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT, PCID_STUDY,
-        STEP,
-    };
-    use natemu_abi::sample::{self as sm, Head, Ring, Sample};
+    use natemu_abi::execution::cache::{DEAD, PCID_STUDY, STEP};
+    use natemu_abi::sample::{self as sm, BlockView, Head, Places, Ring};
     fn word(offset: usize) -> &'static AtomicU64 {
         // SAFETY: this vCPU's study part (its head), shared with the host word by word.
         unsafe { AtomicU64::from_ptr(cache::lookup_area::<u64>(PCID_STUDY + offset)) }
@@ -30,6 +54,56 @@ mod on {
     const IN_WAIT: usize = core::mem::offset_of!(Head, bells_in_wait);
     const UNKNOWN: usize = core::mem::offset_of!(Head, unknown_calls);
     const HELD: usize = core::mem::offset_of!(Head, held);
+    /// This vCPU's bell state in its head.
+    pub struct Bells;
+    impl sm::Bells for Bells {
+        #[inline(always)]
+        fn bell(&self) -> u64 {
+            word(sm::HEAD_BELL).load(Relaxed)
+        }
+        #[inline(always)]
+        fn held(&mut self) -> Option<u64> {
+            let h = word(HELD).load(Relaxed);
+            if h == 0 {
+                return None;
+            }
+            word(HELD).store(0, Relaxed);
+            Some(h - 1)
+        }
+        fn hold(&mut self, intid: u64) {
+            word(HELD).store(intid + 1, Relaxed);
+        }
+        fn in_wait(&mut self) {
+            add(IN_WAIT);
+        }
+    }
+    /// The code cache and guest RAM, as `sample::record` asks them.
+    struct Here;
+    impl Places for Here {
+        fn block(&self, pc: u64) -> Option<BlockView> {
+            cache::block_at(pc).map(|b| {
+                let offset = cache::native_offset(b, pc);
+                BlockView {
+                    rip: b.rip,
+                    context: b.context,
+                    frame: b.source_gpa[0],
+                    offset: offset as i64,
+                    hot: offset != pc.wrapping_sub(b.code_va()),
+                    step: b.flags & STEP != 0,
+                    dead: b.flags & DEAD != 0,
+                }
+            })
+        }
+        fn slot_context(&self, k: usize) -> u64 {
+            cache::control().slot_contexts[k]
+        }
+        fn target(&self, rip: u64, context: u64) -> Option<u64> {
+            cache::current_at(rip, context).map(|b| b.source_gpa[0])
+        }
+        fn read(&self, gpa: u64, out: &mut [u8; sm::BEFORE]) -> bool {
+            crate::execution::guest_ram().copy_out(gpa, out)
+        }
+    }
     /// At the resident's start: from now on the host rings this vCPU.
     pub fn start() {
         word(sm::HEAD_MAGIC).store(sm::MAGIC, Relaxed);
@@ -37,144 +111,26 @@ mod on {
     /// `intid` is this vCPU's sample bell.
     #[inline(always)]
     pub fn is(intid: u64) -> bool {
-        let bell = word(sm::HEAD_BELL).load(Relaxed);
-        bell != 0 && intid == bell
+        sm::is_bell(word(sm::HEAD_BELL).load(Relaxed), intid)
     }
-    /// A bell taken from generated code, interrupted before `elr` at CNTVCT `t0`: one record. Rung before the last resume
-    /// (the host's ring time against `resume_exception`'s), it was pending while the vCPU was outside generated code.
+    /// A bell taken from generated code, interrupted before `elr` at CNTVCT `t0`: one record (`sample::record`).
     pub fn sample(frame: &NativeFrame, elr: u64, t0: u64) {
         add(BELLS);
-        let (rung, resumed) = (word(sm::HEAD_RING_TIME).load(Relaxed), word(sm::HEAD_RESUME_TIME).load(Relaxed));
-        let since = |from: u64| t0.saturating_sub(from).min(u64::from(u32::MAX)) as u32;
-        let mut s = Sample { time: rung, ..Sample::default() };
-        if rung < resumed {
-            (s.kind, s.since) = (sm::RESIDENT, since(rung));
-        } else {
-            (s.kind, s.since) = (sm::EL0, since(resumed));
-            s.flushes = (cache::control().flushes & 0xfff) as u16;
-            place(&mut s, frame, elr);
+        let d0 = u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8]));
+        let s = sm::record(
+            word(sm::HEAD_RING_TIME).load(Relaxed),
+            word(sm::HEAD_RESUME_TIME).load(Relaxed),
+            t0,
+            cache::control().flushes,
+            elr,
+            frame.x[0],
+            d0,
+            &Here,
+        );
+        if s.place == sm::DISPATCH && s.flags >> sm::CALL_SHIFT & 3 == sm::CALL_UNKNOWN {
+            add(UNKNOWN);
         }
         ring().push(s.encode());
-    }
-    /// Where generated code was: a block (a probe charged to its store's), the dispatcher (its target and the call test),
-    /// or elsewhere in the code area.
-    fn place(s: &mut Sample, frame: &NativeFrame, elr: u64) {
-        let x = elr.wrapping_sub(CODE_VA);
-        if x >= CODE_BYTES_MAX as u64 {
-            (s.place, s.frame) = (sm::OUTSIDE, x as u32);
-            return;
-        }
-        if (DISPATCH_VA..DISPATCH_VA + DISPATCH_BYTES as u64).contains(&elr) {
-            (s.place, s.at, s.rip) = (sm::DISPATCH, (elr - DISPATCH_VA) as u16, frame.x[0]);
-            // Slot 0 (the dispatcher itself) serves every context without a slot: the target's context is not known there.
-            let k = (elr - DISPATCH_VA) as usize / DISPATCH_SLOT_BYTES;
-            let context = cache::control().slot_contexts[k];
-            let target = (k != 0 && context != NO_CONTEXT).then(|| cache::current_at(s.rip, context)).flatten();
-            let call = match target {
-                Some(b) => {
-                    (s.context, s.frame) = (context, (b.source_gpa[0] >> 12) as u32);
-                    call_test(b.source_gpa[0] & !0xfff, s.rip)
-                }
-                None => sm::CALL_UNKNOWN,
-            };
-            if call == sm::CALL_UNKNOWN {
-                add(UNKNOWN);
-            }
-            s.flags |= call << sm::CALL_SHIFT;
-            return;
-        }
-        // In a shared probe: charged to its store's block, at the word the probe returns to (x0, then d0).
-        let probe = natemu_abi::execution::probe::at(elr).is_some();
-        let d0 = u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8]));
-        let pc = natemu_abi::execution::probe::returns_to(elr, frame.x[0], d0);
-        // (`block_at` finds the step slot's block too; nothing else of the head is a block.)
-        let Some(b) = cache::block_at(pc) else {
-            (s.place, s.frame) = (if x < HEAD_BYTES as u64 { sm::HEAD } else { sm::NO_BLOCK }, x as u32);
-            return;
-        };
-        s.place = if probe {
-            sm::PROBE
-        } else if b.flags & STEP != 0 {
-            sm::STEP
-        } else {
-            sm::BLOCK
-        };
-        (s.rip, s.context, s.frame) = (b.rip, b.context, (b.source_gpa[0] >> 12) as u32);
-        let offset = cache::native_offset(b, pc);
-        s.at = offset as u16;
-        if offset != pc.wrapping_sub(b.code_va()) {
-            s.flags |= sm::HOT;
-        }
-        if b.flags & DEAD != 0 {
-            s.flags |= sm::DEAD;
-        }
-    }
-    /// The call test of a dispatcher target at `rip` in the guest-physical page `page`: the bytes before it, read through
-    /// the resident's RAM alias (never a guest walk: it sets A bits and can fault).
-    fn call_test(page: u64, rip: u64) -> u8 {
-        let o = rip & 0xfff;
-        if o < sm::BEFORE as u64 {
-            return sm::CALL_UNKNOWN;
-        }
-        let mut b = [0; sm::BEFORE];
-        if !crate::execution::guest_ram().copy_out(page | (o - sm::BEFORE as u64), &mut b) {
-            return sm::CALL_UNKNOWN;
-        }
-        if sm::call_before(&b) { sm::CALL_YES } else { sm::CALL_NO }
-    }
-    /// An interrupt is signalled to this PE (ISR_EL1.I).
-    fn signalled() -> bool {
-        let isr: u64;
-        // SAFETY: reads the pending-interrupt status.
-        unsafe { core::arch::asm!("isb", "mrs {}, isr_el1", out(reg) isr) };
-        isr & 1 << 7 != 0
-    }
-    /// In a wait, with an interrupt signalled: takes every pending sample bell (counted, no wake). True when nothing else
-    /// was pending; false when another interrupt was, acknowledged here and held for `acknowledge` ([`held`]).
-    pub fn bells_only() -> bool {
-        loop {
-            if !signalled() {
-                return true;
-            }
-            let intid: u64;
-            // SAFETY: GIC CPU interface system registers (enabled at start): ICC_IAR1_EL1, then ICC_EOIR1_EL1 for a bell.
-            unsafe { core::arch::asm!("mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
-            if intid >= 1020 {
-                return true;
-            }
-            if !is(intid) {
-                word(HELD).store(intid + 1, Relaxed);
-                return false;
-            }
-            unsafe { core::arch::asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) };
-            add(IN_WAIT);
-        }
-    }
-    /// The INTID [`bells_only`] acknowledged and held, taken: `acknowledge` serves it before reading another (while it is
-    /// active no interrupt of its priority is signalled, so ISR_EL1 would not show the others).
-    #[inline(always)]
-    pub fn held() -> Option<u64> {
-        let h = word(HELD).load(Relaxed);
-        if h == 0 {
-            return None;
-        }
-        word(HELD).store(0, Relaxed);
-        Some(h - 1)
-    }
-    /// A bell `acknowledge` took (in a wait: the resident runs with interrupts masked, so only a wait acknowledges).
-    #[inline(always)]
-    pub fn in_wait() {
-        add(IN_WAIT);
-    }
-    /// `wfi` until something other than a sample bell ended it (each bell taken and counted).
-    pub fn wfi() {
-        loop {
-            // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-            unsafe { core::arch::asm!("dsb sy", "wfi") };
-            if !(signalled() && bells_only()) {
-                return;
-            }
-        }
     }
 }
 #[cfg(feature = "profile")]
@@ -182,6 +138,22 @@ pub use on::*;
 
 #[cfg(not(feature = "profile"))]
 mod off {
+    /// No bell: `natemu_abi::sample::next` is then `acknowledge`'s plain loop.
+    pub struct Bells;
+    impl natemu_abi::sample::Bells for Bells {
+        #[inline(always)]
+        fn bell(&self) -> u64 {
+            0
+        }
+        #[inline(always)]
+        fn held(&mut self) -> Option<u64> {
+            None
+        }
+        #[inline(always)]
+        fn hold(&mut self, _: u64) {}
+        #[inline(always)]
+        fn in_wait(&mut self) {}
+    }
     #[inline(always)]
     pub fn start() {}
     #[inline(always)]
@@ -190,21 +162,24 @@ mod off {
     }
     #[inline(always)]
     pub fn sample(_: &natemu_abi::NativeFrame, _: u64, _: u64) {}
-    #[inline(always)]
-    pub fn bells_only() -> bool {
-        false
-    }
-    #[inline(always)]
-    pub fn held() -> Option<u64> {
-        None
-    }
-    #[inline(always)]
-    pub fn in_wait() {}
-    #[inline(always)]
-    pub fn wfi() {
-        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-        unsafe { core::arch::asm!("dsb sy", "wfi") };
-    }
 }
 #[cfg(not(feature = "profile"))]
 pub use off::*;
+
+/// In a wait, with an interrupt signalled: every pending sample bell taken and counted; false when another interrupt is
+/// pending (held for `acknowledge`). Always false without the feature (an interrupt signalled is a wake).
+#[inline(always)]
+pub fn bells_only() -> bool {
+    cfg!(feature = "profile") && natemu_abi::sample::bells_only(&mut Gic, &mut Bells)
+}
+/// `wfi` until something other than a sample bell ended it (each bell taken and counted).
+#[inline(always)]
+pub fn wfi() {
+    loop {
+        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
+        unsafe { core::arch::asm!("dsb sy", "wfi") };
+        if !cfg!(feature = "profile") || !(natemu_abi::sample::Gic::signalled(&mut Gic) && bells_only()) {
+            return;
+        }
+    }
+}
