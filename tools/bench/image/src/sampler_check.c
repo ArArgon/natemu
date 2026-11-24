@@ -3,7 +3,7 @@
 //     sampler_check RUN SUMSFILE        the timed phases (init's bench=sampler-check; RUN 1 or 2: run 2's PHASE lines are PHASE2)
 //     sampler_check --sums              each phase's batch result only, untimed (build.sh pins them in init)
 //
-// Phases, each timed for PHASE_S seconds of the guest's CLOCK_MONOTONIC, in batches of fixed work started from the same
+// Phases, each timed for PHASE_S seconds of the guest's CLOCK_MONOTONIC (cross: CROSS_S), in batches of fixed work started from the same
 // state, so every batch of a phase gives the same result (checked; that result is the phase's checksum):
 //   1 alu    a one-block ALU loop (inline assembly: the body and its backward jnz are one block)
 //   2 call   a loop calling a small non-inlined function through a pointer (an indirect call, then its return)
@@ -34,6 +34,9 @@
 #include <time.h>
 
 #define PHASE_S 1.0
+// The crossing store spends about 99% of its time outside generated code (a resident trip), so its window is longer: at
+// 250 us, 3 to 60 EL0 samples a second were seen (guest-sampler-check-sample, M2 Max); 8 s gives 20 or more.
+#define CROSS_S 8.0
 #define ALU_N (1u << 20)          // iterations per batch
 #define CALL_N (1u << 18)
 #define CROSS_N (1u << 16)        // a crossing store is a shared probe: about 0.3 us under natemu
@@ -196,7 +199,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         for (int i = 0; i < 4; i++) {
             out(PORT_MARK, i + 1);
-            r[i] = window(i + 1, PHASES[i].name, PHASES[i].fn, PHASES[i].iters, PHASE_S, &all_ok);
+            r[i] = window(i + 1, PHASES[i].name, PHASES[i].fn, PHASES[i].iters, PHASES[i].fn == cross ? CROSS_S : PHASE_S, &all_ok);
         }
         out(PORT_MARK, 5);                 // phase 5: the control port
         r[4] = window(5, "ctrl-on", alu, ALU_N, PHASE_S, &all_ok);
