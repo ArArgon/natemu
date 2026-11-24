@@ -23,7 +23,9 @@ page-study = ["perf"]
 pcid-study = ["perf"]
 # EL0 sampler, measurement builds only (`src/bell.rs`, docs/restructure/el0-sampler-plan.md): each sample bell the host
 # rings (`natemu --profile NAME`) writes where the vCPU was to its sample ring (`natemu_abi::sample`), which the host drains;
-# nothing else changes. Composes with `perf` (they use separate areas).
+# nothing else changes. Composes with `perf` (they use separate areas), but a `perf,profile` build charges each bell as a
+# perf IRQ entry and may add stop re-arms (`rearms`) where a stop was wanted, so its buckets are reported, never used for a
+# decision (the unperturbed `perf` runs give those).
 profile = []
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
