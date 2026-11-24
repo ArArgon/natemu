@@ -144,7 +144,10 @@
 //! code is memory too), and (M2 Part 2, docs/restructure/firmware-mode.md) `firmware HEX`, once, before the first `cpu`
 //! line: a firmware image (whole 4 KiB pages) at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its
 //! stores dropped (the backing as the firmware boot mode's, `execution::prepare_with_firmware`; the MSRs stay the
-//! firmware's, below). LDTR and TR are the reset values, DR0-DR7 too, FCW 0040H as the SDM says (QEMU and KVM start
+//! firmware's, below), and (platform-devices plan, SMBIOS) `legacy_rom GPA HEX`, once, before the first `cpu` line, not with
+//! `firmware`: bytes at GPA in the legacy hole, the whole pages they touch a read-only legacy ROM range
+//! (`execution::Backing::write_legacy_rom`: read as memory, stores dropped, never fetched), as a direct boot's SMBIOS
+//! entry point page. LDTR and TR are the reset values, DR0-DR7 too, FCW 0040H as the SDM says (QEMU and KVM start
 //! with 037FH; no first-version instruction reads it; the rest of the x87 state, in the guest-state page, is FNINIT's).
 //! The MSRs are the firmware's, as for every driver-started vCPU (`execution::set_cpu`: `reset_msrs`, the MTRRs on),
 //! not power-on's (`cpu::power_on_msrs`). The vCPU's output gains `machine`: the fields `tests/interp/interp_rig.py`'s `fields()`
@@ -201,6 +204,8 @@ struct Space {
     mmio: Vec<(u64, u64, bool)>,
     /// The shared firmware image (`firmware HEX`; empty: none).
     firmware: Vec<u8>,
+    /// The shared legacy ROM bytes and their address (`legacy_rom GPA HEX`; `None`: none).
+    legacy_rom: Option<(u64, Vec<u8>)>,
 }
 /// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
 #[derive(Debug, PartialEq)]
@@ -502,6 +507,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("body", [a, h]) => space.bodies.push((Some(number(a)?), hex(h)?)),
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
             ("firmware", [h]) if space.firmware.is_empty() => space.firmware = hex(h)?,
+            ("legacy_rom", [a, h]) if space.legacy_rom.is_none() => space.legacy_rom = Some((number(a)?, hex(h)?)),
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
             ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
             ("identity", []) => space.identity = true,
@@ -555,7 +561,7 @@ fn machine_items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section
             })
         };
         match (words[0], &words[1..]) {
-            ("memory" | "firmware" | "rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
+            ("memory" | "firmware" | "legacy_rom" | "rip" | "rflags" | "gpr" | "cpl" | "xmm" | "mxcsr" | "svr" | "post" | "nmi" | "init", _) => {
                 items(&[*line], space, cpu.as_deref_mut())?
             }
             ("cr0" | "cr3" | "cr4" | "efer", [v]) => {
@@ -1898,6 +1904,15 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         return Err("firmware: an item of the shared space (before the first cpu line)".into());
     }
     let firmware = d.spaces[0].firmware.as_slice();
+    if d.spaces.iter().skip(1).any(|s| s.legacy_rom.is_some()) {
+        return Err("legacy_rom: an item of the shared space (before the first cpu line)".into());
+    }
+    if let Some((gpa, bytes)) = &d.spaces[0].legacy_rom {
+        let range = (gpa & !4095, (gpa + bytes.len() as u64).next_multiple_of(4096));
+        if bytes.is_empty() || !exec::legacy_rom_valid(range) || !firmware.is_empty() {
+            return Err(format!("legacy_rom {gpa:#x}: nonempty bytes in whole pages inside the legacy hole, without a firmware image"));
+        }
+    }
     let backing = match args.guest_state_alias {
         Some(va) => execution::prepare_with_guest_state_alias(
             resident,
@@ -1910,6 +1925,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         )?,
         None => execution::prepare_with_firmware(resident, code_bytes, n, ram_bytes as usize, pool, firmware)?,
     };
+    if let Some((gpa, bytes)) = &d.spaces[0].legacy_rom {
+        backing.write_legacy_rom(*gpa, bytes);
+    }
     // One answer map for the vCPUs under the pool (its entries are the answers other vCPUs compiled).
     let answers = std::sync::OnceLock::new();
     // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
@@ -3775,6 +3793,10 @@ mod tests {
         let d = parse("machine\nmemory 0x10000 90\ncpu\nrip 1\ncpu\nrip 2\ncr0 0x11\n").unwrap();
         assert_eq!(d.cpus.iter().map(|c| (c.rip, c.space)).collect::<Vec<_>>(), [(1, 0), (2, 0)]);
         assert_eq!(d.cpus[1].machine.as_ref().unwrap().cr0, 0x11);
+        // The legacy ROM page (SMBIOS's entry point): its address and bytes, once.
+        let d = parse("machine\nlegacy_rom 0xf0000 5f534d335f\n").unwrap();
+        assert_eq!(d.spaces[0].legacy_rom, Some((0xf_0000, b"_SM3_".to_vec())));
+        assert!(parse("machine\nlegacy_rom 0xf0000 00\nlegacy_rom 0xf0000 00\n").is_err());
         for bad in [
             "machine\ncode 90",
             "machine\nbody 0x1000 90",

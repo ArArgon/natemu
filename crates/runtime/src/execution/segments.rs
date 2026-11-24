@@ -396,7 +396,7 @@ pub(super) fn copy_mixed(s: &mut State, gpa: [u64; 2], first: usize, buf: &mut [
             continue;
         }
         let done = if super::mmio::rom(gpa) {
-            super::mmio::firmware().copy_out(gpa, chunk)
+            super::mmio::roms().copy_out(gpa, chunk)
         } else if !super::mmio::ram(gpa) && !write {
             chunk.fill(0xff);
             true
@@ -514,7 +514,7 @@ fn atomic_byte(
 #[inline(never)]
 fn rom_byte(s: &State, gpa: u64, mut update: impl FnMut(u8) -> Option<u8>) -> Result<u8, u8> {
     let mut byte = [0u8];
-    if !super::mmio::rom(gpa) || !super::mmio::firmware().copy_out(gpa, &mut byte) {
+    if !super::mmio::rom(gpa) || !super::mmio::roms().copy_out(gpa, &mut byte) {
         super::mmio::system_access(s)
     }
     match update(byte[0]) {

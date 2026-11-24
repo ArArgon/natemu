@@ -32,6 +32,20 @@ argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--
         "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "pvpanic-panic"]
 smoke = true
 
+# SMBIOS (platform-devices plan Task 3), at 1 and 2 vCPUs: the kernel's DMI scan of F0000H-FFFFFH finds the SMBIOS 3.0
+# entry point in the read-only legacy ROM page (dmesg `SMBIOS 3.0.0 present.` and `DMI: natemu natemu x86-64, BIOS natemu
+# VERSION 11/23/2026`); /sys/class/dmi/id names natemu; /sys/firmware/dmi/entries holds one entry of each type natemu
+# writes (0, 1, 3, 16, 17, 19, 32, 127) and one type 4 per vCPU; the init's S5 ends the run with Power(1).
+[suite.cases."platform[1]"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "platform", "--vcpus", "1"]
+smoke = true
+
+[suite.cases."platform[2]"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "platform", "--vcpus", "2"]
+needs = { cores = 2, perf = true }
+
 # The runner's self-check: the init's shell syntax, every case's dispatch, the judges' negative controls; no VM.
 [[suite]]
 name = "devices-selfcheck"

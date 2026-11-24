@@ -20,6 +20,7 @@ use std::fmt;
 pub mod acpi;
 pub mod firmware;
 pub mod multiboot;
+pub mod smbios;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -388,6 +389,11 @@ pub struct Inputs<'a> {
     /// 2.12/2.13 predate the field (boot.rst "Protocol 2.14 ... Add ACPI RSDP address"; zero-page.rst marks it ALL) and
     /// ignore it, finding the RSDP by their own search, which these tables do not serve (none lies below 1 MiB).
     pub acpi: Option<&'a acpi::Tables>,
+    /// The SMBIOS structure table ([`smbios::build`], platform-devices plan): placed after the ACPI blobs (so
+    /// [`Loaded::writes`] carries it) and, as they, inside the ACPI NVS range; its entry point is not the loader's (it lies
+    /// in the legacy ROM page, `execution::Backing::write_legacy_rom`). `None` leaves guest memory as without it. A
+    /// Multiboot image gets neither ACPI tables nor this (its map has no NVS range to keep it).
+    pub smbios: Option<&'a smbios::Smbios>,
 }
 /// Where everything went, and the BSP's entry state. A Multiboot image ([`multiboot::load`]) has no setup header
 /// (`setup` `None`): its `zero_page` is the Multiboot information structure, `initrd` its first module, `map` its
@@ -539,6 +545,12 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     }) {
         return Err(LoadError::BadTables(*gpa));
     }
+    let smbios = inputs.smbios.map(|t| (t.table_at(), &t.table[..]));
+    if let Some((gpa, table)) = smbios
+        && !(ACPI_NVS.0 <= gpa && gpa.checked_add(table.len() as u64).is_some_and(|end| end <= ACPI_NVS.1))
+    {
+        return Err(LoadError::BadTables(gpa));
+    }
 
     // boot_params: zeroed, then the setup header from 0x1f1 to its end, then the loader's fields.
     let mut z = vec![0u8; PAGE as usize];
@@ -633,6 +645,9 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     }
     for (gpa, bytes) in blobs {
         place(ram, &mut w, *gpa, bytes)?;
+    }
+    if let Some((gpa, table)) = smbios {
+        place(ram, &mut w, gpa, table)?;
     }
 
     // The BSP: 64-bit mode, paging (4-level, LA57 = 0), PAE, protected mode, ET (fixed) and NE; long mode; IF = 0.
@@ -748,6 +763,7 @@ pub(crate) mod tests {
             cmdline,
             initrd,
             acpi: None,
+            smbios: None,
         }
     }
 
@@ -1155,6 +1171,34 @@ pub(crate) mod tests {
         }
     }
 
+    /// The SMBIOS table (platform-devices plan) is the loader's last write, after the ACPI blobs, inside the ACPI NVS
+    /// range; a table outside it is refused as bad tables are. Without one the writes are those without SMBIOS.
+    #[test]
+    fn smbios_table_follows_the_acpi_tables() {
+        use LoadError::BadTables;
+        let ok = image(0x1000);
+        let tables = acpi::build(2, ACPI_NVS.0);
+        let input = smbios::SmbiosInput { vcpus: 2, cpuid_1: (1, 2), layout: SMALL, version: "0" };
+        let table = smbios::build(&input, tables.end().next_multiple_of(16));
+        let load_with = |t: Option<&smbios::Smbios>| {
+            let (v, r) = ram(SMALL.low_end);
+            let i = Inputs { acpi: Some(&tables), smbios: t, ..inputs(&ok, "", None) };
+            (load(&r, &SMALL, &i).map(|l| (l.writes, r.matches(table.table_at(), &table.table))), v)
+        };
+        let (with, there) = load_with(Some(&table)).0.unwrap();
+        let (without, _) = load_with(None).0.unwrap();
+        let (&(gpa, len), rest) = with.split_last().unwrap();
+        assert_eq!((gpa, len), (table.table_at(), table.table.len() as u64));
+        assert!(there, "the table's bytes in guest RAM");
+        assert_eq!(rest, &without[..], "nothing else changes");
+        assert!(tables.blobs.iter().all(|(a, b)| a + b.len() as u64 <= gpa), "after every ACPI blob");
+        assert!(gpa % 16 == 0 && ACPI_NVS.0 <= gpa && gpa + len <= ACPI_NVS.1);
+        for at in [ACPI_NVS.1 - 16, 0x1000] {
+            let far = smbios::build(&input, at);
+            assert_eq!(load_with(Some(&far)).0.unwrap_err(), BadTables(at));
+        }
+    }
+
     /// The placement, zero page, tables and entry state of a good load (the Python checker judges the same from a dump).
     #[test]
     fn loads() {
@@ -1170,6 +1214,7 @@ pub(crate) mod tests {
                 cmdline: "mitigations=off nokaslr",
                 initrd: Some(&rd),
                 acpi: Some(&tables),
+                smbios: None,
             },
         )
         .unwrap();

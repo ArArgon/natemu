@@ -84,6 +84,19 @@ pub(crate) fn ram_and_rom() -> GuestRam {
     let c = cache::control();
     unsafe { natemu_abi::execution::guest_memory(c.ram_bytes, c.firmware_bytes, GUEST_RAM_VA) }
 }
+/// [`ram_and_rom`] and the legacy ROM range (platform-devices plan, `Control::legacy_rom`: [`mmio::rom`]), the interpreter's
+/// data: what it reads (its fetches keep [`ram_and_rom`]: nothing runs from that range). The host never sets the range
+/// with a firmware image, so the regions are four at most.
+pub(crate) fn ram_and_roms() -> GuestRam {
+    let (start, end) = cache::control().legacy_rom;
+    let m = ram_and_rom();
+    if start == end {
+        m
+    } else {
+        // SAFETY: the hole's part of the alias's low span backs the range for the VM's life.
+        unsafe { m.and(start, end - start, GUEST_RAM_VA + start) }
+    }
+}
 /// EL0t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
 const BLOCK_SPSR: u64 = 0x340;
 /// SPSR.M of generated code (EL0t): every exception the resident serves came from there.
@@ -1766,13 +1779,13 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
         }
     }
 }
-/// [`fetch_walk`]: page `gpa`, which is not RAM, is in the firmware image ([`mmio::rom`]). Out of line, so the RAM path is
-/// as without a firmware. The image's pages lie past the per-page tables below 3 GiB of RAM, which the cache reads as
-/// holding no code to invalidate: the image is never written.
+/// [`fetch_walk`]: page `gpa`, which is not RAM, is in the firmware image ([`mmio::image`]; the legacy ROM range is never
+/// fetched from). Out of line, so the RAM path is as without a firmware. The image's pages lie past the per-page tables
+/// below 3 GiB of RAM, which the cache reads as holding no code to invalidate: the image is never written.
 #[cold]
 #[inline(never)]
 fn rom_page(gpa: u64) -> bool {
-    mmio::rom(gpa)
+    mmio::image(gpa)
 }
 /// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
 /// after a TLB miss: A bits set, any fault meaning no): `Some(flags)` ([`leaves`]). The walk's A writes may invalidate
@@ -4842,7 +4855,7 @@ fn install_ones(s: &mut State, va: u64) {
 /// memory; its stores never reach the shadow). Whatever the memory type: the image never changes, so the order of its reads
 /// cannot be seen. No writable bit or code mark is involved. On table capacity exhaustion, as [`install`].
 fn install_rom(s: &mut State, va: u64, gpa: u64, global: bool) {
-    let image = mmio::firmware();
+    let image = mmio::roms();
     if tables::install(s.cpu.cpl, va, &image, gpa, false, global).is_ok() {
         return;
     }

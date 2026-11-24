@@ -1055,6 +1055,27 @@ fn pvpanic_key_parses_and_set_turns_it_off() {
     assert!(err(load_old(&["--set", "machine.pvpanic=maybe"])).contains("--set machine.pvpanic: bad boolean"));
 }
 
+/// `machine.smbios`: on by default, off from the file or with `--set machine.smbios=false`, and the launch follows.
+#[test]
+fn smbios_key_parses_and_set_turns_it_off() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "r".into(), Vec::new(), None).unwrap().smbios;
+    let c = load_old(&[]).unwrap();
+    assert!(c.smbios && boot(&c));
+    let c = load_old(&["--set", "machine.smbios=false"]).unwrap();
+    assert!(!c.smbios && !boot(&c));
+    let (_, c) = load_file(&format!("[machine]\nsmbios = false\n{MIN}"), &[]);
+    let c = c.unwrap();
+    assert!(!c.smbios && !boot(&c));
+    let (_, c) = load_file(
+        &format!("[machine]\nsmbios = false\n{MIN}"),
+        &["--set", "machine.smbios=on"],
+    );
+    assert!(c.unwrap().smbios, "--set wins over the file");
+    assert!(err(load_file(&format!("[machine]\nsmbios = \"no\"\n{MIN}"), &[]).1).contains("machine.smbios"));
+    assert!(err(load_old(&["--set", "machine.smbios=maybe"])).contains("--set machine.smbios: bad boolean"));
+}
+
 #[test]
 fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
     let _env = lock();

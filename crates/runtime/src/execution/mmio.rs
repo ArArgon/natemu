@@ -26,22 +26,33 @@ use natemu_abi::execution::{
     REQUEST_DEVICE_POLL, REQUEST_PAGE, mmio as status,
 };
 
-/// `gpa` is guest RAM (anything else is a device page, or the firmware image: [`rom`]).
+/// `gpa` is guest RAM (anything else is a device page, or ROM: [`rom`]).
 pub(super) fn ram(gpa: u64) -> bool {
     guest_ram().range(gpa, 1).is_some()
 }
-/// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `gpa`, which is not RAM, is in the firmware image
-/// (`exec::FIRMWARE_END` - `Control::firmware_bytes` .. 4 GiB; none when that is 0). Read and fetched as RAM, a store to it
-/// dropped, as x86 drops a store to ROM. Asked only on the paths that found a page outside RAM, so RAM's paths are as
-/// without a firmware.
+/// `gpa`, which is not RAM, is ROM: read as RAM, a store to it dropped, as x86 drops a store to ROM. Asked only on the paths
+/// that found a page outside RAM, so RAM's paths are as without one. Either the firmware image ([`image`]) or (the
+/// platform-devices plan, SMBIOS) the legacy ROM range in the legacy hole (`Control::legacy_rom`, none when `(0, 0)`: the
+/// SMBIOS entry point's page at F0000H, which a direct boot's host writes): its read-only shadows go onto the hole's own
+/// alias, which nothing else uses, and it is never fetched from (it holds no code: a fetch there is not RAM).
 pub(super) fn rom(gpa: u64) -> bool {
+    let (start, end) = cache::control().legacy_rom;
+    image(gpa) || gpa.wrapping_sub(start) < end - start
+}
+/// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `gpa`, which is not RAM, is in the firmware image
+/// (`exec::FIRMWARE_END` - `Control::firmware_bytes` .. 4 GiB; none when that is 0): ROM that is also fetched as RAM.
+pub(super) fn image(gpa: u64) -> bool {
     let bytes = cache::control().firmware_bytes;
     gpa.wrapping_sub(natemu_abi::execution::FIRMWARE_END - bytes) < bytes
 }
-/// The firmware image through the resident's alias (mapped read-only: a store reaching it would halt the resident).
-pub(super) fn firmware() -> GuestRam {
-    // SAFETY: the host maps the image's blocks of the alias at prepare, for the VM's life.
-    unsafe { natemu_abi::execution::firmware_ram(cache::control().firmware_bytes, GUEST_RAM_VA) }
+/// The ROM ([`rom`]: the firmware image and the legacy ROM range) through the resident's alias (the image's blocks mapped
+/// read-only: a store reaching it would halt the resident; the legacy hole's part of the low RAM span, which no shadow but
+/// a read-only one maps and the resident never writes).
+pub(super) fn roms() -> GuestRam {
+    let c = cache::control();
+    // SAFETY: the host maps the image's blocks of the alias at prepare, and the low span (the hole included), for the VM's
+    // life.
+    unsafe { natemu_abi::execution::rom_ram(c.firmware_bytes, c.legacy_rom, GUEST_RAM_VA) }
 }
 fn exchange() -> *mut Mmio {
     MMIO_VA as *mut Mmio
@@ -93,8 +104,9 @@ pub(super) fn ones(
 /// Share the native read-shadow classification with resident operations whose CPU bank already
 /// describes the instruction. A strict unassigned stop is reported to the caller at its own fault root.
 fn readable_pages(s: &mut State, touched: [Option<u64>; 2], mut device: [Option<u64>; 2]) -> Result<bool, u64> {
-    // M2 Part 2: a page of the firmware image is shadowed read-only onto the image (no host request; not global, so a CR3
-    // load drops it and the next read shadows it again); the caller retries the read, which then runs natively.
+    // M2 Part 2: a page of ROM (the firmware image, or the legacy ROM range) is shadowed read-only onto its own bytes (no
+    // host request; not global, so a CR3 load drops it and the next read shadows it again); the caller retries the read,
+    // which then runs natively.
     if device.iter().flatten().any(|&g| rom(g)) {
         for (va, gpa) in touched.into_iter().zip(device.iter_mut()) {
             if let (Some(va), Some(g)) = (va, *gpa)
@@ -289,13 +301,13 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     // the linear address, never a Site/Block reference into cache metadata across that wait.
     let linear = site_address(site, f);
     bank_at(&mut s, f, b, site);
-    // M2 Part 2: a store to the firmware image is dropped here, with no host exit (x86's ROM); a load reads it (none comes
-    // here: [`translate`] shadows its reads).
+    // M2 Part 2: a store to ROM (the firmware image, the legacy ROM range) is dropped here, with no host exit (x86's ROM); a
+    // load reads it (none comes here: [`translate`] shadows its reads).
     let image = rom(gpa).then(|| match data {
         Some(_) => 0,
         None => {
             let mut v = [0u8; 8];
-            if !firmware().copy_out(gpa, &mut v[..(width as usize).min(8)]) {
+            if !roms().copy_out(gpa, &mut v[..(width as usize).min(8)]) {
                 halt(&s, stop::BAD_REPLY)
             }
             u64::from_le_bytes(v)

@@ -83,6 +83,42 @@ impl Backing {
     pub unsafe fn ram(&self) -> GuestRam {
         self.ram
     }
+    /// Platform-devices plan (SMBIOS): `bytes` into the legacy hole's backing at guest-physical `gpa`, and the whole pages
+    /// they touch made every vCPU's legacy ROM range (`cache::Control::legacy_rom`): read as memory, a store to them dropped
+    /// (x86's ROM), never fetched from. [`GuestRam`] leaves the hole out (so no loader or device write reaches it); the
+    /// backing maps the whole low span, holes included, at `ram_offset + gpa`, as the resident's alias does. Before any vCPU
+    /// runs, once; not with a firmware image (whose boot gets its tables from the firmware).
+    ///
+    /// # Panics
+    /// When the pages are not inside `exec::LEGACY_HOLE`, the VM's mapping and the resident's alias, when a range is
+    /// already set, or with a firmware image.
+    pub fn write_legacy_rom(&self, gpa: u64, bytes: &[u8]) {
+        let range = (gpa & !4095, (gpa + bytes.len() as u64).next_multiple_of(4096));
+        assert!(!bytes.is_empty() && exec::legacy_rom_valid(range), "legacy ROM {range:x?}: whole pages inside the legacy hole");
+        assert!(self.readable == self.ram, "a legacy ROM range with a firmware image");
+        // Guest-physical 0's backing offset: the alias's first region starts there (RAM's from 0).
+        let ram_offset = self.ram.range(0, 1).expect("guest RAM from 0") as usize - self.memory.0 as usize;
+        assert!(ram_offset + range.1 as usize <= self.memory.1, "legacy ROM {range:x?} past the VM's mapping");
+        // The resident's alias of low RAM spans [0, min(R, 3 GiB)), the hole included (`prepare`'s low data span).
+        let alias_end = self.memory.1 as u64 - ram_offset as u64;
+        assert!(range.1 <= alias_end.min(exec::LOW_RAM_END), "legacy ROM {range:x?} past the resident's alias");
+        self.memory.copy(ram_offset + gpa as usize, bytes);
+        for v in 0..self.n {
+            let area = self.vcpu(v);
+            let mut control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+            assert_eq!(control.legacy_rom, (0, 0), "a legacy ROM range set twice");
+            control.legacy_rom = range;
+            area.memory.write_record(area.base + cache::LOOKUP_OFFSET + cache::CONTROL, control);
+        }
+    }
+    /// `N` bytes of the legacy ROM range at `gpa` ([`Backing::write_legacy_rom`]), `None` unless all lie inside it (the
+    /// test driver's dump of a run).
+    pub fn read_legacy_rom<const N: usize>(&self, gpa: u64) -> Option<[u8; N]> {
+        let c: cache::Control = self.vcpu(0).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+        let (start, end) = c.legacy_rom;
+        let ram_offset = self.ram.range(0, 1)? as usize - self.memory.0 as usize;
+        (start <= gpa && gpa + N as u64 <= end).then(|| self.memory.read::<N>(ram_offset + gpa as usize))
+    }
     /// vCPU `v`'s view.
     pub fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
@@ -7629,6 +7665,52 @@ mod tests {
                 [0x5a; 8]
             );
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The legacy ROM page (SMBIOS's entry point at F0000H) in a prepared backing: the bytes land in the hole's backing,
+    /// where the resident's alias of guest-physical F0000H (the address its read-only shadows take, `mmio::rom`) reads
+    /// them back through the window's own block descriptor, while the host's guest RAM still leaves the hole out; every
+    /// vCPU's `Control::legacy_rom` names the page. Refused outside the hole, twice, or with a firmware image.
+    #[test]
+    fn legacy_rom_reads_back_through_the_resident_alias() {
+        let path = std::env::temp_dir().join(format!("natemu-legacy-rom-{}.elf", std::process::id()));
+        std::fs::write(&path, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let resident = path.to_str().unwrap();
+        let entry: Vec<u8> = (0..24u8).map(|k| k.wrapping_mul(37) ^ 0x5f).collect();
+        for (n, pool) in [(1, false), (2, true)] {
+            let b = prepare_with_pool(resident, cache::CODE_BYTES, n, 4 << 20, pool).unwrap();
+            for v in 0..n {
+                let c: cache::Control = b.vcpu(v).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+                assert_eq!(c.legacy_rom, (0, 0), "none until written");
+            }
+            b.write_legacy_rom(0xf_0000, &entry);
+            for v in 0..n {
+                let window = v * b.stride;
+                let c: cache::Control = b.vcpu(v).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+                assert_eq!(c.legacy_rom, (0xf_0000, 0xf_1000));
+                // The alias address the resident shadows for gpa F0000H: GUEST_RAM_VA + F0000H, in the window's third GiB
+                // (its level-2 table, `RAM_TABLES_OFFSET` + 4096), block 0. Its output address is the backing's IPA.
+                let alias = (exec::GUEST_RAM_VA - PRIVATE) as usize + 0xf_0000;
+                let table = exec::RAM_TABLES_OFFSET + ((alias >> 30) - 1) * 4096;
+                let d = u64::from_le_bytes(b.memory.read::<8>(window + table + (alias % (1 << 30)) / cache::BLOCK * 8));
+                assert_eq!(d & 3, 1, "a block descriptor");
+                let at = (d & 0x0000_ffff_ffe0_0000) - crate::IPA + (alias % cache::BLOCK) as u64;
+                assert_eq!(b.memory.read::<24>(at as usize).to_vec(), entry);
+                assert_eq!(b.memory.read::<8>(at as usize + 24), [0; 8], "the rest of the page is zero");
+            }
+            // The host's guest RAM (loaders, devices) cannot reach the hole; nor can the readable view.
+            assert_eq!((b.ram.range(0xf_0000, 1), b.readable.range(0xf_0000, 1)), (None, None));
+            let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.write_legacy_rom(0xf_0000, &entry)));
+            assert!(again.is_err(), "a second range");
+        }
+        let b = prepare_with_pool(resident, cache::CODE_BYTES, 1, 4 << 20, false).unwrap();
+        for (gpa, len) in [(0x9_f000, 0x2000), (0xf_f000, 0x1001), (0x10_0000, 1), (0xf_0000, 0)] {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.write_legacy_rom(gpa, &vec![1; len])));
+            assert!(r.is_err(), "{gpa:#x}+{len:#x}");
+        }
+        let fw = prepare_with_firmware(resident, cache::CODE_BYTES, 1, 4 << 20, false, &[0xcc; 4096]).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fw.write_legacy_rom(0xf_0000, &entry))).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

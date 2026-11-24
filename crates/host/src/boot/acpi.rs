@@ -70,6 +70,12 @@ pub struct Tables {
     pub mailbox: u64,
     pub(crate) blobs: Vec<(u64, Vec<u8>)>,
 }
+impl Tables {
+    /// The end of the highest blob: the SMBIOS table follows (16-byte aligned, `smbios::build`).
+    pub fn end(&self) -> u64 {
+        self.blobs.iter().map(|(a, b)| a + b.len() as u64).max().unwrap_or(self.rsdp)
+    }
+}
 
 /// The board's optional platform devices the tables describe (platform-devices plan). [`Board::default`] is all off: the
 /// tables are then byte for byte those of the board without them.

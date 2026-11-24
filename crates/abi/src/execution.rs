@@ -221,6 +221,23 @@ pub const fn firmware_size(bytes: u64) -> bool {
 pub const unsafe fn firmware_ram(bytes: u64, va: u64) -> crate::guest_memory::GuestRam {
     unsafe { crate::guest_memory::GuestRam::new(FIRMWARE_END - bytes, bytes, va + FIRMWARE_END - bytes) }
 }
+/// Platform-devices plan (SMBIOS): whether `(start, end)` names a legacy ROM range (`cache::Control::legacy_rom`): `(0, 0)`
+/// (none), or whole pages `[start, end)`, nonempty, inside [`LEGACY_HOLE`]. On a PC the system BIOS ROM is there
+/// (F0000H-FFFFFH); natemu's holds the SMBIOS entry point. Read as memory, a store to it dropped, never fetched from: no
+/// code is put there, so a fetch from it is not RAM, as from the rest of the hole.
+pub const fn legacy_rom_valid((start, end): (u64, u64)) -> bool {
+    start == 0 && end == 0
+        || start % 4096 == 0 && end % 4096 == 0 && LEGACY_HOLE.start <= start && start < end && end <= LEGACY_HOLE.end
+}
+/// The read-only guest memory: the firmware image of `firmware` bytes ([`firmware_ram`]) and the legacy ROM range
+/// `legacy` ([`legacy_rom_valid`]), through the alias of guest-physical 0 at `va`. Two regions, either empty.
+///
+/// # Safety
+/// As [`firmware_ram`]; `[va + start, va + end)` backs the legacy ROM range while the value is used.
+pub const unsafe fn rom_ram(firmware: u64, legacy: (u64, u64), va: u64) -> crate::guest_memory::GuestRam {
+    let image = unsafe { firmware_ram(firmware, va) };
+    unsafe { image.and(legacy.0, legacy.1 - legacy.0, va + legacy.0) }
+}
 /// Installed RAM ([`guest_ram`]) and, when `firmware` is nonzero, the firmware image as one more region: guest memory
 /// that can be read or fetched. Its users drop stores to the image themselves.
 ///
@@ -1007,6 +1024,11 @@ pub mod cache {
         /// stubs taken): an in-range operand under a writable expand-up FS or GS takes none. A plain counter in every
         /// build. Appended.
         pub segment_checks: u64,
+        /// Platform-devices plan (SMBIOS): the read-only legacy ROM range `[start, end)` inside the legacy hole
+        /// ([`super::LEGACY_HOLE`]: whole pages, [`super::legacy_rom_valid`]), its bytes in the hole's backing and read through
+        /// the alias as the firmware image's are; `(0, 0)`, the default, is none. Set by the host before any vCPU runs
+        /// (`Backing::write_legacy_rom`, a direct boot with SMBIOS); never with a firmware image. Appended.
+        pub legacy_rom: (u64, u64),
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -5115,6 +5137,29 @@ mod tests {
         assert!(!firmware_size(0) && !firmware_size(0x1_0800) && !firmware_size(MAX_FIRMWARE_BYTES + 4096));
         // Above the I/O APIC and the local APIC, inside the hole RAM leaves below 4 GiB.
         assert!(FIRMWARE_END - MAX_FIRMWARE_BYTES > 0xfee0_0fff && FIRMWARE_END - MAX_FIRMWARE_BYTES >= LOW_RAM_END);
+    }
+
+    /// The legacy ROM range (SMBIOS's entry point page): whole pages inside the legacy hole or none, read through the
+    /// alias at its guest-physical offset beside the firmware image, never RAM.
+    #[test]
+    fn legacy_rom_region() {
+        const VA: u64 = 0x10_0000_0000;
+        let page = (0xf_0000, 0xf_1000);
+        assert!(legacy_rom_valid((0, 0)) && legacy_rom_valid(page) && legacy_rom_valid((0xa_0000, 0x10_0000)));
+        for bad in [(0xf_0000, 0xf_0000), (0xf_0800, 0xf_1000), (0xf_0000, 0xf_0fff), (0x9_f000, 0xa_1000),
+                    (0xf_f000, 0x10_1000), (0x10_0000, 0x10_1000), (0xf_1000, 0xf_0000)] {
+            assert!(!legacy_rom_valid(bad), "{bad:x?}");
+        }
+        let roms = unsafe { rom_ram(0, page, VA) };
+        assert_eq!(roms.range(0xf_0000, 4096), Some((VA + 0xf_0000) as *mut u8));
+        assert_eq!(roms.range(0xf_0fff, 2), None);
+        assert_eq!(roms.range(0xe_f000, 1), None);
+        assert!(!ram_contains(2 << 20, 0xf_0000));
+        let both = unsafe { rom_ram(0x1000, page, VA) };
+        assert_eq!(both.range(FIRMWARE_END - 1, 1), Some((VA + FIRMWARE_END - 1) as *mut u8));
+        assert_eq!(both.range(0xf_0018, 8), Some((VA + 0xf_0018) as *mut u8));
+        let none = unsafe { rom_ram(0, (0, 0), VA) };
+        assert_eq!((none.range(0, 1), none.range(0xf_0000, 1)), (None, None));
     }
 
     #[test]

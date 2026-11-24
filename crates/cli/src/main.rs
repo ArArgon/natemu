@@ -53,7 +53,9 @@
 //!
 //! **Platform devices.** `machine.pvpanic` (default on; `--set machine.pvpanic=false` turns it off) adds the pvpanic device
 //! (`natemu::pvpanic`, `natemu::linux::Boot::pvpanic`): a guest kernel's panic ends the run with `Power(4)` (the
-//! driver's `panic`), exit status 2.
+//! driver's `panic`), exit status 2. `machine.smbios` (default on; `--set machine.smbios=false` turns it off) adds SMBIOS 3.0
+//! tables (`natemu::boot::smbios`, `natemu::linux::Boot::smbios`): the guest's DMI scan finds their entry point at F0000H;
+//! a firmware boot ignores it.
 mod config;
 use clap::{CommandFactory, FromArgMatches};
 use natemu::execution::Stop;

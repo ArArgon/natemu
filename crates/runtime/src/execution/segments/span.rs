@@ -96,7 +96,7 @@ impl Span {
                 Backing::Ram => copy_ram(s, [gpa, 0], len, chunk, write),
                 Backing::Rom if write => {}
                 Backing::Rom => {
-                    if !mmio::firmware().copy_out(gpa, chunk) {
+                    if !mmio::roms().copy_out(gpa, chunk) {
                         halt(s, stop::UNSUPPORTED_SYSTEM)
                     }
                 }

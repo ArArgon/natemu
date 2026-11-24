@@ -17,7 +17,8 @@ order of an INIT before TF, and on two CPUs a SIPI that leaves an interpreted HL
 with a firmware image (`firmware HEX`, docs/restructure/firmware-mode.md: the reset vector fetched from it, stores to it
 dropped by the interpreter, by translated code and by the resident's `copy`, the resident's reads of it, code run from
 it while a RAM page holding translations is written, the same above 3 GiB of RAM, and a LOCKed access to it refused, the
-recorded deviation). `--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop
+recorded deviation), and with a legacy ROM page (`legacy_rom GPA HEX`, the SMBIOS entry point's page at F0000H: Linux's
+DMI scan's string reads of it run natively, stores to it are dropped). `--faults` runs the fault and transition cases against the models (interp_faults.py: the typed stop
 and record the model gives with nothing committed, or the state it reaches; modes_model's programs to where the model
 ends them). `--litmus` runs litmus patterns between an interpreting vCPU and a translated one (interp_litmus.py: every
 outcome in ordering_model's allowed set, each pattern's overlap outcomes seen), `--runs` runs of `--k` iterations each.
@@ -42,6 +43,7 @@ def description(case: dict, common: list) -> str:
     every case), its whole starting state, every stop's linear address (ids in order) and every compared window."""
     st = case['state']
     lines = ['machine'] + ([f"firmware {case['firmware']}"] if case.get('firmware') else [])
+    lines += [f"legacy_rom {case['legacy_rom'][0]:#x} {case['legacy_rom'][1]}"] if case.get('legacy_rom') else []
     blocks = [*common, *case['memory'], case['code']]
     lines += [f"memory {num(b['addr']):#x} {b['data']}" for b in blocks if b['data']]
     lines.append(f"rip {num(st['eip']):#x}")
@@ -364,6 +366,45 @@ def firmware_selftests() -> list:
     return out
 
 
+# --- the legacy ROM page's self-tests (platform-devices plan, SMBIOS): a page of the legacy hole read as ROM ---
+
+LEGACY_ROM = 0xF0000    # the SMBIOS entry point's page; the next page (F1000H) is unassigned
+LEGACY_BYTES = bytes((k * 37 + 11) & 0xFF for k in range(4096))
+
+
+def legacy_rom_selftests() -> list:
+    """(name, case, want) in 64-bit mode at CPL 0 over the common tables (F0000H identity mapped), the page F0000H the
+    driver's legacy ROM (`legacy_rom`, as a direct boot's SMBIOS entry point page): Linux's DMI scan reads it with
+    memcpy_fromio (`rep movsl`, `movsw`, `movsb`, x86 lib/iomem.c) and a scalar load; every form runs without a stop, a
+    string read past its end meets the unassigned page (all-ones). Stores to it (a translated MOV after a read shadowed it,
+    a byte store, SGDT through the resident's copy) are dropped, each read back; a RAM store still lands."""
+    word = lambda o, n: int.from_bytes(LEGACY_BYTES[o:o + n], 'little')
+    segs64 = {'es': G.loaded(0x10), 'cs': G.loaded(0x28), 'ss': G.loaded(0x10), 'ds': G.loaded(0x10), 'fs': G.loaded(0x40),
+              'gs': G.loaded(0x48)}
+    ctl64 = dict(cr0=G.CR0_PG | G.CR0_ET | G.CR0_PE, cr3=G.PML4, cr4=G.CR4_PAE, efer=G.EFER_LME | G.EFER_LMA)
+    reads = nasm(64, G.CODE, ['cld', f'mov esi, {LEGACY_ROM:#x}', f'mov edi, {G.DATA:#x}', 'mov ecx, 4', 'rep movsd',
+                              'movsw', 'movsb', f'mov rax, [{LEGACY_ROM + 0x18:#x}]',
+                              f'mov esi, {LEGACY_ROM + 0xFFC:#x}', f'mov edi, {G.DATA + 0x20:#x}', 'mov ecx, 8', 'rep movsb'])
+    stores = nasm(64, G.CODE, [f'mov esi, {LEGACY_ROM:#x}', 'mov eax, [rsi + 0x10]', 'mov dword [rsi + 0x10], 0x11111111',
+                               'mov ebx, [rsi + 0x10]', 'mov byte [rsi + 0x11], 0x22', 'mov ecx, [rsi + 0x10]',
+                               'sgdt [rsi + 0x20]', 'mov rdx, [rsi + 0x20]', f'mov dword [{G.DATA:#x}], 0x77'])
+    out = []
+    window = LEGACY_BYTES[:19] + bytes(13) + LEGACY_BYTES[0xFFC:] + b'\xff' * 4 + bytes(8)
+    for name, code, want in (
+            ('string_reads_of_legacy_rom_run_natively', reads,
+             {'stop': 0, 'window0': window.hex(), 'gpr': {0: word(0x18, 8)}, 'rip': G.CODE + len(reads)}),
+            ('stores_to_legacy_rom_are_dropped', stores,
+             {'stop': 0, 'eax': word(0x10, 4), 'ebx': word(0x10, 4), 'ecx': word(0x10, 4), 'window0': '77' + '00' * 47,
+              'gpr': {2: word(0x20, 8)}, 'rip': G.CODE + len(stores)})):
+        out.append((name, {'name': name, 'legacy_rom': (LEGACY_ROM, LEGACY_BYTES.hex()),
+                           'state': rom_state({'esp': G.STACK}, G.CODE, segs64, ctl64, (G.IDT64, 0x1ff)),
+                           'code': {'addr': G.h(G.CODE), 'data': code.hex()},
+                           'memory': [{'addr': G.h(G.DATA), 'data': '00' * 48}],
+                           'stops': [{'id': 0, 'linear': G.h(G.CODE + len(code))}],
+                           'compare': {'windows': [{'addr': G.h(G.DATA), 'len': 48}]}}, want))
+    return out
+
+
 def typed_stop(out: dict, want: dict) -> list:
     """The differences of how a run ended from `want`: a typed stop (`resident`, its name; `fault`, the record's first
     three words) or none."""
@@ -459,7 +500,7 @@ def main(argv=None):
             diffs = judge_fault(case, out, want)
             results.append({'name': name, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs})
     elif a.selftest:
-        tests = selftests() + interp_selftests() + firmware_selftests()
+        tests = selftests() + interp_selftests() + firmware_selftests() + legacy_rom_selftests()
         for (name, case, want), out in zip(tests, pool.map(lambda t: go(t[0], t[1]), tests)):
             got = out.get('machine')
             fields = {k: v for k, v in want.items() if k not in ('resident', 'fault', 'rip', 'gpr')}

@@ -2,7 +2,7 @@
 """L2 iasl check: the ACPI tables the loader writes (`crates/host/src/boot/acpi.rs`), judged by ACPICA's `iasl`
 (Homebrew `acpica`, 20260408), for N = 1..4 processors, each twice: as the driver's defaults build them (`nN`), and with
 the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the DSDT then lists the
-pvpanic device).
+pvpanic device; the SMBIOS tables, which must leave the ACPI tables as they are, are in the dump too).
 
     python3 tests/boot/run_l2_iasl.py --out DIR [--host HOST] [--iasl IASL]
 
@@ -33,7 +33,7 @@ KERNEL = RAW_ROOT / 'kernel-census-20261028-01/dl/linux'
 ZERO_PAGE = 0x10000
 MV0 = 'ACPI table terminates in the middle of a data structure!'
 # The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
-DEVICES = ['--pvpanic']
+DEVICES = ['--pvpanic', '--smbios']
 
 
 def build():

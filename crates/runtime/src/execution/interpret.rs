@@ -604,9 +604,9 @@ impl Mem<'_> {
             None => halt(self.s, stop::INTERP_BUG), // an access no check covered
         }
     }
-    /// The resident's pointer to `n` bytes of guest RAM or the firmware image at `gpa`.
+    /// The resident's pointer to `n` bytes of guest RAM or ROM (the firmware image, the legacy ROM range) at `gpa`.
     fn pointer(&self, gpa: u64, n: u8) -> *mut u8 {
-        match ram_and_rom().range(gpa, u64::from(n)) {
+        match ram_and_roms().range(gpa, u64::from(n)) {
             Some(p) => p,
             None => halt(self.s, stop::INTERP_BUG), // a RAM page whose bytes are not: a classification bug
         }

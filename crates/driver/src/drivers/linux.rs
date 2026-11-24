@@ -5,7 +5,7 @@
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
-//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--firmware [--firmware-start reset|flat32]]
+//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--smbios] [--firmware [--firmware-start reset|flat32]]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
@@ -47,7 +47,10 @@
 //! Platform devices (platform-devices plan; all off by default, so a run without the flags is today's machine):
 //! `--pvpanic` adds the pvpanic device at port 505H (`natemu::pvpanic`) and its `\_SB.PEVT` to the DSDT, in a run and in
 //! a `--load-only` dump alike: the guest's PANICKED write ends the run with the stop `panic`, and the result gains
-//! `pvpanic` (`crash_loaded`: the guest's CRASH_LOADED writes).
+//! `pvpanic` (`crash_loaded`: the guest's CRASH_LOADED writes). `--smbios` adds the SMBIOS 3.0 tables (`natemu::boot::smbios`):
+//! the structure table after the ACPI tables, the entry point in the read-only legacy ROM page at F0000H, in a run and in a
+//! `--load-only` dump alike (the dump's records gain the table, a loader write, and last the 24-byte entry point at F0000H,
+//! which is not guest RAM). A Multiboot image gets neither.
 //!
 //! M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `--firmware` boots IMAGE as a firmware image
 //! instead of a kernel (`Boot::firmware`): at guest-physical [4 GiB - its size, 4 GiB), vCPU 0 at the reset vector in the
@@ -174,6 +177,9 @@ pub(crate) struct Args {
     /// The pvpanic device at port 505H, in the DSDT as QEMU0001 (a guest panic ends the run with the stop `panic`)
     #[arg(long)]
     pvpanic: bool,
+    /// SMBIOS 3.0 tables, the entry point at F0000H in a read-only legacy ROM page (a bzImage boot only)
+    #[arg(long)]
+    smbios: bool,
     /// IMAGE is a firmware image (the firmware boot mode), not a kernel
     #[arg(long)]
     firmware: bool,
@@ -216,6 +222,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         no_mailbox,
         debug_exit,
         pvpanic,
+        smbios,
         firmware,
         firmware_start,
     } = args;
@@ -281,11 +288,13 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             ..Default::default()
         };
         let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox, board);
+        let smbios = (smbios && !boot::is_multiboot(&image)).then(|| boot::smbios::for_board(vcpus, layout, &tables));
         let inputs = Inputs {
             image: &image,
             cmdline: &cmdline,
             initrd: initrd.as_deref(),
             acpi: Some(&tables),
+            smbios: smbios.as_ref(),
         };
         // Zero-filled on demand: only the pages the loader writes are touched.
         let mut host = vec![0u64; exec::ram_end(ram) as usize / 8];
@@ -293,7 +302,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let guest = unsafe { exec::guest_ram(ram, host.as_mut_ptr() as u64) };
         let loaded = boot::load_kernel(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
         if let Some(path) = &dump {
-            write_dump(path, &guest, &loaded)?;
+            let rom = smbios.as_ref().map(|s| (boot::smbios::ENTRY_POINT, &s.entry[..]));
+            write_dump(path, &guest, &loaded, rom)?;
         }
         let _ = (guest, &mut host); // `guest` is not used past here; `host` lives to the end of this block
         let placement = Placement::new(&loaded, &layout);
@@ -327,6 +337,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         mailbox: !no_mailbox,
         debug_exit,
         pvpanic,
+        smbios,
         ..if firmware {
             natemu::linux::Boot {
                 firmware: Some(natemu::boot::firmware::Firmware {
@@ -361,7 +372,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     // SAFETY: `guest` is used only while `prepared` lives (this function).
     let guest = unsafe { prepared.guest() };
     if let Some(path) = &dump {
-        write_dump(path, &guest, loaded)?;
+        let rom = backing.read_legacy_rom::<24>(boot::smbios::ENTRY_POINT);
+        write_dump(path, &guest, loaded, rom.as_ref().map(|e| (boot::smbios::ENTRY_POINT, &e[..])))?;
     }
     let started = std::time::Instant::now();
     // L5: `--clock-trace FILE`, every 20 ms: TSC ns since the VM's epoch (the guest's TSC), then the PIT's and RTC's tick
@@ -584,17 +596,19 @@ fn stop_name(stop: &Stop) -> String {
 }
 
 /// The loader's writes, read back from guest RAM.
-fn write_dump(path: &str, guest: &GuestRam, loaded: &Loaded) -> Result<()> {
+/// The dump: one record per loader write, then `rom` (the legacy ROM page's bytes and their address, outside guest RAM).
+fn write_dump(path: &str, guest: &GuestRam, loaded: &Loaded, rom: Option<(u64, &[u8])>) -> Result<()> {
     let mut out = Vec::new();
+    let mut record = |gpa: u64, data: &[u8]| {
+        out.extend(gpa.to_le_bytes().into_iter().chain((data.len() as u64).to_le_bytes()).chain(data.iter().copied()))
+    };
     for &(gpa, length) in &loaded.writes {
         let mut data = vec![0u8; length as usize];
         guest.copy_out(gpa, &mut data);
-        out.extend(
-            gpa.to_le_bytes()
-                .into_iter()
-                .chain(length.to_le_bytes())
-                .chain(data),
-        );
+        record(gpa, &data);
+    }
+    if let Some((gpa, data)) = rom {
+        record(gpa, data);
     }
     fs::write(path, out).map_err(|e| format!("{path}: {e}"))
 }

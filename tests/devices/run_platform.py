@@ -42,6 +42,11 @@ APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'ls', 'ba
 VM_SECONDS = 120
 CMDLINE = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 PVPANIC_CAPABILITY = '/sys/bus/platform/devices/QEMU0001:00/capability'
+# platform: the SMBIOS identity natemu's tables give (crates/host/src/boot/smbios.rs) and the structure types they hold,
+# each once but type 4 (one per vCPU); with the runner's 2 GiB of RAM one type 17 and one type 19.
+DMI_IDS = {'sys_vendor': 'natemu', 'product_name': 'natemu x86-64', 'bios_vendor': 'natemu'}
+SMBIOS_TYPES = (0, 1, 3, 16, 17, 19, 32, 127)
+BIOS_DATE = '11/23/2026'
 
 INIT = r'''#!/bin/sh
 export PATH=/bin
@@ -75,8 +80,22 @@ case_pvpanic_panic() {
   fail sysrq-trigger-returned
 }
 
+# platform: the kernel's DMI scan of F0000H-FFFFFH found natemu's SMBIOS 3.0 entry point (its dmesg lines), and the
+# DMI identity and the structure table's entries in sysfs (CONFIG_DMIID=y, CONFIG_DMI_SYSFS=y: built in).
+case_platform() {
+  dmesg | grep -e 'SMBIOS ' -e 'DMI: ' | while read -r line; do echo "PLATFORM-DMESG $line"; done
+  for id in sys_vendor product_name bios_vendor; do
+    test -r /sys/class/dmi/id/$id || fail "/sys/class/dmi/id/$id missing (no DMI)"
+    echo "PLATFORM-DMI $id=$(cat /sys/class/dmi/id/$id)"
+  done
+  test -d /sys/firmware/dmi/entries || fail "/sys/firmware/dmi/entries missing (no DMI)"
+  echo PLATFORM-ENTRIES $(ls /sys/firmware/dmi/entries)
+  pass
+}
+
 case "$name" in
   pvpanic-panic) case_pvpanic_panic;;
+  platform) case_platform;;
   *) fail "unknown case '$name'";;
 esac
 fail "case $name returned"
@@ -128,6 +147,27 @@ def judge_pvpanic_panic(run: Run) -> list:
     return errors
 
 
+def judge_platform(run: Run) -> list:
+    errors = common(run)
+    dmesg = [re.sub(r'^\[[^]]*\] ?', '', l) for l in re.findall(r'^PLATFORM-DMESG (.*)$', run.serial, re.M)]
+    if 'SMBIOS 3.0.0 present.' not in dmesg:
+        errors.append(f'no "SMBIOS 3.0.0 present." in dmesg (its SMBIOS lines: {[l for l in dmesg if "SMBIOS" in l]})')
+    ids = [l for l in dmesg if l.startswith('DMI: ') and not l.startswith('DMI: Memory')]
+    if len(ids) != 1 or not (ids[0].startswith('DMI: natemu natemu x86-64, BIOS natemu ') and ids[0].endswith(' ' + BIOS_DATE)):
+        errors.append(f'DMI identity line {ids}, expected one "DMI: natemu natemu x86-64, BIOS natemu VERSION {BIOS_DATE}"')
+    got = dict(re.findall(r'^PLATFORM-DMI (\w+)=(.*)$', run.serial, re.M))
+    if got != DMI_IDS: errors.append(f'/sys/class/dmi/id {got}, expected {DMI_IDS}')
+    entries = re.findall(r'^PLATFORM-ENTRIES(.*)$', run.serial, re.M)
+    counts = {}
+    for e in (entries[0].split() if entries else []):
+        counts[int(e.split('-')[0])] = counts.get(int(e.split('-')[0]), 0) + 1
+    want = dict(sorted(({t: 1 for t in SMBIOS_TYPES} | {4: run.vcpus}).items()))
+    if dict(sorted(counts.items())) != want:
+        errors.append(f'/sys/firmware/dmi/entries by type {dict(sorted(counts.items())) if entries else "not listed"}, expected {want}')
+    errors += stopped(run, 'natemu: Power(1)', 0)
+    return errors
+
+
 @dataclasses.dataclass(frozen=True)
 class Case:
     words: tuple                    # kernel command line words beyond CMDLINE and platform_case=NAME
@@ -136,6 +176,7 @@ class Case:
 
 CASES = {
     'pvpanic-panic': Case(('panic=0',), judge_pvpanic_panic),
+    'platform': Case((), judge_platform),
 }
 TRIGGER = re.compile(r'^PLATFORM-TRIGGER ', re.M)
 
@@ -309,7 +350,40 @@ def self_check():
     for what, r in bad.items(): assert judge(r), f'{what}: passed'
     assert any('missing' in e for e in judge(bad['guest failure'])), judge(bad['guest failure'])
     assert any('timed out' in e for e in judge(bad['timeout'])), judge(bad['timeout'])
-    print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad)} negative judge controls passed; no VM launched.')
+    # platform, at 2 vCPUs: a passing log, then one break of each thing it checks.
+    entries = '0-0 1-0 127-0 16-0 17-0 19-0 3-0 32-0 4-0 4-1'
+    serial = (f'PLATFORM-BEGIN case=platform cpus=2 kernel={KVER}\n'
+              '[    0.000000] PLATFORM-DMESG-NOT-THIS SMBIOS 2.8 present.\n'
+              'PLATFORM-DMESG [    0.000000] SMBIOS 3.0.0 present.\n'
+              f'PLATFORM-DMESG [    0.000000] DMI: natemu natemu x86-64, BIOS natemu 0.1.0 {BIOS_DATE}\n'
+              'PLATFORM-DMESG [    0.012345] DMI: Memory slots populated: 1/1\n'
+              'PLATFORM-DMI sys_vendor=natemu\nPLATFORM-DMI product_name=natemu x86-64\nPLATFORM-DMI bios_vendor=natemu\n'
+              f'PLATFORM-ENTRIES {entries}\nPLATFORM-PASS\n')
+    good = Run('platform', 2, serial, 'natemu: Power(1)\n', 0, False, None)
+    judge = CASES['platform'].judge
+    assert not judge(good), judge(good)
+    swap = lambda old, new: dataclasses.replace(good, serial=good.serial.replace(old, new))
+    platform_bad = {'no SMBIOS line': swap('SMBIOS 3.0.0 present.', 'Booting'),
+                    'SMBIOS 3.2.0': swap('SMBIOS 3.0.0', 'SMBIOS 3.2.0'),
+                    'other product': swap('natemu natemu x86-64, BIOS', 'natemu natemu, BIOS'),
+                    'other date': swap(f'0.1.0 {BIOS_DATE}', '0.1.0 01/01/2026'),
+                    'no DMI line': swap('DMI: natemu', 'XMI: natemu'),
+                    'sysfs vendor': swap('sys_vendor=natemu', 'sys_vendor=QEMU'),
+                    'sysfs missing': swap('PLATFORM-DMI bios_vendor=natemu\n', ''),
+                    'one type 4': swap(' 4-1', ''),
+                    'no type 32': swap(' 32-0', ''),
+                    'no type 127': swap('127-0 ', ''),
+                    'extra type 11': swap(' 4-0', ' 11-0 4-0'),
+                    'no entries': swap(f'PLATFORM-ENTRIES {entries}\n', ''),
+                    'guest failure': swap('PLATFORM-PASS', 'PLATFORM-FAIL /sys/firmware/dmi/entries missing (no DMI)'),
+                    'one vCPU': dataclasses.replace(good, vcpus=1),
+                    'panic': dataclasses.replace(good, stderr='natemu: Power(4)\n', returncode=2),
+                    'stopped': dataclasses.replace(good, stderr='natemu: UnsupportedMmio\n', returncode=2),
+                    'timeout': dataclasses.replace(good, timeout=True, stderr='natemu: Cancelled\n', returncode=2)}
+    for what, r in platform_bad.items(): assert judge(r), f'platform {what}: passed'
+    assert any('SMBIOS 3.0.0' in e for e in judge(platform_bad['no SMBIOS line'])), judge(platform_bad['no SMBIOS line'])
+    print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad)} negative judge controls '
+          'passed; no VM launched.')
 
 
 def main():

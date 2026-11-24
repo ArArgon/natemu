@@ -1,0 +1,8 @@
+Source files natemu adapts from cloud-hypervisor (https://github.com/cloud-hypervisor/cloud-hypervisor),
+Apache-2.0 AND BSD-3-Clause (the texts beside this file: Apache-2.0.txt, BSD-3-Clause.txt). Each adapted file's
+header names its upstream path, the commit and what was changed.
+
+upstream path              commit                                    natemu file
+pci/src/configuration.rs   f84dae558c8b9518e9d9bf8c0f1b64cd4dc8e546  crates/host/src/pci/configuration.rs
+pci/src/msix.rs            f84dae558c8b9518e9d9bf8c0f1b64cd4dc8e546  crates/host/src/pci/msix.rs
+arch/src/smbios.rs         f84dae558c8b9518e9d9bf8c0f1b64cd4dc8e546  crates/host/src/boot/smbios.rs

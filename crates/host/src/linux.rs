@@ -414,6 +414,11 @@ pub struct Boot {
     /// tables but the device): the guest's PANICKED write ends the run with `Stop::Power(pm::PANIC)`; its CRASH_LOADED
     /// writes are counted in [`Prepared::pvpanic`]. Default off (the `natemu` CLI turns it on, `machine.pvpanic`).
     pub pvpanic: bool,
+    /// SMBIOS 3.0 tables ([`boot::smbios`], platform-devices plan): the structure table after the ACPI tables in the ACPI
+    /// NVS range, the entry point in a read-only legacy ROM page at F0000H (`execution::Backing::write_legacy_rom`), where
+    /// the guest's DMI scan finds it. A bzImage boot only: a Multiboot image gets no tables, and a firmware boot gets its
+    /// SMBIOS from its firmware. Default off (the `natemu` CLI turns it on, `machine.smbios`).
+    pub smbios: bool,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -456,6 +461,7 @@ impl Boot {
             mailbox: true,
             debug_exit: false,
             pvpanic: false,
+            smbios: false,
             firmware: None,
         }
     }
@@ -504,13 +510,19 @@ impl Boot {
             },
         )?;
         let (layout, tables) = (plan.layout, plan.tables);
+        let smbios = (self.smbios && !boot::is_multiboot(&self.kernel))
+            .then(|| boot::smbios::for_board(self.vcpus, layout, &tables));
         let inputs = Inputs {
             image: &self.kernel,
             cmdline: &self.cmdline,
             initrd: self.initrd.as_deref(),
             acpi: Some(&tables),
+            smbios: smbios.as_ref(),
         };
         let loaded = boot::load_kernel(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
+        if let Some(s) = &smbios {
+            backing.write_legacy_rom(boot::smbios::ENTRY_POINT, &s.entry);
+        }
         execution::guest_ram_written(&backing.memory);
         let lost = self.lost_ticks;
         // The APs: on the mailbox (a bzImage with it), else in the INIT state waiting for a SIPI (`mailbox` off, or a
