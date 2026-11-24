@@ -89,14 +89,15 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 ### Host side
 
 - `crate::pci::DeviceMemory`: one POSIX shared-memory object (`shm_open(O_RDWR | O_CREAT | O_EXCL)` with a short unique
-  name, `/natemu.<pid>.<n>`, within macOS's 31-byte limit; `ftruncate` to the length once, which fixes it: macOS allows
-  only that one size change; a second `shm_open(O_RDONLY)` of the name for the descriptor handed out; then
+  name, `/natemu.<pid>.d<n>` (the fexc channels take `/natemu.<pid>.<n>` with a counter of their own), within macOS's
+  31-byte limit; `ftruncate` to the length once, which fixes it: macOS allows only that one size change; a second `shm_open(O_RDONLY)` of the name for the descriptor handed out; then
   `shm_unlink`, so only the descriptors name it and nothing outlives the process), mapped `MAP_SHARED` read-
   write at a 2 MiB-aligned address (reserve twice the length, `MAP_FIXED` into the aligned part, unmap the rest);
   length a power of two from 2 MiB to 256 MiB (2 MiB: the resident alias's block size). Volatile 8-byte-wide accessors
   (`read_words`, `write_words`) for host copies, so host stores are single-copy atomic per word; `as_ptr()` for a later
   scanout; `fd()` the read-only descriptor, the only one the control socket passes to a client (`SCM_RIGHTS`): on it
-  `mmap(PROT_WRITE, MAP_SHARED)` fails with EACCES, so a client cannot write device memory; and `view()` a second read-only mapping of the same object in this process.
+  `mmap(PROT_WRITE, MAP_SHARED)` fails (with EPERM on macOS, not POSIX's EACCES: Task 1's `fd_is_read_only`), so a
+  client cannot write device memory; and `view()` a second read-only mapping of the same object in this process.
 - **Why shared memory, and the evidence.** A front end in another process must see the guest's frames without a copy
   per frame. Experiment (a scratch program, not a test case; November 24, M3 on macOS 15.7.3 and M2 Max on macOS
   26.6.2): `hv_vm_map` of a `shm_open` + `mmap(MAP_SHARED)` region and of an IOSurface's base address both succeed; a
@@ -105,11 +106,15 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   half a framework case. An IOSurface (for a Metal front end) is the alternative; it cannot travel over a Unix socket
   (it needs a Mach port), so it waits for the native front end.
 - Multi-BAR's memory BAR request gains `mapped: Option<Arc<DeviceMemory>>`. `Bus::install` (in `prepare`) collects the
-  mapped regions into `Prepared`; the VM does not exist yet. `Machine::create` takes them: it counts them in the IPA
-  size computation (`vm.rs`, from the backing size today), `hv_vm_map`s each at `MAPPED_IPA + offset` (offsets 2 MiB-
-  aligned, in BAR order; `MAPPED_IPA` the first 1 GiB-aligned IPA above the backing's end), and `map_private` maps the
-  alias `MAPPED_VA + offset` read-write (`memory.rs` `Span`, whose target is backing-relative and 2 MiB-aligned: a
-  target past the backing works arithmetically).
+  mapped regions into `Prepared` (`Prepared::mapped`, in BAR order; Task 2's driver test device passes its own list to
+  `Machine::create` the same way); the VM does not exist yet. `Machine::create(memory, mapped)` takes them: a pure
+  `vm::mapping_plan` counts them in the IPA size computation (`vm.rs`, from the backing size today) and places each at
+  `MAPPED_IPA + offset` (offsets the sum of the lengths before, so 2 MiB-aligned, in BAR order; `MAPPED_IPA` the first
+  1 GiB-aligned IPA at or above the backing's end), which `Machine::create` `hv_vm_map`s read/write and never
+  executable. The machine has no windows, so the backing writes the alias: `Backing::map_mapped(machine.mapping())`,
+  right after `Machine::create` and before any vCPU, `map_private`s `MAPPED_VA + offset` EL1 read/write in every window
+  (`memory.rs` `mapped_spans`, a `Span` whose target is backing-relative and 2 MiB-aligned: a target past the backing
+  works arithmetically).
 - `MAPPED_VA` = `GUEST_RAM_VA + 3 GiB`: the alias slots of the 3-4 GiB hole, already present in the resident's tables
   and never used (the hole is not RAM), below the firmware image's top 16 MiB; a const assert keeps 256 MiB of
   regions clear of the firmware alias. With RAM above 3 GiB those slots are still unused (high RAM aliases from 4 GiB).
@@ -124,8 +129,10 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 
 ### Shared state (`crates/abi`)
 
-- `MappedRegions` in the global area: `seq: AtomicU64` (even = stable, odd = being written: a seqlock) and up to 8
-  entries `{ base: u64, len: u64, alias: u64, enabled: u32 }`. Written only by the host, under the bus's lock; read by
+- `MappedRegions` in the global area (`cache::MAPPED`, after the scheduling-test metadata, below `CODE_PAGES`; the host
+  reaches it as `Backing::mapped_regions`): `seq: AtomicU64` (even = stable, odd = being written: a seqlock) and up to 8
+  entries `{ base: u64, len: u64, alias: u64, enabled: u32 }` (`MappedRegion`; `publish(i, region)` replaces one,
+  `read()` gives the even `seq` and a consistent copy of all 8). Written only by the host, under the bus's lock; read by
   residents with the seqlock protocol. No field in `Control` (resident-owned after prepare).
 
 ### Resident side
@@ -206,7 +213,7 @@ aliases: Vec<(u64 /*va*/, u64 /*len*/)> }` used by `Machine::create`; `MappedReg
   binary re-executed by `posix_spawn` with `--exact <child test> --ignored` and an environment flag, the descriptor
   passed with `posix_spawn_file_actions_adddup2` since `shm_open` sets FD_CLOEXEC; no deliberate crash, which would
   leave a crash report outside the cache), `fd_is_read_only` (`mmap(PROT_WRITE, MAP_SHARED)` of `fd()` fails with
-  EACCES), `object_has_no_name` (a `shm_open` of the generated name after `new` fails with ENOENT), `host_writes_are_word_atomic` (a reader
+  EPERM, macOS's errno for it), `object_has_no_name` (a `shm_open` of the generated name after `new` fails with ENOENT), `host_writes_are_word_atomic` (a reader
   thread never sees a torn word while a writer alternates two patterns), `plan_places_regions_above_backing` and
   `plan_grows_ipa_bits`, `empty_plan_matches_today` (no maps, today's IPA bits; no VM is created in unit tests),
   `seqlock_reader_never_sees_a_half_entry`, `alias_fits_the_hole_slots` (the const assert's bound).

@@ -70,6 +70,25 @@ impl Backing {
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
     }
+    /// Writes every window's alias of the VM's mapped device memory ([`crate::memory::mapped_spans`]): after the RAM and
+    /// firmware aliases (it replaces their entries, though none lies in its slots: `exec::MAPPED_VA`), before any vCPU
+    /// runs. Nothing for a plan without regions.
+    pub fn map_mapped(&self, plan: &crate::vm::MappingPlan) {
+        let spans = crate::memory::mapped_spans(plan);
+        if spans.is_empty() {
+            return;
+        }
+        for v in 0..self.n {
+            map_private(&self.memory, v * self.stride, &spans);
+        }
+    }
+    /// The region table in the global area, which the host alone writes (`MappedRegions::publish`).
+    pub fn mapped_regions(&self) -> &cache::MappedRegions {
+        let at = cache::GLOBAL_OFFSET + cache::MAPPED;
+        assert!(at % 8 == 0 && at + size_of::<cache::MappedRegions>() <= self.memory.1);
+        // SAFETY: inside the backing, aligned, plain atomics shared with the residents.
+        unsafe { &*self.memory.0.add(at).cast::<cache::MappedRegions>() }
+    }
     /// Guest RAM through the host's alias.
     ///
     /// # Safety
@@ -7666,6 +7685,56 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The mapped regions' alias (`exec::MAPPED_VA`, the const assert's bound: up to `MAX_MAPPED_BYTES` in the 3-4 GiB
+    /// hole's slots, below the firmware image's) in a backing with RAM above 3 GiB and the largest firmware image: no RAM
+    /// or firmware alias entry lies in its slots before it is written, and writing it changes no other entry of any
+    /// window's alias tables; each of its entries is an EL1 read/write, never executable block onto the region's IPA.
+    #[test]
+    fn alias_fits_the_hole_slots() {
+        let path = std::env::temp_dir().join(format!("natemu-mapped-alias-{}.elf", std::process::id()));
+        std::fs::write(&path, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let ram = exec::LOW_RAM_END as usize + cache::BLOCK;
+        let image = vec![0xcc; exec::MAX_FIRMWARE_BYTES as usize];
+        let b = prepare_with_firmware(path.to_str().unwrap(), cache::CODE_BYTES, 2, ram, false, &image).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let plan = crate::vm::mapping_plan(IPA + b.memory.1 as u64, &[exec::MAX_MAPPED_BYTES / 8; 8]);
+        let tables = exec::RAM_TABLES_OFFSET..exec::RAM_TABLES_OFFSET + (exec::PRIVATE_GIBS - 1) * 4096;
+        // The table word of private offset `at` (2 MiB blocks, one level-2 table per GiB after the first).
+        let word = |at: usize| exec::RAM_TABLES_OFFSET + ((at >> 30) - 1) * 4096 + (at % (1 << 30)) / cache::BLOCK * 8;
+        let slots: Vec<usize> = plan
+            .aliases
+            .iter()
+            .flat_map(|&(va, len)| ((va - PRIVATE) as usize..(va - PRIVATE + len) as usize).step_by(cache::BLOCK))
+            .collect();
+        assert_eq!(slots.len() * cache::BLOCK, exec::MAX_MAPPED_BYTES as usize);
+        let read = |window: usize, at: usize| u64::from_le_bytes(b.memory.read::<8>(window + at));
+        let snapshot = |window: usize| -> Vec<u64> { tables.clone().step_by(8).map(|at| read(window, at)).collect() };
+        let before: Vec<Vec<u64>> = (0..b.n).map(|v| snapshot(v * b.stride)).collect();
+        let firmware = word((exec::GUEST_RAM_VA - PRIVATE + exec::FIRMWARE_END - exec::MAX_FIRMWARE_BYTES) as usize);
+        for v in 0..b.n {
+            let window = v * b.stride;
+            assert_ne!(read(window, firmware), 0, "the firmware alias is there");
+            assert_ne!(read(window, word((exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize)), 0, "high RAM");
+            for &at in &slots {
+                assert_eq!(read(window, word(at)), 0, "a RAM or firmware alias entry at {at:#x}");
+                assert!(word(at) < firmware);
+            }
+        }
+        b.map_mapped(&plan);
+        let (pxn, uxn, ap) = (1u64 << 53, 1u64 << 54, 3u64 << 6);
+        for v in 0..b.n {
+            let window = v * b.stride;
+            let mut expected = before[v].clone();
+            for (k, &at) in slots.iter().enumerate() {
+                let d = read(window, word(at));
+                assert_eq!((d & 3, d & (pxn | uxn), d & ap), (1, pxn | uxn, 0), "{d:#x}");
+                assert_eq!(d & 0x0000_ffff_ffe0_0000, plan.maps[0].0 + (k * cache::BLOCK) as u64);
+                expected[(word(at) - tables.start) / 8] = d;
+            }
+            assert_eq!(snapshot(window), expected, "window {v}: only the region slots changed");
+        }
     }
 
     /// The legacy ROM page (SMBIOS's entry point at F0000H) in a prepared backing: the bytes land in the hole's backing,

@@ -391,6 +391,18 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
     );
 }
 
+/// The resident's alias of the VM's mapped device memory ([`crate::vm::MappingPlan`]): each region's EL1 read/write,
+/// never executable, onto the IPA the VM maps it at. Their targets lie past the backing (backing-relative offsets, as
+/// every span's: `map_private` only adds `IPA`), 2 MiB-aligned as the plan places them.
+pub(crate) fn mapped_spans(plan: &crate::vm::MappingPlan) -> Vec<Span> {
+    let at = |va: u64| (va - PRIVATE) as usize;
+    plan.aliases
+        .iter()
+        .zip(&plan.maps)
+        .map(|(&(va, len), &(ipa, _))| Span::data(at(va), len as usize, (ipa - IPA) as usize))
+        .collect()
+}
+
 /// The resident's boot and extended text in window `window`.
 pub(crate) fn resident_text(window: usize) -> Vec<Span> {
     let text = |offset, end| Span::text(offset, end - offset, window + offset);

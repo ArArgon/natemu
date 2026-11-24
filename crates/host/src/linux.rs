@@ -790,6 +790,7 @@ impl Boot {
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
+            mapped: Vec::new(),
             loaded,
             uart,
             devices: devices.freeze(),
@@ -905,6 +906,7 @@ impl Boot {
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
+            mapped: Vec::new(),
             loaded,
             uart,
             devices: devices.freeze(),
@@ -946,6 +948,9 @@ impl Boot {
 /// A loaded VM, ready to run.
 pub struct Prepared {
     backing: Backing,
+    /// Mapped device memory, in creation order (a mapped BAR's request order): the VM maps each above the backing and
+    /// every window aliases it at `MAPPED_VA` (`vm::mapping_plan`). Empty: none, the default launch.
+    mapped: Vec<Arc<crate::pci::DeviceMemory>>,
     loaded: Loaded,
     uart: Arc<Mutex<uart::Uart>>,
     devices: Arc<devices::Devices>,
@@ -1099,7 +1104,8 @@ impl Prepared {
         }
         crate::perf::mark("run");
         let (backing, vcpus) = (&self.backing, self.backing.n);
-        let machine = Machine::create(backing.memory.clone())?;
+        let machine = Machine::create(backing.memory.clone(), &self.mapped)?;
+        backing.map_mapped(machine.mapping());
         self.irqs.attach(machine.doorbell());
         // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed (the
         // rule `irq.rs` sets for asynchronous sources; no Linux boot reads it today).

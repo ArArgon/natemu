@@ -3,10 +3,12 @@
 //! placement ([`place`]), and routing of the PCI memory window, and of the I/O window when a function has an I/O BAR, to
 //! whichever function's BAR currently decodes an address.
 pub mod configuration;
+pub mod memory;
 pub mod msix;
 pub mod place;
 pub mod testdev;
 
+pub use memory::DeviceMemory;
 use crate::devices::{Access, Device, Devices, Direct, mask};
 use configuration::{
     PciBarRegionType, PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType,
