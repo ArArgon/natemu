@@ -33,7 +33,7 @@ def run_records(base, broken=()):
         else:
             ring.append(el0(t(2 + i / 10) + S // 2, RETURN, sr.DISPATCH, USER64, frame=2, flags=sr.CALL_YES << sr.CALL_SHIFT))
         rip = LOOP if 'c' in broken and i % 2 else CROSS
-        place = sr.PROBE if i % 3 == 0 else sr.BLOCK
+        place = sr.PROBE if i % 3 == 0 and 'noprobe' not in broken else sr.BLOCK
         if 'c2' in broken: rip, place = (LOOP, sr.PROBE) if i < 7 else (CROSS, sr.BLOCK)   # probes outnumber the loop's words
         ring.append(el0(t(3 + i / 10) + S // 2, rip, place, USER64, frame=3, at=8))
         ring.append(el0(t(4 + i / 10) + S // 2, CHASE, sr.BLOCK, USER64, frame=4, at=4 * (i % 3)))
@@ -105,7 +105,7 @@ class Judge(unittest.TestCase):
         self.assertEqual((r['problems'], r['marks']), ([], [1, 1, 2, 3, 4, 5, 6, 7, 2, 1, 2, 3, 4, 5, 6, 7]))
 
     def test_probes_charged_elsewhere_fail(self):
-        self.assertEqual(self.judge(('c',))['problems'], ["run 1 c: 50.0% of probe samples charged to the loop's block, want 95.0%"])
+        self.assertEqual(self.judge(('c',))['problems'], ["c: 75.0% of probe samples charged to the loop's block, want 95.0%"])
 
     def test_a_ring_while_stopped_fails(self):
         self.assertEqual(self.judge(('stray',))['problems'], ['run 1 e: 1 samples rung in the stopped window after the pass in flight'])
@@ -118,8 +118,13 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge(('far',))['problems'], ["run 1 a: 0 of the loop's 10 samples locate to a word of its object, want 95.0%"])
         self.assertEqual(self.judge(('noobj',))['problems'], ['run 1 a: no objects file', 'run 2 a: no objects file'])
 
+    def test_probes_are_judged_over_both_runs(self):
+        r = self.judge(('noprobe',))
+        self.assertEqual((r['problems'], r['runs'][1]['c']['probe'], r['c']['probe']), ([], 0, 4))
+        self.assertEqual(self.judge(('noprobe',), ('noprobe',))['problems'], ['c: no probe sample in either run'])
+
     def test_the_loops_block_is_its_own_words_not_its_probes(self):
-        self.assertEqual(self.judge(('c2',))['problems'], ["run 1 c: 0.0% of probe samples charged to the loop's block, want 95.0%"])
+        self.assertEqual(self.judge(('c2',))['problems'], ["c: 36.36% of probe samples charged to the loop's block, want 95.0%"])
 
     def test_a_pass_that_rang_or_a_halted_sample_while_stopped_fails(self):
         self.assertEqual(self.judge(('pass',))['problems'], ['run 1 e: 1 ringing passes rang bells in the stopped window'])

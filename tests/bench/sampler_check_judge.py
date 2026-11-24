@@ -17,7 +17,8 @@ mark to the next mark; phase 7 ends at the next stop (init's, after the run). Sa
      marked a return; and small_fn's `ret` (call test "call before": its target follows a call); and samples on the
      callee's block.
   c  cross: samples in a shared probe, at least 95% of them charged to the loop's block (the top block of the window's
-     samples in a block, probes not counted).
+     samples in a block, probes not counted); over both runs together (the crossing store is nearly all resident time, so
+     one run's window can hold none).
   d  chase: recorded only: where the samples land in the top block (native offset: samples), for the per-word allowance.
   e  ctrl: e1 (mark 5 to the port's stop) and e3 (the port's start to init's stop) hold EL0 samples on phase a's block;
      e2 (stop to start) holds no sample rung after the stop except by the ringing pass in flight at it (a logged pass that
@@ -134,8 +135,8 @@ def judge_run(n, t, ring, toggles, passes, end, halted=(), objects=None):
     charged = sum(1 for s in probes if key(s) == blk_c)
     pshare = round(100 * charged / len(probes), 2) if probes else 0.0
     out['c'] = dict(el0=len(c), probe=len(probes), charged_to_loop=charged, share=pshare, block=blk_c and [hex(x) for x in blk_c])
-    if not probes: problems.append(f'run {n} c: no probe sample')
-    elif pshare < PROBE_SHARE: problems.append(f'run {n} c: {pshare}% of probe samples charged to the loop\'s block, want {PROBE_SHARE}%')
+    # (judged over both runs, in `judge`: the crossing store spends about 99% of its time outside generated code today, so
+    # one run's window may hold no probe sample at all)
     # d (recorded)
     d = el0(win(4))
     blk_d, n_d = top_block(d)
@@ -181,6 +182,12 @@ def judge(name):
         end = next((x['time'] for x in toggles if x['time'] > t[6] and not x['value2']), max(clocks, default=t[6]))
         r, p = judge_run(n, t, ring, toggles, passes, end, halted, objects)
         res['runs'][n] = r; problems += p
+    probes = sum(r['c']['probe'] for r in res['runs'].values())
+    charged = sum(r['c']['charged_to_loop'] for r in res['runs'].values())
+    res['c'] = dict(probe=probes, charged_to_loop=charged, share=round(100 * charged / probes, 2) if probes else 0.0)
+    if not probes: problems.append('c: no probe sample in either run')
+    elif res['c']['share'] < PROBE_SHARE:
+        problems.append(f'c: {res["c"]["share"]}% of probe samples charged to the loop\'s block, want {PROBE_SHARE}%')
     res['problems'] = problems
     return res
 
