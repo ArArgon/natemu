@@ -1,9 +1,10 @@
 # Returns predicted by the Arm return stack (plan)
 
-Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 2, after an
-independent design review (section 13) that asked for rework: the return stack is kept balanced on every path, pads keep no
-link records, the kill-test is split into a host part (mechanism) and an in-VM part (the decision), and the decision is read
-on benchmarks the built version covers. It comes second: the [indirect plan](indirect-cache-plan.md)'s step 1 goes first and
+Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 3: revision 2 (the
+return stack balanced on every path, pads without link records, a host kill-test for mechanism and an in-VM one for the
+decision, the decision read on benchmarks the built version covers) was accepted with fixes by the independent re-review, and
+the fixes are taken in (section 13). Owner decision (November 23): the pad is an "external guarded entry" in INV-03-01's sense,
+under the invariant of section 4.2, now written into that rule (section 4.3). It comes second: the [indirect plan](indirect-cache-plan.md)'s step 1 goes first and
 builds what both use (the slot's lookup form, the words appended to a block, `blr` at indirect calls); this plan adds to it.
 
 ## 1. Why
@@ -58,16 +59,25 @@ drains. So the design is balanced on every path, not only the common one:
 
 | Path | How it pushes or pops |
 | --- | --- |
-| Direct call, linked | the link word becomes `b pair`; the call pair appended to the block is `pair+0: bl <T's entry>`, `pair+4:` the pad; a split block's hot trampoline goes to `pair+0` directly |
+| Direct call, linked | the link word becomes `b pair+0`; the call pair appended to the block is `pair+0: bl <T's entry>`, `pair+4:` the pad (section 4.2 for the link record); a split block's hot trampoline still goes to the link word, so only that word is patched |
 | Indirect call, checked link that is a call (shared code) | the indirect plan's step 1: `bl lookup; blr x1;` pad |
 | Local link that is a call (shared code) | the call pair, `bl` to the target's body |
-| A call the resident continues before its `bl`/`blr` ran (its first execution, a stop at its exit, a target it cannot link); a miss reached through the site's `blr x1` has pushed already and is entered directly | the resident resumes at a *push stub* in the code area's head, `blr x1` with x1 = the target's full entry and x0 its RIP, never by entering the target itself |
+| A call the resident continues before its `bl`/`blr` ran (its first execution, a stop at its exit, a target it cannot link); a miss reached through the site's `blr x1` has pushed already and is entered directly | the resident resumes at the *push stub*, `blr x1` with x1 = the target's full entry and x0 its RIP, never by entering the target itself |
 | Return | the return form: both ways `ret x1`; its miss is `adr x1, DISPATCH_MISS; ret x1`, so a miss pops too |
 | A return the resident continues before its `ret x1` ran (a stop at a ret exit); a miss has popped through its stub and is entered directly | the resident resumes at a *pop stub*, `ret x1` with x1 = the full entry it chose and x0 its RIP |
 | Call to the next instruction (`call $+5; pop`) | linked as plain `b`: it never returns |
 
-Left unbalanced: the single-step slot's block, and calls or returns the resident emulates (system cuts, the interpreter).
-Their count is reported; the kill-test prices an unbalanced call (section 6). Because every context's calls push, the return
+The stubs. The push stub is `blr x1` followed by `b DISPATCH_MISS`, the pop stub `ret x1`; both lie inside the slot area
+(`DISPATCH .. DISPATCH + DISPATCH_BYTES`), so the slot area's stop rule (execution.rs:2583) covers them and a stop there
+continues with x0. The push stub's `blr` pushes stub+4, not a pad: the return that matches it is mispredicted once, by
+construction, and stub+4 is a safe target (`b DISPATCH_MISS` with x0 the RIP) although no table entry names it. A stop on the
+push stub, at pair+0, or at the site's `blr x1` after its lookup returned has not pushed yet and continues through the push stub
+again; a stop inside the lookup form leaves the lookup's own `bl` unpopped and is counted unbalanced. The stubs are never used
+while `State::shadow_entry` is set (the block entered after a shadow-setting instruction must be entered at its first word): the
+resident then enters the target directly and counts the path unbalanced.
+
+Left unbalanced: the single-step slot's block, calls or returns the resident emulates (system cuts, the interpreter), and the
+two counted cases above. Their count is reported; the kill-test prices an unbalanced call (section 6). Because every context's calls push, the return
 form is used for every return. Admission's hint (the ending instruction is a near `ret`, a near call, `call $+5`) chooses the
 forms; a wrong hint costs time, not correctness, since every form's target is the table's or a link's.
 
@@ -78,6 +88,14 @@ A pad is one resident word. It has no link record and no state of its own that a
 > A table entry (R, p) with p a pad exists only while p's word is `b <full_entry(owner)>`, where the owner is R's current
 > block in the table's context, which owns the entry.
 
+- The call's own link (to T) stays an ordinary link record of its link point, with one change of form. The patched word at
+  `link_at` is `b pair+0`, and pair+0 holds `bl <link_entry(source, T)>`; only the `link_at` word is the record's (the hot
+  trampoline is not rewritten). Every path that checks or rewrites a record goes through pair+0 for a call point:
+  `unlink_word`'s check (today `links_to(at, entry)`, cache.rs:2859-2860, which would return `None` on `b pair+0` and fail
+  `suspend` at the first CR3 load, cache.rs:3294) compares `link_at` with `b pair+0` and pair+0's `bl` target with the entry;
+  `relink` (cache.rs:3365), which writes a plain `b` today, writes pair+0's `bl` and then `b pair+0`, so a relinked call still
+  pushes; `unlinked` (cache.rs:2252-2257) and `links_restored` (cache.rs:3425) keep comparing `link_at` with the admitted word,
+  which unlinking restores; pair+0 is left as it is, unreachable.
 - Filling writes the pad word (and synchronizes it), then the entry. It happens (a) when a direct call in absolute code is
   linked and R's block is current, and (b) on a miss for R, from a resident-private *hint* table (direct-mapped by R, 4 Ki
   entries of (caller block, pad offset, context)). A hint is used only if the caller is alive, its block end is R, the context
@@ -88,7 +106,10 @@ A pad is one resident word. It has no link record and no state of its own that a
   the pad word is stale but unreachable: nothing in any block branches to it, and a return reaches it only through an entry.
   A speculative path through a stale RAS entry is squashed.
 - When the caller dies, the resident empties the entries naming its pad (two slots for R in each of the four tables, those
-  whose target is the pad), so no entry leads into a dead block. The stop rule for appended words (4.5) also stands before the
+  whose target is the pad; a table whose context is `NO_CONTEXT`, stale after a global flush until it is cleared to take a
+  context, cache.rs:986-996, is skipped), so no entry leads into a dead block.
+- Appended words are written by the resident for each placed copy, in `copy`, `copy_pooled` and `share` (cache.rs:1590, 1700,
+  1288), never copied from another block's bytes. The stop rule for appended words (4.5) also stands before the
   dead-block filter, as the slot rule does.
 - Only absolute code gets pads in this plan. A return to a caller in shared code finds R's ordinary entry: it pops, and is
   predicted wrong, as today.
@@ -103,14 +124,15 @@ address of the vCPU's own blocks of the same class, as the entries user code can
 2). There is no stack of host addresses in guest-writable memory, which the guest-state page rule forbids ([boot features
 plan](boot-features-plan.md), G1: "no emulator-trusted value lives there"). By the invariant, the slot's compare of the entry's
 RIP with x0, and the per-context tables, a return reaches R's admitted code in its own context through its full entry, or the
-resident with x0 = R. The `link-check` build scans the tables: every target is its owner's full entry, or a pad of a live
-block whose end is the entry's RIP and whose word is `b <full_entry(owner)>`. The existing table checks (`tables-*` in
+resident with x0 = R. The `link-check` build scans the tables (skipping `NO_CONTEXT` ones): every target is its owner's full
+entry, or a pad of a live block whose end is the entry's RIP and whose word is `b <full_entry(owner)>`. The existing table checks (`tables-*` in
 `frame-randomization`, `check_l1_lists`, cache.rs:1079) assume target = owner's full entry and are extended the same way.
 
 Against [INV-03-01](../research/investigations/INV-03-01.md) (lines 5671-5681): an entry holds the guest return identity and a
 target that is a resident trampoline of one direct branch to an external guarded entry, filled and emptied by the resident.
-The reviewer recommends accepting this as that rule's "external guarded entry" with the invariant above written into it; the
-ruling is the owner's (section 12). No other CPU loads these targets (per-vCPU code), so the rule's in-flight census is empty.
+Owner decision (November 23, 2026): the pad counts as that rule's "external guarded entry", with the invariant "a
+return-table entry (R, pad) exists only while the pad word is `b full_entry(owner)`" written into the rule; INV-03-01 records
+it after the rule. No other CPU loads these targets (per-vCPU code), so the rule's in-flight census is empty.
 
 ### 4.4 Stale state and unpaired returns
 
@@ -166,7 +188,7 @@ the hot stream, the fall-through layout.
 | A store and pointer update per call | none |
 | Unbalanced pushes and pops | balanced on every path (4.1); the rest counted and priced |
 | A `ret` mispredicted where today's `br` was predicted | only when calls do not pair; a single-caller return is predicted by both and pays the next row |
-| Extra taken branches | the pad's `b` on return, in unsplit blocks the link word's `b` to the pair |
+| Extra taken branches | the pad's `b` on return; the link word's `b` to pair+0 on a call |
 | Extra words | 2 per call block, cold |
 | A dearer miss | the miss pops through a stub: one more `ret` than today's miss |
 
@@ -195,10 +217,14 @@ pair; choose A0 if within 0.5 ns of A at K = 4 and 16 in the long period.
 
 **In-VM part, the decision (after the smallest version).** Only the VM answers what EL0 to the resident at EL1 and back, and
 HVF's exits, do to the RAS. A new micro body (`tools/bench/bodies/callchain.asm`, run by `micro-natemu`): a call chain of depth
-D = 4, 16, 32 whose bottom makes a resident trip (`cpuid`, a system cut), and the same chain without the trip; plus the
-existing `call` body (K = 1). Base and fix, one round on the M2 Max. Stop if the chain without a trip saves less than 1.5 ns
-per return, or if `call` loses more than 1 ns per pair; if the chain with a trip saves nothing at D = 16, record that the RAS
-does not survive a trip and expect no gain on `hackbench`.
+D = 4, 16, 32 with four or more callers per level, visited in a long-period order (64 Ki or more), whose bottom makes a trip,
+and the same chain without the trip; a single-caller variant of the chain; and the existing `call` body (K = 1). Two trips:
+`cpuid`, a system cut served in the resident (EL0 to EL1 and `eret`, no HVF exit), and a port access, which the host serves
+(every IN/OUT leaves the VM: an HVF exit and back; [sampler plan](el0-sampler-plan.md) section 3), on a port the driver
+program's machine accepts. Base and fix, one round on the M2 Max. Stop if the multi-caller chain without a trip saves less than
+1.5 ns per return, or if the single-caller chain or `call` loses more than 1 ns per pair. If a chain with a trip saves nothing at
+D = 16, record which trip clears the RAS and expect no gain on `hackbench` from it. If no port fits the driver program, the
+HVF-exit question is left to the A/B (`guest-hackbench`).
 
 ## 7. Tests
 
@@ -210,9 +236,9 @@ New cases, each shown to fail when it should (a mutation in `run_relink_mutation
 
 | Case | Shows | Fails under the mutation |
 | --- | --- | --- |
-| `system` `ret-pairs`, 64-bit and i386 builds: calls from K sites, recursion past 64, `longjmp`, a signal handler's return, a rewritten return address, `call $+5; pop`, `ret imm16` | every return lands right; counters show pads filled and hit and no unbalanced path but the listed ones | pad word written after the entry; a pad naming a block of another context; `call $+5` as `bl`; a resident continuation entering a call's target directly |
-| `system` `ret-death`: callee and return pages rewritten (SMC) and remapped (CR3) between call and return, the caller killed while its pad is filled, at 1 and 4 vCPUs | no entry names a dead block or a stale pad (`link-check` scan) | the dead caller's entries not emptied; `cut_one` skipping pad entries |
-| `system` `ret-stop`: interrupts landing on a pad, on pair+0, on the stubs, and on a dead caller's pad | the stop is taken at R or T, no `BAD_STOP` | the appended-word rule after the dead filter |
+| `system` `ret-pairs`, 64-bit and i386 builds: calls from K sites, recursion past 64, `longjmp`, a signal handler's return, a rewritten return address, `call $+5; pop`, `ret imm16` | every return lands right; counters show pads filled and hit and no unbalanced path but the listed ones | pad word written after the entry; a pad naming a block of another context; `call $+5` as `bl`; a resident continuation entering a call's target directly; `relink` writing a plain `b` (caught by the push count after a CR3 load) |
+| `system` `ret-death`: callee and return pages rewritten (SMC) and remapped (CR3) between call and return, CR3 loads that suspend and relink linked calls, the caller killed while its pad is filled, a global flush, at 1 and 4 vCPUs | no entry names a dead block or a stale pad (`link-check` scan); no `LINK_CHECK` or `BAD_LINK` halt | the dead caller's entries not emptied; `cut_one` skipping pad entries; `unlink_word` comparing `link_at` with the entry |
+| `system` `ret-stop`: interrupts landing on a pad, on pair+0, on the stubs, between a site's lookup and its `blr`, and on a dead caller's pad; a shadow-setting instruction before a call | the stop is taken at R or T, no `BAD_STOP`; counters show the push stub used and the counted cases | the appended-word rule after the dead filter; the push stub used with `shadow_entry` set |
 | Rust unit: the invariant over a model of fills, deaths and handovers | each part of 4.2 | each code path broken in turn |
 
 While iterating: `tools/natemu-test run tests/system -k 'ret- or relink'`, `tests/faults -k 'call or ret'`, the Rust units; the
@@ -233,7 +259,8 @@ affected tier (`tools/natemu-test run`) at the end, since every exit and the tab
 ## 9. Estimate (agent hours, low confidence)
 
 On top of the indirect plan's step 1: call pairs and stubs 3, return form 1, pads, hints and the invariant's emptying 3, stops
-1, `link-check` scan and table checks 1.5, the `callchain` body 1, tests and mutations 3, review fixes 1.5: about 15 hours.
+1, `link-check` scan and table checks 1.5, the call link's record through pair+0 (`unlink_word`, `relink`, `suspend`) 2.5, the
+`callchain` body and its variants 1.5, tests and mutations 3, review fixes 1.5: about 18 hours.
 Pads in shared code: 5-6 more.
 
 ## 10. Risks
@@ -255,7 +282,7 @@ blocks at return addresses are 3% or more of EL0 samples on a benchmark the smal
 `tests/bench/family.toml`); and the host kill-test passes. `build`'s share is shared code and does not count for this version.
 Under 3%: recorded and left ([sampler plan](el0-sampler-plan.md) section 7, last rule).
 
-## 12. Verified, unverified, and the owner's question
+## 12. Verified, unverified, decided
 
 Read in the code: everything cited above with file and line. Not verified: the RAS's depth on Apple cores; whether `ret x1`
 predicts from it; whether an exception, `eret` or an HVF exit clears it; whether HVF exposes PAuth; that no path but a flush
@@ -263,8 +290,8 @@ reuses a dead block's bytes (placement reads so); the branch costs in 4.9 (estim
 
 Defaults taken from the review: the resident appends words instead of a fexc change; a single-caller loss is accepted within
 the K = 1 thresholds; the slot area grows to 32 KiB (the indirect plan); the PAC backlog item is dropped if the kill-test
-passes; `host-dispatch-micro` is a bench case. The owner's call: **the pad as INV-03-01's "external guarded entry"**, with the
-invariant of 4.2 written into that rule (the reviewer recommends accepting).
+passes; `host-dispatch-micro` is a bench case. Owner decision (November 23): the pad is INV-03-01's "external guarded entry"
+with the invariant of 4.2 written into that rule. No question is left open.
 
 ## 13. Review
 
@@ -277,3 +304,11 @@ a body that trips to the resident at depth, where the stop threshold now is (6);
 emptied by owner, with the full entry always (4.2); a dead caller's entries emptied and the stop rule before the dead filter
 (4.2, 4.5); the four tables' handover refills counted, the existing table checks extended, `ret-32` folded into `ret-pairs`,
 the census addition dropped, the order (indirect step 1 first) and the estimate.
+
+Re-review (Fable, November 23) of revision 2: accept with fixes. Taken in: the call's link record through pair+0 (`unlink_word`,
+`relink`, `suspend`; only the `link_at` word patched; a mutation for a relink that writes a plain `b`) (4.2); the in-VM chain
+with four or more callers per level in a long period under the 1.5 ns bar, the single-caller chain under the 1 ns bar, `cpuid`
+said to be a resident trip and a host-served port trip added for HVF exits (6); the push stub's own return mispredicted once
+with stub+4 a safe target, the stubs in the slot area under its stop rule, stops before a push continuing through the stub, the
+stubs unused while `shadow_entry` is set (4.1); `NO_CONTEXT` tables skipped; appended words written per copy (4.2); the
+estimate.
