@@ -326,7 +326,7 @@ def main():
     # access sites each, 280 bytes of record: 160 plus 40 per site) fill the 256 MiB metadata arena first (at about
     # 958,000). Each at least three times over the two trips. Equal bytes, so the host reuses one compile per page
     # offset: the case is about placement. Both flush when full and still match.
-    code_max = str(128 * 2**20 - 0x19000)    # CODE_BYTES_MAX - HEAD_BYTES (the step slot, the 16 KiB dispatcher area, the 20 KiB of shared probes)
+    code_max = str(128 * 2**20 - 0x1d000)    # CODE_BYTES_MAX - HEAD_BYTES (the step slot, the 32 KiB dispatcher area, the 20 KiB of shared probes)
     for count, block, load, full in shard.take([(1_200_000, '1', None, 0), (3_600_000, '3', 0x1000_0000, 1)], a.shard):
         program, result, end = add_chain(count, 2, step=0, load=load)
         cache = code_max

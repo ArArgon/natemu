@@ -293,6 +293,8 @@ pub(crate) struct Admitted {
     pub bulk: bool,
     /// The guest offset of its last instruction (the performance log reads it for a call's return site).
     pub last: u32,
+    /// Indirect plan step 1: its exits' forms ([`exit_forms`]), the resident's hint for the words it appends.
+    pub exit_forms: u32,
 }
 
 /// Direct branch target of the x86 instruction `insn` ending at `end`
@@ -445,7 +447,33 @@ pub(crate) fn admit_user(
         ));
     }
     (admitted.links, admitted.dispatch_exit, admitted.bulk) = (links, dispatch_exit, bulk);
+    let end = wrap(rip.wrapping_add(u64::from(h.guest_bytes)), bits32);
+    let tail = source.get(admitted.last as usize..h.guest_bytes as usize).unwrap_or(&[]);
+    admitted.exit_forms = exit_forms(tail, &admitted.links, admitted.dispatch_exit, end, bits32);
     Ok(admitted)
+}
+
+/// Indirect plan step 1, the resident's hint for the words it appends to a block ([`natemu_abi::execution::cache::Block::exit_forms`]),
+/// from its last instruction `insn` (ending at `end`; legacy prefixes, and REX bytes in 64-bit code, before its opcode): a
+/// near direct call (E8) marks the link points to its target as calls, but `call $+5` (to the next instruction: it never
+/// returns, a get-PC idiom); FF /2 (a near indirect call) and FF /4 (a near indirect jump) give the computed exit its own
+/// words, ending in `blr` and `br`. Anything else (a return, a far branch) keeps the slot's shared branch. A wrong hint
+/// changes only those words, never a target: every target is still the data table's or a link's.
+pub(crate) fn exit_forms(insn: &[u8], links: &[LinkPoint], dispatch_exit: Option<u32>, end: u64, bits32: bool) -> u32 {
+    use natemu_abi::execution::cache::{FORM_INDIRECT, FORM_INDIRECT_CALL};
+    let prefix = |b: u8| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3) || (!bits32 && b & 0xf0 == 0x40);
+    let Some(o) = insn.iter().position(|&b| !prefix(b)) else {
+        return 0;
+    };
+    match (insn[o], insn.get(o + 1).map(|m| m >> 3 & 7)) {
+        (0xe8, _) => match branch_target(insn, end).map(|t| wrap(t, bits32)) {
+            Some(t) if t != end => links.iter().enumerate().filter(|(_, p)| p.target == t).fold(0, |m, (k, _)| m | 1 << k),
+            _ => 0,
+        },
+        (0xff, Some(2)) if dispatch_exit.is_some() => FORM_INDIRECT | FORM_INDIRECT_CALL,
+        (0xff, Some(4)) if dispatch_exit.is_some() => FORM_INDIRECT,
+        _ => 0,
+    }
 }
 
 /// Admits every object in `dir` (`NAME.obj`: fexc's `--object`, compiled from `NAME.src` at its header's RIP and in its
@@ -841,6 +869,7 @@ fn admit_records(
         sti_first: false,
         bulk: false,
         last: last as u32,
+        exit_forms: 0,
     };
     let tail = &source[last..h.guest_bytes as usize];
     let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
@@ -1193,6 +1222,28 @@ mod tests {
     /// Guest bytes of the test block: `rex jmp $+1` (target RIP + 4).
     const SOURCE: [u8; 3] = [0x48, 0xeb, 0x01];
 
+    /// Indirect plan step 1: the exit forms' hint from the last instruction, in 64-bit and 32-bit code.
+    #[test]
+    fn exit_forms_from_the_last_instruction() {
+        use natemu_abi::execution::cache::{FORM_INDIRECT as J, FORM_INDIRECT_CALL as C};
+        let p = |target| LinkPoint { offset: 8, word: 0, target };
+        let end = 0x1005;
+        for bits32 in [false, true] {
+            let forms = |insn: &[u8], links: &[LinkPoint], computed: bool| exit_forms(insn, links, computed.then_some(4), end, bits32);
+            assert_eq!(forms(&[0xff, 0xd0], &[], true), J | C, "call rax / eax");
+            assert_eq!(forms(&[0xff, 0x14, 0x85, 0, 0, 0, 0], &[], true), J | C, "call [disp + rax*4]");
+            assert_eq!(forms(&[0xff, 0xe0], &[], true), J, "jmp rax / eax");
+            assert_eq!(forms(&[0x3e, 0xff, 0x24, 0xc5, 0, 0, 0, 0], &[], true), J, "ds jmp [disp + rax*8]");
+            assert_eq!(forms(&[0xff, 0xd0], &[], false), 0, "no computed exit: nothing to append");
+            assert_eq!(forms(&[0xc3], &[], true), 0, "a return keeps the slot's branch");
+            assert_eq!(forms(&[0xff, 0x1d, 0, 0, 0, 0], &[], true), 0, "a far call");
+            // E8 rel32 to 0x2005: the link point to it is a call; one to the block end is not; `call $+5` none.
+            assert_eq!(forms(&[0xe8, 0, 0x10, 0, 0], &[p(0x2005), p(end)], false), 1);
+            assert_eq!(forms(&[0xe8, 0, 0, 0, 0], &[p(end)], false), 0, "call $+5");
+        }
+        assert_eq!(exit_forms(&[0x41, 0xff, 0xe3], &[], Some(4), end, false), J, "jmp r11");
+        assert_eq!(exit_forms(&[0x48, 0xff, 0xe0], &[], Some(4), end, true), 0, "0x48 is DEC EAX in 32-bit code, no prefix");
+    }
     #[test]
     fn lock_neg_forms() {
         // lock neg [rbx]; lock neg qword [rax+rcx*8+0x10]; lock neg byte [rip+x]; fs lock neg word [rsp]; [rbp+0] (mod 1).

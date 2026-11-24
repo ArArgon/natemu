@@ -94,6 +94,21 @@ mod on {
                 }
             })
         }
+        fn tail(&self, pc: u64) -> Option<(BlockView, u16)> {
+            cache::tail_at(pc).map(|(b, point, w)| {
+                let view = BlockView {
+                    rip: b.rip,
+                    context: b.context,
+                    frame: b.source_gpa[0],
+                    dead: b.flags & DEAD != 0,
+                    ..BlockView::default()
+                };
+                let role = w as u16
+                    | if b.tail_calls(point) { sm::TAIL_CALL } else { 0 }
+                    | if point.is_some() { sm::TAIL_POINT } else { 0 };
+                (view, role)
+            })
+        }
         fn slot_context(&self, k: usize) -> u64 {
             cache::control().slot_contexts[k]
         }

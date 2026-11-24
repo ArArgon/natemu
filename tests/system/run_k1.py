@@ -580,17 +580,52 @@ XFLAGS = P.SYS_D(0) + 0x7800     # `pic-xwrite`: per CPU a ready word, then (+ 0
 JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
 PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
        'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross', 'pic-now',
-       'l1-pic', 'miss-pic')
+       'l1-pic', 'miss-pic', 'indirect-sites')
+# Indirect plan step 1 (`indirect-sites`): a library page IL (RL's frame) at RV1, RV3 and RV5 of table A and RV2 of table B,
+# the trampoline page RT at RVT and RVT2. IL: a loop of 256 rounds through three jump sites (`jmp rax`) of 1, 4 and 64
+# targets and three call sites (`call rax`) of as many, a position-independent table each (`movsxd; add`); each target adds
+# its number + 1 to a sum and sets its bit (jumps: `jmp r11` back), then rbx = the jump sum | the call sum << 32, rdi = the
+# AND of the two masks, rax = the alias; IFO: `lea rax, [rel $$]; ret`. RT + 0x300: `call` the alias's IFO (a direct call
+# out of the page: from shared code a checked link that is a call), then `jmp r13`.
+IFO = 0xf00
+IL_SUM = 256 + 64 * 10 + 4 * (64 * 65 // 2)
+
+
+def il_page():
+    jt = ''.join(f'\n.t{k}:\n    add rbx, {k + 1}\n    bts rdi, {k}\n    jmp r11' for k in range(64))
+    ct = ''.join(f'\n.f{k}:\n    add rsi, {k + 1}\n    bts rbp, {k}\n    ret' for k in range(64))
+    site = lambda idx, table, tail: (f'    {idx}\n    movsxd rax, dword [rdx + rax * 4 + {table} - .tabs]\n    add rax, rdx\n'
+                                     f'    lea rdx, [rel .tabs]\n{tail}')
+    jump = lambda idx, k: site(idx, '.jt', f'    lea r11, [rel .j{k}]\n    jmp rax\n.j{k}:\n    lea rdx, [rel .tabs]\n')
+    callsite = lambda idx: site(idx, '.ct', '    call rax\n    lea rdx, [rel .tabs]\n')
+    idx = ('xor eax, eax', 'mov eax, ecx\n    and eax, 3', 'mov eax, ecx\n    and eax, 63')
+    code = ('    xor ebx, ebx\n    xor esi, esi\n    xor edi, edi\n    xor ebp, ebp\n    xor ecx, ecx\n    lea rdx, [rel .tabs]\n.loop:\n'
+            + ''.join(jump(x, k) for k, x in enumerate(idx)) + ''.join(callsite(x) for x in idx)
+            + '    inc ecx\n    cmp ecx, 256\n    jne .loop\n    shl rsi, 32\n    or rbx, rsi\n    and rdi, rbp\n    lea rax, [rel $$]\n'
+            '    jmp r13\n    align 4\n.tabs:\n.jt:\n' + ''.join(f'    dd .t{k} - .tabs\n' for k in range(64))
+            + '.ct:\n' + ''.join(f'    dd .f{k} - .tabs\n' for k in range(64)) + jt + ct + '\n')
+    page = bytearray(0x1000)
+    lib = P.asm(code)
+    assert len(lib) <= IFO, len(lib)
+    page[:len(lib)] = lib
+    f = P.asm('lea rax, [rel $$]\nret')
+    page[IFO:IFO + len(f)] = f
+    return page
+
+
 # Least instances, checked links and local (same-page shared) links per CPU.
 PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1), 'pic-write': (1, 0, 1), 'pic-abs': (2, 1, 1),
            'pic-pge': (2, 1, 1), 'pic-gmap': (1, 0, 1), 'pic-ctx': (1, 1, 1), 'pic-twosrc': (3, 1, 1),
            'pic-cow': (1, 0, 1), 'pic-twoframe': (2, 1, 1), 'pic-xm': (2, 2, 0), 'pic-flush': (6, 2, 2), 'pic-write2': (1, 0, 1),
            'pic-pfault': (1, 0, 1), 'pic-xwrite': (1, 0, 1), 'pic-user': (0, 0, 0),
            'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1), 'pic-cross': (1, 0, 0), 'pic-now': (1, 0, 1),
-           'l1-pic': (1, 0, 1), 'miss-pic': (1, 0, 1)}
+           'l1-pic': (1, 0, 1), 'miss-pic': (1, 0, 1), 'indirect-sites': (2, 2, 1)}
 # Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
 # `pic-user` shares nothing (SHARES).
-PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
+PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)],
+             # Indirect plan step 1: computed exits given their own words as jumps and as calls (TAILS, TAIL_CALLS), shared
+             # link points given theirs (TAIL_POINTS), checked links made through them (TAIL_LINKS: the trampoline's jump and call).
+             'indirect-sites': [(32, 3, None), (33, 3, None), (34, 2, None), (35, 2, None)]}
 # The resident's NATEMU_PIC per program (else the program driver's `all`).
 PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
 
@@ -784,6 +819,10 @@ def pic_bodies(i, n=1):
                       + f'    mov byte [{d + RL + 1:#x}], 3\n' + call('h3', f'{RV3 + XO:#x}') + save(('r10', 'rbx'))
                       + call('h4', f'{RV1 + XO:#x}') + save(('r12', 'rbx')))
     out['pic-user'] = out['pic-two']
+    out['indirect-sites'] = (call('n0', f'{RV1:#x}') + calls('n1', RV3) + save(('r8', 'rbx'), ('r9', 'rdi')) + calls('n2', RVT)
+                             + calls('n3', RVT2) + save(('r10', 'rax')) + calls('n4', RVT + 0x300) + save(('r12', 'rax'))
+                             + calls('n5', RVT2 + 0x300) + save(('r14', 'rax')) + cr3('tb') + calls('n6', RV2)
+                             + save(('r15', 'rbx')) + '    and r9, rdi\n' + cr3('ta'))
     out['miss-pic'] = (call('p0', f'{RV1:#x}') + save(('r8', 'rax'), ('r9', 'rsi')) + call('p1', f'{RV6:#x}') + save(('r10', 'rax')) + call('p2', f'{RV7:#x}') + save(('r12', 'rax'))
                        + call('p3', f'{RV1:#x}') + call('p4', f'{RV6:#x}') + save(('r14', 'rax'), ('r15', 'rsi')))
     return out
@@ -971,6 +1010,8 @@ def reuse_tables(name, i):
         return {RV1: RL, RV3: RL, RVT: RT}, {}
     if name in ('pic-twosrc', 'pic-flush', 'pic-xm', 'pic-repexit'):
         return {RV1: RL, RV3: RL, RV5: RL, RVT: RT, RVT2: RT}, {}
+    if name == 'indirect-sites':
+        return {RV1: RL, RV3: RL, RV5: RL, RVT: RT, RVT2: RT}, {RV2: RL}
     if name == 'pic-twoframe':
         return {RV1: RL, RV3: RL, RV5: RL2, RVT: RT, RVT2: RT}, {}
     if name == 'pic-cow':
@@ -1013,6 +1054,12 @@ def reuse_memory(name, i):
         first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
                          {'addr': f'0x{d + RLC:x}', 'data': TAIL(2).hex()}]
+    if name == 'indirect-sites':
+        tramp = bytearray(0x1000)
+        tramp[:5] = JMP(RVT, RV3)
+        tramp[0x300:0x305] = b'\xe8' + (RV3 + IFO - (RVT + 0x305)).to_bytes(4, 'little', signed=True)
+        tramp[0x305:0x308] = P.asm('jmp r13')
+        return tables + [{'addr': f'0x{d + RL:x}', 'data': il_page().hex()}, {'addr': f'0x{d + RT:x}', 'data': tramp.hex()}]
     if name in PIC:
         page = bytearray(0x1000)
         page[:len(Y(1))] = Y(1)
@@ -1066,6 +1113,10 @@ def reuse_either(name):
             'pic-user': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
             # Two instances of one translation in one L1 set: each with its own page base (rax) and return address (rsi).
             'l1-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV6 + YN}},
+            # Every target of every site reached (the masks), each as often as its site's pattern says (the sums), in both
+            # address spaces; the trampoline's jump and call reach their own aliases (RV3 from RVT, RV5 from RVT2).
+            'indirect-sites': {'r8': {IL_SUM | IL_SUM << 32}, 'r9': {2 ** 64 - 1}, 'r10': {RV5}, 'r12': {RV3 + IFO}, 'r14': {RV5 + IFO},
+                               'r15': {IL_SUM | IL_SUM << 32}},
             'pool-peer': {'r8': {RV1}, 'r9': {RV1 + 17}, 'r10': {RV2}, 'r12': {RV2 + 17}},
             'pool-frame': {'r8': {RV1}, 'r10': {RV3}, 'r12': {RV3 + 17}},
             'pool-smc': {'r8': {1}, 'r9': {1}, 'r10': {3}, 'r12': {0x1000003}},
@@ -1080,7 +1131,7 @@ def reuse_either(name):
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
-REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n not in ('l1-pic', 'miss-pic')}}
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n not in ('l1-pic', 'miss-pic', 'indirect-sites')}}
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
@@ -1569,7 +1620,7 @@ EITHER = {
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
-    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', 'miss-pic', *POOL)},
+    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', 'miss-pic', 'indirect-sites', *POOL)},
     # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
     # CPUID's way into B (eax = 2 from B's own code).
     'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
@@ -1628,7 +1679,7 @@ def program(name, n, k):
                       for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20), (LF1, CQ3, 0x300), (LF2, CQ3, 0x400))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic') else [])
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic', 'indirect-sites') else [])
             + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n) + relink_memory(name, i)
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
@@ -1789,6 +1840,15 @@ def adv_program(name, n):
 
 # The two-way L1 counts (module docstring): per program, what the difference of its dispatcher misses over rounds must be.
 COUNT_CHECKS = ('l1-pair', 'l1-triple', 'l1-triple-d', 'l1-global', 'l1-dup', 'l1-pic')
+
+
+def feature_runtime(feature):
+    """The resident built with `feature` into its own target directory (`target/FEATURE`), as [`perf_runtime`] builds its own."""
+    target = ROOT / 'target' / feature
+    out = target / 'aarch64-unknown-none/release/natemu-runtime'
+    subprocess.run(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
+                    '--features', feature], cwd=ROOT, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
+    return out
 
 
 def perf_runtime(a):
@@ -2075,11 +2135,15 @@ def main():
     ap.add_argument('--page-currency', default='on', choices=('on', 'off', 'check', 'check-halt'), help='the page record mode of every run (local-gpa and the check programs keep their own)')
     ap.add_argument('--hooks-host', type=pathlib.Path, help='an io-test-hooks host for the hold cases (default: built into target/hooks)')
     ap.add_argument('--hooks-runtime', type=pathlib.Path, help='its resident')
+    ap.add_argument('--link-check', action='store_true', help='run on a resident built with `--features link-check` (into target/link-check here)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
+    # (`--link-check`: every program on the `link-check` resident, whose scans halt `link_check` at a TLB flush when the link
+    # records, the L1 lists, the linear chains or the appended words disagree with the code.)
+    if a.link_check: a.runtime = feature_runtime('link-check')
     import k1_expected   # (the expected states: written from the programs, tests/system/k1_expected.py)
     report, failures = [], []
     listed = [x for x in bodies(a.k) if x not in L1_VARIANTS]

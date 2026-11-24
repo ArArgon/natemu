@@ -309,12 +309,186 @@ pub mod cache {
     /// context's slot (its `b` relocated at placement), whose `adrp` names the L1 table holding that context, or which
     /// starts with `b` to [`DISPATCH_MISS`] while no table does; a context without a slot exits to [`DISPATCH_MISS`]. So
     /// a change of context rewrites no code: only giving a table to another context does (two slots).
+    /// Indirect plan step 1: each slot holds three forms of the same probe, [`SLOT_ORDINARY`] (ending in `br x1`, what a
+    /// computed exit's `b` and a checked link reach), [`SLOT_LOOKUP`] (ending in `ret` with x1 the target; a miss returns
+    /// x1 = [`DISPATCH_MISS`]), which the words appended to a block call with `bl` ([`TAIL_ENTRY_BYTES`]), and
+    /// [`SLOT_RETURN`] (ending in `ret x1`; a miss `ret x1` to the miss), for the return plan. An unbound slot's lookup and
+    /// return forms are the miss's two words alone.
     pub const DISPATCH: usize = SLOT + SLOT_BYTES;
-    pub const DISPATCH_BYTES: usize = 0x4000;
+    pub const DISPATCH_BYTES: usize = 0x8000;
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
-    pub const DISPATCH_SLOT_BYTES: usize = 128;
+    pub const DISPATCH_SLOT_BYTES: usize = 256;
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
+    /// Offsets of a slot's three forms, each at most [`SLOT_FORM_BYTES`] (13 probe words and the miss's 2).
+    pub const SLOT_ORDINARY: usize = 0;
+    pub const SLOT_LOOKUP: usize = 64;
+    pub const SLOT_RETURN: usize = 128;
+    pub const SLOT_FORM_BYTES: usize = 64;
+    const _: () = assert!(
+        DISPATCH_SLOTS == 128
+            && SLOT_RETURN + SLOT_FORM_BYTES <= DISPATCH_SLOT_BYTES
+            && DISPATCH_MISS + 4 <= DISPATCH + SLOT_LOOKUP
+            && SLOT_LOOKUP >= SLOT_ORDINARY + SLOT_FORM_BYTES
+            && SLOT_RETURN >= SLOT_LOOKUP + SLOT_FORM_BYTES
+    );
+    /// Indirect plan step 1: the words the resident appends after a block's code for one exit ([`Block::tail`]): `bl` to
+    /// its context's slot's [`SLOT_LOOKUP`] form, then `br x1` (a jump) or `blr x1` (a call), then `b` to
+    /// [`DISPATCH_MISS`] (a call's pad: the return plan's; unreached for a jump).
+    pub const TAIL_ENTRY_BYTES: u32 = 12;
+    /// [`Block::exit_forms`]: link point i is a direct call to its target (bit i); the computed exit is an indirect
+    /// jump or call (it gets appended words); it is an indirect call.
+    pub const FORM_CALL_POINTS: u32 = (1 << super::MAX_LINK_POINTS) - 1;
+    pub const FORM_INDIRECT: u32 = 1 << super::MAX_LINK_POINTS;
+    pub const FORM_INDIRECT_CALL: u32 = 2 << super::MAX_LINK_POINTS;
+    pub const FORMS: u32 = FORM_CALL_POINTS | FORM_INDIRECT | FORM_INDIRECT_CALL;
+    /// `br x1`, `blr x1`, `ret`, `ret x1`.
+    pub const BR_X1: u32 = 0xd61f_0020;
+    pub const BLR_X1: u32 = 0xd63f_0020;
+    pub const RET: u32 = 0xd65f_03c0;
+    pub const RET_X1: u32 = 0xd65f_0020;
+    /// `b` from code-area offset `from` to `to` (the area is at most 128 MiB, so every target is in range).
+    pub const fn b_word(from: u64, to: u64) -> u32 {
+        0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
+    }
+    /// `bl` from code-area offset `from` to `to`.
+    pub const fn bl_word(from: u64, to: u64) -> u32 {
+        0x9400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
+    }
+    /// `adr x1, to` at code-area offset `from` (within 1 MiB: inside the code area's head).
+    pub const fn adr_x1_word(from: u64, to: u64) -> u32 {
+        let d = to.wrapping_sub(from) as u32;
+        0x1000_0001 | (d & 3) << 29 | (d >> 2 & 0x7_ffff) << 5
+    }
+    /// Indirect plan step 1: the words of the dispatcher slot at code-area offset `at` ([`DISPATCH_SLOT_BYTES`]): with
+    /// `probe`, its ordinary form's 13 words (ending in `br x1`, its way-1 miss `cbnz x1` to [`DISPATCH_MISS`]), they make
+    /// all three forms; with none (unbound), `b` to the miss and the lookup and return forms' miss words alone. The lookup
+    /// form ([`SLOT_LOOKUP`]) ends both ways in `ret`, the return form ([`SLOT_RETURN`]) in `ret x1`; their way-1 miss goes
+    /// to their own two words after the probe, `adr x1, DISPATCH_MISS` and that `ret`. No form writes NZCV.
+    pub fn slot_form_words(at: u64, probe: Option<[u32; 13]>) -> [u32; DISPATCH_SLOT_BYTES / 4] {
+        let mut words = [0u32; DISPATCH_SLOT_BYTES / 4];
+        let miss = |form: usize, end: u32| [adr_x1_word(at + 4 * form as u64, DISPATCH_MISS as u64), end];
+        let forms = [(SLOT_LOOKUP / 4, RET), (SLOT_RETURN / 4, RET_X1)];
+        match probe {
+            None => {
+                words[0] = b_word(at, DISPATCH_MISS as u64);
+                for (form, end) in forms {
+                    words[form..form + 2].copy_from_slice(&miss(form, end));
+                }
+            }
+            Some(probe) => {
+                words[..13].copy_from_slice(&probe);
+                for (form, end) in forms {
+                    words[form..form + 13].copy_from_slice(&probe);
+                    // (`cbnz x1, +12`: to the form's own miss words.)
+                    (words[form + 7], words[form + 10], words[form + 12]) = (end, 0xb500_0061, end);
+                    words[form + 13..form + 15].copy_from_slice(&miss(form + 13, end));
+                }
+            }
+        }
+        words
+    }
+    /// Indirect plan step 1: the three words appended at code-area offset `at` for one exit whose context's dispatcher slot
+    /// is at `slot` (the miss: none): `bl` to the slot's lookup form (with no slot, `b` to the miss: x0 holds the target),
+    /// `br x1` or (`call`) `blr x1`, and the pad, `b` to the miss.
+    pub const fn tail_words(at: u64, slot: u64, call: bool) -> [u32; 3] {
+        [
+            if slot == DISPATCH_MISS as u64 { b_word(at, DISPATCH_MISS as u64) } else { bl_word(at, slot + SLOT_LOOKUP as u64) },
+            if call { BLR_X1 } else { BR_X1 },
+            b_word(at + 8, DISPATCH_MISS as u64),
+        ]
+    }
+    /// Indirect plan step 1: every form's words branch where they should, read back by a decoder of their own (`b`, `bl`,
+    /// `cbnz`, `adr`), not by the encoders above.
+    #[cfg(test)]
+    mod forms {
+        use super::*;
+        /// The target of the branch or `adr` word `w` at `at` (None: neither).
+        fn target(at: u64, w: u32) -> Option<u64> {
+            let sx = |v: u32, bits: u32| ((u64::from(v) << (64 - bits)) as i64 >> (64 - bits)) as u64;
+            if matches!(w >> 26, 0x05 | 0x25) {
+                Some(at.wrapping_add(sx(w & 0x3ff_ffff, 26) << 2))
+            } else if w & 0xff00_0000 == 0xb500_0000 {
+                Some(at.wrapping_add(sx(w >> 5 & 0x7_ffff, 19) << 2))
+            } else if w & 0x9f00_0000 == 0x1000_0000 {
+                Some(at.wrapping_add(sx((w >> 5 & 0x7_ffff) << 2 | w >> 29 & 3, 21)))
+            } else {
+                None
+            }
+        }
+        const MISS: u64 = DISPATCH_MISS as u64;
+        /// A bound slot's ordinary probe: its way-0 `cbnz` 3 words on, its way-1 `cbnz` to the miss, `br x1` at 7 and 12.
+        fn probe(at: u64) -> [u32; 13] {
+            let mut p = [0xf940_0041u32; 13];
+            (p[5], p[7], p[12]) = (0xb500_0061, BR_X1, BR_X1);
+            p[10] = 0xb500_0001 | ((MISS.wrapping_sub(at + 40) >> 2) as u32 & 0x7_ffff) << 5;
+            p
+        }
+        #[test]
+        fn a_bound_slots_forms_return_or_branch_and_miss_to_the_miss() {
+            let at = (DISPATCH + 5 * DISPATCH_SLOT_BYTES) as u64;
+            let w = slot_form_words(at, Some(probe(at)));
+            assert_eq!(w[..13], probe(at), "the ordinary form is the probe");
+            assert_eq!(target(at + 40, w[10]), Some(MISS));
+            for (form, end) in [(SLOT_LOOKUP, RET), (SLOT_RETURN, RET_X1)] {
+                let f = form / 4;
+                let pc = |k: usize| at + 4 * (f + k) as u64;
+                assert_eq!((w[f + 7], w[f + 12]), (end, end), "{form}: both ways end in its return");
+                assert_eq!(target(pc(5), w[f + 5]), Some(pc(8)), "{form}: way 0's miss to way 1");
+                assert_eq!(target(pc(10), w[f + 10]), Some(pc(13)), "{form}: way 1's miss to its own words");
+                assert_eq!((target(pc(13), w[f + 13]), w[f + 14]), (Some(MISS), end), "{form}: x1 = the miss, returned");
+                assert!(w[f..f + 15].iter().all(|&x| x != BR_X1), "{form}: no shared `br`");
+                assert!(15 * 4 <= SLOT_FORM_BYTES);
+            }
+        }
+        #[test]
+        fn an_unbound_slots_forms_go_to_the_miss() {
+            let at = (DISPATCH + 9 * DISPATCH_SLOT_BYTES) as u64;
+            let w = slot_form_words(at, None);
+            assert_eq!(target(at, w[0]), Some(MISS));
+            for (form, end) in [(SLOT_LOOKUP, RET), (SLOT_RETURN, RET_X1)] {
+                let f = form / 4;
+                assert_eq!((target(at + form as u64, w[f]), w[f + 1]), (Some(MISS), end), "{form}");
+            }
+        }
+        #[test]
+        fn appended_words_call_the_lookup_form_then_branch_or_call() {
+            let (at, slot) = (HEAD_BYTES as u64 + 0x1234 * 4, (DISPATCH + 3 * DISPATCH_SLOT_BYTES) as u64);
+            for call in [false, true] {
+                let w = tail_words(at, slot, call);
+                assert_eq!((w[0] >> 26, target(at, w[0])), (0x25, Some(slot + SLOT_LOOKUP as u64)), "a `bl`");
+                assert_eq!(w[1], if call { 0xd63f_0020 } else { 0xd61f_0020 });
+                assert_eq!((w[2] >> 26, target(at + 8, w[2])), (0x05, Some(MISS)), "the pad");
+                let none = tail_words(at, MISS, call);
+                assert_eq!((none[0] >> 26, target(at, none[0])), (0x05, Some(MISS)), "with no slot, `b` to the miss");
+            }
+        }
+        #[test]
+        fn a_blocks_appended_entries_follow_its_code() {
+            let mut b: Block = unsafe { core::mem::zeroed() };
+            (b.code, b.code_size, b.dispatch_exit) = (0x2_0000, 0x80, 0x70);
+            b.links[0] = super::super::LinkPoint { offset: 0x10, word: 0, target: 1 };
+            b.links[2] = super::super::LinkPoint { offset: 0x40, word: 0, target: 2 };
+            assert_eq!((b.tail_entries(), b.tail(None)), (0, None), "a plain computed exit has none");
+            b.exit_forms = FORM_INDIRECT | FORM_INDIRECT_CALL | 4;
+            assert_eq!((b.tail_entries(), b.tail(None), b.tail(Some(0))), (1, Some(0x2_0080), None), "absolute: the computed exit's only");
+            assert!(b.tail_calls(None) && b.tail_calls(Some(2)) && !b.tail_calls(Some(0)));
+            b.flags = PIC;
+            b.rep_exits = 1;
+            assert_eq!(b.tail_entries(), 2, "shared: and each link point but a REP self-exit");
+            assert_eq!((b.tail(Some(0)), b.tail(Some(1)), b.tail(Some(2))), (None, None, Some(0x2_008c)));
+            assert_eq!((b.tail_bytes(), b.tail_extent()), (24, 24));
+            assert_eq!(b.tail_word(0x2_0084), Some((None, 1)));
+            assert_eq!(b.tail_word(0x2_0094), Some((Some(2), 2)));
+            assert_eq!((b.tail_word(0x2_0098), b.tail_word(0x2_007c)), (None, None), "past them, and the code's last word");
+            // A link point whose `svc` word lies past the code: its words start after that word.
+            b.links[2].offset = 0x70;
+            assert_eq!((b.tail(None), b.tail_extent()), (Some(0x2_0084), 28));
+            assert_eq!(b.tail_word(0x2_0080), None, "the `svc` word is no appended word");
+            b.flags = PIC | INSTANCE;
+            assert_eq!(b.tail_entries(), 0, "an instance has no code of its own");
+        }
+    }
     /// L1: [`L1_TABLES`] tables of two-way sets, kept as data ([`DL1`]). A set is [`L1_WAYS`] entries, indexed by
     /// `rip & L1_SET_MASK` ([`L1_SET_BITS`] RIP bits). Each table holds entries of one code context
     /// ([`Control::l1_contexts`]); a context's dispatcher slot names its table (perf chunk 5: a CPL change switches tables
@@ -1268,6 +1442,12 @@ pub mod cache {
     pub const PIC_TEST_FORGE_NONCANONICAL: u64 = 6;
     /// As [`PIC_TEST_FORGE`], bits 47-63 flipped (a base in the other half).
     pub const PIC_TEST_FORGE_HALF: u64 = 7;
+    /// Indirect plan step 1 tests: on every second entry of a block from the resident, the vCPU is entered instead at word
+    /// 0, 1 or 2 ([`PIC_TEST_TAIL`] + word) of the words appended to another block of its context for an exit (a dead
+    /// block's when one has them), x0 the entered block's RIP and x1 the miss, with its own doorbell rung: the stop there
+    /// must take that RIP (the programs' values as without the test; `pic::count::TAIL_STOPS`).
+    pub const PIC_TEST_TAIL: u64 = 9;
+    pub const PIC_TEST_TAILS: u64 = 3;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     /// (Hot/cold layout: a split block's trampolines too.)
     pub const ARMED: usize = 3 * super::MAX_LINK_POINTS + 2;
@@ -1382,6 +1562,9 @@ pub mod cache {
         /// and per link point the trampoline its links patch (0: none, its own word).
         pub hot_body: u32,
         pub patch: [u32; super::MAX_LINK_POINTS],
+        /// Indirect plan step 1: the exits' forms ([`FORM_INDIRECT`], [`FORM_INDIRECT_CALL`], [`FORM_CALL_POINTS`]), the
+        /// host's hint kept with the block and its copies; which exits have words appended after its code ([`Block::tail`]).
+        pub exit_forms: u32,
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -1514,6 +1697,80 @@ pub mod cache {
         pub fn admitted_at(&self, p: &super::LinkPoint) -> u32 {
             let (at, own) = (self.link_at(p.offset), u64::from(self.code) + u64::from(p.offset));
             if at == own { p.word } else { 0x1400_0000 | (own.wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff }
+        }
+        /// Indirect plan step 1: the entries of words the resident appends after its code (at `code + code_size`, one
+        /// [`TAIL_ENTRY_BYTES`] each, in this order): its computed exit's when that is an indirect jump or call
+        /// ([`FORM_INDIRECT`]), then, in a [`PIC`] block (shared code, whose literal exits to other pages are checked links),
+        /// each link point's in point order that is not a REP self-exit (those are never checked-linked). A record with
+        /// no code of its own, and the step block, have none.
+        pub fn tail_entries(&self) -> u32 {
+            if self.code_size == 0 || self.flags & (STEP | SYSTEM | INSTANCE) != 0 {
+                return 0;
+            }
+            let points = if self.flags & PIC != 0 {
+                (0..super::MAX_LINK_POINTS).filter(|&k| self.tail_point(k)).count() as u32
+            } else {
+                0
+            };
+            u32::from(self.dispatch_exit != 0 && self.exit_forms & FORM_INDIRECT != 0) + points
+        }
+        fn tail_point(&self, k: usize) -> bool {
+            self.links[k].offset != 0 && self.rep_exits >> k & 1 == 0
+        }
+        /// The bytes [`Block::tail_entries`] take.
+        pub fn tail_bytes(&self) -> u32 {
+            TAIL_ENTRY_BYTES * self.tail_entries()
+        }
+        /// The code-area offset where its appended words begin: after its code, and after every link point's `svc` word,
+        /// which may lie past the placed code (FEX's last exit's `svc` can be the first word after `code_region_end`): at
+        /// most 16 bytes after the point's first word ([`crate::pic::svc_slot`]), and a checked link patches it there.
+        pub fn tail_start(&self) -> u64 {
+            let svc_end = self.links.iter().filter(|p| p.offset != 0).map(|p| p.offset + 20).max().unwrap_or(0);
+            u64::from(self.code) + u64::from(self.code_size.max(svc_end))
+        }
+        /// The bytes its appended words reserve after its code (`code + code_size`): the gap to [`Block::tail_start`] and
+        /// [`Block::tail_bytes`]; 0 with none.
+        pub fn tail_extent(&self) -> u32 {
+            match self.tail_entries() {
+                0 => 0,
+                _ => (self.tail_start() - u64::from(self.code)) as u32 - self.code_size + self.tail_bytes(),
+            }
+        }
+        /// The code-area offset of an exit's appended words: link point `k`'s (`Some(k)`, a [`PIC`] block's) or the
+        /// computed exit's (`None`); `None` when it has none.
+        pub fn tail(&self, point: Option<usize>) -> Option<u64> {
+            if self.tail_entries() == 0 {
+                return None;
+            }
+            let computed = u32::from(self.dispatch_exit != 0 && self.exit_forms & FORM_INDIRECT != 0);
+            let index = match point {
+                None if computed != 0 => 0,
+                None => return None,
+                Some(k) if k < super::MAX_LINK_POINTS && self.flags & PIC != 0 && self.tail_point(k) => {
+                    computed + (0..k).filter(|&j| self.tail_point(j)).count() as u32
+                }
+                Some(_) => return None,
+            };
+            Some(self.tail_start() + u64::from(TAIL_ENTRY_BYTES * index))
+        }
+        /// Whether an exit's appended words end in a call (`blr x1`): the computed exit's ([`FORM_INDIRECT_CALL`]), link
+        /// point `k`'s ([`FORM_CALL_POINTS`] bit k).
+        pub fn tail_calls(&self, point: Option<usize>) -> bool {
+            match point {
+                None => self.exit_forms & FORM_INDIRECT_CALL != 0,
+                Some(k) => self.exit_forms >> k & 1 != 0,
+            }
+        }
+        /// The appended words' entry holding code-area offset `offset` (computed exit `None`, link point `Some(k)`) and the
+        /// word's index in it (0 the `bl`, 1 the `br`/`blr`, 2 the pad), if any.
+        pub fn tail_word(&self, offset: u64) -> Option<(Option<usize>, u32)> {
+            let start = self.tail_start();
+            if offset < start || offset >= start + u64::from(self.tail_bytes()) || offset % 4 != 0 {
+                return None;
+            }
+            let word = ((offset - start) % u64::from(TAIL_ENTRY_BYTES) / 4) as u32;
+            let at = offset - 4 * u64::from(word);
+            [None].into_iter().chain((0..super::MAX_LINK_POINTS).map(Some)).find(|&p| self.tail(p) == Some(at)).map(|p| (p, word))
         }
         /// The code-area offset of its first word ([`Block::full_entry`]'s, for a [`PIC`] block).
         pub fn start(&self) -> u32 {
@@ -4291,6 +4548,10 @@ pub struct State {
     /// [`cache::Control::x87_varied`]). fexc compiles the unit for that pair (`--x87-guess`), with a test at its first x87
     /// instruction ([`crate::code_object::kind::X87GUESS`]).
     pub x87_guess: u64,
+    /// With a reply (indirect plan step 1): the staged block's exit forms ([`cache::Block::exit_forms`]: which link points
+    /// are direct calls, whether its computed exit is an indirect jump or call), the host's hint from the guest bytes; a
+    /// wrong hint changes only the words appended to the block, never a target.
+    pub exit_forms: u64,
 }
 /// The default of [`State::halt_poll_max_us`]. Measured on an M2 Max (November 14, 2026; depth-1 4 KiB direct reads over
 /// virtio-PCI, host CPU per request in brackets). At 2 vCPUs, without polling: 68-70 MB/s (68-70 us). 15 us: 74-85 MB/s
@@ -4427,6 +4688,7 @@ impl State {
             halt_poll_max_us: HALT_POLL_MAX_US,
             halt_poll: 0,
             x87_guess: 0,
+            exit_forms: 0,
         }
     }
 }

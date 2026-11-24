@@ -268,6 +268,7 @@ impl Publisher {
             links,
             dispatch_exit: t.block.dispatch_exit.unwrap_or(0),
             rep_exits: t.rep_exits as u32,
+            exit_forms: t.block.exit_forms,
             code,
             sites,
             relocs,
@@ -404,6 +405,7 @@ mod tests {
             sti_first: true,
             bulk: false,
             last: 0,
+            exit_forms: 0,
         }
     }
     const PREFIX: [u8; 6] = [0x48, 0x01, 0xd8, 0xc3, 0x90, 0x90];

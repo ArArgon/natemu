@@ -384,6 +384,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                         s.rep_exits,
                         s.relocatable != 0,
                         s.sti_first != 0,
+                        s.exit_forms,
                     );
                     crate::perf::leave(p);
                     // PIC study stage 2: a rewrite its static proof refused is a resident fault (the block was left
@@ -1572,13 +1573,16 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             };
             let staged = |k: u64| staged_word(&h, 4 * k);
             let sites = cache::sites(t);
-            // The computed exit's word is `b` to its context's dispatcher slot from the copy's place (perf chunk 12).
+            // The computed exit's word is `b` to its context's dispatcher slot from the copy's place (perf chunk 12), or to its
+            // own appended words when it has them and the context a slot (indirect plan step 1), whose forms are the host's
+            // hint for the answer at this RIP.
             let at = u64::from(t.code) + u64::from(t.dispatch_exit);
-            let dispatch = t.dispatch_exit == 0
+            let slot = cache::dispatcher_for(copy.context);
+            let to = t.tail(None).filter(|_| slot != cache::DISPATCH_MISS as u64).unwrap_or(slot);
+            let dispatch = (t.dispatch_exit == 0
                 || code(u64::from(t.dispatch_exit) / 4)
-                    == 0x1400_0000
-                        | (cache::dispatcher_for(copy.context).wrapping_sub(at) >> 2) as u32
-                            & 0x03ff_ffff;
+                    == 0x1400_0000 | (to.wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff)
+                && t.exit_forms == s.exit_forms as u32 & natemu_abi::execution::cache::FORMS;
             // The template's relocations it carries are the host's answer's (each packable one of the staged table is among
             // them, as many), and the host found its answer a template too.
             let reloc = |i: u32| unsafe {
@@ -2310,6 +2314,21 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
             cache::kick(s.vcpu as usize);
         }
     }
+    // Indirect plan step 1 test ([`cache::PIC_TEST_TAIL`]): entered at a word appended to another block of the context, x0
+    // this block's RIP (the stop there takes it; were the doorbell late, every word goes on to this RIP: the lookup finds
+    // its entry or misses, x1 is the miss).
+    let tail = cache::control().pic_test.wrapping_sub(cache::PIC_TEST_TAIL);
+    if tail < cache::PIC_TEST_TAILS
+        && s.blocks % 2 == 0
+        && s.shadow_entry == 0
+        && block.flags & cache::STEP == 0
+        && !block.starts_with_rep()
+    {
+        if let Some(at) = cache::tail_for_test(block.context, s.blocks / 2) {
+            (f.x[0], f.x[1], pc) = (block.rip, cache::CODE_VA + cache::DISPATCH_MISS as u64, cache::CODE_VA + at + 4 * tail);
+            cache::kick(s.vcpu as usize);
+        }
+    }
     // (And the `svc`-word links of any block, absolute ones' into position-independent targets included.)
     if cache::control().pic_test == cache::PIC_TEST_SVC && s.blocks % 2 == 0 && cache::arm_svc(code)
     {
@@ -2364,9 +2383,10 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64) -> ! {
         let Some(armed) = cache::disarm() else {
             halt_native([0, 0, frame.x[30]], stop::BAD_STOP)
         };
-        // PIC study stage 2 tests: the entry frame's x0 is zero again ([`enter`]).
+        // PIC study stage 2 tests: the entry frame's x0 is zero again ([`enter`]); the indirect plan's tail tests' x1 too.
         if cache::control().pic_test != 0 {
             (*shared()).initial.x[0] = 0;
+            (*shared()).initial.x[1] = 0;
         }
         // S4: a watched access's software step completed; any other entry abandons a step in flight. AFP accurate chunk 3: the
         // step of an FP trap's re-run is told apart by its marker (`fp::cancel` abandoned one that is not this step, in `finish`).
@@ -2597,6 +2617,19 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         let mut s = at_once(s, frame.x[0]);
         completed(&mut s); // a block exited into the dispatcher
         s.stops_dispatch += 1;
+        unsafe { dispatch(&mut s) }
+    }
+    // Indirect plan step 1: in the words appended to a block for an exit (a block boundary: the exit's guest effects are
+    // done and its target is in x0, which they never write), the vCPU stops at once, as in the dispatcher; a dead block's
+    // too (its code still runs until it leaves), so before the dead-block filter below.
+    if let Some((b, _, _)) = cache::tail_at(elr) {
+        let dead = b.flags & cache::DEAD != 0;
+        let mut s = at_once(s, frame.x[0]);
+        completed(&mut s);
+        s.stops_dispatch += 1;
+        let counts = &mut cache::control().pic_counts;
+        counts[natemu_abi::pic::count::TAIL_STOPS] += 1;
+        counts[natemu_abi::pic::count::TAIL_DEAD_STOPS] += u64::from(dead);
         unsafe { dispatch(&mut s) }
     }
     // PIC study (`pic-count` builds): in a link's counting stub, the exit's state: the vCPU stops at the target's start.

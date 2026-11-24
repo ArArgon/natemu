@@ -1,7 +1,8 @@
 # Indirect jumps and calls: a branch per site, then a one-entry inline cache (plan)
 
-Status: plan, November 23, 2026, on `m2-sampler`. Design only: nothing is built or run for it. Revision 2, after an
-independent design review (section 12): step 1 accepted with fixes, taken in; step 2 deferred. This plan goes first: it builds
+Status: step 1 built (section 13: the kill-test, what was built, the tests), November 23, 2026, on a branch from
+`m2-sampler` 810bd50b; its A/B is the owner's pooled round over all fixes. Revision 2, after an independent design review
+(section 12): step 1 accepted with fixes, taken in; step 2 deferred, and dropped by the kill-test. This plan goes first: it builds
 what the [return prediction plan](return-prediction-plan.md) then uses (the slot's forms, the words appended to a block, `blr`
 at indirect calls). Two plans, not one, because each has its own sampler number, benchmarks and A/B.
 
@@ -226,3 +227,91 @@ Independent design review (Fable, November 23) of revision 1: step 1 accept with
 indirect calls from step 1 on, so every call pushes (the return plan's balance rule), and this plan first; step 2's x30
 validated before a fill (live block, cache role, empty, current context); the stop rule before the dead-block filter; the
 decision read from profile cases; the census addition dropped; the kill-test's short and long periods; the estimate.
+
+## 13. Findings: step 1 built (November 23, 2026)
+
+**Kill-test** (bench case `host-dispatch-micro`, `tests/bench/run_host_dispatch_micro.py`, M2 Max, run at 810bd50b; host-native,
+mechanism only, not a guest number). Five rounds of 2^24 exits per variant and pattern, variants alternating; ns per exit, median
+(spread across rounds):
+
+| Pattern | V0 (slot `br`) | step 1 jump | step 1 call | step 2 jump | step 2 call |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p 0.63, long | 6.37 (0.28) | 4.57 (0.21) | 4.53 (0.17) | 4.29 (0.17) | 4.29 (0.22) |
+| p 0.75, long | 5.43 (0.29) | 3.61 (0.17) | 3.61 (0.11) | 3.19 (0.15) | 3.15 (0.07) |
+| p 1.0, short | 1.91 (0.12) | 1.44 (0.08) | 1.43 (0.06) | 1.08 (0.06) | 0.88 (0.03) |
+| p 1.0, long | 1.88 (0.09) | 1.43 (0.05) | 1.44 (0.18) | 1.09 (0.06) | 0.87 (0.04) |
+| interpreter loop | 6.22 (0.19) | 4.21 (0.19) | 4.16 (0.27) | 1.99 (0.06) | 1.96 (0.08) |
+
+Step 1 saves 1.80 and 1.83 ns per exit at 0.63 and 0.75 (bar: 1 ns) and does not lose at 1.0: it gains 0.45 ns there. The
+shared branch does not predict even a fully monomorphic set of 64 sites as well as their own branches. Step 1 is built. Step 2
+saves 0.42 ns over step 1 at 0.75 (bar: 1 ns) and is dropped. It would save about 2.2 ns on the interpreter loop, where every
+handler has one main successor; that is left for the sampler to show, not built. The other patterns are in the case's
+`summary.md`.
+
+**Built** (one commit on 810bd50b):
+
+- The slot area is 32 KiB: 128 slots of 256 bytes, each holding the three forms of section 3.1 (`cache::slot_form_words`,
+  abi). Only the lookup form is used; the return form is written and not reached.
+- Admission's hint (`admission::exit_forms`) comes from the block's last instruction. FF /2 and FF /4 give the computed exit
+  its own words. E8 marks the link points to its target as calls, except `call $+5`. The hint travels in `State::exit_forms`,
+  the template pool's header (offset 60, checked against `FORMS`), and `Block::exit_forms`, which uses the record's spare
+  padding, so the record does not grow.
+- The appended words (`Block::tail`): 12 bytes per entry, `bl` to the lookup form, `br x1` or `blr x1`, then `b` to the miss.
+  Jumps get the third word too, so every entry has the same size. One entry is appended for an indirect computed exit. In a
+  shared translation (`PIC`), one is appended for each link point that is not a REP self-exit. They are written per copy in
+  `place`, `copy`, `copy_pooled` and `share`. A context with no slot gets `b` to the miss.
+- The words start after the code and also after every link point's `svc` slot (`Block::tail_start`: at most the point's
+  offset + 20). In K1 `reuse-cross` and `pic-cross` at block size 1, a shared block's last move ends at `code_size`, and
+  its `svc` slot is the first word past the placed code; a checked link patches that word. The first build put the
+  appended words there, and the host audit caught it (`k1-c1`, `k1-c2@1`, `pic-*`). Not looked into: why that `svc` slot
+  lies outside the placed code at all. At 810bd50b a checked link writes there too, on the next placement's bytes or its
+  padding.
+- A checked link out of shared code patches its `svc` word to `b` to its point's entry (after rewriting the entry's `bl` for
+  the slot). `unlink_word` accepts either form.
+- Deviation: a checked link from absolute code into an instance still goes to the slot (`b`). Absolute blocks get no
+  link-point words; on every block they would cost 12 bytes per link point.
+- The stop rule: `cache::tail_at` (dead blocks included) is checked right after the slot-area rule and before the dead-block
+  filter, and the stop is taken at once with RIP = x0. Deviation: `block_at` is not widened. The stop rule and the sampler call
+  `tail_at` themselves, so no caller of `block_at` can take an appended word for admitted code.
+- The sampler: place `TAIL` (8), with `at` = the word, `TAIL_CALL` and `TAIL_POINT`, and `DEAD` in the flags.
+  `sample_report.py` counts `tail` samples by role, and dispatch samples by slot form (ordinary, lookup, return).
+- Counters, `pic::count` 32-37: computed-exit tails as jumps and as calls, link-point tails, links through them, stops at
+  them, and stops at them in dead blocks.
+- Audits: the host's `check_links` decodes every appended entry and every computed exit that branches to one. The
+  `link-check` resident's `check_tails` checks the same at each TLB flush, plus shared checked links. The reuse check expects
+  the computed exit to branch to its words and the hint to equal the host's.
+
+Not built: the i386 version of `indirect-sites`. 32-bit code takes the same path; `compat32` and the faults shards cover its
+indirect forms.
+
+**Tests** (this worktree, M2 Max, narrow runs only, no gate):
+
+| Case | Shows |
+| --- | --- |
+| `system` `indirect-sites` (K1 program, 1 and 2 vCPUs, block sizes default and 1) | Jump sites (`jmp rax`) and call sites (`call rax`) of 1, 4 and 64 targets, in a library at RV1, RV3 and RV5 of one space and RV2 of another. Every target is reached (bit masks), with exact sums. A shared trampoline's checked jump and checked call reach their own aliases. Counters ≥ 3 computed jump tails, ≥ 3 call tails, ≥ 2 link-point tails, ≥ 2 links through them. |
+| `system` `indirect-sites-lc` | The same, plus `pic-two`, `pic-write`, `pic-twosrc`, `kill-out` and `cr3-link`, on the `link-check` resident (`run_k1.py --link-check`). |
+| `system` `indirect-stop` (`run_pic.py` modes `tail0`-`tail2`) | Entered at each appended word with the doorbell rung: about 6,480 stops per mode, about 330 of them in dead blocks. No `BAD_STOP`; every program's values unchanged. |
+| Rust units (`execution::cache::forms`, `admission::exit_forms_from_the_last_instruction`) | Each form's branches, decoded independently; the tail layout; the hint in 64-bit and 32-bit code. |
+
+Each new check was shown to fail when it should. Each edit below was applied, the case run, then reverted:
+
+| Mutation | Red in |
+| --- | --- |
+| A call's words given `br x1` | `indirect-sites`: host audit, "appended words of the block" |
+| The lookup form's miss leaves x1 stale (no `adr`) | `indirect-sites`: `unknown_abort` |
+| The appended-word stop rule after the dead-block filter | `indirect-stop`: `bad_stop`, no dead-block tail stop |
+| The lookup form's way-1 `cbnz` one word off | Rust unit `a_bound_slots_forms_...` |
+| FF /2 hinted as a jump | Rust unit `exit_forms_from_the_last_instruction` |
+| The computed exit left at `b` slot | `indirect-sites-lc`: `reuse_mismatch`, and the host audit |
+| The pad's `b` to the dispatcher instead of the miss | `indirect-sites-lc`: `link_check` (stop 65) at the first TLB flush |
+
+Narrow runs at the final commit, all passing: the Rust units, and 3,060 system and smp checks (`indirect-*`,
+`frame-randomization*`, `k1-c1`, `k1-c2@*`, `pic-*`, `compat32*`, `smp` `coherence`, `contain`, `privilege`). `faults`
+`faults@*`, `faults-1@*` and `probes@*` (15,935 checks) passed one commit earlier, before the `svc`-slot fix, and were not
+run again. One unrelated failure, already failing
+at 810bd50b: `tests/bench/test_sample_report.py` `Cost::test_a_guest_share_moved_by_more_than_a_point_fails` still expects
+the 1-point bound that a7cd8e82 raised to 2. Not run: the gate, `programs`, `correctness`, `boot`, `io`.
+
+The A/B and the profile are left to the owner's pooled round over all fixes: section 7's cases, with flush counts, since the
+code area now holds 12 bytes more per indirect exit, and more per link point of shared code. The in-VM check
+(`guest-luajit-interp`, `guest-luajit`) belongs to that round.
