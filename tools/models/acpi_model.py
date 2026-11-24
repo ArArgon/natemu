@@ -1072,6 +1072,19 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
         info['DSDT_devices'] = {p: {k: v for k, v in d.items() if k != 'off'} for p, d in devices.items()}
         # ISA devices: COM1 (CLM-03-03-69: PNP0501, 0x3f8..0x3ff, IRQ4); RTC (main-session decision: PNP0B00,
         # 0x70 length 2, IRQ8). Each _CRS: exactly one I/O range and one edge/high interrupt.
+        def crs_items(p):
+            """p's `_CRS` decoded (its descriptors), its problems recorded; None when it is not a static buffer."""
+            crs = obj.get(p + '._CRS')
+            if not crs or crs[0] != 'Name' or not isinstance(crs[1], tuple) or crs[1][0] != 'buffer':
+                viol('CRS', f'{p}._CRS missing or not a static buffer')
+                return None
+            size, init = crs[1][1], crs[1][2]
+            if size != len(init):
+                viol('CRS', f'{p}._CRS BufferSize {size} vs {len(init)} initializer bytes')
+            its, probs = decode_resources(init)
+            for pr in probs:
+                viol('CRS', f'{p}._CRS: {pr}')
+            return its
         isa = []
         for hid, label, port, plen, irqn in (('PNP0501', 'COM1', 0x3F8, 8, 4), ('PNP0B00', 'RTC', 0x70, 2, 8)):
             found = [p for p, d in devices.items() if d['hid'] == hid]
@@ -1079,16 +1092,9 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
             if len(found) != 1:
                 viol('DEVICES', f'{hid} devices {found} (exactly one {label})')
             for p in found:
-                crs = obj.get(p + '._CRS')
-                if not crs or crs[0] != 'Name' or not isinstance(crs[1], tuple) or crs[1][0] != 'buffer':
-                    viol('CRS', f'{p}._CRS missing or not a static buffer')
+                its = crs_items(p)
+                if its is None:
                     continue
-                size, init = crs[1][1], crs[1][2]
-                if size != len(init):
-                    viol('CRS', f'{p}._CRS BufferSize {size} vs {len(init)} initializer bytes')
-                its, probs = decode_resources(init)
-                for pr in probs:
-                    viol('CRS', f'{p}._CRS: {pr}')
                 info[f'{label}_CRS'] = its
                 ios = [x for x in its if x['type'] in ('IO', 'FixedIO')]
                 irq = [x for x in its if x['type'] in ('IRQ', 'Interrupt')]
@@ -1115,16 +1121,8 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
             want = 'exactly one pvpanic device' if pvpanic else 'none: built without pvpanic'
             viol('DEVICES', f'QEMU0001 devices {pv} ({want})')
         for p in pv:
-            crs = obj.get(p + '._CRS')
-            if not crs or crs[0] != 'Name' or not isinstance(crs[1], tuple) or crs[1][0] != 'buffer':
-                viol('CRS', f'{p}._CRS missing or not a static buffer')
-            else:
-                size, init = crs[1][1], crs[1][2]
-                if size != len(init):
-                    viol('CRS', f'{p}._CRS BufferSize {size} vs {len(init)} initializer bytes')
-                its, probs = decode_resources(init)
-                for pr in probs:
-                    viol('CRS', f'{p}._CRS: {pr}')
+            its = crs_items(p)
+            if its is not None:
                 info['PVPANIC_CRS'] = its
                 got = [fmt_resource(x) for x in its if x['type'] != 'End']
                 if got != ['IO (Decode16, 0x505, 0x505, 1, 1)']:
