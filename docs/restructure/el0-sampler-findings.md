@@ -45,7 +45,8 @@ The round took 52 minutes of machine time (21:32 to 22:24), shared with other wo
   For configure and hackbench the EL0 tables below describe a small, long-stretch part of EL0 time and are not used for
   a verdict; for build, make and the benchmarks they describe most of it. The EL0/resident split is read from the
   `-profile` buckets, never from samples. A fix (not made here): record when the vCPU last *left* EL0 as well as when it
-  resumed, and count a ring between those two as resident, a ring before the exit as "EL0, place unknown".
+  resumed, and count a ring between those two as resident, a ring before the exit as "EL0, place unknown". Built since:
+  [the ring-time fix](#the-ring-time-fix-november-24) below.
 - **Sampled runs read low on guest time.** `guest-sampler-cost` this round: `build`'s guest share 1.4-1.9 points lower
   sampled, `hackbench` 0.4-0.8, `build` at 4 vCPUs 1.5-2.0 (all within the 2-point bound). Its wall bound failed for `build`
   at 4 vCPUs: run1 0.585 s slower against a bound of 0.556 s (5.443 against 4.858 s), run2 0.171 s against 0.171 s; `build`
@@ -65,6 +66,62 @@ The round took 52 minutes of machine time (21:32 to 22:24), shared with other wo
   (607.5 M trips in the use launch, exact: the guest bucket's entries equal the entry kinds' summed). Per step each entry
   kind's bucket time is divided by its launch-wide mean cost per entry (link 428 ns, miss 127, helper 132, abort 519): a
   scratch reduction of `io5-solo32-profile`'s log, assuming a kind's mean cost does not change by step.
+
+### The ring-time fix (November 24)
+
+The profile resident now records each trip out of generated code at the start of `finish` (the first Rust the gates
+call; `gates.S` is unchanged) and keeps the last 16 stretches of generated code, each its resume and its exit time. A
+sample's ring time is classed among them: in the stretch the bell interrupted, EL0 at the PC (as before); between two
+stretches, resident or host; in an earlier stretch, a new kind, **EL0 with no place** (the vCPU was in generated code, but
+the PC the interrupt saw is a later stretch's). The report counts it as EL0 time (`el0_all_pct`) and leaves it out of
+every table of EL0 places, roles and symbols. The sample file is version 2; its records are still 32 bytes.
+
+The first version kept only the exit before the last resume. It overshot wherever trips come faster than the bell's delay:
+a ring in the resident between two short stretches is taken two or more trips later and was counted EL0. With 16
+stretches, 75 of the io5 run's 10.8 M samples were rung before every stretch kept (counted resident, flagged); 89% of the
+no-place samples are one stretch back, 99% within three.
+
+Shares in % of the samples that were not halted, beside the guest bucket's % of busy time in the same run (bench cases
+`guest-hackbench-sample`, `io5-solo32-sample`, `guest-scimark32-sse2-sample`, M2 Max, one run each; the a7cd8e82 column
+is the table above, its EL0 share converted to non-halted samples):
+
+| Case, phase | a7cd8e82: EL0 / bucket | exit only (a6f73186): EL0 + no place / bucket | 16 stretches (839f51ac): EL0, no place, sum / bucket |
+| --- | ---: | ---: | ---: |
+| `guest-hackbench-sample` run1 | 3.2 / 38.4 | 67.3 / 46.2 | 5.6, 39.9, **45.5** / 46.4 |
+| `guest-hackbench-sample` run2 | | 68.6 / 47.0 | 6.6, 39.8, **46.4** / 47.3 |
+| `io5-solo32-sample` configure | 23.5 / 37.0 | 46.4 / 40.1 | 28.2, 11.7, **39.9** / 40.1 |
+| `io5-solo32-sample` i386-configure | 25.4 / 39.4 | 50.6 / 44.8 | 34.0, 11.9, **45.9** / 45.9 |
+| `io5-solo32-sample` make | 60.3 / 68.1 | 78.7 / 73.4 | 66.6, 6.8, **73.4** / 70.2 |
+| `io5-solo32-sample` i386-make | 65.6 / 71.9 | 81.4 / 76.6 | 73.7, 6.2, **79.9** / 76.9 |
+| `guest-scimark32-sse2-sample` run1 | 92.6 / 95.0 | 99.8 / 98.5 | 99.8, 0.0, **99.8** / 98.6 |
+
+The sum lands within a point of the bucket on hackbench and both configure steps, and 3 points above it on the make
+steps; scimark32-sse2 does not move (0.01% no place). The excess on make is not explained here. Both time stamps count
+their window toward EL0: the exit is stamped after the gate's register save (31 general and 32 vector registers) and
+`finish`'s prologue, some 70 instructions after the exception, and the resume about 50 loads before the `eret`; a few
+tens of nanoseconds per trip, at roughly 0.4 M trips per busy vCPU-second in a make step. But the guest bucket's own edges
+(`perf::enter` before the resume call and in `returned`) are wider still, so those windows alone would put the samples
+below the bucket, not above it.
+
+The places of EL0 samples (sections 2-4) are unchanged in kind: the samples placed are the same ones as before, and the
+no-place ones have no PC to give. What changes is that the placed samples are now a known share of EL0 time: about 70%
+on configure, 12% on hackbench, 90% on the make steps.
+
+The validity case passed (`guest-sampler-check-sample`, M2 Max). `guest-sampler-cost` (M2 Max) does not hold its bounds
+reliably, with or without the fix. Guest share sampled minus unsampled, in points, `build` at 1 vCPU / at 4 vCPUs, run1
+(the larger of the two runs each time; `hackbench` stayed within 0.1-0.9):
+
+| Commit | Rounds (in order of running) | Verdict |
+| --- | --- | --- |
+| 839f51ac / c4321f9b (same resident code) | -2.02 / -2.20; -0.74 / -2.37; -1.93 / -1.62 | failed, failed, passed |
+| 65a3d1eb (before the fix) | -1.90 / -1.95; -1.29 / -1.89 | passed, failed |
+
+The two commits alternated over five runs: 839f51ac, 65a3d1eb, c4321f9b, 65a3d1eb, c4321f9b. The wall bound failed on both
+commits (base: `hackbench` and `build` at 4 vCPUs in its second run). The guest-share difference sits at 1.6-2.4 points on
+`build` at 4 vCPUs either way; the means differ by under 0.2 points (the fix's 0.14 further at 4 vCPUs, 0.04 nearer at 1),
+inside the fix's own spread of 0.75. The fix adds a few
+stores per trip in both modes and a walk of at most 16 pairs per sample (4,000 per second), which cannot account for even
+that. The 2-point bound is marginal at 65a3d1eb already.
 
 ## 2. Where the vCPUs were
 
