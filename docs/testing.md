@@ -16,7 +16,15 @@ tools/natemu-test run tests/fp            # one family; any pytest selection wor
 
 `run` without a tier looks at what you changed since `main` (committed or not) and runs every unit test, every
 family's smoke cases, and the families whose declared paths match your changes. Files no family claims are listed so
-you can decide whether to widen the run.
+you can decide whether to widen the run. On a branch far from `main`, `--base COMMIT` diffs against that commit instead
+(for example the commit your previous run tested), so only what you changed since then is selected.
+
+**Running on another Mac over ssh.** A login over ssh gets a soft open-file limit of 256, too few for a natemu boot
+(it fails with `fexc channel: shm_open: Too many open files`): run `ulimit -n 61440` (macOS's per-process maximum,
+`kern.maxfilesperproc`) first. A non-interactive ssh command also lacks Homebrew on its PATH: start it with
+`eval "$(/opt/homebrew/bin/brew shellenv)"` and put Homebrew's LLVM first, as the [README](../README.md) says. A clone
+there also needs a local `main` branch: `run` diffs against it, and the `fexc-replay` case builds the compiler at the
+checkout's merge base with `main` (without one it fails with "no merge base with main").
 
 Runs from different checkouts and agents share the machine safely: each test asks the machine's queue before it
 starts. Tests that need the machine to themselves (timing bounds) run in *exclusive windows*: queued exclusive tests

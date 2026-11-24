@@ -200,7 +200,10 @@ tools/natemu-test run --gate   # all of them
 ```
 
 Both include the Rust and Python unit tests, so there is no need to run `cargo test` separately. The
-tests need two more Homebrew packages: `brew install nasm container`. `nasm` assembles small x86 test programs, and
-`container` is Apple's tool for running Linux containers, which the tests use to build x86 Linux files. Start it once
+tests need a few more Homebrew packages: `brew install nasm container llvm acpica iperf3`. `nasm` assembles small x86 test
+programs, and `container` is Apple's tool for running Linux containers, which the tests use to build x86 Linux files.
+`llvm` provides a clang that assembles every x86 test program (older Apple clang, such as version 17, rejects some of
+them); put it first on your PATH with `export PATH="$(brew --prefix llvm)/bin:$PATH"`. `acpica` provides `iasl`, which
+checks the ACPI tables natemu gives the guest, and `iperf3` is the host end of the network speed tests. Start it once
 after each restart of the Mac with `container system start`. The first run on a Mac downloads and builds what the tests
 need, which takes a few minutes. [Testing](docs/testing.md) explains the rest.
