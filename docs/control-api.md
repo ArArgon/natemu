@@ -34,10 +34,10 @@ Without that key natemu opens no socket and the launch is the same as before.
 
 Each message is one line: compact JSON (no newline inside it) followed by a newline (`\n`). Lines go both ways on
 the same connection. A line a client sends may be at most 1 MiB (1,048,576 bytes, without its newline). A longer
-line is answered with a parse error (-32700) and the connection is closed. natemu's own lines have no such bound
-(a later method may answer with more, see [Limits](#limits)). Blank lines are ignored. A line that is not valid UTF-8 is a
-parse error. When a client closes its sending side, a last line without its newline still counts, and the client gets
-the answers to everything it sent before natemu closes the connection.
+line is answered with a parse error (-32700) and the connection is closed. natemu's own lines have no such bound (a
+later method may answer with more, see [Limits](#limits)). Blank lines are ignored. A line that is not valid UTF-8 is
+a parse error. When a client closes its sending side, a last line without its newline still counts, and the client
+gets the answers to everything it sent before natemu closes the connection.
 
 A request:
 

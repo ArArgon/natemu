@@ -306,6 +306,13 @@ def merged(evs: list) -> list:
     return out
 
 
+def keyboard_marks() -> dict:
+    """How many EV_KEY presses and releases the guest has reported at each point the keyboard driver waits for: every
+    table key tapped, ShiftLeft pressed, ShiftLeft released (at the disconnect), the sentinel tapped (all of them)."""
+    table = 2 * len(KEY_CODES)
+    return {'table': table, 'shift_down': table + 1, 'shift_up': table + 2, 'sentinel': table + 4}
+
+
 def keyboard_expected() -> list:
     """Every key's press and release, ShiftLeft's press and its release at the disconnect, the sentinel's tap."""
     return ([(code, v) for _, code in KEY_CODES.values() for v in (1, 0)] + [(KEY_LEFTSHIFT, 1), (KEY_LEFTSHIFT, 0)]
@@ -488,12 +495,14 @@ def drive_keyboard(d: Driver):
         d.until(lambda t: len(keys(events(t, 'keyboard'))) >= 2 * (at + len(part)), QUIET_SECONDS, f'{part} from the guest')
     holder = d.connect()
     d.control['shift'] = answer(lambda: holder.send_input([key('ShiftLeft', True)]))
-    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= len(want) - 1, QUIET_SECONDS, 'the ShiftLeft press from the guest')
+    mark = keyboard_marks()
+    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= mark['shift_down'], QUIET_SECONDS, 'the ShiftLeft press from the guest')
     holder.close()                  # held: natemu must release it
-    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= len(want) - 2, QUIET_SECONDS, 'the ShiftLeft release after the disconnect')
+    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= mark['shift_up'], QUIET_SECONDS, 'the ShiftLeft release after the disconnect')
     last = d.connect()
     d.control['sentinel'] = answer(lambda: last.send_input(tap(SENTINEL_KEY)))
-    d.until(lambda t: keys(events(t, 'keyboard'))[-1:] == want[-1:], QUIET_SECONDS, f'the sentinel {SENTINEL_KEY} from the guest')
+    d.until(lambda t: len(keys(events(t, 'keyboard'))) >= mark['sentinel'] and keys(events(t, 'keyboard'))[-1:] == want[-1:],
+            QUIET_SECONDS, f'the sentinel {SENTINEL_KEY} from the guest')
     last.close()
     vm.close()
     d.quit()
@@ -688,9 +697,48 @@ def self_check():
     assert events(ev_line('m', 2, 8, 4294967293) + '\n', 'm') == [(2, 8, -3)]
     assert events(ev_line('m', 2, 8, 3), 'm') == [], 'a line still being written counted'
     assert merged([(2, 0, 255), (0, 0, 0), (2, 0, 255), (2, 1, 3), (1, 272, 1), (1, 272, 2), (4, 4, 9)]) == [(2, 0, 510), (2, 1, 3), (1, 272, 1)]
+    # The keyboard driver's wait points name the right events of the expected sequence.
+    want, mark = keyboard_expected(), keyboard_marks()
+    table = [(c, v) for _, c in KEY_CODES.values() for v in (1, 0)]
+    assert want[:mark['table']] == table and want[mark['table']:mark['shift_down']] == [(KEY_LEFTSHIFT, 1)]
+    assert want[mark['shift_down']:mark['shift_up']] == [(KEY_LEFTSHIFT, 0)]
+    assert want[mark['shift_up']:] == [(KEY_SENTINEL, 1), (KEY_SENTINEL, 0)] and mark['sentinel'] == len(want)
+    self_check_keyboard_driver()
     neg = self_check_judges()
     print(f'Init shell syntax and device lookup, {len(CASES)} case dispatches, KEY_CODES ({len(KEY_CODES)} keys), the event '
           f'format and {neg} negative judge controls passed; no VM launched.')
+
+
+def self_check_keyboard_driver():
+    """drive_keyboard against a fake guest that reports each key at once and a ShiftLeft release when its holder
+    disconnects: every wait must be met by exactly what the guest has reported by then (a wait for an event that
+    comes only later raises, as it would time out in a run)."""
+    lines, held = [], set()
+
+    class Guest:
+        def send_input(self, evs):
+            for e in evs:
+                code = KEY_CODES[e['code']][1]
+                if e['pressed']: held.add((self, code))
+                else: held.discard((self, code))
+                lines.append(ev_line('keyboard', EV_KEY, code, int(e['pressed'])))
+            return {}
+        def close(self):
+            for who, code in sorted(h for h in held if h[0] is self): lines.append(ev_line('keyboard', EV_KEY, code, 0))
+            held.difference_update({h for h in held if h[0] is self})
+        def call(self, method, params=None): return {}
+        def wait_stopped(self, timeout=60.0): return 'cancelled'
+
+    class Fake(Driver):
+        def __init__(self): self.control = {}
+        def connect(self): return Guest()
+        def ready(self): return Guest()
+        def until(self, test, seconds, what):
+            if not test(''.join(l + '\n' for l in lines)): raise RuntimeError(f'{what}: not reported yet')
+    fake = Fake()
+    drive_keyboard(fake)
+    assert keys(events(''.join(l + '\n' for l in lines), 'keyboard')) == keyboard_expected()
+    assert fake.control['stopped'] == 'cancelled' and fake.control['sentinel'] == {}
 
 
 def self_check_judges() -> int:
@@ -700,7 +748,8 @@ def self_check_judges() -> int:
     kb_lines = []
     for code, v in keyboard_expected():
         kb_lines += [ev_line('keyboard', EV_MSC, 4, 0x1e), ev_line('keyboard', EV_KEY, code, v), ev_line('keyboard', EV_SYN, 0, 0)]
-    kb_lines.insert(len(kb_lines) - 3, ev_line('keyboard', EV_KEY, KEY_LEFTSHIFT, 2))     # an autorepeat while held
+    held = 3 * keyboard_marks()['shift_down']               # the lines up to and including the ShiftLeft press
+    kb_lines.insert(held, ev_line('keyboard', EV_KEY, KEY_LEFTSHIFT, 2))     # an autorepeat while held
     host = 'natemu: Cancelled\n'
     quit = {'quit': {}, 'stopped': 'cancelled'}
     good_kb = Run('control-keyboard', 2, serial('control-keyboard', 2, '\n'.join(kb_lines) + '\n', kb_listing), host, 2, False,
@@ -752,11 +801,11 @@ def self_check_judges() -> int:
         'second release at the disconnect': rswap(good_kb, kb(KEY_SENTINEL, 1), kb(KEY_LEFTSHIFT, 0) + kb(KEY_SENTINEL, 1)),
         'no sentinel': dataclasses.replace(good_kb, serial=good_kb.serial[:good_kb.serial.rindex(kb(KEY_SENTINEL, 1))]),
         'sentinel failed': ctl(good_kb, sentinel={'code': -32002, 'data': None}),
+        'reader fell behind': swap(good_kb, kb(48, 0), ev_line('keyboard', EV_SYN, SYN_DROPPED, 0) + '\n' + kb(48, 0)),
+        # control-mouse
         'extra mouse packet': rswap(good_mouse, ev_line('mouse', EV_KEY, BTN_LEFT, 1) + '\n' + ev_line('mouse', EV_KEY, BTN_LEFT, 0) + '\n',
                                    ev_line('mouse', EV_REL, REL_X, 1) + '\n' + ev_line('mouse', EV_KEY, BTN_LEFT, 1) + '\n'
                                    + ev_line('mouse', EV_KEY, BTN_LEFT, 0) + '\n'),
-        'reader fell behind': swap(good_kb, kb(48, 0), ev_line('keyboard', EV_SYN, SYN_DROPPED, 0) + '\n' + kb(48, 0)),
-        # control-mouse
         'dy not negated': swap(good_mouse, ev_line('mouse', EV_REL, REL_Y, 40), ev_line('mouse', EV_REL, REL_Y, -40)),
         'one packet of 255': dataclasses.replace(good_mouse, serial=good_mouse.serial.replace(ev_line('mouse', EV_REL, REL_X, 255) + '\n', '')
                                                  .replace(ev_line('mouse', EV_REL, REL_X, 235), ev_line('mouse', EV_REL, REL_X, 255))),
