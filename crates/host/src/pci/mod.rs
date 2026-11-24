@@ -1,8 +1,10 @@
 //! Generic PCI layer adapted from cloud-hypervisor (see the header of each file), and natemu's own bus: configuration
-//! mechanism #1 (PCI Local Bus 3.0 3.2.2.3.2), a host bridge at 00:00.0, up to eight functions per slot, and routing of
-//! the PCI memory window to whichever function's memory BAR currently decodes an address.
+//! mechanism #1 (PCI Local Bus 3.0 3.2.2.3.2), a host bridge at 00:00.0, up to eight functions per slot, launch-time BAR
+//! placement ([`place`]), and routing of the PCI memory window, and of the I/O window when a function has an I/O BAR, to
+//! whichever function's BAR currently decodes an address.
 pub mod configuration;
 pub mod msix;
+pub mod place;
 
 use crate::devices::{Access, Device, Devices, Direct, mask};
 use configuration::{
@@ -24,6 +26,10 @@ pub mod platform {
     pub const fn bar(slot: u8) -> u32 {
         WINDOW.0 + 0x1_0000 * slot as u32
     }
+    /// The I/O window the bus forwards, inclusive: C000H-FFFFH (16 KiB), natemu's choice, free on this board (the PM
+    /// block at B000H, the debug and profile ports at F4H-FBH, pvpanic at 505H). The bus registers it, and the root
+    /// bridge's `_CRS` declares it, only when some function requests an I/O BAR ([`super::Bus::io_window`]).
+    pub const IO_WINDOW: (u16, u16) = (0xC000, 0xFFFF);
 }
 
 /// Device slots on the bus (PCI 3.0 3.2.2.3.2: the device number is 5 bits).
@@ -81,7 +87,9 @@ pub trait Function: Send + Sync {
     fn bar_requests(&self) -> Vec<(u8, BarKind, u64)>;
     /// Program BAR `index` to `base` at launch, decoding still off.
     fn assign(&self, index: u8, base: u64);
-    /// An access inside BAR `bar`; `offset` from its base. Tokens must be below 2^52.
+    /// An access inside BAR `bar`; `offset` from its base. Tokens must be below 2^52. An access to an I/O BAR must not
+    /// defer (port accesses are synchronous, `Device::read`/`write`): the bus refuses a deferred one as a refused one,
+    /// and the vCPU stops at the instruction (`unsupported_port`, status `device`).
     fn bar_access(&self, vcpu: usize, bar: u8, offset: u64, size: u64, value: Option<u64>) -> Access;
     /// Polls an access `bar_access` deferred on BAR `bar`, by the token it returned (as `Direct::poll`).
     fn bar_poll(&self, vcpu: usize, bar: u8, token: u64) -> Access;
@@ -99,15 +107,21 @@ pub struct Bars {
 /// A base while the BAR does not decode (no decoding base has its low bits set).
 const NO_BASE: u64 = u64::MAX;
 impl Bars {
-    /// The layout `requests` gives (as `Function::bar_requests`), nothing decoding yet.
+    /// The layout `requests` gives (as `Function::bar_requests`), nothing decoding yet. Panics on a malformed request:
+    /// a length not a power of two or below the minimum (memory 16, I/O 4: PCI 3.0 6.2.5.1), an index past BAR5, or one
+    /// a request already holds (a 64-bit BAR holds the next index too).
     pub fn new(requests: &[(u8, BarKind, u64)]) -> Self {
         let mut layout = [None; BARS];
+        let mut held = [false; BARS];
         for &(index, kind, len) in requests {
             let i = usize::from(index);
+            let upper = i + usize::from(kind == BarKind::Mem64);
+            let min = if kind == BarKind::Io { 4 } else { 16 };
             assert!(
-                i + usize::from(kind == BarKind::Mem64) < BARS && len.is_power_of_two(),
+                upper < BARS && len.is_power_of_two() && len >= min && !held[i] && !held[upper],
                 "BAR {index}: {kind:?} of {len:#x} bytes"
             );
+            (held[i], held[upper]) = (true, true);
             layout[i] = Some((kind, len));
         }
         Bars {
@@ -150,11 +164,16 @@ impl Bars {
         })
     }
     /// Program BAR `index` of `config` to `base` (for `Function::assign`) and republish: both halves of a 64-bit BAR.
+    /// Panics on a base not aligned to the BAR's length, or above 4 GiB for a 32-bit or I/O BAR.
     pub fn assign(&self, config: &mut PciConfiguration, index: u8, base: u64) {
         let i = usize::from(index);
-        let Some((kind, _)) = self.layout[i] else {
+        let Some((kind, len)) = self.layout[i] else {
             panic!("BAR {index} was not requested")
         };
+        assert!(
+            base & (len - 1) == 0 && (kind == BarKind::Mem64 || base >> 32 == 0),
+            "BAR {index}: {kind:?} of {len:#x} bytes at {base:#x}"
+        );
         config.write_config_register(4 + i, 0, &(base as u32).to_le_bytes());
         if kind == BarKind::Mem64 {
             config.write_config_register(5 + i, 0, &((base >> 32) as u32).to_le_bytes());
@@ -252,18 +271,59 @@ impl Bus {
         functions[n] = Some(f);
         Ok(())
     }
-    /// Registers the configuration ports (0xCF8..0xD00) and the whole memory window; both are fixed from here on.
+    /// Whether some function requests an I/O BAR: then [`Bus::install`] registers the I/O window
+    /// ([`platform::IO_WINDOW`]) and the root bridge's `_CRS` must declare it. Fixed by the functions added so far.
+    pub fn io_window(&self) -> bool {
+        self.requests().iter().any(|r| r.kind == BarKind::Io)
+    }
+    /// The BAR requests of the present functions, lowest (slot, function) first.
+    fn requests(&self) -> Vec<place::Request> {
+        let mut requests = Vec::new();
+        for (s, functions) in self.slots.iter().enumerate() {
+            for (n, f) in functions.iter().enumerate() {
+                for (bar, kind, len) in f.iter().flat_map(|f| f.bar_requests()) {
+                    requests.push(place::Request {
+                        slot: s as u8,
+                        function: n as u8,
+                        bar,
+                        kind,
+                        len,
+                    });
+                }
+            }
+        }
+        requests
+    }
+    /// Places every requested BAR ([`place::place`]; `Err` names a BAR that does not fit) and programs it, decoding
+    /// still off; then registers the configuration ports (0xCF8..0xD00), the whole memory window and, when some BAR is
+    /// an I/O BAR ([`Bus::io_window`]), the whole I/O window. All are fixed from here on.
     pub fn install(self, devices: &mut Devices) -> crate::Result<()> {
-        let (ports, window) = self.into_parts();
+        let requests = self.requests();
+        for p in place::place(&requests)? {
+            let r = p.request;
+            let f = self.slots[usize::from(r.slot)][usize::from(r.function)].as_ref();
+            f.expect("a requesting function").assign(r.bar, p.base);
+        }
+        let io = requests.iter().any(|r| r.kind == BarKind::Io);
+        let (ports, window, io_window) = self.into_parts();
         devices.register_ports(0xcf8, 8, Arc::new(Mutex::new(ports)))?;
         let size = u64::from(platform::WINDOW.1 - platform::WINDOW.0);
         devices.register(
             platform::WINDOW.0.into(),
             size,
             Arc::new(Mutex::new(window)),
-        )
+        )?;
+        if io {
+            let (first, last) = platform::IO_WINDOW;
+            devices.register_ports(
+                first.into(),
+                u32::from(last - first) + 1,
+                Arc::new(Mutex::new(io_window)),
+            )?;
+        }
+        Ok(())
     }
-    fn into_parts(self) -> (ConfigPorts, Window) {
+    fn into_parts(self) -> (ConfigPorts, Window, IoWindow) {
         // The present functions in (slot, function) order: the order the window decodes in.
         let mut present = Vec::new();
         for (s, functions) in self.slots.iter().enumerate() {
@@ -277,6 +337,7 @@ impl Bus {
             }
         }
         let slots = Arc::new(self.slots);
+        let present: Arc<[Present]> = present.into();
         (
             ConfigPorts {
                 address: 0,
@@ -284,8 +345,9 @@ impl Bus {
             },
             Window {
                 slots,
-                present: present.into(),
+                present: present.clone(),
             },
+            IoWindow { present },
         )
     }
 }
@@ -438,6 +500,62 @@ impl Device for Window {
     }
 }
 
+/// The I/O window ([`platform::IO_WINDOW`]) as one registered port range, present only when some function has an I/O
+/// BAR: each access goes to the function whose I/O BAR decodes it, lowest (slot, function, BAR) first. An access lying
+/// wholly in one BAR is one call; otherwise it is made byte by byte, each byte decoded on its own, as the registry does
+/// at a range's end. A byte no BAR claims reads FFH and a write to it is dropped, as an unclaimed port on a PC (the
+/// registry sees the whole window as owned, so under `strict_unassigned` such bytes are not refused, and the run report
+/// counts them as owned). Port accesses are synchronous: a function's deferred or refused access is a refusal (the
+/// vCPU stops), and earlier bytes of a split access stay made, as in the registry.
+struct IoWindow {
+    present: Arc<[Present]>,
+}
+impl IoWindow {
+    /// The function whose I/O BAR decodes ports `[port, port + size)`: the BAR, and the offset in it. A BAR decodes
+    /// only when it ends at or below 10000H: its upper 16 bits stay writable (PCI 3.0 6.2.5.1), and x86 port addresses
+    /// have none.
+    fn decode(&self, port: u64, size: u64) -> Option<(&Arc<dyn Function>, u8, u64)> {
+        self.present.iter().find_map(|p| {
+            p.f.bars().iter().enumerate().find_map(|(i, bar)| {
+                let bar = bar.filter(|b| b.kind == BarKind::Io)?;
+                let end = bar.base.checked_add(bar.len)?;
+                (end <= 0x1_0000 && port >= bar.base && port + size <= end)
+                    .then(|| (&p.f, i as u8, port - bar.base))
+            })
+        })
+    }
+    /// A read (`value` `None`, its value returned) or write of `size` bytes at `offset` in the window; `None` refused.
+    fn serve(&self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Option<u64> {
+        let port = u64::from(platform::IO_WINDOW.0) + offset;
+        let call = |(f, bar, off): (&Arc<dyn Function>, u8, u64), size, value| {
+            match f.bar_access(vcpu, bar, off, size, value) {
+                Access::Completed(v) => Some(v & mask(size)),
+                Access::Deferred(_) | Access::Refused => None,
+            }
+        };
+        if let Some(d) = self.decode(port, size) {
+            return call(d, size, value);
+        }
+        let mut out = 0;
+        for k in 0..size {
+            let byte = match self.decode(port + k, 1) {
+                Some(d) => call(d, 1, value.map(|v| v >> (8 * k) & 0xff))?,
+                None => 0xff,
+            };
+            out |= byte << (8 * k);
+        }
+        Some(out)
+    }
+}
+impl Device for IoWindow {
+    fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
+        self.serve(vcpu, offset, size, None)
+    }
+    fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
+        self.serve(vcpu, offset, size, Some(value)).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,11 +653,13 @@ mod tests {
     }
 
     /// A function as the real ones are built: a `PciConfiguration` with its BARs, published through [`Bars`] from
-    /// each configuration write (reads as `Stub`'s).
+    /// each configuration write (reads and writes as `Stub`'s).
     struct Live {
         id: u64,
         config: Mutex<PciConfiguration>,
+        requests: Vec<(u8, BarKind, u64)>,
         bars: Bars,
+        last_write: AtomicU64,
     }
     impl Live {
         /// BARs (index, kind, len, base), decoding off.
@@ -572,7 +692,9 @@ mod tests {
             Arc::new(Live {
                 id,
                 config: Mutex::new(config),
+                requests,
                 bars,
+                last_write: AtomicU64::new(OFF),
             })
         }
         fn write(&self, offset: usize, bytes: &[u8]) {
@@ -595,14 +717,21 @@ mod tests {
             self.bars.get()
         }
         fn bar_requests(&self) -> Vec<(u8, BarKind, u64)> {
-            Vec::new()
+            self.requests.clone()
         }
         fn assign(&self, index: u8, base: u64) {
             self.bars
                 .assign(&mut self.config.lock().unwrap(), index, base);
         }
-        fn bar_access(&self, _: usize, bar: u8, offset: u64, _: u64, _: Option<u64>) -> Access {
-            Access::Completed(self.id << 32 | u64::from(bar) << 24 | offset)
+        fn bar_access(&self, _: usize, bar: u8, offset: u64, _: u64, value: Option<u64>) -> Access {
+            let bar = u64::from(bar);
+            match value {
+                Some(v) => {
+                    self.last_write.store(bar << 48 | offset << 8 | v, SeqCst);
+                    Access::Completed(0)
+                }
+                None => Access::Completed(self.id << 32 | bar << 24 | offset),
+            }
         }
         fn bar_poll(&self, _: usize, _: u8, _: u64) -> Access {
             Access::Refused
@@ -636,6 +765,14 @@ mod tests {
             b.add(*s, *n, f.clone()).unwrap();
         }
         b.into_parts().1
+    }
+    /// The I/O window of a bus with functions (slot, function, f), BARs where the functions have them.
+    fn io_at(fs: &[(u8, u8, Arc<dyn Function>)]) -> IoWindow {
+        let mut b = Bus::new();
+        for (s, n, f) in fs {
+            b.add(*s, *n, f.clone()).unwrap();
+        }
+        b.into_parts().2
     }
     /// A read of `size` bytes at window address `addr`.
     fn read(w: &Window, addr: u64, size: u64) -> u64 {
@@ -1085,5 +1222,209 @@ mod tests {
         let d = ports();
         assert!(d.find(BASE).is_some() && d.find(BASE + 0xfff_f000).is_some());
         assert!(d.find(BASE - 0x1000).is_none() && d.find(platform::WINDOW.1.into()).is_none());
+    }
+
+    /// The ports the registry gives to some device: every port that strict mode does not refuse.
+    fn owned_ports(d: &mut Devices) -> Vec<std::ops::Range<u32>> {
+        d.strict = true;
+        let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+        for p in 0..=0xffffu32 {
+            if d.port(0, p as u16, 1, None).is_ok() {
+                match ranges.last_mut() {
+                    Some(r) if r.end == p => r.end = p + 1,
+                    _ => ranges.push(p..p + 1),
+                }
+            }
+        }
+        d.strict = false;
+        ranges
+    }
+    /// A 4-byte port read.
+    fn inl(d: &Devices, port: u16) -> u64 {
+        d.port(0, port, 4, None).unwrap()
+    }
+
+    #[test]
+    fn install_places_and_programs_the_bars() {
+        // 01.0: a virtio function's BAR0, created at its stride address; 03.0 and 03.1: BARs anywhere, placed at install
+        let v = Live::new(1, &[(0, BarKind::Mem32, 0x8000, bar(1))]);
+        let a = Live::new(
+            2,
+            &[
+                (0, BarKind::Mem32, 0x1000, 0),
+                (2, BarKind::Mem64, 0x1_0000, 0),
+                (4, BarKind::Io, 0x40, 0),
+            ],
+        );
+        let b = Live::new(3, &[(1, BarKind::Io, 0x100, 0)]);
+        let before: Vec<u32> = (0..64).map(|r| v.reg(r)).collect();
+        ports_with(&[(1, 0, v.clone()), (3, 0, a.clone()), (3, 1, b.clone())]);
+        assert_eq!((0..64).map(|r| v.reg(r)).collect::<Vec<_>>(), before, "virtio BAR0 unchanged");
+        let up = BASE as u32 + 0x20_0000;
+        // 03.0 BAR0 keeps its stride; BAR2-3 (64-bit, below 4 GiB) above 2 MiB; the I/O BARs largest first
+        assert_eq!(a.reg(4), bar(3) as u32);
+        assert_eq!((a.reg(6), a.reg(7)), (up | 4, 0));
+        assert_eq!(a.reg(8), 0xc100 | 1);
+        assert_eq!(b.reg(5), 0xc000 | 1);
+        // decoding stays off until the guest enables it
+        assert!(a.bars().iter().chain(b.bars().iter()).all(Option::is_none));
+        // a BAR that does not fit fails the launch, naming it
+        let c = Live::new(4, &[(1, BarKind::Io, 0x4000, 0)]);
+        let e = Live::new(5, &[(3, BarKind::Io, 0x4, 0)]);
+        let mut bus = Bus::new();
+        bus.add(6, 0, c).unwrap();
+        bus.add(6, 1, e).unwrap();
+        let err = bus.install(&mut Devices::new(1 << 30)).unwrap_err();
+        assert!(err.contains("PCI 06.1 BAR3"), "{err}");
+    }
+
+    #[test]
+    fn io_bar_routes_when_io_decoding_on() {
+        let a = Live::new(1, &[(0, BarKind::Mem32, 0x1000, 0), (1, BarKind::Io, 0x40, 0)]);
+        let b = Live::new(2, &[(2, BarKind::Io, 0x100, 0)]);
+        let d = ports_with(&[(3, 0, a.clone()), (5, 0, b.clone())]);
+        // b (256 bytes) at C000H, a (64) at C100H
+        for f in [&a, &b] {
+            f.write(4, &[COMMAND_IO as u8]);
+        }
+        assert_eq!(inl(&d, 0xc104), 1 << 24 | 4);
+        assert_eq!(inl(&d, 0xc0fc), 2 << 24 | 0xfc);
+        assert_eq!(d.port(0, 0xc13e, 2, None), Ok(0x3e), "the BAR's last two bytes");
+        assert_eq!(d.port(0, 0xc011, 1, None), Ok(0x11));
+        d.port(0, 0xc108, 2, Some(0xbeef)).unwrap();
+        assert_eq!(a.last_write.load(SeqCst), 1 << 48 | 8 << 8 | 0xbeef);
+        assert_eq!(b.last_write.load(SeqCst), OFF);
+        // the memory enable alone does not open an I/O BAR; I/O enable does not open a memory BAR
+        a.write(4, &[COMMAND_MEMORY as u8]);
+        assert_eq!(inl(&d, 0xc104), ONES);
+        assert_eq!(inl(&d, 0xc000), 2 << 24, "b still decodes");
+        a.write(4, &[COMMAND_IO as u8]);
+        assert_eq!(d.find(bar(3)).map(|(_, off)| off), Some(0x3_0000));
+        assert_eq!(a.bars()[0], None);
+        // a moved I/O BAR decodes at its new ports only
+        a.write(0x14, &0xd000u32.to_le_bytes());
+        assert_eq!(inl(&d, 0xc104), ONES);
+        assert_eq!(inl(&d, 0xd004), 1 << 24 | 4);
+        // overlapping I/O BARs: the lowest (slot, function, BAR)
+        b.write(0x18, &0xd000u32.to_le_bytes());
+        assert_eq!(inl(&d, 0xd010), 1 << 24 | 0x10);
+    }
+
+    #[test]
+    fn io_bar_silent_when_io_decoding_off() {
+        let a = Live::new(1, &[(0, BarKind::Io, 0x20, 0)]);
+        let d = ports_with(&[(2, 0, a.clone())]);
+        let silent = |why: &str| {
+            assert_eq!(inl(&d, 0xc000), ONES, "{why}");
+            assert_eq!(d.port(0, 0xc01f, 1, None), Ok(0xff), "{why}");
+            d.port(0, 0xc004, 4, Some(5)).unwrap();
+            assert_eq!(a.last_write.load(SeqCst), OFF, "{why}");
+        };
+        silent("as launched");
+        a.write(4, &[(COMMAND_MEMORY | 1 << 2) as u8]);
+        silent("memory and bus master enables only");
+        a.write(4, &[COMMAND_IO as u8]);
+        assert_eq!(inl(&d, 0xc01c), 0x1c);
+        a.write(4, &[0]);
+        silent("I/O enable cleared again");
+    }
+
+    #[test]
+    fn io_access_straddling_bar_end() {
+        // a: 16 ports at C000H, b: 16 ports at C010H, nothing at C020H
+        let a = Stub::with(1, &[(0, BarKind::Io, 0x10, 0)]);
+        let b = Stub::with(2, &[(3, BarKind::Io, 0x10, 0)]);
+        let d = ports_with(&[(2, 0, a.clone()), (3, 0, b.clone())]);
+        // bytes inside b, then unclaimed bytes past the last BAR
+        assert_eq!(inl(&d, 0xc01e), 0xffff_0f0e, "b's last two bytes, then FFH");
+        assert_eq!(d.port(0, 0xc01f, 2, None), Ok(0xff0f));
+        // across the boundary of two BARs: each byte from its own function
+        assert_eq!(d.port(0, 0xc00f, 2, None), Ok(0x000f));
+        assert_eq!(inl(&d, 0xc00e), 0x0100_0f0e, "a's 0EH and 0FH, b's 00H and 01H");
+        // a write: bytes inside are made one by one, the rest dropped
+        d.port(0, 0xc01e, 4, Some(0x4433_2211)).unwrap();
+        assert_eq!(b.last_write.load(SeqCst), 3 << 48 | 0xf << 8 | 0x22);
+        d.port(0, 0xc00f, 2, Some(0x6655)).unwrap();
+        assert_eq!(a.last_write.load(SeqCst), 0xf << 8 | 0x55);
+        assert_eq!(b.last_write.load(SeqCst), 3 << 48 | 0x66);
+    }
+
+    #[test]
+    fn io_bar_past_64k_does_not_decode() {
+        // a: a 128 KiB I/O BAR at 0, so ports 0-1FFFFH, past 10000H; b: 64 ports whose upper 16 bits are set (the
+        // register keeps them writable), its low 16 bits inside the window
+        let a = Stub::with(1, &[(0, BarKind::Io, 0x2_0000, 0)]);
+        let b = Stub::with(2, &[(0, BarKind::Io, 0x40, 0x1_c040)]);
+        let fs: [(u8, u8, Arc<dyn Function>); 2] = [(2, 0, a.clone()), (3, 0, b.clone())];
+        let mut w = io_at(&fs);
+        for (offset, size) in [(0, 4), (0x40, 4), (0x3fff, 1)] {
+            assert_eq!(w.read(0, offset, size), Some(mask(size)), "{offset:#x}");
+        }
+        assert!(w.write(0, 0x44, 4, 7));
+        assert_eq!(a.last_write.load(SeqCst), OFF);
+        assert_eq!(b.last_write.load(SeqCst), OFF);
+        // ending at 10000H decodes
+        b.base[0].store(0xffc0, SeqCst);
+        assert_eq!(w.read(0, 0x3ffc, 4), Some(0x3c));
+    }
+
+    #[test]
+    fn io_bar_deferral_is_refused() {
+        let a = Stub::with(1, &[(0, BarKind::Io, 0x100, 0)]);
+        let d = ports_with(&[(2, 0, a.clone())]);
+        let refused = Err(natemu_abi::execution::mmio::DEVICE);
+        assert_eq!(d.port(0, 0xc000 + DEFER as u16, 4, None), refused);
+    }
+
+    #[test]
+    fn no_io_window_without_io_bars() {
+        // a launch's bus: virtio functions with BAR0 only, one slot with two functions
+        let mut bus = Bus::new();
+        for (s, n) in [(1, 0), (2, 0), (3, 0), (3, 1)] {
+            let f = Live::new(s.into(), &[(0, BarKind::Mem32, 0x8000, bar(s))]);
+            bus.add(s, n, f).unwrap();
+        }
+        assert!(!bus.io_window());
+        let mut d = Devices::new(1 << 30);
+        bus.install(&mut d).unwrap();
+        assert_eq!(owned_ports(&mut d), [0xcf8..0xd00], "the configuration ports alone");
+        // one I/O BAR: the whole window, C000H-FFFFH
+        let mut bus = Bus::new();
+        bus.add(1, 0, Stub::new(1, 0)).unwrap();
+        bus.add(4, 0, Stub::with(2, &[(5, BarKind::Io, 4, 0)])).unwrap();
+        assert!(bus.io_window());
+        let mut d = Devices::new(1 << 30);
+        bus.install(&mut d).unwrap();
+        assert_eq!(owned_ports(&mut d), [0xcf8..0xd00, 0xc000..0x1_0000]);
+    }
+
+    #[test]
+    fn bars_refuse_malformed_requests_and_bases() {
+        let refused = |requests: &[(u8, BarKind, u64)]| {
+            std::panic::catch_unwind(|| Bars::new(requests)).is_err()
+        };
+        use BarKind::{Io, Mem32, Mem64};
+        assert!(!refused(&[(0, Mem64, 16), (2, Io, 4), (5, Mem32, 1 << 31)]));
+        for (bad, what) in [
+            (&[(0, Mem64, 0x1000), (1, Mem32, 0x1000)][..], "BAR1 is BAR0-1's upper half"),
+            (&[(2, Mem64, 0x1000), (3, Io, 4)][..], "BAR3 is BAR2-3's upper half"),
+            (&[(1, Mem32, 0x1000), (0, Mem64, 0x1000)][..], "BAR0-1 over BAR1"),
+            (&[(1, Io, 4), (1, Io, 4)][..], "BAR1 twice"),
+            (&[(5, Mem64, 0x1000)][..], "BAR5-6"),
+            (&[(0, Mem32, 8)][..], "memory below 16"),
+            (&[(0, Io, 2)][..], "I/O below 4"),
+            (&[(0, Mem32, 0x3000)][..], "not a power of two"),
+        ] {
+            assert!(refused(bad), "{what}");
+        }
+        let assign = |index: u8, base: u64| {
+            let f = Live::new(1, &[(0, Mem32, 0x1000, 0), (2, Mem64, 0x1000, 0), (4, Io, 0x10, 0)]);
+            let call = std::panic::AssertUnwindSafe(|| f.assign(index, base));
+            std::panic::catch_unwind(call).is_err()
+        };
+        assert!(!assign(2, 1 << 32), "a 64-bit BAR above 4 GiB");
+        assert!(assign(0, 1 << 32), "a 32-bit BAR above 4 GiB");
+        assert!(assign(4, 0x1_0000_c000), "an I/O BAR above 4 GiB");
+        assert!(assign(0, 0xe000_0800), "unaligned");
     }
 }
