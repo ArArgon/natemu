@@ -2,7 +2,7 @@
 # the framework's input root and its QEMU answers locked in tests.lock (docs/testing.md, tests/README.md).
 [family]
 name = "static"
-covers = ["crates/**", "third_party/FEX", "tools/**", "tests/static/**", "tests/lib/**"]
+covers = ["crates/**", "third_party/FEX", "tools/**", "tests/static/**", "tests/lib/**", "tests/bench/sample_roles.py"]
 
 [[suite]]
 name = "static"
@@ -63,6 +63,13 @@ argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--sh
 # M2: the same checks on 32-bit code (--bitness 32): its own single-instruction forms and programs (PROGRAMS32).
 [suite.cases."fexc-precision-32"]
 argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--bits32"]
+
+# The EL0 sampler report's word roles (tests/bench/sample_roles.py) on an idiom corpus fexc compiles with the host's options,
+# 64- and 32-bit (docs/restructure/el0-sampler-plan.md chunk 1): every word must get its idiom's role, so a change in fexc's
+# output shape fails here and the classifier is revised with it.
+[suite.cases."sample-roles"]
+argv = ["tests/static/check_sample_roles.py", "{fexc}"]
+smoke = true
 
 [suite.cases."fexc-address32"]
 argv = ["tests/static/check_compat_address.py", "{fexc}"]

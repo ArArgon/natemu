@@ -366,7 +366,10 @@ The `-sample` cases (`guest-build-sample` and the other guest benchmarks, `guest
 profiles of where the vCPUs were, from natemu's EL0 sampler ([plan](restructure/el0-sampler-plan.md)): the resident built with
 its `perf` and `profile` features, `--sample-us 250` on the runner, then `tests/bench/sample_report.py`, which writes
 `NAME.report.json` and `NAME.report.md` beside `NAME.samples` and `NAME.objects` in the case's folder (samples by kind and
-place per phase, the top blocks). `guest-sampler-cost` measures what sampling costs: off against on, alternating, three rounds.
+place per phase, the top blocks, each sampled word's role and the top symbols: the kernel's from the booted bzImage's kallsyms,
+the user's by finding each block's guest bytes in the bench image's binaries). The roles' classifier
+(`tests/bench/sample_roles.py`) is checked on fexc's own output by `tests/static`'s `sample-roles` case, an idiom corpus whose
+every word must get its idiom's role: a change in fexc's output shape fails there. `guest-sampler-cost` measures what sampling costs: off against on, alternating, three rounds.
 
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not

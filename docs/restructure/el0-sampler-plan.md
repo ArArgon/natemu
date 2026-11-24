@@ -217,6 +217,13 @@ samples. It is byte-oriented, because the guest's simplest writer, `/dev/port`, 
   the `io5` cases are re-run once with it. User samples by matching their objects'
   guest bytes against the `.text` of the image's binaries at the same page offset (bench image); for `io5`, only if its
   binaries can be read from the io5 inputs, checked here, else user results stop at block level.
+  As built (November 23): the `debian-kernel-deb` package's System.map is a one-line stub (the real one is in the -dbg
+  package), so kernel symbols come from the kallsyms tables of the bzImage natemu boots (`{kernel}`, the same file io5
+  boots), decompressed and read by `tests/bench/sample_symbols.py`. io5's binaries are installed in the guest's disk during
+  the run, which the inputs do not hold: io5 user samples stay at block level. Debian's binaries are stripped, so user
+  samples name a function only where `.dynsym` (or a bench program's own `.symtab`) has one; libc's AVX2/EVEX string
+  functions have no names and are counted by proxy (libc blocks holding a VEX.256 or EVEX instruction). Roles:
+  `tests/bench/sample_roles.py`, its corpus case `sample-roles` (tests/static).
 
 ### Chunk 2: the computed-exit census, under QEMU
 

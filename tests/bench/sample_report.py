@@ -4,7 +4,8 @@
 NAME.report.json and NAME.report.md beside them.
 
     python3 tests/bench/sample_report.py --profile NAME [--markers FILE] [--perf FILE] [--profile NAME ...]
-                                         [--window SECONDS] [--require-place PLACE] [-- COMMAND ...]
+                                         [--window SECONDS] [--require-place PLACE] [--kernel BZIMAGE] [--image CPIO]
+                                         [-- COMMAND ...]
 
 With `-- COMMAND`, the command runs first (a sampling boot: tools/bench/run.py --sample-us, tests/io/run_io5.py --sample-us)
 and the report after it, whatever its exit status; the exit status is the command's when it failed, else the report's.
@@ -24,8 +25,17 @@ the next; and fixed windows (`--window`, default 1 s) as a time series in the JS
 
 Fails (exit 1) when a file is missing or malformed, the run did not end (no counters), a vCPU's records in the file differ
 from what the host drained, no EL0 sample was recorded, the control port counted an ignored access, or a `--require-place`
-place has no sample. Per-word roles, symbols and the HTML page are the plan's chunk 1: `locate` gives each sample's object
-and word, for them to build on."""
+place has no sample.
+
+Roles and symbols (the plan's chunk 1): each block sample's word gets its role from the object's records and the A64
+patterns (tests/bench/sample_roles.py), and its symbol (tests/bench/sample_symbols.py): kernel samples by the kallsyms of
+`--kernel BZIMAGE` with the KASLR slide from the profile's markers, user samples by finding their blocks' guest bytes in
+the binaries of `--image CPIO` (the bench image; without it user samples stay at block level). Per phase: block samples by
+role, user and kernel and 64- and 32-bit apart, by group (FEX's body, its flag words, natemu's words, other), the shares
+the plan's section-7 rows read (split checks and probes, stack checks, REP string bodies, glibc AVX2/EVEX code, flag words,
+load-then-move, the kernel's copy and clear routines, FEX's body on the top 50 blocks), and the top 30 symbols; the top
+50 blocks of the whole run with each word's role and count. A sample past an object's code region (`beyond`) is a
+problem."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import bisect
 import collections
@@ -34,6 +44,9 @@ import mmap
 import re
 import struct
 import subprocess
+
+import sample_roles as roles_mod
+import sample_symbols
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -156,18 +169,152 @@ def locate(objects, s):
     """A block sample's (place BLOCK, PROBE or STEP) object and word: None if the place has no block or no object was
     served for it; else {record, how ('exact' or 'page'), candidates (answers with that key: their bytes differ), offset
     (the native offset in the object's code: a PIC block's full entry is at -4; None when it did not fit the record, FAR),
-    word_index, word (its 4 bytes; None outside the code)}. The first candidate is taken. Chunk 1's roles start from this."""
+    word_index, word (its 4 bytes; None outside the code region: FEX's tail is not placed), beyond (a sample past the code
+    region: a fault the report counts)}. The first candidate is taken."""
     if s['place'] not in (BLOCK, PROBE, STEP): return None
     hits, how = objects.find(s['rip'], s['frame'], s['context'])
     if not hits: return None
     r = objects.record(hits[0])
     off = offset(s)
     c, word = r['code'], None
-    if c and off is not None and 0 <= off and off + 4 <= c['code_size']:
+    # Admission places the code region only (code_region_end); FEX's tail after it is stripped, so no sample lies there.
+    beyond = bool(c) and off is not None and (off < -4 or off + 4 > c['code_region_end'])
+    if c and off is not None and 0 <= off and off + 4 <= c['code_region_end']:
         base = c['code_offset'] + off
         word = r['object'][base:base + 4] if base + 4 <= len(r['object']) else None
     return dict(record=r, how=how, candidates=len(hits), offset=off, word_index=off // 4 if off is not None and off >= 0 else None,
-                word=word)
+                word=word, beyond=beyond)
+
+
+# --- roles and symbols (chunk 1) ---------------------------------------------------------------------------------------
+NO_OFFSET = 1 << 30         # a FAR sample's offset, for sorting
+
+
+class Attribution:
+    """Each block sample's role and symbol, from its object (sample_roles, sample_symbols). `kernel` a Kallsyms, `slide` the
+    guest's KASLR slide, `image` a sample_symbols.Image (None: user samples stay at block level)."""
+
+    def __init__(self, objects, kernel=None, slide=0, image=None):
+        self.objects, self.kernel, self.slide, self.image = objects, kernel, slide, image
+        self.info_of, self.user, self.sym_of = {}, {}, {}
+        self.ambiguous = self.matched = self.looked_up = 0
+        self.reach = {}             # per block, the highest native offset sampled (set_reach)
+
+    def set_reach(self, words):
+        for (k, off, _), _ in words.items():
+            if off is not None and off > self.reach.get(k, -4): self.reach[k] = off
+
+    def info(self, key):
+        """The block's roles, per-word instruction offsets, REP string kinds per instruction and whether it holds a VEX.256 or
+        EVEX instruction; None when no object (or no code object) was served for it. Of several answers served with the
+        block's key (their bytes differ: a shorter compile, code patched since), the first whose code region holds every
+        sampled offset, else the one with the largest region."""
+        if key in self.info_of: return self.info_of[key]
+        info = None
+        hits, _ = self.objects.find(*key) if self.objects is not None else ([], None)
+        codes = []
+        for h in hits:
+            r = self.objects.record(h)
+            try: codes.append((roles_mod.Code(r['object']), r))
+            except (ValueError, IndexError, struct.error): continue
+        if codes:
+            reach = self.reach.get(key, -4)
+            c, r = next(((c, r) for c, r in codes if c.region_end > reach), max(codes, key=lambda x: x[0].region_end))
+            if c:
+                insns, guest, bits = c.word_insns(), r['guest'], 64 if mode(key[2]) == '64' else 32
+                rep, wide = {}, False
+                for g in {x for x in insns if x is not None}:
+                    ib = roles_mod.insn_bytes(c, guest, g)
+                    if k := roles_mod.x86_rep_string(ib, bits): rep[g] = k
+                    wide |= roles_mod.x86_wide_vector(ib, bits) is not None
+                info = dict(roles=roles_mod.roles(c), insns=insns, rep=rep, wide=wide,
+                            guest=guest if privilege(key[2], key[0], True) == 'user' else None)
+        self.info_of[key] = info
+        return info
+
+    def insn(self, info, off):
+        return info['insns'][off // 4] if info and off is not None and 0 <= off < 4 * len(info['insns']) else None
+
+    def match_user(self, keys):
+        """Finds the user blocks `keys` in the image's binaries (once each)."""
+        if self.image is None: return
+        queries = {}
+        for k in keys:
+            if k in self.user or privilege(k[2], k[0], True) != 'user': continue
+            info = self.info(k)
+            self.user[k] = None
+            if info and info['guest']: queries[k] = (k[0] & 0xfff, info['guest'], mode(k[2]) == '64')
+        self.looked_up += len(queries)
+        for k, hits in self.image.match(queries).items():
+            if len({e.name for e, _ in hits}) > 1: self.ambiguous += 1
+            self.user[k] = hits[0]
+            self.matched += 1
+
+    def symbol(self, key, info, off):
+        """'kernel:NAME', 'FILE:NAME', 'FILE:?' (found, no symbol), 'kernel:?' or 'user:?' (not found)."""
+        g = self.insn(info, off)
+        if (key, g) in self.sym_of: return self.sym_of[(key, g)]
+        rip, _, ctx = key
+        if privilege(ctx, rip, True) == 'kernel':
+            s = self.kernel.lookup(rip + (g or 0) - self.slide) if self.kernel else None
+            name = f'kernel:{s[0]}' if s else 'kernel:?'
+        else:
+            m = self.user.get(key)
+            if m is None: name = 'user:?'
+            else:
+                elf, va = m
+                name = f'{sample_symbols.basename(elf.name)}:{elf.lookup(va + (g or 0)) or "?"}'
+        self.sym_of[(key, g)] = name
+        return name
+
+    def words(self, t, key, items=None):
+        """[[native offset, role, samples]] of one block in a phase, in offset order (a probe's samples apart)."""
+        info = self.info(key)
+        acc = collections.Counter()
+        for off, probe, n in (items if items is not None else [(o, p, n) for (k, o, p), n in t.words.items() if k == key]):
+            acc[(NO_OFFSET if off is None else off, roles_mod.role_at(info['roles'] if info else None, off, probe))] += n
+        return [[None if o == NO_OFFSET else o, r, n] for (o, r), n in sorted(acc.items())]
+
+    def phase(self, t, el0, top_keys):
+        """A phase's block samples by role (privilege/mode apart), by group, the section-7 shares (% of the phase's EL0
+        samples; the hot-50 share of the top blocks' samples) and the top 30 symbols."""
+        by = collections.defaultdict(collections.Counter)
+        hot, rep, sym, bins = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
+        wide_libc = beyond = 0
+        for (key, off, probe), n in t.words.items():
+            info = self.info(key)
+            role = roles_mod.role_at(info['roles'] if info else None, off, probe)
+            if role == 'beyond': beyond += n
+            by[f'{privilege(key[2], key[0], True)}/{mode(key[2])}'][role] += n
+            if key in top_keys: hot[roles_mod.GROUPS[role]] += n
+            g = self.insn(info, off)
+            if info and g in info['rep']: rep[info['rep'][g]] += n
+            s = self.symbol(key, info, off)
+            sym[s] += n
+            bins[s.split(':')[0]] += n
+            if s.startswith('libc.so.6:') and info and info['wide']: wide_libc += n
+        allr = collections.Counter()
+        for c in by.values(): allr.update(c)
+        groups = collections.Counter()
+        for r, n in allr.items(): groups[roles_mod.GROUPS[r]] += n
+        pct = lambda n: round(100 * n / el0, 2) if el0 else None
+        avx2_named = sum(n for s, n in sym.items() if sample_symbols.AVX2_NAME.search(s))
+        kcopy = {s[7:]: n for s, n in sym.items() if s.startswith('kernel:') and s[7:] in sample_symbols.KERNEL_COPY}
+        hot_total = sum(hot.values())
+        shares = dict(
+            split_checks_and_probes=pct(allr['split_check'] + allr['probe']), stack_checks=pct(allr['stack_check']),
+            rep_string=pct(sum(rep.values())), rep_movs=pct(rep['movs']), rep_stos=pct(rep['stos']),
+            glibc_avx2_evex_named=pct(avx2_named), libc_wide_vector_blocks=pct(wide_libc), flag_words=pct(allr['flags']),
+            load_then_move=pct(allr['load_move']), kernel_copy_clear=pct(sum(kcopy.values())),
+            exits=pct(allr['exit_literal'] + allr['exit_computed']),
+            fex_body=pct(groups['fex_body']), fex_flags=pct(groups['fex_flags']), natemu=pct(groups['natemu']),
+            hot50_fex_body_pct=round(100 * hot['fex_body'] / hot_total, 2) if hot_total else None,
+            hot50_fex_flags_pct=round(100 * hot['fex_flags'] / hot_total, 2) if hot_total else None)
+        return dict(block_samples=sum(allr.values()), el0=el0, roles={c: dict(v.most_common()) for c, v in sorted(by.items())},
+                    all_roles=dict(allr.most_common()), groups=dict(groups), shares=shares, beyond=beyond,
+                    kernel_copy_clear=kcopy, rep_counts=dict(rep),
+                    symbols=[dict(symbol=s, samples=n, pct=pct(n)) for s, n in sym.most_common(30)],
+                    binaries=dict(bins.most_common()))
 
 
 # --- phases ----------------------------------------------------------------------------------------------------------
@@ -375,7 +522,7 @@ class Profile:
                             if flags & FAR: t_.flags['far'] += 1
                     if key:
                         summ[p].blocks[key] += 1
-                        if p == 0: summ[p].words[(key, None if flags & FAR else (w[2] >> 40 & 0xffff) - AT_BIAS)] += 1
+                        summ[p].words[(key, None if flags & FAR else (w[2] >> 40 & 0xffff) - AT_BIAS, place == PROBE)] += 1
                 s = series[win]; s['el0'] += 1; s[pname] += 1
                 continue
             if k == VCPU:
@@ -434,7 +581,26 @@ class Profile:
             hot=t.flags['hot'], dead=t.flags['dead'], far=t.flags['far'],
             since_log2_us={str(k): n for k, n in sorted(t.since.items())})
 
-    def report(self, objects=None, top=50):
+    def attribute(self, attribution, p, d, top):
+        """Phase p's roles and symbols into its dict d; the whole run's top blocks get their words' roles and a symbol."""
+        t = self.sum[p]
+        ranked = [k for k, _ in t.blocks.most_common(top)]
+        if p == 0:
+            attribution.set_reach(t.words)
+            attribution.match_user(t.blocks)
+            by_key = collections.defaultdict(list)
+            for (k, off, probe), n in t.words.items(): by_key[k].append((off, probe, n))
+            for row, k in zip(d['blocks']['top'], ranked):
+                row['words'] = attribution.words(t, k, by_key[k])
+                busiest = max(row['words'], key=lambda w: w[2])[0] if row['words'] else None
+                row['symbol'] = attribution.symbol(k, attribution.info(k), busiest)
+        d['attribution'] = a = attribution.phase(t, t.kinds['el0'], set(ranked))
+        if p == 0:
+            if a['beyond']: self.problems.append(f'{a["beyond"]} block samples past their object\'s code region')
+            a['user_blocks_looked_up'], a['user_blocks_found'] = attribution.looked_up, attribution.matched
+            a['user_blocks_ambiguous'] = attribution.ambiguous
+
+    def report(self, objects=None, top=50, attribution=None):
         names = [n for n, _, _ in self.phases.windows]
         snap_lines = names_b = None
         if self.perf and pathlib.Path(self.perf).exists():
@@ -457,6 +623,7 @@ class Profile:
                     d['buckets_s'] = {k: round(v, 3) for k, v in sorted(bk.items(), key=lambda kv: -kv[1]) if v >= 0.0005}
                     d['guest_share_of_busy'] = round(bk.get('guest', 0) / busy, 4) if busy else None
             d['blocks'] = self.blocks(self.sum[p], objects, top)
+            if attribution is not None: self.attribute(attribution, p, d, top)
             phases.append(d)
         counters = {str(k): v for k, v in self.counters.items()}
         for v in range(self.vcpus):
@@ -542,13 +709,73 @@ def markdown(rep):
     for i, r in enumerate(b['top'], 1):
         out.append(f'| {i} | `{r["rip"]}` | `{r["frame"]}` | `{r["context"]}` | {r["samples"]} | {r["pct"]} | {r["cum_pct"]} | '
                    f'{r["privilege"]} | {r["mode"]} | {r.get("object") or "none"} | {r.get("guest_insns", "")} | `{r.get("guest_bytes", "")}` |')
+    if 'attribution' in whole: out += attribution_markdown(rep)
     if rep['problems'] or rep['notes']:
         out += ['', '## Problems and notes', ''] + [f'- problem: {x}' for x in rep['problems']] + [f'- note: {x}' for x in rep['notes']]
     return '\n'.join(out) + '\n'
 
 
-def report_one(name, markers=None, perf=None, window_s=1.0, require=()):
-    """Reads NAME.samples and NAME.objects, writes NAME.report.json and NAME.report.md; the problems."""
+def attribution_markdown(rep):
+    p = lambda x: '' if x is None else f'{x:.1f}'
+    whole = rep['phases'][0]
+    out = ['', '## Roles and symbols by phase', '',
+           'Shares are % of the phase\'s EL0 samples; hot 50: FEX\'s body as % of the samples on the phase\'s top 50 blocks. '
+           'AVX2/EVEX named: samples on a symbol named *_avx2* or *_evex*; libc wide: samples in libc.so.6 blocks that hold a '
+           'VEX.256 or EVEX instruction (libc.so.6 is stripped: its string functions have no names).', '',
+           '| phase | block samples | FEX body | FEX flags | natemu | split + probe | stack | load-move | exits | REP str | '
+           'AVX2/EVEX named | libc wide | kernel copy | hot 50 FEX body |',
+           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for ph in rep['phases']:
+        a = ph.get('attribution')
+        if not a: continue
+        s = a['shares']
+        out.append(f'| {ph["name"]} | {a["block_samples"]} | {p(s["fex_body"])} | {p(s["fex_flags"])} | {p(s["natemu"])} | '
+                   f'{p(s["split_checks_and_probes"])} | {p(s["stack_checks"])} | {p(s["load_then_move"])} | {p(s["exits"])} | '
+                   f'{p(s["rep_string"])} | {p(s["glibc_avx2_evex_named"])} | {p(s["libc_wide_vector_blocks"])} | '
+                   f'{p(s["kernel_copy_clear"])} | {p(s["hot50_fex_body_pct"])} |')
+    a = whole['attribution']
+    classes = sorted(a['roles'])
+    total = a['block_samples']
+    out += ['', '## Block samples by role (whole run)', '', '| role | group | ' + ' | '.join(classes) + ' | % of block samples |',
+            '| --- | --- | ' + ' | '.join('---:' for _ in classes) + ' | ---: |']
+    for r, n in a['all_roles'].items():
+        out.append(f'| {r} | {roles_mod.GROUPS[r]} | ' + ' | '.join(str(a['roles'][c].get(r, 0)) for c in classes)
+                   + f' | {100 * n / total:.1f} |')
+    out += ['', f'User blocks looked up in the image: {a.get("user_blocks_looked_up")}, found '
+            f'{a.get("user_blocks_found")} ({a.get("user_blocks_ambiguous")} in more than one file: named by the first).',
+            '', '## Top blocks\' words (whole run)', '',
+            'Per block: its symbol, then each sampled word as native offset (hex), role and samples.', '']
+    for i, r in enumerate(whole['blocks']['top'], 1):
+        ws = ', '.join(f'{"far" if o is None else hex(o)} {role} {n}' for o, role, n in r.get('words', []))
+        out.append(f'{i}. `{r["rip"]}` {r.get("symbol", "")}: {ws}')
+    shown = [ph for ph in rep['phases'] if ph.get('attribution') and not ph['name'].startswith('mark/')]
+    if len(shown) <= 1: shown = [ph for ph in rep['phases'] if ph.get('attribution')]
+    for ph in shown:
+        a = ph['attribution']
+        out += ['', f'## Top 30 symbols: {ph["name"]}', '', '| symbol | samples | % of EL0 |', '| --- | ---: | ---: |']
+        out += [f'| `{x["symbol"]}` | {x["samples"]} | {p(x["pct"])} |' for x in a['symbols']]
+        if a['kernel_copy_clear']:
+            out += ['', 'Kernel copy and clear routines: ' + ', '.join(f'{k} {n}' for k, n in sorted(a['kernel_copy_clear'].items(), key=lambda kv: -kv[1]))]
+    return out
+
+
+def attribution_for(objects, markers=None, kernel=None, image=None, notes=None):
+    """The Attribution of one profile: the kernel's symbols with the slide from its markers, the image's binaries."""
+    notes = notes if notes is not None else []
+    slide = 0
+    if kernel is not None and markers and pathlib.Path(markers).exists():
+        t, note = sample_symbols.ktext(markers)
+        if note: notes.append(note)
+        elif kernel.text is not None: slide = t - kernel.text
+    elif kernel is not None: notes.append('no markers: no KASLR slide assumed')
+    if kernel is None: notes.append('no --kernel: kernel samples stay at block level')
+    if image is None: notes.append('no --image: user samples stay at block level')
+    return Attribution(objects, kernel, slide, image)
+
+
+def report_one(name, markers=None, perf=None, window_s=1.0, require=(), kernel=None, image=None):
+    """Reads NAME.samples and NAME.objects, writes NAME.report.json and NAME.report.md; the problems. `kernel` a
+    sample_symbols.Kallsyms, `image` a sample_symbols.Image (both optional)."""
     name = pathlib.Path(name)
     try:
         prof = Profile(name, markers, perf, window_s)
@@ -557,7 +784,7 @@ def report_one(name, markers=None, perf=None, window_s=1.0, require=()):
         if objects is None: prof.problems.append(f'{objects_path.name}: missing')
     except (FormatError, OSError) as e:
         return [str(e)]
-    rep = prof.report(objects)
+    rep = prof.report(objects, attribution=attribution_for(objects, markers, kernel, image, prof.notes))
     whole = rep['phases'][0]['summed']['el0_places']
     for place in require:
         if not whole.get(place): rep['problems'].append(f'no {place} sample (--require-place {place})')
@@ -573,7 +800,7 @@ def main(argv):
     command = []
     if '--' in argv:
         i = argv.index('--'); argv, command = argv[:i], argv[i + 1:]
-    profiles, require, window = [], [], 1.0
+    profiles, require, window, kernel_path, image_path = [], [], 1.0, None, None
     it = iter(argv)
     for a in it:
         if a == '--profile': profiles.append({'name': next(it)})
@@ -581,6 +808,8 @@ def main(argv):
             if not profiles: sys.exit(f'{a} before any --profile')
             profiles[-1][a[2:]] = next(it)
         elif a == '--window': window = float(next(it))
+        elif a == '--kernel': kernel_path = next(it)
+        elif a == '--image': image_path = next(it)
         elif a == '--require-place':
             place = next(it)
             if place not in PLACES.values(): sys.exit(f'--require-place: one of {", ".join(PLACES.values())}')
@@ -591,9 +820,15 @@ def main(argv):
     if command:
         print('running:', ' '.join(command), flush=True)
         code = subprocess.run(command, cwd=ROOT).returncode
-    problems = []
+    problems, kernel, image = [], None, None
+    try:
+        if kernel_path: kernel = sample_symbols.kernel_symbols(kernel_path)
+        if image_path: image = sample_symbols.Image(image_path)
+    except (OSError, RuntimeError, struct.error, subprocess.CalledProcessError) as e:
+        problems.append(f'symbols: {e}')
     for p in profiles:
-        problems += [f'{pathlib.Path(p["name"]).name}: {x}' for x in report_one(p['name'], p.get('markers'), p.get('perf'), window, require)]
+        problems += [f'{pathlib.Path(p["name"]).name}: {x}'
+                     for x in report_one(p['name'], p.get('markers'), p.get('perf'), window, require, kernel, image)]
     for x in problems: print('problem:', x, flush=True)
     return code if code else (1 if problems else 0)
 

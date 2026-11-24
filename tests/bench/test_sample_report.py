@@ -233,7 +233,9 @@ class Report(Base):
         self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=-4, frame=0x55)))['word'])
         far = sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, raw_at=0xffff, flags=sr.FAR, frame=0x55)))
         self.assertEqual((far['how'], far['offset'], far['word']), ('exact', None, None))
-        self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=16, frame=0x55)))['word'])
+        past = sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=16, frame=0x55)))
+        self.assertEqual((past['word'], past['beyond']), (None, True))
+        self.assertFalse(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=12, frame=0x55)))['beyond'])
         # Not found: another context, another frame; and places with no block.
         self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER32, at=8, frame=0x55))))
         self.assertIsNone(sr.locate(o, sr.sample(el0(0, 0x40_1000, sr.BLOCK, USER64, at=8, frame=0x56))))
@@ -244,7 +246,11 @@ class Report(Base):
         self.write(recs, markers, objects)
         p = sr.Profile(self.name, self.d / 'case.markers.tsv')
         key = (0x40_1000, 0x55, USER64)
-        self.assertEqual({at: n for (k, at), n in p.sum[0].words.items() if k == key}, {4: 2, 8: 1, 0: 1, 12: 1})
+        self.assertEqual({(at, probe): n for (k, at, probe), n in p.sum[0].words.items() if k == key},
+                         {(4, False): 2, (8, False): 1, (0, False): 1, (12, True): 1})
+        # Every phase counts its words (run1 holds all of A's).
+        run1 = [n for n, _, _ in p.phases.windows].index('run1')
+        self.assertEqual(sum(n for (k, _, _), n in p.sum[run1].words.items() if k == key), 5)
 
 
 class Checks(Base):
@@ -313,6 +319,100 @@ class Checks(Base):
         self.assertEqual(problems, [])
         self.assertEqual([p['name'] for p in r['phases']], ['all', 'mark/7', 'mark/8'])
         self.assertIn('no markers file', r['notes'][0])
+
+
+class Attribution(Base):
+    """Roles and symbols (chunk 1) in the report: a real admitted object (the host's admission fixture push-run.obj, which
+    fexc compiled) mapped from sample offsets to its words, and the report's tables on the standard run."""
+    FIXTURE = ROOT / 'crates/host/tests/admission/push-run.obj'
+
+    def fixture_objects(self):
+        obj = self.FIXTURE.read_bytes()
+        guest = self.FIXTURE.with_suffix('.src').read_bytes()
+        c = sr.code_header(obj)
+        write_objects(self.d / 'case.objects', [obj_record(c['guest_rip'], 0x55_000, USER64, obj, guest)])
+        return sr.Objects(self.d / 'case.objects'), obj, c
+
+    def test_a_sample_offset_is_the_admitted_objects_word(self):
+        import sample_roles
+        o, obj, c = self.fixture_objects()
+        code = sample_roles.Code(obj)
+        self.assertLess(c['code_region_end'], c['code_size'])          # FEX's tail follows the region in the object
+        for s in code.sites:
+            at = sr.locate(o, sr.sample(el0(0, c['guest_rip'], sr.BLOCK, USER64, at=s[0], frame=0x55)))
+            self.assertEqual(at['word'], obj[c['code_offset'] + s[0]:][:4])
+            if s[5] in sample_roles.ACCESS_KINDS: self.assertTrue(sample_roles.is_memory(int.from_bytes(at['word'], 'little')))
+        # Past the code region (the tail admission strips, still inside code_size): no word, a fault to count.
+        for off in (c['code_region_end'], c['code_size'] - 4):
+            at = sr.locate(o, sr.sample(el0(0, c['guest_rip'], sr.BLOCK, USER64, at=off, frame=0x55)))
+            self.assertEqual((at['word'], at['beyond']), (None, True), off)
+        a = sr.Attribution(o)
+        roles = sample_roles.roles(code)
+        info = a.info((c['guest_rip'], 0x55, USER64))
+        self.assertEqual(info['roles'], roles)
+        self.assertEqual(sample_roles.role_at(info['roles'], c['code_region_end']), 'beyond')
+
+    def test_a_sample_past_the_code_region_is_a_problem(self):
+        o, obj, c = self.fixture_objects()
+        rip = c['guest_rip']
+        recs = [header(1), hostrec(sr.CLOCK, T0, value1=1), hostrec(sr.TOGGLE, T0, value1=0, value2=1, value3=0, value4=sr.RUN),
+                hostrec(sr.CLOCK, T0 + S, value1=1, value2=1), hostrec(sr.VCPU, T0 + S, value1=0, value2=3, value3=0, value4=3),
+                el0(T0 + 1, rip, sr.BLOCK, USER64, at=4, frame=0x55), el0(T0 + 2, rip, sr.BLOCK, USER64, at=-4, frame=0x55),
+                el0(T0 + 3, rip, sr.BLOCK, USER64, at=c['code_region_end'], frame=0x55),
+                *counts(0, rings=3, written=3, drained=3), *run_counts()]
+        write_samples(self.d / 'case.samples', recs)
+        problems, r = self.report()
+        self.assertEqual(problems, ['1 block samples past their object\'s code region'])
+        a = r['phases'][0]['attribution']
+        self.assertEqual((a['beyond'], a['all_roles']['entry'], a['block_samples']), (1, 1, 3))
+        self.assertEqual(a['all_roles'].get('stack_check'), 1)           # push-run's first word: its stack check
+
+    def test_the_report_gives_roles_per_class_and_the_top_blocks_words(self):
+        recs, markers, objects = standard_run()
+        problems, r = self.report(markers=self.write(recs, markers, objects))
+        self.assertEqual(problems, [])
+        whole = r['phases'][0]
+        a = whole['attribution']
+        self.assertEqual(a['block_samples'], 8)
+        self.assertEqual(set(a['roles']), {'user/64', 'kernel/64', 'user/32'})
+        self.assertEqual(a['roles']['user/32'], {'none': 1})                # B has no object
+        self.assertEqual(a['roles']['kernel/64']['entry'], 1)              # K's -4 sample
+        self.assertEqual(a['all_roles']['probe'], 1)
+        top = whole['blocks']['top'][0]
+        self.assertEqual([w[0] for w in top['words']], [0, 4, 8, 12])
+        self.assertEqual(top['words'][-1][1:], ['probe', 1])
+        self.assertEqual(top['symbol'], 'user:?')                          # no image
+        md = (self.d / 'case.report.md').read_text()
+        for heading in ('## Roles and symbols by phase', '## Block samples by role (whole run)', '## Top blocks\' words',
+                        '## Top 30 symbols: all'):
+            self.assertIn(heading, md)
+        self.assertTrue(any('no --image' in n for n in r['notes']))
+
+    def test_kernel_symbols_take_the_slide_from_the_markers(self):
+        import test_sample_symbols as ts
+        import sample_symbols
+        k = sample_symbols.Kallsyms(ts.kallsyms_blob(ts.SYMS))
+        recs, markers, objects = standard_run()
+        slide = 0x40_0000
+        K = 0xffff_ffff_8100_0040
+        # Move K to clear_page_erms + 0x10 under a 4 MiB slide.
+        new_k = ts.TEXT + 0x110 + slide
+        recs = [(r[0], new_k & ((1 << 48) - 1) | r[1] & ~((1 << 48) - 1), r[2], r[3])
+                if r[2] >> 60 == sr.EL0 and r[1] & ((1 << 48) - 1) == K & ((1 << 48) - 1) else r for r in recs]
+        objects[1] = obj_record(0x40_5000 | (new_k & 0xfff), 0x1000_000, KERNEL64,
+                                code_object(new_k, b'\xaa' * 8 + b'\xbb' * 4), b'\xcc' * 12)
+        mk = self.write(recs, markers + [(1, f'NATEMU-BENCH-KTEXT {ts.TEXT + slide:x}')], objects)
+        problems = sr.report_one(self.name, markers=mk, kernel=k)
+        r = json.loads((self.d / 'case.report.json').read_text())
+        self.assertEqual(problems, [])
+        syms = {x['symbol']: x['samples'] for x in r['phases'][0]['attribution']['symbols']}
+        self.assertEqual(syms.get('kernel:clear_page_erms'), 2)
+        self.assertEqual(r['phases'][0]['attribution']['kernel_copy_clear'], {'clear_page_erms': 2})
+        # Without the slide the same samples name nothing.
+        mk.write_text(mk.read_text().replace(f'NATEMU-BENCH-KTEXT {ts.TEXT + slide:x}', f'NATEMU-BENCH-KTEXT {ts.TEXT:x}'))
+        sr.report_one(self.name, markers=mk, kernel=k)
+        r = json.loads((self.d / 'case.report.json').read_text())
+        self.assertNotIn('kernel:clear_page_erms', {x['symbol'] for x in r['phases'][0]['attribution']['symbols']})
 
 
 class Markers(unittest.TestCase):
