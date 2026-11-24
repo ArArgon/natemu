@@ -11,7 +11,11 @@ keeping `split_begin`'s flag scan, with `holding()` before the table read as the
 direction (same day): plan mapped device memory first among the display-related work; which display and audio devices
 to build is not decided, so this plan builds the primitive and test-only consumers, no display device. It follows the
 multi-BAR PCI plan (`docs/restructure/pci-multibar-plan.md`), whose `Function`/`Bar` interface it extends, and uses the
-`tests/devices` family the platform-devices plan creates.
+`tests/devices` family the platform-devices plan creates. Amended November 24, 2026: a region's backing is a POSIX
+shared-memory object, so another process (a front end, through the control socket of
+`docs/restructure/control-api-plan.md`) can map the same pages; an experiment the same day showed `hv_vm_map` accepts
+such memory (below). An independent review of the amendment required that clients get only a read-only descriptor
+(folded in).
 
 **Goal:** a PCI memory BAR can be backed by host memory that the guest reads and writes natively (no exit per access)
 and the host reads and writes directly, at whatever address the guest programs the BAR to; the primitive a Bochs-style
@@ -84,9 +88,22 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 
 ### Host side
 
-- `crate::pci::DeviceMemory`: one anonymous host allocation, 2 MiB-aligned, length a power of two from 2 MiB to
-  256 MiB (2 MiB: the resident alias's block size). Volatile 8-byte-wide accessors (`read_words`, `write_words`) for
-  host copies, so host stores are single-copy atomic per word; `as_ptr()` for a later scanout.
+- `crate::pci::DeviceMemory`: one POSIX shared-memory object (`shm_open(O_RDWR | O_CREAT | O_EXCL)` with a short unique
+  name, `/natemu.<pid>.<n>`, within macOS's 31-byte limit; `ftruncate` to the length once, which fixes it: macOS allows
+  only that one size change; a second `shm_open(O_RDONLY)` of the name for the descriptor handed out; then
+  `shm_unlink`, so only the descriptors name it and nothing outlives the process), mapped `MAP_SHARED` read-
+  write at a 2 MiB-aligned address (reserve twice the length, `MAP_FIXED` into the aligned part, unmap the rest);
+  length a power of two from 2 MiB to 256 MiB (2 MiB: the resident alias's block size). Volatile 8-byte-wide accessors
+  (`read_words`, `write_words`) for host copies, so host stores are single-copy atomic per word; `as_ptr()` for a later
+  scanout; `fd()` the read-only descriptor, the only one the control socket passes to a client (`SCM_RIGHTS`): on it
+  `mmap(PROT_WRITE, MAP_SHARED)` fails with EACCES, so a client cannot write device memory; and `view()` a second read-only mapping of the same object in this process.
+- **Why shared memory, and the evidence.** A front end in another process must see the guest's frames without a copy
+  per frame. Experiment (a scratch program, not a test case; November 24, M3 on macOS 15.7.3 and M2 Max on macOS
+  26.6.2): `hv_vm_map` of a `shm_open` + `mmap(MAP_SHARED)` region and of an IOSurface's base address both succeed; a
+  vCPU's store into each is read by a second process that maps the object (the shared-memory object by name, the
+  IOSurface by global ID). Task 1's `view()` test and Task 2's `SUM` (computed through `view()`) make the shared-memory
+  half a framework case. An IOSurface (for a Metal front end) is the alternative; it cannot travel over a Unix socket
+  (it needs a Mach port), so it waits for the native front end.
 - Multi-BAR's memory BAR request gains `mapped: Option<Arc<DeviceMemory>>`. `Bus::install` (in `prepare`) collects the
   mapped regions into `Prepared`; the VM does not exist yet. `Machine::create` takes them: it counts them in the IPA
   size computation (`vm.rs`, from the backing size today), `hv_vm_map`s each at `MAPPED_IPA + offset` (offsets 2 MiB-
@@ -150,6 +167,8 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   enabled at a base, plus `--mapped-control-at GPA` a control page with registers `MOVE` (write a new base; 0 disables),
   `SUM` (read: the host's 64-bit sum of the region's words) and `FILL` (write: the host fills the region with a pattern
   derived from the value). This exercises the resident without PCI.
+- **`SUM` reads through `view()`**, the second mapping, never the main one: each case that checks `SUM` also checks
+  that guest stores reach another mapping of the object.
 - **PCI test function** (`debug.mapped_testdev`, multi-BAR's test-option style): BAR0 a 2 MiB mapped region, BAR2 a
   4 KiB MMIO page with the same `SUM` and `FILL` registers, for Linux guest cases. Identity (decided November 23; the
   owner had no preference): vendor 1B36H, device 0005H as multi-BAR's test function, with its own subsystem ID and
@@ -177,11 +196,17 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 **Files:** create `crates/host/src/pci/memory.rs`; modify `crates/abi/src/execution.rs`, `crates/abi/src/lib.rs`,
 `crates/host/src/vm.rs`, `crates/host/src/memory.rs`, `crates/host/src/execution.rs`, `crates/host/src/linux.rs`.
 
-**Interfaces:** `DeviceMemory::new(len: u64) -> Result<Arc<DeviceMemory>>`, `read_words`, `write_words`; a pure
+**Interfaces:** `DeviceMemory::new(len: u64) -> Result<Arc<DeviceMemory>>`, `read_words`, `write_words`,
+`fd(&self) -> BorrowedFd<'_>`, `view(&self) -> Result<View>` (a read-only `MAP_SHARED` mapping, unmapped on drop); a pure
 `mapping_plan(backing_end: u64, regions: &[u64]) -> MappingPlan { ipa_bits: u32, maps: Vec<(u64 /*ipa*/, u64 /*len*/)>,
 aliases: Vec<(u64 /*va*/, u64 /*len*/)> }` used by `Machine::create`; `MappedRegions::{publish, read}` (seqlock).
 
-- [ ] **Step 1: unit tests**: `device_memory_is_2mib_aligned_power_of_two`, `host_writes_are_word_atomic` (a reader
+- [ ] **Step 1: unit tests**: `device_memory_is_2mib_aligned_power_of_two`, `view_sees_writes` (a word written
+  through the main mapping reads back through `view()`, and through a `PROT_READ` `mmap` of `fd()` in a child: the test
+  binary re-executed by `posix_spawn` with `--exact <child test> --ignored` and an environment flag, the descriptor
+  passed with `posix_spawn_file_actions_adddup2` since `shm_open` sets FD_CLOEXEC; no deliberate crash, which would
+  leave a crash report outside the cache), `fd_is_read_only` (`mmap(PROT_WRITE, MAP_SHARED)` of `fd()` fails with
+  EACCES), `object_has_no_name` (a `shm_open` of the generated name after `new` fails with ENOENT), `host_writes_are_word_atomic` (a reader
   thread never sees a torn word while a writer alternates two patterns), `plan_places_regions_above_backing` and
   `plan_grows_ipa_bits`, `empty_plan_matches_today` (no maps, today's IPA bits; no VM is created in unit tests),
   `seqlock_reader_never_sees_a_half_entry`, `alias_fits_the_hole_slots` (the const assert's bound).
@@ -274,4 +299,5 @@ first-touch and eviction cost with a bench case.
 A display device, scanout and dirty tracking (a later display plan builds on `DeviceMemory::as_ptr`); the legacy VGA
 window at A0000H (a second, fixed region in the legacy hole, with a VGA device if one is chosen); execute-in-place from
 device memory; device-to-device DMA; mapped regions in the firmware boot path (it has no PCI bus yet; M3); save and
-restore of device memory.
+restore of device memory; passing the descriptor to clients (the control API's `framebuffer` method, added with a
+display); an IOSurface backing.
