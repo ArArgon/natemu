@@ -399,6 +399,7 @@ Each new check was shown to fail when it should: the edit applied, the case run 
 | A return exit written to the next slot's return form | `ret-pairs`: the host audit (a return exit to a slot not serving the block's context) |
 | `empty_pad_entries` scanning only `NO_CONTEXT` tables | `ret-pairs-lc` (`ret-death`): `link_check` |
 | `pad_at_link` not called | `ret-pairs` (`ret-death`): no pad named at a link (counter 43) |
+| The linker enters a call's target directly | `compat32-resident-limits` `ret32`: push-stub entries 0 |
 
 The first ten mutations were run at the build before the rebase onto bd97a67d (the `cut_one` one again after it and the hint
 fix); the last four after the review fixes below. The context mutation was green at first: CR4.OSFXSR, set before the
@@ -419,9 +420,9 @@ target is a kept SYSCALL, SYSENTER, INT or IRET, served by `sys_fast` before the
 (`pop; jmp reg`, a retpoline's `ret` used as a jump), which the hints cannot see. Owed: a signal handler's return (K1 bodies run
 at CPL 0; no existing CPL-3 family delivers a signal cheaply).
 
-Narrow runs at the final code (bd97a67d plus this work and the review fixes), all passing: the Rust units (NUNIT passed); `system` NSYS checks
+Narrow runs at the final code (161176fb plus this work and the review fixes), all passing: the Rust units (714 passed); `system` 902 + 1,563 (`compat32-resident-limits` again after a fix to `ret32`'s end address) checks
 (`k1-c1`, `k1-c2@*`, `indirect-*`, `pic-*`, `frame-randomization*`, `compat32*`, `ret-*`); `smp` `coherence`, `contain`,
-`privilege` (NSMP); `faults` `faults@*`, `faults-1@*`, `probes@*` (NFAULT). Not run: the gate, `programs`, `correctness`, `boot`,
+`privilege` (626); `faults` `faults@*`, `faults-1@*`, `probes@*` (15,935). Not run: the gate, `programs`, `correctness`, `boot`,
 `io`. The A/B and the profile are the owner's pooled round (section 8).
 
 **For the owner.** (1) The kill-test at depth 4 saves 0.82 ns per return, under the 1.5 ns bar; depths 16 and 32 pass three

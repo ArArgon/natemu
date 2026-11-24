@@ -1524,7 +1524,8 @@ def ret32():
             'lib_ri:\n    mov eax, [esp + 4]\n    ret 4\n')
     prog = C.program('ret32', C.ENTER() + C.handlers('    jmp .fin\n'), text, [P_zero(res, 12)])
     prog['pic_min'] = [(40, 1), (44, 1), (46, 1)]
-    end = C.U + len(C.user32(main))
+    # (Assembled alone with the library's labels after it: every `call` is rel32, so its length is main's own.)
+    end = C.U + len(C.user32(main + 'lib_f:\nlib_rec:\nlib_ri:\n'))
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128, 0, end, 0xdb),
                   res: struct.pack('<III', 64 * 14, 64 * 80, 64 * 7)}
 
