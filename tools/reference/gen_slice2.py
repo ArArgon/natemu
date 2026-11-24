@@ -300,8 +300,8 @@ def stride_program(kind, k, seed):
     form `[rbx + i*8]`, a memory xchg (S3e), qword accesses stepping 3 bytes (a split access reaches the next page mid-loop), `push` crossing from
     one stack page to the one below, pushes running below the stack region (a fault without any mutation), and recursion one
     level deeper per outer iteration. `cross-loop` (split-check plan step A): every iteration's two 8-byte stores cross a page: the
-    first the DATA pair, the second the DATA pair before iteration `k` and the STACK pair from it on (a page of that pair
-    made absent or read-only faults in iteration `k`, the first page unwritten), the second in a block of its own whose
+    first the DATA pair, the second the DATA pair in iterations 0 to k - 1 (counting from 0) and the STACK pair from iteration k on (a page of
+    that pair made absent or read-only faults in iteration k, its first page unwritten), the second in a block of its own whose
     next word is its exit (`jmp`; the slice-2 VM has no SSE: 16-byte crossings are K1 `probe-copy`'s and `probe-share`'s): the probes return into the block's hot copy, and a store resumed after
     its probe faulted goes on at the exit's trampoline."""
     rng = random.Random(seed)

@@ -170,11 +170,7 @@ fn split(b: &mut Block, sites: impl Iterator<Item = Site>) -> bool {
 /// copy for ENTRY_OFFSET <= o < `hot_size`, or at `hot_size` the first exit's trampoline when it stands there in place (a
 /// store that is the last word before that exit resumes at it). `None`: not split, or no hot word stands for `o`.
 pub fn hot_at(b: &Block, o: u64) -> Option<u64> {
-    let (h, body) = (u64::from(b.hot_size), b.hot_body());
-    if h == 0 || o < u64::from(natemu_abi::execution::ENTRY_OFFSET) || o > h {
-        return None;
-    }
-    (o < h || b.trampolines().any(|(e, at)| e == u64::from(b.code) + h && at == body + h)).then_some(body + o)
+    b.hot_word(o)
 }
 /// Split-check plan step A, in [`split`] once it can no longer fail (beside the run end's return): each probing split stub
 /// (a SPLIT site whose first word is `adr x0, R`, R in the block's code, and whose second branches to a shared probe) gets
@@ -204,21 +200,23 @@ fn probe_returns(b: &Block, sites: impl Iterator<Item = Site>) {
 /// code + (t - hot_body). A PC-relative word, the same wherever the code is placed. `None`: any other word.
 pub fn admitted_adr(b: &Block, o: u64) -> Option<u32> {
     use natemu_abi::execution::probe;
-    let (code, body, h) = (u64::from(b.code), b.hot_body(), u64::from(b.hot_size));
-    if h == 0 {
+    let code = u64::from(b.code);
+    if b.hot_size == 0 {
         return None;
     }
     let at = code + o;
     let t = probe::adr_x0_target(word(at), at)?;
-    if t < body + u64::from(natemu_abi::execution::ENTRY_OFFSET) || t > body + h {
+    // (Exactly the words [`hot_at`] gives: offset `hot_size` only where an exit's trampoline stands in place.)
+    let admitted = b.probe_return_admitted(t);
+    if admitted == t {
         return None;
     }
     sites(b).iter().any(|s| s.kind == natemu_abi::code_object::kind::SPLIT && u64::from(s.native_offset) == o).then(|| ())?;
-    probe::adr_x0(at, code + (t - body))
+    probe::adr_x0(at, admitted)
 }
-/// Split-check plan step A, the `cold_exits` count: a linker entry from `b`'s `svc` at code-area VA `svc` came through the
-/// cold code of a split block: its link point's trampoline is linked (no longer its admitted word), so the hot copy could
-/// not have reached the `svc`.
+/// Split-check plan step A, the `cold_exits` count: a linker entry from `b`'s link point at native offset `offset` (its
+/// code's) came through the cold code of a split block: the point's trampoline is linked (no longer its admitted word), so
+/// the hot copy could not have reached the `svc`.
 pub fn cold_exit(b: &Block, offset: u64) -> bool {
     b.hot_size != 0
         && b.links.iter().any(|p| p.offset != 0 && u64::from(p.offset) == offset && word(b.link_at(p.offset)) != b.admitted_at(p))

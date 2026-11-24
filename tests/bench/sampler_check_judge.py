@@ -26,7 +26,8 @@ mark to the next mark; phase 7 ends at the next stop (init's, after the run). Sa
      are the port's (cause port).
   f  cold exits (split-check plan step A): linker entries through a split block's cold code over the boot (natemu's
      `cold_exits` on NAME.stderr) under 1% of the cross phase's iterations in both runs (NAME.serial's end lines): the probe
-     returns into the hot copy, whose exits are linked. Judged when NAME.stderr exists.
+     returns into the hot copy, whose exits are linked. A missing NAME.stderr fails it (the framework case; the unit tests'
+     fixtures, judged through `judge(name, cold=False)`, have none).
   marks: the seven marks in order in both runs (init's own, 0x80 + the run's number, ignored; an older init's, the run's
      number before mark 1, is skipped by the search); the control port ignored nothing (sample_report's own check).
 
@@ -172,7 +173,7 @@ def judge_run(n, t, ring, toggles, passes, end, halted=(), objects=None):
     return out, problems
 
 
-def judge(name):
+def judge(name, cold=True):
     ring, host = read(name)
     marks = sorted((h for h in host if h['kind'] == sr.MARK and h['value1'] < INIT_MARKS), key=lambda h: h['time'])
     toggles = sorted((h for h in host if h['kind'] == sr.TOGGLE), key=lambda h: (h['time'], h['value1']))
@@ -193,7 +194,9 @@ def judge(name):
     if not probes: problems.append('c: no probe sample in either run')
     elif res['c']['share'] < PROBE_SHARE:
         problems.append(f'c: {res["c"]["share"]}% of probe samples charged to the loop\'s block, want {PROBE_SHARE}%')
-    if pathlib.Path(f'{name}.stderr').exists():
+    if cold and not pathlib.Path(f'{name}.stderr').exists():
+        problems.append(f'f: {name}.stderr: missing')
+    elif cold:
         res['f'], p = cold_exits(name); problems += p
     res['problems'] = problems
     return res

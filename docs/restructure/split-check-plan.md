@@ -233,10 +233,11 @@ pooled change set.
 
 New, each shown to fail on a mutation before it counts:
 
-- A1 (faults family, QEMU-compared): a loop of crossing 8- and 16-byte stores in a block with a hot copy, the second
-  page unmapped by the guest mid-loop, then mapped again: #PF exact, first page unwritten, the loop's result after; and
-  a crossing store whose next word is the block's exit (the `hot_at` edge at `hot_size`). Mutation: the rewritten `adr`
-  aimed one word past R'.
+- A1 (faults family, QEMU-compared; as built, section 9): loopfaults' `cross-loop`, a loop of two crossing 8-byte stores
+  per iteration in blocks with hot copies (the slice-2 VM has no SSE; the 16-byte crossings are A2's), the second store
+  moving at iteration k to a page pair the case's mutation made absent or read-only (no unmap and remap by the guest):
+  #PF exact, first page unwritten; the second store's next word is its block's exit (the `hot_at` edge at `hot_size`).
+  Mutation: the rewritten `adr` aimed one word past R'.
 - A2 (with the hooks host, as the reuse and PIC cases run): a split block with a probing stub, its hot copy made and the
   `adr` rewritten, then copied (`copy`), shared (`share`: the translation's copied words, `pic::proved` passing, and an
   instance of it entered and crossing a page), and checked by the reuse check; the host audit passes after each and the
@@ -295,11 +296,17 @@ Each was shown to fail on its mutation, one at a time: the rewritten `adr` aimed
 refusal); `share` without it (`k1-probe-share`); the audit accepting any `adr` target (probes@2,
 `tamper-after-probe-adr-cross`); the rewrite switched off (`guest-sampler-check-sample`, check f: 44,649,303 cold exits
 over 44,630,016 cross iterations, one per iteration, which also shows the counter counts what it should).
+After review: the rewrite, its admitted form, the audit and the driver's tamper share one rule (`Block::hot_word`,
+`Block::probe_return_admitted`: offset `hot_size` only where an exit's trampoline stands in place; an abi unit test,
+which fails with the old range rule); check f fails when NAME.stderr is missing (its unit test fails when it skips);
+and the resident split's hot resume aimed one word further fails loopfaults' `cross-loop` and K1's `probe-copy` and
+`probe-share`.
 
 Narrow runs passed on the change (M2 Max): system `k1-c1`, `k1-c2@1-2`, `pic-*`, `indirect-*`, `ret-*`, `compat32*`,
 `m2`, `m3`, `s4`; faults `faults@1-5`, `probes@1-2`, `loopfaults-*`; smp `vector-ac`, `vector-split-smp`; unit.
 The gate is for the pooled change set.
 
-Also changed: `tools/reference/ref.py` copies the QEMU binary into a work folder once (a second batch into the same
-folder failed on the read-only copy when seeding loopfaults answers).
+Also changed: `tools/reference/ref.py` keeps the QEMU binary already copied into a work folder only when its bytes
+are the reference's, else replaces it (a second batch into the same folder failed on the read-only copy when seeding
+loopfaults answers; a kept copy must not outlive a pin change).
 

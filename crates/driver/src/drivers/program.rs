@@ -1059,7 +1059,6 @@ fn corrupt_probe_adr(area: Area) -> bool {
         if b.hot_size == 0 || b.code_size == 0 || b.flags & (cache::INSTANCE | cache::SYSTEM) != 0 {
             continue;
         }
-        let hot = b.hot_body()..=b.hot_body() + u64::from(b.hot_size);
         for k in 0..b.sites_count as usize {
             let site: natemu_abi::code_object::Site =
                 area.read_record(cache::META_OFFSET + meta + size_of::<cache::Block>() + k * size_of::<natemu_abi::code_object::Site>());
@@ -1067,7 +1066,7 @@ fn corrupt_probe_adr(area: Area) -> bool {
             if site.kind != natemu_abi::code_object::kind::SPLIT {
                 continue;
             }
-            if let Some(w) = probe::adr_x0_target(word(at), at).filter(|t| hot.contains(t)).and_then(|t| probe::adr_x0(at, t + 4)) {
+            if let Some(w) = probe::adr_x0_target(word(at), at).filter(|&t| t >= b.hot_body() && b.hot_word(t - b.hot_body()) == Some(t)).and_then(|t| probe::adr_x0(at, t + 4)) {
                 area.copy(cache::CODE_OFFSET + at as usize, &w.to_le_bytes());
                 return true;
             }

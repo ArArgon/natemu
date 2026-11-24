@@ -69,9 +69,9 @@ class Judge(unittest.TestCase):
     def setUp(self):
         self.d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.d, True)
 
-    def judge(self, broken=(), broken2=()):
+    def judge(self, broken=(), broken2=(), cold=False):
         write(self.d / 'sc.samples', broken, broken2)
-        return j.judge(self.d / 'sc')
+        return j.judge(self.d / 'sc', cold=cold)
 
     def test_a_good_run_passes(self):
         r = self.judge()
@@ -131,13 +131,13 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge(('halted',))['problems'], ['run 1 e: 1 halted samples in the stopped window'])
 
     def test_cold_exits_are_judged_against_the_cross_iterations(self):
-        # Check f (split-check plan step A): judged only when NAME.stderr exists; under 1% of both runs' cross iterations.
+        # Check f (split-check plan step A): under 1% of both runs' cross iterations; a missing NAME.stderr fails it.
         def cold(n, iters=(1000, 1000), line=True):
             (self.d / 'sc.stderr').write_text(f'natemu-system-counts vcpu 0 stack 0 kinds 1:2 cold_exits {n}\n' if line else 'natemu: x\n')
             (self.d / 'sc.serial').write_text(''.join(f'NATEMU-SAMPLER end run={r} phase=3 name=cross t=1.0 iters={i} batches=1 batch=0 ok=1\n'
                                                       for r, i in enumerate(iters, 1)))
-            return self.judge()
-        self.assertEqual(self.judge()['problems'], [])
+            return self.judge(cold=True)
+        self.assertEqual(self.judge(cold=True)['problems'], [f"f: {self.d / 'sc'}.stderr: missing"])
         self.assertEqual(cold(19)['problems'], [])
         self.assertEqual(cold(19)['f']['share'], 0.95)
         self.assertEqual(cold(20)['problems'], ['f: 20 cold exits over 2000 cross iterations, want under 1.0%'])

@@ -1753,8 +1753,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             // re-points it, stands for the code word code + (t - hot_body)) is the word after the one branch to the stub.
             let code = u64::from(b.code);
             let t = exec::probe::adr_x0_target(word(at), at).unwrap_or(0);
-            let (body, h) = (b.hot_body(), u64::from(b.hot_size));
-            let admitted = if h != 0 && (body + u64::from(exec::ENTRY_OFFSET)..=body + h).contains(&t) { code + (t - body) } else { t };
+            let admitted = b.probe_return_admitted(t);
             let into = |o: u64| {
                 let w = word(o);
                 let d = if w & 0x7e00_0000 == 0x3600_0000 {

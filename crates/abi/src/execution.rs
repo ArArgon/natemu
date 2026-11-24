@@ -514,6 +514,27 @@ pub mod cache {
             assert_eq!((target(RETURN_MISS as u64, w[r]), w[r + 1]), (Some(MISS), RET_X1), "slot 0's return form pops to the miss");
         }
         #[test]
+        fn a_probe_return_maps_back_from_the_hot_copy_only_where_hot_word_stands() {
+            // Split-check plan step A: body words [ENTRY_OFFSET, hot_size) map back; hot_size only with an exit's
+            // trampoline in place there; the words before ENTRY_OFFSET, past hot_size and the cold code stay.
+            let mut b: Block = unsafe { core::mem::zeroed() };
+            (b.code, b.code_size, b.hot, b.hot_size) = (0x2_0000, 0x80, 0x1000, 0x40);
+            b.links[0] = super::super::LinkPoint { offset: 0x60, word: 0, target: 1 };
+            b.hot_body = b.hot_body_for();
+            let body = b.hot_body();
+            let e = u64::from(super::super::ENTRY_OFFSET);
+            assert_eq!(b.probe_return_admitted(body + e), 0x2_0000 + e);
+            assert_eq!(b.probe_return_admitted(body + 0x3c), 0x2_003c);
+            assert_eq!(b.probe_return_admitted(body + 0x40), body + 0x40, "no exit at hot_size: no hot word there");
+            assert_eq!(b.probe_return_admitted(body + e - 4), body + e - 4);
+            assert_eq!(b.probe_return_admitted(0x2_0010), 0x2_0010);
+            b.links[1] = super::super::LinkPoint { offset: 0x40, word: 0, target: 2 };
+            b.hot_body = b.hot_body_for();
+            let body = b.hot_body();
+            assert_eq!(b.probe_return_admitted(body + 0x40), 0x2_0040, "an exit's trampoline in place at hot_size");
+            assert_eq!(b.probe_return_admitted(body + 0x44), body + 0x44);
+        }
+        #[test]
         fn a_blocks_appended_entries_follow_its_code() {
             let mut b: Block = unsafe { core::mem::zeroed() };
             (b.code, b.code_size, b.dispatch_exit) = (0x2_0000, 0x80, 0x70);
@@ -1770,6 +1791,24 @@ pub mod cache {
                 let at = if e[i] <= h { body + u64::from(e[i]) } else { hot + 4 * (i - after + 1) as u64 };
                 (code + u64::from(e[i]), at)
             })
+        }
+        /// Split-check plan step A: the hot copy's word (a code-area offset) standing for code offset `o` of a split block:
+        /// its body's copy for ENTRY_OFFSET <= o < `hot_size`, or at `hot_size` the first exit's trampoline when it stands
+        /// there in place (a store that is the last word before that exit resumes at it). `None`: not split, or no hot word
+        /// stands for `o`. The one rule for the resident's rewrite and resume, its admitted form and the host's audit.
+        pub fn hot_word(&self, o: u64) -> Option<u64> {
+            let (h, body) = (u64::from(self.hot_size), self.hot_body());
+            if h == 0 || o < u64::from(super::ENTRY_OFFSET) || o > h {
+                return None;
+            }
+            (o < h || self.trampolines().any(|(e, at)| e == u64::from(self.code) + h && at == body + h)).then_some(body + o)
+        }
+        /// Split-check plan step A: the code-area offset a probing split stub's `adr x0` target `t` (a code-area offset)
+        /// stands for: a hot word [`Block::hot_word`] gives maps back to its code word, code + (t - hot_body); any other
+        /// target is itself.
+        pub fn probe_return_admitted(&self, t: u64) -> u64 {
+            let body = self.hot_body();
+            if t >= body && self.hot_word(t - body) == Some(t) { u64::from(self.code) + (t - body) } else { t }
         }
         /// Hot/cold: the code-area offset of the word a link at native offset `offset` patches (and a stop arms): a split
         /// block's exit word's trampoline (its code's word then stays as admitted), else the word itself.
