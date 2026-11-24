@@ -170,7 +170,7 @@ struct Cli {
     #[arg(long, env = "NATEMU_CHECK_REUSE", value_parser = clap::builder::BoolishValueParser::new())]
     check_reuse: bool,
     /// How virtio devices attach: `mmio` or `pci` for all, or (experimental) per device, e.g. `disk=pci,net=mmio,rng=mmio`
-    /// (keys disk, net, rng; unnamed devices take mmio) [default: pci with a --config file, mmio without one]
+    /// (keys disk, net, rng, console; unnamed devices take mmio) [default: pci with a --config file, mmio without one]
     #[arg(long, value_name = "SPEC", value_parser = transports, default_value = "mmio", hide_default_value = true)]
     virtio_transport: Transports,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
@@ -284,7 +284,7 @@ fn size(text: &str) -> Result<u64, String> {
     n.checked_mul(1 << shift).ok_or_else(bad)
 }
 
-/// `mmio`, `pci`, or `key=value,...` with keys disk, net, rng and values mmio or pci (unnamed keys: mmio).
+/// `mmio`, `pci`, or `key=value,...` with keys disk, net, rng, console and values mmio or pci (unnamed keys: mmio).
 fn transports(text: &str) -> Result<Transports, String> {
     let value = |v: &str| match v {
         "mmio" => Ok(Transport::Mmio),
@@ -304,7 +304,8 @@ fn transports(text: &str) -> Result<Transports, String> {
             "disk" => &mut t.disk,
             "net" => &mut t.net,
             "rng" => &mut t.rng,
-            _ => return Err(format!("unknown device {key:?}: disk, net or rng")),
+            "console" => &mut t.console,
+            _ => return Err(format!("unknown device {key:?}: disk, net, rng or console")),
         };
         if seen.contains(&key) {
             return Err(format!("device {key:?} named twice"));
@@ -681,6 +682,13 @@ mod tests {
                 net: Mmio,
                 rng: Mmio,
                 console: Mmio
+            })
+        );
+        assert_eq!(
+            t("console=pci"),
+            Ok(Transports {
+                console: Pci,
+                ..Transports::all(Mmio)
             })
         );
         for bad in [

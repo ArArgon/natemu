@@ -524,6 +524,26 @@ fn console_transport_key() {
     );
 }
 
+/// `--set machine.transport=...` names the console as the file's table and `machine.transport.console` do.
+#[test]
+fn console_in_the_transport_spec() {
+    let _env = lock();
+    let console = format!("{MIN}[[console]]\nid = \"hvc\"\noutput = \"c.log\"\n");
+    let (_, c) = load_file(&console, &["--set", "machine.transport=nic=pci,console=mmio"]);
+    assert_eq!(
+        c.unwrap().transports,
+        Transports {
+            net: Pci,
+            ..Transports::all(Mmio)
+        },
+        "unnamed devices take mmio"
+    );
+    let c = load_old(&["--set", "machine.transport=console=pci"]).unwrap();
+    assert_eq!(c.transports.console, Pci);
+    let e = err(load_old(&["--set", "machine.transport=gpu=pci"]));
+    assert!(e.contains("disk, net, rng or console"), "{e}");
+}
+
 #[test]
 fn ram_forms_in_the_file() {
     let _env = lock();

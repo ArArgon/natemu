@@ -755,7 +755,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             assert_eq!(rig.used(1), 4, "the fifth chain waits while 1 MiB is held");
             assert!(rig.model.shared.lock().blocked, "answered Busy");
-            assert!(!rig.model.drain(), "bytes are held");
+            // 1 MiB is held: read under the lock, since `drain` would start its 2 s grace and a slow run could pass it.
+            let tx = rig.model.shared.lock();
+            assert_eq!(tx.pending.len() + tx.writing, 4 * CHAIN, "1 MiB is held");
+            drop(tx);
             // The output catches up: the writer resumes transmitq, and the fifth chain completes.
             gate.open();
             until("the fifth chain", || rig.used(1) == 5);
