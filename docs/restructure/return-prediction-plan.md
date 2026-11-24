@@ -366,7 +366,7 @@ between host exits.
   `tables-*` checks of `frame-randomization` compare RIP words, not targets: unchanged.
 - Stop rules: call pairs and call tails on `block_at`'s miss path, before the dead-block filter (step 1's rule, moved there by
   its review fix).
-- Counters `pic::count` 40-51, sampler role `TAIL_PAIR`, test entries `NATEMU_PIC_TEST=ras0..ras3` (14-17).
+- Counters `pic::count` 40-51, sampler role `TAIL_PAIR`, test entries `NATEMU_PIC_TEST=ras0..ras4` (14-18).
 
 Deviations: no `ret-pairs` i386 build (32-bit code takes the same paths: `compat32` ran); no signal handler's return in
 `ret-pairs` (K1 bodies run at CPL 0; the longjmp and the rewritten return address are its unmatched returns). A call to a
@@ -395,19 +395,35 @@ Each new check was shown to fail when it should: the edit applied, the case run 
 | The pad word not written before the entry (for "written after": single-threaded per-vCPU code, written before the next EL0 entry, so the order alone is not observable) | `ret-pairs-lc`: `link_check` |
 | The pair stop rule behind the dead-block filter | `ret-stop` `ras3`: `bad_stop` at a dead block's pair |
 | The push stub used with `shadow_entry` set | `ret-stop` `ras0`: no shadow entry counted |
-| A pad filled across code contexts (`pad_for`'s context check removed) | **green**: under the mutation the counters are unchanged (70 pads filled), so `ret-pairs` never meets a hint of another context at a miss; the check is not shown by a test (below) |
+| A pad filled across code contexts (`pad_for`'s context check removed) | `ret-pairs-lc`: `link_check` (`check_l1_targets`) |
+| A return exit written to the next slot's return form | `ret-pairs`: the host audit (a return exit to a slot not serving the block's context) |
+| `empty_pad_entries` scanning only `NO_CONTEXT` tables | `ret-pairs-lc` (`ret-death`): `link_check` |
+| `pad_at_link` not called | `ret-pairs` (`ret-death`): no pad named at a link (counter 43) |
 
-The mutations were run at the build before the rebase onto bd97a67d, the `cut_one` and context ones again after it and the
-hint fix. Not shown by a test: `pad_for`'s context check. Under its mutation `ret-pairs` fills as many pads as without it, so its
-second-context phase never meets, at a miss in the first context, a hint naming a caller of the second; why (the hint
-overwritten again, or no miss there) was not looked into. The `link-check` scan would catch a pad named across contexts
-(`check_l1_targets` compares the caller's context with the owner's); a program that produces such a hint is still owed.
+The first ten mutations were run at the build before the rebase onto bd97a67d (the `cut_one` one again after it and the hint
+fix); the last four after the review fixes below. The context mutation was green at first: CR4.OSFXSR, set before the
+second-context phase, is itself in the code context, so the "first context again" was a third one with no blocks yet. `ret-pairs`
+now sets it before its first phase.
 
-Narrow runs at the final code (bd97a67d plus this work), all passing: the Rust units (711 passed); `system` 2,462 checks
+**Review fixes** (independent review of 81e05284: accept with fixes, none blocking). Both audits require a return exit to go to
+its own context's slot's return form or slot 0's. A block gets a call pair only when its hint marks exactly one link point (a
+`jcc T` before `call T`, or any second point to the call's target, gets none: the call is then a plain link, unbalanced, never a
+wrong target or a jump that pushes; Rust unit). A continuation through a stub is dropped, and counted unbalanced, when the
+resident runs an instruction itself (`system`, `step`). New coverage: `ret32` in `compat32-resident-limits` (32-bit code: pairs
+linked, pads hinted, push-stub entries); `ret-stop` mode `ras4` (every block placed as with no slot, exits armed: a return's
+stop continues through the pop stub; 65,079 pop entries); `ret-death` links a caller placed again while its return address's
+entry names the full entry (12 pads named at a link).
+
+Imbalances not counted (deviations): a call from the single-step block (the linker does not treat it as a call); a call whose
+target is a kept SYSCALL, SYSENTER, INT or IRET, served by `sys_fast` before the linker (no push stub); a return made by a jump
+(`pop; jmp reg`, a retpoline's `ret` used as a jump), which the hints cannot see. Owed: a signal handler's return (K1 bodies run
+at CPL 0; no existing CPL-3 family delivers a signal cheaply).
+
+Narrow runs at the final code (bd97a67d plus this work and the review fixes), all passing: the Rust units (NUNIT passed); `system` NSYS checks
 (`k1-c1`, `k1-c2@*`, `indirect-*`, `pic-*`, `frame-randomization*`, `compat32*`, `ret-*`); `smp` `coherence`, `contain`,
-`privilege` (626); `faults` `faults@*`, `faults-1@*`, `probes@*` (15,935). Not run: the gate, `programs`, `correctness`, `boot`,
+`privilege` (NSMP); `faults` `faults@*`, `faults-1@*`, `probes@*` (NFAULT). Not run: the gate, `programs`, `correctness`, `boot`,
 `io`. The A/B and the profile are the owner's pooled round (section 8).
 
 **For the owner.** (1) The kill-test at depth 4 saves 0.82 ns per return, under the 1.5 ns bar; depths 16 and 32 pass three
 times over. The build went on (the plan's decision case is the deep chain); whether the bar is per depth is the owner's call.
-(2) An HVF exit clears the return stack: no gain across host exits. (3) The context check of the pads has no red test yet.
+(2) An HVF exit clears the return stack: no gain across host exits. 
