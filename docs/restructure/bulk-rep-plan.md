@@ -1,7 +1,7 @@
 # Bulk REP MOVS inside a page: plan
 
-November 23, 2026, on `m2-sampler` (written at d3f2fe4d, revised after review at 7c96a2a5). Design only: nothing here is
-built or measured. It is the "REP string bodies >= 3%" row of the [EL0 sampler findings](el0-sampler-findings.md)
+November 23, 2026, on `m2-sampler` (written at d3f2fe4d, revised after review at 7c96a2a5). The first cut is built
+(November 24): what task 0 measured, what was built and where it departs from this design are in section 13. It is the "REP string bodies >= 3%" row of the [EL0 sampler findings](el0-sampler-findings.md)
 (section 7, verdict **build**), one of the fixes the owner pooled: no A/B of its own, one combined A/B and profile round at
 the end, with the gate. It keeps its own kill-test (section 8) and correctness tests (section 9). The model is chunk 26's
 bulk REP STOS ([perf plan](perf-plan.md):2928-3141), whose design, proofs and tests this plan reuses wherever the
@@ -411,3 +411,109 @@ Share x (1 - 1/speedup), with chunk 26's 4 KiB speedups (`movsq` 1.2-2.2x, `movs
 4. **Declined copies get slower**: the skip words are paid per element. The ordering in 4.3 and the kill-test's short and
    declined rows bound it.
 5. **Element atomicity** across vCPUs: the 8-alignment rule for MOVSQ; relaxing it needs its own proof.
+
+## 13. The first cut, built (November 24)
+
+At b0be221c (task 0) and a23206f2 (tasks 1-7; FEX fork 39eb0db on 13a1bfc). Task 8 (the independent review) and the
+QEMU cases of 9.3 are not done; see the end of this section.
+
+**Task 0: eligibility** (census cases, QEMU 11.1.2 with the plugin, the M2 Max; bytes are each instance's first RCX times
+the width; "moved in bulk" simulates every pass of 4.3 from the first iteration's registers, with the plan's [1, 16]
+overlap rule):
+
+| Case | 64-bit MOVSB + MOVSQ, MiB | eligible | moved in bulk | 32-bit MOVSD, MiB | its eligible (3.2's rule) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `guest-zstd-census` | 432.8 | 77.1% | 77.0% | 0 | |
+| `guest-hackbench-census` | 1,376.5 | 49.2% | 44.7% | 0 | |
+| `guest-build-census` | 993.4 | 99.1% | 97.4% | 0 | |
+| `guest-startup32-census` | 8.1 | 98.7% | 94.9% | 1,628.3 | 32.2% |
+| pooled | 2,810.8 | 71.3% | 68.4% | | |
+
+Go (over half). Where it falls short: hackbench's kernel `rep movsq` (`rep_movs_alternative` on 100-byte messages) has
+only 49% of its bytes with both pointers 8-aligned; zstd's kernel `rep movsq` has 22% of its bytes at RDI - RSI in
+[1, 16] mod 4096 (page-cache pages copied to a buffer 16 bytes into its page, as glibc's mmap'd chunks are), which the
+built rule's exact [1, 15] no longer declines. 32-bit MOVSD does not qualify for 3.2 (32% eligible: 18% 8-aligned, 25% with
+DF set, 22% overlapping): not built. The sample report's form split, over the kept outputs of runs 20261123-213409-4d92
+and 20261123-213500-1086 (an experiment, not a case: the report's code over files read in place) gives section 1's
+numbers again, e.g. `guest-zstd-sample` run1: `rep movsb 64-bit user` 5.27, `rep movsq 64-bit kernel` 0.91 % of EL0.
+
+**Task 1: no stop.** A UC source page is never shadowed for a block but the step block's ([`translate`](../../crates/runtime/src/execution.rs)):
+the `ldp` aborts and the instruction is stepped, one element (steps never get `--bulk`). WT and WP pages are shadowed for
+reads: the `ldp` is a native read, as the element's `ldr` is. A device page: the pair site is refused (`mmio::device`,
+`status::SITE`) before any device effect, with the state at the instruction, as the element's load is (no completion
+record, `FORM`): the same stop. A 16-byte X-register load pair was already an admitted site kind (I5a). RSI is x10, RCX x7,
+RDI x11; x0-x3 (FEX's TMP1-4) are free inside an op.
+
+**What departs from the design.**
+- The overlap skip is exact: `sub x0, x11, x10; sub x0, x0, #1; and x0, x0, #0xfff; sub x0, x0, #15; tbnz x0, #63, S`
+  declines RDI - RSI in [1, 15] mod 4096 (section 5.1's exact condition), one word more than the [1, 16] mask, so the
+  zstd copies above are bulk.
+- Segment prefixes: FEX's decoder records none of ES/CS/SS/DS in 64-bit mode (they do nothing there), so only FS and GS
+  decline; admission's `x86_rep_movs` refuses 64 and 65 and lets the others be.
+- Stack-check dataflow (rule 5) needed no change: the back edge already clears every register its loop writes.
+
+**Tests** (all green at a23206f2): host `bulk_rep_movs_only_when_asked`, `bulk_rep_movs_loops_are_pinned` (fixtures
+`rep-movsq-bulk`, `rep-movsb-bulk`); `k2-repmovs` (tests/system/run_k2.py `repmovs`, 44 cases at block sizes default and 1:
+fill at eight offset pairings and seven counts, DF, 0x67, FS; overlap at 26 distances and three counts; one frame at two
+pages; source/destination unmapped, read-only, both, crossing, first; kicks with fast strings on and off; TF; UC and WT
+sources; linked); `k2-repbulk` unchanged; `census-check` with ten REP instances of known counts.
+
+**Mutations** (each a scratch build of the shim and the admission template together, `k2-repmovs` run, reverted):
+
+| Mutation | Red |
+| --- | --- |
+| overlap skip removed | `movs-overlap-w1/w8`, `movs-alias-w1/w8` |
+| overlap on the linear distance (no `and #0xfff`) | `movs-alias-w1/w8` |
+| RCX stepped before the store | `movs-dst-unmapped`, `movs-first`, `movs-uc-src` |
+| the destination's room dropped | `movs-dst-unmapped` |
+| the source's room dropped | none: a load crossing into the next page aborts and the instruction is stepped from the round's boundary, so it stays exact (only slower); `movs-src-cross-w1/w8` pin that exactness |
+| fast-string test removed | `movs-kicks-w1/w8-misc-off` |
+| DF test removed | `movs-fill-w1/w8` |
+| the `ldp` with write intent | `movs-first` (#PF with W) |
+| bulk in steps too | `movs-tf`, `movs-uc-src` |
+
+Not run: `stp` before `ldp` (the recorder would describe the wrong word; admission refuses it).
+
+**Kill-test: killed.** Bench case `guest-repmicro`, M2 Max, three runs before (natemu b0be221c, `TESTKIT_BENCH_AT` for two)
+and three after (a23206f2), ns per copy (run 2's median of three rounds; a row's figure the median over the runs, with
+their range; section 8's rule, `tests/bench/repmicro_report.py compare`):
+
+| row | before | after | speedup | verdict |
+| --- | ---: | ---: | ---: | --- |
+| movsb-16 | 8.8 (8.8-8.8) | 4.2 (4.1-4.3) | 2.12x | hot |
+| movsb-64 | 23.5 (23.2-23.9) | 5.6 (5.5-5.6) | 4.22x | hot |
+| movsb-128 | 51.5 (50.8-51.8) | 6.8 (6.7-6.9) | 7.58x | hot |
+| movsb-512 | 176.5 (174.4-177.5) | 14.5 (14.2-14.5) | 12.20x | hot |
+| movsb-4096 | 1494.2 (1470.7-1497.1) | 98.2 (96.7-99.6) | 15.21x | ok |
+| movsb-65536 | 23825.1 (23681.0-24076.3) | 1740.1 (1709.0-1750.7) | 13.69x | hot |
+| movsq-64 | 6.5 (6.4-6.5) | 5.3 (5.1-5.3) | 1.23x | hot |
+| movsq-100 | 10.4 (10.4-10.8) | 9.3 (9.1-9.4) | 1.12x | hot |
+| movsq-128 | 10.7 (10.6-10.9) | 6.5 (6.4-6.5) | 1.64x | hot |
+| movsq-512 | 47.3 (45.8-48.7) | 14.0 (13.8-14.1) | 3.38x | hot |
+| movsq-4096 | 402.0 (399.5-424.4) | 96.0 (94.4-97.7) | 4.19x | ok |
+| movsb-1 | 3.7 (3.6-3.8) | 3.7 (3.6-3.8) | 0.99x | ok |
+| movsb-3 | 5.1 (5.0-5.3) | 5.8 (5.6-5.9) | 0.87x | regressed: 5.84 > 5.56 |
+| movsb-7 | 6.3 (6.2-6.3) | 8.0 (7.8-8.2) | 0.78x | regressed: 7.99 > 6.46 |
+| movsb-15 | 8.5 (8.5-8.9) | 13.1 (12.7-13.1) | 0.65x | regressed: 13.07 > 9.38 |
+| movsq-8 | 3.6 (3.6-3.8) | 3.5 (3.3-3.5) | 1.05x | ok |
+| movsq-4096-src4 | 409.4 (400.8-416.0) | 484.0 (475.9-490.8) | 0.85x | regressed: 484.03 > 431.19 |
+| movsb-4096-overlap8 | 1503.7 (1498.2-1518.8) | 2829.4 (2810.6-2859.9) | 0.53x | regressed: 2829.36 > 1539.46 |
+| movsq-4096-src808 | 401.8 (399.0-410.1) | 111.7 (103.9-113.6) | 3.60x | ok |
+| movsd-4 | 5.8 (5.4-5.9) | 5.7 (5.6-5.8) | 1.01x | ok |
+| movsd-8 | 6.7 (6.4-6.8) | 6.7 (6.5-6.7) | 1.00x | ok |
+| movsd-12 | 7.3 (7.0-7.5) | 7.3 (7.1-7.4) | 1.00x | ok |
+| movsd-4096 | 890.3 (881.4-925.0) | 917.9 (889.3-919.0) | 0.97x | ok |
+| movsd-4096-off4 | 896.2 (880.0-925.4) | 919.7 (888.7-924.9) | 0.97x | ok |
+
+The hot rows pass by far (4 KiB `movsb` 15.2x, `movsq` 4.2x; 64 KiB `movsb` 13.7x), but five rows regress beyond the
+before spread, as risk 4 feared: the short `movsb` rows (3, 7, 15 bytes) pay the count test's two words on every
+element (about 0.3 ns each), and the declined rows pay the words before their skip on every element (`movsq` with a
+source 4 mod 8: five, +18%; `movsb` with RDI = RSI + 8: seven, +88%). The 32-bit rows are unchanged. What would
+remove them is not in this design: a bounded element loop inside the page for what the rounds decline (tails,
+misaligned and overlapping copies), so declined copies stop re-entering the setup per element. Owner decision:
+drop the first cut, keep it with the rule relaxed for these rows, or add that loop.
+
+**Not done** (first cut): 9.3's QEMU corpus (`i2` input and suite, gen_i2's new deltas, `loopfaults-i2`); 9.2's
+`movs-cpl3-us`, `movs-noncanonical`, `movs-into-noncanonical`, `movs-frame-alias`, `movs-watch-src/dst`, `movs-ac`,
+`movs-wt-wp` as a destination, `movs-smc-*`, `movs-tso` and the M2 device cases; the independent review (task 8).
+`fexc-replay` fails by design (64-bit output changes for every REP MOVSB/MOVSQ compiled with `--bulk`).
