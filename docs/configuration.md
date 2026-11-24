@@ -110,6 +110,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | `[[console]]` | `id` | required | A second console for the guest (see below) |
 | | `output` | none | A file: what the guest writes to the console is added to its end (created when missing) |
 | | `socket` | none | A Unix socket natemu listens on: a program that connects talks to the guest's console (see below) |
+| `[control]` | `socket` | none | A Unix socket natemu listens on for programs that drive the VM: keyboard and mouse input, quit, status ([the control API](control-api.md)) |
 | `[debug]` | `pool` | `true` | Shared template pool |
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
@@ -245,6 +246,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: nic[0].forward: bad forward "x": [tcp\|udp:]HOST_PORT:GUEST_PORT, decimal ports 1-65535` | A forward is malformed |
 | `c.toml: console[0]: needs exactly one of output, socket; found none` | Also `found both` |
 | `console "log": c.sock: exists and is not a socket` | Something other than a socket is at the `socket` path (also `another program listens on this socket`, and a path over 103 bytes) |
+| `control socket vm.sock: another program listens on this socket` | Another natemu (or program) uses the `[control] socket` path (also `exists and is not a socket`, and a path over 103 bytes) |
 | `console "log": no interrupt line left on mmio (lines 16-23 are all held); use pci` | Every MMIO interrupt line is taken (6 MMIO disks with the NIC and entropy device) |
 | `console "log": PCI slots 1-31 are all used; use mmio or fewer disks on pci` | 29 disks on PCI leave no slot |
 | `--set bad: expected key=value` | `--set` without `=` |

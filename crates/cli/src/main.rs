@@ -386,6 +386,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         None => Box::new(std::io::stdout()),
     });
     let summary = network_summary(boot.net, &boot.net_options);
+    let vcpus = boot.vcpus;
     let prepared = report_prepared(boot.prepare(), &summary, &mut std::io::stderr().lock())?;
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     prepared.canceller().on_signals();
@@ -396,17 +397,50 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     if cfg.serial_stdin {
         prepared.serial_input(natemu::linux::serial_stdin()); // raw mode only once the signals are handled
     }
-    // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
-    let mut outcome = prepared.run()?;
-    if let Some(e) = prepared.serial_error() {
-        return Err(format!("serial output: {e}"));
-    }
-    let first = if outcome.ended_first < outcome.each.len() {
-        outcome.ended_first
-    } else {
-        0
+    // `[control] socket`: the control API (docs/control-api.md) for the run; without it, no listener.
+    let control = match &cfg.control_socket {
+        Some(path) => Some(natemu::control::serve(
+            path,
+            natemu::control::Target {
+                ps2: prepared.ps2().cloned(),
+                cancel: prepared.canceller(),
+                status: natemu::control::StatusSource {
+                    vcpus,
+                    started: std::time::Instant::now(),
+                },
+                irqs: prepared.irqs().clone(),
+            },
+        )?),
+        None => None,
     };
-    Ok(outcome.each.swap_remove(first).unwrap().0)
+    // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
+    let stop = prepared.run().and_then(|mut outcome| {
+        if let Some(e) = prepared.serial_error() {
+            return Err(format!("serial output: {e}"));
+        }
+        let first = if outcome.ended_first < outcome.each.len() {
+            outcome.ended_first
+        } else {
+            0
+        };
+        Ok(outcome.each.swap_remove(first).unwrap().0)
+    });
+    if let Some(server) = control {
+        server.stopped(stop_reason(&stop));
+    } // dropped: the socket is removed
+    stop
+}
+
+/// The control API's `stopped` reason for how the run ended.
+fn stop_reason(stop: &natemu::Result<Stop>) -> natemu::control::protocol::StopReason {
+    use natemu::control::protocol::StopReason;
+    match stop {
+        Ok(Stop::Power(natemu::pm::POWEROFF)) => StopReason::PowerOff,
+        Ok(Stop::Power(natemu::pm::RESET)) => StopReason::Reset,
+        Ok(Stop::Power(natemu::pm::PANIC)) => StopReason::Panic,
+        Ok(Stop::Cancelled) => StopReason::Cancelled,
+        _ => StopReason::Error,
+    }
 }
 
 fn main() {
@@ -493,6 +527,24 @@ mod tests {
                 error.contains("--runtime missing-runtime"),
                 "accepted policy must reach input checks: {error}"
             );
+        }
+    }
+
+    /// How the run ended, as the control API's `stopped` reason.
+    #[test]
+    fn stop_reasons() {
+        use natemu::control::protocol::StopReason;
+        use natemu::execution::Stop;
+        for (stop, reason) in [
+            (Ok(Stop::Power(natemu::pm::POWEROFF)), StopReason::PowerOff),
+            (Ok(Stop::Power(natemu::pm::RESET)), StopReason::Reset),
+            (Ok(Stop::Power(natemu::pm::PANIC)), StopReason::Panic),
+            (Ok(Stop::Cancelled), StopReason::Cancelled),
+            (Ok(Stop::Watchdog { pc: 0, el0: true, asked: 0 }), StopReason::Error),
+            (Ok(Stop::Power(natemu::pm::DEBUG_EXIT)), StopReason::Error),
+            (Err("serial output: broken pipe".to_string()), StopReason::Error),
+        ] {
+            assert_eq!(super::stop_reason(&stop), reason, "{:?}", stop.as_ref().err());
         }
     }
 

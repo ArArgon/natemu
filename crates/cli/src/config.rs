@@ -86,6 +86,8 @@ pub struct Config {
     /// Seconds a vCPU may stay in the guest without a host exit, or in the host outside a translation, before the run ends
     /// with its report; None = the library's 60 s.
     pub watchdog: Option<u64>,
+    /// The control API's socket (`[control] socket`, docs/control-api.md); None = no control socket.
+    pub control_socket: Option<PathBuf>,
 }
 
 impl Config {
@@ -130,6 +132,7 @@ impl Config {
             perf_log: None,
             inspect: true,
             watchdog: None,
+            control_socket: None,
         }
     }
     /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
@@ -163,6 +166,7 @@ struct FileConfig {
     #[serde(default)]
     console: Vec<FConsole>,
     debug: Option<FDebug>,
+    control: Option<FControl>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +261,12 @@ struct FDebug {
     perf_log: Option<PathBuf>,
     inspect: Option<bool>,
     watchdog: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FControl {
+    socket: Option<PathBuf>,
 }
 
 /// A file value's path: relative ones are taken from the file's folder.
@@ -422,6 +432,12 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         cfg.perf_log = d.perf_log.map(|p| rel(base, &p)).or(cfg.perf_log.take());
         cfg.inspect = d.inspect.unwrap_or(cfg.inspect);
         cfg.watchdog = d.watchdog.or(cfg.watchdog);
+    }
+    if let Some(socket) = f.control.and_then(|c| c.socket) {
+        if socket.as_os_str().is_empty() {
+            return Err(format!("{who}: control.socket: an empty path"));
+        }
+        cfg.control_socket = Some(rel(base, &socket));
     }
     Ok(())
 }
@@ -627,7 +643,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 31] = [
+const KEYS: [&str; 32] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -659,6 +675,7 @@ const KEYS: [&str; 31] = [
     "debug.perf_log",
     "debug.inspect",
     "debug.watchdog",
+    "control.socket",
 ];
 const DEVICE_KEYS: &str =
     "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
@@ -821,6 +838,8 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "debug.watchdog" => {
             cfg.watchdog = Some(text.parse().map_err(|_| err(format!("bad seconds {text:?}")))?)
         }
+        "control.socket" if text.is_empty() => return Err(err("an empty path".into())),
+        "control.socket" => cfg.control_socket = Some(path()),
         _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())

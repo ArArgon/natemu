@@ -3,7 +3,8 @@
 //!
 //! **Translation.** A key is its set 2 make code ([`KeyCode::set2`], Microsoft's "USB HID to PS/2 Scan Code
 //! Translation Table") and its break, F0 before the make's last byte (`Pause` has none). A pointer motion is split into
-//! packets of at most 255 per axis (the mouse clamps beyond its 9 bits) with dy negated (the API's dy is positive
+//! packets of at most 255 per axis (the mouse clamps beyond its 9 bits; each axis is clamped on its own, so the path
+//! bends while the final position is exact) with dy negated (the API's dy is positive
 //! downward, PS/2's upward); a scroll is packets whose wheel byte is the scroll's dy (at most 127 each), which the mouse
 //! sends only in IntelliMouse mode. Every packet carries the buttons the guest holds.
 //!
@@ -166,7 +167,8 @@ impl KeyCode {
 }
 
 /// A pointer motion in the API's directions (dy downward) as PS/2 steps (dy upward), each axis at most 255 in
-/// magnitude: the first steps carry 255 on the longer axis, the last the rest. No motion is no step.
+/// magnitude. Each axis is clamped on its own, so the path bends (the shorter axis is done first, the longer one goes
+/// on alone) while the final position is exact. No motion is no step.
 pub fn motion_steps(dx: i32, dy: i32) -> impl Iterator<Item = (i16, i16)> {
     let mut rest = (i64::from(dx), -i64::from(dy));
     std::iter::from_fn(move || {
@@ -904,21 +906,31 @@ mod tests {
         // No reader: a stall.
         let stall = Duration::from_millis(100);
         let (b, input) = setup(stall);
-        let presses: Vec<_> = letters.iter().map(|&c| key(c, true)).collect();
+        // 19 one-byte makes leave one of the keyboard's 19 host places (the output buffer holds the first byte): the
+        // up arrow's two bytes (E0 75) do not fit, so none of them is queued (a partial push would leave E0 alone).
+        let presses: Vec<_> = letters[..19]
+            .iter()
+            .chain([&KeyCode::ArrowUp])
+            .chain(&letters[19..])
+            .map(|&c| key(c, true))
+            .collect();
         let start = Instant::now();
-        assert_eq!(input.send(A, &presses), Err(SendError::Stalled));
+        let stalled = input.send(A, &presses);
+        assert_eq!(stalled, Err(SendError::Stalled));
         assert!(start.elapsed() >= stall);
-        // The keyboard's 19 host places and the output buffer: the first 20 makes, whole.
-        let delivered: Vec<u8> = letters[..20].iter().flat_map(|c| c.set2().iter().copied()).collect();
-        assert_eq!(collect(&b, 20, 0), (delivered, vec![]));
+        assert_eq!(Error::from(stalled.unwrap_err()).code.code(), -32003, "a stall is -32003");
+        assert_eq!(Error::from(SendError::Stopping).code.code(), -32002);
+        let delivered: Vec<u8> = letters[..19].iter().flat_map(|c| c.set2().iter().copied()).collect();
+        assert_eq!(collect(&b, 19, 0), (delivered, vec![]), "the first 19 makes, whole, no E0");
         assert_eq!(input.send(A, &[motion(10_000, 0)]), Err(SendError::Stalled));
         let (k, m) = collect(&b, 0, 15);
         assert!(k.is_empty());
         // The output buffer took the first byte; four more packets fill the FIFO to 14 of its 16 bytes.
         assert_eq!(m, [0x08, 255, 0].repeat(5), "whole packets only");
-        // The undelivered presses were discarded: the client's leaving breaks the 20 delivered keys, no more.
+        // The undelivered presses were discarded: the client's leaving breaks the 19 delivered keys, no more (no up
+        // arrow).
         input.release(A);
-        let breaks: Vec<u8> = letters[..20].iter().flat_map(|c| c.set2_break().unwrap()).collect();
-        assert_eq!(collect(&b, 40, 0), (breaks, vec![]));
+        let breaks: Vec<u8> = letters[..19].iter().flat_map(|c| c.set2_break().unwrap()).collect();
+        assert_eq!(collect(&b, 38, 0), (breaks, vec![]));
     }
 }

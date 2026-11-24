@@ -54,7 +54,7 @@ const GRACE: Duration = Duration::from_secs(2);
 /// The most client bytes the socket backend holds that the guest has not taken.
 const INPUT: usize = 64 * 1024;
 /// `sun_path`'s size on macOS: a socket path is shorter.
-const SUN_PATH: usize = 104;
+pub(crate) const SUN_PATH: usize = 104;
 
 /// A virtio console on an output file ([`Console::file`]) or a Unix socket ([`Console::socket`]).
 pub(crate) struct Console {
@@ -207,6 +207,15 @@ impl Drop for Console {
 
 /// A listening socket at `path`, non-blocking.
 fn listen(path: &Path) -> std::result::Result<UnixListener, String> {
+    claim_socket_path(path)?;
+    let listener = UnixListener::bind(path).map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    Ok(listener)
+}
+
+/// Readies `path` for a listening socket (the console's and the control API's rules): a path of at most 103 bytes;
+/// nothing there, or a socket an earlier run left behind (removed); a live socket or anything else is refused.
+pub(crate) fn claim_socket_path(path: &Path) -> std::result::Result<(), String> {
     let len = path.as_os_str().len();
     if len >= SUN_PATH {
         return Err(format!(
@@ -227,9 +236,7 @@ fn listen(path: &Path) -> std::result::Result<UnixListener, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    let listener = UnixListener::bind(path).map_err(|e| e.to_string())?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    Ok(listener)
+    Ok(())
 }
 
 impl Shared {

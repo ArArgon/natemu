@@ -1399,3 +1399,33 @@ fn the_documented_example_is_in_the_doc_and_loads() {
     assert_eq!(cfg.ram, Some(4 << 30));
     assert_eq!(cfg.fexc, Some(d.join("../build/fexc")));
 }
+
+/// `[control] socket`: none by default (no control socket); from the file relative to its folder, by `--set` as given
+/// (the working directory's), `--set` winning; an empty path, a wrong type and an unknown key are refused.
+#[test]
+fn control_socket_key() {
+    let _env = lock();
+    assert_eq!(load_old(&[]).unwrap().control_socket, None, "no socket by default");
+    let (_, c) = load_file(MIN, &[]);
+    assert_eq!(c.unwrap().control_socket, None);
+    let (d, c) = load_file(&format!("{MIN}[control]\nsocket = \"run/c.sock\"\n"), &[]);
+    assert_eq!(c.unwrap().control_socket, Some(d.join("run/c.sock")));
+    let (_, c) = load_file(&format!("{MIN}[control]\nsocket = \"/abs/c.sock\"\n"), &[]);
+    assert_eq!(c.unwrap().control_socket, Some(PathBuf::from("/abs/c.sock")));
+    let (_, c) = load_file(&format!("{MIN}[control]\n"), &[]);
+    assert_eq!(c.unwrap().control_socket, None, "an empty table names no socket");
+    let c = load_old(&["--set", "control.socket=rel/c.sock"]).unwrap();
+    assert_eq!(c.control_socket, Some(PathBuf::from("rel/c.sock")));
+    let (_, c) = load_file(&format!("{MIN}[control]\nsocket = \"a.sock\"\n"), &["--set", "control.socket=b.sock"]);
+    assert_eq!(c.unwrap().control_socket, Some(PathBuf::from("b.sock")), "--set wins");
+    let e = err(load_file(&format!("{MIN}[control]\nsocket = \"\"\n"), &[]).1);
+    assert!(e.contains("vm.toml: control.socket: an empty path"), "{e}");
+    let e = err(load_old(&["--set", "control.socket="]));
+    assert!(e.contains("--set control.socket: an empty path"), "{e}");
+    let e = err(load_file(&format!("{MIN}[control]\nsocket = 3\n"), &[]).1);
+    assert!(e.contains("vm.toml: control.socket"), "{e}");
+    let e = err(load_file(&format!("{MIN}[control]\nport = 3\n"), &[]).1);
+    assert!(e.contains("vm.toml: control") && e.contains("port"), "{e}");
+    let e = err(load_old(&["--set", "control.socket=a", "--set", "control.socket=b"]));
+    assert!(e.contains("--set control.socket: set twice"), "{e}");
+}

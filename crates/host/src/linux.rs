@@ -989,6 +989,15 @@ impl Canceller {
     pub fn cancel(&self) {
         owners::cancel_owners(&self.0);
     }
+    /// Whether the run was cancelled (by any holder of this handle or a peer's failure).
+    pub fn cancelled(&self) -> bool {
+        self.0.load(SeqCst)
+    }
+    /// A canceller no run watches (tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> Canceller {
+        Canceller(Arc::new(AtomicBool::new(false)))
+    }
     /// SIGINT and SIGTERM cancel the run from now on (a second one exits the process at once with 130): the handler only
     /// sets a flag, a detached thread acts on it (`cancel` in the performance log). For a process's command-line entry
     /// (the `natemu` stub, the test driver's `boot-linux`); once per process.
@@ -1427,6 +1436,10 @@ impl Prepared {
     /// [`crate::irq::Irqs::busy`] guard while input can still arrive ([`crate::ps2`]).
     pub fn ps2(&self) -> Option<&crate::ps2::Ps2Input> {
         self.ps2.as_ref()
+    }
+    /// The interrupt routing, for asynchronous sources and their [`crate::irq::Irqs::busy`] guards (the control API's).
+    pub fn irqs(&self) -> &crate::irq::Irqs {
+        &self.irqs
     }
     /// The bytes COM1 has sent so far.
     pub fn serial_bytes(&self) -> usize {

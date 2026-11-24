@@ -63,10 +63,11 @@ dependencies). Python client for tests in `tests/lib`. New dependencies are allo
   guest idle in HLT waiting for a key is not ended as idle.
 - Every request gets exactly one response, in the order requests arrived on that connection; notifications are never
   answered. A client that stops reading is disconnected when its output buffer exceeds 1 MiB (the run goes on).
-- Held state is server-wide, since the 8042 has one keyboard and one button mask: each key has a down count over all
-  clients (a make is sent on 0 to 1, a break on 1 to 0) and the button mask sent is the OR of every client's buttons.
-  A client's disconnect drops its own counts and buttons, so a crashed client never leaves a key stuck and never
-  releases what another client holds.
+- Held state is server-wide, since the 8042 has one keyboard and one button mask: each key has the set of clients
+  holding it (a client's repeated press is idempotent; a make is sent when the first client takes the key, a break
+  when the last lets go) and the button mask sent is the OR of every client's buttons. A client's disconnect drops it
+  from every key's set and drops its buttons, so a crashed client never leaves a key stuck and never releases what
+  another client holds.
 - Writes never block the server: each client has one writer with `SO_SNDTIMEO` of 1 s and an output cap of 1 MiB; a
   client over either is disconnected (the run goes on). `Server::stopped` writes the notification with that deadline,
   `shutdown`s every client socket and joins the threads, so the end of the run never waits on a client.
@@ -155,6 +156,9 @@ keys with a set 2 code (`IntlBackslash`, `IntlRo`, `IntlYen`, `ContextMenu`, `Pa
 `Left`, `Right`, `Middle` (wire `"left"`, ...). Wire examples: `{"type":"key","code":"KeyA","pressed":true}`,
 `{"type":"pointer_motion","dx":10,"dy":-3}`, `{"type":"button","button":"left","pressed":true}`. An absolute
 pointer (`pointer_position`) is not defined: PS/2 has none, and an absolute device (a tablet) adds the variant.
+Each event's |dx| and |dy| (`pointer_motion`) and |dy| (`scroll`) is at most 65535: beyond it the request gets -32602
+naming the field (`data`: `events[1].dx: at most 65535 in magnitude`) and none of its events is applied (the server
+checks the whole list first). The cap bounds the packets one event becomes (at most 257 per axis).
 
 ### Translation to PS/2 (`crates/host/src/control/ps2.rs`)
 
@@ -179,12 +183,20 @@ pointer (`pointer_position`) is not defined: PS/2 has none, and an absolute devi
 ### Server (`crates/host/src/control/mod.rs`)
 
 - `pub fn serve(path: &Path, target: Target) -> Result<Server>`; `Target { ps2: Option<Ps2Input>, cancel: Canceller,
-  power_button: Option<PowerButton>, status: StatusSource, irqs: Irqs }`; `Server::stopped(&self, reason)` sends the
-  notification and closes; dropping it removes the socket.
-- One listener thread, at most 8 clients (a ninth connection is closed at once), each with a reader thread (reads
-  lines, decodes, dispatches, waits for input room) and a writer (responses and notifications, `SO_SNDTIMEO` 1 s, 1 MiB
-  cap). One input thread per device (`control::ps2::Input`, Task 1) drains the server's queues into the 8042, so
-  clients' events interleave per event, never inside a key's bytes.
+  status: StatusSource, irqs: Irqs }` (Task 3 adds `power_button: Option<PowerButton>`; until then `power_button` is
+  -32601); `StatusSource { vcpus, started: Instant }` (`uptime_ms` counts from `started`; `state` is `stopping` once
+  `quit` was asked, the canceller is set or `stopped` began); `Server::stopped(&self, reason)` sends the notification
+  and closes; dropping it closes without the notification and removes the socket (only if it is still this server's
+  file). The stale/live/non-socket/length checks are the console's, shared as `crate::virtio::claim_socket_path`.
+- One listener thread (`poll` on the listener and a wake socket), at most 8 clients (a ninth connection is closed at
+  once), each with a reader thread (reads lines, decodes, dispatches, waits for input room) and a writer thread
+  (responses and notifications from a queue, `SO_SNDTIMEO` 1 s, `SO_NOSIGPIPE`, 1 MiB cap on the queued bytes; over
+  either the client is shut down). A blank line is ignored. A client's end of file releases what it held, then its
+  queued responses are written before the connection closes (so `echo REQUEST | socat` gets its answer).
+  `Server::stopped` stops the listener, stops `Input` (pending `send_input` gets -32002), queues the notification,
+  waits for the writers until one shared 1 s deadline, shuts every socket down and joins every thread. One input
+  thread per device (`control::ps2::Input`, Task 1) drains the server's queues into the 8042, so clients' events
+  interleave per event, never inside a key's bytes.
 - `crates/cli`: `[control] socket = "PATH"` (relative to the file's folder; `--set control.socket=PATH` relative to the
   working directory, as every path key); `serve` after `prepare`, `stopped` when the run returns.
 
@@ -212,7 +224,7 @@ Metal front end needs a Mach port, which a Unix socket cannot carry; the native 
 | --- | --- |
 | `crates/host/src/control/mod.rs` (new) | listener, clients, dispatch, `Target`, `Server` |
 | `crates/host/src/control/protocol.rs` (new) | `Call`, `InputEvent`, `KeyCode`, `MouseButton`, envelopes, errors |
-| `crates/host/src/control/ps2.rs` (new) | key codes to set 2, motion splitting, held-state release |
+| `crates/host/src/control/ps2.rs` (new) | key codes to set 2, motion splitting, held-state release; delivery (`Input`: the per-device queues and threads) |
 | `crates/host/src/ps2.rs`, `crates/host/src/ps2/{keyboard.rs,mouse.rs}` | `try_keyboard`, `try_mouse` (with `dz`), `wait_keyboard`, `wait_mouse`; a crate-visible test constructor of the 8042 without a VM |
 | `crates/host/src/pm.rs`, `crates/host/src/clock.rs`, `crates/host/src/linux.rs` | `PowerButton` (the PM device sits type-erased inside a `Timer` in `clock.rs`, so the handle is made there and carried on `Board`); `Prepared::power_button()`, `Prepared::irqs()` |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `crates/cli/src/main.rs` | `[control] socket` |
@@ -251,8 +263,9 @@ SendError>`, `release(&self, ClientId)` and `stop(&self)`; `Ps2Input::mouse(dx, 
 
 ### Task 2: the server and its configuration
 
-**Files:** `crates/host/src/control/mod.rs`, `crates/host/src/lib.rs`, `crates/host/src/linux.rs`, `crates/cli/src/*`,
-`docs/configuration.md`, `docs/control-api.md`.
+**Files:** `crates/host/src/control/{mod.rs,tests.rs}`, `crates/host/src/linux.rs` (`Prepared::irqs`,
+`Canceller::cancelled`), `crates/host/src/virtio/{console.rs,mod.rs}` (the shared socket-path checks),
+`crates/cli/src/*`, `docs/configuration.md`, `docs/control-api.md`.
 
 **Interfaces:** `control::serve`, `Target`, `Server::stopped`; `[control] socket`.
 

@@ -14,7 +14,7 @@ mod profile;
 mod queue;
 mod slirp;
 pub(crate) use block::CALL_LIMIT as DISK_CALL_LIMIT;
-pub(crate) use console::Console;
+pub(crate) use console::{Console, SUN_PATH, claim_socket_path};
 pub use net::{Frame, Gso, Offloads, PacketPort, RxChecksum, RxMeta, TxMeta};
 pub use slirp::{ForwardProtocol, PortForward, Slirp, SlirpOptions};
 #[cfg(feature = "testing")]
