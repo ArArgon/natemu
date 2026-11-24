@@ -579,6 +579,12 @@ fn power_button_presses() {
     // Pressing again is harmless, and the status still answers.
     assert_eq!(c.call(2, "power_button", json!({}))["result"], json!({}));
     assert_eq!(c.status(3)["state"], "running");
+    // While stopping: -32002, and nothing more is pressed.
+    assert!(crate::devices::Device::write(&mut *pm.lock(), 0, 0, 2, 1 << 8));
+    assert_eq!(c.call(4, "quit", json!({}))["result"], json!({}));
+    let v = c.call(5, "power_button", json!({}));
+    assert_eq!(v["error"]["code"], json!(-32002), "{v}");
+    assert_eq!(status() & 1 << 8, 0, "a refused press sets nothing");
 }
 
 #[test]

@@ -124,7 +124,8 @@ PM1_STS) is set and, if the guest has enabled it (PWRBTN_EN), the guest gets its
 ACPI `button` driver reports that as a KEY_POWER press on its "Power Button" input device, which a login manager or
 `acpid` normally turns into a shutdown; natemu itself does nothing more, and a guest that ignores it keeps running.
 Pressing again before the guest has handled the first press changes nothing. If the VM has no power button the answer
-is error -32001 with `data` `{"device": "power_button"}`; every VM natemu builds has one.
+is error -32001 with `data` `{"device": "power_button"}`; every VM natemu builds has one. While the run is stopping
+the answer is -32002 and nothing is pressed.
 
 ## Input events
 

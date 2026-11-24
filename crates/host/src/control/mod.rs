@@ -502,6 +502,9 @@ impl Shared {
             }
             Call::PowerButton => {
                 let button = self.power_button.as_ref().ok_or_else(|| Error::no_device("power_button"))?;
+                if self.stopping.load(SeqCst) {
+                    return Err(Error::new(ErrorCode::Stopping));
+                }
                 button.press();
                 Ok(json!({}))
             }

@@ -12,8 +12,8 @@
 //! **PM1 event** (4.8.3.1): PM1_STS bits are cleared by writing 1 (any bit, as QEMU); PM1_EN reads back as written
 //! (all 16 bits, as QEMU). The SCI is asserted while a status bit is set with its enable among TMR_EN, GBL_EN,
 //! PWRBTN_EN and RTC_EN (`acpi_update_sci`); TMR_STS and PWRBTN_STS have sources on this board (the timer, and
-//! [`PowerButton::press`] for the host; no global lock owner or RTC wake). With TMR_EN and TMR_STS clear the next toggle is scheduled on a [`clock::Timer`] thread, which
-//! holds an [`Irqs::busy`] guard meanwhile. A write to both halves (32 bits at B000H) is one update.
+//! [`PowerButton::press`] for the host; no global lock owner or RTC wake). With TMR_EN and TMR_STS clear the next toggle
+//! is scheduled on a [`clock::Timer`] thread, which holds an [`Irqs::busy`] guard meanwhile. A write to both halves (32 bits at B000H) is one update.
 //!
 //! **PM1 control** (4.8.3.2.1): SCI_EN is set from reset (ACPI-only mode, no SMI command) and read-only: the hardware
 //! owns it (Table 4.13, "OSPM always preserves this bit position"; QEMU lets a write clear it). SLP_EN is write-only
@@ -186,6 +186,7 @@ impl Pm {
     fn press(&mut self) {
         self.sts |= PWRBTN;
         self.update_sci();
+
     }
 }
 /// The fixed power button, for a host thread (the control socket's `power_button`): a cloneable handle on the PM device.
@@ -221,12 +222,12 @@ mod tests {
     use crate::devices::{Device, Devices};
     use std::sync::Mutex;
 
-    pub(crate) struct Rig {
-        pub(crate) irqs: Irqs,
-        pub(crate) pm: Timer<Pm>,
+    struct Rig {
+        irqs: Irqs,
+        pm: Timer<Pm>,
     }
     /// A PM device on a registry with the interrupt controllers (no vCPU): the SCI through the chipset's input level.
-    pub(crate) fn rig() -> Rig {
+    fn rig() -> Rig {
         let memory = Arc::new(crate::memory::Memory::with_size(4096).unwrap());
         let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
         let mut devices = Devices::new(1 << 30);
@@ -235,10 +236,10 @@ mod tests {
         Rig { irqs, pm }
     }
     impl Rig {
-        pub(crate) fn sts(&mut self) -> u16 {
+        fn sts(&mut self) -> u16 {
             self.pm.read(0, 0, 2).unwrap() as u16
         }
-        pub(crate) fn enable(&mut self, en: u16) {
+        fn enable(&mut self, en: u16) {
             assert!(self.pm.write(0, 2, 2, en.into()));
         }
     }
