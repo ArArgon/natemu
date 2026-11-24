@@ -3,7 +3,9 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Status: revised November 23, 2026, after an independent review (accept with required changes: four blocking findings
+Status: implemented on branch `claude/pci-multibar-44dd6e` (rebased onto the platform-devices track at 30f0da70),
+pending the integration gate. Decisions taken in execution are written into the tasks below (Task 1 Step 5, Task 4).
+Revised November 23, 2026, after an independent review (accept with required changes: four blocking findings
 on test selection, an undecoded test device, an ACPI check that saw no PCI bus, and the I/O straddling rule, all
 folded in below); a second check confirmed those and found the decode A/B named an unusable bench case: folded in. Owner direction (same day): plan multi-BAR PCI now, beside the platform devices and the virtio
 device interface, because display, SATA, NVMe and IDE need it (roadmap M3 P1).
@@ -154,7 +156,7 @@ launch error.
 | `crates/host/src/linux.rs`, `crates/driver/src/drivers/linux.rs` | `Bus::add` call sites; the load-only path can place a PCI function and the test function for L2 dumps |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `docs/configuration.md` | `debug.pci_testdev` |
 | `tools/models/acpi_model.py`, `tests/boot/run_l2.py`, `tests/boot/run_l2_iasl.py` | `PCI0` checks; an L2 dump with PCI functions |
-| `tests/devices/run_pci.py`, `tests/devices/family.toml` | the guest case `pci-multibar` (the family the platform-devices plan creates) |
+| `tests/devices/run_platform.py`, `tests/devices/family.toml` | the guest case `pci-multibar`: a case of the devices family's runner, suite `devices-pci` |
 
 ## Tasks
 
@@ -165,24 +167,29 @@ launch error.
 **Interfaces:** produces `Bar`, `BarKind`, the `Function` trait above; `Bus::add(&mut self, slot: u8, function: u8,
 f: Arc<dyn Function>) -> Result<()>`; `const TOKEN_BITS: u32 = 52`.
 
-- [ ] **Step 1: unit tests** in `pci/mod.rs` (the test `Stub` grows a BAR list): `bar0_routing_unchanged` (the
+- [x] **Step 1: unit tests** in `pci/mod.rs` (the test `Stub` grows a BAR list): `bar0_routing_unchanged` (the
   existing routing tests pass with only call signatures and the token width changed), `routes_to_bar_n_with_offset`,
   `mem64_halves_written_in_either_order`, `sizing_probe_decodes_nothing`, `overlapping_bars_pick_lowest`,
   `function_bits_select_function`, `multifunction_bit_on_function_0_only_with_siblings`,
   `function_without_function_0_is_refused`, `token_carries_slot_function_bar` (a deferred access from slot 3
   function 2 BAR 4 polls back to the same BAR).
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; the new tests FAIL in junit.xml.
-- [ ] **Step 3: implement.**
-- [ ] **Step 4: run** the unit tests (PASS) and `tools/natemu-test run tests/io -k "io-coverage-pci or net-linux-pci"`
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; the new tests FAIL in junit.xml.
+- [x] **Step 3: implement.**
+- [x] **Step 4: run** the unit tests (PASS) and `tools/natemu-test run tests/io -k "io-coverage-pci or net-linux-pci"`
   (PASS, behaviour unchanged). Show `sizing_probe_decodes_nothing` fails with the size mask removed.
-- [ ] **Step 5: A/B** of the decode change, on one machine, alternating three rounds: `TESTKIT_BENCH_AT=<parent>
+- [x] **Step 5: A/B** of the decode change, on one machine, alternating three rounds: `TESTKIT_BENCH_AT=<parent>
   tools/natemu-test run --tier bench -k <case>` then the same without `TESTKIT_BENCH_AT` (the checkout), where
   `<case>` is a bench case whose disk and network run on the PCI transport (check `io5-solo`'s transport in
   `tests/io/run_io5.py`; if no bench case uses PCI, first add a PCI variant of `io5-solo` to `tests/bench/family.toml`,
   shown to run). Compare its wall time; record the rounds and their spread in the commit message; the benchmarks page
   changes only if the difference exceeds the spread. (`m1-perf` does not fit: it compares against its fixed baseline
   commit and takes about 80 minutes.)
-- [ ] **Step 6: commit** `pci: functions per slot and BARs beyond BAR0 on the bus`.
+  As built: `io5-solo` runs its devices on MMIO, so a PCI variant `io5-solo-pci` (`run_io5.py --transport pci`) was
+  added for the A/B. Bench case `io5-solo-pci`, M4: the difference is within noise and the benchmarks page is
+  unchanged; the rounds are in the message of commit `pci: a bound on decode's calls per access; io5-solo-pci leaves
+  the default bench tier`. The framework has no opt-in bench case, so that commit takes `io5-solo-pci` out of the
+  default bench tier again (its message holds the block that re-adds it); `run_io5.py --transport pci` stays.
+- [x] **Step 6: commit** `pci: functions per slot and BARs beyond BAR0 on the bus`.
 
 ### Task 2: launch-time placement and the I/O window
 
@@ -192,13 +199,13 @@ f: Arc<dyn Function>) -> Result<()>`; `const TOKEN_BITS: u32 = 52`.
 u8, kind: BarKind, len: u64 }`, `Placed { request: Request, base: u64 }`; `pub const IO_WINDOW: (u16, u16) = (0xC000,
 0xFFFF)` (inclusive); `Bus::install` calls `place`, then `assign`, and registers `IoWindow` when an I/O BAR exists.
 
-- [ ] **Step 1: unit tests** in `place.rs`: `function0_memory_bar0_keeps_slot_stride`,
+- [x] **Step 1: unit tests** in `place.rs`: `function0_memory_bar0_keeps_slot_stride`,
   `others_naturally_aligned_above_2mib`, `largest_first_no_overlap`, `io_bars_in_io_window`,
   `exhaustion_names_the_bar`. In `pci/mod.rs`: `io_bar_routes_when_io_decoding_on`,
   `io_bar_silent_when_io_decoding_off`, `io_access_straddling_bar_end`, `io_bar_past_64k_does_not_decode`,
   `no_io_window_without_io_bars` (the registry's port ranges equal today's).
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
-- [ ] **Step 5: commit** `pci: launch-time BAR placement and the I/O window C000H-FFFFH`.
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
+- [x] **Step 5: commit** `pci: launch-time BAR placement and the I/O window C000H-FFFFH`.
 
 ### Task 3: the test function, ACPI resources and the L2 dump
 
@@ -206,37 +213,40 @@ u8, kind: BarKind, len: u64 }`, `Placed { request: Request, base: u64 }`; `pub c
 `docs/configuration.md`, both `linux.rs`, `tools/models/acpi_model.py`, `tests/boot/run_l2.py`,
 `tests/boot/run_l2_iasl.py`.
 
-- [ ] **Step 1: unit tests**: in `testdev.rs`, the header and test-table registers on both BARs of function 0 and
+- [x] **Step 1: unit tests**: in `testdev.rs`, the header and test-table registers on both BARs of function 0 and
   function 1, and function 1's 64-bit BAR reading its offsets; in `acpi.rs`, `pci0_crs_has_io_window_with_io_bars`
   and `pci0_crs_unchanged_without_io_bars`; in `config/tests.rs`, the key.
-- [ ] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.**
-- [ ] **Step 4: L2**: the driver's `boot-linux --load-only` gains `--pci-testdev` (and places the entropy device on
+- [x] **Step 2: run** `tools/natemu-test run tests/unit -k rust`; FAIL. **Step 3: implement.**
+- [x] **Step 4: L2**: the driver's `boot-linux --load-only` gains `--pci-testdev` (and places the entropy device on
   PCI with its existing `--rng` plus a `--transport pci` flag if it has none); `run_l2.py` and `run_l2_iasl.py` add a
   dump per N with both; the model checks `PCI0`'s `_CRS` descriptors. Run `tools/natemu-test run tests/boot -k l2`
   (PASS); show the model check fails with the WordIO range ending at FFFEH.
-- [ ] **Step 5: commit** `pci: a pci-testdev test function and the root bridge's I/O window`.
+- [x] **Step 5: commit** `pci: a pci-testdev test function and the root bridge's I/O window`.
 
 ### Task 4: the guest case
 
-**Files:** create `tests/devices/run_pci.py`; modify `tests/devices/family.toml` (`covers` adds `crates/host/src/pci/**`,
-`crates/host/src/virtio/pci.rs`). This task waits for the platform-devices track, which creates `tests/devices`; if
-that track has not landed, this task creates the family itself with the `covers` and layout that plan's Task 2 gives.
+**Files:** modify `tests/devices/run_platform.py` and `tests/devices/family.toml` (`covers` adds
+`crates/host/src/pci/**`, `crates/host/src/virtio/pci.rs`). As built: the case lives in the devices family's one
+runner, not a new `run_pci.py`, as the family's documented layout and AGENTS.md ("a new test is a case in a family")
+ask; the platform-devices track had landed (30f0da70) and created the family.
 
-**Interfaces:** `run_pci.py prepare` builds a BusyBox initramfs from the framework's inputs as
-`tests/io/run_virtio_rng.py prepare` does; it checks `busybox --list` has `devmem`, `hexdump` and `dd` and refuses to
-build otherwise; `run_pci.py run --case pci-multibar --cpus N`, judged from serial markers; `self-check`.
+**Interfaces:** `run_platform.py prepare` builds the family's platform initramfs and refuses a BusyBox whose applet
+table lacks `devmem`, `hexdump`, `dd` or `printf`; `run_platform.py run --case pci-multibar --vcpus N --set
+debug.pci_testdev=true` (suite `devices-pci`, cases `pci-multibar-1cpu` and `pci-multibar-2cpu`), judged from serial
+markers; its negative controls are in `self-check` (case `platform-selfcheck`). The case's init function, judge and
+controls are one block of the runner.
 
-- [ ] **Step 1: the case `pci-multibar`** (`--set debug.pci_testdev=true`, 1 and 2 vCPUs): the init finds the two
+- [x] **Step 1: the case `pci-multibar`** (`--set debug.pci_testdev=true`, 1 and 2 vCPUs): the init finds the two
   functions under `/sys/bus/pci/devices/` by vendor `0x1b36` and device `0x0005`; dmesg has `root bus resource [io
   0xc000-0xffff window]` and no `can't claim`, `no space` or `failed to assign`; for each function `echo 1 > enable`
   (no driver binds, so nothing else turns decoding on), then the Command register in `config` has memory and I/O
   enabled; `resource` lists the placed bases and sizes; `devmem` reads BAR0's header register; `dd if=/dev/port bs=1
   skip=<BAR1> count=4 | hexdump` reads BAR1's (`/dev/port` needs only root's `CAP_SYS_RAWIO`); function 1's BAR2
   reads its offsets. S5 ends the run.
-- [ ] **Step 2: show it fails** against three breaks, one at a time: no multi-function bit (function 1 absent), no
+- [x] **Step 2: show it fails** against three breaks, one at a time: no multi-function bit (function 1 absent), no
   `IoWindow` (BAR1 reads FFH), no WordIO (the kernel reports no I/O window and reassigns or fails BAR1); passes here.
 - [ ] **Step 3: run** `tools/natemu-test run` then `--gate`; PASS.
-- [ ] **Step 4: commit** `tests/devices: the multi-BAR, multi-function guest case`.
+- [x] **Step 4: commit** `tests/devices: the multi-BAR, multi-function guest case`.
 
 ## Out of scope
 

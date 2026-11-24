@@ -210,10 +210,17 @@ weeks for a first demonstration.
   and mouse (the controller exists; the display front end will add the source), and
   SMBIOS tables for a firmware boot (a direct boot has them; the firmware's come with M3). The ACPI tables already include the PCI root bridge with resources and
   interrupt routing.
-- **P1** Multi-BAR, multi-function PCI. The bus today routes BAR0 only, one function per
-  device, one fixed 256 MiB window and no I/O BARs. A SATA controller (BAR5 plus I/O
-  BARs), a Bochs-style display (BAR0 and BAR2) and a firmware PM function (second
-  function) need more.
+- **P1** Multi-BAR, multi-function PCI. **Built** (branch `claude/pci-multibar-44dd6e`,
+  November 23, 2026, pending the integration gate;
+  [the plan](restructure/pci-multibar-plan.md)): a PCI function may have up to six BARs
+  of any kind (32- and 64-bit memory, I/O ports) and a slot up to eight functions.
+  natemu places the BARs at launch and follows the guest when it moves them; I/O BARs go
+  in a port window at C000H-FFFFH, which the root bridge's ACPI resources list when some
+  function has one. That covers a SATA controller (BAR5 plus I/O BARs), a Bochs-style
+  display (BAR0 and BAR2) and a firmware PM function (second function). Still missing,
+  for when a device needs it: a 64-bit memory window above 4 GB, expansion ROM BARs,
+  interrupt routing per pin (INTB-INTD; every function of a slot shares INTA), PCI
+  bridges, PCIe extended configuration space and plain MSI.
 - **P1** Boot Linux the way a PC does (firmware, bootloader, kernel) from the existing
   virtio disk, alongside the current direct-boot path.
 - **P1** Display for the firmware and installers: a framebuffer device with resolution
