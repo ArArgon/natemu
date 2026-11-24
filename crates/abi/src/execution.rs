@@ -344,7 +344,10 @@ pub mod cache {
     /// Return plan: the computed exit is a near return (`ret`, `ret imm16`): it leaves through its slot's [`SLOT_RETURN`]
     /// form (`ret x1`), so it pops the return-address stack every call pushes.
     pub const FORM_RETURN: u32 = 4 << super::MAX_LINK_POINTS;
-    pub const FORMS: u32 = FORM_CALL_POINTS | FORM_INDIRECT | FORM_INDIRECT_CALL | FORM_RETURN;
+    /// Return plan: the block's pads are used (return prediction is on for it, `NATEMU_RETURN_PREDICT`); without it a block
+    /// has none, and the host gives it no call points and no return form either (its hint is step 1's alone).
+    pub const FORM_PADS: u32 = 8 << super::MAX_LINK_POINTS;
+    pub const FORMS: u32 = FORM_CALL_POINTS | FORM_INDIRECT | FORM_INDIRECT_CALL | FORM_RETURN | FORM_PADS;
     /// Return plan: a slot's fourth form, for a checked link that is a call from absolute code (whose blocks have no
     /// link-point words): `bl` to its lookup form, `blr x1`, `b` to the miss. Slot 0, never bound, holds the resident's
     /// stubs there instead: [`PUSH_STUB`] and [`POP_STUB`]. Slot 0's [`SLOT_RETURN`] form is the miss's two words
@@ -558,9 +561,11 @@ pub mod cache {
             b.links[2].offset = 0x6c;
             assert_eq!((b.tail(None), b.tail(Some(2))), (Some(0x2_0080), Some(0x2_008c)));
             assert_eq!(b.tail_word(0x2_007c), None, "the `svc` word is no appended word");
-            b.flags = 0;
+            (b.flags, b.exit_forms) = (0, b.exit_forms | FORM_PADS);
             assert_eq!((b.tail_entries(), b.pair(), b.pad()), (1, Some(0x2_008c), Some(0x2_0090)), "absolute: the pair's pad");
             b.exit_forms = FORM_INDIRECT | FORM_INDIRECT_CALL;
+            assert_eq!(b.pad(), None, "no pad with return prediction off");
+            b.exit_forms |= FORM_PADS;
             assert_eq!((b.pair(), b.pad(), b.exit_branch(0x123)), (None, Some(0x2_0088), 0x2_0080), "an indirect call's third word");
             b.exit_forms = FORM_RETURN;
             assert_eq!((b.tail_extent(), b.pad(), b.exit_branch(0x400)), (0, None, 0x400 + SLOT_RETURN as u64), "a return");
@@ -1882,7 +1887,7 @@ pub mod cache {
         /// Return plan: its pad, the word a return to the address after its call reaches through a return-table entry: an
         /// absolute block's (not [`PIC`]) call pair's second word, or its indirect call's appended words' third.
         pub fn pad(&self) -> Option<u64> {
-            if self.flags & PIC != 0 {
+            if self.flags & PIC != 0 || self.exit_forms & FORM_PADS == 0 {
                 return None;
             }
             match self.pair() {

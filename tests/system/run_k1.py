@@ -2349,7 +2349,7 @@ def main():
                         problems.append(f"cpu{v} flushes {c['stats']['flushes']}, want the driver's and the program's")
                 # Return plan: the resident counters of the call pairs, pads and stubs (natemu_abi::pic::count, least per CPU).
                 # (Not under a PIC test mode, which changes how blocks are entered: run_pic.py checks its own counters.)
-                for v, c in enumerate(out['cpus'] if out and name in RET_COUNT and not os.environ.get('NATEMU_PIC_TEST') else []):
+                for v, c in enumerate(out['cpus'] if out and name in RET_COUNT and not os.environ.get('NATEMU_PIC_TEST') and os.environ.get('NATEMU_RETURN_PREDICT') == '1' else []):
                     pic = c['stats']['k1']['pic']
                     for k, least in RET_COUNT[name]:
                         if pic[k] < least:

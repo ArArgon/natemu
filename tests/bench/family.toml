@@ -25,6 +25,7 @@ argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{o
 [suite.cases.micro-callchain]
 argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3",
         "--bench", "call,chain4-d4,chain4-d16,chain4-d32,chain1-d16,chain4-d16-cpuid,chain4-d16-port"]
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 # The same at the kill-test's base, the indirect plan's step 1 as built (ad452224: the slot's shared `br` for every return), with
 # this checkout's fexc (unchanged since): natemu at the base through its build folder.
@@ -245,6 +246,19 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sam
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
+
+# The return plan's slowdown fix (return-prediction-plan.md section 15): repmicro and hackbench at 65a3d1eb (return prediction
+# on for every block), natemu through its build folder, this checkout's fexc and image: the base side of that kill-test.
+[suite.cases.guest-repmicro-base]
+baseline = "65a3d1eb"
+argv = ["python3", "tests/bench/repmicro_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
+        "--fexc", "{fexc}", "--natemu", "{natemu_baseline}/release/natemu", "--runtime", "{natemu_baseline}/aarch64-unknown-none/release/natemu-runtime"]
+
+[suite.cases.guest-hackbench-base]
+baseline = "65a3d1eb"
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "hackbench",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu_baseline}/release/natemu",
+        "--runtime", "{natemu_baseline}/aarch64-unknown-none/release/natemu-runtime", "--compile-cache", "off"]
 
 [suite.cases.guest-hackbench-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",

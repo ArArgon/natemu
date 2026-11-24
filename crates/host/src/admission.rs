@@ -449,8 +449,23 @@ pub(crate) fn admit_user(
     (admitted.links, admitted.dispatch_exit, admitted.bulk) = (links, dispatch_exit, bulk);
     let end = wrap(rip.wrapping_add(u64::from(h.guest_bytes)), bits32);
     let tail = source.get(admitted.last as usize..h.guest_bytes as usize).unwrap_or(&[]);
-    admitted.exit_forms = exit_forms(tail, &admitted.links, admitted.dispatch_exit, end, bits32);
+    admitted.exit_forms = predicted(exit_forms(tail, &admitted.links, admitted.dispatch_exit, end, bits32));
     Ok(admitted)
+}
+
+/// Return plan (return-prediction-plan.md section 15): with `NATEMU_RETURN_PREDICT=1` a block's hint keeps its call points
+/// and its return form and gains [`FORM_PADS`]; otherwise (the default) both go, so calls are plain links and returns leave
+/// through the slot's shared `br` as before the plan, and the block has no pads: step 1's words alone. (Every block that
+/// ends at a return address pushes its own pad, and the return's entry can name only one: with two blocks ending at one
+/// return address, a loop's back edge and its first entry, every return of the loop mispredicted.)
+pub(crate) fn predicted(forms: u32) -> u32 {
+    use natemu_abi::execution::cache::{FORM_CALL_POINTS, FORM_PADS, FORM_RETURN};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("NATEMU_RETURN_PREDICT").is_ok_and(|v| v == "1")) {
+        forms | FORM_PADS
+    } else {
+        forms & !(FORM_CALL_POINTS | FORM_RETURN)
+    }
 }
 
 /// Indirect plan step 1, the resident's hint for the words it appends to a block ([`natemu_abi::execution::cache::Block::exit_forms`]),

@@ -428,3 +428,46 @@ Narrow runs at the final code (161176fb plus this work and the review fixes), al
 **For the owner.** (1) The kill-test at depth 4 saves 0.82 ns per return, under the 1.5 ns bar; depths 16 and 32 pass three
 times over. The build went on (the plan's decision case is the deep chain); whether the bar is per depth is the owner's call.
 (2) An HVF exit clears the return stack: no gain across host exits. 
+## 15. The slowdown, and return prediction off by default (November 24, 2026)
+
+The bisect on the M2 Max (bench cases `guest-repmicro` and `guest-hackbench`, 161176fb against 115f0b34) showed return
+prediction a slowdown: repmicro's run 2 about +7.5 ns per copy (movsb-1 3.66 to 11.10), hackbench 14.47 to 17.18 s, and in a
+26-case pass build +39%, sqlite32 +26%, startup32 +23%. repmicro's timed loop is `call copy` per iteration (gcc does not
+inline `copy`, which ends `rep movs; ret`): one call and one return.
+
+**Cause** (experiments, M2 Max, bench cases `guest-repmicro` and a temporary `guest-repmicro-sample`, not kept): the return
+misses the return stack on every iteration in run 2 although its table entry names a pad.
+- The sampler puts 21% of all samples on the first word of the block at the return address (0x401a3c), in run 2 only
+  (`repmicro:main` 10.9% of EL0 in run 1, 35.5% in run 2): the landing of a mispredicted branch.
+- With the return form switched off (returns through the slot's `br`, calls still pushing) run 2 is 4.17 ns: the `ret x1`
+  is what mispredicts.
+- A counter on that return address's fills (instrumented resident, not kept): all 795 fills named a pad, from a valid hint;
+  but in 764 of 853 fills the hint's caller was not the block found at the loop's call RIP 0x401a30. Two live blocks end at
+  the return address: the loop's back edge enters 0x401a30, its first entry comes through the `nop`s before it (a longer block
+  ending at the same call). Each block has its own call pair, the return stack holds the pad of the one that ran, and the
+  entry names one pad only: when the hint names the other block, every return mispredicts. Which one the hint names depends
+  on placement and relink order: right in run 1, wrong in run 2. Making the longer block win (an experiment) made both runs
+  slow; making hints survive (re-registered at relinks and revalidations, a 64 Ki table) and checking the caller's frames left
+  run 2 slow. Loop headers, fall-through entries and blocks placed from an instruction inside another all give a return
+  address several callers, so the multi-process benchmarks pay it everywhere.
+
+A correct fix needs one push address per return address, whichever block makes the call: one call stub per return address
+shared by every block ending there, with link records for the stub's users and the entries named by it. Not small.
+
+**Fix: return prediction off by default.** `NATEMU_RETURN_PREDICT=1` turns it on. Off, admission's hint drops the call points
+and the return form, and a block has no pads (`FORM_PADS`, set only with it on): calls are plain links, returns leave
+through the slot's shared `br`, indirect calls keep step 1's `blr` (pushes no return pops: harmless). That is the code at
+161176fb but for the stubs, slot forms and audits, which stay. The plan's cases (`ret-pairs`, `ret-pairs-lc`, `ret-stop`,
+`compat32-resident-limits`, `micro-callchain`) turn it on; the K1 counter checks and `ret32`'s apply only with it on.
+
+Kill-test (bench cases `guest-repmicro-base`, `guest-hackbench-base` at 65a3d1eb, and `guest-repmicro`, `guest-hackbench` at
+the fix, M2 Max, three alternating rounds a side):
+
+| Case | 65a3d1eb | fix |
+| --- | --- | --- |
+| repmicro movsb-1, ns per copy | 11.44, 10.88, 11.07 | 3.67, 3.69, 3.71 |
+| repmicro movsd-4 (32-bit) | 12.81, 12.72, 12.50 | 6.01, 5.88, 5.76 |
+| repmicro movsq-4096 | 107.82, 104.15, 105.41 | 99.93, 97.47, 99.04 |
+| hackbench wall, s (run 1 / run 2) | 16.93/16.92, 16.28/16.71, 17.01/17.30 | 14.72/14.54, 13.44/13.70, 14.78/14.41 |
+
+movsb-1 is back at 161176fb's 3.66 and hackbench at its 14.47 s, within the rounds' spread.

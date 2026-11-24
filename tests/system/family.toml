@@ -269,16 +269,19 @@ needs = { cores = 2, perf = true }
 [suite.cases."ret-pairs"]
 argv = ["tests/system/run_k1.py", "--cpus", "1", "4", "--programs", "ret-pairs,ret-death", "--timeout", "900", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases."ret-pairs-lc"]
 argv = ["tests/system/run_k1.py", "--cpus", "1", "4", "--programs", "ret-pairs,ret-death,cr3-relink,relink-smc", "--link-check",
         "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases."ret-stop"]
 argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "ras0,ras1,ras2,ras3,ras4,tail1", "--programs", "ret-pairs,ret-death,indirect-sites,miss-boundary",
         "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 2, perf = true }
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases."pic-and"]
 argv = ["tests/system/run_pic.py", "--cpus", "1", "2", "--modes", "and", "--fexc", "{fexc}", "--out", "{out}"]
@@ -429,6 +432,7 @@ smoke = true
 [suite.cases."compat32-resident-limits"]
 argv = ["tests/smp/run_slice3_vm.py", "compat-limits", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases."mixed-far"]
 argv = ["tests/system/run_x1.py", "--only", "mixed-far", "--fexc", "{fexc}", "--out", "{out}"]

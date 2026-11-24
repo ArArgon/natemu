@@ -1523,7 +1523,8 @@ def ret32():
             'lib_rec:\n    test ecx, ecx\n    jz .z\n    dec ecx\n    call lib_rec\n    inc eax\n    ret\n.z:\n    xor eax, eax\n    ret\n'
             'lib_ri:\n    mov eax, [esp + 4]\n    ret 4\n')
     prog = C.program('ret32', C.ENTER() + C.handlers('    jmp .fin\n'), text, [P_zero(res, 12)])
-    prog['pic_min'] = [(40, 1), (44, 1), (46, 1)]
+    # (Return prediction is off by default: the counters only where the case turns it on.)
+    prog['pic_min'] = [(40, 1), (44, 1), (46, 1)] if __import__('os').environ.get('NATEMU_RETURN_PREDICT') == '1' else []
     # (Assembled alone with the library's labels after it: every `call` is rel32, so its length is main's own.)
     end = C.U + len(C.user32(main + 'lib_f:\nlib_rec:\nlib_ri:\n'))
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128, 0, end, 0xdb),
