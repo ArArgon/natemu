@@ -105,6 +105,13 @@ COSTS = {
     'verw_null': ('mov word ptr [rbx], 0\nverw word ptr [rbx]', {3: DATA + 16}),
     'syscall_verw': (None, {}),
 }
+# Trip-cost plan, experiment X1 (rows run only when --cost-rows names them; never kept): PCMPISTRI's helper trip
+# (`svc #STRING`), and under the `x1-floor` resident the same `svc` turned straight around by the gate, the variant chosen
+# by the control's low 3 bits (gates.S `x1_turn`): a as every trip, b without the two FPCR writes, then a plus one write
+# of the value the register holds.
+X1_ROWS = {'pcmpistri': 0, 'x1_a': 0, 'x1_b': 1, 'x1_spsel': 2, 'x1_fpsr': 3, 'x1_fpcr': 4, 'x1_elr': 5, 'x1_sp_el0': 6}
+for _name, _v in X1_ROWS.items():
+    COSTS[_name] = (f'pcmpistri xmm1, xmm2, {_v}', {}, 'sse 1\n')
 
 
 # The two-way L1 plan, chunk 1: the price of a way-1 hit. L1 sets are RIP bits 14:0, so P and P + 0x8000 share a set (two
@@ -170,11 +177,11 @@ def syscall_program(user, kernel, regs, extra=''):
             f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nregion 0x3e0000 0x10000\n{extra}')
 
 
-def driver(a, text, work, extra=()):
+def driver(a, text, work, extra=(), runtime=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     t0 = time.perf_counter()
-    run = subprocess.run([a.host, a.runtime, 'run-program', a.fexc, work / 'program.txt', work, *vm.frame_alias_args(), '--watchdog-ms', '600000', *map(str, extra)],
+    run = subprocess.run([a.host, runtime or a.runtime, 'run-program', a.fexc, work / 'program.txt', work, *vm.frame_alias_args(), '--watchdog-ms', '600000', *map(str, extra)],
                          capture_output=True, text=True, timeout=900)
     dt = time.perf_counter() - t0
     return dt, (json.loads(run.stdout) if run.returncode == 0 else None), run.stderr[-1500:]
@@ -199,11 +206,19 @@ def gp_at(out, rip, regs, cpl, flags=2, cr2=None):
     return [] if ok else [f"#GP state: stop {out['stop']} fault {fault} frame {frame} regs {[hex(x) for x in g]} delivered {out.get('delivered')}"]
 
 
+def x1_runtime():
+    """The `x1-floor` resident (experiment X1), built into its own target directory as run_k1's feature builds are."""
+    import run_k1
+    return run_k1.feature_runtime('x1-floor')
+
+
 def cost(a, report):
     failures, rows = [], {}
-    for name, (body, regs) in COSTS.items():
+    for name, (body, regs, *more) in COSTS.items():
         if a.cost_rows and name not in a.cost_rows: continue
-        extra = ''
+        if name in X1_ROWS and not a.cost_rows: continue
+        extra = more[0] if more else ''
+        runtime = x1_runtime() if name.startswith('x1_') else None
         if callable(body): body, regs, extra = body()
         code = ref.assemble(f'1: {body}\ndec r8\njnz 1b') if body else None
         times, stats = {a.n: [], 2 * a.n: []}, {}
@@ -211,7 +226,7 @@ def cost(a, report):
             for n in (a.n, 2 * a.n):
                 text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n, **regs})}\ncode {code.hex()}\ncpl 0\nif 0\n'
                         f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n{extra}') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL_VERW if name == 'syscall_verw' else LINUX_KERNEL, {8: n})
-                dt, out, err = driver(a, text, a.out / 'cost' / f'{name}-{n}')
+                dt, out, err = driver(a, text, a.out / 'cost' / f'{name}-{n}', runtime=runtime)
                 if out is None or out['stop'] != 'reached' or int(out['gpr'][8], 0) != 0:
                     failures.append(f"cost {name} n={n}: {err if out is None else (out['stop'], out['reason'])}")
                     break
