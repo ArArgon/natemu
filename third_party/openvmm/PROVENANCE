@@ -1,0 +1,9 @@
+Source files natemu adapts from OpenVMM (https://github.com/microsoft/openvmm), MIT (the text beside this file:
+LICENSE). Each adapted file's header names its upstream path, the commit and what was changed; OpenVMM's crates natemu
+does not have (bitfield_struct, open_enum, inspect, input_core, futures, chipset_device) were expanded by hand into plain
+Rust.
+
+upstream path                                    commit                                    natemu file
+vm/devices/chipset/src/i8042/mod.rs              5d6ab1cfa66c0c9435b374e194aa6ad6c5f9db42  crates/host/src/ps2.rs
+vm/devices/chipset/src/i8042/spec.rs             5d6ab1cfa66c0c9435b374e194aa6ad6c5f9db42  crates/host/src/ps2.rs
+vm/devices/chipset/src/i8042/ps2keyboard.rs      5d6ab1cfa66c0c9435b374e194aa6ad6c5f9db42  crates/host/src/ps2/keyboard.rs

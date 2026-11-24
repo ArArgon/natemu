@@ -35,7 +35,10 @@ smoke = true
 # SMBIOS (platform-devices plan Task 3), at 1 and 2 vCPUs: the kernel's DMI scan of F0000H-FFFFFH finds the SMBIOS 3.0
 # entry point in the read-only legacy ROM page (dmesg `SMBIOS 3.0.0 present.` and `DMI: natemu natemu x86-64, BIOS natemu
 # VERSION 11/23/2026`); /sys/class/dmi/id names natemu; /sys/firmware/dmi/entries holds one entry of each type natemu
-# writes (0, 1, 3, 16, 17, 19, 32, 127) and one type 4 per vCPU; the init's S5 ends the run with Power(1).
+# writes (0, 1, 3, 16, 17, 19, 32, 127) and one type 4 per vCPU. PS/2 (Task 4): i8042 finds the controller through ACPI
+# (`PNP: PS/2 Controller [...] at 0x60,0x64 irq 1,12`), /proc/bus/input/devices lists `AT Translated Set 2 keyboard` on
+# serio0 and, after `modprobe psmouse`, a PS/2 mouse on serio1, and dmesg has no `i8042: Can't read CTR` and no psmouse
+# failure. The init's S5 ends the run with Power(1).
 [suite.cases."platform[1]"]
 argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
         "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "platform", "--vcpus", "1"]

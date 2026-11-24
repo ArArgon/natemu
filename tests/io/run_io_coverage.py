@@ -19,8 +19,9 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
   reboot-acpi    `reboot -f` with the ext4 mounted after sync (Linux's default reboot writes the FADT reset register).
                  natemu: the run ends with the stop `Power(2)` (exit 2) after the same disk drain and final full sync
                  as S5 (crates/host/src/pm.rs; REQUEST_POWER_POLL in crates/host/src/execution.rs).
-  reboot-kbd     the same with reboot=k: the keyboard controller's reset pulse (FEH to port 64H; there is no 8042,
-                 but that write is decoded, crates/host/src/pm.rs) ends the run the same way: Power(2), drain, sync.
+  reboot-kbd     the same with reboot=k: the keyboard controller's reset pulse (FEH to port 64H: the 8042's, on by
+                 default, crates/host/src/ps2.rs; with machine.ps2 off pm.rs's reset-only register) ends the run the
+                 same way: Power(2), drain, sync.
   reboot-triple  the same with reboot=t: Linux loads an empty IDT and faults: the resident stop SHUTDOWN (16), exit 2.
                  A guest reboot ends the run: natemu does not reboot (docs/restructure/io-plan.md); the defined
                  behaviour checked here is the typed stop, no hang, and a relaunch that replays the journal and finds

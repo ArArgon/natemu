@@ -7,7 +7,7 @@ For N = 1..4 runs `natemu-host unused boot-linux unused BZIMAGE --ram 0x8000000 
 the dump (table validity, AML decode, MADT/CPUID/mailbox/e820/device agreement) and writes DIR/l2.json plus the DSDT
 listing DIR/dsdt-nN.dsl; then again with `--no-mailbox` (`nN-no-mailbox`: the MADT without the wakeup structure, M2
 Part 2), and again with the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the
-DSDT then lists the pvpanic device; the SMBIOS tables, which must leave the ACPI tables as they are, are in the dump too). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump, nN-devices.dump)
+DSDT then lists the pvpanic device and the 8042's keyboard and mouse, and the FADT has the 8042 bit; the SMBIOS tables, which must leave the ACPI tables as they are, are in the dump too). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump, nN-devices.dump)
 files instead of running the driver.
 Prints one pass/fail line per N; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -20,11 +20,11 @@ from models import acpi_model  # noqa: E402
 
 RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
 # The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
-DEVICES = ['--pvpanic', '--smbios']
+DEVICES = ['--pvpanic', '--smbios', '--ps2']
 # Each dump: its name's suffix, the driver's extra flags, and what the model expects.
 VARIANTS = [('', [], dict()),
             ('-no-mailbox', ['--no-mailbox'], dict(mailbox=False)),
-            ('-devices', DEVICES, dict(pvpanic=True))]
+            ('-devices', DEVICES, dict(pvpanic=True, ps2=True))]
 
 
 def main():

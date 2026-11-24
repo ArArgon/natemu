@@ -277,12 +277,14 @@ impl Board {
 
 /// L4b: puts the board's timed devices on `devices`, wired into `irqs`: the PIT at ports 40H-43H and 61H, the RTC at
 /// 70H-71H, the UART at COM1, the ACPI PM block at B000H-B00BH and its reset register at B040H (`boot::acpi::platform`). Each runs on its
-/// own [`Timer`] thread, joined when `devices` drops.
+/// own [`Timer`] thread, joined when `devices` drops. Port 64H is the PM device's reset-only register (`pm`) unless `ps2`:
+/// the 8042 then takes it (`crate::ps2::install`, after this).
 pub fn install(
     devices: &mut crate::devices::Devices,
     irqs: &crate::irq::Irqs,
     lost: LostTicks,
     uart: &Arc<Mutex<crate::uart::Uart>>,
+    ps2: bool,
 ) -> crate::Result<Board> {
     use crate::boot::acpi::platform as p;
     use crate::devices::{At, Shared};
@@ -312,7 +314,9 @@ pub fn install(
     )?;
     devices.register_ports(p::PM_TMR.into(), p::PM_TMR_LEN.into(), at(crate::pm::TIMER))?;
     devices.register_ports(p::RESET_PORT.into(), 1, at(crate::pm::RESET_REG))?;
-    devices.register_ports(crate::pm::KBD_PORT.into(), 1, at(crate::pm::KBD_REG))?;
+    if !ps2 {
+        devices.register_ports(crate::pm::KBD_PORT.into(), 1, at(crate::pm::KBD_REG))?;
+    }
     Ok(Board {
         pit: pit_stats,
         rtc: rtc_stats,

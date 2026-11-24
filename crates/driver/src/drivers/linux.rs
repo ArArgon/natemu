@@ -5,7 +5,7 @@
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
-//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--smbios] [--firmware [--firmware-start reset|flat32]]
+//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--smbios] [--ps2] [--firmware [--firmware-start reset|flat32]]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
@@ -50,7 +50,10 @@
 //! `pvpanic` (`crash_loaded`: the guest's CRASH_LOADED writes). `--smbios` adds the SMBIOS 3.0 tables (`natemu::boot::smbios`):
 //! the structure table after the ACPI tables, the entry point in the read-only legacy ROM page at F0000H, in a run and in a
 //! `--load-only` dump alike (the dump's records gain the table, a loader write, and last the 24-byte entry point at F0000H,
-//! which is not guest RAM). A Multiboot image gets neither.
+//! which is not guest RAM). A Multiboot image gets neither. `--ps2` adds the 8042 keyboard controller with a PS/2 keyboard
+//! and mouse at ports 60H and 64H (`natemu::ps2`; port 64H is otherwise the reset-only register, `natemu::pm`) and its
+//! `\_SB.KBD_` and `\_SB.MOU_` with the FADT's 8042 bit, in a run and in a `--load-only` dump alike (a Multiboot image gets
+//! the device without tables).
 //!
 //! M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `--firmware` boots IMAGE as a firmware image
 //! instead of a kernel (`Boot::firmware`): at guest-physical [4 GiB - its size, 4 GiB), vCPU 0 at the reset vector in the
@@ -180,6 +183,9 @@ pub(crate) struct Args {
     /// SMBIOS 3.0 tables, the entry point at F0000H in a read-only legacy ROM page (a bzImage boot only)
     #[arg(long)]
     smbios: bool,
+    /// The 8042 keyboard controller with a PS/2 keyboard and mouse at ports 60H/64H, in the DSDT as PNP0303 and PNP0F13
+    #[arg(long)]
+    ps2: bool,
     /// IMAGE is a firmware image (the firmware boot mode), not a kernel
     #[arg(long)]
     firmware: bool,
@@ -223,6 +229,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         debug_exit,
         pvpanic,
         smbios,
+        ps2,
         firmware,
         firmware_start,
     } = args;
@@ -283,10 +290,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         } else {
             Vec::new()
         };
-        let board = boot::acpi::Board {
-            pvpanic,
-            ..Default::default()
-        };
+        let board = boot::acpi::Board { pvpanic, ps2 };
         let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox, board);
         let smbios = (smbios && !boot::is_multiboot(&image)).then(|| boot::smbios::for_board(vcpus, layout, &tables));
         let inputs = Inputs {
@@ -338,6 +342,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         debug_exit,
         pvpanic,
         smbios,
+        ps2,
         ..if firmware {
             natemu::linux::Boot {
                 firmware: Some(natemu::boot::firmware::Firmware {

@@ -1076,6 +1076,27 @@ fn smbios_key_parses_and_set_turns_it_off() {
     assert!(err(load_old(&["--set", "machine.smbios=maybe"])).contains("--set machine.smbios: bad boolean"));
 }
 
+/// `machine.ps2`: on by default, off from the file or with `--set machine.ps2=false`, and the launch follows.
+#[test]
+fn ps2_key_parses_and_set_turns_it_off() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "r".into(), Vec::new(), None).unwrap().ps2;
+    let c = load_old(&[]).unwrap();
+    assert!(c.ps2 && boot(&c));
+    let c = load_old(&["--set", "machine.ps2=false"]).unwrap();
+    assert!(!c.ps2 && !boot(&c));
+    let (_, c) = load_file(&format!("[machine]\nps2 = false\n{MIN}"), &[]);
+    let c = c.unwrap();
+    assert!(!c.ps2 && !boot(&c));
+    let (_, c) = load_file(
+        &format!("[machine]\nps2 = false\n{MIN}"),
+        &["--set", "machine.ps2=on"],
+    );
+    assert!(c.unwrap().ps2, "--set wins over the file");
+    assert!(err(load_file(&format!("[machine]\nps2 = \"no\"\n{MIN}"), &[]).1).contains("machine.ps2"));
+    assert!(err(load_old(&["--set", "machine.ps2=maybe"])).contains("--set machine.ps2: bad boolean"));
+}
+
 #[test]
 fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
     let _env = lock();

@@ -3,6 +3,7 @@
     check(dump_bytes, n) -> dict(violations=[...], not_fixed=[...], listing=str, info=dict)
     check(dump_bytes, n, mailbox=False)   # tables built without the wakeup mailbox (boot-linux --no-mailbox)
     check(dump_bytes, n, pvpanic=True)    # tables built with the pvpanic device (boot-linux --pvpanic)
+    check(dump_bytes, n, ps2=True)        # tables built with the 8042 and PS/2 keyboard and mouse (boot-linux --ps2)
 
 Inputs are the driver's `--dump` records ([u64 gpa][u64 length][bytes], later records override earlier ones; guest RAM is
 zero elsewhere) and the vCPU count N. Expectations are derived from: ACPI 6.6 ch. 5 snapshot (layouts; the plan targets
@@ -12,7 +13,9 @@ ch. 6.4 resource descriptors (from knowledge, not in the snapshot), CLM-03-03-22
 (arch/x86/kernel/acpi/boot.c, madt_wakeup.c, drivers/acpi/processor_idle.c) and tools/models/cpu_profile, plus the
 main session's decisions: the SCI as QEMU describes it (IRQ9 -> GSI9 override, flags 0x000d), an RTC device (PNP0B00,
 0x70/2, IRQ8), FADT flags judged against QEMU's PC FADT, GPE0 omitted; and the platform-devices plan's pvpanic device
-(QEMU's `docs/specs/pvpanic.rst` and its ISA device's ACPI description: `_HID` "QEMU0001", one I/O port at 505H).
+(QEMU's `docs/specs/pvpanic.rst` and its ISA device's ACPI description: `_HID` "QEMU0001", one I/O port at 505H) and its
+8042 (the PC's keyboard controller as QEMU's `pc` describes it: PNP0303 with I/O 60H and 64H and IRQ1, PNP0F13 with
+IRQ12; the FADT's IAPC_BOOT_ARCH 8042 bit set only with exactly that pair).
 
 Violations are strings `RULE: message` (with guest physical addresses and table offsets). Values the records do not fix
 go to `not_fixed` as dict(item, value, meaning, judgement) where judgement starts with 'FLAG' when it looks
@@ -559,7 +562,11 @@ def gas(b, o):
 
 
 def fmt_resource(x):
-    """A decoded resource descriptor as its ASL (IO descriptors; others by type)."""
+    """A decoded resource descriptor as its ASL (IO and IRQ descriptors; others by type)."""
+    if x['type'] == 'IRQ':
+        flags = (f'{"Edge" if x["edge"] else "Level"}, {"ActiveLow" if x["low"] else "ActiveHigh"}, '
+                 f'{"Shared" if x["shared"] else "Exclusive"}')
+        return f'IRQ ({flags}) {{{", ".join(map(str, x["irqs"]))}}}'
     if x['type'] != 'IO':
         return x['type']
     return f'IO (Decode{16 if x["decode16"] else 10}, {x["min"]:#x}, {x["max"]:#x}, {x["align"]}, {x["len"]})'
@@ -569,11 +576,14 @@ def fmt_gas(g):
     return f"space {g['space']} width {g['width']} offset {g['offset']} access {g['access']} addr {g['addr']:#x}"
 
 
-def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
+def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False, ps2=False):
     """`mailbox`: the MADT has exactly one version-0 multiprocessor wakeup structure (the default), or, False, none
     (boot-interpreter plan section 6: the OS starts its APs with INIT and SIPI). `pvpanic`: the DSDT has exactly one
     QEMU0001 device, whose `_CRS` is only IO (Decode16, 0x505, 0x505, 1, 1) and whose `_STA` is 0x0F, or, False (the
-    default), none."""
+    default), none. `ps2`: the DSDT has exactly one PNP0303 device (`_CRS` IO (Decode16, 0x60, 0x60, 1, 1), IO (Decode16,
+    0x64, 0x64, 1, 1), IRQNoFlags () {1}) and one PNP0F13 (`_CRS` IRQNoFlags () {12}) and the FADT's IAPC_BOOT_ARCH has
+    the 8042 bit, or, False (the default), neither device nor the bit. The bit is a violation without exactly that
+    pair whatever `ps2` says."""
     img = Image(dump)
     if corrupt:
         corrupt(img)
@@ -592,6 +602,7 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
         return None
 
     tables = {}          # name -> (gpa, length)
+    iapc = None          # FADT IAPC_BOOT_ARCH, judged with the DSDT's devices
 
     def header(p, sig, name):
         """Reads and validates a description header at p; returns the table bytes or None."""
@@ -794,11 +805,9 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
                'RTC CMOS indices of day/month alarm (0 = not supported)',
                'ok (QEMU: 0 / 0)' if fa[106] == fa[107] == 0
                else 'judge: alarm indices must exist in the reused RTC model\'s CMOS')
-            ia = u16(fa, 109)
+            ia = iapc = u16(fa, 109)
             dec = [IAPC[k] for k in range(6) if ia >> k & 1]
             j = []
-            if ia & 2:
-                viol('FADT', f'IAPC_BOOT_ARCH {ia:#x} at FADT+109 claims an 8042; the device set has none')
             if not ia & 4:
                 j.append('VGA not marked absent: Linux may probe legacy VGA')
             if not ia & 1:
@@ -1130,7 +1139,35 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
             sta = obj.get(p + '._STA')
             if not sta or sta[0] != 'Name' or sta[1] != 0x0F:
                 viol('DEVICES', f'{p}._STA {sta and sta[:2]!r} (pvpanic: 0x0F)')
-        com = isa + pv
+        # PS/2 (platform-devices plan Task 4): the 8042 as QEMU's `pc` describes it, PNP0303 with `IO (Decode16, 0x0060,
+        # 0x0060, 0x01, 0x01)`, `IO (Decode16, 0x0064, 0x0064, 0x01, 0x01)` and `IRQNoFlags () {1}`, and its mouse
+        # PNP0F13 with `IRQNoFlags () {12}`, nothing else in either _CRS; only when the tables were built with them. The
+        # FADT's IAPC_BOOT_ARCH 8042 bit (bit 1; Linux then probes the controller) is valid only with exactly that pair.
+        want_ps2 = {'PNP0303': ['IO (Decode16, 0x60, 0x60, 1, 1)', 'IO (Decode16, 0x64, 0x64, 1, 1)',
+                                'IRQ (Edge, ActiveHigh, Exclusive) {1}'],
+                    'PNP0F13': ['IRQ (Edge, ActiveHigh, Exclusive) {12}']}
+        ps2_devices, pair = [], True
+        for hid, want in want_ps2.items():
+            found = [p for p, d in devices.items() if d['hid'] == hid]
+            ps2_devices += found
+            pair &= len(found) == 1
+            if len(found) != int(ps2):
+                viol('DEVICES', f'{hid} devices {found} ({"exactly one" if ps2 else "none: built without PS/2"})')
+            for p in found:
+                its = crs_items(p)
+                got = its is not None and [fmt_resource(x) for x in its if x['type'] != 'End']
+                info[f'{hid}_CRS'] = its
+                if got != want:
+                    pair = False
+                    viol('DEVICES', f'{p}._CRS {got} ({hid}: only {", ".join(want)})')
+        if iapc is not None:
+            if iapc & 2 and not pair:
+                viol('FADT', f'IAPC_BOOT_ARCH {iapc:#x} at FADT+109 claims an 8042 without exactly one PNP0303 '
+                             f'(60H, 64H, IRQ1) and one PNP0F13 (IRQ12): {ps2_devices}')
+            if bool(iapc & 2) != ps2:
+                viol('FADT', f'IAPC_BOOT_ARCH {iapc:#x}: the 8042 bit {"clear" if ps2 else "set"}, '
+                             f'built {"with" if ps2 else "without"} PS/2')
+        com = isa + pv + ps2_devices
         # processors (UIDs vs MADT)
         cpus = {p: d for p, d in devices.items() if d['kind'] == 'Processor' or d['hid'] == 'ACPI0007'}
         dsdt_uids = []
@@ -1146,11 +1183,10 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
         if len(set(dsdt_uids)) != len(dsdt_uids):
             viol('UID', f'duplicate DSDT processor UIDs {dsdt_uids}')
         for p, d in devices.items():
-            if d['hid'] in ('PNP0103', 'PNP0C0C', 'PNP0C0E', 'PNP0303', 'PNP0F13', 'PNP0A03', 'PNP0A08', 'PNP0C0A',
-                            'ACPI0013', 'PNP0C80'):
+            if d['hid'] in ('PNP0103', 'PNP0C0C', 'PNP0C0E', 'PNP0A03', 'PNP0A08', 'PNP0C0A', 'ACPI0013', 'PNP0C80'):
                 viol('DEVICES', f'{p} {d["hid"]}: a device outside the CLM-03-03-69 set')
         other = {p: d['hid'] for p, d in devices.items() if p not in com and p not in cpus}
-        nf('DSDT other devices', other or 'none', 'devices besides COM1, the RTC, pvpanic and processors',
+        nf('DSDT other devices', other or 'none', 'devices besides COM1, the RTC, pvpanic, PS/2 and processors',
            'FLAG: CLM-03-03-69 also names LNRO0005 virtio-mmio resources; none described (later chunk?)'
            if not any(d == 'LNRO0005' for d in other.values()) else 'judge: check against claim 69 windows/GSIs')
         nf('DSDT processor objects', sorted(cpus), 'ACPI0007 devices or Processor objects', 'ok')

@@ -1,0 +1,7 @@
+Source files natemu adapts from FreeBSD's bhyve (https://github.com/freebsd/freebsd-src, usr.sbin/bhyve), BSD-2-Clause
+(the texts beside this file: LICENSE, each adapted upstream file's own notice). Each adapted file's header names its
+upstream path, the commit and what was changed.
+
+upstream path                       commit                                    natemu file
+usr.sbin/bhyve/amd64/ps2mouse.c     4d65a7c6951cea0333f1a0c1b32c38489cdfa6c5  crates/host/src/ps2/mouse.rs
+usr.sbin/bhyve/amd64/atkbdc.c       4d65a7c6951cea0333f1a0c1b32c38489cdfa6c5  crates/host/src/ps2.rs (the XLAT table)

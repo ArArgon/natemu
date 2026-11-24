@@ -83,7 +83,8 @@ impl Tables {
 pub struct Board {
     /// The pvpanic device at port 505H ([`crate::pvpanic`]): `\_SB.PEVT`, `_HID` "QEMU0001".
     pub pvpanic: bool,
-    /// The 8042 with a PS/2 keyboard and mouse (accepted; described from the plan's Task 4 on).
+    /// The 8042 with a PS/2 keyboard and mouse ([`crate::ps2`]): `\_SB.KBD_` (PNP0303) and `\_SB.MOU_` (PNP0F13), and
+    /// the FADT's IAPC_BOOT_ARCH 8042 bit.
     pub ps2: bool,
 }
 
@@ -130,7 +131,8 @@ fn gas(bits: u8, access: u8, port: u16) -> [u8; 12] {
 }
 
 /// The FADT (5.2.9, revision 6, minor 5: 276 bytes): not hardware-reduced (the PM1/PM timer registers of L4b exist).
-fn fadt(facs: u64, dsdt: u64) -> Vec<u8> {
+/// `ps2`: the board has the 8042 ([`Board::ps2`]).
+fn fadt(facs: u64, dsdt: u64, ps2: bool) -> Vec<u8> {
     let mut f = vec![0u8; 276 - HEADER];
     let mut at = |o: usize, v: &[u8]| put(&mut f, o - HEADER, v);
     at(36, &(facs as u32).to_le_bytes()); // FIRMWARE_CTRL (X_FIRMWARE_CTRL stays 0: "must be zero" when this is used)
@@ -148,9 +150,10 @@ fn fadt(facs: u64, dsdt: u64) -> Vec<u8> {
     at(96, &0x0fffu16.to_le_bytes());
     at(98, &0x0fffu16.to_le_bytes());
     at(108, &[RTC_CENTURY]);
-    // IAPC_BOOT_ARCH: LEGACY_DEVICES (COM1 is an ISA device), VGA Not Present; no 8042, CMOS RTC present. QEMU's PC
-    // FADT is revision 1, which has no such field (Linux reads it from revision 2): these bits describe this machine.
-    at(109, &0x0005u16.to_le_bytes());
+    // IAPC_BOOT_ARCH: LEGACY_DEVICES (COM1 is an ISA device), VGA Not Present, CMOS RTC present; the 8042 (bit 1) only
+    // with PS/2 (Linux then probes it; without the bit and without its PNP devices it does not). QEMU's PC FADT is
+    // revision 1, which has no such field (Linux reads it from revision 2): these bits describe this machine.
+    at(109, &(if ps2 { 0x0007u16 } else { 0x0005 }).to_le_bytes());
     // Flags, QEMU's 0x80a5 except where noted: WBINVD (0), PROC_C1 (2), PWR_BUTTON clear (4: the fixed power button
     // of PM1, which the PIIX4 model has), SLP_BUTTON (5: none), FIX_RTC clear (6: RTC_STS/RTC_EN in PM1),
     // USE_PLATFORM_CLOCK (15); TMR_VAL_EXT clear: a 24-bit PM timer. Deviations: RESET_REG_SUP (10) set, for claim
@@ -355,6 +358,34 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)], board: Board) ->
             ],
         ));
     }
+    if board.ps2 {
+        // The 8042 and its mouse port (QEMU's `pc`: `Device (KBD)`, `Device (MOU)`): IO (Decode16, 0x60, 0x60, 1, 1),
+        // IO (Decode16, 0x64, 0x64, 1, 1), IRQNoFlags () {1}; IRQNoFlags () {12}; each with its end tag.
+        let io = |port: u16| {
+            let [lo, hi] = port.to_le_bytes();
+            [0x47, 0x01, lo, hi, lo, hi, 0x01, 0x01]
+        };
+        let irq = |n: usize| {
+            let [lo, hi] = (1u16 << n).to_le_bytes();
+            [0x22, lo, hi]
+        };
+        let kbd = [
+            &io(crate::ps2::DATA_PORT)[..],
+            &io(crate::ps2::COMMAND_PORT),
+            &irq(crate::ps2::KEYBOARD_IRQ),
+            &[0x79, 0x00],
+        ]
+        .concat();
+        let mou = [&irq(crate::ps2::MOUSE_IRQ)[..], &[0x79, 0x00]].concat();
+        sb.push(device(
+            b"KBD_",
+            &[name(b"_HID", eisa_id("PNP0303")), name(b"_CRS", buffer(&kbd))],
+        ));
+        sb.push(device(
+            b"MOU_",
+            &[name(b"_HID", eisa_id("PNP0F13")), name(b"_CRS", buffer(&mou))],
+        ));
+    }
     if !pci.is_empty() {
         sb.push(pci0(pci));
     }
@@ -485,7 +516,7 @@ pub fn build_tables(
     let mut blobs = vec![
         (rsdp, r),
         (xsdt, table(b"XSDT", 1, &xsdt_body)),
-        (fadt_at, fadt(facs_at, dsdt_at)),
+        (fadt_at, fadt(facs_at, dsdt_at, board.ps2)),
         (facs_at, facs()),
         (dsdt_at, dsdt),
         (madt_at, madt),
@@ -939,6 +970,62 @@ mod tests {
                 match &x[..4] {
                     b"DSDT" => assert_eq!(a, b),
                     b"XSDT" => assert_eq!((a, x.len(), &x[36..44]), (b, y.len(), &y[36..44])),
+                    _ => assert_eq!(x, y, "{}", String::from_utf8_lossy(&x[..4])),
+                }
+            }
+        }
+    }
+
+    /// PS/2 (platform-devices plan Task 4): `Device (KBD)` with `_HID` PNP0303 and `_CRS` IO (Decode16, 0x60, 0x60, 1,
+    /// 1), IO (Decode16, 0x64, 0x64, 1, 1), IRQNoFlags () {1}, and `Device (MOU)` with `_HID` PNP0F13 and `_CRS`
+    /// IRQNoFlags () {12}, in the DSDT only with `Board::ps2`; the FADT's IAPC_BOOT_ARCH is then 0x0007 (the 8042 bit),
+    /// else 0x0005. Every other table as without it.
+    #[test]
+    fn dsdt_lists_ps2_and_iapc_has_8042() {
+        let kbd_crs = [
+            0x47, 1, 0x60, 0, 0x60, 0, 1, 1, 0x47, 1, 0x64, 0, 0x64, 0, 1, 1, 0x22, 0x02, 0x00, 0x79, 0x00,
+        ];
+        let mou_crs = [0x22, 0x00, 0x10, 0x79, 0x00];
+        let (pnp0303, pnp0f13) = (aml::eisa_id("PNP0303"), aml::eisa_id("PNP0F13"));
+        let kbd = [&b"KBD_\x08_HID"[..], &pnp0303, b"\x08_CRS\x11\x18\x0a\x15", &kbd_crs].concat();
+        let mou = [&b"MOU_\x08_HID"[..], &pnp0f13, b"\x08_CRS\x11\x08\x0a\x05", &mou_crs].concat();
+        let fadt_of = |t: &Tables| -> Vec<u8> {
+            t.blobs.iter().map(|(_, b)| b.clone()).find(|b| &b[..4] == b"FACP").unwrap()
+        };
+        let on = Board {
+            ps2: true,
+            ..Board::default()
+        };
+        for n in [1, 4] {
+            let (off, with) = (
+                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], &[], true, on),
+            );
+            let (d0, d) = (dsdt_of(&off), dsdt_of(&with));
+            for absent in [&b"KBD_"[..], b"MOU_", &pnp0303, &pnp0f13] {
+                assert!(!has(d0, absent), "{absent:x?} without PS/2");
+            }
+            assert_eq!((count(d, b"KBD_"), count(d, b"MOU_")), (1, 1));
+            assert!(has(d, &kbd), "KBD: _HID, _CRS");
+            assert!(has(d, &mou), "MOU: _HID, _CRS");
+            assert_eq!((sum(d), u32_at(d, 4) as usize), (0, d.len()));
+            let (f0, f) = (fadt_of(&off), fadt_of(&with));
+            assert_eq!(u16::from_le_bytes([f0[109], f0[110]]), 0x0005);
+            assert_eq!(u16::from_le_bytes([f[109], f[110]]), 0x0007);
+            assert_eq!(sum(&f), 0);
+            // The same tables otherwise: the FADT but for IAPC_BOOT_ARCH and its checksum, the DSDT at the same address
+            // (the MADT may move after the longer DSDT, so the XSDT's pointer to it is not compared).
+            assert_eq!(off.blobs.len(), with.blobs.len());
+            for ((a, x), (b, y)) in off.blobs.iter().zip(&with.blobs) {
+                let masked = |t: &[u8]| -> Vec<u8> {
+                    let mut t = t.to_vec();
+                    (t[9], t[109]) = (0, 0);
+                    t
+                };
+                match &x[..4] {
+                    b"DSDT" => assert_eq!(a, b),
+                    b"XSDT" => assert_eq!((a, x.len(), &x[36..44]), (b, y.len(), &y[36..44])),
+                    b"FACP" => assert_eq!((a, masked(x)), (b, masked(y))),
                     _ => assert_eq!(x, y, "{}", String::from_utf8_lossy(&x[..4])),
                 }
             }

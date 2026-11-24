@@ -47,6 +47,12 @@ PVPANIC_CAPABILITY = '/sys/bus/platform/devices/QEMU0001:00/capability'
 DMI_IDS = {'sys_vendor': 'natemu', 'product_name': 'natemu x86-64', 'bios_vendor': 'natemu'}
 SMBIOS_TYPES = (0, 1, 3, 16, 17, 19, 32, 127)
 BIOS_DATE = '11/23/2026'
+# platform, PS/2: the stock i8042 driver finds the 8042 through ACPI (PNP0303 and PNP0F13) and the built-in atkbd binds
+# the keyboard on serio0 (translated by the controller); the psmouse module binds the mouse on serio1.
+PS2_KEYBOARD = ('AT Translated Set 2 keyboard', 'isa0060/serio0/input0')
+PS2_MOUSE_PHYS = 'isa0060/serio1/input0'
+PS2_PNP = re.compile(r'i8042: PNP: PS/2 Controller \[.*\] at 0x60,0x64 irq 1,12$')
+PS2_FAILURES = re.compile(r"i8042: Can't read CTR|psmouse.*failed", re.I)
 
 INIT = r'''#!/bin/sh
 export PATH=/bin
@@ -81,7 +87,9 @@ case_pvpanic_panic() {
 }
 
 # platform: the kernel's DMI scan of F0000H-FFFFFH found natemu's SMBIOS 3.0 entry point (its dmesg lines), and the
-# DMI identity and the structure table's entries in sysfs (CONFIG_DMIID=y, CONFIG_DMI_SYSFS=y: built in).
+# DMI identity and the structure table's entries in sysfs (CONFIG_DMIID=y, CONFIG_DMI_SYSFS=y: built in). Then PS/2:
+# psmouse loaded, the input devices (serio binds asynchronously: up to 20 s for the mouse on serio1) and the dmesg
+# lines of i8042, atkbd, psmouse and serio.
 case_platform() {
   dmesg | grep -e 'SMBIOS ' -e 'DMI: ' | while read -r line; do echo "PLATFORM-DMESG $line"; done
   for id in sys_vendor product_name bios_vendor; do
@@ -90,6 +98,12 @@ case_platform() {
   done
   test -d /sys/firmware/dmi/entries || fail "/sys/firmware/dmi/entries missing (no DMI)"
   echo PLATFORM-ENTRIES $(ls /sys/firmware/dmi/entries)
+  modprobe psmouse || fail modprobe-psmouse
+  n=0
+  until grep -q '@MOUSE_PHYS@' /proc/bus/input/devices || test $n -ge 20; do sleep 1; n=$((n + 1)); done
+  # Through cat: BusyBox read takes the file a byte at a time, which /proc/bus/input/devices did not finish in 110 s.
+  cat /proc/bus/input/devices | while read -r line; do echo "PLATFORM-INPUT $line"; done
+  dmesg | grep -e i8042 -e atkbd -e psmouse -e serio | while read -r line; do echo "PLATFORM-PS2 $line"; done
   pass
 }
 
@@ -99,7 +113,7 @@ case "$name" in
   *) fail "unknown case '$name'";;
 esac
 fail "case $name returned"
-'''.replace('@KVER@', KVER).replace('@CAPABILITY@', PVPANIC_CAPABILITY)
+'''.replace('@KVER@', KVER).replace('@CAPABILITY@', PVPANIC_CAPABILITY).replace('@MOUSE_PHYS@', PS2_MOUSE_PHYS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,7 +178,38 @@ def judge_platform(run: Run) -> list:
     want = dict(sorted(({t: 1 for t in SMBIOS_TYPES} | {4: run.vcpus}).items()))
     if dict(sorted(counts.items())) != want:
         errors.append(f'/sys/firmware/dmi/entries by type {dict(sorted(counts.items())) if entries else "not listed"}, expected {want}')
+    errors += judge_ps2(run)
     errors += stopped(run, 'natemu: Power(1)', 0)
+    return errors
+
+
+def input_devices(serial: str) -> list:
+    """/proc/bus/input/devices from the PLATFORM-INPUT lines: (name, phys) of each device."""
+    devices, name, phys = [], None, None
+    for line in [*re.findall(r'^PLATFORM-INPUT ?(.*)$', serial, re.M), '']:
+        if not line.strip():
+            if name is not None or phys is not None: devices.append((name, phys))
+            name = phys = None
+        elif m := re.fullmatch(r'N: Name="(.*)"', line.strip()): name = m.group(1)
+        elif m := re.fullmatch(r'P: Phys=(.*)', line.strip()): phys = m.group(1)
+    return devices
+
+
+def judge_ps2(run: Run) -> list:
+    """platform's PS/2 part: the keyboard on serio0, a PS/2 mouse on serio1, the controller found through ACPI, and
+    no i8042 or psmouse failure in dmesg."""
+    errors = []
+    devices = input_devices(run.serial)
+    if devices.count(PS2_KEYBOARD) != 1:
+        errors.append(f'input devices {devices}: expected one {PS2_KEYBOARD[0]!r} on {PS2_KEYBOARD[1]}')
+    mice = [n for n, p in devices if p == PS2_MOUSE_PHYS]
+    if len(mice) != 1 or not re.search(r'PS/2 .*Mouse', mice[0] or ''):
+        errors.append(f'input devices on {PS2_MOUSE_PHYS}: {mice}, expected one PS/2 mouse (psmouse probe failed?)')
+    dmesg = [re.sub(r'^\[[^]]*\] ?', '', l) for l in re.findall(r'^PLATFORM-PS2 (.*)$', run.serial, re.M)]
+    if not any(PS2_PNP.search(l) for l in dmesg):
+        errors.append(f'no "i8042: PNP: PS/2 Controller [...] at 0x60,0x64 irq 1,12" in dmesg (its i8042 lines: '
+                      f'{[l for l in dmesg if "i8042" in l]})')
+    errors += [f'dmesg: {l}' for l in dmesg if PS2_FAILURES.search(l)]
     return errors
 
 
@@ -358,7 +403,20 @@ def self_check():
               f'PLATFORM-DMESG [    0.000000] DMI: natemu natemu x86-64, BIOS natemu 0.1.0 {BIOS_DATE}\n'
               'PLATFORM-DMESG [    0.012345] DMI: Memory slots populated: 1/1\n'
               'PLATFORM-DMI sys_vendor=natemu\nPLATFORM-DMI product_name=natemu x86-64\nPLATFORM-DMI bios_vendor=natemu\n'
-              f'PLATFORM-ENTRIES {entries}\nPLATFORM-PASS\n')
+              f'PLATFORM-ENTRIES {entries}\n'
+              'PLATFORM-INPUT I: Bus=0019 Vendor=0000 Product=0001 Version=0000\nPLATFORM-INPUT N: Name="Power Button"\n'
+              'PLATFORM-INPUT P: Phys=LNXPWRBN/button/input0\nPLATFORM-INPUT \n'
+              'PLATFORM-INPUT I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\n'
+              'PLATFORM-INPUT N: Name="AT Translated Set 2 keyboard"\nPLATFORM-INPUT P: Phys=isa0060/serio0/input0\n'
+              'PLATFORM-INPUT S: Sysfs=/devices/platform/i8042/serio0/input/input1\nPLATFORM-INPUT \n'
+              'PLATFORM-INPUT I: Bus=0011 Vendor=0002 Product=0005 Version=0000\n'
+              'PLATFORM-INPUT N: Name="ImPS/2 Generic Wheel Mouse"\nPLATFORM-INPUT P: Phys=isa0060/serio1/input0\n'
+              'PLATFORM-INPUT \n'
+              'PLATFORM-PS2 [    0.512345] i8042: PNP: PS/2 Controller [PNP0303:KBD,PNP0f13:MOU] at 0x60,0x64 irq 1,12\n'
+              'PLATFORM-PS2 [    0.523456] serio: i8042 KBD port at 0x60,0x64 irq 1\n'
+              'PLATFORM-PS2 [    0.523457] serio: i8042 AUX port at 0x60,0x64 irq 12\n'
+              'PLATFORM-PS2 [    0.601234] input: AT Translated Set 2 keyboard as /devices/platform/i8042/serio0/input/input1\n'
+              'PLATFORM-PASS\n')
     good = Run('platform', 2, serial, 'natemu: Power(1)\n', 0, False, None)
     judge = CASES['platform'].judge
     assert not judge(good), judge(good)
@@ -379,8 +437,19 @@ def self_check():
                     'one vCPU': dataclasses.replace(good, vcpus=1),
                     'panic': dataclasses.replace(good, stderr='natemu: Power(4)\n', returncode=2),
                     'stopped': dataclasses.replace(good, stderr='natemu: UnsupportedMmio\n', returncode=2),
-                    'timeout': dataclasses.replace(good, timeout=True, stderr='natemu: Cancelled\n', returncode=2)}
+                    'timeout': dataclasses.replace(good, timeout=True, stderr='natemu: Cancelled\n', returncode=2),
+                    'no keyboard': swap('N: Name="AT Translated Set 2 keyboard"', 'N: Name="Power Button"'),
+                    'untranslated keyboard': swap('AT Translated Set 2 keyboard"', 'AT Set 2 keyboard"'),
+                    'keyboard elsewhere': swap('Phys=isa0060/serio0/input0', 'Phys=isa0060/serio2/input0'),
+                    'no mouse': swap('PLATFORM-INPUT P: Phys=isa0060/serio1/input0\n', ''),
+                    'not a mouse': swap('ImPS/2 Generic Wheel Mouse', 'Some Touchscreen'),
+                    'no input list': dataclasses.replace(good, serial=re.sub(r'^PLATFORM-INPUT.*\n', '', serial, flags=re.M)),
+                    'no PNP': swap('i8042: PNP: PS/2 Controller', 'i8042: PNP: No PS/2 controller found.'),
+                    'no aux irq': swap('at 0x60,0x64 irq 1,12', 'at 0x60,0x64 irq 1'),
+                    "can't read CTR": swap('PLATFORM-PASS', "PLATFORM-PS2 [    0.5] i8042: Can't read CTR while initializing i8042\nPLATFORM-PASS"),
+                    'psmouse failed': swap('PLATFORM-PASS', 'PLATFORM-PS2 [    1.2] psmouse serio1: Failed to enable mouse on isa0060/serio1\nPLATFORM-PASS')}
     for what, r in platform_bad.items(): assert judge(r), f'platform {what}: passed'
+    assert any('PS/2 mouse' in e for e in judge(platform_bad['no mouse'])), judge(platform_bad['no mouse'])
     assert any('SMBIOS 3.0.0' in e for e in judge(platform_bad['no SMBIOS line'])), judge(platform_bad['no SMBIOS line'])
     print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad)} negative judge controls '
           'passed; no VM launched.')

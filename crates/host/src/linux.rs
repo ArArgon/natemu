@@ -419,6 +419,11 @@ pub struct Boot {
     /// the guest's DMI scan finds it. A bzImage boot only: a Multiboot image gets no tables, and a firmware boot gets its
     /// SMBIOS from its firmware. Default off (the `natemu` CLI turns it on, `machine.smbios`).
     pub smbios: bool,
+    /// The 8042 keyboard controller with a PS/2 keyboard and mouse ([`crate::ps2`]) at ports 60H and 64H, IRQ 1 and 12,
+    /// listed in the DSDT as `\_SB.KBD_` and `\_SB.MOU_` with the FADT's 8042 bit (a firmware boot has no tables but the
+    /// device); its host input handle is [`Prepared::ps2`]. Without it port 64H is `pm`'s reset-only register. Default
+    /// off (the `natemu` CLI turns it on, `machine.ps2`).
+    pub ps2: bool,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -462,6 +467,7 @@ impl Boot {
             debug_exit: false,
             pvpanic: false,
             smbios: false,
+            ps2: false,
             firmware: None,
         }
     }
@@ -506,7 +512,7 @@ impl Boot {
             self.mailbox,
             boot::acpi::Board {
                 pvpanic: self.pvpanic,
-                ..Default::default()
+                ps2: self.ps2,
             },
         )?;
         let (layout, tables) = (plan.layout, plan.tables);
@@ -559,12 +565,16 @@ impl Boot {
         let mut devices = devices::Devices::new(self.ram);
         // L4a: the I/O APIC, the 8259 pair and their wires.
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
-        // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-        let board = clock::install(&mut devices, &irqs, lost, &uart)?;
-        // Beside the PM block: the pvpanic device (`Boot::pvpanic`).
+        // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register (and port 64H without the 8042).
+        let board = clock::install(&mut devices, &irqs, lost, &uart, self.ps2)?;
+        // Beside the PM block: the pvpanic device (`Boot::pvpanic`) and the 8042 (`Boot::ps2`).
         let pvpanic = self
             .pvpanic
             .then(|| crate::pvpanic::install(&mut devices))
+            .transpose()?;
+        let ps2 = self
+            .ps2
+            .then(|| crate::ps2::install(&mut devices, &irqs))
             .transpose()?;
         let debug_exit = if self.debug_exit {
             let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
@@ -647,6 +657,7 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
+            ps2,
         })
     }
 
@@ -706,11 +717,15 @@ impl Boot {
         uart.lock().unwrap().sink = self.serial.take();
         let mut devices = devices::Devices::new(self.ram);
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
-        let board = clock::install(&mut devices, &irqs, lost, &uart)?;
-        // Beside the PM block: the pvpanic device (`Boot::pvpanic`).
+        let board = clock::install(&mut devices, &irqs, lost, &uart, self.ps2)?;
+        // Beside the PM block: the pvpanic device (`Boot::pvpanic`) and the 8042 (`Boot::ps2`).
         let pvpanic = self
             .pvpanic
             .then(|| crate::pvpanic::install(&mut devices))
+            .transpose()?;
+        let ps2 = self
+            .ps2
+            .then(|| crate::ps2::install(&mut devices, &irqs))
             .transpose()?;
         let debug_exit = if self.debug_exit {
             let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
@@ -754,6 +769,7 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
+            ps2,
         })
     }
 
@@ -796,6 +812,8 @@ pub struct Prepared {
     debug_exit: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// [`Boot::pvpanic`]: the device's counts.
     pvpanic: Option<Arc<crate::pvpanic::PvPanicStats>>,
+    /// [`Boot::ps2`]: the 8042's host input.
+    ps2: Option<crate::ps2::Ps2Input>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -1240,6 +1258,11 @@ impl Prepared {
     /// [`Boot::pvpanic`]: the device's counts (`None` without the device).
     pub fn pvpanic(&self) -> Option<&crate::pvpanic::PvPanicStats> {
         self.pvpanic.as_deref()
+    }
+    /// [`Boot::ps2`]: the 8042's host input, keyboard and mouse (`None` without the device). A producer holds an
+    /// [`crate::irq::Irqs::busy`] guard while input can still arrive ([`crate::ps2`]).
+    pub fn ps2(&self) -> Option<&crate::ps2::Ps2Input> {
+        self.ps2.as_ref()
     }
     /// The bytes COM1 has sent so far.
     pub fn serial_bytes(&self) -> usize {

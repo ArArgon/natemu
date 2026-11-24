@@ -55,7 +55,9 @@
 //! (`natemu::pvpanic`, `natemu::linux::Boot::pvpanic`): a guest kernel's panic ends the run with `Power(4)` (the
 //! driver's `panic`), exit status 2. `machine.smbios` (default on; `--set machine.smbios=false` turns it off) adds SMBIOS 3.0
 //! tables (`natemu::boot::smbios`, `natemu::linux::Boot::smbios`): the guest's DMI scan finds their entry point at F0000H;
-//! a firmware boot ignores it.
+//! a firmware boot ignores it. `machine.ps2` (default on; `--set machine.ps2=false` turns it off) adds the 8042 keyboard
+//! controller with a PS/2 keyboard and mouse (`natemu::ps2`, `natemu::linux::Boot::ps2`); without it port 64H only
+//! takes the reset command FEH. Either way `reboot=k` ends the run with `Power(2)`.
 mod config;
 use clap::{CommandFactory, FromArgMatches};
 use natemu::execution::Stop;

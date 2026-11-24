@@ -1978,7 +1978,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     // L4a: the I/O APIC, the 8259 pair and their wires; the UART's IRQ4 into them.
     let irqs = crate::irq::install(&mut registry, backing.memory(), n, &uart)?;
     // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-    let board = crate::clock::install(&mut registry, &irqs, lost, &uart)?;
+    let board = crate::clock::install(&mut registry, &irqs, lost, &uart, false)?;
     if let Some(port) = irq_source {
         let mut source = super::test_devices::TestSource::new(&irqs);
         source.veto = irq_veto;
