@@ -85,7 +85,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `vcpus` | `1` | Processors |
 | | `transport` | all `pci` with a file | `disk`, `nic`, `rng`, each `"mmio"` or `"pci"` |
 | | `pvpanic` | `true` | The pvpanic device (ACPI `QEMU0001`, port 505H): a guest kernel panic ends the run (`natemu: Power(4)`, exit status 2) |
-| | `smbios` | `true` | SMBIOS 3.0 tables naming the machine `natemu` (what `dmidecode` and `/sys/class/dmi/id` show), the entry point at F0000H; a firmware boot ignores it |
+| | `smbios` | `true` | SMBIOS 3.0 tables naming the machine `natemu` (what `dmidecode` and `/sys/class/dmi/id` show), the entry point at F0000H; a firmware boot or a Multiboot kernel ignores it |
 | | `ps2` | `true` | An 8042 controller with a PS/2 keyboard and mouse (no host input reaches them yet); `false` leaves port 64H a reset-only register |
 | `[serial]` | `output` | standard output | A file path, or the word `stdout` |
 | | `stdin` | `false` | Feed standard input to COM1 |

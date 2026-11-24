@@ -15,7 +15,9 @@ differs: re-measure the baseline, then `record` again. The canary (one VM at a t
   cpython   the CPython slice (cpython-profile-20261110-01 initrd, part=slice), 2 vCPUs, seconds to its CT-END line
   micro     run_natemu.py benchmarks int and mem64, ns per guest instruction (median of 3)
 A fio job is not in the canary (it needs the staged installed-root inputs); add one as another item of ITEMS when wanted.
-Paired A/B runs (baseline and candidate side by side, so drift cancels) are not implemented. Fixed inputs: KERNEL, INITRD."""
+The canary starts the `natemu` CLI with its defaults, so a build with `machine.pvpanic`, `machine.smbios` and `machine.ps2`
+boots it with those devices on (no switch is passed: an older stored build's CLI would reject the unknown keys); that is
+consistent per stored build, and `check` runs the same build. Paired A/B runs (baseline and candidate side by side, so drift cancels) are not implemented. Fixed inputs: KERNEL, INITRD."""
 import argparse, fcntl, json, os, pathlib, signal, subprocess, sys, tempfile, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent

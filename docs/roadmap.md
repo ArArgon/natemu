@@ -205,9 +205,10 @@ weeks for a first demonstration.
   for the Cloud Hypervisor VMM needs a much smaller platform; compare the two before
   committing. Whichever is chosen, natemu's own ACPI builder must be delivered through
   the channel it reads. (From my own knowledge of the firmware project, unverified.)
-- **P1** Platform pieces that do not exist yet (checked in the code today): a PS/2
-  keyboard and mouse controller, SMBIOS tables, and the flash or firmware-config device
-  from the spike. The ACPI tables already include the PCI root bridge with resources and
+- **P1** Platform pieces that do not exist yet (checked in the code today): the flash
+  or firmware-config device from the spike, a host input source for the PS/2 keyboard
+  and mouse (the controller exists; the display front end will add the source), and
+  SMBIOS tables for a firmware boot (a direct boot has them; the firmware's come with M3). The ACPI tables already include the PCI root bridge with resources and
   interrupt routing.
 - **P1** Multi-BAR, multi-function PCI. The bus today routes BAR0 only, one function per
   device, one fixed 256 MiB window and no I/O BARs. A SATA controller (BAR5 plus I/O

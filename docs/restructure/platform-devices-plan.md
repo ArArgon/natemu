@@ -5,10 +5,10 @@
 
 Status: built November 24, 2026 (Tasks 1-5, branch `claude/platform-devices-c98b44` from `m2-peripherals` 6dfd0634,
 commits from 5fa3b5d1 on); the gate is the integration gate of the peripherals round, still to run. Built as planned:
-pvpanic at port 505H (a panic is `Power(4)`), SMBIOS 3.0 with its entry point in a read-only legacy ROM page at F0000H,
+pvpanic at port 505H (a panic is `Power(4)`), SMBIOS 3.0 with its entry point in a read-only legacy ROM page at F0000H (built only for a bzImage direct boot; a Multiboot kernel gets none),
 an 8042 with a PS/2 keyboard and mouse (adapted from OpenVMM and bhyve), the three `[machine]` keys on in the CLI and
 off in `natemu-host` unless `--pvpanic`, `--smbios` or `--ps2`, and the `tests/devices` family (`pvpanic-panic`,
-`platform[1]`, `platform[2]`, `platform-off`; smoke has `pvpanic-panic` and `platform[1]`), whose initramfs lives in the
+`platform[1]`, `platform[2]`, `platform-off`, `platform-selfcheck`; smoke has `pvpanic-panic` and `platform[1]`), whose initramfs lives in the
 shared input root. Where it departed: the legacy ROM page is data only (a fetch from it stops as not RAM); Task 3's
 Device-page break stops at Linux's iBFT scan, before the DMI scan; the `--skip-capability` demonstration ends with a
 watchdog stop after about 60 s rather than a timeout; IRQ 1 is raised for the controller's own replies (as a real 8042

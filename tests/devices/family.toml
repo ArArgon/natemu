@@ -10,7 +10,10 @@
 name = "devices"
 covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crates/host/src/ps2.rs", "crates/host/src/ps2/**",
           "crates/host/src/lib.rs", "crates/host/src/boot.rs", "crates/abi/src/execution.rs",
-          "crates/runtime/src/execution/mmio.rs", "crates/host/src/pm.rs", "crates/host/src/clock.rs",
+          "crates/runtime/src/execution.rs", "crates/runtime/src/execution/segments.rs",
+          "crates/runtime/src/execution/segments/span.rs", "crates/runtime/src/execution/interpret.rs",
+          "crates/runtime/src/execution/mmio.rs", "tests/io/run_io_matrix.py", "tests/io/run_io5.py", "tools/bench/boot.py",
+          "tools/bench/run.py", "tests/bench/run_paper.py", "tests/bench/run_m1_perf.py", "crates/host/src/pm.rs", "crates/host/src/clock.rs",
           "crates/host/src/boot/acpi.rs", "crates/host/src/linux.rs", "crates/driver/src/drivers/linux.rs",
           "crates/driver/src/drivers/program.rs", "crates/cli/src/config.rs", "crates/cli/src/config/tests.rs",
           "crates/cli/src/main.rs", "docs/configuration.md", "tools/models/acpi_model.py", "tests/boot/run_l2.py",

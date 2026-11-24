@@ -105,7 +105,8 @@ case_platform() {
   modprobe psmouse || fail modprobe-psmouse
   n=0
   until grep -q '@MOUSE_PHYS@' /proc/bus/input/devices || test $n -ge 20; do sleep 1; n=$((n + 1)); done
-  # Through cat: BusyBox read takes the file a byte at a time, which /proc/bus/input/devices did not finish in 110 s.
+  # Through cat: BusyBox `read` polls before each read, and /proc/bus/input/devices implements poll, so it reports readable
+  # only when the device list changed since the last read; after the first line the loop blocks (guest behaviour, not a natemu stall).
   cat /proc/bus/input/devices | while read -r line; do echo "PLATFORM-INPUT $line"; done
   dmesg | grep -e i8042 -e atkbd -e psmouse -e serio | while read -r line; do echo "PLATFORM-PS2 $line"; done
   pass

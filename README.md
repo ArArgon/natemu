@@ -158,10 +158,11 @@ A launch can also be described in a TOML file (`--config FILE`), which adds seve
 read-only disks; see [docs/configuration.md](docs/configuration.md).
 
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
-2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error. If the guest's Linux kernel crashes (a kernel
-panic), natemu ends the run with status 2 instead of leaving the guest hanging.
+2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error. If the guest's Linux kernel has its pvpanic driver
+(Debian's kernels load it), a kernel panic ends the run at once with status 2; without the driver the panic leaves the
+guest hanging until the one-minute stop described below.
 
-When natemu stops for any reason other than a power-off, a reboot or Ctrl-C, it prints on standard error where the processor was: the
+When natemu stops for any reason other than a power-off, a reboot, a guest kernel panic or Ctrl-C, it prints on standard error where the processor was: the
 address of the guest instruction, its bytes and the registers. If the guest seems stuck, press Ctrl-T in the terminal
 (with `--serial-stdin` the keys go to the guest: run `kill -INFO` on natemu's process instead) to print the same for every processor while the guest keeps running. A guest
 that loops forever without natemu's involvement for a minute ends the run with that report. If natemu itself waits that
