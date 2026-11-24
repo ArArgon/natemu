@@ -4,7 +4,7 @@
 NAME.report.json and NAME.report.md beside them.
 
     python3 tests/bench/sample_report.py --profile NAME [--markers FILE] [--perf FILE] [--profile NAME ...]
-                                         [--window SECONDS] [--require-place PLACE] [--kernel BZIMAGE] [--image CPIO]
+                                         [--window SECONDS] [--require-place PLACE] [--kernel-symbols TABLE] [--image CPIO]
                                          [-- COMMAND ...]
 
 With `-- COMMAND`, the command runs first (a sampling boot: tools/bench/run.py --sample-us, tests/io/run_io5.py --sample-us)
@@ -29,7 +29,7 @@ place has no sample.
 
 Roles and symbols (the plan's chunk 1): each block sample's word gets its role from the object's records and the A64
 patterns (tests/bench/sample_roles.py), and its symbol (tests/bench/sample_symbols.py): kernel samples by the kallsyms of
-`--kernel BZIMAGE` with the KASLR slide from the profile's markers, user samples by finding their blocks' guest bytes in
+`--kernel-symbols TABLE` (the framework's kernel-symbols input; a bzImage is read too) with the KASLR slide from the profile's markers, user samples by finding their blocks' guest bytes in
 the binaries of `--image CPIO` (the bench image; without it user samples stay at block level). Per phase: block samples by
 role, user and kernel and 64- and 32-bit apart, by group (FEX's body, its flag words, natemu's words, other), the shares
 the plan's section-7 rows read (split checks and probes, stack checks, REP string bodies, glibc AVX2/EVEX code, flag words,
@@ -154,6 +154,13 @@ class Objects:
         if hits := self.page.get((frame, rip & 0xfff, context)): return hits, 'page'
         return [], None
 
+    def find_rip(self, rip, context):
+        """The record offsets of answers served for `rip` in `context`, on any frame (a link target's: its frame unknown)."""
+        if not hasattr(self, 'by_rip'):
+            self.by_rip = collections.defaultdict(list)
+            for (r, _, c), hits in self.exact.items(): self.by_rip[(r, c)] += hits
+        return self.by_rip.get((rip, context), [])
+
 
 def code_header(obj):
     """The code object's header fields the report reads, or None if the bytes are not a code object."""
@@ -199,6 +206,7 @@ class Attribution:
         self.info_of, self.user, self.sym_of = {}, {}, {}
         self.ambiguous = self.matched = self.looked_up = 0
         self.reach = {}             # per block, the highest native offset sampled (set_reach)
+        self.entry_of = {}
 
     def set_reach(self, words):
         for (k, off, _), _ in words.items():
@@ -227,10 +235,33 @@ class Attribution:
                     ib = roles_mod.insn_bytes(c, guest, g)
                     if k := roles_mod.x86_rep_string(ib, bits): rep[g] = k
                     wide |= roles_mod.x86_wide_vector(ib, bits) is not None
-                info = dict(roles=roles_mod.roles(c), insns=insns, rep=rep, wide=wide,
-                            guest=guest if privilege(key[2], key[0], True) == 'user' else None)
+                info = dict(roles=roles_mod.roles(c), insns=insns, rep=rep, wide=wide, exits=roles_mod.exit_targets(c),
+                            delta=key[0] - c.rip, guest=guest if privilege(key[2], key[0], True) == 'user' else None)
         self.info_of[key] = info
         return info
+
+    def entry_role(self, rip, context):
+        """The role of the first body word (ENTRY_OFFSET) of the block for `rip` in `context`, or None (no object)."""
+        k = (rip, context)
+        if k not in self.entry_of:
+            role = None
+            for h in self.objects.find_rip(rip, context) if self.objects is not None else []:
+                try: c = roles_mod.Code(self.objects.record(h)['object'])
+                except (ValueError, IndexError, struct.error): continue
+                rs = roles_mod.roles(c)
+                if len(rs) > 1: role = rs[1]; break
+            self.entry_of[k] = role
+        return self.entry_of[k]
+
+    def skid_role(self, key, info, off, probe, role):
+        """The role under the one-word skid correction (sample_roles.NOT_MOVED's comment): the next word executed."""
+        if probe or info is None or role in roles_mod.NOT_MOVED: return role
+        if role == 'exit_literal' and off is not None and off >= 0:
+            t = info['exits'].get(off // 4)
+            r = self.entry_role((t + info['delta']) & (2 ** 64 - 1), key[2]) if t is not None else None
+            return r or role
+        i = roles_mod.next_word(info['roles'], off)
+        return role if i is None else info['roles'][i]
 
     def insn(self, info, off):
         return info['insns'][off // 4] if info and off is not None and 0 <= off < 4 * len(info['insns']) else None
@@ -280,13 +311,18 @@ class Attribution:
         samples; the hot-50 share of the top blocks' samples) and the top 30 symbols."""
         by = collections.defaultdict(collections.Counter)
         hot, rep, sym, bins = collections.Counter(), collections.Counter(), collections.Counter(), collections.Counter()
-        wide_libc = beyond = 0
+        skid, skid_hot = collections.Counter(), collections.Counter()
+        wide_libc = beyond = unresolved = 0
         for (key, off, probe), n in t.words.items():
             info = self.info(key)
             role = roles_mod.role_at(info['roles'] if info else None, off, probe)
             if role == 'beyond': beyond += n
             by[f'{privilege(key[2], key[0], True)}/{mode(key[2])}'][role] += n
             if key in top_keys: hot[roles_mod.GROUPS[role]] += n
+            moved = self.skid_role(key, info, off, probe, role)
+            if role == 'exit_literal' and moved == role: unresolved += n
+            skid[moved] += n
+            if key in top_keys: skid_hot[roles_mod.GROUPS[moved]] += n
             g = self.insn(info, off)
             if info and g in info['rep']: rep[info['rep'][g]] += n
             s = self.symbol(key, info, off)
@@ -309,9 +345,17 @@ class Attribution:
             exits=pct(allr['exit_literal'] + allr['exit_computed']),
             fex_body=pct(groups['fex_body']), fex_flags=pct(groups['fex_flags']), natemu=pct(groups['natemu']),
             hot50_fex_body_pct=round(100 * hot['fex_body'] / hot_total, 2) if hot_total else None,
-            hot50_fex_flags_pct=round(100 * hot['fex_flags'] / hot_total, 2) if hot_total else None)
+            hot50_fex_flags_pct=round(100 * hot['fex_flags'] / hot_total, 2) if hot_total else None, fex_mem=pct(allr['fex_mem']))
+        sg = collections.Counter()
+        for r, n in skid.items(): sg[roles_mod.GROUPS[r]] += n
+        shares['skid'] = dict(
+            fex_mem=pct(skid['fex_mem']), fex_body=pct(sg['fex_body']), fex_flags=pct(sg['fex_flags']), natemu=pct(sg['natemu']),
+            split_checks_and_probes=pct(skid['split_check'] + skid['probe']), flag_words=pct(skid['flags']),
+            exits=pct(skid['exit_literal'] + skid['exit_computed']),
+            hot50_fex_body_pct=round(100 * skid_hot['fex_body'] / hot_total, 2) if hot_total else None,
+            exit_samples_unresolved=unresolved)
         return dict(block_samples=sum(allr.values()), el0=el0, roles={c: dict(v.most_common()) for c, v in sorted(by.items())},
-                    all_roles=dict(allr.most_common()), groups=dict(groups), shares=shares, beyond=beyond,
+                    all_roles=dict(allr.most_common()), skid_roles=dict(skid.most_common()), groups=dict(groups), shares=shares, beyond=beyond,
                     kernel_copy_clear=kcopy, rep_counts=dict(rep),
                     symbols=[dict(symbol=s, samples=n, pct=pct(n)) for s, n in sym.most_common(30)],
                     binaries=dict(bins.most_common()))
@@ -733,6 +777,20 @@ def attribution_markdown(rep):
                    f'{p(s["split_checks_and_probes"])} | {p(s["stack_checks"])} | {p(s["load_then_move"])} | {p(s["exits"])} | '
                    f'{p(s["rep_string"])} | {p(s["glibc_avx2_evex_named"])} | {p(s["libc_wide_vector_blocks"])} | '
                    f'{p(s["kernel_copy_clear"])} | {p(s["hot50_fex_body_pct"])} |')
+    out += ['', '### One-word skid correction', '',
+            'Each sample also counted on the next word executed (the next word of its block, or a linked exit\'s target '
+            'block\'s first body word; sample_roles.NOT_MOVED: the validity case\'s chase phase put 58% of a slow load\'s '
+            'samples on the word before it): % of EL0 samples, raw / corrected.', '',
+            '| phase | fex_mem | FEX body | FEX flags | natemu | split + probe | exits | hot 50 FEX body | exit samples unresolved |',
+            '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for ph in rep['phases']:
+        a = ph.get('attribution')
+        if not a: continue
+        s, k = a['shares'], a['shares']['skid']
+        rc = lambda x: f'{p(s[x])} / {p(k[x])}'
+        out.append(f'| {ph["name"]} | {rc("fex_mem")} | {rc("fex_body")} | {rc("fex_flags")} | {rc("natemu")} | '
+                   f'{rc("split_checks_and_probes")} | {rc("exits")} | {p(s["hot50_fex_body_pct"])} / {p(k["hot50_fex_body_pct"])} | '
+                   f'{k["exit_samples_unresolved"]} |')
     a = whole['attribution']
     classes = sorted(a['roles'])
     total = a['block_samples']
@@ -768,7 +826,7 @@ def attribution_for(objects, markers=None, kernel=None, image=None, notes=None):
         if note: notes.append(note)
         elif kernel.text is not None: slide = t - kernel.text
     elif kernel is not None: notes.append('no markers: no KASLR slide assumed')
-    if kernel is None: notes.append('no --kernel: kernel samples stay at block level')
+    if kernel is None: notes.append('no --kernel-symbols: kernel samples stay at block level')
     if image is None: notes.append('no --image: user samples stay at block level')
     return Attribution(objects, kernel, slide, image)
 
@@ -808,7 +866,7 @@ def main(argv):
             if not profiles: sys.exit(f'{a} before any --profile')
             profiles[-1][a[2:]] = next(it)
         elif a == '--window': window = float(next(it))
-        elif a == '--kernel': kernel_path = next(it)
+        elif a in ('--kernel-symbols', '--kernel'): kernel_path = next(it)
         elif a == '--image': image_path = next(it)
         elif a == '--require-place':
             place = next(it)

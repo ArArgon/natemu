@@ -67,6 +67,24 @@ class Kernel(unittest.TestCase):
         struct.pack_into('<II', img, 0x248, 0x100, len(payload) - 4)
         self.assertEqual(S.bzimage_payload(bytes(img)), vmlinux)
 
+    def test_the_table_the_framework_writes_reads_back(self):
+        d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
+        k = S.Kallsyms(kallsyms_blob(SYMS))
+        k.write_table(d / 'kallsyms.txt')
+        t = S.kernel_symbols(d / 'kallsyms.txt')
+        self.assertEqual((t.addrs, t.names, t.text), (k.addrs, k.names, TEXT))
+        self.assertEqual(t.lookup(TEXT + 0x105), ('clear_page_erms', 5))
+
+    def test_a_zstd_kernel_without_a_decompressor_says_what_to_install(self):
+        import unittest.mock as um
+        with um.patch.dict(sys.modules, {'compression.zstd': None, 'compression': None}), \
+                um.patch.object(S.shutil, 'which', lambda n: None), um.patch.object(S, 'ZSTD_PATHS', ()):
+            with self.assertRaises(RuntimeError) as e: S.zstd_tool()
+            self.assertIn('brew install zstd', str(e.exception))
+        with um.patch.dict(sys.modules, {'compression.zstd': None, 'compression': None}), \
+                um.patch.object(S.shutil, 'which', lambda n: '/x/zstd'):
+            self.assertEqual(S.zstd_tool(), '/x/zstd')
+
     def test_ktext_lines(self):
         d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
         for line, want in (('NATEMU-BENCH-KTEXT ffffffff81000000', (TEXT, None)), ('IO5 ktext ffffffffb3000000', (0xffff_ffff_b300_0000, None)),

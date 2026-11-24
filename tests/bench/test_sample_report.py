@@ -396,6 +396,33 @@ class Attribution(Base):
             self.assertIn(heading, md)
         self.assertTrue(any('no --image' in n for n in r['notes']))
 
+    def test_the_skid_correction_charges_the_next_word_executed(self):
+        import test_sample_roles as tr
+        import sample_roles
+        A, B = 0x40_1000, 0x40_2000
+        a = tr.code_object([tr.LDR_X20_X11_8, tr.MOV_X6_X20, tr.MOVZ_W0, tr.MOVK_W0, tr.SVC_LINK], sites=[tr.site(4, sample_roles.LOAD)],
+                           relocs=[tr.reloc(12, sample_roles.RELOC_GUEST_RIP_MOVE, 0, value=B)], rip=A)
+        b = tr.code_object([0x8b14_016b, tr.LDR_X20_X11_8], rip=B)          # B's first body word: an add
+        objects = [obj_record(A, 0x55_000, USER64, a, b'\x90' * 16), obj_record(B, 0x77_000, USER64, b, b'\x90' * 16)]
+        samples = [el0(T0 + i, A, sr.BLOCK, USER64, at=at, frame=0x55) for i, at in enumerate((4, 4, 8, 12, 16))]
+        recs = [header(1), hostrec(sr.CLOCK, T0, value1=1), hostrec(sr.TOGGLE, T0, value1=0, value2=1, value3=0, value4=sr.RUN),
+                hostrec(sr.CLOCK, T0 + S, value1=1, value2=1), hostrec(sr.VCPU, T0 + S, value1=0, value2=5, value3=0, value4=5),
+                *samples, *counts(0, rings=5, written=5, drained=5), *run_counts()]
+        self.write(recs, None, objects)
+        problems, r = self.report()
+        self.assertEqual(problems, [])
+        at = r['phases'][0]['attribution']
+        self.assertEqual(at['all_roles'], {'fex_mem': 2, 'exit_literal': 2, 'load_move': 1})
+        # The load's samples go to its move, the move's to the exit, the exit's (both words) to B's first body word.
+        self.assertEqual(at['skid_roles'], {'load_move': 2, 'fex_alu': 2, 'exit_literal': 1})
+        self.assertEqual((at['shares']['fex_mem'], at['shares']['skid']['fex_mem']), (40.0, 0.0))
+        self.assertEqual(at['shares']['skid']['exit_samples_unresolved'], 0)
+        # Without the target's object the exit's samples stay, counted unresolved.
+        self.write(recs, None, objects[:1])
+        _, r = self.report()
+        self.assertEqual(r['phases'][0]['attribution']['shares']['skid']['exit_samples_unresolved'], 2)
+        self.assertIn('### One-word skid correction', (self.d / 'case.report.md').read_text())
+
     def test_kernel_symbols_take_the_slide_from_the_markers(self):
         import test_sample_symbols as ts
         import sample_symbols

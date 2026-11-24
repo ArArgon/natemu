@@ -219,7 +219,10 @@ samples. It is byte-oriented, because the guest's simplest writer, `/dev/port`, 
   binaries can be read from the io5 inputs, checked here, else user results stop at block level.
   As built (November 23): the `debian-kernel-deb` package's System.map is a one-line stub (the real one is in the -dbg
   package), so kernel symbols come from the kallsyms tables of the bzImage natemu boots (`{kernel}`, the same file io5
-  boots), decompressed and read by `tests/bench/sample_symbols.py`. io5's binaries are installed in the guest's disk during
+  boots), decompressed and read once per kernel into the framework's `kernel-symbols` input (`{kernel_symbols}`; its zstd
+  payload needs Homebrew's `zstd`, a README test prerequisite, or Python 3.14). The report gives every role share raw and
+  under a one-word skid correction (each sample counted on the next word executed), since the validity case's chase phase
+  put most of a slow load's samples on the word before it; read section 7's FEX-body row off both. io5's binaries are installed in the guest's disk during
   the run, which the inputs do not hold: io5 user samples stay at block level. Debian's binaries are stripped, so user
   samples name a function only where `.dynsym` (or a bench program's own `.symtab`) has one; libc's AVX2/EVEX string
   functions have no names and are counted by proxy (libc blocks holding a VEX.256 or EVEX instruction). Roles:

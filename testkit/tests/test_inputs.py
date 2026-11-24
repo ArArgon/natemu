@@ -69,6 +69,27 @@ def test_container_inputs_need_container(monkeypatch, tmp_path):
         assert 'brew install container' in str(e.value)
 
 
+def test_kernel_symbols_need_a_zstd_decompressor(monkeypatch, tmp_path):
+    """The kernel-symbols input (the EL0 sampler report's kernel names) stops with a BuildFailure that says what to install
+    when neither Python's compression.zstd nor zstd is there; with one it writes the table."""
+    import sys
+    from testkit import paths
+    script = paths.repo_root() / 'tests' / 'bench' / 'sample_symbols.py'
+    img = bytearray(5 * 512 + 0x100) + b'\x28\xb5\x2f\xfd' + bytes(16)
+    img[0x1f1] = 4
+    struct.pack_into('<II', img, 0x248, 0x100, 20)
+    (tmp_path / 'bz').write_bytes(bytes(img))
+    monkeypatch.setitem(sys.modules, 'compression', None)
+    monkeypatch.setitem(sys.modules, 'compression.zstd', None)
+    monkeypatch.setattr(inputs.shutil, 'which', lambda n: None)
+    real = inputs.pathlib.Path.is_file
+    monkeypatch.setattr(inputs.pathlib.Path, 'is_file', lambda p: False if p.name == 'zstd' else real(p))
+    (tmp_path / 'out').mkdir()
+    with pytest.raises(BuildFailure) as e:
+        inputs._kernel_symbols_recipe(tmp_path / 'out', [tmp_path / 'bz', script])
+    assert 'brew install zstd' in str(e.value) and not (tmp_path / 'out' / 'kallsyms.txt').exists()
+
+
 def test_unreachable_snapshot_is_unpreparable_with_the_url(monkeypatch, tmp_path):
     monkeypatch.setattr(inputs.shutil, 'which', lambda n: '/usr/bin/true')
     url = 'http://snapshot.debian.org/archive/debian/20261108T000000Z/dists/trixie/InRelease'

@@ -279,6 +279,35 @@ def role_at(code_roles, offset, place_probe=False):
     return code_roles[offset // 4]
 
 
+# The one-word skid correction (the report's `skid` shares). The sampler's validity case shows where the samples of a stall
+# land: in guest-sampler-check-sample's chase phase (a loop of dependent cache-missing loads; M2 Max, run
+# 20261123-194520-5367) 58% fell on the linked back-edge word just before the slow load in execution order, 18% on the load,
+# the rest on cheap words after it. So a sample is also counted on the next word executed: the next word of its block for
+# a straight-line word, the target block's first body word for a linked literal exit (its RIP from the exit's guest-RIP
+# move). Branches with two successors, computed exits and the places with no word stay where they are.
+NOT_MOVED = {'fex_branch', 'exit_computed', 'probe', 'none', 'far', 'beyond'}
+
+
+def exit_targets(code: Code):
+    """{word index: target RIP} of each literal exit's words (the guest-RIP move into x0 up to its svc #LINK)."""
+    out, n = {}, len(code.words)
+    for off, kind, reg, _, _, value in code.relocs:
+        if kind != RELOC_GUEST_RIP_MOVE or reg != 0: continue
+        o = off
+        while o // 4 < n:
+            out[o // 4] = value
+            if code.words[o // 4] == SVC_LINK or o - off >= 20: break
+            o += 4
+    return out
+
+
+def next_word(code_roles, offset):
+    """The word index a straight-line sample at `offset` moves to under the skid correction, or None (stays)."""
+    if code_roles is None or offset is None: return None
+    i = 0 if offset == -4 else offset // 4 + 1
+    return i if 0 <= offset + 4 and i < len(code_roles) and offset % 4 == 0 else None
+
+
 # --- guest instructions ----------------------------------------------------------------------------------------------
 LEGACY = set(b'\x26\x2e\x36\x3e\x64\x65\x66\x67\xf0\xf2\xf3')
 

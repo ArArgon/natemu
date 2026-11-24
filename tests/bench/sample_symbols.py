@@ -3,8 +3,11 @@ symbol table, user samples by finding their blocks' guest bytes in the bench ima
 
 **Kernel.** Debian's linux-image package ships a stub System.map (its one line says the real one is in the -dbg package),
 so the symbols come from the kernel itself: the kallsyms tables in the bzImage natemu boots (the `debian-kernel` resource,
-`{kernel}`; io5 boots the same file, run_io5.py's BZIMAGE_SHA). Its payload (zstd for Debian's 6.12) is decompressed with
-Python's `compression.zstd` (3.14 and later) or the `zstd` program, and the tables are found by their shape: the 256 tokens
+`debian-kernel`; io5 boots the same file, run_io5.py's BZIMAGE_SHA). The framework reads them once, before the run, into its
+`kernel-symbols` input (testkit/inputs.py kernel_symbols, `{kernel_symbols}`: `ADDRESS NAME` lines), which the report
+reads. The payload (zstd for Debian's 6.12) is decompressed with Python's `compression.zstd` (3.14 and later) or Homebrew's
+`zstd` (the README's test prerequisites); without either the input fails to build, with ZSTD_NEEDED, before any case
+runs. The tables are found by their shape: the 256 tokens
 and their u16 index, the u32 markers before them, `kallsyms_num_syms` (8-byte aligned) before the names, the s32 offsets
 after the index and the relative base after those (6.12's layout; a negative offset is relative_base - 1 - offset, a
 non-negative one an absolute per-CPU symbol). The guest's KASLR slide is its `_text` (the bench init's NATEMU-BENCH-KTEXT
@@ -29,19 +32,34 @@ import subprocess
 
 
 # --- the kernel ------------------------------------------------------------------------------------------------------
+ZSTD_PATHS = ('/opt/homebrew/bin/zstd', '/usr/local/bin/zstd')     # Homebrew's, when PATH lacks it
+ZSTD_NEEDED = "Debian's kernel is zstd-compressed: reading its symbols needs Homebrew's zstd (brew install zstd) or Python 3.14+"
+
+
+def zstd_tool():
+    """How a zstd payload is decompressed: None for Python's own compression.zstd (3.14 and later), else the path of the zstd
+    program (on PATH, or Homebrew's). RuntimeError (ZSTD_NEEDED) when there is neither."""
+    try:
+        from compression import zstd  # noqa: F401
+        return None
+    except ImportError:
+        pass
+    exe = shutil.which('zstd') or next((p for p in ZSTD_PATHS if pathlib.Path(p).is_file()), None)
+    if not exe: raise RuntimeError(ZSTD_NEEDED)
+    return exe
+
+
 def bzimage_payload(data: bytes) -> bytes:
     """The decompressed kernel (an ELF vmlinux) of a bzImage."""
     setup = data[0x1f1] or 4
     off, length = struct.unpack_from('<II', data, 0x248)
     p = data[(setup + 1) * 512 + off:][:length]
     if p[:4] == b'\x28\xb5\x2f\xfd':
-        try:
-            from compression import zstd                  # Python 3.14+
+        exe = zstd_tool()
+        if exe is None:
+            from compression import zstd
             return zstd.ZstdDecompressor().decompress(p)
-        except ImportError:
-            exe = shutil.which('zstd')
-            if not exe: raise RuntimeError('the kernel is zstd-compressed: needs Python 3.14 (compression.zstd) or zstd')
-            return subprocess.run([exe, '-dc'], input=p[:-4], capture_output=True, check=True).stdout
+        return subprocess.run([exe, '-dc'], input=p[:-4], capture_output=True, check=True).stdout
     if p[:2] == b'\x1f\x8b':
         import zlib
         return zlib.decompressobj(31).decompress(p)
@@ -119,8 +137,24 @@ class Kallsyms:
         return self.names[i], addr - self.addrs[i]
 
 
-def kernel_symbols(bzimage):
-    return Kallsyms(bzimage_payload(pathlib.Path(bzimage).read_bytes()))
+    def write_table(self, path):
+        """The table as `ADDRESS NAME` lines (hex, sorted): testkit's kernel-symbols input, which the report reads."""
+        pathlib.Path(path).write_text(''.join(f'{a:x} {n}\n' for a, n in zip(self.addrs, self.names)))
+
+    @classmethod
+    def from_table(cls, path):
+        k = cls.__new__(cls)
+        rows = [line.split(' ', 1) for line in pathlib.Path(path).read_text().splitlines() if line.strip()]
+        k.addrs, k.names = [int(a, 16) for a, _ in rows], [n for _, n in rows]
+        k.text = k.lookup_addr('_text')
+        return k
+
+
+def kernel_symbols(path):
+    """The kernel's text symbols from a table (write_table's, the framework's {kernel_symbols}) or from a bzImage."""
+    data = pathlib.Path(path).read_bytes()
+    if data[0x202:0x206] == b'HdrS': return Kallsyms(bzimage_payload(data))     # the bzImage's setup header
+    return Kallsyms.from_table(path)
 
 
 def ktext(markers):

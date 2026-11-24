@@ -53,6 +53,23 @@ def _lib() -> pathlib.Path:
     return paths.repo_root() / 'tests' / 'lib'
 
 
+def _kernel_symbols_recipe(out: pathlib.Path, inputs: list) -> None:
+    bzimage, script = inputs
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('sample_symbols_recipe', script)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    try: m.Kallsyms(m.bzimage_payload(pathlib.Path(bzimage).read_bytes())).write_table(out / 'kallsyms.txt')
+    except RuntimeError as e: raise BuildFailure('kernel-symbols', str(e)) from None
+
+
+def kernel_symbols() -> pathlib.Path:
+    """The text symbols of the kernel the benchmarks and io5 boot (debian-kernel's bzImage; Debian's System.map is a stub),
+    read from its kallsyms by tests/bench/sample_symbols.py: `ADDRESS NAME` lines. Its zstd payload needs Python 3.14 or
+    Homebrew's zstd (README); a BuildFailure that says so when neither is there."""
+    return resources.derived('kernel-symbols', _kernel_symbols_recipe,
+                             [resources.fetch('debian-kernel'), paths.repo_root() / 'tests' / 'bench' / 'sample_symbols.py']) / 'kallsyms.txt'
+
+
 def _runner(script, *args) -> None:
     """Run a build step's script: a path, or a name in tests/io (the io scripts' `prepare` commands), else under tools/."""
     path = script if pathlib.Path(script).is_absolute() else _io() / script if (_io() / script).is_file() else _tools() / script
