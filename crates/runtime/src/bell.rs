@@ -129,10 +129,10 @@ mod on {
             crate::execution::guest_ram().copy_out(gpa, out)
         }
     }
-    /// A trip out of generated code begins (`finish`, the first Rust every gate calls): its CNTVCT becomes the last exit
-    /// (`Head::exit_time`), the previous one `Head::exit_before`, which a bell taken from generated code classes its ring
-    /// time by (`sample::record`). Taken after the gate's register save, so a few tens of nanoseconds late: a ring in that
-    /// window is counted EL0 with no place rather than resident.
+    /// A trip out of generated code begins (`finish`, the first Rust every gate calls): the stretch it ends (the last
+    /// resume to now) is kept in `Head::stretches`, among which a bell taken from generated code finds its ring time
+    /// (`sample::record`). Taken after the gate's register save, so a few tens of nanoseconds late: a ring in that window
+    /// is counted EL0 with no place rather than resident.
     #[inline(always)]
     pub fn left() {
         let now: u64;
@@ -155,8 +155,7 @@ mod on {
         let d0 = u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8]));
         let s = sm::record(
             word(sm::HEAD_RING_TIME).load(Relaxed),
-            word(sm::HEAD_RESUME_TIME).load(Relaxed),
-            word(sm::HEAD_EXIT_BEFORE).load(Relaxed),
+            &ring().stretches(),
             t0,
             cache::control().flushes,
             elr,

@@ -14,10 +14,11 @@ NAME.markers.tsv, run_io5.py's markers-PHASE.tsv; CLOCK_UPTIME_RAW ns, the sampl
 log, for each phase's resident buckets: reported, never a decision, since sampling perturbs them). A missing markers or
 perf file is noted, not an error (a boot that failed early).
 
-Per profile, per vCPU and summed, per phase: samples by kind (EL0; EL0 with no place: rung while the vCPU was in generated
-code, but taken only after its next trip out began, so its PC is a later stretch's (format version 2); resident or host: the
-bell was pending while the vCPU was outside generated code; halted: the host found it halted and did not ring), and the EL0
-share of both EL0 kinds (`el0_all`, the one to set beside the guest bucket); EL0 samples (with a place) by place (block, probe, dispatch
+Per profile, per vCPU and summed, per phase: samples by kind (EL0; EL0 with no place: rung in an earlier stretch of
+generated code than the one the bell interrupted, so its PC is a later stretch's (format version 2), with how many stretches
+back; resident or host: the bell was pending while the vCPU was outside generated code, `resident_old` of them rung before
+every stretch the resident kept; halted: the host found it halted and did not ring), and the EL0 share of both EL0 kinds
+(`el0_all`, the one to set beside the guest bucket); EL0 samples (with a place) by place (block, probe, dispatch
 slot, head, step, no block, outside), by privilege and code mode (from the block's code context; a dispatcher slot's target
 by its RIP where the slot has no context), dispatcher samples by their call test (the target is a return address, is not,
 or unknown), the top 50 blocks by (RIP, frame, context) with their objects, the cumulative curve of block samples, the lost
@@ -82,6 +83,7 @@ def tail_role(at):
     """'jump-bl', 'call-branch', 'link-call-pad', ...: the exit (computed, or a shared link point's `link-`), jump or call, the word."""
     return f"{'link-' if at & TAIL_POINT else ''}{'call' if at & TAIL_CALL else 'jump'}-{TAIL_WORDS[at & 3]}"
 HOT, DEAD, FAR = 1, 2, 4
+OLD = 1                     # a resident sample's flags: rung before every stretch the resident kept (version 2)
 AT_BIAS = 4                 # a block sample's `at` is its native offset + 4 (a PIC block's full entry word, -4, is 0)
 CALL_SHIFT = 2
 CALL_YES, CALL_NO, CALL_UNKNOWN = 1, 2, 3
@@ -488,11 +490,11 @@ def buckets_between(snap_lines, t0, t1, names):
 # --- the samples file ------------------------------------------------------------------------------------------------
 class Tally:
     """Counts of one (vCPU or all, phase)."""
-    __slots__ = ('kinds', 'places', 'privilege', 'modes', 'calls', 'flags', 'since', 'blocks', 'words', 'forms', 'tails')
+    __slots__ = ('kinds', 'places', 'privilege', 'modes', 'calls', 'flags', 'since', 'blocks', 'words', 'forms', 'tails', 'back')
 
     def __init__(self, blocks=False):
         self.kinds, self.places, self.privilege, self.modes = (collections.Counter() for _ in range(4))
-        self.forms, self.tails = collections.Counter(), collections.Counter()
+        self.forms, self.tails, self.back = collections.Counter(), collections.Counter(), collections.Counter()
         self.calls, self.flags, self.since = collections.Counter(), collections.Counter(), collections.Counter()
         self.blocks = collections.Counter() if blocks else None
         self.words = collections.Counter() if blocks else None
@@ -577,7 +579,13 @@ class Profile:
                 win = (t - origin) // wt if t >= origin else -1
                 if k != EL0:        # resident, or EL0 with no place: counted by kind only
                     kn = KINDS[k]
-                    for p in ps: per[(vcpu, p)].kinds[kn] += 1; summ[p].kinds[kn] += 1
+                    old = k == RESIDENT and w[1] >> 60 & OLD
+                    back = min(w[2] >> 40 & 0xffff, 16) if k == EL0_UNKNOWN else None
+                    for p in ps:
+                        for t_ in (per[(vcpu, p)], summ[p]):
+                            t_.kinds[kn] += 1
+                            if old: t_.flags['resident_old'] += 1
+                            if back is not None: t_.back[back] += 1
                     series[win][kn] += 1
                     continue
                 place = w[2] >> 56 & 0xf
@@ -665,6 +673,7 @@ class Profile:
             samples=total, kinds={k: t.kinds[k] for k in KINDS.values()},
             kind_pct={k: pct(t.kinds[k], total) for k in KINDS.values()},
             el0_all_pct=pct(el0 + t.kinds['el0_unknown'], total),
+            resident_old=t.flags['resident_old'], el0_unknown_back={str(k): n for k, n in sorted(t.back.items())},
             el0_places={n: t.places[n] for n in PLACES.values()}, el0_place_pct={n: pct(t.places[n], el0) for n in PLACES.values()},
             privilege=dict(t.privilege), privilege_pct={k: pct(n, el0) for k, n in t.privilege.items()},
             modes=dict(t.modes), dispatch_calls={k: t.calls[k] for k in ('return', 'not_call', 'unknown')},
@@ -782,6 +791,7 @@ def markdown(rep):
                    f'{p(c["not_call"])} | {p(c["unknown"])} |')
     out += ['', 'EL0 all: EL0 samples with a place and without (rung in generated code, taken after the next trip out began: its PC',
             'is a later stretch\'s), the share to set beside the guest bucket. Everything below is of EL0 samples with a place.',
+            f'Resident samples rung before every stretch the resident kept (counted resident): {rep["phases"][0]["summed"]["resident_old"]}.',
             'EL0 places are % of EL0 samples; the call test (return, not a call, unknown) is % of dispatch samples; tail: the words',
             'appended to a block for an indirect jump or call or a shared block\'s checked link (indirect plan step 1).', '']
     whole_s = rep['phases'][0]['summed']

@@ -121,7 +121,7 @@ class Format(unittest.TestCase):
         text = (ROOT / 'crates/abi/src/sample.rs').read_text()
         const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u16|u32|u64|i64|usize) = ([^;]+);', text)}
         num = lambda n: int(const[n].replace('_', ''), 0)
-        for n in ('FILE', 'EL0', 'RESIDENT', 'EL0_UNKNOWN', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
+        for n in ('FILE', 'EL0', 'RESIDENT', 'EL0_UNKNOWN', 'OLD', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
                   'DISPATCH', 'STEP', 'HEAD', 'NO_BLOCK', 'OUTSIDE', 'HOT', 'DEAD', 'CALL_SHIFT', 'CALL_YES', 'CALL_NO',
                   'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS', 'FAR', 'AT_BIAS', 'TAIL', 'TAIL_CALL', 'TAIL_POINT'):
             self.assertEqual(getattr(sr, n), num(n), n)
@@ -199,11 +199,12 @@ class Report(Base):
         resident = [i for i, r in enumerate(recs) if r[2] >> 60 == sr.RESIDENT]
         self.assertEqual(len(resident), 1)
         r = recs[resident[0]]
-        recs[resident[0]] = (r[0], r[1], r[2] & ~(0xf << 60) | sr.EL0_UNKNOWN << 60, r[3])
+        recs[resident[0]] = (r[0], r[1], r[2] & ~(0xf << 60) | 3 << 40 | sr.EL0_UNKNOWN << 60, r[3])   # three stretches back
         problems, rep = self.report(markers=self.write(recs, markers, objects))
         self.assertEqual(problems, [])
         s = rep['phases'][0]['summed']
         self.assertEqual(s['kinds'], dict(el0=12, el0_unknown=1, resident=0, halted=2))
+        self.assertEqual((s['el0_unknown_back'], s['resident_old']), ({'3': 1}, 0))
         self.assertEqual(s['el0_all_pct'], round(100 * 13 / 15, 2))
         self.assertEqual(s['kind_pct']['el0'], round(100 * 12 / 15, 2))
         self.assertEqual(sum(s['el0_places'].values()), 12)
@@ -215,6 +216,16 @@ class Report(Base):
         sep = md.splitlines()[md.splitlines().index(head) + 1]
         self.assertEqual(head.count('|'), sep.count('|'))
         self.assertEqual(head.count('|'), row.count('|'))
+
+    def test_a_resident_sample_older_than_every_stretch_is_counted(self):
+        recs, markers, objects = standard_run()
+        i = next(i for i, r in enumerate(recs) if r[2] >> 60 == sr.RESIDENT)
+        recs[i] = (recs[i][0], recs[i][1] | sr.OLD << 60, recs[i][2], recs[i][3])
+        problems, rep = self.report(markers=self.write(recs, markers, objects))
+        self.assertEqual(problems, [])
+        s = rep['phases'][0]['summed']
+        self.assertEqual((s['kinds']['resident'], s['resident_old']), (1, 1))
+        self.assertIn('kept (counted resident): 1.', (self.d / 'case.report.md').read_text())
 
     def test_a_version_1_file_still_reads(self):
         recs, markers, objects = standard_run()
