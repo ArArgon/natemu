@@ -225,46 +225,7 @@ impl Sampler {
                 signals = s;
                 self.set(!self.on(), sample::BY_SIGNAL, u32::MAX);
             }
-            let (seq, start) = (self.seq.load(SeqCst), crate::clock::now());
-            let mut rung = 0;
-            for v in 0..self.n {
-                if !self.on() {
-                    break;
-                }
-                if blocks.word(v, study(sample::HEAD_MAGIC)).load(SeqCst) != sample::MAGIC {
-                    continue;
-                }
-                if crate::execution::park_state(blocks.memory(), v).0 != 0 {
-                    self.halted[v].fetch_add(1, SeqCst);
-                    self.host(HostRecord {
-                        kind: sample::HALTED,
-                        time: crate::clock::now(),
-                        value1: seq,
-                        value3: v as u32,
-                        ..HostRecord::default()
-                    });
-                    continue;
-                }
-                blocks
-                    .word(v, study(sample::HEAD_RING_TIME))
-                    .store(crate::clock::now(), SeqCst);
-                if bell.ring(v).is_ok() {
-                    self.rings[v].fetch_add(1, SeqCst);
-                    rung += 1;
-                }
-            }
-            let end_seq = self.seq.load(SeqCst);
-            if end_seq != seq || seq != logged {
-                self.host(HostRecord {
-                    kind: sample::PASS,
-                    time: start,
-                    value1: crate::clock::now(),
-                    value2: seq,
-                    value3: end_seq as u32,
-                    value4: rung,
-                });
-            }
-            logged = end_seq;
+            self.pass(blocks, |v| bell.ring(v).is_ok(), &mut logged);
             next += period;
             let now = Instant::now();
             match next.checked_duration_since(now) {
@@ -272,6 +233,49 @@ impl Sampler {
                 None => next = now,
             }
         }
+    }
+    /// One ringing pass (`ring` rings vCPU v's bell; `logged`: the sequence number the last logged pass ended under).
+    fn pass(&self, blocks: &Blocks, mut ring: impl FnMut(usize) -> bool, logged: &mut u64) {
+        let (seq, start) = (self.seq.load(SeqCst), crate::clock::now());
+        let mut rung = 0;
+        for v in 0..self.n {
+            if !self.on() {
+                break;
+            }
+            if blocks.word(v, study(sample::HEAD_MAGIC)).load(SeqCst) != sample::MAGIC {
+                continue;
+            }
+            if crate::execution::park_state(blocks.memory(), v).0 != 0 {
+                self.halted[v].fetch_add(1, SeqCst);
+                self.host(HostRecord {
+                    kind: sample::HALTED,
+                    time: crate::clock::now(),
+                    value1: seq,
+                    value3: v as u32,
+                    ..HostRecord::default()
+                });
+                continue;
+            }
+            blocks
+                .word(v, study(sample::HEAD_RING_TIME))
+                .store(crate::clock::now(), SeqCst);
+            if ring(v) {
+                self.rings[v].fetch_add(1, SeqCst);
+                rung += 1;
+            }
+        }
+        let end_seq = self.seq.load(SeqCst);
+        if end_seq != seq || seq != *logged {
+            self.host(HostRecord {
+                kind: sample::PASS,
+                time: start,
+                value1: crate::clock::now(),
+                value2: seq,
+                value3: end_seq as u32,
+                value4: rung,
+            });
+        }
+        *logged = end_seq;
     }
     /// The drain thread's loop: every 250 ms until `done`, then the last drain and the counters.
     pub(crate) fn drain_until(&self, blocks: &Blocks, done: &AtomicBool) {
@@ -468,9 +472,89 @@ impl Objects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use natemu_abi::sample::Sample;
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("natemu-sampler-{name}-{}", std::process::id()))
+    }
+
+    /// The samples file's records, decoded as host records (the resident's are compared word by word).
+    fn records(path: &std::path::Path) -> Vec<[u64; 4]> {
+        std::fs::read(path)
+            .unwrap()
+            .chunks(32)
+            .map(|c| std::array::from_fn(|k| u64::from_le_bytes(c[8 * k..8 * k + 8].try_into().unwrap())))
+            .collect()
+    }
+
+    /// The host's side over two fake vCPU blocks, one with a sampling resident: `begin` gives each its bell's INTID; a pass
+    /// rings the sampling one only (the other has no magic), records a halted one instead of ringing it, and is logged;
+    /// each drain writes a VCPU record and that ring's records in order across the wrap, a full ring's lost count; the end
+    /// writes the counters (rings, halted, written, lost, drained, the vCPU that never sampled).
+    #[test]
+    fn the_rings_are_drained_and_counted() {
+        const BLOCK: usize = 2 << 20;
+        let stride = (cache::GLOBAL_OFFSET + cache::GLOBAL_BYTES).next_multiple_of(BLOCK);
+        let memory = Arc::new(crate::memory::Memory::with_size(2 * stride).unwrap());
+        let blocks = Blocks::for_tests(memory.clone(), 2, stride);
+        let name = temp("rings");
+        let s = Sampler::new(&Options::new(&name), 2, None).unwrap();
+        s.begin(&blocks, |v| 100 + v as u32);
+        assert_eq!([0, 1].map(|v| blocks.word(v, study(sample::HEAD_BELL)).load(SeqCst)), [100, 101]);
+        blocks.word(0, study(sample::HEAD_MAGIC)).store(sample::MAGIC, SeqCst); // vCPU 0's resident samples
+        let (mut rung, mut logged) = (Vec::new(), u64::MAX);
+        s.pass(&blocks, |v| {
+            rung.push(v);
+            true
+        }, &mut logged);
+        assert_eq!(rung, [0]);
+        assert_ne!(blocks.word(0, study(sample::HEAD_RING_TIME)).load(SeqCst), 0, "the ring time before the ring");
+        crate::execution::set_halted(&memory, 0, 1);
+        s.pass(&blocks, |v| {
+            rung.push(v);
+            true
+        }, &mut logged);
+        assert_eq!(rung, [0], "a halted vCPU is not rung");
+        crate::execution::set_halted(&memory, 0, 0);
+        // The resident's side: three quarters of a ring, drained; then a lap and two more, which the full ring loses.
+        let ring = unsafe { sample::Ring::at(blocks.ptr(0, study(0), sample::BYTES)) };
+        let rec = |k: u64| Sample { time: k, rip: k, kind: sample::EL0, place: sample::BLOCK, ..Sample::default() }.encode();
+        let first = (3 * sample::CAPACITY / 4) as u64;
+        (0..first).for_each(|k| assert!(ring.push(rec(k))));
+        s.drain(&blocks);
+        (first..first + sample::CAPACITY as u64 + 2).for_each(|k| {
+            ring.push(rec(k));
+        });
+        s.drain_until(&blocks, &AtomicBool::new(true)); // the last drain and the counters
+        let r = records(&Options::new(&name).file("samples"));
+        assert_eq!(r[0], sample::file_header(crate::clock::frequency(), 2, 250));
+        let host = |w: &[u64; 4]| HostRecord::decode(*w);
+        let vcpu: Vec<usize> = (0..r.len()).filter(|&i| sample::kind(&r[i]) == sample::VCPU).collect();
+        assert_eq!(vcpu.len(), 2, "one per drain with new records");
+        let (a, b) = (host(&r[vcpu[0]]), host(&r[vcpu[1]]));
+        assert_eq!((a.value3, a.value4, a.value1, a.value2), (0, first as u32, 0, first));
+        assert_eq!((b.value3, b.value4, b.value1), (0, sample::CAPACITY as u32, 2));
+        let drained: Vec<u64> = vcpu
+            .iter()
+            .flat_map(|&i| r[i + 1..i + 1 + host(&r[i]).value4 as usize].iter().map(|w| Sample::decode(*w).time))
+            .collect();
+        assert_eq!(drained, (0..first + sample::CAPACITY as u64).collect::<Vec<_>>(), "in order, across the wrap");
+        let kinds = |k: u8| r.iter().filter(|w| sample::kind(w) == k).count();
+        assert_eq!((kinds(sample::HALTED), kinds(sample::TOGGLE)), (1, 1));
+        assert!(kinds(sample::PASS) >= 1 && kinds(sample::CLOCK) >= 3);
+        let count = |v: u32, c: u32| {
+            r.iter().map(host).find(|h| h.kind == sample::COUNT && h.value3 == v && h.value4 == c).map(|h| h.value1)
+        };
+        assert_eq!(count(0, sample::C_RINGS), Some(1));
+        assert_eq!(count(0, sample::C_HALTED), Some(1));
+        assert_eq!(count(0, sample::C_WRITTEN), Some(first + sample::CAPACITY as u64));
+        assert_eq!(count(0, sample::C_LOST), Some(2));
+        assert_eq!(count(0, sample::C_DRAINED), Some(first + sample::CAPACITY as u64));
+        assert_eq!(count(1, sample::C_RINGS), None, "vCPU 1 never sampled");
+        assert_eq!(count(u32::MAX, sample::C_NOT_SAMPLING), Some(1));
+        for ext in ["samples", "objects"] {
+            let _ = std::fs::remove_file(Options::new(&name).file(ext));
+        }
     }
 
     /// Each distinct (RIP, frame, context, bytes) is written once, in the abi's layout: a repeat is dropped, and an answer

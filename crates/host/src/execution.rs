@@ -205,6 +205,11 @@ pub(crate) struct Blocks {
     stride: usize,
 }
 impl Blocks {
+    /// Test seam: `n` blocks of `stride` bytes in `memory` (the global area at its offset in the first).
+    #[cfg(test)]
+    pub(crate) fn for_tests(memory: Arc<Memory>, n: usize, stride: usize) -> Self {
+        Blocks { memory, n, stride }
+    }
     pub(crate) fn memory(&self) -> &Memory {
         &self.memory
     }
@@ -819,6 +824,11 @@ pub(crate) fn pending(memory: &Memory, v: usize, vector: u64) -> bool {
 /// L4a: vCPU `v`'s published APIC word (what senders match destinations against, `natemu_abi::lapic::published`).
 pub(crate) fn published(memory: &Memory, v: usize) -> u64 {
     event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst)
+}
+/// Test seam: vCPU `v`'s park state word (`Events::halted`).
+#[cfg(test)]
+pub(crate) fn set_halted(memory: &Memory, v: usize, word: u64) {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).store(word, SeqCst);
 }
 /// Test seam: stores vCPU `v`'s published APIC word, and reads a vector's TMR bit.
 #[cfg(test)]
