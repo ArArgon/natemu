@@ -5112,6 +5112,22 @@ pub mod perf {
         "pool",
         "relink",
     ];
+    /// `Control::system_from`'s slots past the buckets (a `perf` resident writes them; 0 otherwise): the system calls'
+    /// SYSCALLs and SYSRETs the resident's fast path ran to the end (perf chunk 22, reported as `"?"`), and the trip-cost
+    /// plan's step 0 split of the `helper` bucket's entries by kind: `svc #X87` (x87 transcendental, remainder, scale and
+    /// extract) and `svc #STRING` (the PCMPxSTRx intermediate result).
+    pub const FROM_SYS_FAST: usize = BUCKETS;
+    pub const FROM_X87: usize = BUCKETS + 1;
+    pub const FROM_STRING: usize = BUCKETS + 2;
+    /// The report's name of `system_from`'s slot `b`: a bucket's, or the extra slots' above (`"?"` for any other).
+    pub fn from_name(b: usize) -> &'static str {
+        match b {
+            FROM_X87 => "x87",
+            FROM_STRING => "string",
+            _ => NAMES.get(b).copied().unwrap_or("?"),
+        }
+    }
+    const _: () = assert!(FROM_STRING < 32);
 }
 
 #[cfg(test)]

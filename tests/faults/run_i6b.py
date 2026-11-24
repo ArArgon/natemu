@@ -14,7 +14,8 @@ reported; the reduced-precision deviation).
 FSINCOS raise no flag): the C2 out-of-range rule at and around 2^63, FPREM/FPREM1 quotient bits and partial remainders, stack
 underflow and overflow for every form with the masked responses, the exception word (IE ZE OE UE PE), invalid operands, and
 for PCMPxSTRx the memory faults (#PF not present and crossing, #GP/#SS non-canonical, no alignment fault), each with the state
-at the fault equal to the state before the instruction.
+at the fault equal to the state before the instruction; and `helper-counts` (trip-cost plan step 0): under the `perf` resident, the
+helper entries counted by kind (`x87`, `string`) equal the FSINs and PCMPISTRIs a program ran.
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, pathlib, struct, subprocess, sys
@@ -284,8 +285,38 @@ def judge(c, code, vm, offsets, regs):
     return problems
 
 
+HELPER_COUNTS = {'x87': 37, 'string': 23}   # distinct, so a swap or a merge of the two counters shows
+
+
+def helper_counts(a, host):
+    """Trip-cost plan step 0 (docs/restructure/trip-cost-plan.md, T11): under the `perf` resident, the `helper` bucket's
+    entries split by kind (K1 `systems.from`'s `x87` and `string`) count exactly the FSINs and PCMPISTRIs the program ran,
+    each in a loop of its own (the counter in R8: PCMPISTRI writes ECX)."""
+    import run_k1
+    runtime = run_k1.perf_runtime(argparse.Namespace(perf_runtime=None))
+    lines = ['fninit', f'mov r8d, {HELPER_COUNTS["x87"]}', '1:', 'fld1', 'fsin', 'fstp st(0)', 'dec r8d', 'jnz 1b',
+             'movdqu xmm1, xmmword ptr [rdi]', 'movdqu xmm2, xmmword ptr [rdi + 16]',
+             f'mov r8d, {HELPER_COUNTS["string"]}', '2:', 'pcmpistri xmm1, xmm2, 0x0c', 'dec r8d', 'jnz 2b']   # (the program ends where its code does)
+    code = ref.assemble('\n'.join(lines))
+    work = a.out / 'work' / 'helper-counts'; work.mkdir(parents=True, exist_ok=True)
+    text, _ = f6.description({'setup': [], 'cpl': 0}, code)
+    (work / 'program.txt').write_text(text)
+    run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([str(a.max_block)] if a.max_block else []) +
+                         vm1.CODE_SHAPE, capture_output=True, text=True)
+    if run.returncode: return [f'driver: {run.stderr.strip()[-300:]}']
+    vm = json.loads(run.stdout)
+    if vm['stop'] != 'reached': return [f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}"]
+    got = vm['stats']['k1']['systems']['from']
+    return [f'helper entries {k} {got.get(k, 0)}, want {n} (K1 systems.from {got})' for k, n in HELPER_COUNTS.items() if got.get(k, 0) != n]
+
+
 def cases(a, host, runtime):
     results, bad = [], 0
+    if not a.only or a.only in 'helper-counts':
+        problems = helper_counts(a, host)
+        bad += bool(problems)
+        results.append({'name': 'helper-counts', 'ok': not problems, 'problems': problems})
+        if problems: print('FAIL helper-counts', '; '.join(problems)[:400])
     for c in cases_list():
         if a.only and a.only not in c['name']: continue
         code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' if not l.endswith(':') else l for i, l in enumerate(c['lines'])), labels=True)

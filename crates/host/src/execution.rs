@@ -1248,7 +1248,7 @@ struct K1Systems {
 }
 impl K1 {
     fn new(c: &cache::Control) -> Self {
-        use natemu_abi::execution::perf::{NAMES as BUCKETS, SYS_FAST_DECLINE_NAMES};
+        use natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES;
         const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
         let us = |ticks| ticks_ns(ticks) / 1000;
         Self {
@@ -1313,7 +1313,7 @@ impl K1 {
                     .collect(),
                 from: (0..32)
                     .filter(|&b| c.system_from[b] != 0)
-                    .map(|b| (*BUCKETS.get(b).unwrap_or(&"?"), c.system_from[b]))
+                    .map(|b| (natemu_abi::execution::perf::from_name(b), c.system_from[b]))
                     .collect(),
                 chained: c.system_chained,
                 declined: SYS_FAST_DECLINE_NAMES
@@ -5133,7 +5133,7 @@ mod tests {
             .map(|b| {
                 format!(
                     "\"{}\":{}",
-                    natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"),
+                    natemu_abi::execution::perf::from_name(b),
                     c.system_from[b]
                 )
             })

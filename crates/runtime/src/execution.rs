@@ -1103,7 +1103,7 @@ fn decline_fast(reason: usize) {
 /// Perf chunk 22, `perf` resident: [`Control::system_from`]'s slot (past the buckets) counting the system calls'
 /// SYSCALLs and SYSRETs [`sys_fast`] ran to the end (the host reports it as `"?"`).
 #[cfg(feature = "perf")]
-const SYS_FAST: usize = crate::perf::BUCKETS;
+const SYS_FAST: usize = crate::perf::FROM_SYS_FAST;
 /// Why a literal exit to a kept SYSCALL or SYSRET did not run `sys_fast` to the end: no current decode (a CR3
 /// load or TLB flush since it was last used); the boundary before it had something to do, or the exit was not an
 /// ordinary one; the decode current but not committing; after the instruction, a trap or event to take or a target not
@@ -2505,8 +2505,21 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64) -> ! {
                 missed(frame)
             }
             imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
-            svc::X87 => helpers::x87(frame, elr, spsr),
-            svc::STRING => helpers::string(frame, elr, spsr),
+            svc::X87 => {
+                // Trip-cost plan step 0: the `helper` bucket's entries by kind (`perf` resident only).
+                #[cfg(feature = "perf")]
+                {
+                    cache::control().system_from[crate::perf::FROM_X87] += 1;
+                }
+                helpers::x87(frame, elr, spsr)
+            }
+            svc::STRING => {
+                #[cfg(feature = "perf")]
+                {
+                    cache::control().system_from[crate::perf::FROM_STRING] += 1;
+                }
+                helpers::string(frame, elr, spsr)
+            }
             _ => {}
         }
         halt_native([esr, 0, elr], stop::UNKNOWN_ABORT)
