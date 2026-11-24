@@ -2505,21 +2505,22 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u6
                 miss_fast(frame);
                 missed(frame)
             }
-            imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
+            // (Trip-cost step 2: `frame_ptr` itself, which they write; `frame` is not used after these calls.)
+            imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame_ptr, elr, spsr),
             svc::X87 => {
                 // Trip-cost plan step 0: the `helper` bucket's entries by kind (`perf` resident only).
                 #[cfg(feature = "perf")]
                 {
                     cache::control().system_from[crate::perf::FROM_X87] += 1;
                 }
-                helpers::x87(frame, elr, spsr)
+                helpers::x87(frame_ptr, elr, spsr)
             }
             svc::STRING => {
                 #[cfg(feature = "perf")]
                 {
                     cache::control().system_from[crate::perf::FROM_STRING] += 1;
                 }
-                helpers::string(frame, elr, spsr)
+                helpers::string(frame_ptr, elr, spsr)
             }
             _ => {}
         }
@@ -2535,8 +2536,12 @@ pub unsafe fn fp_cancel(frame: *mut NativeFrame, kind: u64) {
 /// Perf chunk 22: the synchronous exception being taken is an `svc #LINK` or `svc #MISS` (ESR_EL1: EC 0x15 and its
 /// immediate), whose service ([`linker`], [`missed`], or a halt) reads only the gate's frame, never `Shared::captured`. AFP accurate chunk
 /// 6b: also a trapped FP exception (EC 0x2C): [`fp::trap`] works on the gate's frame in place, and copies it only for its step fallback.
+/// Trip-cost plan step 2: and the division and helper `svc`s ([`division`], [`helpers::x87`], [`helpers::string`]), which
+/// read their inputs from the gate's frame, write their results into it and resume from it.
 pub fn frame_only(esr: u64) -> bool {
-    esr >> 26 == fp::EC_FP_TRAP || esr >> 26 == 0x15 && matches!((esr & 0xffff) as u16, svc::LINK | svc::MISS)
+    esr >> 26 == fp::EC_FP_TRAP
+        || esr >> 26 == 0x15
+            && matches!((esr & 0xffff) as u16, svc::LINK | svc::MISS | svc::DIV_U | svc::DIV_S | svc::X87 | svc::STRING)
 }
 /// A block exit to the dispatcher's miss: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
 /// Not inlined, as [`halt_native`]: `returned` holds no state copy (the nested-entry stack bound).
@@ -2582,23 +2587,22 @@ fn resident_fault(native: [u64; 3]) -> ! {
 
 /// The 128/64 division (`svc #DIV_U/DIV_S` from a block, FEX's LUDIV/LDIV): x0 high, x1 low, x2 divisor in; x0
 /// quotient, x1 remainder and x2 = 0 out, or x2 = 1 for #DE (the block then branches to its divide stub). Nothing else
-/// changes; the block resumes after the `svc`.
+/// changes; the block resumes after the `svc`. Trip-cost plan step 2: `f` is the gate's frame (no copy into
+/// `Shared::captured`), its inputs read before the results are written into it and the block resumed from it; the record is
+/// read in place, as [`sys_fast`] does (nothing here copies it out and back; a halt copies).
 #[inline(never)] // its frame stays out of `returned` (the nested-entry stack bound)
-unsafe fn division(signed: bool, f: &NativeFrame, elr: u64, spsr: u64) -> ! {
+unsafe fn division(signed: bool, f: *mut NativeFrame, elr: u64, spsr: u64) -> ! {
     unsafe {
-        let s = load();
         if cache::block_at(elr.wrapping_sub(4)).is_none() {
-            let mut s = s;
-            s.native = [0, 0, elr];
-            halt(&s, stop::UNKNOWN_ABORT)
+            halt_native([0, 0, elr], stop::UNKNOWN_ABORT)
         }
-        let resume = &raw mut (*shared()).captured;
-        let (quotient, remainder, de) = match divide(signed, f.x[0], f.x[1], f.x[2]) {
+        let (high, low, divisor) = ((*f).x[0], (*f).x[1], (*f).x[2]);
+        let (quotient, remainder, de) = match divide(signed, high, low, divisor) {
             Some((q, r)) => (q, r, 0),
-            None => (f.x[0], f.x[1], 1),
+            None => (high, low, 1),
         };
-        ((*resume).x[0], (*resume).x[1], (*resume).x[2]) = (quotient, remainder, de);
-        self::resume(&s, resume, elr, spsr)
+        ((*f).x[0], (*f).x[1], (*f).x[2]) = (quotient, remainder, de);
+        self::resume(&*record(), f, elr, spsr)
     }
 }
 
