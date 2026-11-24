@@ -303,11 +303,12 @@ impl Virtio {
         table.set_gate(bus_master.clone());
         let msix = Arc::new(Mutex::new(table));
         // QEMU's class codes (the spec's device table): mass storage / SCSI, network / Ethernet, and for entropy
-        // class 0x00 subclass 0xff.
-        let (class, subclass) = match self.profile {
+        // class 0x00 subclass 0xff; a model names its own.
+        let (class, subclass) = match &self.profile {
             Profile::Block(_) => (PciClassCode::MassStorage, 0),
             Profile::Network(_) => (PciClassCode::NetworkController, 0),
             Profile::Entropy => (PciClassCode::TooOld, 0xff),
+            Profile::Model(hosted) => hosted.model.pci_class(),
         };
         let mut config = PciConfiguration::new(
             VENDOR,
@@ -399,7 +400,7 @@ impl Virtio {
                 0x16 => s.queue_sel.into(),
                 // The queue's size; before one is written, the maximum (4.1.4.3.2: the driver reads it there).
                 0x18 if valid => match s.queues[q].size {
-                    0 => self.profile.queue_max().into(),
+                    0 => self.profile.size_max(q).into(),
                     size => size.into(),
                 },
                 0x1a if valid => s.vectors.0[q].into(),
@@ -432,7 +433,7 @@ impl Virtio {
             // queue_enable = 1 (0 went to the MMIO queue reset): with no size written, the maximum (4.1.4.3.2).
             0x1c if valid => {
                 if s.queues[q].size == 0 && !s.queues[q].ready && !s.queue_active(q) {
-                    s.queues[q].size = self.profile.queue_max();
+                    s.queues[q].size = self.profile.size_max(q);
                 }
                 return self.write_queue_ready(s, q, value as u32);
             }
@@ -1052,7 +1053,7 @@ mod tests {
         assert!(!rig.d.lock().notified.iter().any(|n| *n));
         // RX's gate never opens: the locked notify, which sees no received frame.
         rig.write(NOTIFY, 2, 0);
-        assert!(rig.d.lock().rx_kicked);
+        assert!(rig.d.lock().rx_kicked[0]);
     }
     #[test]
     fn isr_read_clears() {

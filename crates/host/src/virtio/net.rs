@@ -263,13 +263,13 @@ impl PacketPort {
         let before = frames.len();
         let mut taken = false;
         while !frames.is_empty() {
-            if !s.current(id) || !s.accepting(0) || s.received.len() >= RX_SLOTS {
+            if !s.current(id) || !s.accepting(0) || s.received[0].len() >= RX_SLOTS {
                 break;
             }
             let frame = frames.pop_front().expect("nonempty");
             match received_packet(frame, accepted, self.offloads) {
                 Some(packet) => {
-                    s.received.push_back((id, packet));
+                    s.received[0].push_back((id, Arrival::Packet(packet)));
                     taken = true;
                 }
                 None => {
@@ -278,7 +278,7 @@ impl PacketPort {
             }
         }
         // An RX request in flight re-notifies itself while frames wait (`finish_request`).
-        if taken && !s.notified[0] && !s.queue_active(0) && !s.rx_starved {
+        if taken && !s.notified[0] && !s.queue_active(0) && !s.rx_starved[0] {
             s.notified[0] = true;
             device.busy(&mut s);
             device.wake.ring();
@@ -397,11 +397,13 @@ impl Virtio {
         chain: &Chain<'_>,
         snapshot: &Snapshot,
         network: &Network,
-        received: Option<Packet>,
+        received: Option<Arrival>,
         cancel: &AtomicBool,
     ) -> Result<Request> {
         if self.profile.is_rx(chain.id.queue) {
-            let packet = received.expect("RX admission reserves a frame");
+            let Some(Arrival::Packet(packet)) = received else {
+                panic!("RX admission reserves a frame")
+            };
             return self.net_receive(guest, chain, snapshot, network, packet);
         }
         let capacity = match capacity(chain.descriptors, false) {
@@ -479,7 +481,10 @@ impl Virtio {
                 Ok(None) => {
                     return Ok(
                         match self.ask_for_buffer(guest, q, chain.id, next.next_avail)? {
-                            Some(posted) => Request::Starved { packet, posted },
+                            Some(posted) => Request::Starved {
+                                packet: Arrival::Packet(packet),
+                                posted,
+                            },
                             None => Request::Canceled,
                         },
                     );
@@ -518,12 +523,16 @@ impl Virtio {
             None => Request::Canceled,
         })
     }
-    /// Ring the network backend's doorbell, if any.
+    /// Ring the network backend's (or the model's) doorbell, if any.
     pub(super) fn backend_ready(&self) {
-        if let Profile::Network(network) = &self.profile {
-            if let Some(ready) = network.ready.get() {
-                ready();
+        match &self.profile {
+            Profile::Network(network) => {
+                if let Some(ready) = network.ready.get() {
+                    ready();
+                }
             }
+            Profile::Model(hosted) => hosted.ring(),
+            Profile::Entropy | Profile::Block(_) => {}
         }
     }
     /// Queue one TX packet for the backend while `id` is current: true once queued, false if a
@@ -1049,14 +1058,14 @@ mod tests {
             assert!(p.receive(&frame()));
         }
         assert!(!p.receive(&frame()), "RX_SLOTS frames wait at most");
-        let old = d.lock().received.front().unwrap().0;
+        let old = d.lock().received[0].front().unwrap().0;
         write(&d, reg::QUEUE_SEL, 0);
         write(&d, reg::QUEUE_READY, 0);
-        assert!(d.lock().received.is_empty());
+        assert!(d.lock().received[0].is_empty());
         write(&d, reg::QUEUE_READY, 1);
         assert!(!d.current(old));
         assert!(p.receive(&frame()));
-        assert_ne!(d.lock().received.front().unwrap().0, old);
+        assert_ne!(d.lock().received[0].front().unwrap().0, old);
         d.stop();
     }
     #[test]
@@ -1206,18 +1215,18 @@ mod tests {
         starve(true);
         {
             let s = d.lock();
-            assert!(!s.rx_starved && s.notified[0], "retried at once");
-            assert_eq!(s.received.len(), 1, "the frame is kept");
+            assert!(!s.rx_starved[0] && s.notified[0], "retried at once");
+            assert_eq!(s.received[0].len(), 1, "the frame is kept");
         }
         starve(false);
         assert!(
-            d.lock().rx_starved && !d.lock().notified[0],
+            d.lock().rx_starved[0] && !d.lock().notified[0],
             "held until notified"
         );
         assert!(p.receive(&frame()));
         assert!(!d.lock().notified[0], "arrivals wait too");
         write(&d, reg::QUEUE_NOTIFY, 0);
-        assert!(!d.lock().rx_starved && d.lock().notified[0]);
+        assert!(!d.lock().rx_starved[0] && d.lock().notified[0]);
         d.stop();
     }
     #[test]
@@ -1582,7 +1591,7 @@ mod tests {
                 deliver(rig, 2);
                 std::thread::sleep(Duration::from_millis(50));
                 assert_eq!(rig.used(0), 4, "nothing partial is published");
-                assert!(rig.d.lock().rx_starved);
+                assert!(rig.d.lock().rx_starved[0]);
                 for i in 5..8 {
                     rig.post_rx(i);
                 }
@@ -1641,7 +1650,7 @@ mod tests {
                     },
                 }]);
                 assert!(rig.p.receive_from(&mut one));
-                until("starved", || rig.d.lock().rx_starved);
+                until("starved", || rig.d.lock().rx_starved[0]);
                 assert_eq!(
                     rig.word(avail_event).load(SeqCst),
                     1,
@@ -1683,7 +1692,7 @@ mod tests {
                 assert!(rig.p.receive_from(&mut frames));
                 until("the small frame", || rig.used(0) == 1);
                 assert_eq!(rig.p.lost(), 1);
-                assert!(!rig.d.lock().rx_starved);
+                assert!(!rig.d.lock().rx_starved[0]);
             });
         }
         #[test]

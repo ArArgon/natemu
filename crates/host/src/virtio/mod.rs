@@ -6,6 +6,7 @@
 //! alongside the vCPU owners, call [`Virtio::stop`], and join the owner before detaching IRQs or
 //! destroying the VM.
 mod block;
+mod model;
 mod net;
 mod pci;
 mod profile;
@@ -230,12 +231,18 @@ struct State {
     token: u64,
     /// Keeps the VM from ending as all-halted while work is pending.
     busy: Option<Busy>,
-    /// One received packet waiting for an RX buffer, tagged with the RX queue's incarnation.
-    received: VecDeque<(Identity, net::Packet)>,
-    /// RX found no buffer: hold the received frames until the driver notifies RX.
-    rx_starved: bool,
-    /// The driver notified RX since the current RX request was admitted: that request cannot starve.
-    rx_kicked: bool,
+    /// Per receive queue ([`Profile::is_rx`]): data waiting for its buffers (network: received packets; a model: the
+    /// bytes it delivered), each tagged with the queue's incarnation.
+    received: [VecDeque<(Identity, Arrival)>; MAX_QUEUES],
+    /// Per receive queue: it found no buffer: hold its data until the driver notifies it.
+    rx_starved: [bool; MAX_QUEUES],
+    /// Per receive queue: the driver notified it since its current request was admitted: that request cannot starve.
+    rx_kicked: [bool; MAX_QUEUES],
+    /// Model, per DeviceReads queue: the request the model answered Busy, waiting for [`model::ModelPort::resume`];
+    /// until then the queue admits nothing else.
+    parked: [Option<model::Parked>; MAX_QUEUES],
+    /// Model, per queue: [`model::ModelPort::resume`] since the queue's last admission.
+    resumed: [bool; MAX_QUEUES],
     backend_error: Option<String>,
     /// Block, per queue: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY (the owner's kick suppression).
     /// A reset waits for the owner to clear it, so no incarnation ends with its driver's kicks suppressed.
@@ -302,6 +309,13 @@ impl State {
             && !self.waiting.iter().any(|w| w.vcpu == vcpu)
             && self.token != u64::MAX
     }
+    /// Drop the data waiting for `queue`'s buffers and its parked request.
+    fn drop_held(&mut self, queue: usize) {
+        self.received[queue].clear();
+        self.rx_starved[queue] = false;
+        self.parked[queue] = None;
+        self.resumed[queue] = false;
+    }
     /// A notification of `queue` is dropped now, as every earlier one not yet admitted: the queue does not accept work,
     /// the device stopped, or a reset of the queue is closing.
     fn kills(&self, queue: usize) -> bool {
@@ -363,6 +377,10 @@ enum Profile {
     Entropy,
     Block(block::Disk),
     Network(net::Network),
+    /// Any device on owned buffers ([`model::Model`]).
+    // The console (the plan's next task) is the first outside the tests.
+    #[cfg_attr(not(test), expect(dead_code))]
+    Model(model::Hosted),
 }
 impl Profile {
     fn device_id(&self) -> u32 {
@@ -370,6 +388,7 @@ impl Profile {
             Self::Network(_) => 1,
             Self::Block(_) => 2,
             Self::Entropy => 4,
+            Self::Model(hosted) => hosted.model.device_id(),
         }
     }
     fn queue_count(&self) -> usize {
@@ -377,13 +396,29 @@ impl Profile {
             Self::Network(_) => 2,
             Self::Block(disk) => disk.queues(),
             Self::Entropy => 1,
+            Self::Model(hosted) => hosted.model.queues().len(),
         }
     }
+    /// The largest queue size of any of the device's queues (a metadata snapshot's size).
     fn queue_max(&self) -> u16 {
         match self {
             Self::Entropy => RNG_MAX_QUEUE,
             Self::Block(_) => BLOCK_QUEUE,
             Self::Network(_) => 256,
+            Self::Model(hosted) => hosted
+                .model
+                .queues()
+                .iter()
+                .map(|q| q.max)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+    /// QueueNumMax of `queue`.
+    fn size_max(&self, queue: usize) -> u16 {
+        match self {
+            Self::Model(hosted) => hosted.model.queues().get(queue).map_or(0, |q| q.max),
+            _ => self.queue_max(),
         }
     }
     fn features(&self) -> u64 {
@@ -391,11 +426,12 @@ impl Profile {
             Self::Entropy => VERSION_1,
             Self::Block(disk) => disk.features(),
             Self::Network(network) => network.features(),
+            Self::Model(hosted) => VERSION_1 | hosted.model.features(),
         }
     }
     fn required(&self) -> u64 {
         match self {
-            Self::Entropy | Self::Network(_) => VERSION_1,
+            Self::Entropy | Self::Network(_) | Self::Model(_) => VERSION_1,
             Self::Block(_) => block::REQUIRED,
         }
     }
@@ -403,12 +439,28 @@ impl Profile {
     fn accepts(&self, features: u64) -> bool {
         features & !self.features() == 0
             && features & self.required() == self.required()
-            && (!matches!(self, Self::Network(_)) || net::dependencies_met(features))
+            && match self {
+                Self::Network(_) => net::dependencies_met(features),
+                Self::Model(hosted) => hosted.model.accepts(features),
+                Self::Entropy | Self::Block(_) => true,
+            }
     }
-    /// The network RX queue: its buffers alone are not work; a packet arrival is.
+    /// A receive queue (network RX, a model's DeviceWrites queues): its buffers alone are not work; data arriving is.
     fn is_rx(&self, queue: usize) -> bool {
-        matches!(self, Self::Network(_)) && queue == 0
+        match self {
+            Self::Network(_) => queue == 0,
+            Self::Model(hosted) => hosted.receives(queue),
+            Self::Entropy | Self::Block(_) => false,
+        }
     }
+}
+
+/// Data waiting for a receive queue's buffers.
+enum Arrival {
+    /// A network frame.
+    Packet(net::Packet),
+    /// A model's bytes: a stream's run, or one message.
+    Bytes(Vec<u8>),
 }
 
 /// The owner's one wake source: guest notifications, resets, power drain, stop and disk
@@ -757,9 +809,18 @@ enum Request {
     /// `count` used elements were published (several for one mergeable RX frame). `pending` asks
     /// the owner to look at the queue again.
     Committed { pending: bool, count: u16 },
-    /// RX: no buffer was posted. The frame goes back to the front of the queue; `posted` if a
+    /// Receive: no buffer was posted. The data goes back to the front of the queue; `posted` if a
     /// buffer appeared after the device asked to be notified of one.
-    Starved { packet: net::Packet, posted: bool },
+    Starved { packet: Arrival, posted: bool },
+    /// A model's stream filled `count` chains (published) before they ran out: `rest` goes back to
+    /// the front of the queue, as for `Starved`.
+    Partial {
+        count: u16,
+        rest: Vec<u8>,
+        posted: bool,
+    },
+    /// The model answered Busy: the request waits outside the in-flight set for a resume.
+    Parked(model::Parked),
     /// The driver broke the protocol; the device asks for a reset.
     Invalid(String),
 }
@@ -769,7 +830,9 @@ enum Work {
     Request {
         queue: Queue,
         id: Identity,
-        received: Option<net::Packet>,
+        received: Option<Arrival>,
+        /// A model's resumed request.
+        resumed: Option<model::Parked>,
     },
     Drain,
     Stop,
@@ -951,8 +1014,7 @@ impl Virtio {
         s.stopped = true;
         self.take_kicks(&mut s);
         s.notified = [false; MAX_QUEUES];
-        s.received.clear();
-        s.rx_starved = false;
+        (0..MAX_QUEUES).for_each(|q| s.drop_held(q));
         if let Some((_, p)) = &s.permit {
             p.cancel();
         }
@@ -964,8 +1026,7 @@ impl Virtio {
         let mut s = self.lock();
         s.quiescing = true;
         s.notified = [false; MAX_QUEUES];
-        s.received.clear();
-        s.rx_starved = false;
+        (0..MAX_QUEUES).for_each(|q| s.drop_held(q));
         self.wake.ring();
         Ok(s.drained)
     }
@@ -988,8 +1049,7 @@ impl Virtio {
                 s.queues = [Queue::default(); MAX_QUEUES];
                 s.notified = [false; MAX_QUEUES];
                 s.cursor = 0;
-                s.received.clear();
-                s.rx_starved = false;
+                (0..MAX_QUEUES).for_each(|q| s.drop_held(q));
                 s.status = 0;
                 s.features = 0;
                 self.accepted.store(0, SeqCst);
@@ -999,6 +1059,9 @@ impl Virtio {
                 s.vectors = Default::default();
                 if let Some(pci) = self.pci.get() {
                     pci.clear_pending();
+                }
+                if let Profile::Model(hosted) = &self.profile {
+                    hosted.model.reset();
                 }
                 s.device_sel = 0;
                 s.driver_sel = 0;
@@ -1017,20 +1080,18 @@ impl Virtio {
                 };
                 s.notified[i] = false;
                 s.owing &= !(1 << i);
-                if i == 0 {
-                    s.received.clear();
-                    s.rx_starved = false;
-                }
+                s.drop_held(i);
             }
         }
         self.irq(s);
         self.settle(s);
     }
-    /// Release the busy guard once no work is notified, nothing is in flight and the block owner holds no interrupt
-    /// back (`block::Hold`: the guard vetoes the all-halted end while this device may still post).
+    /// Release the busy guard once no work is notified, nothing is in flight or parked and the block owner holds no
+    /// interrupt back (`block::Hold`: the guard vetoes the all-halted end while this device may still post).
     fn settle(&self, s: &mut State) {
         let held = s.owing != 0 && matches!(self.profile, Profile::Block(_));
-        if !s.pending() && s.in_flight.is_empty() && !held {
+        let parked = s.parked.iter().any(Option::is_some);
+        if !s.pending() && s.in_flight.is_empty() && !held && !parked {
             s.busy = None;
         }
     }
@@ -1093,7 +1154,7 @@ impl Virtio {
             reg::DEVICE_ID => self.profile.device_id(),
             reg::VENDOR_ID => VENDOR,
             reg::DEVICE_FEATURES => feature_word(self.profile.features(), s.device_sel),
-            reg::QUEUE_NUM_MAX if valid_queue => self.profile.queue_max().into(),
+            reg::QUEUE_NUM_MAX if valid_queue => self.profile.size_max(selected).into(),
             reg::QUEUE_READY => u32::from(valid_queue && s.queues[selected].ready),
             reg::INTERRUPT_STATUS => {
                 profile::count(profile::STATUS_READS);
@@ -1152,7 +1213,7 @@ impl Virtio {
             };
         }
         if offset == reg::QUEUE_NUM {
-            let max = self.profile.queue_max().into();
+            let max = self.profile.size_max(queue).into();
             if value == 0 || value > max || !value.is_power_of_two() {
                 self.fail(s);
             } else {
@@ -1177,7 +1238,7 @@ impl Virtio {
         if value == 0 {
             return self.reset(s, Reset::Queue(queue));
         }
-        let valid = s.queues[queue].valid(self.profile.queue_max());
+        let valid = s.queues[queue].valid(self.profile.size_max(queue));
         if value != 1 || s.status & status::FEATURES_OK == 0 || !valid {
             self.fail(s);
         } else {
@@ -1188,17 +1249,17 @@ impl Virtio {
         }
         Access::Completed(0)
     }
-    /// QueueNotify: schedule `queue` if it accepts work. RX buffers alone are not work; packet
+    /// QueueNotify: schedule `queue` if it accepts work. Receive buffers alone are not work; data
     /// arrival schedules the scan, even without a new kick.
     fn notify(&self, s: &mut State, queue: usize) {
         if queue >= self.profile.queue_count() || !s.accepting(queue) {
             return;
         }
         if self.profile.is_rx(queue) {
-            s.rx_starved = false;
-            s.rx_kicked = true;
+            s.rx_starved[queue] = false;
+            s.rx_kicked[queue] = true;
         }
-        if self.profile.is_rx(queue) && s.received.is_empty() {
+        if self.profile.is_rx(queue) && s.received[queue].is_empty() {
             return;
         }
         s.notified[queue] = true;
@@ -1215,6 +1276,7 @@ impl Virtio {
             self.fail(s);
             return Access::Completed(0);
         }
+        let old = s.status;
         s.status = value;
         if value & status::DRIVER_OK != 0 {
             self.backend_ready();
@@ -1232,6 +1294,11 @@ impl Virtio {
         if value & status::FAILED != 0 {
             s.notified = [false; MAX_QUEUES];
         }
+        if let Profile::Model(hosted) = &self.profile {
+            if old & status::DRIVER_OK == 0 && s.driver_ready() {
+                hosted.start(s.generation);
+            }
+        }
         Access::Completed(0)
     }
     /// A read of device-specific configuration, or None outside it.
@@ -1244,6 +1311,7 @@ impl Virtio {
             Profile::Entropy => None,
             Profile::Block(disk) => access(&disk.config()),
             Profile::Network(network) => access(&network.config()),
+            Profile::Model(hosted) => access(&hosted.model.config()),
         }
     }
     /// One guest MMIO access. Configuration reads complete at once. Register accesses complete,
@@ -1577,7 +1645,7 @@ impl Virtio {
         self.backend_ready();
         Ok(())
     }
-    /// Entropy and network serve one request at a time; block has its own owner loop.
+    /// Entropy, network and models serve one request at a time; block has its own owner loop.
     fn owner(&self, guest: Guest<'_>, cancel: &AtomicBool) -> Result<()> {
         if let Profile::Block(disk) = &self.profile {
             let result = self.block_owner(guest, disk, cancel);
@@ -1586,16 +1654,27 @@ impl Virtio {
         }
         let mut snapshot = Snapshot::new(self.profile.queue_max());
         loop {
-            let (queue, id, received) = match self.next_work(cancel)? {
+            let (queue, id, received, resumed) = match self.next_work(cancel)? {
                 Work::Request {
                     queue,
                     id,
                     received,
-                } => (queue, id, received),
+                    resumed,
+                } => (queue, id, received, resumed),
                 Work::Stop => return Ok(()),
-                Work::Drain => return self.drain(),
+                Work::Drain => {
+                    // A model first passes its transmitted bytes on; a stop meanwhile ends the owner undrained.
+                    return if self.model_drained(cancel) {
+                        self.drain()
+                    } else {
+                        Ok(())
+                    };
+                }
             };
-            let result = self.request(guest, &mut snapshot, queue, id, received, cancel);
+            let result = match resumed {
+                Some(parked) => self.model_resume(guest, queue, parked),
+                None => self.request(guest, &mut snapshot, queue, id, received, cancel),
+            };
             self.finish_request(result, &mut snapshot, queue, id)?;
         }
     }
@@ -1626,7 +1705,8 @@ impl Virtio {
         }
     }
     /// Take the next notified queue, round-robin, unless a reset or a deferred access must go
-    /// first. The taken queue becomes active; RX takes the packet tagged with its incarnation.
+    /// first (a queue with a parked request only once resumed). The taken queue becomes active; a
+    /// receive queue takes the data tagged with its incarnation, a resumed one its parked request.
     fn admit(&self, s: &mut State) -> Option<Work> {
         self.take_kicks(s);
         if !s.admission_open() {
@@ -1635,29 +1715,30 @@ impl Virtio {
         let count = self.profile.queue_count();
         let i = (0..count)
             .map(|n| (s.cursor + n) % count)
-            .find(|&i| s.notified[i])?;
+            .find(|&i| s.notified[i] && (s.parked[i].is_none() || s.resumed[i]))?;
         s.notified[i] = false;
         let id = s.identity(i);
         s.in_flight.push(id);
         s.cursor = (i + 1) % count;
         if self.profile.is_rx(i) {
-            s.rx_kicked = false;
+            s.rx_kicked[i] = false;
         }
-        let received = if i == 0 {
-            // Frames of an older incarnation are dropped.
-            std::iter::from_fn(|| s.received.pop_front())
-                .find_map(|(tag, packet)| (tag == id).then_some(packet))
-        } else {
-            None
-        };
+        s.resumed[i] = false;
+        // A reset of the queue drops its parked request (`State::drop_held`).
+        let resumed = s.parked[i].take();
+        debug_assert!(resumed.as_ref().is_none_or(|p| p.id() == id));
+        // Data of an older incarnation is dropped.
+        let received = std::iter::from_fn(|| s.received[i].pop_front())
+            .find_map(|(tag, packet)| (tag == id).then_some(packet));
         Some(Work::Request {
             queue: s.queues[i],
             id,
             received,
+            resumed,
         })
     }
-    /// Retire the one entropy or network request: advance the ring indices or fail the device,
-    /// then complete a reset waiting for it.
+    /// Retire the one entropy, network or model request: advance the ring indices or fail the
+    /// device, then complete a reset waiting for it.
     fn finish_request(
         &self,
         result: Result<Request>,
@@ -1682,19 +1763,44 @@ impl Virtio {
             Request::Starved { packet, posted } => {
                 snapshot.discard();
                 if s.current(id) {
-                    s.received.push_front((id, packet));
+                    s.received[id.queue].push_front((id, packet));
                     // A notification during this request may already announce the buffer.
-                    s.rx_starved = !posted && !s.rx_kicked;
+                    s.rx_starved[id.queue] = !posted && !s.rx_kicked[id.queue];
                     // The driver refills after it has seen the completions.
                     if s.owed > 0 {
                         self.raise(&mut s);
                     }
                 }
             }
+            Request::Partial {
+                count,
+                rest,
+                posted,
+            } => {
+                self.retire_request(&mut s, snapshot, q, id, true, count);
+                if s.current(id) {
+                    s.received[id.queue].push_front((id, Arrival::Bytes(rest)));
+                    s.rx_starved[id.queue] = !posted && !s.rx_kicked[id.queue];
+                }
+            }
+            Request::Parked(parked) => {
+                snapshot.discard();
+                if s.current(id) {
+                    s.parked[id.queue] = Some(parked);
+                    // A resume may have come while the model answered.
+                    if s.resumed[id.queue] && s.accepting(id.queue) {
+                        s.notified[id.queue] = true;
+                    }
+                }
+            }
         }
-        if self.profile.is_rx(id.queue) && !s.received.is_empty() && s.accepting(0) && !s.rx_starved
+        let rx = id.queue;
+        if self.profile.is_rx(rx)
+            && !s.received[rx].is_empty()
+            && s.accepting(rx)
+            && !s.rx_starved[rx]
         {
-            s.notified[0] = true;
+            s.notified[rx] = true;
         }
         self.retire_reset(&mut s);
         self.settle(&mut s);
@@ -1729,7 +1835,7 @@ impl Virtio {
         snapshot: &mut Snapshot,
         q: Queue,
         id: Identity,
-        received: Option<net::Packet>,
+        received: Option<Arrival>,
         cancel: &AtomicBool,
     ) -> Result<Request> {
         if self.profile.is_rx(id.queue) && received.is_none() {
@@ -1773,6 +1879,7 @@ impl Virtio {
                 self.net_request(guest, &chain, snapshot, network, received, cancel)
             }
             Profile::Entropy => self.entropy_request(guest, &chain),
+            Profile::Model(hosted) => self.model_request(guest, &chain, snapshot, hosted, received),
         }
     }
     /// A well-formed queue whose rings lie in guest RAM (validation only: no raw pointer is
