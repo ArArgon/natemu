@@ -33,8 +33,9 @@ STRESS = 'io-safety-stress-20261108-01'                     # bin/stress-ng, sou
 MATRIX = 'io-matrix-inputs-20261118-01'                     # run_io_matrix.py prepare's folder (the serial-stress and soak campaigns)
 PLATFORM = 'devices-platform/platform'                      # tests/devices/run_platform.py prepare's folder (its run --inputs)
 CONSOLE = 'devices-console/console'                         # tests/devices/run_console.py prepare's folder (its run --inputs)
+CONTROL = 'devices-control/control'                         # tests/devices/run_control.py prepare's folder (its run --inputs)
 PATHS = (NETBOOT_LINUX, NETBOOT_INITRD, QEMU_USER, BLOCK_INPUTS, BLOCK_KERNEL_DEB, NETWORK_ROOTFS, I7_PROGRAMS, S2D_PROGRAMS,
-         FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE)
+         FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE, CONTROL)
 E2FSPROGS = pathlib.Path('/opt/homebrew/opt/e2fsprogs')     # Homebrew's: a host tool, checked (version and hashes key the image), not pinned
 
 
@@ -107,6 +108,22 @@ def console_inputs() -> pathlib.Path:
     return resources.derived('devices-console-inputs', _console_recipe,
                              srcs + [dev / 'run_console.py', dev / 'run_platform.py', lib / 'io_common.py',
                                      t / 'raw_root.py', t / 'play/mkcpio.py']) / 'console'
+
+
+def _control_recipe(out: pathlib.Path, inputs: list) -> None:
+    kernel, kernel_deb, busybox = inputs[:3]
+    _runner(paths.repo_root() / 'tests' / 'devices' / 'run_control.py', 'prepare', '--kernel', kernel, '--kernel-deb', kernel_deb,
+            '--busybox-deb', busybox, '--out', out / 'control')
+
+
+def control_inputs() -> pathlib.Path:
+    """tests/devices/run_control.py prepare's folder: the netboot kernel, Debian's BusyBox and the stock evdev, psmouse
+    and button modules from the same kernel's package, in control.cpio."""
+    t, lib, dev = _tools(), _lib(), paths.repo_root() / 'tests' / 'devices'
+    srcs = [str(resources.fetch(n)) for n in ('debian-netboot-linux', 'debian-kernel-deb', 'busybox-static-deb')]
+    return resources.derived('devices-control-inputs', _control_recipe,
+                             srcs + [dev / 'run_control.py', dev / 'run_platform.py', lib / 'io_common.py',
+                                     t / 'raw_root.py', t / 'play/mkcpio.py']) / 'control'
 
 
 def e2fsprogs() -> tuple[pathlib.Path, str]:
@@ -506,7 +523,7 @@ def components() -> dict[str, pathlib.Path]:
             QEMU_USER: artifacts.qemu_user(), BLOCK_INPUTS: block_inputs(), BLOCK_KERNEL_DEB: resources.fetch('debian-kernel-deb'),
             NETWORK_ROOTFS: network_rootfs(), I7_PROGRAMS: corpus('gen_i7.py'), S2D_PROGRAMS: corpus('gen_slice2.py'),
             FIO_PREP: fio_prep(), STRESS: stress_ng(), MATRIX: matrix_inputs(), PLATFORM: platform_inputs(),
-            CONSOLE: console_inputs()}
+            CONSOLE: console_inputs(), CONTROL: control_inputs()}
 
 
 def root() -> pathlib.Path:

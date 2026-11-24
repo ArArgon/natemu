@@ -196,6 +196,13 @@ on as the guest reads, so nothing is lost or overwritten however fast a client s
 arrive, in order. `send_input` is answered when the last of its events has been passed on, so a client that waits for
 each answer knows the guest can see what it sent.
 
+natemu passes the bytes on as fast as the guest reads them, much faster than a real keyboard, so a guest program can
+fall behind even though its kernel got everything. A Linux program that reads the keyboard's `/dev/input/event*`
+device (a display server, for example) is kept at most 64 events, about 20 key presses and releases, and loses them
+all when it lets more pile up. To be sure such a program sees every key, send a few keys per `send_input` and let it
+read them before sending more (the guest cases in `tests/devices/run_control.py` send 6 and wait until the guest
+reports them).
+
 If the guest takes nothing for 5 seconds (it hangs, or does not read the keyboard or mouse at all), `send_input` fails
 with -32003. The events not yet passed on are dropped, and what the guest already got stands: a key whose press
 reached the guest stays held by that client until the client releases it or disconnects, and a press that did not

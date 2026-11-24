@@ -200,10 +200,31 @@ def test_console_inputs_runs_the_console_prepare(monkeypatch, tmp_path):
     assert d.name == 'console' and (d / 'inputs.json').exists()
 
 
+def test_control_inputs_runs_the_control_prepare(monkeypatch, tmp_path):
+    """tests/devices/run_control.py prepare, from the same three downloads as the platform runner's."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    files = {n: tmp_path / n for n in ('debian-netboot-linux', 'debian-kernel-deb', 'busybox-static-deb')}
+    for f in files.values(): f.write_text(f.name)
+    monkeypatch.setattr(inputs.resources, 'fetch', lambda n: files[n])
+    calls = []
+    def runner(script, *args):
+        a = dict(zip(args[1::2], args[2::2])); calls.append((script, args[0], a))
+        a['--out'].mkdir(); (a['--out'] / 'inputs.json').write_text('{}')
+    monkeypatch.setattr(inputs, '_runner', runner)
+    d = inputs.control_inputs()
+    script, command, a = calls[0]
+    assert script.as_posix().endswith('tests/devices/run_control.py') and command == 'prepare'
+    assert {k: v for k, v in a.items() if k != '--out'} == {'--kernel': str(files['debian-netboot-linux']),
+                                                           '--kernel-deb': str(files['debian-kernel-deb']),
+                                                           '--busybox-deb': str(files['busybox-static-deb'])}
+    assert d.name == 'control' and (d / 'inputs.json').exists()
+
+
 def test_new_paths_are_components(monkeypatch, tmp_path):
     stub = {n: tmp_path / n for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'qemu_user', 'corpus', 'fetch',
-                                      'matrix_inputs', 'platform_inputs', 'console_inputs')}
-    for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'matrix_inputs', 'platform_inputs', 'console_inputs'):
+                                      'matrix_inputs', 'platform_inputs', 'console_inputs', 'control_inputs')}
+    for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'matrix_inputs', 'platform_inputs', 'console_inputs',
+              'control_inputs'):
         monkeypatch.setattr(inputs, n, lambda n=n: stub[n])
     monkeypatch.setattr(inputs, 'corpus', lambda g: stub['corpus'])
     monkeypatch.setattr(inputs.artifacts, 'qemu_user', lambda: stub['qemu_user'])
@@ -212,7 +233,7 @@ def test_new_paths_are_components(monkeypatch, tmp_path):
     assert set(parts) == set(inputs.PATHS)
     assert parts[inputs.FIO_PREP] == stub['fio_prep'] and parts[inputs.STRESS] == stub['stress_ng']
     assert parts[inputs.MATRIX] == stub['matrix_inputs'] and parts[inputs.PLATFORM] == stub['platform_inputs']
-    assert parts[inputs.CONSOLE] == stub['console_inputs']
+    assert parts[inputs.CONSOLE] == stub['console_inputs'] and parts[inputs.CONTROL] == stub['control_inputs']
 
 
 # ---------------------------------------------------------------- IO5 inputs (stubbed prepare)

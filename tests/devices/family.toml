@@ -12,6 +12,13 @@
 # VM from the initramfs `run_console.py prepare` builds (the input root's devices-console/console, console_inputs()),
 # judged from the serial markers, what the console's host end received and the exit line. Adding a console case: its
 # case_<name> and dispatch in run_console.py's INIT, its judge in JUDGES, negative controls in self_check, an entry below.
+#
+# The devices-control suites run tests/devices/run_control.py (the control socket, `[control] socket`; its docstring):
+# one VM from the initramfs `run_control.py prepare` builds (the input root's devices-control/control,
+# control_inputs()), driven through the socket by tests/lib/control_client.py and judged from the guest's evdev events
+# on the serial console, the answers and the `stopped` notification, and the exit line. Adding a control case: its
+# case_<name> and dispatch in run_control.py's INIT, its CASES entry (judge and driver), negative controls in
+# self_check_judges, an entry below.
 [family]
 name = "devices"
 covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crates/host/src/ps2.rs", "crates/host/src/ps2/**",
@@ -27,7 +34,8 @@ covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crate
           "crates/host/src/devices.rs", "crates/host/src/irq.rs", "crates/host/src/execution.rs", "crates/host/src/boot/**",
           "tests/devices/**", "tests/lib/**", "testkit/inputs.py",
           "crates/host/src/pci/**", "crates/host/src/virtio/pci.rs", "crates/host/src/virtio/console.rs",
-          "crates/host/src/virtio/model.rs", "crates/host/src/virtio/mod.rs"]
+          "crates/host/src/virtio/model.rs", "crates/host/src/virtio/mod.rs",
+          "crates/host/src/control/**"]
 
 [[suite]]
 name = "devices"
@@ -167,3 +175,53 @@ params = { timeout = 120 }
 
 [suite.cases."console-selfcheck"]
 argv = ["tests/devices/run_console.py", "self-check"]
+
+# The control socket (tests/devices/run_control.py's docstring), each at 1 vCPU, control-keyboard also at 2.
+[[suite]]
+name = "devices-control"
+kind = "judged"
+harness = "runner"
+params = { timeout = 600 }
+needs = { cores = 1, perf = true }
+
+# Every KeyCode pressed and released in one send_input: the keyboard's EV_KEY events are the Linux KEY_* of the runner's
+# table, in order; then a second client holds ShiftLeft and disconnects: the release arrives. Ends with quit.
+[suite.cases."control-keyboard"]
+argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-keyboard", "--vcpus", "1"]
+smoke = true
+
+[suite.cases."control-keyboard[2]"]
+argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-keyboard", "--vcpus", "2"]
+needs = { cores = 2, perf = true }
+
+# dx 1000 sums to REL_X 1000, dy 40 is REL_Y +40, scroll dy 3 is REL_WHEEL -3 and -3 is +3, each button down and up.
+[suite.cases."control-mouse"]
+argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-mouse", "--vcpus", "1"]
+
+# power_button: KEY_POWER down and up on the fixed "Power Button" (LNXPWRBN), then the init powers off: stopped
+# power_off, natemu: Power(1), exit status 0.
+[suite.cases."control-power-button"]
+argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-power-button", "--vcpus", "1"]
+smoke = true
+
+# With machine.ps2=false: query_status while running (no ps2), send_input is -32001 naming ps2, quit ends the run with
+# stopped cancelled and exit status 2.
+[suite.cases."control-status"]
+argv = ["tests/devices/run_control.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-control/control", "--out", "{out}", "--case", "control-status", "--vcpus", "1",
+        "--set", "machine.ps2=false"]
+
+# run_control.py's self-check: the init's shell syntax and device lookup, KEY_CODES against protocol.rs, the event
+# format, the modules, the judges' negative controls; no VM.
+[[suite]]
+name = "devices-control-selfcheck"
+kind = "judged"
+harness = "runner"
+params = { timeout = 120 }
+
+[suite.cases."control-selfcheck"]
+argv = ["tests/devices/run_control.py", "self-check"]

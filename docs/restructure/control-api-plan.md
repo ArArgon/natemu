@@ -85,9 +85,12 @@ dependencies). Python client for tests in `tests/lib`. New dependencies are allo
   disconnect). With two clients, A holds the left button and B moves the pointer: the button stays down; A holds
   `KeyA`, B presses and releases it, then A disconnects: one break, after A's (Task 1 `held_state_is_server_wide`;
   break: per-client state).
-- **The guest falls behind:** 200 keys in one `send_input` and a dx of 10,000 all arrive, none overwritten by OVERRUN
-  or dropped by a full FIFO (Task 1 `queue_waits_for_room`, Task 4 `control-keyboard`; break: call `keyboard`/`mouse`
-  without waiting for room).
+- **The guest falls behind:** 200 keys in one `send_input` and a dx of 10,000 all arrive at the 8042, none overwritten
+  by OVERRUN or dropped by a full FIFO (Task 1 `queue_waits_for_room`; break: call `keyboard`/`mouse` without waiting
+  for room). A guest's evdev reader cannot see that many at once: natemu passes bytes on as fast as the guest reads
+  60H, so one `send_input`'s keys arrive as one run of interrupts, and evdev keeps 64 events per keyboard reader and
+  drops them all beyond that (SYN_DROPPED). Task 4 `control-keyboard` therefore sends 6 keys per `send_input` (found
+  in Task 4: one `send_input` of all 208 transitions lost all but the last few, at 1 and 2 vCPUs).
 - **Large pointer motion:** a `pointer_motion` of dx 1000 must move the guest pointer 1000 units, not 255 with the
   overflow bit (the mouse clamps beyond 9 bits, `ps2/mouse.rs` `movement_get`): the server splits it into packets of at
   most 255 (Task 1 `motion_splits_into_nine_bit_packets`, Task 4 `control-mouse`; break: one packet).
@@ -304,7 +307,8 @@ one is missing), finds the keyboard's, mouse's and power button's `/dev/input/ev
 `KEY_*` and `REL_*` numbers are Linux's UAPI interface constants (`input-event-codes.h`), cited as such. Reading evdev in the guest is the test's observer, not a
 front end.
 
-- [ ] **Step 1: cases**: `control-keyboard` (every `KeyCode`, press and release: the guest's EV_KEY codes equal the
+- [ ] **Step 1: cases**: `control-keyboard` (every `KeyCode`, press and release, a few keys per `send_input` (the
+  guest's evdev holds 64 events per reader, Review Focus): the guest's EV_KEY codes equal the
   Linux `KEY_*` each code names, from a table in the runner; then `ShiftLeft` down and a disconnect: the release
   arrives); `control-mouse` (after `modprobe psmouse`: dx 1000 sums to 1000 in REL_X, dy 40 gives REL_Y +40, each
   button down and up, scroll dy 3 gives REL_WHEEL -3 and dy -3 gives +3); `control-power-button` (KEY_POWER on the "Power Button" device,
