@@ -11,14 +11,16 @@
 //   4 chase  dependent loads that miss the cache (a 128 MiB single-cycle permutation) with cheap words between them (skid)
 //   5 ctrl   the control port: the alu loop with sampling on (window e1), then a stop (port F8H, value 2) and the loop
 //            again (e2), then a start (F8H, 1) and the loop once more (e3); marks 5, 6, 7 before the three windows
-// Before each phase a mark (port F9H) with the phase number. The ports are written (ioperm, outb; root) only when the
+// Before each phase a mark (port F9H) with the phase number: marks 1-7. Mark numbers in a bench boot: 1-127 are the
+// program's (these), 0x80 + N (129, 130) the bench init's run N (tools/bench/image/scripts/init says the same). The ports are written (ioperm, outb; root) only when the
 // kernel command line holds the word natemu.profile=1 (the runner adds it in sampling runs only, plan section 3): the
 // program never probes for the device. Without it every phase runs the same and no port is touched.
 //
 // Console lines (stdout, line by line), in init's style:
 //   NATEMU-SAMPLER begin run=R ports=on|off phase_s=S
 //   NATEMU-SAMPLER start run=R phase=N name=NAME t=SECONDS                   (CLOCK_MONOTONIC at the phase's start)
-//   NATEMU-BENCH-PHASE[2] bench=sampler-check jobs=1 name=NAME rc=0|1 guest_s=SECONDS   (tools/bench/run.py times these)
+//   NATEMU-BENCH-PHASE[2] bench=sampler-check jobs=1 name=NAME rc=0|1 guest_s=SECONDS   (tools/bench/run.py times these;
+//                         it reads name, rc and guest_s and skips the bench= and jobs= words; jobs=1: one thread)
 //   NATEMU-SAMPLER end run=R phase=N name=NAME t=SECONDS iters=I batches=B batch=HEX ok=1|0
 //   NATEMU-SAMPLER sums alu=HEX call=HEX cross=HEX chase=HEX ctrl=HEX     (also written to SUMSFILE, for init's check)
 // Exit 0, or 1 if a batch differed from the phase's first, 2 on a usage or set-up error.

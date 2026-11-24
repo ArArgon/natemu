@@ -124,6 +124,30 @@ class Synthetic(unittest.TestCase):
         problems = self.outcome(serial='\n'.join(lines))[0]
         self.assertTrue(any('phases, the program announced' in p for p in problems))
 
+    def test_a_missing_run_fails(self):
+        bad = '\n'.join(l for l in self.serial.splitlines() if 'run=2 ' not in l)
+        self.assertIn('program runs [1], not [1, 2]', self.outcome(serial=bad)[0])
+
+    def test_phases_out_of_order_fail(self):
+        lines = self.serial.splitlines()
+        i = next(i for i, l in enumerate(lines) if 'phase=5 run=1 ' in l)
+        lines[i], lines[i + 1] = lines[i + 1], lines[i]
+        self.assertIn('run 1: phases out of order', self.outcome(serial='\n'.join(lines))[0])
+        self.assertNotIn('run 1: phases out of order', self.outcome()[0])
+
+    def test_competing_placements_fail(self):
+        # Phase 0 alone (a small k=0 phase) fits every small k=0 stretch at its own offset: many placements, none chosen.
+        lines = self.serial.splitlines()
+        one = '\n'.join(l for l in lines if 'NATEMU-COLDTRIP phase=' not in l or l.startswith('NATEMU-COLDTRIP phase=0 run=1 '))
+        runs = {1: C.parse_serial(one)[1]}
+        ts, vals, _ = C.parse_snaps(self.perf)
+        where, tried = C.place_runs(runs, ts, C.stretches(ts, vals))
+        self.assertEqual(where, {}); self.assertGreater(tried['placements'], 1)
+        rows, problems, _ = C.measure(runs, ts, vals)
+        self.assertEqual(rows, []); self.assertTrue(any(f'({tried["placements"]} placements found)' in p for p in problems), problems)
+        where, tried = C.place_runs(C.parse_serial(self.serial), ts, C.stretches(ts, vals))   # all phases: one placement
+        self.assertEqual(tried['placements'], 1); self.assertEqual(len(where), 2 * len(program(1)))
+
     def test_an_unfinished_run_fails(self):
         bad = self.serial.replace('NATEMU-COLDTRIP end run=2 ok=1', 'NATEMU-COLDTRIP end run=2 ok=0')
         self.assertIn('run 2: no end line with ok=1', self.outcome(serial=bad)[0])

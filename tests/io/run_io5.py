@@ -223,7 +223,8 @@ i386() {   # --i386: Debian's i386 userland in /i386 (debootstrap, same snapshot
 }
 say begin $P cpus=$(nproc) mem_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) kernel=$(uname -r)
 if [ $PROF = 1 ]; then
-  say ktext $(grep -m1 ' _text$' /proc/kallsyms | cut -d' ' -f1)
+  kt=$(grep -m1 ' _text$' /proc/kallsyms | cut -d' ' -f1)   # all zeros: kptr_restrict hides it (read the boot as nokaslr's)
+  [[ $kt =~ ^0*$ ]] && say ktext hidden || say ktext $kt
   [ -c /dev/port ] && say profile port=/dev/port || say profile no-dev-port: the control port cannot be written
 fi
 say system $(systemctl is-system-running --wait) boot=$(systemd-analyze | head -1 | sed 's/.*= //; s/ //g')

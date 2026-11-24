@@ -6,9 +6,11 @@
 # timing (busybox time per phase; a NATEMU-BENCH-PHASE / PHASE2 line after each named phase), NATEMU-BENCH-END (END2) with the
 # guest's elapsed seconds (/proc/uptime), then NATEMU-BENCH-VERIFY (VERIFY2) ok or FAIL for that run; then powers off (ACPI S5).
 # natemu.profile=1 (sampling runs only; docs/restructure/el0-sampler-plan.md section 3): the kernel's _text address once
-# (NATEMU-BENCH-KTEXT, for the KASLR slide), and around each run's timed window a start (port F8H, 1), a mark (F9H: the run's
-# number) and after it a stop (F8H, 2), written through /dev/port. The device is never probed: without the word nothing
-# here touches a port.
+# (NATEMU-BENCH-KTEXT ADDRESS, or NATEMU-BENCH-KTEXT hidden when kptr_restrict shows zeros: read the boot as nokaslr's), and
+# around each run's timed window a start (port F8H, 1), a mark (F9H) and after it a stop (F8H, 2), written through /dev/port.
+# The device is never probed: without the word nothing here touches a port. Mark numbers in a bench boot: 1-127 are the
+# program's own (sampler_check: its phases 1-7), 0x80 + N (129, 130) is this script's run N; tools/bench/image/src/
+# sampler_check.c says the same.
 export PATH=/usr/bin HOME=/tmp
 mount -t proc proc /proc
 mount -t sysfs sys /sys
@@ -23,10 +25,11 @@ done
 port() { printf "\\$(printf %03o $2)" | dd of=/dev/port bs=1 seek=$1 count=1 conv=notrunc 2>/dev/null; }
 prof() {   # start | stop | mark N: the sampler's control port, only in a sampling run
     [ $profile = 1 ] && [ -c /dev/port ] || return 0
-    case $1 in start) port 248 1;; stop) port 248 2;; mark) port 249 $2;; esac
+    case $1 in start) port 248 1;; stop) port 248 2;; mark) port 249 $2;; esac   # mark N: N is 0-255
 }
 if [ $profile = 1 ]; then
-    echo "NATEMU-BENCH-KTEXT $(grep -m1 ' _text$' /proc/kallsyms | cut -d' ' -f1)"
+    kt=$(grep -m1 ' _text$' /proc/kallsyms | cut -d' ' -f1)
+    case $kt in ''|*[!0]*) echo "NATEMU-BENCH-KTEXT ${kt:-hidden}" ;; *) echo "NATEMU-BENCH-KTEXT hidden" ;; esac
     [ -c /dev/port ] && echo "NATEMU-BENCH-PROFILE port=/dev/port" || echo "NATEMU-BENCH-PROFILE no /dev/port: the control port cannot be written"
 fi
 
@@ -156,7 +159,7 @@ for r in 1 2; do
     sfx=; [ $r = 1 ] || sfx=$r
     rc=0
     prep $r
-    prof start; prof mark $r
+    prof start; prof mark $((128 + r))
     echo "NATEMU-BENCH-START$sfx bench=$bench jobs=$jobs cpus=$(nproc)"
     t0=$(now)
     run

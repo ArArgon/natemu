@@ -28,7 +28,11 @@ the guest bucket's ns per trip. The guest bucket runs from just before `resume_e
 and, the same way, the whole trip (every bucket but `halted`) per trip. Each is given per round and summarized over
 the rounds (median, min, max, standard deviation); the slopes pooled over the rounds come with their standard errors.
 A CPUID trip touches less resident state than a page fault, a system call or a dispatcher miss do: its cold state is a
-lower bound for theirs.
+lower bound for theirs. The cold-state figure also holds the gate's own cold code and the trip's disturbance of the
+branch predictors: the large footprint misses L1I every iteration even without trips (its chunk last ran 64 iterations
+before), so the difference is what a trip adds on top of that. K=64 and K=16 alias with the 64-iteration chunk period
+(the trip always lands before the same chunks), a small effect: K=1 and 2 dominate the fit. Quote cold_ns with its
+spread over the rounds (min, max, stdev), never its median alone.
 
 The judge: both runs complete with every phase, each phase's trip count is ITERS / K (0 for k=0), every phase of a
 footprint has the same work sum (and run.py's record verified, which compares it with the sum pinned at build time),
