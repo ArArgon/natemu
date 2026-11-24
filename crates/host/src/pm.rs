@@ -13,7 +13,8 @@
 //! (all 16 bits, as QEMU). The SCI is asserted while a status bit is set with its enable among TMR_EN, GBL_EN,
 //! PWRBTN_EN and RTC_EN (`acpi_update_sci`); TMR_STS and PWRBTN_STS have sources on this board (the timer, and
 //! [`PowerButton::press`] for the host; no global lock owner or RTC wake). With TMR_EN and TMR_STS clear the next toggle
-//! is scheduled on a [`clock::Timer`] thread, which holds an [`Irqs::busy`] guard meanwhile. A write to both halves (32 bits at B000H) is one update.
+//! is scheduled on a [`clock::Timer`] thread, which holds an [`Irqs::busy`] guard meanwhile. A write to both halves
+//! (32 bits at B000H) is one update.
 //!
 //! **PM1 control** (4.8.3.2.1): SCI_EN is set from reset (ACPI-only mode, no SMI command) and read-only: the hardware
 //! owns it (Table 4.13, "OSPM always preserves this bit position"; QEMU lets a write clear it). SLP_EN is write-only
@@ -186,7 +187,6 @@ impl Pm {
     fn press(&mut self) {
         self.sts |= PWRBTN;
         self.update_sci();
-
     }
 }
 /// The fixed power button, for a host thread (the control socket's `power_button`): a cloneable handle on the PM device.
