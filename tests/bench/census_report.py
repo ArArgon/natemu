@@ -5,7 +5,8 @@
 - indirect jmp and call executions at sites with one target and with two (and three, four, five or more), user, kernel
   and total; each also with the sites keyed by their physical code instead of their address space and address (natemu
   shares translated code between processes by frame, so an inline cache in shared code sees every process's targets);
-- ret executions, and the return-stack model's hit rate at depths 8, 16 and 32 (a pop of an empty stack is a miss);
+- ret executions, and the return-stack model's hit rate at depths 8, 16 and 32 (a pop of an empty stack is a miss):
+  one stack per vCPU, and split (one per vCPU and mode, so a system call's kernel calls do not overwrite user entries);
 - each per 1,000 guest instructions executed (time under TCG means nothing here).
 
     python3 tests/bench/census_report.py CENSUS.json [--window run1] [--json OUT.json]
@@ -18,6 +19,7 @@ import json
 MODES = ('user', 'kernel')
 CLASSES = ('1', '2', '3', '4', '5+')
 DEPTHS = ('8', '16', '32')
+RAS = ('ras', 'ras_split')
 COLS = ('kind', 'mode', 'asid', 'pc', 'phys', 'flags', 'execs', 'overflow', 'targets')
 
 
@@ -59,14 +61,15 @@ def physical(s: dict) -> tuple:
 def merge_segments(segs: list[dict], name: str) -> dict:
     """Segments summed into one (counts added; sites merged by kind, address space and address)."""
     out = {'name': name, 'insns': {m: 0 for m in MODES}, 'direct_calls': {m: 0 for m in MODES},
-           'ras': {d: {m: {'hit': 0, 'miss': 0, 'empty': 0} for m in MODES} for d in DEPTHS},
+           **{k: {d: {m: {'hit': 0, 'miss': 0, 'empty': 0} for m in MODES} for d in DEPTHS} for k in RAS},
            'events': {}, 'far': {k: {m: 0 for m in MODES} for k in ('call', 'jmp', 'ret')}}
     for s in segs:
         for m in MODES:
             out['insns'][m] += s['insns'][m]; out['direct_calls'][m] += s['direct_calls'][m]
             for k in out['far']: out['far'][k][m] += s['far'][k][m]
-            for d in DEPTHS:
-                for r in ('hit', 'miss', 'empty'): out['ras'][d][m][r] += s['ras'][d][m][r]
+            for k in RAS:
+                for d in DEPTHS:
+                    for r in ('hit', 'miss', 'empty'): out[k][d][m][r] += s[k][d][m][r]
         for k, v in s['events'].items(): out['events'][k] = out['events'].get(k, 0) + v
     merged = regroup([x for s in segs for x in sites(s)], lambda x: (x['kind'], x['mode'], x['asid'], x['pc']))
     out['sites'] = [[m[c] for c in COLS] for m in merged]
@@ -87,8 +90,8 @@ def reduce(data: dict, window: str) -> dict:
         mine = [s for s in ss if mode == 'total' or s['mode'] == mode]
         ind = [s for s in mine if s['kind'] in ('call', 'jmp')]
         insns = sum(seg['insns'].values()) if mode == 'total' else seg['insns'][mode]
-        ras = {d: {k: sum(seg['ras'][d][m][k] for m in MODES if mode in ('total', m)) for k in ('hit', 'miss', 'empty')}
-               for d in DEPTHS}
+        ras = {key: {d: {k: sum(seg[key][d][m][k] for m in MODES if mode in ('total', m)) for k in ('hit', 'miss', 'empty')}
+                     for d in DEPTHS} for key in RAS}
         calls = sum(s['execs'] for s in ind if s['kind'] == 'call')
         jmps = sum(s['execs'] for s in ind if s['kind'] == 'jmp')
         rets = sum(s['execs'] for s in mine if s['kind'] == 'ret')
@@ -100,7 +103,8 @@ def reduce(data: dict, window: str) -> dict:
             'indirect_jmp': by_targets([s for s in ind if s['kind'] == 'jmp']),
             'indirect_by_code': by_targets(regroup(ind, physical)),
             'ret': by_targets([s for s in mine if s['kind'] == 'ret']),
-            'ras': {d: {**v, 'hit_rate': v['hit'] / sum(v.values()) if sum(v.values()) else None} for d, v in ras.items()},
+            **{key: {d: {**v, 'hit_rate': v['hit'] / sum(v.values()) if sum(v.values()) else None} for d, v in ras[key].items()}
+               for key in RAS},
             'per_1000': {'indirect_call': per(calls), 'indirect_jmp': per(jmps), 'indirect': per(calls + jmps),
                          'ret': per(rets), 'direct_call': per(direct)},
         }
@@ -108,6 +112,7 @@ def reduce(data: dict, window: str) -> dict:
 
 
 def _pct(x): return '' if x is None else f'{100 * x:.1f}%'
+def _pair(b): return '' if b['share_1'] is None else f"{_pct(b['share_1'])} / {_pct(b['share_2'])}"
 def _num(x): return '' if x is None else f'{x:.2f}'
 
 
@@ -118,12 +123,16 @@ def markdown(r: dict, name: str) -> str:
             ('  of which calls', lambda v: _num(v['per_1000']['indirect_call'])),
             ('indirect executions at 1-target sites', lambda v: _pct(v['indirect']['share_1'])),
             ('indirect executions at 2-target sites', lambda v: _pct(v['indirect']['share_2'])),
+            ('  indirect calls at 1 / 2-target sites', lambda v: _pair(v['indirect_call'])),
+            ('  indirect jmps at 1 / 2-target sites', lambda v: _pair(v['indirect_jmp'])),
             ('indirect executions at 1-target sites, by physical code', lambda v: _pct(v['indirect_by_code']['share_1'])),
             ('indirect executions at 2-target sites, by physical code', lambda v: _pct(v['indirect_by_code']['share_2'])),
             ('indirect sites (1 / 2 / 3 / 4 / 5+ targets)', lambda v: ' / '.join(str(v['indirect']['sites_by_targets'][c]) for c in CLASSES)),
             ('ret per 1,000 instructions', lambda v: _num(v['per_1000']['ret'])),
             ('direct call per 1,000 instructions', lambda v: _num(v['per_1000']['direct_call']))]
     rows += [(f'return model hit rate, depth {d}', lambda v, d=d: _pct(v['ras'][d]['hit_rate'])) for d in DEPTHS]
+    rows += [(f'split return model (user, kernel apart), depth {d}', lambda v, d=d: _pct(v['ras_split'][d]['hit_rate']))
+             for d in DEPTHS]
     out = [f'### Census {name}, segment {r["window"]}', '', '| | user | kernel | total |', '| --- | ---: | ---: | ---: |']
     out += [f'| {label} | ' + ' | '.join(f(m[k]) for k in ('user', 'kernel', 'total')) + ' |' for label, f in rows]
     out += ['', f'CR3 {r["cr3"]}; RIP {r["rip"]}; events {r["events"]}.', '']

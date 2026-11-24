@@ -18,6 +18,8 @@
 ;   G       one ret at two virtual addresses of one physical page (QEMU runs one translation for both): two sites
 ;   H       a call whose target page is not present: the fault is at the target (the call has its target)
 ;   I       a jmp through memory whose operand page is not present: the jmp faults, is dropped, runs again
+;           The #PF handler runs at the KBASE alias (kernel) and recurses 10 deep by direct calls: H's user return
+;           straddles those kernel calls, so the one-stack model at depth 8 finds its stack empty, the split one hits
 ; then OUT 0xF4 (isa-debug-exit).
 bits 32
 org 0x100000
@@ -207,9 +209,15 @@ ffar:   o64 retf
 f6:     ret
 f7:     ret
 
-; #PF at CPL0: make the faulting 2 MiB region present (another mapping of the first 2 MiB), drop the error code, iretq.
+; #PF at CPL0, entered at its KBASE alias: a 10-deep recursion, then make the faulting 2 MiB region present (another
+; mapping of the first 2 MiB), drop the error code, iretq.
 pf:     push rax
         push rbx
+        push rcx
+        mov ecx, 10
+        call krec
+pf_after:
+        pop rcx
         mov rax, cr2
         shr rax, 21
         and eax, 511
@@ -221,6 +229,11 @@ pf:     push rax
         pop rax
         add rsp, 8
         iretq
+krec:   dec ecx
+        jz krec_done
+        call krec
+krec_done:
+        ret
 
 align 8
 btable: dq g1, g2
@@ -269,10 +282,10 @@ pd:     dq 0x000000 | 0x87                  ; P RW US PS
         dq 0x000000 | 0x87                  ; ALIAS
         times 509 dq 0
 idt:    times 14 * 16 db 0
-        dw ABS(pf) & 0xffff                 ; vector 14
+        dw ABS(pf) & 0xffff                 ; vector 14, at KBASE + pf
         dw 0x08
         db 0, 0x8E
-        dw (ABS(pf) >> 16) & 0xffff
-        dd 0, 0
+        dw ((ABS(pf) >> 16) & 0xffff) | 0x8000
+        dd 0xffffffff, 0
         times 256 * 16 - ($ - idt) db 0
 image_end:

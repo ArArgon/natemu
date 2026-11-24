@@ -199,13 +199,20 @@ EXPECTED_SITES = [
     ('call', 'user', 'H_call', 0, {('f7', 'HALIAS'): 1}, 0, 0),
     ('ret', 'user', 'f7', 'HALIAS', {('H_next', 0): 1}, 0, 0),
     ('jmp', 'user', 'I_jmp', 0, {('I_target', 0): 1}, 0, F['mem']),
+    ('ret', 'kernel', 'krec_done', 'KBASE', {('krec_done', 'KBASE'): 18, ('pf_after', 'KBASE'): 2}, 0, 0),
 ]
 # Return model (user): A 1000 + B 600 + E 12 + G 5 + H 1 pairs hit at every depth; D's 10 recursions of 12 hit 8 and
-# find the depth-8 stack empty 4 times, and hit 12 at depths 16 and 32. Kernel: 7.
-EXPECTED_RAS = {'8': {'user': {'hit': 1618 + 80, 'miss': 0, 'empty': 40}, 'kernel': {'hit': 7, 'miss': 0, 'empty': 0}},
-                '16': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': {'hit': 7, 'miss': 0, 'empty': 0}},
-                '32': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': {'hit': 7, 'miss': 0, 'empty': 0}}}
-EXPECTED_COUNTS = {'direct_calls': {'user': 120, 'kernel': 0},
+# find the depth-8 stack empty 4 times, and hit 12 at depths 16 and 32. Kernel: the kernel phase's 7, and in each of
+# the two page faults a 10-deep recursion: 8 hits and 2 empty at depth 8, 10 hits at 16 and 32. H's user return comes
+# after the fault's kernel calls: with one stack, depth 8 finds it empty; with user and kernel apart (ras_split) it hits.
+_K8, _K16 = {'hit': 7 + 16, 'miss': 0, 'empty': 4}, {'hit': 7 + 20, 'miss': 0, 'empty': 0}
+EXPECTED_RAS = {'8': {'user': {'hit': 1618 + 80 - 1, 'miss': 0, 'empty': 41}, 'kernel': _K8},
+                '16': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
+                '32': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
+EXPECTED_RAS_SPLIT = {'8': {'user': {'hit': 1618 + 80, 'miss': 0, 'empty': 40}, 'kernel': _K8},
+                      '16': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
+                      '32': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
+EXPECTED_COUNTS = {'direct_calls': {'user': 120, 'kernel': 20},
                    'far': {'call': {'user': 2, 'kernel': 0}, 'jmp': {'user': 1, 'kernel': 0}, 'ret': {'user': 2, 'kernel': 0}},
                    'events': {'interrupts': 2, 'exceptions': 2, 'dropped': 1, 'unresolved': 0, 'wide': 0}}
 
@@ -246,6 +253,8 @@ def check_problems(data: dict, sym: dict) -> list[str]:
     for k in sorted(set(got) - want, key=lambda k: k[2]):
         problems.append(f'unexpected site {k[0]} {k[1]} at {k[2]:#x}: {got[k]}')
     if seg['ras'] != EXPECTED_RAS: problems.append(f'return model {seg["ras"]}, expected {EXPECTED_RAS}')
+    if seg['ras_split'] != EXPECTED_RAS_SPLIT:
+        problems.append(f'split return model {seg["ras_split"]}, expected {EXPECTED_RAS_SPLIT}')
     for key, w in EXPECTED_COUNTS.items():
         if seg[key] != w: problems.append(f'{key} {seg[key]}, expected {w}')
     if not seg['insns']['kernel'] or not seg['insns']['user']: problems.append(f'instructions {seg["insns"]}')

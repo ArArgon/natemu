@@ -12,11 +12,12 @@ def ras(user, kernel):
             for i, d in enumerate(('8', '16', '32'))}
 
 
-def segment(name, sites, insns=(10000, 4000), direct=(30, 10), r=None):
+def segment(name, sites, insns=(10000, 4000), direct=(30, 10), r=None, split=None):
     return {'name': name, 'vcpu_parts': 1, 'insns': {'user': insns[0], 'kernel': insns[1]},
             'direct_calls': {'user': direct[0], 'kernel': direct[1]},
             'far': {k: {'user': 0, 'kernel': 0} for k in ('call', 'jmp', 'ret')},
             'ras': r or ras([(80, 15, 5), (90, 10, 0), (95, 5, 0)], [(20, 0, 0), (20, 0, 0), (20, 0, 0)]),
+            'ras_split': split or ras([(99, 1, 0), (100, 0, 0), (100, 0, 0)], [(20, 0, 0), (20, 0, 0), (20, 0, 0)]),
             'events': {'interrupts': 3, 'exceptions': 1, 'dropped': 0, 'unresolved': 0, 'wide': 0}, 'sites': sites}
 
 
@@ -59,6 +60,8 @@ class Reduce(unittest.TestCase):
         self.assertEqual(u['ret']['execs'], 100); self.assertEqual(t['ret']['execs'], 120)
         self.assertAlmostEqual(u['ras']['8']['hit_rate'], 0.8); self.assertAlmostEqual(u['ras']['32']['hit_rate'], 0.95)
         self.assertAlmostEqual(t['ras']['8']['hit_rate'], 100 / 120)
+        self.assertAlmostEqual(u['ras_split']['8']['hit_rate'], 0.99); self.assertAlmostEqual(t['ras_split']['8']['hit_rate'], 119 / 120)
+        self.assertAlmostEqual(u['indirect_call']['share_1'], 1.0); self.assertAlmostEqual(u['indirect_jmp']['share_2'], 0.75)
         self.assertAlmostEqual(u['per_1000']['indirect'], 14.0); self.assertAlmostEqual(u['per_1000']['ret'], 10.0)
         self.assertAlmostEqual(k['per_1000']['direct_call'], 2.5); self.assertAlmostEqual(t['per_1000']['indirect'], 1000 * 190 / 14000)
 
@@ -73,11 +76,14 @@ class Reduce(unittest.TestCase):
         self.assertEqual(u['indirect']['execs_by_targets'], {'1': 0, '2': 8, '3': 0, '4': 0, '5+': 5})
         self.assertEqual(u['insns'], 20000)
         self.assertEqual(r['modes']['total']['ras']['8']['hit'], 200)
+        self.assertEqual(r['modes']['user']['ras_split']['16']['hit'], 200)
 
     def test_markdown_names_the_decision_rows(self):
         md = census_report.markdown(self.r, 'build')
         self.assertIn('| indirect executions at 1-target sites | 71.4% | 100.0% | 78.9% |', md)
         self.assertIn('| return model hit rate, depth 16 | 90.0% | 100.0% | 91.7% |', md)
+        self.assertIn('| split return model (user, kernel apart), depth 8 | 99.0% | 100.0% | 99.2% |', md)
+        self.assertIn('|   indirect jmps at 1 / 2-target sites | 0.0% / 75.0% |  | 0.0% / 75.0% |', md)
 
 
 class Check(unittest.TestCase):
@@ -111,6 +117,7 @@ Real              Virtual           Name
         sites = [[k, m, 0x102000 if m == 'user' else 0, a(lab, al), 0, fl, sum(tg.values()) + ov, ov,
                   [[a(t, tal), c] for (t, tal), c in tg.items()]] for k, m, lab, al, tg, ov, fl in run_census.EXPECTED_SITES]
         seg = {'name': 'program', 'sites': sites, 'ras': copy.deepcopy(run_census.EXPECTED_RAS),
+               'ras_split': copy.deepcopy(run_census.EXPECTED_RAS_SPLIT),
                'insns': {'user': 9000, 'kernel': 40}, **copy.deepcopy(run_census.EXPECTED_COUNTS)}
         return {'cr3': 'read', 'rip': 'read', 'segments': [{'name': 'boot', 'sites': []}, seg]}, sym
 
@@ -129,6 +136,8 @@ Real              Virtual           Name
         self.assertTrue(any('unexpected site' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['ras']['8']['user']['empty'] = 0
         self.assertTrue(any('return model' in p for p in run_census.check_problems(bad, sym)))
+        bad = copy.deepcopy(data); bad['segments'][1]['ras_split']['16']['kernel']['hit'] = 6
+        self.assertTrue(any('split return model' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['events']['dropped'] = 0
         self.assertTrue(any('events' in p for p in run_census.check_problems(bad, sym)))
         bad = copy.deepcopy(data); bad['segments'][1]['sites'][13][5] = 0               # E2's REX flag lost

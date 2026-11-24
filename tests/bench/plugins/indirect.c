@@ -24,9 +24,11 @@
  *
  * User and kernel are told apart by the address half (bit 63: Linux's kernel addresses); a user site is keyed by its
  * address space too, CR3 with its PCID and PTI bits (11-12) cleared, read through the register API after the vCPU ran
- * kernel code (only the kernel writes CR3), and at every user branch until paging is on. The return-stack model is one
- * stack per vCPU and depth (8, 16, 32): a call pushes its return address (dropping the oldest when full), a ret pops
- * and compares; a pop of an empty stack is a miss of its own kind ("empty").
+ * kernel code (only the kernel writes CR3), and at every user branch until paging is on. The return-stack model (`ras`)
+ * is one stack per vCPU and depth (8, 16, 32): a call pushes its return address (dropping the oldest when full), a ret
+ * pops and compares; a pop of an empty stack is a miss of its own kind ("empty"). `ras_split` is the same with one
+ * stack per vCPU and mode (the call's or ret's): user returns then do not lose their entries to the kernel's calls
+ * during a system call or an interrupt.
  *
  * Segments: the counts are kept per segment. The first is named `first` (default "boot"); each line appended to the
  * `ctl` file (polled every 20 ms) starts a new segment of that name, and so does, once, the first execution of the
@@ -70,7 +72,7 @@ struct ras { uint64_t buf[32]; int top, count, depth; };
 
 struct stats {      /* [mode]: 0 user, 1 kernel */
     uint64_t direct_calls[2], far_call[2], far_jmp[2], far_ret[2];
-    uint64_t hit[NDEPTH][2], miss[NDEPTH][2], empty[NDEPTH][2];
+    uint64_t hit[2][NDEPTH][2], miss[2][NDEPTH][2], empty[2][NDEPTH][2];    /* [model][depth][mode of the ret] */
     uint64_t interrupts, exceptions, dropped, unresolved, wide;
 };
 
@@ -87,7 +89,7 @@ struct vcpu {       /* the scoreboard's element; all but `pending` and `insns` o
     struct table t;
     struct stats st;
     struct segment *done;
-    struct ras ras[NDEPTH];
+    struct ras ras[2][2][NDEPTH];     /* [model][stack][depth]: model 0 one stack (stack 0), model 1 one per mode */
     GByteArray *buf;
 };
 
@@ -207,24 +209,26 @@ static inline struct vcpu *vcpu_of(unsigned int idx)
 
 /* --- the return-stack model --- */
 
-static void ras_push(struct vcpu *v, uint64_t ret)
+static void ras_push(struct vcpu *v, uint64_t ret, int mode)
 {
-    for (int d = 0; d < NDEPTH; d++) {
-        struct ras *r = &v->ras[d];
-        r->top = (r->top + 1) % r->depth; r->buf[r->top] = ret;
-        if (r->count < r->depth) r->count++;
-    }
+    for (int m = 0; m < 2; m++)
+        for (int d = 0; d < NDEPTH; d++) {
+            struct ras *r = &v->ras[m][m ? mode : 0][d];
+            r->top = (r->top + 1) % r->depth; r->buf[r->top] = ret;
+            if (r->count < r->depth) r->count++;
+        }
 }
 
 static void ras_pop(struct vcpu *v, uint64_t target, int mode)
 {
-    for (int d = 0; d < NDEPTH; d++) {
-        struct ras *r = &v->ras[d];
-        if (!r->count) { v->st.empty[d][mode]++; continue; }
-        uint64_t x = r->buf[r->top];
-        r->top = (r->top + r->depth - 1) % r->depth; r->count--;
-        if (x == target) v->st.hit[d][mode]++; else v->st.miss[d][mode]++;
-    }
+    for (int m = 0; m < 2; m++)
+        for (int d = 0; d < NDEPTH; d++) {
+            struct ras *r = &v->ras[m][m ? mode : 0][d];
+            if (!r->count) { v->st.empty[m][d][mode]++; continue; }
+            uint64_t x = r->buf[r->top];
+            r->top = (r->top + r->depth - 1) % r->depth; r->count--;
+            if (x == target) v->st.hit[m][d][mode]++; else v->st.miss[m][d][mode]++;
+        }
 }
 
 /* --- callbacks --- */
@@ -235,12 +239,12 @@ static void resolve(struct vcpu *v, uint64_t target)
     int mode = v->p_mode;
     uint64_t pc = v->p_pc;
     v->pending = 0;
-    if (in->kind == K_DCALL) { v->st.direct_calls[mode]++; ras_push(v, pc + in->len); return; }
+    if (in->kind == K_DCALL) { v->st.direct_calls[mode]++; ras_push(v, pc + in->len, mode); return; }
     struct site *s = table_get(&v->t, mode ? 0 : v->asid, pc, in->kind, true);
     if (!s->execs) { s->phys = in->phys; s->flags = in->flags; s->mode = mode; }
     s->execs++;
     site_target(s, target, 1);
-    if (in->kind == K_CALL) ras_push(v, pc + in->len);
+    if (in->kind == K_CALL) ras_push(v, pc + in->len, mode);
     else if (in->kind == K_RET) ras_pop(v, target, mode);
 }
 
@@ -362,7 +366,9 @@ static void vcpu_init(unsigned int idx, void *udata)
     struct vcpu *v = qemu_plugin_scoreboard_find(sb, idx);
     v->buf = g_byte_array_new();
     table_init(&v->t);
-    for (int d = 0; d < NDEPTH; d++) v->ras[d].depth = DEPTHS[d];
+    for (int m = 0; m < 2; m++)
+        for (int k = 0; k < 2; k++)
+            for (int d = 0; d < NDEPTH; d++) v->ras[m][k][d].depth = DEPTHS[d];
     v->seg = atomic_load(&g_seg);
     v->initialized = 1;
 }
@@ -447,15 +453,19 @@ static void at_exit(void *udata)
         pair(f, "direct_calls", st.direct_calls, ", ");
         fprintf(f, "\"far\": {"); pair(f, "call", st.far_call, ", "); pair(f, "jmp", st.far_jmp, ", ");
         pair(f, "ret", st.far_ret, "}, ");
-        fprintf(f, "\"ras\": {");
-        for (int d = 0; d < NDEPTH; d++) {
-            fprintf(f, "\"%d\": {", DEPTHS[d]);
-            for (int m = 0; m < 2; m++)
-                fprintf(f, "\"%s\": {\"hit\": %" PRIu64 ", \"miss\": %" PRIu64 ", \"empty\": %" PRIu64 "}%s",
-                        m ? "kernel" : "user", st.hit[d][m], st.miss[d][m], st.empty[d][m], m ? "" : ", ");
-            fprintf(f, "}%s", d + 1 < NDEPTH ? ", " : "");
+        for (int model = 0; model < 2; model++) {
+            fprintf(f, "\"%s\": {", model ? "ras_split" : "ras");
+            for (int d = 0; d < NDEPTH; d++) {
+                fprintf(f, "\"%d\": {", DEPTHS[d]);
+                for (int m = 0; m < 2; m++)
+                    fprintf(f, "\"%s\": {\"hit\": %" PRIu64 ", \"miss\": %" PRIu64 ", \"empty\": %" PRIu64 "}%s",
+                            m ? "kernel" : "user", st.hit[model][d][m], st.miss[model][d][m], st.empty[model][d][m],
+                            m ? "" : ", ");
+                fprintf(f, "}%s", d + 1 < NDEPTH ? ", " : "");
+            }
+            fprintf(f, "}%s", model ? "" : ", ");
         }
-        fprintf(f, "},\n   \"events\": {\"interrupts\": %" PRIu64 ", \"exceptions\": %" PRIu64 ", \"dropped\": %" PRIu64
+        fprintf(f, ",\n   \"events\": {\"interrupts\": %" PRIu64 ", \"exceptions\": %" PRIu64 ", \"dropped\": %" PRIu64
                 ", \"unresolved\": %" PRIu64 ", \"wide\": %" PRIu64 "},\n   \"sites\": [",
                 st.interrupts, st.exceptions, st.dropped, st.unresolved, st.wide);
         int first = 1;
