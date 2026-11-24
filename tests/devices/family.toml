@@ -108,10 +108,10 @@ harness = "runner"
 params = { timeout = 600 }
 needs = { cores = 1, perf = true }
 
-# virtio-console on a host output (run_console.py's docstring): the guest writes a 1 MiB pattern to /dev/hvc0 and
+# virtio-console on a host output (run_console.py's docstring): the guest writes 256 KiB of pattern to /dev/hvc0 and
 # powers off. The output is a pipe the runner reads only after the power-off began, so the device's power-off drain
 # must deliver the tail; the runner checks the bytes are exactly the pattern (no CR added) and `natemu: Power(1)`.
-# `-file` writes a regular file instead (created by natemu).
+# `-file` writes 1 MiB to a regular file instead (created by natemu).
 [suite.cases."console-file-mmio-1"]
 argv = ["tests/devices/run_console.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
         "--inputs", "{raw}/devices-console/console", "--out", "{out}", "--case", "console-file", "--transport", "mmio", "--cpus", "1"]

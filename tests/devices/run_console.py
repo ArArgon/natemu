@@ -25,15 +25,21 @@ drivers/tty/n_tty.c and BusyBox 1.37's stty):
   chars_in_buffer (its outbuf) is empty, with no timeout. Both return at once when nothing is left, so they cannot hide
   a device that loses its tail: no sleep or wait stands between the write and the power-off.
 
-console-file: the init writes the 1 MiB pattern (FILE_BYTES, every byte value, LF and CR included) to /dev/hvc0 with
-`dd bs=4096`, drains it, prints CONSOLE-WRITTEN and powers off. The console's output is (`--sink fifo`, the default) a
-named pipe the runner holds open and does not read until RELEASE seconds after the kernel's `reboot: Power down` line
-on COM1: the backend can only put a pipe's buffer (16-64 KiB) into it, so at the guest's power-off the model still
-holds about 1 MiB (within TX_BUFFER, so the guest never waits), and only the device's power-off drain (up to 2 s) can
-get it to the runner. A drain that returns at once ends natemu before the runner reads, and the tail is lost. With
-`--sink file` the output is a regular file natemu creates; the backend usually keeps up with the guest there, so that
-sink shows create-and-append, not the drain. The runner checks the bytes are exactly the pattern (no CR added, nothing
-lost or repeated), nothing was reported discarded, and the run ends with `natemu: Power(1)`.
+console-file: the init writes the start of the pattern (every byte value, LF and CR included) to /dev/hvc0 with
+`dd bs=4096` (as many blocks as `console_blocks=N` says), drains it, prints CONSOLE-WRITTEN and powers off. The
+console's output is (`--sink fifo`, the default) a named pipe the runner holds open and does not read until RELEASE
+seconds after it sees the kernel's `reboot: Power down` line on COM1. The backend can only put a pipe's buffer (8 KiB
+here) into it, so at the guest's power-off the model still holds the rest of FIFO_BYTES (256 KiB), and only the
+device's power-off drain (up to 2 s) can get it to the runner. A drain that returns at once ends natemu before the
+runner reads, and the tail is lost. The payload is small so the good case's margin is wide: after RELEASE, 256 KiB
+must cross the 8 KiB pipe (about 32 writer and reader wake-ups) inside the rest of the grace. result.json's `timings`
+shows that margin in every run (seconds from the runner seeing `Power down` to its first read, its last byte, and
+natemu's exit). The window left: a drain that returns at once still passes if natemu takes longer than RELEASE to exit
+after the power-down line (the runner then reads while the writer is alive); the break demonstration ended natemu in
+well under that. With `--sink file` the output is a regular file natemu creates and the whole 1 MiB (FILE_BYTES, the
+device's TX_BUFFER) is written; the backend usually keeps up with the guest there, so that sink shows create-and-append,
+not the drain. The runner checks the bytes are exactly the pattern's start (no CR added, nothing lost or repeated),
+nothing was reported discarded, and the run ends with `natemu: Power(1)`.
 
 console-socket: the console is a Unix socket in a private folder from `tempfile.mkdtemp(prefix='nm-')` (run folders
 can pass sun_path's 104 bytes), removed afterwards. The runner connects after the guest's CONSOLE-READY on COM1 (the
@@ -75,7 +81,8 @@ APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'ls', 'ba
            'poweroff', 'sleep', 'stty', 'dd', 'sha256sum')
 VM_SECONDS = 240
 CMDLINE = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
-FILE_BYTES = 1 << 20            # the device's TX_BUFFER: the whole pattern fits what the model may hold
+FILE_BYTES = 1 << 20            # --sink file: the device's TX_BUFFER (the whole pattern fits what the model may hold)
+FIFO_BYTES = 256 << 10          # --sink fifo: well over the pipe's 8 KiB, small enough to cross it quickly in the drain
 SOCKET_BYTES = 4 << 20          # well over what the guest buffers (about 1.7 MiB) and the device's 64 + 64 KiB
 PAUSE = 3                       # seconds the init leaves the socket's input unread
 RELEASE = 0.5                   # seconds after `reboot: Power down` before the runner reads the pipe (drain grace: 2 s)
@@ -95,9 +102,11 @@ mount -t proc proc /proc || fail proc
 mount -t sysfs sysfs /sys || fail sysfs
 mount -t devtmpfs devtmpfs /dev || fail devtmpfs
 exec </dev/console >/dev/console 2>&1
-name= transport=
+name= transport= blocks=
 for item in $(cat /proc/cmdline); do
-  case "$item" in console_case=*) name=${item#*=};; console_transport=*) transport=${item#*=};; esac
+  case "$item" in
+    console_case=*) name=${item#*=};; console_transport=*) transport=${item#*=};; console_blocks=*) blocks=${item#*=};;
+  esac
 done
 echo "CONSOLE-BEGIN case=$name transport=$transport cpus=$(nproc) kernel=$(uname -r)"
 test "$(uname -r)" = '@KVER@' || fail kernel
@@ -128,9 +137,10 @@ stty -F /dev/hvc0 raw -echo || fail stty-raw
 
 # console-file: the pattern to /dev/hvc0, drained, then the power-off (nothing waits in between).
 case_file() {
-  echo "CONSOLE-WRITE bytes=@FILE_BYTES@"
-  dd if=/pattern bs=4096 2>/tmp/dd.log >&3 || fail "dd: $(cat /tmp/dd.log)"
-  grep -q '^@FILE_BLOCKS@+0 records out$' /tmp/dd.log || fail "dd: $(cat /tmp/dd.log)"
+  test -n "$blocks" || fail "no console_blocks= on the kernel command line"
+  echo "CONSOLE-WRITE bytes=$((blocks * 4096))"
+  dd if=/pattern bs=4096 count="$blocks" 2>/tmp/dd.log >&3 || fail "dd: $(cat /tmp/dd.log)"
+  grep -q "^$blocks+0 records out\$" /tmp/dd.log || fail "dd: $(cat /tmp/dd.log)"
   drain /dev/hvc0 || fail hvc0-drain
   echo CONSOLE-WRITTEN
   pass
@@ -159,7 +169,7 @@ case "$name" in
 esac
 fail "case $name returned"
 '''
-for _k, _v in {'KVER': KVER, 'FILE_BYTES': FILE_BYTES, 'FILE_BLOCKS': FILE_BYTES // 4096, 'PAUSE': PAUSE,
+for _k, _v in {'KVER': KVER, 'PAUSE': PAUSE,
                'SOCKET_BLOCKS': SOCKET_BYTES // 4096}.items():
     INIT = INIT.replace(f'@{_k}@', str(_v))
 
@@ -173,6 +183,11 @@ def pattern(label: str, size: int) -> bytes:
 
 def file_pattern() -> bytes:
     return pattern('natemu console-file', FILE_BYTES)
+
+
+def written(sink: str) -> bytes:
+    """What console-file writes with this sink: the pattern's first FIFO_BYTES or all of it."""
+    return file_pattern()[:FIFO_BYTES if sink == 'fifo' else FILE_BYTES]
 
 
 def socket_pattern() -> bytes:
@@ -194,6 +209,7 @@ class Run:
     nonce: str = ''                 # console-socket
     sent: int = 0                   # console-socket: bytes the runner sent
     socket_left: bool = False       # console-socket: the socket file still there after natemu exited
+    timings: dict = dataclasses.field(default_factory=dict)   # console-file on a pipe: seconds after `Power down` was seen
 
 
 def common(run: Run) -> list:
@@ -225,7 +241,9 @@ def compare(got: bytes, want: bytes, what: str) -> list:
     """Empty if `got` is exactly `want`; else what differs, in words."""
     if got == want: return []
     at = next((i for i in range(0, min(len(got), len(want)), 4096) if got[i:i + 4096] != want[i:i + 4096]), None)
-    if at is not None: at += next(i for i, (a, b) in enumerate(zip(got[at:at + 4096], want[at:at + 4096])) if a != b)
+    if at is not None:
+        g, w = got[at:at + 4096], want[at:at + 4096]
+        at += next((i for i, (a, b) in enumerate(zip(g, w)) if a != b), min(len(g), len(w)))   # or one ends inside the block
     else: at = min(len(got), len(want))
     why = f'{what}: {len(got)} bytes, expected exactly {len(want)}; the first difference is at byte {at}'
     if want.startswith(got): why += f' (a prefix: the last {len(want) - len(got)} bytes are missing)'
@@ -236,8 +254,11 @@ def compare(got: bytes, want: bytes, what: str) -> list:
 
 def judge_file(run: Run) -> list:
     errors = common(run)
+    want = written(run.sink)
+    if re.findall(r'^CONSOLE-WRITE bytes=(\d+)$', run.serial, re.M) != [str(len(want))]:
+        errors.append(f'the guest did not write {len(want)} bytes (CONSOLE-WRITE)')
     if len(re.findall(r'^CONSOLE-WRITTEN$', run.serial, re.M)) != 1: errors.append('the guest never reported the pattern written')
-    return errors + compare(run.received, file_pattern(), f'the console output ({run.sink})')
+    return errors + compare(run.received, want, f'the console output ({run.sink})')
 
 
 def reply(nonce: str) -> bytes:
@@ -333,28 +354,38 @@ def boot(args, work: Path) -> Run:
     """One VM: started, its console's host end served, stopped at VM_SECONDS."""
     output, fifo, folder, sock_path, client, sender = work / 'console.out', None, None, None, None, None
     nonce, sent, received = '', [0], []
-    if args.case == 'console-file' and args.sink == 'fifo':
-        os.mkfifo(output)
-        fifo = os.open(output, os.O_RDONLY | os.O_NONBLOCK)      # natemu's open for writing does not wait then
-    if args.case == 'console-socket':
-        folder = Path(tempfile.mkdtemp(prefix='nm-'))
-        if len(str(folder / SOCKET_NAME).encode()) > SUN_PATH:  # a long TMPDIR
-            shutil.rmtree(folder)
-            folder = Path(tempfile.mkdtemp(prefix='nm-', dir='/tmp'))
-        sock_path = folder / SOCKET_NAME
-    backend = f'socket = {json.dumps(str(sock_path))}' if sock_path else f'output = {json.dumps(str(output.resolve()))}'
-    config = work / 'natemu.toml'
-    config.write_text(f'[machine]\ntransport = {{ console = "{args.transport}" }}\n\n[[console]]\nid = "hvc0"\n{backend}\n')
-    command = [str(args.natemu.resolve()), '--config', str(config.resolve()), '--runtime', str(args.runtime.resolve()),
-               '--fexc', str(args.fexc.resolve()), '--kernel', str((args.inputs / 'linux').resolve()),
-               '--initrd', str((args.inputs / 'console.cpio').resolve()), '--vcpus', str(args.cpus), '--ram', '2G',
-               '--compile-cache', 'off', '--serial', str((work / 'serial.log').resolve()),
-               '--cmdline', f'{CMDLINE} console_case={args.case.removeprefix("console-")} console_transport={args.transport}']
-    write_json(work / 'command.json', command)
-    env = {k: v for k, v in os.environ.items() if k not in ('NATEMU_PERF_LOG', 'NATEMU_COMPILE_CACHE')}   # settings the CLI reads (deprecated)
+    marks = {}                      # console-file on a pipe: when the runner saw `Power down`, read first and last, natemu ended
+
+    def take(chunk: bytes):
+        if chunk:
+            now = time.monotonic()
+            marks.setdefault('first_read', now)
+            marks['last_byte'] = now
+            received.append(chunk)
     serial = work / 'serial.log'
-    started, timeout, power_down, reading = time.monotonic(), False, None, False
+    started, timeout, reading = time.monotonic(), False, False
     try:
+        if args.case == 'console-file' and args.sink == 'fifo':
+            os.mkfifo(output)
+            fifo = os.open(output, os.O_RDONLY | os.O_NONBLOCK)      # natemu's open for writing does not wait then
+        if args.case == 'console-socket':
+            folder = Path(tempfile.mkdtemp(prefix='nm-'))
+            if len(str(folder / SOCKET_NAME).encode()) > SUN_PATH:  # a long TMPDIR
+                shutil.rmtree(folder)
+                folder = None
+                folder = Path(tempfile.mkdtemp(prefix='nm-', dir='/tmp'))
+            sock_path = folder / SOCKET_NAME
+        backend = f'socket = {json.dumps(str(sock_path))}' if sock_path else f'output = {json.dumps(str(output.resolve()))}'
+        config = work / 'natemu.toml'
+        config.write_text(f'[machine]\ntransport = {{ console = "{args.transport}" }}\n\n[[console]]\nid = "hvc0"\n{backend}\n')
+        command = [str(args.natemu.resolve()), '--config', str(config.resolve()), '--runtime', str(args.runtime.resolve()),
+                   '--fexc', str(args.fexc.resolve()), '--kernel', str((args.inputs / 'linux').resolve()),
+                   '--initrd', str((args.inputs / 'console.cpio').resolve()), '--vcpus', str(args.cpus), '--ram', '2G',
+                   '--compile-cache', 'off', '--serial', str(serial.resolve()),
+                   '--cmdline', f'{CMDLINE} console_case={args.case.removeprefix("console-")} console_transport={args.transport}'
+                   f' console_blocks={len(written(args.sink)) // 4096}']
+        write_json(work / 'command.json', command)
+        env = {k: v for k, v in os.environ.items() if k not in ('NATEMU_PERF_LOG', 'NATEMU_COMPILE_CACHE')}   # settings the CLI reads (deprecated)
         with (work / 'stdout.log').open('wb') as stdout, (work / 'stderr.log').open('wb') as stderr:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
             try:
@@ -365,8 +396,8 @@ def boot(args, work: Path) -> Run:
                         break
                     text = serial.read_text(errors='replace') if serial.exists() and not (reading or client) else ''
                     if fifo is not None and not reading:
-                        if power_down is None and 'reboot: Power down' in text: power_down = time.monotonic()
-                        reading = power_down is not None and time.monotonic() - power_down >= RELEASE
+                        if 'power_down' not in marks and 'reboot: Power down' in text: marks['power_down'] = time.monotonic()
+                        reading = 'power_down' in marks and time.monotonic() - marks['power_down'] >= RELEASE
                     if sock_path and client is None and re.search(r'^CONSOLE-READY\r?$', text, re.M):
                         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                         client.connect(str(sock_path))
@@ -382,18 +413,20 @@ def boot(args, work: Path) -> Run:
                         sender.start()
                     if reading:
                         select.select([fifo], [], [], 0.05)
-                        received.append(read_some(fifo)[0])
+                        take(read_some(fifo)[0])
                     elif client:
                         chunk, done = receive(client, 0.05)
-                        received.append(chunk)
+                        take(chunk)
                         if done: client.close(); client = False       # natemu closed it (it is ending)
                     else:
                         time.sleep(0.05)
             except BaseException:
                 stop_group(process)
                 raise
-        if fifo is not None: received.append(read_to_end(read_pipe(fifo), 10))
-        if client: received.append(read_to_end(lambda: receive(client, 0.1), 10))
+            marks['exit'] = time.monotonic()
+            marks['bytes_before_exit'] = sum(map(len, received))
+        if fifo is not None: take(read_to_end(read_pipe(fifo), 10))
+        if client: take(read_to_end(lambda: receive(client, 0.1), 10))
         if sender: sender.join(10)
         socket_left = bool(sock_path) and os.path.lexists(sock_path)
     finally:
@@ -401,9 +434,16 @@ def boot(args, work: Path) -> Run:
         if client: client.close()
         if folder: shutil.rmtree(folder, ignore_errors=True)
     if args.case == 'console-file' and args.sink == 'file' and output.exists(): received = [output.read_bytes()]
+    timings = {}
+    if fifo is not None:
+        zero = marks.get('power_down')
+        timings = {k: (round(v - zero, 3) if zero is not None else None) for k, v in marks.items()
+                   if k in ('first_read', 'last_byte', 'exit')}
+        timings['bytes_before_exit'] = marks.get('bytes_before_exit')
+        timings['power_down_seen'] = None if zero is None else round(zero - started, 3)
     return Run(args.case, args.transport, args.cpus, serial.read_text(errors='replace').replace('\r', '') if serial.exists() else '',
                (work / 'stderr.log').read_text(errors='replace'), process.returncode, timeout, b''.join(received),
-               sink=args.sink, nonce=nonce, sent=sent[0], socket_left=socket_left)
+               sink=args.sink, nonce=nonce, sent=sent[0], socket_left=socket_left, timings=timings)
 
 
 def run(args):
@@ -425,7 +465,7 @@ def run(args):
     errors = JUDGES[args.case](r)
     result = {'name': name, 'ok': not errors, 'errors': errors, 'returncode': r.returncode, 'timeout': r.timeout,
               'seconds': round(seconds, 1), 'received_bytes': len(r.received), 'received_sha256': hashlib.sha256(r.received).hexdigest(),
-              'sent_bytes': r.sent, 'nonce': r.nonce}
+              'sent_bytes': r.sent, 'nonce': r.nonce, 'timings': r.timings}
     write_json(work / 'result.json', result)
     write_json(args.out / 'results.json', {'results': [result]})
     print(json.dumps(result), flush=True)
@@ -451,20 +491,27 @@ def self_check():
         return (f'CONSOLE-BEGIN case={short} transport={transport} cpus=2 kernel={KVER}\n{dev}\n{extra}CONSOLE-PASS\n'
                 'reboot: Power down\n')
     host = 'natemu: cpu: x\nnatemu: Power(1)\n'
-    good_file = Run('console-file', 'mmio', 2, serial('file', 'mmio', f'CONSOLE-WRITE bytes={FILE_BYTES}\nCONSOLE-WRITTEN\n'),
-                    host, 0, False, file_pattern())
+    good_file = Run('console-file', 'mmio', 2, serial('file', 'mmio', f'CONSOLE-WRITE bytes={FIFO_BYTES}\nCONSOLE-WRITTEN\n'),
+                    host, 0, False, written('fifo'))
+    plain_file = dataclasses.replace(good_file, sink='file', received=written('file'),
+                                     serial=good_file.serial.replace(f'bytes={FIFO_BYTES}', f'bytes={FILE_BYTES}'))
     nonce = '0123456789abcdef'
     good_socket = Run('console-socket', 'pci', 2, serial('socket', 'pci', f'CONSOLE-READY\nCONSOLE-PING nonce={nonce}\nCONSOLE-REPLIED sha256=x\n'),
                       host, 0, False, reply(nonce), nonce=nonce, sent=len(f'ping {nonce}\n') + SOCKET_BYTES)
-    pci_file = dataclasses.replace(good_file, transport='pci', serial=serial('file', 'pci', 'CONSOLE-WRITTEN\n'))
-    for good in (good_file, good_socket, dataclasses.replace(good_file, sink='file'), pci_file):
+    pci_file = dataclasses.replace(good_file, transport='pci', serial=serial('file', 'pci', f'CONSOLE-WRITE bytes={FIFO_BYTES}\nCONSOLE-WRITTEN\n'))
+    for good in (good_file, good_socket, plain_file, pci_file):
         assert not JUDGES[good.case](good), JUDGES[good.case](good)
     swap = lambda run, old, new: dataclasses.replace(run, serial=run.serial.replace(old, new))
-    data = file_pattern()
+    data = written('fifo')
+    assert len(data) == FIFO_BYTES and len(written('file')) == FILE_BYTES
     bad = {
         'tail lost': dataclasses.replace(good_file, received=data[:-4096]),
         'output empty': dataclasses.replace(good_file, received=b''),
-        'pipe buffer only': dataclasses.replace(good_file, received=data[:65536]),
+        'pipe buffer only': dataclasses.replace(good_file, received=data[:8192]),
+        'whole pattern on the pipe': dataclasses.replace(good_file, received=written('file')),
+        'pipe size on a file': dataclasses.replace(plain_file, received=data),
+        'file tail lost': dataclasses.replace(plain_file, received=written('file')[:-1]),
+        'other size written': swap(good_file, f'bytes={FIFO_BYTES}', f'bytes={FILE_BYTES}'),
         'CR added': dataclasses.replace(good_file, received=data.replace(b'\n', b'\r\n')),
         'byte repeated': dataclasses.replace(good_file, received=data[:1000] + data[999:]),
         'byte changed': dataclasses.replace(good_file, received=data[:5000] + bytes([data[5000] ^ 1]) + data[5001:]),
