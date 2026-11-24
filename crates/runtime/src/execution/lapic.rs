@@ -343,7 +343,7 @@ pub(super) fn wait(s: &State, window: u64) -> bool {
             t0.saturating_add(window)
         };
         while now() < end {
-            if pending() {
+            if woken() {
                 return true;
             }
             core::hint::spin_loop();
@@ -376,18 +376,23 @@ fn pending() -> bool {
     unsafe { asm!("mrs {}, isr_el1", out(reg) isr) };
     isr & 1 << 7 != 0
 }
+/// An interrupt other than a sample bell is signalled: the EL0 sampler's bells are taken and counted, so a bell neither
+/// ends a wait nor counts as a wake caught by the poll (`profile` builds; otherwise [`pending`]).
+fn woken() -> bool {
+    pending() && !crate::bell::bells_only()
+}
 /// [`wait`] without the poll.
 fn sleep(d: u64, f: u64, timer: bool) {
     let n = now();
     // With nothing its timer can deliver (masked, IF = 0, a class not above the PPR) the timer cannot end the halt:
     // a plain wait, no early wakes, no spin.
     if !timer || d <= n {
-        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-        return unsafe { asm!("dsb sy", "wfi") };
+        // Waits for an interrupt (masked at EL1: it only wakes the PE); a sample bell alone does not end it.
+        return crate::bell::wfi();
     }
     if d - n <= clock::scale(SPIN_US, f, 1_000_000) {
         while now() < d {
-            if pending() {
+            if woken() {
                 return;
             }
             core::hint::spin_loop();
@@ -395,7 +400,7 @@ fn sleep(d: u64, f: u64, timer: bool) {
         return;
     }
     cntv(Some(n + (d - n) / 2));
-    unsafe { asm!("dsb sy", "wfi") };
+    crate::bell::wfi();
     cntv(Some(d));
 }
 /// The V of the timer's next expiry (`u64::MAX`: none).

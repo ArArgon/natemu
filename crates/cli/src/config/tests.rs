@@ -1330,8 +1330,34 @@ fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
         "1",
         "--perf-log",
         "p",
+        "--profile",
+        "prof",
+        "--profile-us",
+        "100",
+        "--profile-start",
+        "guest",
     ])
     .unwrap();
+}
+
+/// The EL0 sampler's options from flags, the file and `--set`: the name, the interval and the start; refused without a
+/// name, or at 0 us, or with another start word.
+#[test]
+fn profile_options_reach_the_boot() {
+    let _env = lock();
+    let c = load_old(&["--profile", "out/run", "--profile-us", "500", "--profile-start", "guest"]).unwrap();
+    assert_eq!((c.profile.as_deref(), c.profile_us, c.profile_start_guest), (Some(Path::new("out/run")), Some(500), true));
+    let c = load_old(&["--profile", "x"]).unwrap();
+    assert_eq!((c.profile_us, c.profile_start_guest), (None, false));
+    let c = load_old(&["--set", "debug.profile=y", "--set", "debug.profile_start=guest"]).unwrap();
+    assert_eq!((c.profile.as_deref(), c.profile_start_guest), (Some(Path::new("y")), true));
+    let (d, c) = load_file(&format!("{MIN}[debug]\nprofile = \"p\"\nprofile_us = 125\n"), &[]);
+    let c = c.unwrap();
+    assert_eq!((c.profile, c.profile_us), (Some(d.join("p")), Some(125)));
+    assert!(err(load_old(&["--profile-us", "100"])).contains("need a profile"));
+    assert!(err(load_old(&["--profile", "x", "--profile-us", "0"])).contains("at least 1"));
+    assert!(load_old(&["--profile", "x", "--profile-start", "later"]).is_err());
+    assert!(err(load_old(&["--set", "debug.profile=x", "--set", "debug.profile_start=later"])).contains("run or guest"));
 }
 
 #[test]

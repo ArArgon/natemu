@@ -5,7 +5,7 @@
 //!       [--ram SIZE] [--vcpus N] [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]]
 //!       [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE] [--page-currency on|off|check]
 //!       [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
-//!       [--net-host-loopback] [--virtio-transport SPEC]
+//!       [--net-host-loopback] [--virtio-transport SPEC] [--profile NAME [--profile-us N] [--profile-start run|guest]]
 //!
 //! Named arguments (clap; `natemu --help`); the configuration file is described in docs/configuration.md.
 //!
@@ -48,6 +48,9 @@
 //! `--serial-stdin` (off by default) feeds standard input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode,
 //! Ctrl-C to the guest, Ctrl-A x cancels the run. `--page-currency` and `--writable-on-read` are debug and measurement switches (see their
 //! help). `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` turns it off) is the shared template pool.
+//! `--profile NAME` (a measurement; a resident built with its `profile` feature) rings each vCPU's sample bell every
+//! `--profile-us` microseconds (250) and writes `NAME.samples` and `NAME.objects` (`natemu::sampler`); `--profile-start
+//! guest` waits for the guest's start through its control port (F8H), SIGUSR1 turns sampling off and on.
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 //!
@@ -182,6 +185,25 @@ struct Cli {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<PathBuf>,
+    /// Measurement: sample where every vCPU is, into NAME.samples and NAME.objects (needs a resident built with its
+    /// `profile` feature; docs/restructure/el0-sampler-plan.md). SIGUSR1 turns sampling off and on again
+    #[arg(long, value_name = "NAME")]
+    profile: Option<PathBuf>,
+    /// The sampler's interval in microseconds [default: 250]
+    #[arg(long, value_name = "N")]
+    profile_us: Option<u64>,
+    /// When sampling starts: `run` (the run's start) or `guest` (the guest's first start through port F8H)
+    #[arg(long, value_name = "run|guest", value_parser = profile_start, action = clap::ArgAction::Set, default_value = "run", hide_default_value = true)]
+    profile_start: bool,
+}
+
+/// `--profile-start`: whether sampling waits for the guest (`guest`) or starts with the run (`run`).
+fn profile_start(text: &str) -> Result<bool, String> {
+    match text {
+        "run" => Ok(false),
+        "guest" => Ok(true),
+        _ => Err(format!("{text:?}: run or guest")),
+    }
 }
 
 /// Parses the command line, recording which flags came from it and which from an environment variable.
@@ -390,6 +412,10 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     let prepared = report_prepared(boot.prepare(), &summary, &mut std::io::stderr().lock())?;
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     prepared.canceller().on_signals();
+    // EL0 sampler: SIGUSR1 toggles sampling while the VM runs.
+    if cfg.profile.is_some() {
+        natemu::sampler::on_signal();
+    }
     // M2 task D: SIGINFO (Ctrl-T) prints every vCPU's state and the run goes on; `debug.inspect = false` turns it off.
     if cfg.inspect {
         natemu::execution::inspect_on_signal();

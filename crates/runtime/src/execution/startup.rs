@@ -126,8 +126,8 @@ pub(super) fn wait(s: &mut State) {
             }
             halt(s, stop::WAIT_FOR_SIPI)
         }
-        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-        unsafe { asm!("dsb sy", "wfi") };
+        // Waits for an interrupt (masked at EL1: it only wakes the PE); a sample bell alone does not end it.
+        crate::bell::wfi();
     }
 }
 

@@ -135,6 +135,10 @@ const MPIDR_EL1: u16 = 0xc005;
 pub struct Machine {
     /// The first SPI: vCPU v's host doorbell is `spi + v`.
     spi: u32,
+    /// The SPIs HVF gives the VM from `spi` on.
+    spis: u32,
+    /// EL0 sampler ([`Machine::bells`]): each vCPU's sample bell, SPI `spi + MAX_VCPUS + v`, is configured and routed.
+    bells: bool,
     /// The mapped backing, owned while the VM maps it (R2 review: a borrow could end, and `mem::forget` of the machine
     /// would leave the VM mapping freed memory; an owned `Arc` leaks with it instead).
     memory: std::sync::Arc<Memory>,
@@ -214,6 +218,8 @@ impl Machine {
         // From here on every early return destroys the VM (Drop).
         let mut machine = Self {
             spi: 0,
+            spis: 0,
+            bells: false,
             memory,
             mapped: mapped.to_vec(),
             plan,
@@ -247,24 +253,12 @@ impl Machine {
         if (count as usize) < natemu_abi::execution::cache::MAX_VCPUS {
             return Err(format!("{count} GIC SPIs: one per vCPU needed"));
         }
-        machine.spi = spi;
+        (machine.spi, machine.spis) = (spi, count);
         // Affinity routing, both groups enabled.
         let ctlr = machine.distributor(GICD_CTLR)?;
         machine.set_distributor(GICD_CTLR, ctlr | 0x13)?;
-        // Every vCPU's SPI (one register write each: these registers hold several INTIDs, so all are set at once).
-        let spis = spi..spi + natemu_abi::execution::cache::MAX_VCPUS as u32;
-        let mut words: std::collections::BTreeMap<u16, u64> = Default::default();
-        for n in spis.clone() {
-            *words.entry(gicd(GICD_IGROUPR, n, 1)).or_default() |= 1 << (n % 32);
-            *words.entry(gicd(GICD_ICFGR, n, 2)).or_default() |= 2 << (2 * (n % 16)); // edge
-            *words.entry(gicd(GICD_IPRIORITYR, n, 8)).or_default() |= 0x80 << (8 * (n % 4));
-        }
-        for (reg, value) in words {
-            machine.set_distributor(reg, value)?;
-        }
-        for n in spis {
-            machine.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
-        }
+        // Every vCPU's SPI.
+        machine.configure(spi..spi + natemu_abi::execution::cache::MAX_VCPUS as u32)?;
         unsafe { hv(hv_vm_map(base.cast(), IPA, bytes, MAPPED), "hv_vm_map")? };
         for (region, &(ipa, len)) in machine.mapped.iter().zip(&machine.plan.maps) {
             unsafe {
@@ -298,6 +292,42 @@ impl Machine {
         }
         Ok(machine)
     }
+    /// Configures SPIs `spis` as host doorbells: group 1, edge-triggered, priority 0x80, enabled (one register write
+    /// each: these registers hold several INTIDs, so all are set at once). Their routes are written per vCPU ([`route`]).
+    ///
+    /// [`route`]: Machine::route
+    fn configure(&self, spis: std::ops::Range<u32>) -> Result<()> {
+        let mut words: std::collections::BTreeMap<u16, u64> = Default::default();
+        for n in spis.clone() {
+            *words.entry(gicd(GICD_IGROUPR, n, 1)).or_default() |= 1 << (n % 32);
+            *words.entry(gicd(GICD_ICFGR, n, 2)).or_default() |= 2 << (2 * (n % 16)); // edge
+            *words.entry(gicd(GICD_IPRIORITYR, n, 8)).or_default() |= 0x80 << (8 * (n % 4));
+        }
+        for (reg, value) in words {
+            self.set_distributor(reg, value)?;
+        }
+        for n in spis {
+            self.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
+        }
+        Ok(())
+    }
+    /// EL0 sampler (docs/restructure/el0-sampler-plan.md section 3): a second SPI per vCPU, its *sample bell*, after the
+    /// whole doorbell range (`spi + MAX_VCPUS + v`), configured as the doorbells are and routed with them; only in a run
+    /// that samples (before any vCPU exists), so other runs' GIC is unchanged. Refused when HVF gives fewer than
+    /// `2 * MAX_VCPUS` SPIs.
+    pub fn bells(&mut self) -> Result<()> {
+        let n = natemu_abi::execution::cache::MAX_VCPUS as u32;
+        if self.spis < 2 * n {
+            return Err(format!("{} GIC SPIs: the sampler needs two per vCPU ({})", self.spis, 2 * n));
+        }
+        self.configure(self.spi + n..self.spi + 2 * n)?;
+        self.bells = true;
+        Ok(())
+    }
+    /// vCPU `v`'s sample bell's INTID ([`Machine::bells`]).
+    pub fn bell_intid(&self, v: usize) -> u32 {
+        self.spi + natemu_abi::execution::cache::MAX_VCPUS as u32 + v as u32
+    }
     fn distributor(&self, reg: u16) -> Result<u64> {
         let mut value = 0;
         let _gic = gic();
@@ -329,11 +359,19 @@ impl Machine {
         self.set_distributor(
             GICD_IROUTER + 8 * (self.spi + v as u32) as u16,
             natemu_abi::execution::vcpu_affinity(v),
-        )
+        )?;
+        if self.bells {
+            self.set_distributor(GICD_IROUTER + 8 * self.bell_intid(v) as u16, natemu_abi::execution::vcpu_affinity(v))?;
+        }
+        Ok(())
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
     pub(crate) fn ring(&self, v: usize) -> Result<()> {
         self.doorbell().ring(v)
+    }
+    /// vCPU `v`'s sample bell, from any thread ([`Machine::bells`]).
+    pub(crate) fn bell(&self) -> Bell {
+        Bell { intid: self.bell_intid(0) }
     }
     /// The doorbells alone (X2: what a vCPU's service loop rings for a test driver's event source).
     pub fn doorbell(&self) -> Doorbell {
@@ -367,6 +405,18 @@ impl Doorbell {
     pub fn ring(&self, v: usize) -> Result<()> {
         let _gic = gic();
         unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
+    }
+}
+/// The VM's sample bells ([`Machine::bells`]); valid while the machine exists.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bell {
+    intid: u32,
+}
+impl Bell {
+    /// Rings vCPU `v`'s sample bell (an edge on its SPI).
+    pub(crate) fn ring(&self, v: usize) -> Result<()> {
+        let _gic = gic();
+        unsafe { hv(hv_gic_set_spi(self.intid + v as u32, true), "hv_gic_set_spi") }
     }
 }
 #[cfg(test)]

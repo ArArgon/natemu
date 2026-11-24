@@ -177,7 +177,7 @@ impl<T: Timed + 'static> Drop for Timer<T> {
 
 /// Puts the calling thread under the time-constraint scheduling policy (computation 50 us within 100 us, preemptible),
 /// so its timed waits end on time. A failure leaves it at the default policy (its wake-ups are then later, never wrong).
-fn time_constraint() {
+pub(crate) fn time_constraint() {
     #[repr(C)]
     struct Policy {
         period: u32,

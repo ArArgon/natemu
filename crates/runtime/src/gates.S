@@ -177,9 +177,12 @@ resume_exception:
     msr elr_el1, x1
     msr spsr_el1, x2
 .if {profile}
-    // Translated-code profile: where generated code resumes (`study::prof::sample` discards interrupts taken there).
-    ldr x9, ={resume_pc}
-    str x1, [x9]
+    // EL0 sampler: when generated code was last resumed (`natemu_abi::sample::Head::resume_time`): a bell rung before it
+    // was pending while the vCPU was outside generated code (`bell::sample`). Scratch registers only (x9 and x10 are loaded
+    // from the frame below), and before `mov sp`, as the contract above asks.
+    mrs x10, cntvct_el0
+    ldr x9, ={resume_time}
+    str x10, [x9]
 .endif
     mov x16, x0
     ldr x9, [x16, #{sp_offset}]

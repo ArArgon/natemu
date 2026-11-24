@@ -559,6 +559,10 @@ pub struct Boot {
     /// device memory, the EDID's preferred mode `width` x `height` ([`crate::display::Spec::check`] refuses others). It
     /// installs the bus even when every virtio device is on MMIO. Default none.
     pub display: Option<crate::display::Spec>,
+    /// EL0 sampler (docs/restructure/el0-sampler-plan.md; default none): ring each vCPU's sample bell and write
+    /// `NAME.samples` and `NAME.objects` ([`crate::sampler`]), with the guest's control port at F8H-FBH
+    /// ([`crate::profile_port`]). Only a resident built with its `profile` feature samples; others are never rung.
+    pub profile: Option<crate::sampler::Options>,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -607,6 +611,7 @@ impl Boot {
             pci_testdev: false,
             mapped_testdev: false,
             display: None,
+            profile: None,
             firmware: None,
         }
     }
@@ -761,6 +766,7 @@ impl Boot {
         } else {
             None
         };
+        let sampler = sampler(&self.profile, self.vcpus, &backing, &mut devices)?;
         let mut virtio = Vec::new();
         let mut serials = Vec::new();
         let mut bus = crate::pci::Bus::new();
@@ -874,7 +880,9 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
-            ps2,            display,
+            ps2,
+            display,
+            sampler,
         })
     }
 
@@ -964,6 +972,7 @@ impl Boot {
         } else {
             None
         };
+        let sampler = sampler(&self.profile, self.vcpus, &backing, &mut devices)?;
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
@@ -997,7 +1006,9 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
-            ps2,            display: None,
+            ps2,
+            display: None,
+            sampler,
         })
     }
 
@@ -1005,6 +1016,26 @@ impl Boot {
     pub fn run(self) -> Result<Outcome> {
         self.prepare()?.run()
     }
+}
+
+/// [`Boot::profile`]: the sampler, and its control port registered beside debug-exit (both prepare paths, before the
+/// registry is frozen).
+fn sampler(
+    profile: &Option<crate::sampler::Options>,
+    vcpus: usize,
+    backing: &Backing,
+    devices: &mut devices::Devices,
+) -> Result<Option<Arc<crate::sampler::Sampler>>> {
+    let Some(options) = profile else {
+        return Ok(None);
+    };
+    let sampler = crate::sampler::Sampler::new(options, vcpus, Some(backing.blocks()))?;
+    devices.register_ports(
+        crate::profile_port::PORT.into(),
+        crate::profile_port::PORTS,
+        Arc::new(Mutex::new(crate::profile_port::ProfilePort(sampler.clone()))),
+    )?;
+    Ok(Some(sampler))
 }
 
 /// A loaded VM, ready to run.
@@ -1050,6 +1081,8 @@ pub struct Prepared {
     ps2: Option<crate::ps2::Ps2Input>,
     /// [`Boot::display`]: the display function.
     display: Option<Arc<crate::display::Display>>,
+    /// [`Boot::profile`]'s sampler.
+    sampler: Option<Arc<crate::sampler::Sampler>>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -1180,7 +1213,13 @@ impl Prepared {
         }
         crate::perf::mark("run");
         let (backing, vcpus) = (&self.backing, self.backing.n);
-        let machine = backing.machine(&self.mapped)?;
+        let mut machine = backing.machine(&self.mapped)?;
+        // EL0 sampler: the sample bells, and each one's INTID in its vCPU's head before any vCPU exists.
+        if let Some(s) = &self.sampler {
+            machine.bells()?;
+            s.begin(&backing.blocks(), |v| machine.bell_intid(v));
+        }
+        let machine = machine;
         self.irqs.attach(machine.doorbell());
         // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed (the
         // rule `irq.rs` sets for asynchronous sources; no Linux boot reads it today).
@@ -1230,6 +1269,7 @@ impl Prepared {
             compiler.shape = self.code_shape;
             compiler.accurate_fp = self.accurate_fp;
             compiler.report = true; // M2 task D: stop reports and the host-side progress check
+            compiler.objects = self.sampler.as_ref().map(|s| s.objects.clone());
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),
                 ..Default::default()
@@ -1321,7 +1361,8 @@ impl Prepared {
         // Perf chunk 14: with the log on, every 5 ms each vCPU's resident time so far by bucket (the current one counted to
         // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
         let sampling = AtomicBool::new(crate::perf::on());
-        let sampling_profile = AtomicBool::new(true);
+        // EL0 sampler: its ringing and drain threads end once every vCPU has.
+        let sampler_done = AtomicBool::new(false);
         let (supervision, io_result) = std::thread::scope(|scope| {
             let io: Vec<_> = self
                 .virtio
@@ -1351,44 +1392,25 @@ impl Prepared {
                     result
                 })
             });
-            // Translated-code profile: every NATEMU_SAMPLE_US microseconds each vCPU's doorbell is rung, so a `profile`
-            // resident samples where its generated code was.
-            if let Some(us) = std::env::var("NATEMU_SAMPLE_US").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&us| us != 0) {
-                let (doorbell, sampling) = (machine.doorbell(), &sampling_profile);
-                scope.spawn(move || {
-                    while sampling.load(SeqCst) {
-                        for v in 0..vcpus {
-                            let _ = doorbell.ring(v);
-                        }
-                        std::thread::sleep(std::time::Duration::from_micros(us));
-                    }
-                });
+            // EL0 sampler: the ringing thread and the drain (`crate::sampler`).
+            if let Some(s) = &self.sampler {
+                let (blocks, bell, done) = (backing.blocks(), machine.bell(), &sampler_done);
+                scope.spawn(move || s.ring(&blocks, bell, done));
+                let blocks = backing.blocks();
+                scope.spawn(move || s.drain_until(&blocks, done));
             }
             if sampling.load(SeqCst) {
-                scope.spawn(|| {
-                    use exec::perf as rp;
+                let (blocks, sampling) = (backing.blocks(), &sampling);
+                scope.spawn(move || {
                     while sampling.load(SeqCst) {
-                        let t = crate::perf::now();
-                        let mut text = format!("snap {t}");
-                        for v in 0..vcpus {
-                            let p: rp::Perf = backing.vcpu(v).read_record(rp::OFFSET);
-                            let mut ticks = p.ticks;
-                            let now = crate::clock::now();
-                            if p.magic == rp::MAGIC && (p.current as usize) < rp::BUCKETS {
-                                ticks[p.current as usize] += now.saturating_sub(p.since);
-                            }
-                            for x in ticks {
-                                text += &format!(" {}", execution::ticks_ns(x));
-                            }
-                        }
-                        crate::perf::line(&text);
+                        crate::perf::line(&blocks.snap());
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 });
             }
             let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
             sampling.store(false, SeqCst);
-            sampling_profile.store(false, SeqCst);
+            sampler_done.store(true, SeqCst);
             for device in &self.virtio {
                 device.stop();
             }

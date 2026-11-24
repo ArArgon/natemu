@@ -479,8 +479,8 @@ pub(super) fn wait_mailbox(s: &mut State) -> bool {
             halt(s, stop::HALTED)
         }
         s.mailbox_wakes += 1;
-        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-        unsafe { asm!("dsb sy", "wfi") };
+        // Waits for an interrupt (masked at EL1: it only wakes the PE); a sample bell alone does not end it.
+        crate::bell::wfi();
     }
 }
 
@@ -488,20 +488,33 @@ pub(super) fn wait_mailbox(s: &mut State) -> bool {
 /// how many there were. ISR_EL1.I ends the loop first when no IRQ is signalled: under HVF's GIC each ICC access traps
 /// (about 1.2 us, measured: io-benchmarks.md "Shorter depth-1 path"), ISR_EL1 does not, so a wake by one doorbell
 /// costs two traps, not three. A doorbell ISR_EL1 misses stays pending: it ends the next `wfi` at once, or interrupts
-/// generated code (`interrupted`), so none is lost.
+/// generated code (`interrupted`), so none is lost. EL0 sampler (`profile` builds): an INTID a wait's bell test already
+/// acknowledged ([`crate::bell::held`]) comes first; a sample bell is ended and counted as taken in a wait, never as a
+/// doorbell (no stop, no wake).
 fn acknowledge() -> u64 {
     let mut any = 0;
     loop {
-        let (isr, intid): (u64, u64);
-        // SAFETY: reads the pending-interrupt status.
-        unsafe { asm!("isb", "mrs {}, isr_el1", out(reg) isr) };
-        if isr & 1 << 7 == 0 {
-            return any;
-        }
-        // SAFETY: GIC CPU interface system registers (enabled at start).
-        unsafe { asm!("mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
+        let intid = match crate::bell::held() {
+            Some(intid) => intid,
+            None => {
+                let (isr, intid): (u64, u64);
+                // SAFETY: reads the pending-interrupt status.
+                unsafe { asm!("isb", "mrs {}, isr_el1", out(reg) isr) };
+                if isr & 1 << 7 == 0 {
+                    return any;
+                }
+                // SAFETY: GIC CPU interface system registers (enabled at start).
+                unsafe { asm!("mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
+                intid
+            }
+        };
         if intid >= 1020 {
             return any;
+        }
+        if crate::bell::is(intid) {
+            unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) };
+            crate::bell::in_wait();
+            continue;
         }
         // L5: a timer IRQ before its expiry (a halted vCPU's early wake, `lapic::wait`) is no stop and no counted IRQ.
         let counted = intid != lapic::TIMER_PPI || lapic::timer_irq();

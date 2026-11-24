@@ -21,9 +21,9 @@ page-study = ["perf"]
 # PCID gain study, measurement builds only (`src/study.rs`): models the TLB a PCID guest would keep across CR3 loads and counts
 # the shadow misses and block revalidations that were refills (`Control::pcid_study`).
 pcid-study = ["perf"]
-# Translated-code profile, measurement builds only (`study::prof`): at every interrupt taken in generated code, where the
-# vCPU was (dispatcher, a block's header, body or exits), in whose code (user or kernel), on what kind of instruction, and
-# a table of the blocks hit most (the host rings each vCPU's doorbell every NATEMU_SAMPLE_US microseconds to sample).
+# EL0 sampler, measurement builds only (`src/bell.rs`, docs/restructure/el0-sampler-plan.md): each sample bell the host
+# rings (`natemu --profile NAME`) writes where the vCPU was to its sample ring (`natemu_abi::sample`), which the host drains;
+# nothing else changes. Composes with `perf` (they use separate areas).
 profile = []
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []

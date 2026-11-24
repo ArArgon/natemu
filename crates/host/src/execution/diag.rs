@@ -39,14 +39,18 @@ pub fn inspect_on_signal() {
     INSPECTING.store(true, SeqCst);
 }
 const SIGINFO: i32 = 29;
-/// Blocks SIGINFO on the calling thread (a vCPU's, and the watchdog thread it starts), so the signal never lands during
-/// `hv_vcpu_run`; the process's other threads take it.
+/// Blocks SIGINFO (and SIGUSR1 in a run that toggles sampling on it) on the calling thread (a vCPU's, and the watchdog
+/// thread it starts), so the signal never lands during `hv_vcpu_run`; the process's other threads take it.
 pub(crate) fn block_inspect_signal() {
     unsafe extern "C" {
         fn pthread_sigmask(how: i32, set: *const u32, old: *mut u32) -> i32;
     }
     const SIG_BLOCK: i32 = 1;
-    let set: u32 = 1 << (SIGINFO - 1); // Darwin's sigset_t: one bit per signal
+    let mut set: u32 = 1 << (SIGINFO - 1); // Darwin's sigset_t: one bit per signal
+    // The EL0 sampler's toggle (`crate::sampler::on_signal`), when it is installed, likewise.
+    if crate::sampler::SIGNAL_TOGGLES.load(SeqCst) {
+        set |= 1 << (crate::sampler::SIGUSR1 - 1);
+    }
     unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) };
 }
 

@@ -50,7 +50,8 @@ STACK_SWITCHES = {'private_start': {('mov sp, x9', 'EXCEPTION_STACK_TOP'), ('msr
                   'resume_exception': {('mov sp, x9', 'EXCEPTION_STACK_TOP')},
                   'enter_allocated': {('msr spsel, #0x1', None)}}
 R = 'natemu_runtime::execution::'
-ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'resume', R + 'interrupted', R + 'miss_fast'}
+# (`resume_interrupted`: the return after a spurious INTID or a sample bell, which arms a wanted stop in a probe's block.)
+ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'resume', R + 'resume_interrupted', R + 'interrupted', R + 'miss_fast'}
 # A nested gate entry's path to its halt: the gate's chain, then the calls its last function makes before halting.
 NESTED = {'exception_capture': (['finish', R + 'returned', R + 'resident_fault'], [R + 'load', R + 'halt'])}
 # Declared shared bodies: a branch from the function into the target's body past its prologue, after an identical

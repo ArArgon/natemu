@@ -187,6 +187,58 @@ impl Backing {
         }
     }
 }
+impl Backing {
+    /// The vCPUs' blocks, owned (for threads that outlive a borrow of the backing: the sampler's, a device's).
+    pub(crate) fn blocks(&self) -> Blocks {
+        Blocks {
+            memory: self.memory.clone(),
+            n: self.n,
+            stride: self.stride,
+        }
+    }
+}
+/// Every vCPU's block of the backing, held by its mapping ([`Backing::blocks`]): what the sampler and the performance log's
+/// snapshots read while the vCPUs run.
+pub(crate) struct Blocks {
+    memory: Arc<Memory>,
+    n: usize,
+    stride: usize,
+}
+impl Blocks {
+    pub(crate) fn memory(&self) -> &Memory {
+        &self.memory
+    }
+    /// A word of vCPU `v`'s block at `offset` (8-aligned), shared with its resident.
+    pub(crate) fn word(&self, v: usize, offset: usize) -> &AtomicU64 {
+        let at = v * self.stride + offset;
+        assert!(v < self.n && at % 8 == 0 && at + 8 <= self.memory.1);
+        unsafe { AtomicU64::from_ptr(self.memory.0.add(at).cast()) }
+    }
+    /// The address of `bytes` bytes of vCPU `v`'s block at `offset`.
+    pub(crate) fn ptr(&self, v: usize, offset: usize, bytes: usize) -> *mut u8 {
+        let at = v * self.stride + offset;
+        assert!(v < self.n && at + bytes <= self.memory.1);
+        unsafe { self.memory.0.add(at) }
+    }
+    /// The performance log's `snap` line: each vCPU's resident time so far by bucket (the current one counted to now; zero
+    /// without a `perf` resident), `perf::BUCKETS` ns values per vCPU after `snap NS`.
+    pub(crate) fn snap(&self) -> String {
+        use exec::perf as rp;
+        let mut text = format!("snap {}", crate::perf::now());
+        for v in 0..self.n {
+            let p: rp::Perf = self.memory.read_record(v * self.stride + rp::OFFSET);
+            let mut ticks = p.ticks;
+            let now = crate::clock::now();
+            if p.magic == rp::MAGIC && (p.current as usize) < rp::BUCKETS {
+                ticks[p.current as usize] += now.saturating_sub(p.since);
+            }
+            for x in ticks {
+                text += &format!(" {}", ticks_ns(x));
+            }
+        }
+        text
+    }
+}
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
 #[derive(Clone, Copy)]
 pub struct Area<'a> {
@@ -887,37 +939,13 @@ pub fn k1_stats(area: Area) -> K1 {
         k.dispatch_misses = perf.count[exec::perf::MISS as usize];
     }
     k.pic_transitions = pic_transitions(area);
-    // Translated-code profile (`profile` residents): the counters and the 80 blocks hit most, each with its guest bytes and,
-    // when its code is still where its last sample found it, its native code.
+    // EL0 sampler (`profile` residents, `natemu_abi::sample`): the ring's counters; the samples themselves go to the
+    // `--profile` files.
     {
-        use cache::profile as pr;
-        let at = cache::LOOKUP_OFFSET + cache::PCID_STUDY;
-        let counters: [u64; pr::COUNTERS] = area.read_record(at);
-        if counters[pr::TOTAL] != 0 && control.pcid_study.iter().all(|&v| v == 0) {
-            let mut hot: Vec<pr::Hot> = (0..pr::HOT_ENTRIES)
-                .map(|i| area.read_record::<pr::Hot>(at + 4096 + i * size_of::<pr::Hot>()))
-                .filter(|e| e.key != 0)
-                .collect();
-            hot.sort_by_key(|e| std::cmp::Reverse(e.count));
-            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-            let cumulative = [10usize, 100, 1000, 10000]
-                .map(|n| hot.iter().take(n).map(|e| u64::from(e.count)).sum::<u64>());
-            let top = hot
-                .iter()
-                .take(80)
-                .map(|e| {
-                    let native = if u64::from(e.flushes) == control.flushes {
-                        (0..(e.code_size as usize).min(4096) / 4)
-                            .map(|k| hex(&area.read::<4>(cache::CODE_OFFSET + e.code as usize + 4 * k)))
-                            .collect::<String>()
-                    } else {
-                        String::new()
-                    };
-                    serde_json::json!({"rip": e.rip, "user": e.key >> 63, "count": e.count, "guest_bytes": e.guest_bytes,
-                        "code_size": e.code_size, "guest": hex(&e.bytes[..(e.guest_bytes as usize).min(24)]), "native": native})
-                })
-                .collect::<Vec<_>>();
-            k.profile = Some(serde_json::json!({"counters": counters.to_vec(), "blocks": hot.len(), "cumulative": cumulative, "top": top}));
+        let h: natemu_abi::sample::Head = area.read_record(cache::LOOKUP_OFFSET + cache::PCID_STUDY);
+        if h.magic == natemu_abi::sample::MAGIC {
+            k.profile = Some(serde_json::json!({"written": h.write, "drained": h.read, "lost": h.lost, "bells": h.bells,
+                "bells_in_wait": h.bells_in_wait, "unknown_calls": h.unknown_calls}));
         }
     }
     // Code-size study: the live translations with code of their own at the end (blocks, guest bytes, native bytes; hot/cold
@@ -996,7 +1024,7 @@ pub struct K1 {
     page_study: K1PageStudy,
     /// Code-size study: live translations with their own code at the vCPU's end: count, guest bytes, native bytes.
     code_size: [u64; 5],
-    /// Translated-code profile (`profile` resident builds only).
+    /// EL0 sampler counters (`profile` resident builds only).
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<serde_json::Value>,
     /// PCID gain study (`natemu_abi::execution::cache::pcid_study`; `pcid-study` resident builds only).
@@ -2926,6 +2954,8 @@ pub struct Compiler {
     pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
     last: Option<Arc<Entry>>,
     noted: Vec<(u64, [u64; GATING])>,
+    /// EL0 sampler: the run's objects file (`--profile`), which every answer served is written to once.
+    pub(crate) objects: Option<Arc<crate::sampler::Objects>>,
 }
 /// The afp row's bit in `supported` (the features fexc is told): [`Cpu::no_afp`] is its complement.
 const AFP: usize = admission::index("afp");
@@ -3114,6 +3144,7 @@ impl Compiler {
             pool: None,
             last: None,
             noted: Vec::new(),
+            objects: None,
         }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
@@ -4688,7 +4719,7 @@ fn translation(
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
-    let (code, more, next_fault, cut, bytes_len, nop_run, call) = loop {
+    let (code, more, next_fault, cut, bytes_len, nop_run, call, bytes) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
@@ -4767,7 +4798,7 @@ fn translation(
                         }),
                     _ => false,
                 };
-                break (code, more, next_fault, cut, bytes.len(), nop_run, call);
+                break (code, more, next_fault, cut, bytes.len(), nop_run, call, bytes);
             }
         }
     };
@@ -4851,6 +4882,10 @@ fn translation(
     state.relocatable = u64::from(template);
     let t = compiler.stamp();
     area.copy(exec::STAGING_OFFSET, &block.object);
+    if let Some(objects) = &compiler.objects {
+        let source = &bytes[..(block.guest_bytes as usize).min(bytes.len())];
+        objects.served(area.vcpu, step, rip, state.fetch, state.cpu.code_context(), &block.object, source);
+    }
     state.system = exec::System::NONE;
     if !step {
         requests.blocks += 1;

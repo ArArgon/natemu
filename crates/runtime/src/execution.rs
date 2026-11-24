@@ -172,6 +172,7 @@ fn ends_in_mode(s: &mut State) {
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
+    crate::bell::start();
     #[cfg(feature = "page-study")]
     page_study::init();
     cache::read_ctr_el0();
@@ -2505,6 +2506,27 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
     crate::perf::enter(crate::perf::GUEST);
     unsafe { resume_exception(frame, pc, spsr, alignment_check(&s.cpu)) }
 }
+/// Resumes generated code at `elr` after an interrupt that asks nothing of it (a spurious INTID, a sample bell), from the
+/// captured frame. A stop still wanted is armed again in the block `elr` runs in, which for a PC in a shared probe is not
+/// the probe (the code area's head holds no block, so [`resume`] would halt `BAD_STOP` there) but its store's block, found
+/// through x0 or d0 as [`interrupted`] does.
+unsafe fn resume_interrupted(s: &State, frame: &NativeFrame, elr: u64, spsr: u64) -> ! {
+    if s.stop_wanted != 0 {
+        if !cache::block_at(probe_returns_to(frame, elr)).is_some_and(cache::arm) {
+            halt(s, stop::BAD_STOP)
+        }
+        cache::control().rearms += 1;
+    }
+    post_pending(s, false);
+    select_guest_space(s);
+    crate::perf::enter(crate::perf::GUEST);
+    unsafe { resume_exception(&raw const (*shared()).captured, elr, spsr, alignment_check(&s.cpu)) }
+}
+/// [`natemu_abi::execution::probe::returns_to`] of an interrupted `elr` with its frame's x0 and d0.
+fn probe_returns_to(frame: &NativeFrame, elr: u64) -> u64 {
+    let d0 = u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8]));
+    natemu_abi::execution::probe::returns_to(elr, frame.x[0], d0)
+}
 /// A wanted stop is served by a resident entry at a block boundary (the resident drained or will drain before the
 /// next block runs; [`enter`], [`halt`]).
 fn served(s: &mut State) {
@@ -2533,13 +2555,17 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
              i = out(reg) intid, t0 = out(reg) t0, elr = out(reg) elr, spsr = out(reg) spsr);
     }
     let mut s = unsafe { load() };
-    #[cfg(feature = "profile")]
-    if from_el0(spsr) {
-        crate::study::prof::sample(elr, frame.x[1]);
-    }
     // A spurious INTID (1020-1023) is neither ended nor counted: generated code resumes (a stop still wanted is armed again).
     if intid >= 1020 {
-        unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr) }
+        unsafe { resume_interrupted(&s, frame, elr, spsr) }
+    }
+    // EL0 sampler (`profile` builds): the sample bell is only a sample. It is recorded and ended, and generated code
+    // resumes from the frame as from a spurious INTID: no bank, no stop, no arm. A pending doorbell is its own INTID,
+    // taken at the `eret`.
+    if crate::bell::is(intid) {
+        crate::bell::sample(frame, elr, t0);
+        unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) }; // ICC_EOIR1_EL1
+        unsafe { resume_interrupted(&s, frame, elr, spsr) }
     }
     if intid == lapic::TIMER_PPI {
         lapic::timer_irq();
@@ -2583,11 +2609,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     }
     // In a page-crossing store's shared probe (`natemu_abi::execution::probe`): the block it returns to (the word after
     // the stub's split check: in x0 at the probe's first word, in d0 after it) runs on to an exit, as from inside a block.
-    let pc = match natemu_abi::execution::probe::at(elr) {
-        Some((_, 0)) => frame.x[0],
-        Some(_) => u64::from_le_bytes(frame.q[0][..8].try_into().unwrap_or([0; 8])),
-        None => elr,
-    };
+    let pc = probe_returns_to(frame, elr);
     let Some(b) = cache::block_at(pc).filter(|b| b.flags & cache::DEAD == 0) else {
         bad(s)
     };

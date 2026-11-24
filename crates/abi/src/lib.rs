@@ -37,6 +37,7 @@ pub mod pic;
 pub mod pool;
 pub mod power_on;
 pub mod resident;
+pub mod sample;
 pub mod shadow;
 pub mod strings;
 pub mod tiny;

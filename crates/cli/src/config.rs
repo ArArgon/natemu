@@ -94,6 +94,11 @@ pub struct Config {
     pub display_on: bool,
     /// `[display] vram_mib`, `width`, `height` (32, 1024, 768); checked by `natemu::display::Spec::check`.
     pub display: natemu::display::Spec,
+    /// EL0 sampler (`natemu::sampler`): the NAME of `NAME.samples` and `NAME.objects`, the ringing interval in
+    /// microseconds (None = 250), and whether sampling waits for the guest's start through its control port.
+    pub profile: Option<PathBuf>,
+    pub profile_us: Option<u64>,
+    pub profile_start_guest: bool,
 }
 
 impl Config {
@@ -142,6 +147,9 @@ impl Config {
             control_socket: None,
             display_on: false,
             display: natemu::display::Spec::default(),
+            profile: None,
+            profile_us: None,
+            profile_start_guest: false,
         }
     }
     /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
@@ -272,6 +280,9 @@ struct FDebug {
     perf_log: Option<PathBuf>,
     inspect: Option<bool>,
     watchdog: Option<u64>,
+    profile: Option<PathBuf>,
+    profile_us: Option<u64>,
+    profile_start: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +463,12 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         cfg.perf_log = d.perf_log.map(|p| rel(base, &p)).or(cfg.perf_log.take());
         cfg.inspect = d.inspect.unwrap_or(cfg.inspect);
         cfg.watchdog = d.watchdog.or(cfg.watchdog);
+        cfg.profile = d.profile.map(|p| rel(base, &p)).or(cfg.profile.take());
+        cfg.profile_us = d.profile_us.or(cfg.profile_us);
+        if let Some(v) = d.profile_start {
+            cfg.profile_start_guest =
+                crate::profile_start(&v).map_err(|e| format!("{who}: debug.profile_start: {e}"))?;
+        }
     }
     if let Some(socket) = f.control.and_then(|c| c.socket) {
         if socket.as_os_str().is_empty() {
@@ -620,6 +637,15 @@ fn apply_flags(
     if on("perf_log", &["debug.perf_log"]) {
         cfg.perf_log = cli.perf_log.clone();
     }
+    if on("profile", &["debug.profile"]) {
+        cfg.profile = cli.profile.clone();
+    }
+    if on("profile_us", &["debug.profile_us"]) {
+        cfg.profile_us = cli.profile_us;
+    }
+    if on("profile_start", &["debug.profile_start"]) {
+        cfg.profile_start_guest = cli.profile_start;
+    }
     if on(
         "virtio_transport",
         &[
@@ -680,7 +706,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 37] = [
+const KEYS: [&str; 40] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -718,6 +744,9 @@ const KEYS: [&str; 37] = [
     "display.vram_mib",
     "display.width",
     "display.height",
+    "debug.profile",
+    "debug.profile_us",
+    "debug.profile_start",
 ];
 const DEVICE_KEYS: &str =
     "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
@@ -889,6 +918,11 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         }
         "display.width" => cfg.display.width = text.parse().map_err(|_| err(format!("bad count {text:?}")))?,
         "display.height" => cfg.display.height = text.parse().map_err(|_| err(format!("bad count {text:?}")))?,
+        "debug.profile" => cfg.profile = Some(path()),
+        "debug.profile_us" => {
+            cfg.profile_us = Some(text.parse().map_err(|_| err(format!("bad microseconds {text:?}")))?)
+        }
+        "debug.profile_start" => cfg.profile_start_guest = crate::profile_start(text).map_err(err)?,
         _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())
@@ -952,6 +986,12 @@ pub fn validate(cfg: &Config) -> Res<()> {
         return Err(format!(
             "{who}: no fexc: --fexc FILE, or [engine] fexc in a --config file"
         ));
+    }
+    if cfg.profile.is_none() && (cfg.profile_us.is_some() || cfg.profile_start_guest) {
+        return Err(format!("{who}: debug.profile_us and debug.profile_start need a profile (--profile NAME)"));
+    }
+    if cfg.profile_us == Some(0) {
+        return Err(format!("{who}: debug.profile_us: at least 1"));
     }
     let ids = cfg
         .disks
@@ -1138,6 +1178,11 @@ pub fn to_boot(
     boot.mapped_testdev = cfg.mapped_testdev;
     boot.display = cfg.display_on.then_some(cfg.display);
     boot.check_reuse = cfg.check_reuse;
+    boot.profile = cfg.profile.as_ref().map(|name| natemu::sampler::Options {
+        name: name.clone(),
+        interval_us: cfg.profile_us.unwrap_or(natemu::sampler::Options::INTERVAL_US),
+        from_start: !cfg.profile_start_guest,
+    });
     boot.transports = cfg.transports;
     boot.pvpanic = cfg.pvpanic;
     boot.smbios = cfg.smbios;

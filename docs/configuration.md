@@ -123,6 +123,9 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `watchdog` | `60` | Seconds a vCPU may run guest code without a host exit before the run ends with its report; a vCPU waiting that long in the host (outside a compile) is reported once and the run goes on |
 | | `pci_testdev` | `false` | Test option: a PCI test device for guest test programs (see below) |
 | | `mapped_testdev` | `false` | Test option: a PCI test device whose memory the guest reads and writes directly (see below) |
+| | `profile` | none | Measurement: sample where every vCPU is into `NAME.samples` and `NAME.objects` (`--profile NAME`; needs a resident built with its `profile` feature, [the sampler plan](restructure/el0-sampler-plan.md)); SIGUSR1 turns sampling off and on |
+| | `profile_us` | `250` | The sampler's interval in microseconds (`--profile-us`) |
+| | `profile_start` | `"run"` | `run`: sample from the start; `guest`: from the guest's first start through port F8H (`--profile-start`) |
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
 

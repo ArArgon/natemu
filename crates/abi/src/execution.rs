@@ -385,67 +385,11 @@ pub mod cache {
         (guest_state_va >> 21 & 511) as usize + 1 <= 511
     }
     const _: () = assert!(DL1_BYTES == 2 * BLOCK && L1_SPACE_TABLES * L1_ENTRIES * 16 == BLOCK && DL1 % BLOCK == 0);
-    /// PCID gain study (`pcid-study` resident builds only; untouched, so unbacked, otherwise): the modelled sets, after the
-    /// page record.
+    /// PCID gain study (`pcid-study` resident builds; the EL0 sampler's ring in `profile` builds; untouched, so unbacked,
+    /// otherwise): the modelled sets, after the page record.
     pub const PCID_STUDY: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
     pub const PCID_STUDY_BYTES: usize = 18 * MIB;
-    /// Translated-code profile (`profile` resident builds): the study part's first page holds [`profile::COUNTERS`] words
-    /// and from its second page [`profile::HOT_ENTRIES`] [`profile::Hot`] records.
-    pub mod profile {
-        pub const COUNTERS: usize = 64;
-        pub const TOTAL: usize = 0;
-        pub const HEAD: usize = 1;
-        pub const STEP_SLOT: usize = 2;
-        pub const NO_BLOCK: usize = 3;
-        pub const BLOCK: usize = 4;
-        pub const USER: usize = 5;
-        pub const KERNEL: usize = 6;
-        pub const ABSOLUTE: usize = 7;
-        pub const SHARED: usize = 8;
-        pub const OTHER_KIND: usize = 9;
-        pub const PROLOGUE: usize = 10;
-        pub const BODY: usize = 11;
-        pub const EXIT: usize = 12;
-        pub const HOT_FULL: usize = 13;
-        pub const CLASS_USER: usize = 16;
-        pub const CLASS_KERNEL: usize = 32;
-        pub const CLASS_NAMES: [&str; 15] = [
-            "load", "store", "simd_fp_load_store", "atomic", "reg_op", "imm_op", "csel_ccmp", "cond_branch", "branch",
-            "indirect_branch", "svc", "system", "simd_fp", "mul_div", "other",
-        ];
-        pub const RESUMED: usize = 14;
-        /// Block samples by distance from the block's entry instruction: on it, one word on, two or three on, further.
-        pub const AT_ENTRY: usize = 48;
-        /// Of the samples on or just before an entry instruction: x1 holds the address the dispatcher branched to (the block
-        /// was entered through the dispatcher), or does not (through a patched link).
-        pub const ENTRY_DISPATCHED: usize = 52;
-        pub const ENTRY_LINKED: usize = 53;
-        /// Hot/cold layout: block samples in a split block's hot copy, and in its whole code (cold: an exit stub, or
-        /// code resumed there).
-        pub const SPLIT_HOT: usize = 54;
-        pub const SPLIT_COLD: usize = 55;
-        /// The address generated code was last resumed at (written by the exit gate): an interrupt taken there was pending
-        /// while the resident ran, so it says nothing of where generated code spends time.
-        pub const RESUME_PC: usize = 63;
-        pub const HOT_ENTRIES: usize = 1 << 18;
-        /// A block hit by samples: its key (frame | page offset, bit 62, bit 63 = user), its samples, its guest bytes (the
-        /// first 32 inside its page), and where its code was at the last sample (code-area offset, size, and the vCPU's
-        /// cache flush count then: the bytes are still there only while that count is the current one).
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        pub struct Hot {
-            pub key: u64,
-            pub rip: u64,
-            pub count: u32,
-            pub code: u32,
-            pub code_size: u32,
-            pub flushes: u32,
-            pub guest_bytes: u16,
-            pub reserved: [u16; 3],
-            pub bytes: [u8; 24],
-        }
-        const _: () = assert!(size_of::<Hot>() == 64 && 4096 + HOT_ENTRIES * 64 <= super::PCID_STUDY_BYTES);
-    }
+    /// EL0 sampler (`profile` resident builds): the study part holds the sample ring ([`crate::sample`]).
     /// [`Control::pcid_study`]'s counters: CR3 loads to a space still modelled, to a new one and of the current value, and
     /// the flush ticks of each; shadow misses and block revalidations that were first uses or refills (of what a CR3 load
     /// alone took; `REFILL_GLOBAL`: a kept global shadow a CR3 load's full reset took); spaces cleared because the guest
@@ -2657,6 +2601,16 @@ pub mod probe {
         let index = (o / THUNK_BYTES) as u32;
         decode(index).map(|_| (index, o % THUNK_BYTES))
     }
+    /// The word generated code interrupted at `pc` runs on to in its block: `pc` itself, or for a `pc` in a shared probe the
+    /// word after its store's split check, where the probe returns (in x0 at the probe's first word, in d0 after it: its
+    /// `fmov d0, x0`). An interrupt that resumes generated code arms a wanted stop in that word's block.
+    pub fn returns_to(pc: u64, x0: u64, d0: u64) -> u64 {
+        match at(pc) {
+            Some((_, 0)) => x0,
+            Some(_) => d0,
+            None => pc,
+        }
+    }
     /// The stub's first word: `adr x0, to` at `at`, if `to` is within reach.
     pub const fn adr_x0(at: u64, to: u64) -> Option<u32> {
         let d = to.wrapping_sub(at) as i64;
@@ -4762,6 +4716,23 @@ mod tests {
     /// register, width) the probe saves the return in d0, sends an armed breakpoint and (64-bit) a wrapping store or (32-bit)
     /// one above 4 GiB to its `brk`, probes exactly the store's first and last byte through its register, and returns through
     /// x0 restored from d0; slots without a probe are zero; the index, the stub's `adr` and its `b` round-trip.
+    /// A PC in a shared probe runs on to its store's block: x0 at the probe's first word, d0 at every later one (the empty
+    /// slot of x0 and every PC outside the probes are themselves).
+    #[test]
+    fn a_probe_pc_returns_to_its_store() {
+        use super::probe::*;
+        let (x0, d0) = (0x1111, 0x2222);
+        let p = super::cache::CODE_VA + offset(index(false, 3, 8).unwrap());
+        assert_eq!(returns_to(p, x0, d0), x0);
+        for w in 1..THUNK_BYTES / 4 {
+            assert_eq!(returns_to(p + 4 * w, x0, d0), d0, "word {w}");
+        }
+        let empty = super::cache::CODE_VA + offset(0);
+        assert_eq!(returns_to(empty + 4, x0, d0), empty + 4);
+        let block = super::cache::CODE_VA + super::cache::HEAD_BYTES as u64 + 0x40;
+        assert_eq!(returns_to(block, x0, d0), block);
+        assert_eq!(returns_to(super::cache::PROBES_VA - 4, x0, d0), super::cache::PROBES_VA - 4);
+    }
     #[test]
     fn every_shared_probe_is_its_store_s() {
         use super::probe::*;

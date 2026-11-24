@@ -9,6 +9,7 @@ use core::{
 use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use natemu_abi::*;
 use record::*;
+mod bell;
 mod cache;
 mod execution;
 #[cfg(feature = "io-test-hooks")]
@@ -34,8 +35,8 @@ global_asm!(include_str!("gates.S"),
     l1_mask=const natemu_abi::execution::cache::L1_SET_MASK,
     svc_miss=const natemu_abi::execution::svc::MISS,
     profile=const cfg!(feature = "profile") as u64,
-    resume_pc=const natemu_abi::execution::cache::LOOKUP_VA
-        + (natemu_abi::execution::cache::PCID_STUDY + 8 * natemu_abi::execution::cache::profile::RESUME_PC) as u64,
+    resume_time=const natemu_abi::execution::cache::LOOKUP_VA
+        + (natemu_abi::execution::cache::PCID_STUDY + natemu_abi::sample::HEAD_RESUME_TIME) as u64,
 );
 
 fn shared() -> *mut Shared {
