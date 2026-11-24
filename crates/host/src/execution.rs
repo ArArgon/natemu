@@ -1599,8 +1599,10 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         if b.tail(None).is_none() && b.dispatch_exit != 0 && b.exit_forms & cache::FORM_RETURN != 0 {
             let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
             let to = target_of(exit, word(exit));
+            // (Its own context's slot's return form: the slot serving the block's context.)
+            let serves = |to: u64| control.slot_contexts.get((to - cache::DISPATCH as u64) as usize / cache::DISPATCH_SLOT_BYTES) == Some(&b.context);
             let form = to == cache::RETURN_MISS as u64
-                || slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_RETURN as u64;
+                || slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_RETURN as u64 && serves(to);
             if word(exit) >> 26 != 0x05 || !form {
                 return Err(format!("return exit of the block at {:#x}: word {:#010x}", b.rip, word(exit)));
             }
@@ -4345,9 +4347,10 @@ pub fn run(
         Ok("ras1") => cache::PIC_TEST_RAS + 1,
         Ok("ras2") => cache::PIC_TEST_RAS + 2,
         Ok("ras3") => cache::PIC_TEST_RAS + 3,
+        Ok("ras4") => cache::PIC_TEST_RAS + 4,
         Ok(other) => {
             return Err(format!(
-                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal, tail0-tail2, lookup, trampoline or ras0-ras3"
+                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal, tail0-tail2, lookup, trampoline or ras0-ras4"
             ));
         }
     };

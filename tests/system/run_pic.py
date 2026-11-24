@@ -35,7 +35,8 @@ of a shared translation's instance from the resident:
   block's RIP, with the vCPU's own doorbell rung: the stop there must take that RIP (every program's values as without
   the test; PUSH_ENTRIES, POP_ENTRIES, PAD_STOPS, PAIR_STOPS in some run). The stubs at every entry: one under a shadow
   (`miss-boundary`: after MOV SS and STI) is not through a stub and counted (SHADOW_UNBALANCED). Run on the programs that call
-  (`ret-pairs`, `ret-death`, `indirect-sites`) and `miss-boundary`.
+  (`ret-pairs`, `ret-death`, `indirect-sites`) and `miss-boundary`. `ras4`: every block placed as with no slot (a return
+  leaves through slot 0's return form) and its exits armed: a stop at a return's exit continues through the pop stub.
 
 - `user` (and under each mode above): CPL-3 ports of K1 programs in two user address spaces switched by CR3 at CPL 0
   (the driver's `switch` hooks): `user-two`, `user-cow`, `user-twoframe`, `user-pfault` (a #PF at the alias's own RIP
@@ -61,7 +62,7 @@ SAME, ABS_TO_SHARED, UNPROVED, ENTRY_STOPS, SVC_STOPS, SHARES, INSTANCES, CHECKE
 TAILS, TAIL_CALLS, TAIL_POINTS, TAIL_STOPS, TAIL_DEAD_STOPS, LOOKUP_STOPS, TRAMPOLINE_STOPS = 32, 33, 34, 36, 37, 38, 39
 # Return plan: PUSH_ENTRIES, POP_ENTRIES, PAIR_STOPS, PAD_STOPS; the counter each `ras` mode must move.
 PUSH_ENTRIES, POP_ENTRIES, UNBALANCED, PAIR_STOPS, PAD_STOPS, SHADOW_UNBALANCED = 46, 47, 48, 49, 50, 51
-RAS_WANT = {'ras0': PUSH_ENTRIES, 'ras1': POP_ENTRIES, 'ras2': PAD_STOPS, 'ras3': PAIR_STOPS}
+RAS_WANT = {'ras0': PUSH_ENTRIES, 'ras1': POP_ENTRIES, 'ras2': PAD_STOPS, 'ras3': PAIR_STOPS, 'ras4': POP_ENTRIES}
 MODES = 'and,str,body,svc,forge,forge-noncanonical,forge-half,tail0,tail1,tail2,lookup,trampoline,ac,fence,user'
 SVC_PROGRAMS = ('pic-two', 'pic-ctx', 'pic-xm', 'pic-twosrc')
 
@@ -228,6 +229,12 @@ def user(a, name, env):
 HALTS = ('bad_link', 'bad_stop', 'bad_reply', 'reuse_mismatch', 'status=4', 'unknown_abort')
 
 
+def no_slot(mode, problem):
+    """`ras4` places every block as with no slot: no checked link is made and no exit gets the step-1 lookup words' links (a
+    shortfall of those is expected there, nothing else)."""
+    return mode == 'ras4' and ('checked links' in problem or any(f'pic counter {k} ' in problem for k in range(32, 40)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
@@ -258,7 +265,7 @@ def main():
                 want = SVC_STOPS if mode == 'svc' else ENTRY_STOPS + ['and', 'str', 'body'].index(mode)
                 if not pic[want] and (mode != 'svc' or pic[CHECKED]):
                     problems.append(f'no stop at the tested word (counter {want})')
-            user_bad += [f'{name}: {p}' for p in problems]
+            user_bad += [f'{name}: {p}' for p in problems if not no_slot(mode, p)]
         if mode == 'user':
             print(f"user: {'FAIL ' + '; '.join(user_bad) if user_bad else 'ok'} ({', '.join(USER)})", flush=True)
             failed += [mode] * bool(user_bad)
@@ -272,7 +279,7 @@ def main():
         report = json.loads((out / 'k1.json').read_text())['report']
         stats = [s['k1']['pic'] for r in report for s in r.get('stats') or [] if 'k1' in s]
         total = [sum(p[i] for p in stats) for i in range(len(stats[0]) if stats else 40)]
-        problems = [p for r in report for p in r['problems']]
+        problems = [p for r in report for p in r['problems'] if not no_slot(mode, p)]
         bad = []
         bad += user_bad
         if mode.startswith('forge'):
@@ -286,7 +293,8 @@ def main():
             if total[want] == 0:
                 bad.append(f'no stop at the tested word (counter {want})')
         elif mode in RAS_WANT:
-            if rc != 0 or problems:
+            # (`ras4`: run_k1's own exit counts the step-1 shortfalls `no_slot` drops; its problems are judged here.)
+            if rc != 0 and mode != 'ras4' or problems:
                 bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
             if total[RAS_WANT[mode]] == 0:
                 bad.append(f'no entry or stop at the tested place (counter {RAS_WANT[mode]})')
@@ -315,7 +323,7 @@ def main():
             if missed or total[want] == 0:
                 bad.append(f'no stop at the tested word (counter {want}) in {missed or "any run"}')
         for k, name in [(SAME, 'local shared'), (CHECKED, 'checked'), (ABS_TO_SHARED, 'absolute into shared')]:
-            if total[k] == 0 and not (mode in RAS_WANT and a.programs and 'indirect-sites' not in a.programs):
+            if total[k] == 0 and not (mode in RAS_WANT and a.programs and 'indirect-sites' not in a.programs) and not (mode == 'ras4' and k != SAME):
                 bad.append(f'no {name} link')
         if total[UNPROVED]:
             bad.append(f'{total[UNPROVED]} rewrites unproved')

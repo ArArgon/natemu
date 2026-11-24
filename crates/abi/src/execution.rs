@@ -546,6 +546,8 @@ pub mod cache {
             assert_eq!(b.exit_branch(MISS), RETURN_MISS as u64, "a return with no slot pops through slot 0's form");
             (b.rip, b.guest_bytes, b.context) = (0xffff_fffe, 5, (super::super::CodeMode::Compat32 as u64) << 2);
             assert_eq!(b.end_rip(), 3, "32-bit code's return address wraps");
+            (b.rep_exits, b.exit_forms) = (0, 5);
+            assert_eq!((b.call_points(), b.pair()), (0, None), "two points marked as calls (a wrong hint): no pair");
             b.flags = PIC | INSTANCE;
             assert_eq!(b.tail_entries(), 0, "an instance has no code of its own");
         }
@@ -1529,7 +1531,9 @@ pub mod cache {
     /// must take that RIP (the programs' values as without the test; `pic::count::PUSH_ENTRIES`, `POP_ENTRIES`, `PAD_STOPS`,
     /// `PAIR_STOPS`).
     pub const PIC_TEST_RAS: u64 = 14;
-    pub const PIC_TEST_RASES: u64 = 4;
+    /// (+ 4: every block placed as with no slot for its context, its exits armed at every second entry: a stop at a return's
+    /// computed exit, which leaves through slot 0's return form, continues through the pop stub.)
+    pub const PIC_TEST_RASES: u64 = 5;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     /// (Hot/cold layout: a split block's trampolines too.)
     pub const ARMED: usize = 3 * super::MAX_LINK_POINTS + 2;
@@ -1814,15 +1818,18 @@ pub mod cache {
             let pair = if self.call_points() != 0 { PAIR_BYTES } else { 0 };
             self.tail_bytes() + pair
         }
-        /// Return plan: its link points that are a direct call to their target ([`FORM_CALL_POINTS`] bits; none a REP
-        /// self-exit), in a record with code of its own.
+        /// Return plan: its link point that is a direct call to its target ([`FORM_CALL_POINTS`] bit; not a REP self-exit),
+        /// in a record with code of its own. Exactly one: a hint marking more (another exit to the call's target, a `jcc T`
+        /// before `call T`) gets no pair at all, so a wrong hint never makes a jump push and never retargets the pair's `bl`
+        /// (the call then leaves as a plain link: unbalanced, never wrong).
         pub fn call_points(&self) -> u32 {
             if self.code_size == 0 || self.flags & (STEP | SYSTEM | INSTANCE) != 0 {
                 return 0;
             }
-            (0..super::MAX_LINK_POINTS)
+            let m = (0..super::MAX_LINK_POINTS)
                 .filter(|&k| self.exit_forms >> k & 1 != 0 && self.links[k].offset != 0 && self.rep_exits >> k & 1 == 0)
-                .fold(0, |m, k| m | 1 << k)
+                .fold(0u32, |m, k| m | 1 << k);
+            if m.count_ones() == 1 { m } else { 0 }
         }
         /// Return plan: the code-area offset of its call pair ([`PAIR_BYTES`]: `bl` to the call's target, then the pad),
         /// after its appended entries, when it has call points; a linked call point's word is `b` to it.

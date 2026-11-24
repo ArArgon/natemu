@@ -1743,6 +1743,8 @@ def ret_bodies(k, i, n):
     # fills the pad, the second's callee kills (every fourth round).)
     death = (f'    xor ebp, ebp\n    xor r11d, r11d\n    mov ecx, {k}\n.l:\n' + jump('c1', d + RET_R1 - 7) + '    add r8, rax\n' + jump('c1b', d + RET_R1 - 7)
              + '    add r8, rax\n' + jump('c2', d + RET_R2 - 7) + '    add r9, rax\n' + jump('c2b', d + RET_R2 - 7) + '    add r9, rax\n'
+             # (After a kill the caller is placed again and linked while R2's entry names R2's full entry: the link names the pad.)
+             + jump('c2c', d + RET_R2 - 7) + '    add r9, rax\n'
              + jump('c3', d + RET_R3 - 7) + '    add r10, rax\n' + cr3(0) + jump('c4', lib + RET_F['c4']) + '    add r12, rax\n'
              + '    dec ecx\n    jnz .l\n')
     # (A second code context: MXCSR's IM clear, with CR4.OSFXSR; then back to the first, whose return addresses' hints name the
@@ -1750,7 +1752,8 @@ def ret_bodies(k, i, n):
     # reload has the `link-check` resident scan the tables.)
     mx = lambda v: f'    sub rsp, 8\n    mov dword [rsp], {v:#x}\n    ldmxcsr [rsp]\n    add rsp, 8\n'
     sse = '    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n'
-    return {'ret-pairs': rounds('la') + cr3(1) + rounds('lb') + cr3(0) + rounds('lc') + sse + mx(0x1f00) + rounds('ld') + mx(0x1f80) + cr3(0) + rounds('le') + cr3(0),
+    # (CR4.OSFXSR is in the code context: set first, so the last phase runs in the first phase's context, whose blocks exist.)
+    return {'ret-pairs': sse + rounds('la') + cr3(1) + rounds('lb') + cr3(0) + rounds('lc') + mx(0x1f00) + rounds('ld') + mx(0x1f80) + cr3(0) + rounds('le') + cr3(0),
             'ret-death': death}
 
 
@@ -1788,11 +1791,11 @@ def ret_smc_sum(k):
 RET_VALUES = {
     'ret-pairs': lambda i, k: {'r8': {5 * k * 14}, 'r9': {5 * k * 80}, 'r10': {5 * k}, 'r12': {5 * k * 5}, 'r14': {5 * k * 3},
                                'r15': {5 * k * 9}, 'rbx': {5 * k * 11}},
-    'ret-death': lambda i, k: {'r8': {ret_smc_sum(k)}, 'r9': {8 * k}, 'r10': {7 * k}, 'r12': {6 * k}},
+    'ret-death': lambda i, k: {'r8': {ret_smc_sum(k)}, 'r9': {12 * k}, 'r10': {7 * k}, 'r12': {6 * k}},
 }
-# (natemu_abi::pic::count: PAIR_LINKS 40, PAIR_RELINKS 41, PADS_HINTED 44, PADS_EMPTIED 45, PUSH_ENTRIES 46.)
+# (natemu_abi::pic::count: PAIR_LINKS 40, PAIR_RELINKS 41, PADS_LINKED 43, PADS_HINTED 44, PADS_EMPTIED 45, PUSH_ENTRIES 46.)
 EITHER.update(RET_VALUES)
-RET_COUNT = {'ret-pairs': [(40, 1), (41, 1), (44, 1), (46, 1)], 'ret-death': [(40, 1), (41, 1), (44, 1), (45, 1), (46, 1)]}
+RET_COUNT = {'ret-pairs': [(40, 1), (41, 1), (44, 1), (46, 1)], 'ret-death': [(40, 1), (41, 1), (43, 1), (44, 1), (45, 1), (46, 1)]}
 
 
 # ---- The independent review's adversarial programs (QEMU-compared unless in ADV_EITHER) ----------------------------------

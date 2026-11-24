@@ -1304,6 +1304,7 @@ def cases(*, reference_control=False):
         success=True, ecx=int.from_bytes(VALUE[:4], 'little'), checks=0)
 
     cases.append(indirect32())
+    cases.append(ret32())
     return cases
 
 
@@ -1505,6 +1506,27 @@ def mixed_user_shld_6g():
     prog = C.program('mixed-user-shld-6g', C.ENTER(cs=0x23) + C.handlers(), user, memory)
     return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQ', 14, 4), C.REC + 0x38: struct.pack('<Q', 0x80001000),
                   C.XPAGE: struct.pack('<I', 0x5eed0000)}
+
+
+def ret32():
+    """Return plan in 32-bit code (natemu only): 64 rounds of four call sites of one leaf (`call` then `ret`), a recursion 80
+    deep (past the return stack) and a `ret 4`, each summed in memory; the end at INT 0x80. `pic_min`: call pairs linked,
+    pads filled from hints (the 32-bit return address, zero-extended) and the first executions continued through the push
+    stub (`natemu_abi::pic::count` 40, 44, 46)."""
+    res = C.W + 0x700
+    main = ('    xor esi, esi\nr_loop:\n'
+            + ''.join(f'    mov eax, {j}\n    call lib_f\n    add [{res:#x}], eax\n' for j in range(1, 5))
+            + f'    mov ecx, 80\n    call lib_rec\n    add [{res + 4:#x}], eax\n'
+            + f'    push 7\n    call lib_ri\n    add [{res + 8:#x}], eax\n'
+            + '    inc esi\n    cmp esi, 64\n    jne r_loop\n    int 0x80\n')
+    text = (main + '    times 0x400 - ($ - $$) db 0xcc\nlib_f:\n    lea eax, [eax + 1]\n    ret\n'
+            'lib_rec:\n    test ecx, ecx\n    jz .z\n    dec ecx\n    call lib_rec\n    inc eax\n    ret\n.z:\n    xor eax, eax\n    ret\n'
+            'lib_ri:\n    mov eax, [esp + 4]\n    ret 4\n')
+    prog = C.program('ret32', C.ENTER() + C.handlers('    jmp .fin\n'), text, [P_zero(res, 12)])
+    prog['pic_min'] = [(40, 1), (44, 1), (46, 1)]
+    end = C.U + len(C.user32(main))
+    return prog, {C.LOG: struct.pack('<Q', 1), C.REC: struct.pack('<QQQQ', 128, 0, end, 0xdb),
+                  res: struct.pack('<III', 64 * 14, 64 * 80, 64 * 7)}
 
 
 def indirect32():

@@ -2365,6 +2365,11 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // (Through a stub at every entry, the doorbell rung at every second: an entry with a shadow set is counted unbalanced.)
     if ras_test < cache::PIC_TEST_RASES && s.ras == 0 && block.flags & cache::STEP == 0 && !block.starts_with_rep() {
         match ras_test {
+            4 => {
+                if s.blocks % 2 == 0 && cache::arm(code) {
+                    s.stop_wanted = 1;
+                }
+            }
             0 | 1 => {
                 (s.ras, s.ras_rip) = (if ras_test == 0 { RAS_PUSH } else { RAS_POP }, block.rip);
                 if s.blocks % 2 == 0 {
@@ -2902,6 +2907,12 @@ unsafe fn stopped(
     }
     unsafe { dispatch(&mut s) }
 }
+/// Return plan: a continuation through a stub the resident drops (it runs an instruction itself): counted unbalanced.
+fn ras_dropped(s: &mut State) {
+    if core::mem::take(&mut s.ras) != 0 {
+        cache::control().pic_counts[natemu_abi::pic::count::UNBALANCED] += 1;
+    }
+}
 /// Return plan: how the resident continues an exit of block `b` stopped at its exit word at native offset `offset` (a link
 /// point's first word or `svc` word, or its computed exit's `b`): through the push stub for a call (a direct call's point,
 /// an indirect call with words of its own), the pop stub for a return; else directly.
@@ -2967,6 +2978,9 @@ const GP: [u64; 3] = [13, 0, 0];
 fn system(s: &mut State, i: System) {
     let p = crate::perf::enter(crate::perf::SYSTEM);
     s.systems += 1;
+    // Return plan: the resident runs this instruction itself; a continuation through a stub waiting for the exit's target
+    // goes (counted): a re-entry at that RIP after it must not push or pop.
+    ras_dropped(s);
     // A shadow covers this instruction and ends with it (X2: MOV SS and STI set theirs again in the transaction); the
     // boundary is not between REP iterations. A BT* form under alignment checking does not complete here (it is stepped).
     if i.kind != system::BT_ALIGNED {
@@ -3812,6 +3826,7 @@ fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
 /// [`code_written`]'s invalidation path and completes; its exit goes to the next instruction, which the next miss
 /// compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
 fn step(s: &mut State) -> ! {
+    ras_dropped(s);
     loop {
         s.steps += 1;
         // A system instruction whose decode is kept runs from it (K2), as a decoded reply below does.

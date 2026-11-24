@@ -750,6 +750,10 @@ fn bind_slot(t: usize, context: u64) {
 /// current table's context when that is `context` ([`select_l1`] ran for it), else the miss.
 pub fn dispatcher_for(context: u64) -> u64 {
     let c = control();
+    // (Return plan test [`PIC_TEST_RAS`] + 4: every block placed as with no slot for its context.)
+    if c.pic_test == PIC_TEST_RAS + 4 {
+        return area::DISPATCH_MISS as u64;
+    }
     let t = c.l1_table as usize;
     match c.l1_slots[t] as usize {
         k if k != 0 && c.l1_contexts[t] == context && c.slot_contexts[k] == context => slot_at(k),
@@ -1218,7 +1222,7 @@ fn check_tails() {
             let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
             let to = target(exit);
             if word(exit) >> 26 != 0x05
-                || !(to == area::RETURN_MISS as u64 || slot.is_some_and(|k| to == k + area::SLOT_RETURN as u64) || to as usize % area::DISPATCH_SLOT_BYTES == area::SLOT_RETURN && to >= area::DISPATCH as u64 && to < (area::DISPATCH + area::DISPATCH_BYTES) as u64)
+                || !(to == area::RETURN_MISS as u64 || slot.is_some_and(|k| to == k + area::SLOT_RETURN as u64))
             {
                 bad(n, exit)
             }
