@@ -5,7 +5,7 @@
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
-//!       [--no-mailbox] [--debug-exit] [--firmware [--firmware-start reset|flat32]]
+//!       [--no-mailbox] [--debug-exit] [--pvpanic] [--firmware [--firmware-start reset|flat32]]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
@@ -43,6 +43,11 @@
 //! path then `--cmdline`; no ACPI tables; its APs wait for a SIPI; the placement's `version` is 0, `zero_page` the
 //! information structure). `--debug-exit` (test only) adds QEMU's isa-debug-exit device at ports F4H-F7H: a write of V
 //! ends the run with the stop `debug_exit` and the result's `debug_exit` [V, (V << 1) | 1] (QEMU's exit status).
+//!
+//! Platform devices (platform-devices plan; all off by default, so a run without the flags is today's machine):
+//! `--pvpanic` adds the pvpanic device at port 505H (`natemu::pvpanic`) and its `\_SB.PEVT` to the DSDT, in a run and in
+//! a `--load-only` dump alike: the guest's PANICKED write ends the run with the stop `panic`, and the result gains
+//! `pvpanic` (`crash_loaded`: the guest's CRASH_LOADED writes).
 //!
 //! M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md): `--firmware` boots IMAGE as a firmware image
 //! instead of a kernel (`Boot::firmware`): at guest-physical [4 GiB - its size, 4 GiB), vCPU 0 at the reset vector in the
@@ -166,6 +171,9 @@ pub(crate) struct Args {
     /// Test only: QEMU's isa-debug-exit device at ports F4H-F7H (a write ends the run)
     #[arg(long)]
     debug_exit: bool,
+    /// The pvpanic device at port 505H, in the DSDT as QEMU0001 (a guest panic ends the run with the stop `panic`)
+    #[arg(long)]
+    pvpanic: bool,
     /// IMAGE is a firmware image (the firmware boot mode), not a kernel
     #[arg(long)]
     firmware: bool,
@@ -207,6 +215,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         perf_log,
         no_mailbox,
         debug_exit,
+        pvpanic,
         firmware,
         firmware_start,
     } = args;
@@ -267,7 +276,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         } else {
             Vec::new()
         };
-        let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox);
+        let board = boot::acpi::Board {
+            pvpanic,
+            ..Default::default()
+        };
+        let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &[], !no_mailbox, board);
         let inputs = Inputs {
             image: &image,
             cmdline: &cmdline,
@@ -313,6 +326,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         pool,
         mailbox: !no_mailbox,
         debug_exit,
+        pvpanic,
         ..if firmware {
             natemu::linux::Boot {
                 firmware: Some(natemu::boot::firmware::Firmware {
@@ -531,6 +545,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             k1: execution::k1_stats(backing.vcpu(0)),
         },
         devices: devices.report(),
+        pvpanic: prepared.pvpanic(),
         serial_bytes: prepared.serial_bytes(),
         serial_error: prepared.serial_error(),
         ticks: Ticks {
@@ -599,6 +614,9 @@ struct Report<'a> {
     stats: Stats,
     #[serde(flatten)]
     devices: natemu::devices::AccessCounts,
+    /// `--pvpanic`: the device's counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pvpanic: Option<&'a natemu::pvpanic::PvPanicStats>,
     serial_bytes: usize,
     serial_error: Option<String>,
     ticks: Ticks<'a>,
@@ -942,6 +960,7 @@ mod tests {
                     k1: execution::K1::default(),
                 },
                 devices: Default::default(),
+                pvpanic: None,
                 serial_bytes: 18,
                 serial_error: serial_error.map(Into::into),
                 ticks: Ticks {

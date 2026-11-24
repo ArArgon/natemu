@@ -41,6 +41,8 @@ pub struct Config {
     pub ram: Option<u64>,
     pub vcpus: Option<usize>,
     pub transports: Transports,
+    /// The pvpanic device (`machine.pvpanic`, default on): a guest panic ends the run.
+    pub pvpanic: bool,
     pub serial_output: Option<PathBuf>, // None = standard output
     pub serial_stdin: bool,
     pub fexc: Option<PathBuf>,
@@ -86,6 +88,7 @@ impl Config {
             } else {
                 Transport::Mmio
             }),
+            pvpanic: true,
             serial_output: None,
             serial_stdin: false,
             fexc: None,
@@ -149,6 +152,7 @@ struct FMachine {
     ram: Option<toml::Value>,
     vcpus: Option<usize>,
     transport: Option<FTransport>,
+    pvpanic: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +273,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
             });
         }
         cfg.vcpus = m.vcpus.or(cfg.vcpus);
+        cfg.pvpanic = m.pvpanic.unwrap_or(cfg.pvpanic);
         if let Some(t) = m.transport {
             let one = |v: Option<String>, key: &str, slot: &mut Transport| -> Res<()> {
                 if let Some(v) = v {
@@ -575,13 +580,14 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 27] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
     "machine.transport.disk",
     "machine.transport.nic",
     "machine.transport.rng",
+    "machine.pvpanic",
     "serial.output",
     "serial.stdin",
     "engine.fexc",
@@ -723,6 +729,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "machine.transport.disk" => cfg.transports.disk = transport_word(text).map_err(err)?,
         "machine.transport.nic" => cfg.transports.net = transport_word(text).map_err(err)?,
         "machine.transport.rng" => cfg.transports.rng = transport_word(text).map_err(err)?,
+        "machine.pvpanic" => cfg.pvpanic = boolish(text).map_err(err)?,
         "serial.output" => cfg.serial_output = (text != "stdout").then(path),
         "serial.stdin" => cfg.serial_stdin = boolish(text).map_err(err)?,
         "engine.fexc" => cfg.fexc = Some(path()),
@@ -976,6 +983,7 @@ pub fn to_boot(
     boot.pool = cfg.pool;
     boot.check_reuse = cfg.check_reuse;
     boot.transports = cfg.transports;
+    boot.pvpanic = cfg.pvpanic;
     boot.initrd = initrd;
     boot.cmdline = cfg.cmdline.clone();
     boot.ram = cfg.ram.unwrap_or(boot.ram);

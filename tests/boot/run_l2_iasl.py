@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """L2 iasl check: the ACPI tables the loader writes (`crates/host/src/boot/acpi.rs`), judged by ACPICA's `iasl`
-(Homebrew `acpica`, 20260408), for N = 1..4 processors.
+(Homebrew `acpica`, 20260408), for N = 1..4 processors, each twice: as the driver's defaults build them (`nN`), and with
+the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the DSDT then lists the
+pvpanic device).
 
     python3 tests/boot/run_l2_iasl.py --out DIR [--host HOST] [--iasl IASL]
 
 For each N the driver's load-only dump (`boot-linux --load-only --vcpus N --dump`) is read; the tables are found from
-`boot_params.acpi_rsdp_addr` (RSDP -> XSDT -> FADT, MADT; FADT -> FACS, DSDT) and written to DIR/nN/*.dat. Then:
+`boot_params.acpi_rsdp_addr` (RSDP -> XSDT -> FADT, MADT; FADT -> FACS, DSDT) and written to DIR/nN/*.dat
+(DIR/nN-devices/*.dat). Then:
 - `iasl -d` on the XSDT, FADT, FACS, DSDT and MADT: exit 0, no error/warning/remark in its output, and no `/****`
   diagnostic in the disassembly, with exactly one allowed exception (below);
 - the DSDT recompiled from iasl's own disassembly with `-oa` (no optimisation) equals ours byte for byte, except the
@@ -29,6 +32,8 @@ from raw_root import RAW_ROOT  # noqa: E402
 KERNEL = RAW_ROOT / 'kernel-census-20261028-01/dl/linux'
 ZERO_PAGE = 0x10000
 MV0 = 'ACPI table terminates in the middle of a data structure!'
+# The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
+DEVICES = ['--pvpanic']
 
 
 def build():
@@ -75,11 +80,11 @@ def problems_in(log):
             or re.search(r'Compilation complete\. [1-9]|[1-9]\d* Errors?|[1-9]\d* Warnings?', line)]
 
 
-def check_n(host, tool, work, n, rng=False, kernel=KERNEL):
+def check_n(host, tool, work, n, rng=False, kernel=KERNEL, flags=()):
     work.mkdir(parents=True, exist_ok=True)
     dump = work / 'loaded.dump'
     subprocess.run([host, 'unused', 'boot-linux', 'unused', kernel, '--ram', '0x8000000', '--load-only', '--vcpus', str(n),
-                    '--dump', dump] + (['--rng'] if rng else []), capture_output=True, check=True)
+                    '--dump', dump] + (['--rng'] if rng else []) + list(flags), capture_output=True, check=True)
     t = tables(dump.read_bytes())
     dump.unlink()
     v = []
@@ -162,15 +167,17 @@ def main():
     host = o.host or build()
     o.out.mkdir(parents=True, exist_ok=True)
     report = {}
-    for n in range(1, 5):
-        v = check_n(host, o.iasl, o.out / f'n{n}', n, o.rng, o.kernel)
-        report[n] = v
-        print(f'N={n}: {"pass" if not v else "FAIL"}')
+    for (suffix, flags), n in [(v, n) for v in (('', []), ('-devices', DEVICES)) for n in range(1, 5)]:
+        name = f'n{n}{suffix}'
+        v = check_n(host, o.iasl, o.out / name, n, o.rng, o.kernel, flags)
+        report[name] = v
+        print(f'{name}: {"pass" if not v else "FAIL"}')
         for x in v:
             print('  ', x)
     (o.out / 'l2-iasl.json').write_text(json.dumps(report, indent=1))
     (o.out / 'results.json').write_text(json.dumps({'results': [   # per-case rows for the framework
-        {'name': f'n{n}', 'outcome': 'fail' if v else 'match', 'diffs': list(map(str, v))} for n, v in report.items()]}, indent=1))
+        {'name': name, 'outcome': 'fail' if v else 'match', 'diffs': list(map(str, v))} for name, v in report.items()]},
+        indent=1))
     sys.exit(1 if any(report.values()) else 0)
 
 

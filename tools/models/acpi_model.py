@@ -2,6 +2,7 @@
 
     check(dump_bytes, n) -> dict(violations=[...], not_fixed=[...], listing=str, info=dict)
     check(dump_bytes, n, mailbox=False)   # tables built without the wakeup mailbox (boot-linux --no-mailbox)
+    check(dump_bytes, n, pvpanic=True)    # tables built with the pvpanic device (boot-linux --pvpanic)
 
 Inputs are the driver's `--dump` records ([u64 gpa][u64 length][bytes], later records override earlier ones; guest RAM is
 zero elsewhere) and the vCPU count N. Expectations are derived from: ACPI 6.6 ch. 5 snapshot (layouts; the plan targets
@@ -10,7 +11,8 @@ ch. 6.4 resource descriptors (from knowledge, not in the snapshot), CLM-03-03-22
 (§1a AP start / legacy island / idle states, §1e ACPI tables, L1/X3 notes), Linux v6.12 consumers
 (arch/x86/kernel/acpi/boot.c, madt_wakeup.c, drivers/acpi/processor_idle.c) and tools/models/cpu_profile, plus the
 main session's decisions: the SCI as QEMU describes it (IRQ9 -> GSI9 override, flags 0x000d), an RTC device (PNP0B00,
-0x70/2, IRQ8), FADT flags judged against QEMU's PC FADT, GPE0 omitted.
+0x70/2, IRQ8), FADT flags judged against QEMU's PC FADT, GPE0 omitted; and the platform-devices plan's pvpanic device
+(QEMU's `docs/specs/pvpanic.rst` and its ISA device's ACPI description: `_HID` "QEMU0001", one I/O port at 505H).
 
 Violations are strings `RULE: message` (with guest physical addresses and table offsets). Values the records do not fix
 go to `not_fixed` as dict(item, value, meaning, judgement) where judgement starts with 'FLAG' when it looks
@@ -556,13 +558,22 @@ def gas(b, o):
     return dict(space=b[o], width=b[o + 1], offset=b[o + 2], access=b[o + 3], addr=u64(b, o + 4))
 
 
+def fmt_resource(x):
+    """A decoded resource descriptor as its ASL (IO descriptors; others by type)."""
+    if x['type'] != 'IO':
+        return x['type']
+    return f'IO (Decode{16 if x["decode16"] else 10}, {x["min"]:#x}, {x["max"]:#x}, {x["align"]}, {x["len"]})'
+
+
 def fmt_gas(g):
     return f"space {g['space']} width {g['width']} offset {g['offset']} access {g['access']} addr {g['addr']:#x}"
 
 
-def check(dump, n, profile=None, corrupt=None, mailbox=True):
+def check(dump, n, profile=None, corrupt=None, mailbox=True, pvpanic=False):
     """`mailbox`: the MADT has exactly one version-0 multiprocessor wakeup structure (the default), or, False, none
-    (boot-interpreter plan section 6: the OS starts its APs with INIT and SIPI)."""
+    (boot-interpreter plan section 6: the OS starts its APs with INIT and SIPI). `pvpanic`: the DSDT has exactly one
+    QEMU0001 device, whose `_CRS` is only IO (Decode16, 0x505, 0x505, 1, 1) and whose `_STA` is 0x0F, or, False (the
+    default), none."""
     img = Image(dump)
     if corrupt:
         corrupt(img)
@@ -1096,7 +1107,32 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True):
                     nf(f'{p}._CRS I/O alignment', ios[0]['align'], 'IO descriptor alignment (min = max, unused)',
                        'ok')
                 nf(f'{p}._UID', devices[p]['uid'], f'{label} instance', 'ok')
-        com = isa
+        # pvpanic (platform-devices plan): QEMU0001 with one I/O port, 505H length 1 (QEMU's
+        # `IO (Decode16, 0x0505, 0x0505, 0x01, 0x01)`), and nothing else in its _CRS; _STA 0x0F (present, enabled,
+        # shown, functioning). Only when the tables were built with it.
+        pv = [p for p, d in devices.items() if d['hid'] == 'QEMU0001']
+        if len(pv) != int(pvpanic):
+            want = 'exactly one pvpanic device' if pvpanic else 'none: built without pvpanic'
+            viol('DEVICES', f'QEMU0001 devices {pv} ({want})')
+        for p in pv:
+            crs = obj.get(p + '._CRS')
+            if not crs or crs[0] != 'Name' or not isinstance(crs[1], tuple) or crs[1][0] != 'buffer':
+                viol('CRS', f'{p}._CRS missing or not a static buffer')
+            else:
+                size, init = crs[1][1], crs[1][2]
+                if size != len(init):
+                    viol('CRS', f'{p}._CRS BufferSize {size} vs {len(init)} initializer bytes')
+                its, probs = decode_resources(init)
+                for pr in probs:
+                    viol('CRS', f'{p}._CRS: {pr}')
+                info['PVPANIC_CRS'] = its
+                got = [fmt_resource(x) for x in its if x['type'] != 'End']
+                if got != ['IO (Decode16, 0x505, 0x505, 1, 1)']:
+                    viol('DEVICES', f'{p}._CRS {got} (pvpanic: only IO (Decode16, 0x505, 0x505, 1, 1))')
+            sta = obj.get(p + '._STA')
+            if not sta or sta[0] != 'Name' or sta[1] != 0x0F:
+                viol('DEVICES', f'{p}._STA {sta and sta[:2]!r} (pvpanic: 0x0F)')
+        com = isa + pv
         # processors (UIDs vs MADT)
         cpus = {p: d for p, d in devices.items() if d['kind'] == 'Processor' or d['hid'] == 'ACPI0007'}
         dsdt_uids = []
@@ -1116,7 +1152,7 @@ def check(dump, n, profile=None, corrupt=None, mailbox=True):
                             'ACPI0013', 'PNP0C80'):
                 viol('DEVICES', f'{p} {d["hid"]}: a device outside the CLM-03-03-69 set')
         other = {p: d['hid'] for p, d in devices.items() if p not in com and p not in cpus}
-        nf('DSDT other devices', other or 'none', 'devices besides COM1, the RTC and processors',
+        nf('DSDT other devices', other or 'none', 'devices besides COM1, the RTC, pvpanic and processors',
            'FLAG: CLM-03-03-69 also names LNRO0005 virtio-mmio resources; none described (later chunk?)'
            if not any(d == 'LNRO0005' for d in other.values()) else 'judge: check against claim 69 windows/GSIs')
         nf('DSDT processor objects', sorted(cpus), 'ACPI0007 devices or Processor objects', 'ok')

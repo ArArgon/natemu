@@ -71,6 +71,16 @@ pub struct Tables {
     pub(crate) blobs: Vec<(u64, Vec<u8>)>,
 }
 
+/// The board's optional platform devices the tables describe (platform-devices plan). [`Board::default`] is all off: the
+/// tables are then byte for byte those of the board without them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Board {
+    /// The pvpanic device at port 505H ([`crate::pvpanic`]): `\_SB.PEVT`, `_HID` "QEMU0001".
+    pub pvpanic: bool,
+    /// The 8042 with a PS/2 keyboard and mouse (accepted; described from the plan's Task 4 on).
+    pub ps2: bool,
+}
+
 /// One enabled modern virtio-MMIO device, shared by launch discovery and the MMIO registry.
 #[derive(Clone, Copy, Debug)]
 pub struct VirtioMmio {
@@ -282,8 +292,9 @@ fn pci0(pci: &[(u8, u32)]) -> Vec<u8> {
     )
 }
 
-/// The DSDT (5.2.11.1, revision 2: 64-bit integers): `\_S5`, COM1, the RTC and one processor device per vCPU.
-fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)]) -> Vec<u8> {
+/// The DSDT (5.2.11.1, revision 2: 64-bit integers): `\_S5`, COM1, the RTC, the `board`'s optional devices and one
+/// processor device per vCPU.
+fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)], board: Board) -> Vec<u8> {
     use aml::*;
     // COM1's resources (6.4): IO (Decode16, 0x3f8, 0x3f8, 1, 8), IRQNoFlags () {4} (edge, active high), end tag.
     let [lo, hi] = COM1_PORT.to_le_bytes();
@@ -325,6 +336,19 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)]) -> Vec<u8> {
         ],
     );
     let mut sb = vec![com1, rtc];
+    if board.pvpanic {
+        // pvpanic (QEMU's ISA device): IO (Decode16, 0x505, 0x505, 1, 1), end tag; present and functioning.
+        let [lo, hi] = crate::pvpanic::PORT.to_le_bytes();
+        let crs = [0x47, 0x01, lo, hi, lo, hi, 0x01, 0x01, 0x79, 0x00];
+        sb.push(device(
+            b"PEVT",
+            &[
+                name(b"_HID", string("QEMU0001")),
+                name(b"_CRS", buffer(&crs)),
+                name(b"_STA", integer(0x0f)),
+            ],
+        ));
+    }
     if !pci.is_empty() {
         sb.push(pci0(pci));
     }
@@ -411,17 +435,19 @@ pub fn build_with_devices(
     virtio: &[VirtioMmio],
     pci: &[(u8, u32)],
 ) -> Tables {
-    build_tables(vcpus, base, virtio, pci, true)
+    build_tables(vcpus, base, virtio, pci, true, Board::default())
 }
 
 /// As [`build_with_devices`]; with `mailbox` false, without the multiprocessor wakeup structure and its mailbox page
 /// ([`Tables::mailbox`] 0): the OS then starts its other processors with INIT and SIPI (boot-interpreter plan section 6).
+/// `board` names the optional platform devices the DSDT lists ([`Board`]).
 pub fn build_tables(
     vcpus: usize,
     base: u64,
     virtio: &[VirtioMmio],
     pci: &[(u8, u32)],
     mailbox: bool,
+    board: Board,
 ) -> Tables {
     assert!(
         (1..=254).contains(&vcpus),
@@ -434,7 +460,7 @@ pub fn build_tables(
     let fadt_at = next(xsdt, HEADER + 16, 64);
     let facs_at = next(fadt_at, 276, 64);
     let dsdt_at = next(facs_at, 64, 64);
-    let dsdt = dsdt(vcpus, virtio, pci);
+    let dsdt = dsdt(vcpus, virtio, pci, board);
     let madt_at = next(dsdt_at, dsdt.len(), 64);
     let madt_len = 44 + 8 * vcpus + 12 + 2 * 10 + 6 + if mailbox { 16 } else { 0 };
     let mailbox = mailbox.then(|| next(madt_at, madt_len, 4096));
@@ -691,8 +717,8 @@ mod tests {
     fn tables_without_the_mailbox() {
         for n in [1, 2, 4, 64] {
             let (with, without) = (
-                build_tables(n, ACPI_NVS.0, &[], &[], true),
-                build_tables(n, ACPI_NVS.0, &[], &[], false),
+                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], &[], false, Board::default()),
             );
             assert_eq!((without.mailbox, without.rsdp), (0, with.rsdp));
             assert_eq!(without.blobs.len() + 1, with.blobs.len());
@@ -836,12 +862,19 @@ mod tests {
             &[BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE],
         ];
         let mut got = Vec::new();
+        let digest = |t: &Tables| {
+            fnv(t.blobs.iter().flat_map(|(a, b)| {
+                a.to_le_bytes().into_iter().chain(b.iter().copied())
+            }))
+        };
         for vcpus in [1, 4] {
             for m in manifests {
                 let t = build_with_virtio(vcpus, ACPI_NVS.0, m);
-                got.push(fnv(t.blobs.iter().flat_map(|(a, b)| {
-                    a.to_le_bytes().into_iter().chain(b.iter().copied())
-                })));
+                got.push(digest(&t));
+                // The board without its optional devices builds the same tables.
+                let board = build_tables(vcpus, ACPI_NVS.0, m, &[], true, Board::default());
+                assert_eq!(digest(&board), digest(&t));
+                assert_eq!(board.blobs, t.blobs);
             }
         }
         let map = |l: Layout| {
@@ -869,6 +902,42 @@ mod tests {
         11904427970829829364,
         10577683458271288932,
     ];
+
+    /// pvpanic (platform-devices plan): `Device (PEVT)` with `_HID` "QEMU0001", `_CRS` IO (Decode16, 0x505, 0x505, 1, 1)
+    /// and `_STA` 0x0F, in the DSDT only with `Board::pvpanic`; every other table as without it.
+    #[test]
+    fn dsdt_lists_pvpanic_when_enabled() {
+        let hid = b"\x08_HID\x0dQEMU0001\x00";
+        let io = [0x47, 0x01, 0x05, 0x05, 0x05, 0x05, 0x01, 0x01];
+        let crs = [&b"\x08_CRS\x11\x0d\x0a\x0a"[..], &io, &[0x79, 0x00]].concat();
+        let sta = b"\x08_STA\x0a\x0f";
+        let on = Board {
+            pvpanic: true,
+            ..Board::default()
+        };
+        for n in [1, 4] {
+            let (off, with) = (
+                build_tables(n, ACPI_NVS.0, &[], &[], true, Board::default()),
+                build_tables(n, ACPI_NVS.0, &[], &[], true, on),
+            );
+            let (d0, d) = (dsdt_of(&off), dsdt_of(&with));
+            assert!(!has(d0, b"QEMU0001") && !has(d0, b"PEVT") && !has(d0, &io));
+            assert_eq!((count(d, b"PEVT"), count(d, hid), count(d, &io)), (1, 1, 1));
+            let dev = [&b"PEVT"[..], hid, &crs, sta].concat();
+            assert!(has(d, &dev), "PEVT: _HID, _CRS, _STA");
+            assert_eq!((sum(d), u32_at(d, 4) as usize), (0, d.len()));
+            // The same tables otherwise (the MADT may move after the longer DSDT, so the XSDT's pointer to it is not
+            // compared), the DSDT at the same address.
+            assert_eq!(off.blobs.len(), with.blobs.len());
+            for ((a, x), (b, y)) in off.blobs.iter().zip(&with.blobs) {
+                match &x[..4] {
+                    b"DSDT" => assert_eq!(a, b),
+                    b"XSDT" => assert_eq!((a, x.len(), &x[36..44]), (b, y.len(), &y[36..44])),
+                    _ => assert_eq!(x, y, "{}", String::from_utf8_lossy(&x[..4])),
+                }
+            }
+        }
+    }
 
     /// AML encodings with known iasl outputs.
     #[test]

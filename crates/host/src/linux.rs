@@ -294,16 +294,18 @@ fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> 
 /// The ACPI tables (with the mailbox) and the lists they are built from, for the tests ([`plan_tables_with`]).
 #[cfg(test)]
 fn plan_tables(vcpus: usize, rsdp: u64, placed: &[Placed], ram: u64) -> Result<LaunchPlan> {
-    plan_tables_with(vcpus, rsdp, placed, ram, true)
+    plan_tables_with(vcpus, rsdp, placed, ram, true, boot::acpi::Board::default())
 }
 /// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`);
-/// `mailbox` false leaves the multiprocessor wakeup mailbox out ([`Boot::mailbox`]).
+/// `mailbox` false leaves the multiprocessor wakeup mailbox out ([`Boot::mailbox`]); `board` names the optional platform
+/// devices the DSDT lists.
 fn plan_tables_with(
     vcpus: usize,
     rsdp: u64,
     placed: &[Placed],
     ram: u64,
     mailbox: bool,
+    board: boot::acpi::Board,
 ) -> Result<LaunchPlan> {
     let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
@@ -315,7 +317,7 @@ fn plan_tables_with(
         }
     }
     functions.sort_unstable();
-    let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &functions, mailbox);
+    let tables = boot::acpi::build_tables(vcpus, rsdp, &manifest, &functions, mailbox, board);
     Ok(LaunchPlan {
         manifest,
         functions,
@@ -408,6 +410,10 @@ pub struct Boot {
     /// ([`crate::debug_exit`]): a write ends the run with `Stop::Power(pm::DEBUG_EXIT)`, the value in
     /// [`Prepared::debug_exit`]. Default off.
     pub debug_exit: bool,
+    /// The pvpanic device at port 505H ([`crate::pvpanic`]), listed in the DSDT as `\_SB.PEVT` (a firmware boot has no
+    /// tables but the device): the guest's PANICKED write ends the run with `Stop::Power(pm::PANIC)`; its CRASH_LOADED
+    /// writes are counted in [`Prepared::pvpanic`]. Default off (the `natemu` CLI turns it on, `machine.pvpanic`).
+    pub pvpanic: bool,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -449,6 +455,7 @@ impl Boot {
             transports: Transports::all(Transport::Mmio),
             mailbox: true,
             debug_exit: false,
+            pvpanic: false,
             firmware: None,
         }
     }
@@ -485,7 +492,17 @@ impl Boot {
             self.ram as usize,
             self.pool,
         )?;
-        let plan = plan_tables_with(self.vcpus, self.rsdp, &placed, self.ram, self.mailbox)?;
+        let plan = plan_tables_with(
+            self.vcpus,
+            self.rsdp,
+            &placed,
+            self.ram,
+            self.mailbox,
+            boot::acpi::Board {
+                pvpanic: self.pvpanic,
+                ..Default::default()
+            },
+        )?;
         let (layout, tables) = (plan.layout, plan.tables);
         let inputs = Inputs {
             image: &self.kernel,
@@ -532,6 +549,11 @@ impl Boot {
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
         // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
+        // Beside the PM block: the pvpanic device (`Boot::pvpanic`).
+        let pvpanic = self
+            .pvpanic
+            .then(|| crate::pvpanic::install(&mut devices))
+            .transpose()?;
         let debug_exit = if self.debug_exit {
             let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
             devices.register_ports(
@@ -612,6 +634,7 @@ impl Boot {
             cancel: Arc::default(),
             serial_input: Mutex::new(None),
             debug_exit,
+            pvpanic,
         })
     }
 
@@ -672,6 +695,11 @@ impl Boot {
         let mut devices = devices::Devices::new(self.ram);
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
+        // Beside the PM block: the pvpanic device (`Boot::pvpanic`).
+        let pvpanic = self
+            .pvpanic
+            .then(|| crate::pvpanic::install(&mut devices))
+            .transpose()?;
         let debug_exit = if self.debug_exit {
             let (device, value) = crate::debug_exit::DebugExit::new(devices.power.clone());
             devices.register_ports(
@@ -713,6 +741,7 @@ impl Boot {
             cancel: Arc::default(),
             serial_input: Mutex::new(None),
             debug_exit,
+            pvpanic,
         })
     }
 
@@ -753,6 +782,8 @@ pub struct Prepared {
     serial_input: Mutex<Option<Box<dyn Read + Send>>>,
     /// [`Boot::debug_exit`]: the value its device was written ([`crate::debug_exit::NONE`] until then).
     debug_exit: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// [`Boot::pvpanic`]: the device's counts.
+    pvpanic: Option<Arc<crate::pvpanic::PvPanicStats>>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -1193,6 +1224,10 @@ impl Prepared {
             .as_ref()
             .map(|v| v.load(SeqCst))
             .filter(|&v| v != crate::debug_exit::NONE)
+    }
+    /// [`Boot::pvpanic`]: the device's counts (`None` without the device).
+    pub fn pvpanic(&self) -> Option<&crate::pvpanic::PvPanicStats> {
+        self.pvpanic.as_deref()
     }
     /// The bytes COM1 has sent so far.
     pub fn serial_bytes(&self) -> usize {

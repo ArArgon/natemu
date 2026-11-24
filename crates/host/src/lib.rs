@@ -30,6 +30,7 @@ mod pic;
 mod pit;
 mod probe;
 pub mod pm;
+pub mod pvpanic;
 mod relocation;
 pub mod report;
 mod rtc;

@@ -1326,11 +1326,12 @@ struct Ran {
     /// M2 Part 2: its pending word as its run ended (read at once: later IPIs to it change the word but not its run).
     pending: u64,
 }
-/// L4b: a power stop's name (`pm::POWEROFF`, `pm::RESET`).
+/// L4b: a power stop's name (`pm::POWEROFF`, `pm::RESET`, `pm::DEBUG_EXIT`, `pm::PANIC`).
 pub(crate) fn power_name(p: u8) -> &'static str {
     match p {
         crate::pm::RESET => "reset",
         crate::pm::DEBUG_EXIT => "debug_exit",
+        crate::pm::PANIC => "panic",
         _ => "poweroff",
     }
 }

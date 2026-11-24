@@ -29,7 +29,7 @@
 //! `[serial] output = "stdout"` (or `--set serial.output=stdout`), which means standard output. Without either, COM1 goes
 //! to standard output. The stop of the vCPU that ended the run is written to standard error, after each vCPU's report
 //! (`natemu::execution`'s diagnostics: guest RIP, mode, CPL, instruction bytes, registers, code identity; none at a power-off,
-//! a reset or a cancel).
+//! a reset, a guest panic or a cancel).
 //! SIGINFO (Ctrl-T) prints every vCPU's report while the run goes on (`debug.inspect`, on by default); `debug.watchdog`
 //! (seconds, default 60) bounds a vCPU's stay in guest code without a host exit (the run ends with its report); a vCPU that
 //! long in the host outside a compile (a blocked serial write, say) is reported once and the run goes on.
@@ -42,14 +42,18 @@
 //!
 //! `--runtime` defaults to the resident built beside this binary (`<target>/aarch64-unknown-none/<profile>/natemu-runtime`
 //! for `<target>/<profile>/natemu`) when that file exists. `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units:
-//! 2G = 2048M = 0x80000000). Exits 0 when the guest powered off, 2 at any other stop (SIGINT or SIGTERM cancels the run:
-//! `Cancelled`; a second one exits 130 at once), 1 on a host error (a failed serial write and a refused command line
-//! included; `--help` exits 0). `--perf-log FILE` turns on the library's timing log (`natemu::perf`). `--serial-stdin` (off
-//! by default) feeds standard input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest,
-//! Ctrl-A x cancels the run. `--page-currency` and `--writable-on-read` are debug and measurement switches (see their
+//! 2G = 2048M = 0x80000000). Exits 0 when the guest powered off, 2 at any other stop (a guest panic included; SIGINT or
+//! SIGTERM cancels the run: `Cancelled`; a second one exits 130 at once), 1 on a host error (a failed serial write and a
+//! refused command line included; `--help` exits 0). `--perf-log FILE` turns on the library's timing log (`natemu::perf`).
+//! `--serial-stdin` (off by default) feeds standard input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode,
+//! Ctrl-C to the guest, Ctrl-A x cancels the run. `--page-currency` and `--writable-on-read` are debug and measurement switches (see their
 //! help). `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` turns it off) is the shared template pool.
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
+//!
+//! **Platform devices.** `machine.pvpanic` (default on; `--set machine.pvpanic=false` turns it off) adds the pvpanic device
+//! (`natemu::pvpanic`, `natemu::linux::Boot::pvpanic`): a guest kernel's panic ends the run with `Power(4)` (the
+//! driver's `panic`), exit status 2.
 mod config;
 use clap::{CommandFactory, FromArgMatches};
 use natemu::execution::Stop;
@@ -70,7 +74,7 @@ const MAX_INPUT: usize = 1 << 32;
     _PAGE_CURRENCY, _WRITABLE_ON_READ, _POOL, _CHECK_REUSE, _COMPILE_CACHE, _COMPILE_CACHE_MB and _PERF_LOG are deprecated: \
     they still work, and each one used prints a warning to standard error naming the file key to use. \
     See docs/configuration.md.\n\n\
-    Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
+    Exit status: 0 the guest powered off, 2 any other stop (reset, a guest panic, a typed stop, a watchdog, \
     SIGINT/SIGTERM), 1 a host error. A flag wins over its environment variable."
 )]
 struct Cli {

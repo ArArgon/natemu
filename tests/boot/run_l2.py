@@ -6,7 +6,9 @@
 For N = 1..4 runs `natemu-host unused boot-linux unused BZIMAGE --ram 0x8000000 --load-only --vcpus N --dump`, checks
 the dump (table validity, AML decode, MADT/CPUID/mailbox/e820/device agreement) and writes DIR/l2.json plus the DSDT
 listing DIR/dsdt-nN.dsl; then again with `--no-mailbox` (`nN-no-mailbox`: the MADT without the wakeup structure, M2
-Part 2). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump) files instead of running the driver.
+Part 2), and again with the board's optional platform devices (`nN-devices`: `DEVICES`, the platform-devices plan; the
+DSDT then lists the pvpanic device). `--dumps DIR` judges existing nN.dump (and nN-no-mailbox.dump, nN-devices.dump)
+files instead of running the driver.
 Prints one pass/fail line per N; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, pathlib, subprocess, sys
@@ -17,6 +19,12 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from models import acpi_model  # noqa: E402
 
 RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
+# The driver's flags for the board's optional platform devices (all off by default), for the `nN-devices` dumps.
+DEVICES = ['--pvpanic']
+# Each dump: its name's suffix, the driver's extra flags, and what the model expects.
+VARIANTS = [('', [], dict()),
+            ('-no-mailbox', ['--no-mailbox'], dict(mailbox=False)),
+            ('-devices', DEVICES, dict(pvpanic=True))]
 
 
 def main():
@@ -32,20 +40,20 @@ def main():
                        cwd=ROOT, check=True)
     host = o.host or ROOT / 'target/release/natemu-host'
     report, fail = {}, False
-    for mailbox, n in [(m, n) for m in (True, False) for n in range(1, 5)]:
-        name = f'n{n}' if mailbox else f'n{n}-no-mailbox'
+    for (suffix, flags, expect), n in [(v, n) for v in VARIANTS for n in range(1, 5)]:
+        name = f'n{n}{suffix}'
         if o.dumps:
             dump = o.dumps / f'{name}.dump'
             r = None
         else:
             dump = o.out / f'{name}.dump'
             r = subprocess.run([host, 'unused', 'boot-linux', 'unused', o.kernel, '--ram', '0x8000000', '--load-only',
-                                '--vcpus', str(n), '--dump', dump, *([] if mailbox else ['--no-mailbox'])],
+                                '--vcpus', str(n), '--dump', dump, *flags],
                                capture_output=True, text=True, timeout=300)
         if r is not None and r.returncode:
             res = dict(violations=[f'DRIVER: exit {r.returncode}: {r.stderr.strip()[-400:]}'], not_fixed=[], info={})
         else:
-            res = acpi_model.check(dump.read_bytes(), n, mailbox=mailbox)
+            res = acpi_model.check(dump.read_bytes(), n, **expect)
             (o.out / f'dsdt-{name}.dsl').write_text(res.pop('listing') + '\n')
         if not o.dumps:
             dump.unlink(missing_ok=True)

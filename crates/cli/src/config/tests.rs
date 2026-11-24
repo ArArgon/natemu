@@ -1034,6 +1034,27 @@ fn backing_files_follow_the_same_file_rule() {
     );
 }
 
+/// `machine.pvpanic`: on by default, off from the file or with `--set machine.pvpanic=false`, and the launch follows.
+#[test]
+fn pvpanic_key_parses_and_set_turns_it_off() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "r".into(), Vec::new(), None).unwrap().pvpanic;
+    let c = load_old(&[]).unwrap();
+    assert!(c.pvpanic && boot(&c));
+    let c = load_old(&["--set", "machine.pvpanic=false"]).unwrap();
+    assert!(!c.pvpanic && !boot(&c));
+    let (_, c) = load_file(&format!("[machine]\npvpanic = false\n{MIN}"), &[]);
+    let c = c.unwrap();
+    assert!(!c.pvpanic && !boot(&c));
+    let (_, c) = load_file(
+        &format!("[machine]\npvpanic = false\n{MIN}"),
+        &["--set", "machine.pvpanic=on"],
+    );
+    assert!(c.unwrap().pvpanic, "--set wins over the file");
+    assert!(err(load_file(&format!("[machine]\npvpanic = \"no\"\n{MIN}"), &[]).1).contains("machine.pvpanic"));
+    assert!(err(load_old(&["--set", "machine.pvpanic=maybe"])).contains("--set machine.pvpanic: bad boolean"));
+}
+
 #[test]
 fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
     let _env = lock();
