@@ -256,12 +256,20 @@ class Report(Base):
 class Checks(Base):
     """Each check of the report, on a run broken in its one way."""
 
+    def test_records_written_after_the_last_drain_fail(self):
+        recs, markers, objects = standard_run()
+        recs = [r for r in recs if not (r[2] >> 60 == sr.COUNT and r[3] == 0 | sr.COUNTERS.index('written') << 32)]
+        recs += [hostrec(sr.COUNT, 0, value1=14, value3=0, value4=sr.COUNTERS.index('written'))]
+        problems, _ = self.report(markers=self.write(recs, markers, objects))
+        self.assertEqual(problems, ['vCPU 0: 2 records written after the last drain'])
+
     def test_records_the_host_did_not_drain_fail(self):
         recs, markers, objects = standard_run()
         recs = [r for r in recs if not (r[2] >> 60 == sr.COUNT and r[3] == 0 | sr.COUNTERS.index('drained') << 32)]
         recs += [hostrec(sr.COUNT, 0, value1=11, value3=0, value4=sr.COUNTERS.index('drained'))]
         problems, _ = self.report(markers=self.write(recs, markers, objects))
-        self.assertEqual(problems, ['vCPU 0: 12 ring records in the file, the host drained 11'])
+        self.assertEqual(problems, ['vCPU 0: 12 ring records in the file, the host drained 11',
+                                    'vCPU 0: 1 records written after the last drain'])
 
     def test_a_run_that_did_not_end_fails(self):
         recs, markers, objects = standard_run()

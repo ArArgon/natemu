@@ -478,7 +478,6 @@ class Profile:
         self.sum = [Tally(blocks=True) for _ in range(P)]
         self.series = collections.defaultdict(collections.Counter)
         self.records = collections.Counter()        # per vCPU: ring records found after its VCPU records
-        self.vcpu_lost = {}
         pending, vcpu, bad = 0, 0, 0
         origin, wt, freq, phases_at = self.origin, self.window_ticks, self.freq, self.phases.at
         per, summ, series = self.per, self.sum, self.series
@@ -528,7 +527,6 @@ class Profile:
             if k == VCPU:
                 r = host(w)
                 vcpu, pending = r['value3'], r['value4']
-                self.vcpu_lost[vcpu] = r['value1']
                 if vcpu >= self.vcpus: self.problems.append(f'records of vCPU {vcpu}: the header says {self.vcpus} vCPUs')
             elif k == HALTED:
                 r = host(w); v = r['value3']
@@ -562,6 +560,8 @@ class Profile:
                 continue
             if c.get('drained') != self.records[v]:
                 self.problems.append(f'vCPU {v}: {self.records[v]} ring records in the file, the host drained {c.get("drained")}')
+            if c.get('written', 0) != c.get('drained', 0):     # the last drain runs after the vCPUs stopped: nothing is left
+                self.problems.append(f'vCPU {v}: {c.get("written", 0) - c.get("drained", 0)} records written after the last drain')
         run = self.counters['run']
         if run.get('port_ignored'): self.problems.append(f'the control port ignored {run["port_ignored"]} accesses (a stray port access)')
         if run.get('not_sampling'): self.problems.append(f'{run["not_sampling"]} vCPU(s) never rung: the resident does not sample')
