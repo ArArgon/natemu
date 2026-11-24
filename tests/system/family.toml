@@ -235,11 +235,13 @@ needs = { perf = true }
 # Indirect plan step 1 (docs/restructure/indirect-cache-plan.md section 6): `indirect-sites`, the K1 program of jump and call
 # sites of 1, 4 and 64 targets in a library at three addresses of one space and one of another, with a shared trampoline's
 # checked jump and call (its values, the counters of appended words and of links through them, the host's audit of every
-# appended word); `indirect-stop`, entries at each appended word with the doorbell rung (run_pic.py's tail modes), dead
-# blocks' among them; `indirect-sites-lc`, it and programs that kill, relink and share on the `link-check` resident (its scan
+# appended word; with `reuse-cross` and `pic-cross`, whose shared block at block size 1 ends in a checked link's `svc` word
+# with its appended entry right after it: the word must be `b`, not the linker's next-word `nop`); `indirect-stop`, entries
+# at each appended word, each word of the lookup form and a split block's computed-exit trampoline with the doorbell rung
+# (run_pic.py's tail, lookup and trampoline modes), dead blocks' among them; `indirect-sites-lc`, it and programs that kill, relink and share on the `link-check` resident (its scan
 # of every block's appended words at each TLB flush).
 [suite.cases."indirect-sites"]
-argv = ["tests/system/run_k1.py", "--cpus", "1", "2", "--programs", "indirect-sites", "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/system/run_k1.py", "--cpus", "1", "2", "--programs", "indirect-sites,reuse-cross,pic-cross", "--timeout", "1500", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 2, perf = true }
 
 [suite.cases."indirect-sites-lc"]

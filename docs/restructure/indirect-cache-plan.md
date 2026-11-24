@@ -260,37 +260,44 @@ handler has one main successor; that is left for the sampler to show, not built.
   Jumps get the third word too, so every entry has the same size. One entry is appended for an indirect computed exit. In a
   shared translation (`PIC`), one is appended for each link point that is not a REP self-exit. They are written per copy in
   `place`, `copy`, `copy_pooled` and `share`. A context with no slot gets `b` to the miss.
-- The words start after the code and also after every link point's `svc` slot (`Block::tail_start`: at most the point's
-  offset + 20). In K1 `reuse-cross` and `pic-cross` at block size 1, a shared block's last move ends at `code_size`, and
-  its `svc` slot is the first word past the placed code; a checked link patches that word. The first build put the
-  appended words there, and the host audit caught it (`k1-c1`, `k1-c2@1`, `pic-*`). Not looked into: why that `svc` slot
-  lies outside the placed code at all. At 810bd50b a checked link writes there too, on the next placement's bytes or its
-  padding.
+- The words start right after the code (`code + code_size`). Every link point's `svc` word lies inside the code
+  (`pic::link_point`), so a point's entry can follow its `svc` word directly. This happens in K1 `reuse-cross` and
+  `pic-cross` at block size 1.
 - A checked link out of shared code patches its `svc` word to `b` to its point's entry (after rewriting the entry's `bl` for
-  the slot). `unlink_word` accepts either form.
+  the slot). The word is always `b`, never the linker's next-word `nop` (`link_word`, meant for a split block's trampoline);
+  `unlink_word` accepts either a `b` to the slot or a `b` to the entry. Correction (review fix 309cf492): the first build
+  wrote `link_word` there. When the entry was the next word, the `svc` became `nop`, `pic::svc_slot` then read the entry's
+  `bl`, and the host audit failed (`k1-c1`, `k1-c2@1`, `pic-*`). That build was patched by padding the words after an
+  assumed `svc` outside the placed code. That reading was wrong: no `svc` lies outside the placed code at 810bd50b. The
+  padding is gone, and the claim about 810bd50b is withdrawn.
 - Deviation: a checked link from absolute code into an instance still goes to the slot (`b`). Absolute blocks get no
   link-point words; on every block they would cost 12 bytes per link point.
-- The stop rule: `cache::tail_at` (dead blocks included) is checked right after the slot-area rule and before the dead-block
-  filter, and the stop is taken at once with RIP = x0. Deviation: `block_at` is not widened. The stop rule and the sampler call
+- The stop rule: `cache::tail_at` (dead blocks included) is checked on `block_at`'s miss, which every appended word is,
+  dead block or not; it is never filtered by death. The stop is taken at once with RIP = x0. Deviation: `block_at` is not widened. The stop rule and the sampler call
   `tail_at` themselves, so no caller of `block_at` can take an appended word for admitted code.
 - The sampler: place `TAIL` (8), with `at` = the word, `TAIL_CALL` and `TAIL_POINT`, and `DEAD` in the flags.
   `sample_report.py` counts `tail` samples by role, and dispatch samples by slot form (ordinary, lookup, return).
-- Counters, `pic::count` 32-37: computed-exit tails as jumps and as calls, link-point tails, links through them, stops at
-  them, and stops at them in dead blocks.
-- Audits: the host's `check_links` decodes every appended entry and every computed exit that branches to one. The
+- Counters, `pic::count` 32-39: computed-exit tails as jumps and as calls, and link-point tails, counted once the block is
+  filed; links through them; stops at them, and of those in dead blocks; stops inside a lookup form; stops at a split
+  block's computed-exit trampoline that leads to appended words.
+- `write_slot` now writes and synchronizes 256 bytes per slot binding (128 before), at each table hand-over.
+- Audits: the host's `check_links` decodes every appended entry and every computed exit that branches to one; a `bl` must
+  name the slot serving the block's context. The
   `link-check` resident's `check_tails` checks the same at each TLB flush, plus shared checked links. The reuse check expects
   the computed exit to branch to its words and the hint to equal the host's.
 
-Not built: the i386 version of `indirect-sites`. 32-bit code takes the same path; `compat32` and the faults shards cover its
-indirect forms.
+32-bit code: `indirect32` (below) runs the same sites and a shared checked jump and call in 32-bit user code. A 4-word move
+into x0 before a checked link (`pic::form` n = 4) was not constructed: FEX builds x0 with `movz`, `movn` or `orr` and then
+`movk`s, so a canonical address needs at most three words. The fix does not depend on the move's length.
 
 **Tests** (this worktree, M2 Max, narrow runs only, no gate):
 
 | Case | Shows |
 | --- | --- |
-| `system` `indirect-sites` (K1 program, 1 and 2 vCPUs, block sizes default and 1) | Jump sites (`jmp rax`) and call sites (`call rax`) of 1, 4 and 64 targets, in a library at RV1, RV3 and RV5 of one space and RV2 of another. Every target is reached (bit masks), with exact sums. A shared trampoline's checked jump and checked call reach their own aliases. Counters ≥ 3 computed jump tails, ≥ 3 call tails, ≥ 2 link-point tails, ≥ 2 links through them. |
+| `system` `indirect-sites` (K1 programs `indirect-sites`, `reuse-cross`, `pic-cross`; 1 and 2 vCPUs, block sizes default and 1) | Jump sites (`jmp rax`) and call sites (`call rax`) of 1, 4 and 64 targets, in a library at RV1, RV3 and RV5 of one space and RV2 of another. Every target is reached (bit masks), with exact sums. A shared trampoline's checked jump and checked call reach their own aliases. Counters ≥ 3 computed jump tails, ≥ 3 call tails, ≥ 2 link-point tails, ≥ 2 links through them. `reuse-cross` and `pic-cross` at block size 1: a checked link whose entry follows its `svc` word. |
 | `system` `indirect-sites-lc` | The same, plus `pic-two`, `pic-write`, `pic-twosrc`, `kill-out` and `cr3-link`, on the `link-check` resident (`run_k1.py --link-check`). |
-| `system` `indirect-stop` (`run_pic.py` modes `tail0`-`tail2`) | Entered at each appended word with the doorbell rung: about 6,480 stops per mode, about 330 of them in dead blocks. No `BAD_STOP`; every program's values unchanged. |
+| `system` `indirect-stop` (`run_pic.py` modes `tail0`-`tail2`, `lookup`, `trampoline`) | Entered with the doorbell rung at each appended word (about 6,480 stops per mode, about 330 in dead blocks), at each word of the slot's lookup form (6,601 stops) and at a split block's computed-exit trampoline (6,480 stops). No `BAD_STOP`; every program's values unchanged. |
+| `system` `compat32-resident-limits`: `indirect32` (`tests/smp/compat_limits.py`, natemu only, block sizes default and 1) | 32-bit user code: jump and call sites of 1, 4 and 64 targets in a library at three addresses, and a shared trampoline's checked jump and checked call. Every count, both returns, and least counters for instances, checked links, 32-bit jump and call tails, link-point tails and links through them. |
 | Rust units (`execution::cache::forms`, `admission::exit_forms_from_the_last_instruction`) | Each form's branches, decoded independently; the tail layout; the hint in 64-bit and 32-bit code. |
 
 Each new check was shown to fail when it should. Each edit below was applied, the case run, then reverted:
@@ -304,13 +311,12 @@ Each new check was shown to fail when it should. Each edit below was applied, th
 | FF /2 hinted as a jump | Rust unit `exit_forms_from_the_last_instruction` |
 | The computed exit left at `b` slot | `indirect-sites-lc`: `reuse_mismatch`, and the host audit |
 | The pad's `b` to the dispatcher instead of the miss | `indirect-sites-lc`: `link_check` (stop 65) at the first TLB flush |
+| A checked link through appended words written by `link_word` (`nop` for the next word) | `indirect-sites`: `reuse-cross`, `pic-cross` at block size 1, host audit (it survived the case without those two programs) |
+| The hint off in 32-bit code | `compat32-resident-limits`: `indirect32`'s counters |
 
-Narrow runs at the final commit, all passing: the Rust units, and 3,060 system and smp checks (`indirect-*`,
-`frame-randomization*`, `k1-c1`, `k1-c2@*`, `pic-*`, `compat32*`, `smp` `coherence`, `contain`, `privilege`). `faults`
-`faults@*`, `faults-1@*` and `probes@*` (15,935 checks) passed one commit earlier, before the `svc`-slot fix, and were not
-run again. One unrelated failure, already failing
-at 810bd50b: `tests/bench/test_sample_report.py` `Cost::test_a_guest_share_moved_by_more_than_a_point_fails` still expects
-the 1-point bound that a7cd8e82 raised to 2. Not run: the gate, `programs`, `correctness`, `boot`, `io`.
+Narrow runs after the review fix (309cf492 and the next commit), all passing: the Rust units (745); 3,072 system and smp
+checks (`indirect-*`, `frame-randomization*`, `k1-c1`, `k1-c2@*`, `pic-*`, `compat32*` including `indirect32`, `smp`
+`coherence`, `contain`, `privilege`); `faults` `faults@*`, `faults-1@*` and `probes@*` (15,935). Not run: the gate, `programs`, `correctness`, `boot`, `io`.
 
 The A/B and the profile are left to the owner's pooled round over all fixes: section 7's cases, with flush counts, since the
 code area now holds 12 bytes more per indirect exit, and more per link point of shared code. The in-VM check
