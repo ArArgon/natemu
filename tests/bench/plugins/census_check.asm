@@ -20,6 +20,12 @@
 ;   I       a jmp through memory whose operand page is not present: the jmp faults, is dropped, runs again
 ;           The #PF handler runs at the KBASE alias (kernel) and recurses 10 deep by direct calls: H's user return
 ;           straddles those kernel calls, so the one-stack model at depth 8 finds its stack empty, the split one hits
+;   G'      a ret that is not its block's first instruction (f9_ret, after an XOR) at two virtual addresses
+;   K       compatibility mode: a far return into a 32-bit code segment, 3 calls through a register (FF D3, each after
+;           an INC EAX, 40: an instruction of its own in 32-bit code, not a REX prefix) and their 32-bit ret, a direct
+;           far jmp back
+;   J       two address spaces: the same call site and ret in each, INT 0x80 switching CR3 between pml4 and pml4b (the
+;           handler, at KBASE, runs no call or ret: only the interrupt tells the plugin that CR3 may have changed)
 ; then OUT 0xF4 (isa-debug-exit).
 bits 32
 org 0x100000
@@ -180,6 +186,29 @@ H_next:
 I_jmp:  jmp [rbx]
 I_target:
 
+        lea rbx, [rel f9]                   ; G'
+G3:     call rbx
+G3_next:
+        mov rbx, ALIAS + f9
+        mov ecx, 2
+g4loop:
+G4:     call rbx
+G4_next:
+        dec ecx
+        jnz g4loop
+
+        push 0x3b                           ; K: code32 DPL3
+        lea rax, [rel c32]
+        push rax
+        o64 retf
+back64:
+        mov r13d, 2                         ; J
+jloop:  lea rbx, [rel f8]
+X_call: call rbx
+X_next: int 0x80
+        dec r13d
+        jnz jloop
+
         mov dx, 0xf4                        ; exit
         xor eax, eax
         out dx, al
@@ -208,6 +237,31 @@ f5:     ret 0
 ffar:   o64 retf
 f6:     ret
 f7:     ret
+f8:     ret
+f9:     xor eax, eax
+f9_ret: ret
+
+bits 32
+c32:    mov ebx, f32
+        mov ecx, 3
+c32loop:
+        inc eax
+C32_call:
+        call ebx
+C32_next:
+        dec ecx
+        jnz c32loop
+        jmp 0x1b:back64
+f32:    ret
+bits 64
+
+; INT 0x80 at CPL0, entered at its KBASE alias: CR3 to the other of pml4 and pml4b (the same mappings).
+sw:     push rax
+        mov rax, cr3
+        xor rax, ABS(pml4) ^ ABS(pml4b)
+        mov cr3, rax
+        pop rax
+        iretq
 
 ; #PF at CPL0, entered at its KBASE alias: a 10-deep recursion, then make the faulting 2 MiB region present (another
 ; mapping of the first 2 MiB), drop the error code, iretq.
@@ -259,6 +313,7 @@ gdt:    dq 0
         db 0x89, 0
         db (ABS(tss) >> 24) & 0xff
         dd 0, 0
+        dq 0x00CFFA000000FFFF               ; 0x38 code32 DPL3 (compatibility mode)
 gdtr:   dw $ - gdt - 1
         dq gdt
 idtr:   dw 256 * 16 - 1
@@ -287,5 +342,15 @@ idt:    times 14 * 16 db 0
         db 0, 0x8E
         dw ((ABS(pf) >> 16) & 0xffff) | 0x8000
         dd 0xffffffff, 0
+        times 0x80 * 16 - ($ - idt) db 0
+        dw ABS(sw) & 0xffff                 ; vector 0x80, DPL3, at KBASE + sw
+        dw 0x08
+        db 0, 0xEE
+        dw ((ABS(sw) >> 16) & 0xffff) | 0x8000
+        dd 0xffffffff, 0
         times 256 * 16 - ($ - idt) db 0
+align 4096
+pml4b:  dq ABS(pdpt) | 7                    ; J's second address space: pml4's mappings, another CR3
+        times 510 dq 0
+        dq ABS(pdpt_hi) | 7
 image_end:

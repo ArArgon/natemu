@@ -170,8 +170,10 @@ def io5(a) -> int:
 
 # --- check ---
 
-# (kind, mode, site label, alias added to the site, {target label (+ alias): count}, overflow, flags) in segment "program".
-# Labels are census_check.asm's; KBASE means the label's kernel alias. Flags: the plugin's F_* bits.
+# (kind, mode, site label, alias added to the site, {target label (+ alias): count}, overflow, flags[, address space])
+# in segment "program". Labels are census_check.asm's; KBASE means the label's kernel alias. Flags: the plugin's F_* bits.
+# The address space is the label of the page table whose CR3 the site ran under: pml4 for user sites unless given,
+# none (0) for kernel ones.
 F = dict(mem=1, rex=2, opsize=4, notrack=8, seg=16, rep=32, imm=64)
 EXPECTED_SITES = [
     ('jmp', 'user', 'L_kjmp', 0, {('kcode', 'KBASE'): 1}, 0, 0),
@@ -200,21 +202,31 @@ EXPECTED_SITES = [
     ('ret', 'user', 'f7', 'HALIAS', {('H_next', 0): 1}, 0, 0),
     ('jmp', 'user', 'I_jmp', 0, {('I_target', 0): 1}, 0, F['mem']),
     ('ret', 'kernel', 'krec_done', 'KBASE', {('krec_done', 'KBASE'): 18, ('pf_after', 'KBASE'): 2}, 0, 0),
+    ('call', 'user', 'G3', 0, {('f9', 0): 1}, 0, 0),
+    ('ret', 'user', 'f9_ret', 0, {('G3_next', 0): 1}, 0, 0),
+    ('call', 'user', 'G4', 0, {('f9', 'ALIAS'): 2}, 0, 0),
+    ('ret', 'user', 'f9_ret', 'ALIAS', {('G4_next', 0): 2}, 0, 0),
+    ('call', 'user', 'C32_call', 0, {('f32', 0): 3}, 0, 0),
+    ('ret', 'user', 'f32', 0, {('C32_next', 0): 3}, 0, 0),
+    ('call', 'user', 'X_call', 0, {('f8', 0): 1}, 0, 0, 'pml4'),
+    ('ret', 'user', 'f8', 0, {('X_next', 0): 1}, 0, 0, 'pml4'),
+    ('call', 'user', 'X_call', 0, {('f8', 0): 1}, 0, 0, 'pml4b'),
+    ('ret', 'user', 'f8', 0, {('X_next', 0): 1}, 0, 0, 'pml4b'),
 ]
-# Return model (user): A 1000 + B 600 + E 12 + G 5 + H 1 pairs hit at every depth; D's 10 recursions of 12 hit 8 and
+# Return model (user): A 1000 + B 600 + E 12 + G 5 + H 1 + G' 3 + K 3 + J 2 pairs hit at every depth; D's 10 recursions of 12 hit 8 and
 # find the depth-8 stack empty 4 times, and hit 12 at depths 16 and 32. Kernel: the kernel phase's 7, and in each of
 # the two page faults a 10-deep recursion: 8 hits and 2 empty at depth 8, 10 hits at 16 and 32. H's user return comes
 # after the fault's kernel calls: with one stack, depth 8 finds it empty; with user and kernel apart (ras_split) it hits.
-_K8, _K16 = {'hit': 7 + 16, 'miss': 0, 'empty': 4}, {'hit': 7 + 20, 'miss': 0, 'empty': 0}
-EXPECTED_RAS = {'8': {'user': {'hit': 1618 + 80 - 1, 'miss': 0, 'empty': 41}, 'kernel': _K8},
-                '16': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
-                '32': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
-EXPECTED_RAS_SPLIT = {'8': {'user': {'hit': 1618 + 80, 'miss': 0, 'empty': 40}, 'kernel': _K8},
-                      '16': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
-                      '32': {'user': {'hit': 1618 + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
+_K8, _K16, _U = {'hit': 7 + 16, 'miss': 0, 'empty': 4}, {'hit': 7 + 20, 'miss': 0, 'empty': 0}, 1626
+EXPECTED_RAS = {'8': {'user': {'hit': _U + 80 - 1, 'miss': 0, 'empty': 41}, 'kernel': _K8},
+                '16': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
+                '32': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
+EXPECTED_RAS_SPLIT = {'8': {'user': {'hit': _U + 80, 'miss': 0, 'empty': 40}, 'kernel': _K8},
+                      '16': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16},
+                      '32': {'user': {'hit': _U + 120, 'miss': 0, 'empty': 0}, 'kernel': _K16}}
 EXPECTED_COUNTS = {'direct_calls': {'user': 120, 'kernel': 20},
-                   'far': {'call': {'user': 2, 'kernel': 0}, 'jmp': {'user': 1, 'kernel': 0}, 'ret': {'user': 2, 'kernel': 0}},
-                   'events': {'interrupts': 2, 'exceptions': 2, 'dropped': 1, 'unresolved': 0, 'wide': 0}}
+                   'far': {'call': {'user': 2, 'kernel': 0}, 'jmp': {'user': 1, 'kernel': 0}, 'ret': {'user': 3, 'kernel': 0}},
+                   'events': {'interrupts': 4, 'exceptions': 4, 'dropped': 1, 'unresolved': 0, 'wide': 0}}
 
 
 def symbols(map_text: str) -> dict:
@@ -231,17 +243,21 @@ def check_problems(data: dict, sym: dict) -> list[str]:
     seg = next((s for s in data['segments'] if s['name'] == 'program'), None)
     if seg is None: return [f'no segment "program" (segments {[s["name"] for s in data["segments"]]})']
     addr = lambda label, alias: sym[label] + (sym[alias] if alias else 0)
-    asid = sym['pml4'] & ~0x1fff
     lo, hi = sym['mb_header'], sym['image_end']
     inside = lambda pc: lo <= pc < hi or lo <= pc - sym['KBASE'] < hi or any(lo <= pc - sym[a] < hi for a in ('ALIAS', 'HALIAS'))
-    got = {(s[0], s[1], s[3]): s for s in seg['sites'] if inside(s[3])}
+    got = {(s[0], s[1], s[2], s[3]): s for s in seg['sites'] if inside(s[3])}
     problems = []
     if data.get('cr3') != 'read' or data.get('rip') != 'read': problems.append(f'registers: cr3 {data.get("cr3")}, rip {data.get("rip")}')
     want = set()
-    for kind, mode, label, alias, targets, overflow, flags in EXPECTED_SITES:
-        pc = addr(label, alias); want.add((kind, mode, pc))
-        s = got.get((kind, mode, pc))
-        if s is None: problems.append(f'{kind} at {label}{"+" + alias if alias else ""} ({pc:#x}, {mode}): no site'); continue
+    for kind, mode, label, alias, targets, overflow, flags, *space in EXPECTED_SITES:
+        pc = addr(label, alias)
+        asid = sym[space[0] if space else 'pml4'] & ~0x1fff if mode == 'user' else 0
+        want.add((kind, mode, asid, pc))
+        s = got.get((kind, mode, asid, pc))
+        if s is None:
+            others = [hex(k[2]) for k in got if k[:2] == (kind, mode) and k[3] == pc]
+            problems.append(f'{kind} at {label}{"+" + alias if alias else ""} ({pc:#x}, {mode}, asid {asid:#x}): no site'
+                            + (f' (only in address spaces {others})' if others else '')); continue
         _, _, s_asid, _, _, s_flags, execs, s_over, s_tg = s
         tg = {t: c for t, c in s_tg}
         w = {addr(t, al): c for (t, al), c in targets.items()}
@@ -249,8 +265,7 @@ def check_problems(data: dict, sym: dict) -> list[str]:
             problems.append(f'{kind} at {label}: execs {execs} overflow {s_over} flags {s_flags} targets '
                             f'{ {hex(k): v for k, v in tg.items()} }; expected {sum(w.values()) + overflow} {overflow} {flags} '
                             f'{ {hex(k): v for k, v in w.items()} }')
-        if s_asid != (asid if mode == 'user' else 0): problems.append(f'{kind} at {label}: asid {s_asid:#x}, expected {asid if mode == "user" else 0:#x}')
-    for k in sorted(set(got) - want, key=lambda k: k[2]):
+    for k in sorted(set(got) - want, key=lambda k: k[3]):
         problems.append(f'unexpected site {k[0]} {k[1]} at {k[2]:#x}: {got[k]}')
     if seg['ras'] != EXPECTED_RAS: problems.append(f'return model {seg["ras"]}, expected {EXPECTED_RAS}')
     if seg['ras_split'] != EXPECTED_RAS_SPLIT:

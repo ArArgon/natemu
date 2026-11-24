@@ -24,7 +24,8 @@
  *
  * User and kernel are told apart by the address half (bit 63: Linux's kernel addresses); a user site is keyed by its
  * address space too, CR3 with its PCID and PTI bits (11-12) cleared, read through the register API after the vCPU ran
- * kernel code (only the kernel writes CR3), and at every user branch until paging is on. The return-stack model (`ras`)
+ * kernel code or took an interrupt or exception (only the kernel writes CR3), and at every user branch until paging is
+ * on. The return-stack model (`ras`)
  * is one stack per vCPU and depth (8, 16, 32): a call pushes its return address (dropping the oldest when full), a ret
  * pops and compares; a pop of an empty stack is a miss of its own kind ("empty"). `ras_split` is the same with one
  * stack per vCPU and mode (the call's or ret's): user returns then do not lose their entries to the kernel's calls
@@ -102,6 +103,8 @@ static const char *out_path, *ctl_path;
 static char *seg_names[MAXSEG];
 static atomic_int g_seg;
 static int registers_found;
+static GHashTable *infos;        /* interned insn_info: one per distinct (block, instruction), whatever is retranslated */
+static pthread_mutex_t infos_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t mark_pc;
 static const char *mark_name;
 static atomic_int mark_fired;
@@ -283,6 +286,7 @@ static void mark_exec(unsigned int idx, void *udata)
 static void discon(unsigned int idx, enum qemu_plugin_discon_type type, uint64_t from, uint64_t to, void *udata)
 {
     struct vcpu *v = vcpu_of(idx);
+    v->asid_valid = 0;                 /* a handler can switch CR3 without a tracked kernel branch */
     if (type == QEMU_PLUGIN_DISCON_EXCEPTION) { v->st.exceptions++; return; }
     if (type != QEMU_PLUGIN_DISCON_INTERRUPT) return;
     v->st.interrupts++;
@@ -327,6 +331,31 @@ static int decode(const uint8_t *b, size_t len, uint8_t *kind, uint8_t *flags)
     return 0;
 }
 
+static guint info_hash(gconstpointer p)
+{
+    const struct insn_info *i = p;
+    return (guint)mix(i->tb_vaddr * 31 ^ i->vaddr ^ i->phys * 7 ^ ((uint64_t)i->len << 56 | (uint64_t)i->kind << 48 |
+                                                                  (uint64_t)i->flags << 40));
+}
+
+static gboolean info_equal(gconstpointer a, gconstpointer b)
+{
+    const struct insn_info *x = a, *y = b;
+    return x->tb_vaddr == y->tb_vaddr && x->vaddr == y->vaddr && x->phys == y->phys && x->len == y->len &&
+           x->kind == y->kind && x->flags == y->flags;
+}
+
+/* The insn_info for `key`, made once: a callback's udata outlives its translation (QEMU frees no plugin data with a
+ * block), so a fresh one per translation would grow for as long as code is retranslated. */
+static struct insn_info *intern(const struct insn_info *key)
+{
+    pthread_mutex_lock(&infos_lock);
+    struct insn_info *in = g_hash_table_lookup(infos, key);
+    if (!in) { in = g_memdup2(key, sizeof *key); g_hash_table_add(infos, in); }
+    pthread_mutex_unlock(&infos_lock);
+    return in;
+}
+
 static void tb_trans(struct qemu_plugin_tb *tb, void *udata)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
@@ -340,11 +369,9 @@ static void tb_trans(struct qemu_plugin_tb *tb, void *udata)
         uint8_t b[16], kind, flags;
         size_t len = qemu_plugin_insn_data(insn, b, sizeof b);
         if (!decode(b, len, &kind, &flags)) continue;
-        struct insn_info *in = malloc(sizeof *in);
-        in->tb_vaddr = tbv; in->vaddr = qemu_plugin_insn_vaddr(insn);
-        in->phys = (uint64_t)(uintptr_t)qemu_plugin_insn_haddr(insn);
-        in->len = (uint8_t)qemu_plugin_insn_size(insn); in->kind = kind; in->flags = flags;
-        qemu_plugin_register_vcpu_insn_exec_cb(insn, insn_exec, QEMU_PLUGIN_CB_R_REGS, in);
+        struct insn_info key = {tbv, qemu_plugin_insn_vaddr(insn), (uint64_t)(uintptr_t)qemu_plugin_insn_haddr(insn),
+                                (uint8_t)qemu_plugin_insn_size(insn), kind, flags};
+        qemu_plugin_register_vcpu_insn_exec_cb(insn, insn_exec, QEMU_PLUGIN_CB_R_REGS, intern(&key));
     }
 }
 
@@ -431,7 +458,8 @@ static void at_exit(void *udata)
     char *tmp = g_strdup_printf("%s.tmp", out_path);
     FILE *f = fopen(tmp, "w");
     if (!f) { fprintf(stderr, "indirect: cannot write %s\n", tmp); return; }
-    fprintf(f, "{\"plugin\": \"indirect\", \"version\": 1, \"vcpus\": %d, \"depths\": [8, 16, 32],\n", nv);
+    fprintf(f, "{\"plugin\": \"indirect\", \"version\": 1, \"vcpus\": %d, \"depths\": [8, 16, 32], \"insn_infos\": %u,\n", nv,
+            g_hash_table_size(infos));
     fprintf(f, " \"cr3\": \"%s\", \"rip\": \"%s\",\n", reg_cr3 ? "read" : "unavailable: no cr3 register",
             reg_rip && reg_cr0 ? "read" : "unavailable: translation addresses");
     fprintf(f, " \"sites_columns\": [\"kind\", \"mode\", \"asid\", \"pc\", \"phys\", \"flags\", \"execs\", \"overflow\", \"targets\"],\n");
@@ -509,6 +537,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     if (!info->system_emulation || strcmp(info->target_name, "x86_64")) {
         fprintf(stderr, "indirect: only for qemu-system-x86_64\n"); return -1;
     }
+    infos = g_hash_table_new(info_hash, info_equal);
     sb = qemu_plugin_scoreboard_new(sizeof(struct vcpu));
     pending_entry = qemu_plugin_scoreboard_u64_in_struct(sb, struct vcpu, pending);
     insn_entry[0] = qemu_plugin_scoreboard_u64_in_struct(sb, struct vcpu, insns[0]);
