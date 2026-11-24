@@ -82,6 +82,16 @@ class Binary(unittest.TestCase):
     def test_the_built_runtime_passes(self):
         self.assertEqual(self.problems(self.text), [])
 
+    def resume_time_store(self, store):
+        """The EL0 sampler's resume-time store (`profile` builds) put into this runtime's resume_exception, before `mov x16, x0`."""
+        return self.mutate(r'(<resume_exception>:\n(?:.*\n)*?)(\s*[0-9a-f]+:\s+)(mov\tx16, x0)$',
+                           rf'\1\2mrs\tx10, cntvct_el0\n\2ldr\tx9, 0x1000 <_start>\n\2{store}\n\2\3')
+
+    def test_the_samplers_resume_time_store_is_allowed_and_nothing_else(self):
+        self.assertEqual(self.problems(self.resume_time_store('str\tx10, [x9]')), [])
+        self.assertTrue(self.problems(self.resume_time_store('str\tx11, [x9]')))
+        self.assertTrue(self.problems(self.resume_time_store('str\tx10, [x8]')))
+
     def test_corruptions_are_refused(self):
         cases = {
             'a dropped GPR restore': (r'^.*ldr\tx5, \[x16, #0x28\]\n', ''),

@@ -57,6 +57,7 @@ NESTED = {'exception_capture': (['finish', R + 'returned', R + 'resident_fault']
 # Declared shared bodies: a branch from the function into the target's body past its prologue, after an identical
 # prologue of its own: counts the target's depth without its frame.
 SHARED_BODIES = set()
+PROFILE_RESUME_TIME = ['mrs x10, cntvct_el0', 'ldr x9, LIT', 'str x10, [x9]']
 CALL_LIKE = re.compile(r'^(bl|b|b\.\w+|cbn?z|tbn?z)$')
 
 
@@ -229,11 +230,16 @@ def eret_problems(funcs, words, tops):
             ['ldr x16, [x16, #0x80]', 'eret'])
     skip = lambda n, i: re.sub(rf' 0x[0-9a-f]+ <{n}\+0x[0-9a-f]+>$', ' SKIP', i) if re.match(r'(cbz|tbz) ', i) else i
     got = [skip('resume_exception', re.sub(r'^ldr x9, 0x[0-9a-f]+ <.*', 'ldr x9, LIT', i)) for _, i in body]
+    # The EL0 sampler's resident (`profile` feature): CNTVCT stored to `Head::resume_time` after the SPSR, before `mov sp`,
+    # in x9 and x10 only (both loaded from the frame below). Only this exact store is allowed there.
+    sp_literal = 11
+    if got[7:10] == PROFILE_RESUME_TIME:
+        got = got[:7] + got[10:]; body = body[:7] + body[10:]
     if got != want:
         diff = next((f'#{k}: `{g}`, want `{w}`' for k, (g, w) in enumerate(zip(got, want)) if g != w),
                     f'{len(got)} instructions, want {len(want)}')
         problems.append(f'resume_exception restore sequence differs: {diff}')
-    elif literal(words, body, 11) != tops['EXCEPTION_STACK_TOP']:
+    elif literal(words, body, sp_literal) != tops['EXCEPTION_STACK_TOP']:
         problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
     callers = {n for n, insns in funcs.items() for _, i in insns
                if re.match(r'bl? 0x[0-9a-f]+ <(resume_exception|enter_allocated)>$', i)} - {'resume_exception'}
