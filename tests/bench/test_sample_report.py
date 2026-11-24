@@ -553,12 +553,13 @@ class Cost(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('wall differs by 0.450 s > 0.402 s', c['build-1/run2']['why'])
 
-    def test_a_guest_share_moved_by_more_than_a_point_fails(self):
+    def test_a_guest_share_moved_by_more_than_two_points_fails(self):
         import run_sampler_cost as rc
         self.assertTrue(rc.compare(self.rows([10] * 3, [10] * 3, share_on=(51, 50.9, 51)))[0])
-        ok, c = rc.compare(self.rows([10] * 3, [10] * 3, share_on=(48.9, 48.8, 49)))
+        self.assertTrue(rc.compare(self.rows([10] * 3, [10] * 3, share_on=(48.9, 48.8, 49)))[0])   # 1.1: inside 2
+        ok, c = rc.compare(self.rows([10] * 3, [10] * 3, share_on=(47.9, 47.8, 48)))
         self.assertFalse(ok)
-        self.assertEqual(c['build-1/run1']['why'], 'guest share differs by 1.10 points > 1.0')
+        self.assertEqual(c['build-1/run1']['why'], 'guest share differs by 2.10 points > 2.0')
 
     def test_a_missing_value_fails(self):
         import run_sampler_cost as rc
