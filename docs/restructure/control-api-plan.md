@@ -91,7 +91,9 @@ dependencies). Python client for tests in `tests/lib`. New dependencies are allo
   60H, so one `send_input`'s keys arrive as one run of interrupts, and evdev keeps 64 events per keyboard reader and
   drops what had piled up beyond that (SYN_DROPPED). Task 4 `control-keyboard` therefore sends 6 keys per
   `send_input` (found in Task 4: one `send_input` of all 208 transitions lost all but the last few in
-  `control-keyboard` at 1 and 2 vCPUs on the M4).
+  `control-keyboard` at 1 and 2 vCPUs on the M4). A part still holds more bytes than the 8042's room (the part with
+  ControlRight, AltRight and MetaLeft has E0 keys), so the break above fails `control-keyboard` too: at 1 and 2 vCPUs
+  on the M4 the guest stopped reporting keys in that part (119 of 218 presses and releases).
 - **Large pointer motion:** a `pointer_motion` of dx 1000 must move the guest pointer 1000 units, not 255 with the
   overflow bit (the mouse clamps beyond 9 bits, `ps2/mouse.rs` `movement_get`): the server splits it into packets of at
   most 255 (Task 1 `motion_splits_into_nine_bit_packets`, Task 4 `control-mouse`; break: one packet).
