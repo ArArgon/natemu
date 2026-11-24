@@ -19,7 +19,8 @@ covers = ["crates/host/src/pvpanic.rs", "crates/host/src/boot/smbios.rs", "crate
           "crates/cli/src/main.rs", "docs/configuration.md", "tools/models/acpi_model.py", "tests/boot/run_l2.py",
           "tests/boot/run_l2_iasl.py", "testkit/harness/bench.py", "third_party/openvmm/**", "third_party/freebsd-bhyve/**",
           "crates/host/src/devices.rs", "crates/host/src/irq.rs", "crates/host/src/execution.rs", "crates/host/src/boot/**",
-          "tests/devices/**", "tests/lib/**", "testkit/inputs.py"]
+          "tests/devices/**", "tests/lib/**", "testkit/inputs.py",
+          "crates/host/src/pci/**", "crates/host/src/virtio/pci.rs"]
 
 [[suite]]
 name = "devices"
@@ -70,3 +71,24 @@ params = { timeout = 120 }
 
 [suite.cases."platform-selfcheck"]
 argv = ["tests/devices/run_platform.py", "self-check"]
+
+# pci-multibar: the PCI test function (debug.pci_testdev: QEMU's pci-testdev, vendor 1B36H device 0005H) as functions 0
+# and 1 of one slot, no driver bound: the kernel finds both and the root bridge's I/O window C000H-FFFFH, claims every
+# BAR where natemu's launch placed it, and `enable` turns decoding on; BAR0 (memory, /dev/mem) and BAR1 (I/O, /dev/port)
+# read the selected test's header, function 1's 64-bit BAR2 its offsets; S5 ends the run. At 1 and 2 vCPUs.
+[[suite]]
+name = "devices-pci"
+kind = "judged"
+harness = "runner"
+params = { timeout = 600 }
+needs = { cores = 2, perf = true }
+
+[suite.cases."pci-multibar-1cpu"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "pci-multibar", "--vcpus", "1",
+        "--set", "debug.pci_testdev=true"]
+
+[suite.cases."pci-multibar-2cpu"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "pci-multibar", "--vcpus", "2",
+        "--set", "debug.pci_testdev=true"]

@@ -75,6 +75,42 @@ for item in $cmdline; do case "$item" in platform_case=*) name=${item#*=};; esac
 echo "PLATFORM-BEGIN case=$name cpus=$(nproc) kernel=$(uname -r)"
 test "$(uname -r)" = '@KVER@' || fail kernel
 
+# pci-multibar (debug.pci_testdev): the PCI test function's two functions as the stock kernel leaves them with no driver
+# bound, reported for the runner to judge: the PCI lines of dmesg; per function (found by vendor and device) the
+# Command register before and after `enable` (the kernel's pci_enable_device: memory and I/O decoding), the BARs of
+# `resource`, BAR0's header (test 2 selected by its byte at offset 0) through /dev/mem, BAR1's (test 1 of BAR1, test 4)
+# through /dev/port, and on function 1 BAR2's dwords, each reading its own offset.
+pci_command() { busybox hexdump -s 4 -n 2 -e '1/2 "%04x"' "$1/config"; }
+case_pci_multibar() {
+  for applet in devmem hexdump dd printf; do
+    busybox --list | grep -x "$applet" >/dev/null || fail "BusyBox has no $applet applet"
+  done
+  dmesg | while read -r line; do
+    case "$line" in *'root bus resource'*|*"can't claim"*|*'no space'*|*'failed to assign'*) echo "PLATFORM-PCI-DMESG $line";; esac
+  done
+  for dev in /sys/bus/pci/devices/*; do
+    test "$(cat "$dev/vendor") $(cat "$dev/device")" = '0x1b36 0x0005' || continue
+    fn=$(basename "$dev")
+    echo "PLATFORM-PCI-FUNCTION $fn"
+    echo "PLATFORM-PCI-COMMAND $fn before $(pci_command "$dev")"
+    echo 1 > "$dev/enable" || fail "$fn: enable"
+    echo "PLATFORM-PCI-COMMAND $fn after $(pci_command "$dev")"
+    bar=0
+    while test $bar -lt 6 && read -r start end flags; do
+      echo "PLATFORM-PCI-RESOURCE $fn $bar $start $end $flags"
+      eval "bar$bar=$start"
+      bar=$((bar + 1))
+    done < "$dev/resource"
+    busybox devmem $((bar0)) 8 2 || fail "$fn: devmem write to BAR0"
+    echo "PLATFORM-PCI-BAR0 $fn $(busybox devmem $((bar0)) 32) $(busybox devmem $((bar0 + 4)) 32)"
+    busybox printf '\001' | busybox dd of=/dev/port bs=1 seek=$((bar1)) count=1 conv=notrunc 2>/dev/null || fail "$fn: write to BAR1"
+    echo "PLATFORM-PCI-BAR1 $fn $(busybox dd if=/dev/port bs=1 skip=$((bar1)) count=8 2>/dev/null | busybox hexdump -v -e '1/1 "%02x"')"
+    case "$fn" in *.1) echo "PLATFORM-PCI-BAR2 $fn $(busybox devmem $((bar2)) 32) $(busybox devmem $((bar2 + 0x10)) 32)" \
+                            "$(busybox devmem $((bar2 + 0xfffc)) 32) $(busybox devmem $((bar2 + 8)) 64)";; esac
+  done
+  pass
+}
+
 # pvpanic-panic: the stock driver finds the ACPI device and its capability (PANICKED and CRASH_LOADED), then a panic
 # (panic=0: the kernel does not reboot) must end the run through the device. platform_skip_capability (the runner's
 # --skip-capability) goes straight to the panic.
@@ -130,6 +166,7 @@ case_platform_off() {
 }
 
 case "$name" in
+  pci-multibar) case_pci_multibar;;
   pvpanic-panic) case_pvpanic_panic;;
   platform) case_platform;;
   platform-off) case_platform_off;;
@@ -170,6 +207,132 @@ def stopped(run: Run, line: str, status: int) -> list:
     errors = [] if last == line else [f'host ended with {last!r}, expected {line!r}']
     if run.returncode != status: errors.append(f'exit status {run.returncode}, expected {status}')
     return errors
+
+
+# pci-multibar: what natemu's launch places for the test function (crates/host/src/pci/place.rs, testdev.rs) at the first
+# free slot S, as each function's `resource` lines (BAR: base, length, the kernel's IORESOURCE_ type bits):
+# function 0's BAR0 keeps the slot's 64 KiB stride address; the rest of memory goes from E0200000H largest first
+# (function 1's 64 KiB BAR2-3, then its BAR0); I/O from C000H, lowest function first.
+PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf')
+PCI_IO, PCI_MEM, PCI_PREFETCH, PCI_MEM_64 = 0x100, 0x200, 0x2000, 0x100000
+PCI_TYPE = PCI_IO | PCI_MEM | PCI_PREFETCH | PCI_MEM_64
+PCI_IO_WINDOW = 'root bus resource [io  0xc000-0xffff window]'
+PCI_PLACEMENT_ERRORS = ("can't claim", 'no space', 'failed to assign')
+
+
+def pci_expected(slot: int) -> dict:
+    """Function name -> {BAR: (base, length, type bits)}; BARs not listed read 0 0 0."""
+    at = f'0000:00:{slot:02x}'
+    return {f'{at}.0': {0: (0xE000_0000 + 0x1_0000 * slot, 0x1000, PCI_MEM), 1: (0xC000, 0x100, PCI_IO)},
+            f'{at}.1': {0: (0xE021_0000, 0x1000, PCI_MEM), 1: (0xC100, 0x100, PCI_IO),
+                        2: (0xE020_0000, 0x1_0000, PCI_MEM | PCI_PREFETCH | PCI_MEM_64)}}
+
+
+def busybox_applets(busybox: bytes) -> list:
+    """The applet names in BusyBox's name table (what `busybox --list` prints): NUL-separated and sorted, from `[`."""
+    start = busybox.find(b'[\0[[\0')
+    assert start >= 0, 'no BusyBox applet name table'
+    names = [n.decode() for n in busybox[start:busybox.index(b'\0\0', start)].split(b'\0')]
+    assert names == sorted(names) and 'sh' in names, 'not a BusyBox applet name table'
+    return names
+
+
+def hexes(text: str | None) -> list | None:
+    """The hexadecimal numbers of `text` (with or without 0x), or None if it has a word that is not one."""
+    try: return [int(v, 16) for v in (text or '').split()]
+    except ValueError: return None
+
+
+def judge_pci_multibar(run: Run) -> list:
+    errors = common(run)
+    marks = lambda tag: re.findall(rf'^PLATFORM-PCI-{tag} (.*)$', run.serial, re.M)
+    dmesg = marks('DMESG')
+    if not any(PCI_IO_WINDOW in line for line in dmesg): errors.append(f'dmesg has no "{PCI_IO_WINDOW}"')
+    errors += [f'dmesg: {line}' for line in dmesg if any(e in line for e in PCI_PLACEMENT_ERRORS)]
+    functions = marks('FUNCTION')
+    slot = re.fullmatch(r'0000:00:([0-9a-f]{2})\.0', functions[0]) if functions else None
+    expected = pci_expected(int(slot.group(1), 16)) if slot else {}
+    if not expected or functions != list(expected):
+        return errors + [f'test functions {functions}, expected functions 0 and 1 of one slot (vendor 1b36, device 0005)']
+    command = {m.split()[0]: hexes(m.split()[2]) for m in marks('COMMAND') if m.split()[1:2] == ['after']}
+    resource = {}
+    for line in marks('RESOURCE'):
+        fn, bar, *values = line.split()
+        resource.setdefault(fn, {})[bar] = tuple(hexes(' '.join(values)) or ())
+    reads = {tag: dict(m.split(None, 1) for m in marks(tag)) for tag in ('BAR0', 'BAR1', 'BAR2')}
+    for fn, bars in expected.items():
+        if (command.get(fn) or [0])[0] & 3 != 3: errors.append(f'{fn}: Command after enable {command.get(fn)}, expected I/O and memory decoding (bits 0-1)')
+        for bar in range(6):
+            base, length, kind = bars.get(bar, (0, 0, 0))
+            want = (base, base + length - 1, kind) if length else (0, 0, 0)
+            got = resource.get(fn, {}).get(str(bar), ())
+            if len(got) != 3 or (got[0], got[1], got[2] & PCI_TYPE) != want:
+                errors.append(f'{fn}: BAR{bar} resource {tuple(map(hex, got))}, expected {tuple(map(hex, want))} (base, end, type)')
+        # Test 2 (mmio-datamatch-eventfd) selected: index 2, width 1; its write at 802H.
+        if hexes(reads['BAR0'].get(fn)) != [0x102, 0x802]: errors.append(f'{fn}: BAR0 header {reads["BAR0"].get(fn)!r}, expected 0x00000102 0x00000802')
+        # Test 4 (portio-wildcard-eventfd) selected: index 4, width 1, zero; its write at 84H.
+        if reads['BAR1'].get(fn) != '0401000084000000': errors.append(f'{fn}: BAR1 header {reads["BAR1"].get(fn)!r}, expected 0401000084000000')
+    f1 = list(expected)[1]
+    if hexes(reads['BAR2'].get(f1)) != [0, 0x10, 0xfffc, 0xc_0000_0008]:
+        errors.append(f'{f1}: BAR2 reads {reads["BAR2"].get(f1)!r}, expected its offsets 0 10 FFFC and (64 bits at 8) C00000008')
+    if 'PLATFORM-PASS' not in run.serial: errors.append('the init did not finish (no PLATFORM-PASS)')
+    return errors + stopped(run, 'natemu: Power(1)', 0)
+
+
+def self_check_pci_multibar():
+    """pci-multibar's judge on a synthetic passing log and its negative controls, among them the three natemu breaks
+    the case was shown to fail against (no multi-function bit, no I/O window, no WordIO in the root bridge's _CRS)."""
+    e = pci_expected(1)
+    lines = [f'PLATFORM-BEGIN case=pci-multibar cpus=2 kernel={KVER}',
+             f'PLATFORM-PCI-DMESG pci_bus 0000:00: {PCI_IO_WINDOW}',
+             'PLATFORM-PCI-DMESG pci_bus 0000:00: root bus resource [mem 0xe0000000-0xefffffff window]']
+    for fn, bars in e.items():
+        lines += [f'PLATFORM-PCI-FUNCTION {fn}', f'PLATFORM-PCI-COMMAND {fn} before 0000', f'PLATFORM-PCI-COMMAND {fn} after 0003']
+        for bar in range(6):
+            base, length, kind = bars.get(bar, (0, 0, 0))
+            values = (base, base + length - 1, kind | 0x40000) if length else (0, 0, 0)
+            lines.append(f'PLATFORM-PCI-RESOURCE {fn} {bar} ' + ' '.join(f'0x{v:016x}' for v in values))
+        lines += [f'PLATFORM-PCI-BAR0 {fn} 0x00000102 0x00000802', f'PLATFORM-PCI-BAR1 {fn} 0401000084000000']
+    lines += ['PLATFORM-PCI-BAR2 0000:00:01.1 0x00000000 0x00000010 0x0000FFFC 0x0000000C00000008', 'PLATFORM-PASS']
+    good = Run('pci-multibar', 2, '\n'.join(lines) + '\n', 'natemu: Power(1)\n', 0, False, None)
+    judge = CASES['pci-multibar'].judge
+    assert not judge(good), judge(good)
+    def drop(*tags): return dataclasses.replace(good, serial=''.join(l + '\n' for l in lines if not any(t in l for t in tags)))
+    unclaimed = ["PLATFORM-PCI-DMESG pci 0000:00:01.0: BAR 1 [io  0xc000-0xc0ff]: can't claim; no compatible bridge window",
+                 "PLATFORM-PCI-DMESG pci 0000:00:01.0: BAR 1 [io  size 0x0100]: can't assign; no space"]
+    without = [l for l in lines if PCI_IO_WINDOW not in l]
+    def swap(old, new): return dataclasses.replace(good, serial=good.serial.replace(old, new))
+    # The three breaks as the guest showed them: function 1 absent; BAR1 reading FFH; no I/O window, and BAR1 neither
+    # claimed nor assigned (its resource line unchanged).
+    bad = {'no multi-function bit': drop('0000:00:01.1'),
+           'no I/O window': swap('0000:00:01.0 0401000084000000', '0000:00:01.0 ffffffffffffffff'),
+           'no WordIO': dataclasses.replace(good, serial='\n'.join(without[:2] + unclaimed + without[2:]) + '\n'),
+           'no WordIO, quiet': drop(PCI_IO_WINDOW),
+           'failed to assign': swap('[mem 0xe0000000-0xefffffff window]', '[mem 0xe0000000-0xefffffff window]\n'
+                                    'PLATFORM-PCI-DMESG pci 0000:00:01.0: BAR 1: failed to assign [io  size 0x0100]'),
+           'placement error': swap('[mem 0xe0000000-0xefffffff window]', "[mem 0xe0000000-0xefffffff window]\n"
+                                   "PLATFORM-PCI-DMESG pci 0000:00:01.1: BAR 2: can't claim"),
+           'other slot base': swap('0x00000000e0010000', '0x00000000e0020000'),
+           'I/O as memory': swap('0x000000000000c0ff 0x0000000000040100', '0x000000000000c0ff 0x0000000000040200'),
+           'not 64-bit': swap('0x00000000e020ffff 0x0000000000142200', '0x00000000e020ffff 0x0000000000042200'),
+           'extra BAR': swap('0000:00:01.0 5 0x0000000000000000', '0000:00:01.0 5 0x0000000000001000'),
+           'no decoding': swap('0000:00:01.1 after 0003', '0000:00:01.1 after 0002'),
+           'BAR0 zero': swap('0000:00:01.0 0x00000102 0x00000802', '0000:00:01.0 0x00000000 0x00000000'),
+           'BAR2 offsets': swap('0x0000FFFC', '0x0000FFF8'),
+           'no BAR2': drop('PLATFORM-PCI-BAR2'),
+           'one function only, as 01.1': drop('0000:00:01.0'),
+           'guest failure': swap('PLATFORM-PASS', 'PLATFORM-FAIL BusyBox has no devmem applet'),
+           'no pass': drop('PLATFORM-PASS'),
+           'cpus': dataclasses.replace(good, vcpus=1),
+           'panic': dataclasses.replace(good, stderr='natemu: Power(4)\n', returncode=2),
+           'timeout': dataclasses.replace(good, timeout=True, stderr='natemu: Cancelled\n', returncode=1)}
+    for what, r in bad.items(): assert judge(r), f'pci-multibar {what}: passed'
+    assert any('BAR1 header' in x for x in judge(bad['no I/O window'])), judge(bad['no I/O window'])
+    assert any('root bus resource' in x for x in judge(bad['no WordIO'])), judge(bad['no WordIO'])
+    assert sum("can't" in x for x in judge(bad['no WordIO'])) == 2, judge(bad['no WordIO'])
+    assert any('test functions' in x for x in judge(bad['no multi-function bit'])), judge(bad['no multi-function bit'])
+    assert busybox_applets(b'x\0[\0[[\0dd\0devmem\0sh\0\0') == ['[', '[[', 'dd', 'devmem', 'sh']
+    print(f'pci-multibar: {len(bad)} negative judge controls passed.')
 
 
 def judge_pvpanic_panic(run: Run) -> list:
@@ -267,6 +430,7 @@ class Case:
 
 
 CASES = {
+    'pci-multibar': Case((), judge_pci_multibar),
     'pvpanic-panic': Case(('panic=0',), judge_pvpanic_panic),
     'platform': Case((), judge_platform),
     'platform-off': Case(('reboot=k',), judge_platform_off),
@@ -332,6 +496,7 @@ def prepare(args):
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / 'bin/busybox').write_bytes(busybox_from(args.busybox_deb))
     (root / 'bin/busybox').chmod(0o755)
+    assert not set(PCI_APPLETS) - set(busybox_applets((root / 'bin/busybox').read_bytes())), f'BusyBox lacks one of {PCI_APPLETS}'
     for applet in APPLETS: (root / 'bin' / applet).symlink_to('busybox')
     modules = module_closure(args.kernel_deb, MODULES)
     for rel, data, _ in modules.values():
@@ -536,6 +701,7 @@ def self_check():
     assert any('SMBIOS found' in e for e in judge(off_bad['SMBIOS on'])), judge(off_bad['SMBIOS on'])
     assert any('QEMU0001' in e for e in judge(off_bad['pvpanic on'])), judge(off_bad['pvpanic on'])
     assert any('serio' in e for e in judge(off_bad['PS/2 on'])), judge(off_bad['PS/2 on'])
+    self_check_pci_multibar()
     print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad) + len(off_bad)} negative '
           'judge controls passed; no VM launched.')
 
