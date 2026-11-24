@@ -27,9 +27,6 @@ pcid-study = ["perf"]
 # perf IRQ entry and may add stop re-arms (`rearms`) where a stop was wanted, so its buckets are reported, never used for a
 # decision (the unperturbed `perf` runs give those).
 profile = []
-# Trip-cost plan experiment X1, measurement builds only, never kept (`gates.S`, `x1_turn`): the gate turns an `svc #STRING`
-# straight around (no Rust, w0 unchanged), in variants chosen by the PCMPxSTRx control's low 3 bits (k2 cost rows `x1_*`).
-x1-floor = []
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
 # PIC study stage 1, measurement builds only: links enter their targets through counting stubs (`cache::stub`), for linked

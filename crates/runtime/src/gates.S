@@ -44,10 +44,6 @@ private_start:
 
 .section .text,"ax"
 .macro save_native
-    save_regs
-    save_system
-.endm
-.macro save_regs
     sub sp, sp, #{frame_size}
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
@@ -81,14 +77,10 @@ private_start:
     stp q26, q27, [sp, #({q_offset}+416)]
     stp q28, q29, [sp, #({q_offset}+448)]
     stp q30, q31, [sp, #({q_offset}+480)]
-.endm
-.macro save_system fpcr=1
     mrs x9, fpcr
     str x9, [sp, #{fpcr_offset}]
     // The resident never runs under the guest's FPCR (I5a: rounding, flush and any trap enables are generated code's).
-.if \fpcr
     msr fpcr, xzr
-.endif
     mrs x9, fpsr
     str x9, [sp, #{fpsr_offset}]
     str xzr, [sp, #{reserved_offset}]
@@ -103,18 +95,7 @@ private_start:
 .endm
 
 exception_capture:
-.if {x1}
-    // Trip-cost plan, experiment X1 (`x1-floor` builds only, never kept): an `svc #STRING` is turned straight around.
-    save_regs
-    mrs x9, esr_el1
-    movz w10, #{svc_string}
-    movk w10, #0x5600, lsl #16
-    cmp x9, x10
-    b.eq x1_turn
-    save_system
-.else
     save_native
-.endif
     mrs x9, sp_el0
     str x9, [sp, #{sp_offset}]
     mrs x9, spsr_el1
@@ -183,7 +164,8 @@ irq_gate:
 // gate saved; `resume` and `enter` use `Shared::captured` and `Shared::initial`). The stack layout is therefore a contract:
 // SP is reset to the exception stack's top below, above the frame, and NOTHING between that reset and the `eret` may push or
 // call (a push would silently overwrite the frame's `sp` and `nzcv` fields, which are loaded after it: no fault would say so).
-.macro restore_native fpcr=1
+.global resume_exception
+resume_exception:
     // x3 != 0: generated code runs under x86 alignment checking (X2, #AC): every misaligned data access at EL0 takes an
     // alignment fault (SCTLR_EL1.A). Every load below is aligned.
     cbz x3, 1f
@@ -207,10 +189,8 @@ irq_gate:
     msr sp_el0, x9
     ldr x9, ={exception_stack_top}
     mov sp, x9
-.if \fpcr
     ldr x9, [x16, #{fpcr_offset}]
     msr fpcr, x9
-.endif
     ldr x9, [x16, #{fpsr_offset}]
     msr fpsr, x9
     ldp q0, q1, [x16, #({q_offset}+0)]
@@ -261,63 +241,6 @@ irq_gate:
     ldr x30, [x16, #240]
     ldr x16, [x16, #128]
     eret
-.endm
-.global resume_exception
-resume_exception:
-    restore_native
-
-.if {x1}
-// Experiment X1 (docs/restructure/trip-cost-plan.md section 5; `x1-floor` builds only, never kept): an `svc #STRING`
-// (PCMPxSTRx's helper) resumes at once from the gate's frame, w0 unchanged, no Rust. The variant is the control word's
-// low 3 bits (x0, the PCMPxSTRx imm8): 0 (a) the gate and the return as for every trip; 1 (b) without the two FPCR
-// writes; 2-6 (a) plus one write of the value the register holds: 2 SPSel (#1), 3 FPSR, 4 FPCR (0, the resident's),
-// 5 ELR_EL1, 6 SP_EL0.
-x1_turn:
-    and x10, x0, #7
-    cmp x10, #1
-    b.eq 7f
-    save_system
-    mrs x9, sp_el0
-    str x9, [sp, #{sp_offset}]
-    mrs x9, spsr_el1
-    and x9, x9, #0xf0000000
-    str x9, [sp, #{nzcv_offset}]
-    cmp x10, #2
-    b.ne 1f
-    msr spsel, #1
-1:  cmp x10, #3
-    b.ne 2f
-    mrs x9, fpsr
-    msr fpsr, x9
-2:  cmp x10, #4
-    b.ne 3f
-    mrs x9, fpcr
-    msr fpcr, x9
-3:  cmp x10, #5
-    b.ne 4f
-    mrs x9, elr_el1
-    msr elr_el1, x9
-4:  cmp x10, #6
-    b.ne 5f
-    mrs x9, sp_el0
-    msr sp_el0, x9
-5:  mov x0, sp
-    mrs x1, elr_el1
-    mrs x2, spsr_el1
-    mov x3, #0
-    b resume_exception
-7:  save_system 0
-    mrs x9, sp_el0
-    str x9, [sp, #{sp_offset}]
-    mrs x9, spsr_el1
-    and x9, x9, #0xf0000000
-    str x9, [sp, #{nzcv_offset}]
-    mov x0, sp
-    mrs x1, elr_el1
-    mrs x2, spsr_el1
-    mov x3, #0
-    restore_native 0
-.endif
 
 
 // Allocated roots can include x16 and the frame below SP. Use the exception

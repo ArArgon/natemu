@@ -35,8 +35,6 @@ global_asm!(include_str!("gates.S"),
     l1_mask=const natemu_abi::execution::cache::L1_SET_MASK,
     svc_miss=const natemu_abi::execution::svc::MISS,
     profile=const cfg!(feature = "profile") as u64,
-    x1=const cfg!(feature = "x1-floor") as u64,
-    svc_string=const natemu_abi::execution::svc::STRING,
     resume_time=const natemu_abi::execution::cache::LOOKUP_VA
         + (natemu_abi::execution::cache::PCID_STUDY + natemu_abi::sample::HEAD_RESUME_TIME) as u64,
 );

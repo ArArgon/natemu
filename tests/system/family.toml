@@ -66,14 +66,6 @@ needs = { exclusive = true, why = "reports wall-clock microseconds per iteration
 smoke = true
 rerun = true
 
-# Trip-cost plan experiment X1 (docs/restructure/trip-cost-plan.md section 5; measurement only, never kept): the gate's floor
-# and the price of each system-register write, wall clock, under the `x1-floor` resident (rows x1_*), with the real
-# PCMPISTRI helper trip and the division, CPUID and NOP rows of the production resident beside them.
-[suite.cases."x1-floor"]
-argv = ["tests/system/run_k2.py", "--only", "cost", "--cost-rows", "x1_a,x1_b,x1_spsel,x1_fpsr,x1_fpcr,x1_elr,x1_sp_el0,pcmpistri,div,cpuid,nop",
-        "--n", "1000000", "--fexc", "{fexc}", "--out", "{out}"]
-needs = { exclusive = true, why = "reports wall-clock microseconds per iteration" }
-
 [suite.cases."k2-rdrand"]
 argv = ["tests/system/run_k2.py", "--only", "rdrand", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
