@@ -427,8 +427,15 @@ about 45 ns, division's about 58. The two FPCR writes are not resolved (-2.0 aga
 for a lazy-FPCR note, so none is written. SPSel costs nothing measurable: **step 1.3 is not built**. A same-value FPSR
 write costs 6.4 ns (beyond 3 SE and over 3 ns): **step 1.4 qualifies** and gets its own kill-test.
 
-The kill-tests below ran after the rebase onto 161176fb (bulk REP MOVS), each "before" the tip the step was built on;
-profiles on the M2 Max, three alternating runs a side, never page numbers.
+The kill-tests below ran on a base of 161176fb (bulk REP MOVS), each "before" the tip the step was built on (161176fb for
+step 1.1-1.2, then that step's commit, then 1.4's revert); profiles on the M2 Max, three alternating runs a side, never
+page numbers.
+
+The narrow runs (static, system, smp, faults; programs added for step 2) passed apart from known bugs: after step 1.1-1.2,
+79,536 passed, 268 skipped, smp's `kicks-adversarial-no-resident-stop` failed once (a known bug: whether a peer's doorbell
+is seen exactly at resident entry depends on timing) and system's `r1-serial-intermittent` passed twice (listed as a
+known bug, it looks fixed); after step 2, 81,185 passed, 268 skipped, `r1-serial-intermittent` passed twice and
+`kicks-adversarial-no-resident-stop` passed.
 
 **Step 1.1 and 1.2 (kept).** `guest-coldtrip-profile`, before 161176fb, after 9d1ee344, 18 counted rounds a
 side: `gate_ns` 56.8 (min 52.5, sd 2.9) to 53.6 (min 51.0, sd 2.4), **-3.2 ns** against 3 SE 2.7 and the 3 ns minimum

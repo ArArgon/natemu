@@ -171,7 +171,8 @@ irq_gate:
 
 // Resumes EL0 from the frame at x0 (x1 = ELR, x2 = SPSR, x3 = alignment checking). The frame is read from, never written to,
 // and it may be the gate's own frame on the exception stack (`miss_fast`, which serves a dispatcher miss from the frame the
-// gate saved; `resume` and `enter` use `Shared::captured` and `Shared::initial`). The stack layout is therefore a contract:
+// gate saved, and `resume` for a division or a helper, trip-cost step 2; `resume`'s other callers and `enter` use
+// `Shared::captured` and `Shared::initial`). The stack layout is therefore a contract:
 // SP is reset to the exception stack's top below, above the frame, and NOTHING between that reset and the `eret` may push or
 // call (a push would silently overwrite the frame's `sp` and `nzcv` fields, which are loaded after it: no fault would say so).
 .global resume_exception

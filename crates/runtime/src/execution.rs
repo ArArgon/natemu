@@ -2438,7 +2438,8 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
 /// Exception capture (`kind` 1: an `svc` entry, a check stub, a stop, an abort or a trap from generated code) and the
 /// IRQ gate (3) end here. An exception from EL1 (the resident's own fault) halts at once (`unknown_abort`). Any stop
 /// armed is disarmed first ([`cache::disarm`]). The `svc` entries come from EL0: a literal exit (the linker), the
-/// dispatcher's miss (only from its own `svc`), and a division; any other `svc` is an unknown abort.
+/// dispatcher's miss (only from its own `svc`), a division and the helpers (`X87`, `STRING`); any other `svc` is an unknown
+/// abort.
 pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u64, elr: u64) -> ! {
     unsafe {
         let frame = &*frame_ptr;

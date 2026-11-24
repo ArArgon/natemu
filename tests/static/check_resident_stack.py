@@ -226,6 +226,23 @@ def nested(info, gate):
     return total + worst, problems
 
 
+def skip_targets(name, body, lands):
+    """Each conditional skip in `body` ([(address, instruction)]) branches exactly to the instruction `lands` names for its
+    normalized form (`cbz x3, SKIP` -> the first such instruction after it): the one right after what it skips. The
+    sequence checks see a skip's target only as SKIP, which would accept any."""
+    problems, insns = [], [i for _, i in body]
+    for k, (addr, ins) in enumerate(body):
+        m = re.match(r'(cbz|tbz) .*?0x([0-9a-f]+) <', ins)
+        if not m: continue
+        form = re.sub(r' 0x[0-9a-f]+ <.*>$', ' SKIP', ins)
+        if form not in lands or lands[form] not in insns[k:]:
+            problems.append(f'{name}+{addr - body[0][0]:#x}: undeclared conditional skip `{ins}`'); continue
+        want = body[insns.index(lands[form], k)][0]
+        if int(m[2], 16) != want:
+            problems.append(f'{name}+{addr - body[0][0]:#x}: `{form}` branches to {int(m[2], 16):#x}, not {want:#x} (right after what it skips)')
+    return problems
+
+
 def eret_problems(funcs, words, tops, profile=False):
     """The ERET path, the gates' save sequences and the vectors, instruction by instruction. `profile`: the EL0 sampler's
     resident, whose resume-time store is allowed (and required to store to `Head::resume_time`)."""
@@ -263,8 +280,11 @@ def eret_problems(funcs, words, tops, profile=False):
         diff = next((f'#{k}: `{g}`, want `{w}`' for k, (g, w) in enumerate(zip(got, want)) if g != w),
                     f'{len(got)} instructions, want {len(want)}')
         problems.append(f'resume_exception restore sequence differs: {diff}')
-    elif literal(words, body, sp_literal) != tops['EXCEPTION_STACK_TOP']:
-        problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
+    else:
+        # X2's alignment skip lands on the ELR write, right after the SCTLR_EL1.A set it skips.
+        problems += skip_targets('resume_exception', body, {'cbz x3, SKIP': 'msr elr_el1, x1'})
+        if literal(words, body, sp_literal) != tops['EXCEPTION_STACK_TOP']:
+            problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
     callers = {n for n, insns in funcs.items() for _, i in insns
                if re.match(r'bl? 0x[0-9a-f]+ <(resume_exception|enter_allocated)>$', i)} - {'resume_exception'}
     if callers != ERET_CALLERS:
@@ -284,6 +304,9 @@ def eret_problems(funcs, words, tops, profile=False):
                       re.sub(rf'^b 0x[0-9a-f]+ <{gate}\+0x[0-9a-f]+>$', 'b SELF', skip(gate, i))) for _, i in funcs.get(gate, [])]
         if got[:len(want)] != want or any(i != 'nop' for i in got[len(want):]):
             problems.append(f'{gate} save sequence differs from the declared gate shape')
+        else:
+            # X2's skip lands on the SP_EL0 save, right after the SCTLR_EL1.A clear it skips.
+            problems += skip_targets(gate, funcs[gate], {'tbz w9, #0x1, SKIP': 'mrs x9, sp_el0'})
     vec = funcs.get('vectors', [])
     branches = [(a - vec[0][0], i) for a, i in vec if i != 'nop'] if vec else []
     target = lambda k: 'irq_gate' if k == 9 else 'exception_capture'

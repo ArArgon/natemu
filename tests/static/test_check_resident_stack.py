@@ -110,6 +110,9 @@ class Binary(unittest.TestCase):
             'a restore from the wrong slot': (r'(ldp\tx6, x7, \[x16, #)0x30\]', r'\g<1>0x40]'),
             # Trip-cost plan T1, T2 (step 1.1): a pair from x12's slot; the base x16 restored before x17.
             'a pair from the wrong slot': (r'(ldp\tx14, x15, \[x16, #)0x70\]', r'\g<1>0x60]'),
+            # A conditional skip landing anywhere but right after what it skips (the alignment checks, X2).
+            'the restore\'s alignment skip landing elsewhere': (r'(cbz\tx3, )0x[0-9a-f]+( <resume_exception\+0x[0-9a-f]+>)', r'\g<1>0x1000\2'),
+            'a gate\'s alignment skip landing elsewhere': (r'(<exception_capture>:\n(?:.*\n)*?.*\ttbz\tw9, #0x1, )0x[0-9a-f]+', r'\g<1>0x1000'),
             'x16 before x17': (r'^(\s*[0-9a-f]+:\s+)ldr\tx17, \[x16, #0x88\]$', r'\1ldr\tx16, [x16, #0x80]'),
             'a second ERET': (r'^(\s*[0-9a-f]+:\s+)mov\tx16, x0$', r'\1eret'),
             'an unsaved register in a gate': (r'^.*stp\tq30, q31, \[sp, #0x2e0\]\n', ''),
