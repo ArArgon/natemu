@@ -121,7 +121,7 @@ class Format(unittest.TestCase):
         text = (ROOT / 'crates/abi/src/sample.rs').read_text()
         const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u16|u32|u64|i64|usize) = ([^;]+);', text)}
         num = lambda n: int(const[n].replace('_', ''), 0)
-        for n in ('FILE', 'EL0', 'RESIDENT', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
+        for n in ('FILE', 'EL0', 'RESIDENT', 'EL0_UNKNOWN', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
                   'DISPATCH', 'STEP', 'HEAD', 'NO_BLOCK', 'OUTSIDE', 'HOT', 'DEAD', 'CALL_SHIFT', 'CALL_YES', 'CALL_NO',
                   'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS', 'FAR', 'AT_BIAS', 'TAIL', 'TAIL_CALL', 'TAIL_POINT'):
             self.assertEqual(getattr(sr, n), num(n), n)
@@ -175,14 +175,14 @@ class Report(Base):
         whole = r['phases'][0]
         self.assertEqual(whole['name'], 'all')
         s = whole['summed']
-        self.assertEqual(s['kinds'], dict(el0=12, resident=1, halted=2))
+        self.assertEqual(s['kinds'], dict(el0=12, el0_unknown=0, resident=1, halted=2))
         self.assertEqual(s['el0_places'], dict(block=6, probe=1, dispatch=3, step=1, head=1, no_block=0, outside=0, tail=0))
         self.assertEqual((s['dispatch_forms'], s['tail_roles']), (dict(ordinary=3, lookup=0, ** {'return': 0}), {}))
         self.assertEqual(s['dispatch_calls'], {'return': 1, 'not_call': 1, 'unknown': 1})
         # Blocks and the dispatcher with a context by it; the context-less dispatcher sample by its RIP; the head sample unknown.
         self.assertEqual(s['privilege'], dict(user=8, kernel=3, unknown=1))
         self.assertEqual(s['modes'], {'64': 9, '32': 1})
-        self.assertEqual(whole['vcpus']['1']['kinds'], dict(el0=1, resident=0, halted=2))
+        self.assertEqual(whole['vcpus']['1']['kinds'], dict(el0=1, el0_unknown=0, resident=0, halted=2))
         self.assertEqual(s['hot'], 1)
         self.assertEqual(r['vcpus'], 2)
         self.assertEqual(r['counters']['1']['halted'], 2)
@@ -192,13 +192,44 @@ class Report(Base):
         md = (self.d / 'case.report.md').read_text()
         self.assertIn('| all |', md); self.assertIn('| run1/one |', md); self.assertIn('`0x401000`', md)
 
+    def test_el0_with_no_place_counts_as_el0_but_has_no_place(self):
+        """Version 2: a ring before the EL0 exit preceding the last resume (natemu_abi::sample::EL0_UNKNOWN) is EL0 time in
+        `el0_all_pct` and in its own kind, but in no place, privilege or EL0 share below it."""
+        recs, markers, objects = standard_run()
+        resident = [i for i, r in enumerate(recs) if r[2] >> 60 == sr.RESIDENT]
+        self.assertEqual(len(resident), 1)
+        r = recs[resident[0]]
+        recs[resident[0]] = (r[0], r[1], r[2] & ~(0xf << 60) | sr.EL0_UNKNOWN << 60, r[3])
+        problems, rep = self.report(markers=self.write(recs, markers, objects))
+        self.assertEqual(problems, [])
+        s = rep['phases'][0]['summed']
+        self.assertEqual(s['kinds'], dict(el0=12, el0_unknown=1, resident=0, halted=2))
+        self.assertEqual(s['el0_all_pct'], round(100 * 13 / 15, 2))
+        self.assertEqual(s['kind_pct']['el0'], round(100 * 12 / 15, 2))
+        self.assertEqual(sum(s['el0_places'].values()), 12)
+        self.assertEqual(sum(s['privilege'].values()), 12)
+        md = (self.d / 'case.report.md').read_text()
+        row = next(l for l in md.splitlines() if l.startswith('| all |'))
+        self.assertEqual(row.split(' | ')[3:6], ['86.7', '80.0', '6.7'])
+        head = next(l for l in md.splitlines() if l.startswith('| phase |'))
+        sep = md.splitlines()[md.splitlines().index(head) + 1]
+        self.assertEqual(head.count('|'), sep.count('|'))
+        self.assertEqual(head.count('|'), row.count('|'))
+
+    def test_a_version_1_file_still_reads(self):
+        recs, markers, objects = standard_run()
+        recs[0] = (sr.FILE_MAGIC, 1 | 32 << 32, F, recs[0][3])
+        problems, rep = self.report(markers=self.write(recs, markers, objects))
+        self.assertEqual(problems, [])
+        self.assertEqual(rep['phases'][0]['summed']['el0_all_pct'], round(100 * 12 / 15, 2))
+
     def test_phases_come_from_markers_and_marks(self):
         recs, markers, objects = standard_run()
         _, r = self.report(markers=self.write(recs, markers, objects))
         ph = {p['name']: p for p in r['phases']}
         self.assertEqual(list(ph), ['all', 'boot', 'run1', 'run1/one', 'between', 'run2', 'mark/7', 'mark/8'])
         self.assertEqual((ph['run1']['start_s'], ph['run1']['end_s']), (2.0, 5.0))
-        self.assertEqual(ph['run1']['summed']['kinds'], dict(el0=9, resident=1, halted=1))
+        self.assertEqual(ph['run1']['summed']['kinds'], dict(el0=9, el0_unknown=0, resident=1, halted=1))
         self.assertEqual(ph['run1/one']['summed']['el0_places']['block'], 3)        # 2.1, 2.2, 2.3 s
         self.assertEqual(ph['run2']['summed']['el0_places'], dict(block=2, probe=0, dispatch=0, step=1, head=0, no_block=0, outside=0, tail=0))
         self.assertEqual(ph['boot']['summed']['samples'], 0)
@@ -299,7 +330,7 @@ class Checks(Base):
         self.write(recs, objects=[])
         problems, r = self.report()
         self.assertEqual(problems, ['no EL0 sample'])
-        self.assertEqual(r['phases'][0]['summed']['kinds'], dict(el0=0, resident=0, halted=1))
+        self.assertEqual(r['phases'][0]['summed']['kinds'], dict(el0=0, el0_unknown=0, resident=0, halted=1))
 
     def test_a_required_place_without_samples_fails(self):
         recs, markers, objects = standard_run()
@@ -323,7 +354,7 @@ class Checks(Base):
         self.assertEqual(problems, ['case.objects: missing'])
         self.assertNotIn('object', r['phases'][0]['blocks']['top'][0])
         (self.d / 'case.samples').write_bytes(struct.pack('<4Q', 1, 2, 3, 4))
-        self.assertEqual(sr.report_one(self.name), [f'{self.d / "case.samples"}: not a version 1 samples file'])
+        self.assertEqual(sr.report_one(self.name), [f'{self.d / "case.samples"}: not a version 1 or 2 samples file'])
         (self.d / 'case.samples').unlink()
         self.assertEqual(sr.report_one(self.name), [f'{self.d / "case.samples"}: missing'])
         write_samples(self.d / 'case.samples', recs)

@@ -14,8 +14,10 @@ NAME.markers.tsv, run_io5.py's markers-PHASE.tsv; CLOCK_UPTIME_RAW ns, the sampl
 log, for each phase's resident buckets: reported, never a decision, since sampling perturbs them). A missing markers or
 perf file is noted, not an error (a boot that failed early).
 
-Per profile, per vCPU and summed, per phase: samples by kind (EL0; resident or host: the bell was pending while the vCPU was
-outside generated code; halted: the host found it halted and did not ring), EL0 samples by place (block, probe, dispatch
+Per profile, per vCPU and summed, per phase: samples by kind (EL0; EL0 with no place: rung while the vCPU was in generated
+code, but taken only after its next trip out began, so its PC is a later stretch's (format version 2); resident or host: the
+bell was pending while the vCPU was outside generated code; halted: the host found it halted and did not ring), and the EL0
+share of both EL0 kinds (`el0_all`, the one to set beside the guest bucket); EL0 samples (with a place) by place (block, probe, dispatch
 slot, head, step, no block, outside), by privilege and code mode (from the block's code context; a dispatcher slot's target
 by its RIP where the slot has no context), dispatcher samples by their call test (the target is a return address, is not,
 or unknown), the top 50 blocks by (RIP, frame, context) with their objects, the cumulative curve of block samples, the lost
@@ -55,10 +57,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # --- the format (crates/abi/src/sample.rs; test_sample_report.py checks these against it) -------------------------------
 FILE_MAGIC = int.from_bytes(b'NATEMUSA', 'little')
 OBJECTS_MAGIC = int.from_bytes(b'NATEMUOB', 'little')
-VERSION = 1
+VERSION = 2
+VERSIONS = (1, 2)           # 1: before EL0_UNKNOWN (its samples were counted resident); the layout is the same
 RECORD_BYTES = 32
 OBJECT_HEADER_BYTES = 56
-FILE, EL0, RESIDENT, HALTED, MARK, CLOCK, VCPU, COUNT, TOGGLE, PASS = range(10)
+FILE, EL0, RESIDENT, HALTED, MARK, CLOCK, VCPU, COUNT, TOGGLE, PASS, EL0_UNKNOWN = range(11)
 BLOCK, PROBE, DISPATCH, STEP, HEAD, NO_BLOCK, OUTSIDE, TAIL = range(1, 9)
 PLACES = {BLOCK: 'block', PROBE: 'probe', DISPATCH: 'dispatch', STEP: 'step', HEAD: 'head', NO_BLOCK: 'no_block',
           OUTSIDE: 'outside', TAIL: 'tail'}
@@ -94,7 +97,7 @@ CODE_MAGIC = b'NFXOBJ\0\x01'
 CODE_HEADER = struct.Struct('<8sIIIIQIIIIIII')   # magic .. code_region_end
 REC = struct.Struct('<4Q')
 OBJ = struct.Struct('<IBBHQQQQQII')
-KINDS = {EL0: 'el0', RESIDENT: 'resident', HALTED: 'halted'}
+KINDS = {EL0: 'el0', EL0_UNKNOWN: 'el0_unknown', RESIDENT: 'resident', HALTED: 'halted'}
 
 
 class FormatError(Exception):
@@ -143,8 +146,8 @@ class Objects:
         f.close()
         if size < RECORD_BYTES: raise FormatError(f'{self.path}: no header')
         magic, version, _, _ = REC.unpack_from(self.data, 0)
-        if magic != OBJECTS_MAGIC or version & 0xffff_ffff != VERSION or version >> 32 != OBJECT_HEADER_BYTES:
-            raise FormatError(f'{self.path}: not a version {VERSION} objects file')
+        if magic != OBJECTS_MAGIC or version & 0xffff_ffff not in VERSIONS or version >> 32 != OBJECT_HEADER_BYTES:
+            raise FormatError(f'{self.path}: not a version 1 or 2 objects file')
         self.exact, self.page, self.count = collections.defaultdict(list), collections.defaultdict(list), 0
         at = RECORD_BYTES
         while at < size:
@@ -517,8 +520,8 @@ class Profile:
         if size < RECORD_BYTES: raise FormatError(f'{path}: no header')
         size -= size % RECORD_BYTES
         h = REC.unpack_from(data, 0)
-        if h[0] != FILE_MAGIC or h[1] & 0xffff_ffff != VERSION or h[1] >> 32 != RECORD_BYTES or h[2] >> 60:
-            raise FormatError(f'{path}: not a version {VERSION} samples file')
+        if h[0] != FILE_MAGIC or h[1] & 0xffff_ffff not in VERSIONS or h[1] >> 32 != RECORD_BYTES or h[2] >> 60:
+            raise FormatError(f'{path}: not a version 1 or 2 samples file')
         self.freq, self.vcpus, self.interval_us = h[2], h[3] & 0xffff_ffff, h[3] >> 32
         if not self.freq: raise FormatError(f'{path}: frequency 0')
         view = memoryview(data)[RECORD_BYTES:size]
@@ -567,14 +570,15 @@ class Profile:
             if pending:
                 pending -= 1
                 self.records[vcpu] += 1
-                if k not in (EL0, RESIDENT): bad += 1; continue
+                if k not in (EL0, RESIDENT, EL0_UNKNOWN): bad += 1; continue
                 if vcpu >= self.vcpus: continue
                 t = w[0]
                 ps = phases_at(t)
                 win = (t - origin) // wt if t >= origin else -1
-                if k == RESIDENT:
-                    for p in ps: per[(vcpu, p)].kinds['resident'] += 1; summ[p].kinds['resident'] += 1
-                    series[win]['resident'] += 1
+                if k != EL0:        # resident, or EL0 with no place: counted by kind only
+                    kn = KINDS[k]
+                    for p in ps: per[(vcpu, p)].kinds[kn] += 1; summ[p].kinds[kn] += 1
+                    series[win][kn] += 1
                     continue
                 place = w[2] >> 56 & 0xf
                 flags = w[1] >> 60
@@ -621,7 +625,7 @@ class Profile:
                     summ[p].kinds['halted'] += 1
                 series[(r['time'] - origin) // wt if r['time'] >= origin else -1]['halted'] += 1
         if pending: self.problems.append(f'the file ends {pending} records into vCPU {vcpu}\'s batch')
-        if bad: self.problems.append(f'{bad} ring records of a kind that is not EL0 or resident')
+        if bad: self.problems.append(f'{bad} ring records of a kind that is not EL0, EL0 with no place or resident')
         self.check()
 
     # -- derived ------------------------------------------------------------------------------------------------------
@@ -658,8 +662,9 @@ class Profile:
         el0 = t.kinds['el0']
         pct = lambda n, d: round(100 * n / d, 2) if d else None
         return dict(
-            samples=total, kinds={k: t.kinds[k] for k in ('el0', 'resident', 'halted')},
-            kind_pct={k: pct(t.kinds[k], total) for k in ('el0', 'resident', 'halted')},
+            samples=total, kinds={k: t.kinds[k] for k in KINDS.values()},
+            kind_pct={k: pct(t.kinds[k], total) for k in KINDS.values()},
+            el0_all_pct=pct(el0 + t.kinds['el0_unknown'], total),
             el0_places={n: t.places[n] for n in PLACES.values()}, el0_place_pct={n: pct(t.places[n], el0) for n in PLACES.values()},
             privilege=dict(t.privilege), privilege_pct={k: pct(n, el0) for k, n in t.privilege.items()},
             modes=dict(t.modes), dispatch_calls={k: t.calls[k] for k in ('return', 'not_call', 'unknown')},
@@ -766,25 +771,29 @@ def markdown(rep):
            f'{rep["vcpus"]} vCPU(s), every {rep["interval_us"]} us requested ({rep["requested_per_s"]}/s per vCPU), '
            f'{rep["duration_s"]} s, sampling on {rep["on_s"]} s; {rep["objects"]} objects. A profile, not a timing.', '',
            '## By phase (all vCPUs)', '',
-           '| phase | s | samples | EL0 % | resident % | halted % | block | probe | dispatch | tail | step | head | no block | outside | user % | kernel % | ret % | not call % | unknown % |',
-           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+           '| phase | s | samples | EL0 all % | EL0 % | EL0 no place % | resident % | halted % | block | probe | dispatch | tail | step | head | no block | outside | user % | kernel % | ret % | not call % | unknown % |',
+           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for ph in rep['phases']:
         s = ph['summed']; e = s['el0_place_pct']; c = s['dispatch_call_pct']; k = s['kind_pct']; pr = s['privilege_pct']
-        out.append(f'| {ph["name"]} | {ph["end_s"] - ph["start_s"]:.1f} | {s["samples"]} | {p(k["el0"])} | {p(k["resident"])} | '
+        out.append(f'| {ph["name"]} | {ph["end_s"] - ph["start_s"]:.1f} | {s["samples"]} | {p(s["el0_all_pct"])} | {p(k["el0"])} | '
+                   f'{p(k["el0_unknown"])} | {p(k["resident"])} | '
                    f'{p(k["halted"])} | {p(e["block"])} | {p(e["probe"])} | {p(e["dispatch"])} | {p(e["tail"])} | {p(e["step"])} | {p(e["head"])} | '
                    f'{p(e["no_block"])} | {p(e["outside"])} | {p(pr.get("user"))} | {p(pr.get("kernel"))} | {p(c["return"])} | '
                    f'{p(c["not_call"])} | {p(c["unknown"])} |')
-    out += ['', 'EL0 places are % of EL0 samples; the call test (return, not a call, unknown) is % of dispatch samples; tail: the words',
+    out += ['', 'EL0 all: EL0 samples with a place and without (rung in generated code, taken after the next trip out began: its PC',
+            'is a later stretch\'s), the share to set beside the guest bucket. Everything below is of EL0 samples with a place.',
+            'EL0 places are % of EL0 samples; the call test (return, not a call, unknown) is % of dispatch samples; tail: the words',
             'appended to a block for an indirect jump or call or a shared block\'s checked link (indirect plan step 1).', '']
     whole_s = rep['phases'][0]['summed']
     out += [f"Dispatch samples by slot form: {whole_s['dispatch_forms']}; tail samples by role: {whole_s['tail_roles'] or 'none'}.", '',
-            '## Per vCPU (whole run)', '', '| vCPU | samples | per s | EL0 % | resident % | halted % | rings | bells | in wait | merged | lost | written | drained |',
-            '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+            '## Per vCPU (whole run)', '', '| vCPU | samples | per s | EL0 all % | EL0 % | EL0 no place % | resident % | halted % | rings | bells | in wait | merged | lost | written | drained |',
+            '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     whole = rep['phases'][0]
     for v, s in whole['vcpus'].items():
         c = rep['counters'].get(str(v), {})
         k = s['kind_pct']
-        out.append(f'| {v} | {s["samples"]} | {whole["samples_per_s"][v]} | {p(k["el0"])} | {p(k["resident"])} | {p(k["halted"])} | '
+        out.append(f'| {v} | {s["samples"]} | {whole["samples_per_s"][v]} | {p(s["el0_all_pct"])} | {p(k["el0"])} | '
+                   f'{p(k["el0_unknown"])} | {p(k["resident"])} | {p(k["halted"])} | '
                    f'{c.get("rings")} | {c.get("bells")} | {c.get("bells_in_wait")} | {c.get("merged")} | {c.get("lost")} | '
                    f'{c.get("written")} | {c.get("drained")} |')
     run = rep['counters'].get('run', {})
@@ -905,7 +914,7 @@ def report_one(name, markers=None, perf=None, window_s=1.0, require=(), kernel=N
     name.with_name(name.name + '.report.json').write_text(json.dumps(rep, indent=1) + '\n')
     name.with_name(name.name + '.report.md').write_text(markdown(rep))
     s = rep['phases'][0]['summed']
-    print(f'{name.name}: {s["samples"]} samples, EL0 {s["kind_pct"]["el0"]}%, dispatch {s["el0_place_pct"]["dispatch"]}% of EL0, '
+    print(f'{name.name}: {s["samples"]} samples, EL0 {s["el0_all_pct"]}% ({s["kind_pct"]["el0_unknown"]} no place), dispatch {s["el0_place_pct"]["dispatch"]}% of EL0, '
           f'{rep["phases"][0]["blocks"]["distinct"]} blocks; {name.name}.report.md', flush=True)
     return rep['problems']
 

@@ -6,7 +6,7 @@
 //! offset `LOOKUP_OFFSET + PCID_STUDY` in the vCPU's block of the backing) starts with a [`Head`] page, then [`CAPACITY`]
 //! records of [`RECORD_BYTES`] from [`RING`] (1 MiB). In sampling builds the study part holds nothing else (the hot-block
 //! table of the November experiments is gone); in other builds it is untouched. The resident is the only writer of records,
-//! `write`, `lost`, `resume_time` and its counters; the host writes `bell` before the vCPU first runs, `ring_time` before each
+//! `write`, `lost`, `resume_time`, `exit_time`, `exit_before` and its counters; the host writes `bell` before the vCPU first runs, `ring_time` before each
 //! ring and `read` after each drain. A record is stored before `write` is published with release ordering; the host loads
 //! `write` with acquire, copies the records up to it and publishes `read` (release). When the ring is full a record is not
 //! written and `lost` counts it.
@@ -83,6 +83,11 @@ pub struct Head {
     pub unknown_calls: u64,
     /// An INTID a wait's bell test acknowledged that is not a bell, held for `acknowledge` (INTID + 1; 0: none).
     pub held: u64,
+    /// CNTVCT at the start of the last trip out of generated code (`finish`, the first Rust the gates call: a few tens of
+    /// nanoseconds after the exception, the gate's register save), and the one before it ([`Ring::left`]). A bell taken
+    /// from generated code reads `exit_before`: the end of the EL0 stretch before the one it interrupted.
+    pub exit_time: u64,
+    pub exit_before: u64,
 }
 pub const HEAD_MAGIC: usize = core::mem::offset_of!(Head, magic);
 pub const HEAD_WRITE: usize = core::mem::offset_of!(Head, write);
@@ -91,13 +96,15 @@ pub const HEAD_LOST: usize = core::mem::offset_of!(Head, lost);
 pub const HEAD_BELL: usize = core::mem::offset_of!(Head, bell);
 pub const HEAD_RING_TIME: usize = core::mem::offset_of!(Head, ring_time);
 pub const HEAD_RESUME_TIME: usize = core::mem::offset_of!(Head, resume_time);
+pub const HEAD_EXIT_TIME: usize = core::mem::offset_of!(Head, exit_time);
+pub const HEAD_EXIT_BEFORE: usize = core::mem::offset_of!(Head, exit_before);
 
-/// Record kinds (bits 60-63 of word 2). The resident writes [`EL0`] and [`RESIDENT`]; the host the others.
+/// Record kinds (bits 60-63 of word 2). The resident writes [`EL0`], [`RESIDENT`] and [`EL0_UNKNOWN`]; the host the others.
 pub const FILE: u8 = 0;
 /// The bell was rung after generated code was last resumed: the vCPU was at `place` (word fields as [`Sample`]).
 pub const EL0: u8 = 1;
-/// The bell was rung before the last resume: it was pending while the vCPU was in the resident or the host; `since` is the
-/// ticks from the ring to the interrupt, the other fields 0.
+/// The bell was rung before the last resume but not before the EL0 exit preceding it: it was pending while the vCPU was in
+/// the resident or the host; `since` is the ticks from the ring to the interrupt, the other fields 0.
 pub const RESIDENT: u8 = 2;
 /// The host found the vCPU halted (`Events::halted` set: HLT, the mailbox or SIPI wait) and did not ring it:
 /// `time` the host's look, `value1` the ringing pass's sequence number, `value3` the vCPU.
@@ -121,6 +128,11 @@ pub const TOGGLE: u8 = 8;
 /// sequence number read at its start, `value3` the one read at its end, `value4` the bells it rang. Other passes are not
 /// logged: every pass between two logged ones rang under the earlier one's end sequence number.
 pub const PASS: u8 = 9;
+/// The bell was rung before the EL0 exit that preceded the last resume (version 2): the vCPU was in generated code then, but
+/// the trip out began before the interrupt was taken (the bell arrives 1.5-2 us after the ring), so where it was is not
+/// known: the PC the interrupt saw is a later EL0 stretch's. EL0 time with no place: `since` the ticks from the ring to the
+/// interrupt, `frame` from the ring to that exit (saturated), the other fields 0.
+pub const EL0_UNKNOWN: u8 = 10;
 pub const BY_START: u32 = 0;
 pub const BY_PORT: u32 = 1;
 pub const BY_SIGNAL: u32 = 2;
@@ -217,7 +229,8 @@ pub struct Sample {
     pub place: u8,
     pub kind: u8,
     pub frame: u32,
-    /// [`EL0`]: ticks from the last resume to the interrupt; [`RESIDENT`]: from the ring to the interrupt (saturated).
+    /// [`EL0`]: ticks from the last resume to the interrupt; [`RESIDENT`], [`EL0_UNKNOWN`]: from the ring to the interrupt
+    /// (saturated).
     pub since: u32,
 }
 pub const CONTEXT_BITS: u32 = 40;
@@ -294,7 +307,8 @@ pub fn to_bytes(w: &[u64; 4]) -> [u8; RECORD_BYTES] {
 
 pub const FILE_MAGIC: u64 = u64::from_le_bytes(*b"NATEMUSA");
 pub const OBJECTS_MAGIC: u64 = u64::from_le_bytes(*b"NATEMUOB");
-pub const VERSION: u64 = 1;
+/// 2: the resident writes [`EL0_UNKNOWN`] (version 1 counted those samples [`RESIDENT`]); the layout is unchanged.
+pub const VERSION: u64 = 2;
 /// The samples file's first record.
 pub const fn file_header(frequency: u64, vcpus: u32, interval_us: u32) -> [u64; 4] {
     [FILE_MAGIC, VERSION | (RECORD_BYTES as u64) << 32, frequency, vcpus as u64 | (interval_us as u64) << 32]
@@ -418,16 +432,21 @@ pub trait Places {
     fn read(&self, gpa: u64, out: &mut [u8; BEFORE]) -> bool;
 }
 /// The record of a bell taken from generated code before `elr` at CNTVCT `t0` (x0 and d0 its frame's), the host having rung
-/// at `rung` and generated code resumed last at `resumed`; `flushes` the vCPU's cache flush count. Rung before the last
-/// resume, it was pending while the vCPU was outside generated code ([`RESIDENT`]); otherwise it says where generated code
-/// was ([`EL0`]): a block (a shared probe charged to its store's), the dispatcher (its target and the call test), or
-/// elsewhere in the code area.
-pub fn record(rung: u64, resumed: u64, t0: u64, flushes: u64, elr: u64, x0: u64, d0: u64, p: &impl Places) -> Sample {
+/// at `rung`, generated code resumed last at `resumed` and left before that at `left` ([`Head::exit_before`]); `flushes` the
+/// vCPU's cache flush count. Rung at or after the last resume, it says where generated code was ([`EL0`]): a block (a shared
+/// probe charged to its store's), the dispatcher (its target and the call test), or elsewhere in the code area. Rung between
+/// the exit and the resume, it was pending while the vCPU was outside generated code ([`RESIDENT`]). Rung before the exit,
+/// the vCPU was in generated code, at a place this interrupt cannot see ([`EL0_UNKNOWN`]).
+pub fn record(rung: u64, resumed: u64, left: u64, t0: u64, flushes: u64, elr: u64, x0: u64, d0: u64, p: &impl Places) -> Sample {
     use crate::execution::cache::{
         CODE_BYTES_MAX, CODE_VA, DISPATCH_BYTES, DISPATCH_SLOT_BYTES, DISPATCH_VA, HEAD_BYTES, NO_CONTEXT,
     };
     let since = |from: u64| t0.saturating_sub(from).min(u32::MAX as u64) as u32;
     let mut s = Sample { time: rung, ..Sample::default() };
+    if rung < left {
+        (s.kind, s.since, s.frame) = (EL0_UNKNOWN, since(rung), (left - rung).min(u32::MAX as u64) as u32);
+        return s;
+    }
     if rung < resumed {
         (s.kind, s.since) = (RESIDENT, since(rung));
         return s;
@@ -609,7 +628,16 @@ impl Ring {
             bells_in_wait: w(core::mem::offset_of!(Head, bells_in_wait)),
             unknown_calls: w(core::mem::offset_of!(Head, unknown_calls)),
             held: w(core::mem::offset_of!(Head, held)),
+            exit_time: w(HEAD_EXIT_TIME),
+            exit_before: w(HEAD_EXIT_BEFORE),
         }
+    }
+    /// The resident, at the start of each trip out of generated code (at CNTVCT `now`): the last exit becomes the one before.
+    #[inline(always)]
+    pub fn left(&self, now: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.word(HEAD_EXIT_BEFORE).store(self.word(HEAD_EXIT_TIME).load(Relaxed), Relaxed);
+        self.word(HEAD_EXIT_TIME).store(now, Relaxed);
     }
 }
 
@@ -672,8 +700,8 @@ mod tests {
     #[test]
     fn a_bell_is_placed_where_generated_code_was() {
         let p = fake();
-        let at = |elr: u64, x0: u64, d0: u64| record(1000, 900, 1100, 0x1abc, elr, x0, d0, &p);
-        let r = record(800, 900, 1100, 7, BLOCK_PC, 0, 0, &p);
+        let at = |elr: u64, x0: u64, d0: u64| record(1000, 900, 700, 1100, 0x1abc, elr, x0, d0, &p);
+        let r = record(800, 900, 700, 1100, 7, BLOCK_PC, 0, 0, &p);
         assert_eq!(r, Sample { time: 800, kind: RESIDENT, since: 300, ..Sample::default() });
         let b = at(BLOCK_PC + 0x10, 0, 0);
         assert_eq!((b.kind, b.place, b.since, b.time, b.flushes), (EL0, BLOCK, 200, 1000, 0xabc));
@@ -708,6 +736,50 @@ mod tests {
         let none = at(BLOCK_PC + 0x1000, 0, 0);
         assert_eq!((none.place, none.frame), (NO_BLOCK, (BLOCK_PC + 0x1000 - CODE_VA) as u32));
         assert_eq!(at(CODE_VA - 4, 0, 0).place, OUTSIDE);
+    }
+
+    /// The three regions of a ring time (el0-sampler-findings section 1), the last resume at 900, the EL0 exit before it at
+    /// 700, the interrupt at 1100. At or after the resume: EL0 at the PC (a ring at the resume is EL0).
+    fn class(rung: u64) -> Sample {
+        record(rung, 900, 700, 1100, 7, BLOCK_PC + 0x10, 0, 0, &fake())
+    }
+    #[test]
+    fn a_ring_after_the_last_resume_is_el0_at_the_pc() {
+        for rung in [900, 950, 1099] {
+            let s = class(rung);
+            assert_eq!((s.kind, s.place, s.since), (EL0, BLOCK, 200), "{rung}");
+        }
+    }
+    /// From the exit up to the resume: the resident's or the host's (a ring at the exit is resident); with no exit yet (the
+    /// first trip out), everything before the resume.
+    #[test]
+    fn a_ring_between_the_exit_and_the_resume_is_resident() {
+        for rung in [700, 800, 899] {
+            assert_eq!(class(rung), Sample { time: rung, kind: RESIDENT, since: (1100 - rung) as u32, ..Sample::default() }, "{rung}");
+        }
+        assert_eq!(record(10, 900, 0, 1100, 7, BLOCK_PC, 0, 0, &fake()).kind, RESIDENT);
+    }
+    /// Before the exit: EL0 with no place, whatever the PC; `frame` the ticks from the ring to the exit, saturated.
+    #[test]
+    fn a_ring_before_the_exit_is_el0_with_no_place() {
+        for rung in [0, 500, 699] {
+            let s = class(rung);
+            assert_eq!(s, Sample { time: rung, kind: EL0_UNKNOWN, since: (1100 - rung) as u32, frame: (700 - rung) as u32,
+                ..Sample::default() }, "{rung}");
+        }
+        assert_eq!(record(1, 900, u32::MAX as u64 + 10, u32::MAX as u64 + 20, 7, BLOCK_PC, 0, 0, &fake()).frame, u32::MAX);
+    }
+
+    /// Each trip out moves the last exit to `exit_before`: a bell reads the exit before the stretch it interrupted.
+    #[test]
+    fn each_trip_out_keeps_the_exit_before_it() {
+        let mut buf = std::vec![0u64; BYTES / 8];
+        // SAFETY: `buf` holds BYTES, 8-aligned.
+        let ring = unsafe { Ring::at(buf.as_mut_ptr().cast()) };
+        ring.left(100);
+        assert_eq!((ring.head().exit_time, ring.head().exit_before), (100, 0));
+        ring.left(250);
+        assert_eq!((ring.head().exit_time, ring.head().exit_before), (250, 100));
     }
 
     /// `at` holds a native offset + 4; one that does not fit is saturated and flagged, never wrapped.

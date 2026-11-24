@@ -129,6 +129,17 @@ mod on {
             crate::execution::guest_ram().copy_out(gpa, out)
         }
     }
+    /// A trip out of generated code begins (`finish`, the first Rust every gate calls): its CNTVCT becomes the last exit
+    /// (`Head::exit_time`), the previous one `Head::exit_before`, which a bell taken from generated code classes its ring
+    /// time by (`sample::record`). Taken after the gate's register save, so a few tens of nanoseconds late: a ring in that
+    /// window is counted EL0 with no place rather than resident.
+    #[inline(always)]
+    pub fn left() {
+        let now: u64;
+        // SAFETY: reads the virtual counter.
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nomem, nostack, preserves_flags)) };
+        ring().left(now);
+    }
     /// At the resident's start: from now on the host rings this vCPU.
     pub fn start() {
         word(sm::HEAD_MAGIC).store(sm::MAGIC, Relaxed);
@@ -145,6 +156,7 @@ mod on {
         let s = sm::record(
             word(sm::HEAD_RING_TIME).load(Relaxed),
             word(sm::HEAD_RESUME_TIME).load(Relaxed),
+            word(sm::HEAD_EXIT_BEFORE).load(Relaxed),
             t0,
             cache::control().flushes,
             elr,
@@ -179,6 +191,8 @@ mod off {
         #[inline(always)]
         fn in_wait(&mut self) {}
     }
+    #[inline(always)]
+    pub fn left() {}
     #[inline(always)]
     pub fn start() {}
     #[inline(always)]

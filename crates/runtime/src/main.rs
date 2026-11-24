@@ -91,6 +91,11 @@ unsafe extern "C" fn runtime_main() -> ! {
 unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64, esr: u64, far: u64, elr: u64) -> ! {
     unsafe {
         let s = shared();
+        // EL0 sampler (`profile` builds; nothing otherwise): when this trip out of generated code began, as early as Rust
+        // can. Only in execution mode, whose private tables map the study part.
+        if cfg!(feature = "profile") && ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
+            bell::left();
+        }
         // Perf chunk 22: a literal exit or a dispatcher miss is served from the gate's frame alone (`linker`, `missed`);
         // the copy is for the entries that may resume generated code mid-block (`resume` and its callers).
         execution::fp_cancel(frame as *mut NativeFrame, fault);
