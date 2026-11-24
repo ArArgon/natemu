@@ -119,7 +119,21 @@ All in existing families, through `tools/natemu-test`:
 
 ## Gate and campaigns
 
-**Placeholder: the orchestrator adds the gate and campaign results here when they finish.**
+All at natemu 670fab60 (FEX 13a1bfc), November 23, 2026.
+
+- **Gate** (`tools/natemu-test run --gate`, Apple M4): 91,695 passed, none failed, in 36 minutes. The 12 expected
+  failures are the recorded x87 double-precision deviations; the 2 known-bug results are the existing virtio block
+  retirement timing flake (`block-abandoned-worker-retire-timeout`); 4 known bugs passed this time.
+- **Campaign tier**, as a mosaic of two Macs at the same commit (pass and fail do not depend on the machine):
+  - `torture32`, `ltp32` and `libm32` on an Apple M3: 7,578 passed, none failed; 1,451 expected failures (the x87
+    deviations each suite lists) and 148 unsupported; accurate mode with AFP excluded, since it changes nothing on a
+    host with AFP.
+  - every other campaign suite on the Apple M4: 9,221 passed, none failed; 376 expected failures, 370 unsupported, 2
+    flaky (CPython's timerfd remaining-time test, the known timing-sensitive case), and 8 unverified: LTP's
+    `mprotect01`-`04` in the public suite at 1 and 4 vCPUs, which pass every check but are old-style LTP tests that
+    print no summary line for the verdict rule to find. main 035b243e gives the same 8 on the same parts.
+  - The two kernel self-tests that were expected failures for want of mixed-mode far transfers
+    (`test_syscall_vdso_32`, `sysret_ss_attrs_64`, campaign `x86st`) pass.
 
 ## Performance
 
