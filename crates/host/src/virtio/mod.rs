@@ -6,6 +6,7 @@
 //! alongside the vCPU owners, call [`Virtio::stop`], and join the owner before detaching IRQs or
 //! destroying the VM.
 mod block;
+mod console;
 mod model;
 mod net;
 mod pci;
@@ -13,6 +14,7 @@ mod profile;
 mod queue;
 mod slirp;
 pub(crate) use block::CALL_LIMIT as DISK_CALL_LIMIT;
+pub(crate) use console::Console;
 pub use net::{Frame, Gso, Offloads, PacketPort, RxChecksum, RxMeta, TxMeta};
 pub use slirp::{ForwardProtocol, PortForward, Slirp, SlirpOptions};
 #[cfg(feature = "testing")]
@@ -377,9 +379,7 @@ enum Profile {
     Entropy,
     Block(block::Disk),
     Network(net::Network),
-    /// Any device on owned buffers ([`model::Model`]).
-    // The console (the plan's next task) is the first outside the tests.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Any device on owned buffers ([`model::Model`]): the console.
     Model(model::Hosted),
 }
 impl Profile {

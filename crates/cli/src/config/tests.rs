@@ -371,7 +371,8 @@ fn transports_default_and_partial_specs() {
         Transports {
             disk: Pci,
             net: Mmio,
-            rng: Mmio
+            rng: Mmio,
+            console: Mmio
         }
     );
     let (_, c) = load_file(MIN, &["--virtio-transport", "net=pci"]);
@@ -380,7 +381,8 @@ fn transports_default_and_partial_specs() {
         Transports {
             disk: Mmio,
             net: Pci,
-            rng: Mmio
+            rng: Mmio,
+            console: Mmio
         }
     );
     // The file's table: nic is the network device; unnamed keys keep the file default (pci).
@@ -393,7 +395,8 @@ fn transports_default_and_partial_specs() {
         Transports {
             disk: Pci,
             net: Mmio,
-            rng: Pci
+            rng: Pci,
+            console: Pci
         }
     );
     let (_, c) = load_file(MIN, &["--set", "machine.transport.rng=mmio"]);
@@ -405,6 +408,119 @@ fn transports_default_and_partial_specs() {
         )
         .1)
         .contains("net")
+    );
+}
+
+/// `[[console]]` takes exactly one of `output` and `socket` (a path from the file's folder); its id joins the others.
+#[test]
+fn console_needs_exactly_one_of_output_socket() {
+    let _env = lock();
+    let (d, c) = load_file(
+        &format!("{MIN}[[console]]\nid = \"hvc\"\noutput = \"out/c.log\"\n"),
+        &[],
+    );
+    let c = c.unwrap();
+    assert_eq!(
+        c.consoles,
+        [Console {
+            id: "hvc".into(),
+            backend: ConsoleBackend::Output(d.join("out/c.log"))
+        }]
+    );
+    let (d, c) = load_file(
+        &format!("{MIN}[[console]]\nid = \"tty\"\nsocket = \"c.sock\"\n"),
+        &[],
+    );
+    assert_eq!(
+        c.unwrap().consoles[0].backend,
+        ConsoleBackend::Socket(d.join("c.sock"))
+    );
+    for (keys, found) in [("", "none"), ("output = \"a\"\nsocket = \"b\"\n", "both")] {
+        let e = err(load_file(&format!("{MIN}[[console]]\nid = \"hvc\"\n{keys}"), &[]).1);
+        assert!(
+            e.ends_with(&format!(
+                "vm.toml: console[0]: needs exactly one of output, socket; found {found}"
+            )),
+            "{e}"
+        );
+    }
+    let e = err(load_file(
+        &format!("{MIN}[[console]]\nid = \"hvc\"\nfile = \"a\"\n"),
+        &[],
+    )
+    .1);
+    assert!(e.contains("console[0].file: unknown field"), "{e}");
+    let two = format!("{MIN}[[rng]]\nid = \"x\"\n[[console]]\nid = \"x\"\noutput = \"a\"\n");
+    assert!(
+        err(load_file(&two, &[]).1).contains("device id \"x\" is used twice (rng 1 and console 1)")
+    );
+    let bad = format!("{MIN}[[console]]\nid = \"A\"\noutput = \"a\"\n");
+    assert!(err(load_file(&bad, &[]).1).contains("(console 1)"));
+}
+
+/// `machine.transport.console`: in the file's table, by `--set`, counted with the other transport keys, and given to
+/// each console the library sees.
+#[test]
+fn console_transport_key() {
+    let _env = lock();
+    let console = format!("{MIN}[[console]]\nid = \"hvc\"\noutput = \"c.log\"\n");
+    let (_, c) = load_file(&console, &[]);
+    assert_eq!(c.unwrap().transports.console, Pci, "with a file: pci");
+    assert_eq!(
+        load_old(&[]).unwrap().transports.console,
+        Mmio,
+        "no file: mmio"
+    );
+    let (_, c) = load_file(
+        &format!("[machine]\ntransport = {{ console = \"mmio\" }}\n{console}"),
+        &[],
+    );
+    let c = c.unwrap();
+    assert_eq!(
+        c.transports,
+        Transports {
+            console: Mmio,
+            ..Transports::all(Pci)
+        },
+        "the others keep the file default"
+    );
+    let boot = to_boot(&c, "rt".into(), vec![], None).unwrap();
+    assert_eq!(
+        boot.consoles,
+        [natemu::linux::ConsoleSpec {
+            id: "hvc".into(),
+            backend: c.consoles[0].backend.clone(),
+            transport: Mmio
+        }]
+    );
+    let (_, c) = load_file(&console, &["--set", "machine.transport.console=mmio"]);
+    assert_eq!(c.unwrap().transports.console, Mmio);
+    let (_, c) = load_file(&console, &["--set", "machine.transport=mmio"]);
+    assert_eq!(c.unwrap().transports.console, Mmio, "the whole transport");
+    let e = err(load_file(
+        &console,
+        &[
+            "--set",
+            "machine.transport=pci",
+            "--set",
+            "machine.transport.console=mmio",
+        ],
+    )
+    .1);
+    assert!(e.contains("machine.transport.console: set twice"), "{e}");
+    let e = err(load_file(
+        &format!("[machine]\ntransport = {{ console = \"usb\" }}\n{MIN}"),
+        &[],
+    )
+    .1);
+    assert!(
+        e.contains("machine.transport.console: bad transport \"usb\": mmio or pci"),
+        "{e}"
+    );
+    let e = err(load_old(&["--set", "machine.transport.console=usb"]));
+    assert!(
+        e.contains("--set machine.transport.console: bad transport"),
+        "{e}"
     );
 }
 
@@ -901,7 +1017,14 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
         Some(d.join("r.raw"))
     );
     assert_eq!(b.cmdline, "quiet");
-    assert_eq!(b.transports, Transports::all(Mmio));
+    // The table names no console: it keeps the file default.
+    assert_eq!(
+        b.transports,
+        Transports {
+            console: Pci,
+            ..Transports::all(Mmio)
+        }
+    );
     // Several plain disks keep their order.
     let mut three = cfg.clone();
     for id in ["b", "c"] {
@@ -1185,7 +1308,8 @@ fn review_fixes() {
             Transports {
                 disk: Mmio,
                 net: Pci,
-                rng: Mmio
+                rng: Mmio,
+                console: Mmio
             },
             "{spec}"
         );

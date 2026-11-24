@@ -679,7 +679,8 @@ mod tests {
             Ok(Transports {
                 disk: Pci,
                 net: Mmio,
-                rng: Mmio
+                rng: Mmio,
+                console: Mmio
             })
         );
         for bad in [

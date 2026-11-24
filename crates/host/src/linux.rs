@@ -50,6 +50,7 @@ pub struct Transports {
     pub disk: Transport,
     pub net: Transport,
     pub rng: Transport,
+    pub console: Transport,
 }
 impl Transports {
     pub const fn all(t: Transport) -> Self {
@@ -57,6 +58,7 @@ impl Transports {
             disk: t,
             net: t,
             rng: t,
+            console: t,
         }
     }
 }
@@ -98,6 +100,22 @@ impl DiskSpec {
     }
 }
 
+/// A virtio console ([`crate::virtio::Console`]): a second guest console, `/dev/hvc0` for the first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleSpec {
+    pub id: String,
+    pub backend: ConsoleBackend,
+    pub transport: Transport,
+}
+/// Where a console's bytes go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsoleBackend {
+    /// What the guest writes is appended to this file (created when missing); the guest receives nothing.
+    Output(PathBuf),
+    /// A Unix-domain socket natemu listens on (not built yet: a launch with one is refused).
+    Socket(PathBuf),
+}
+
 /// GET_ID serials are a file's device and inode in hex, so two read-only disks on one file would share one. A repeat
 /// gets a non-hex first character ('g', 'h', ...: never any file's serial) by its place in the list; the first use,
 /// and so every launch that names each file once, keeps the file's serial.
@@ -124,6 +142,8 @@ struct Wanted {
     rng: Option<Transport>,
     disks: Vec<Transport>,
     net: Option<Transport>,
+    /// Each console's id (for messages) and transport.
+    consoles: Vec<(String, Transport)>,
     /// The test function ([`Boot::pci_testdev`]).
     testdev: bool,
 }
@@ -136,6 +156,7 @@ impl Wanted {
             rng: rng.then_some(t.rng),
             disks: if disk { vec![t.disk] } else { vec![] },
             net: net.then_some(t.net),
+            consoles: vec![],
             testdev: false,
         }
     }
@@ -146,6 +167,7 @@ enum Kind {
     Rng,
     Disk(usize),
     Net,
+    Console(usize),
     /// The test function's two functions ([`crate::pci::testdev`]): no virtio device, no INTx line.
     TestDev,
 }
@@ -168,9 +190,13 @@ struct Placed {
 /// among the disks of their own transport, so a mixed list leaves no gaps. PCI INTx lines: slots 1-3 keep 16/17/18 (old
 /// launches unchanged) unless an MMIO device holds that line; the other PCI functions take, round robin in slot order,
 /// the lines 16-23 that no MMIO device holds, so they share lines with each other ([`SHARED_INTX`]), never with an MMIO
-/// device. Every line is inside 16-23, as `Virtio::new` asserts. Returned in wiring order: entropy, disk 0, network,
-/// then disks 1 and up, then the test function ([`Wanted::testdev`]) at the lowest slot no other function holds (its
-/// functions 0 and 1; no INTx line, no `_PRT` entry); none free is an error.
+/// device. Every line is inside 16-23, as `Virtio::new` asserts. Consoles come after the disks: the k-th console on
+/// MMIO takes page and uid 2 + max(m, 1) + k (m the MMIO disks) and the first line of 16-23 no MMIO device holds; the
+/// k-th on PCI takes slot 3 + max(p, 1) + k (p the PCI disks); no line or slot left is a launch error naming the
+/// console. Returned in wiring order: entropy, disk 0, network, disks 1 and up, the consoles, then the test function
+/// ([`Wanted::testdev`]) at the lowest slot no other function holds, the consoles' included (its functions 0 and 1; no
+/// INTx line, no `_PRT` entry); none free is an error. Consoles are placed first, so the test function never moves a
+/// console, and without consoles it takes the slot it took before them.
 ///
 /// Per-disk transports exist only in the library: the CLI and the config file have one `transport.disk` for all disks
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
@@ -233,6 +259,36 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
     out.extend(one(Kind::Net, w.net, NET_SLOT, NET_RESOURCE));
     for k in 1..w.disks.len() {
         out.push(disk(k));
+    }
+    // The next console page (and uid) and slot: after the disks'.
+    let mut page = 2 + (w.disks.len() - on_pci_disks).max(1) as u32;
+    let mut slot = 3 + on_pci_disks.max(1);
+    for (k, (id, t)) in w.consoles.iter().enumerate() {
+        let mut p = Placed {
+            kind: Kind::Console(k),
+            pci: pci(*t),
+            slot: 0,
+            res: BLOCK_RESOURCE,
+            intx: 0,
+        };
+        if p.pci {
+            p.slot = u8::try_from(slot).ok().filter(|&s| s <= 31).ok_or_else(|| {
+                format!("console {id:?}: PCI slots 1-31 are all used; use mmio or fewer disks on pci")
+            })?;
+            slot += 1;
+        } else {
+            let held: Vec<u32> = out.iter().filter(|p| !p.pci).map(|p| p.res.gsi).collect();
+            let gsi = (16..24).find(|l| !held.contains(l)).ok_or_else(|| {
+                format!("console {id:?}: no interrupt line left on mmio (lines 16-23 are all held); use pci")
+            })?;
+            p.res = boot::acpi::VirtioMmio {
+                uid: page as u8,
+                base: 0xf000_0000 + page * 4096,
+                gsi,
+            };
+            page += 1;
+        }
+        out.push(p);
     }
     // INTx lines. A slot 1-3 function keeps its old line unless an MMIO device holds it.
     let held: Vec<u32> = out.iter().filter(|p| !p.pci).map(|p| p.res.gsi).collect();
@@ -432,6 +488,8 @@ pub struct Boot {
     pub net: bool,
     /// Static localhost forwards and explicit host-loopback access; requires `net`.
     pub net_options: crate::virtio::SlirpOptions,
+    /// The virtio consoles (each with its own transport; `transports.console` is not read here).
+    pub consoles: Vec<ConsoleSpec>,
     /// The shared template pool (cross-vCPU reuse plan): back a read-only span of about 274 MiB of address space before guest
     /// RAM (pages are backed as touched), map it into every vCPU, publish admitted templates into it and let each resident look
     /// in it before asking the host. On by default (the gate passed, November 14: configure -3.3%, make -1.8% wall);
@@ -507,6 +565,7 @@ impl Boot {
             disks: Vec::new(),
             net: false,
             net_options: crate::virtio::SlirpOptions::default(),
+            consoles: Vec::new(),
             pool: true,
             transports: Transports::all(Transport::Mmio),
             mailbox: true,
@@ -526,6 +585,11 @@ impl Boot {
             rng: self.rng.then_some(t.rng),
             disks: self.disks.iter().map(|d| d.transport).collect(),
             net: self.net.then_some(t.net),
+            consoles: self
+                .consoles
+                .iter()
+                .map(|c| (c.id.clone(), c.transport))
+                .collect(),
             testdev: self.pci_testdev,
         })
     }
@@ -561,6 +625,16 @@ impl Boot {
             return Err("network: forwarding and host-loopback options require --net".into());
         }
         self.net_options.validate()?;
+        if let Some(c) = self
+            .consoles
+            .iter()
+            .find(|c| matches!(c.backend, ConsoleBackend::Socket(_)))
+        {
+            return Err(format!(
+                "console {:?}: a socket console is not supported yet; use output = FILE",
+                c.id
+            ));
+        }
         // PCID plan P1: the barriers' leaf SB needs FEAT_SB (the vCPU's ID_AA64ISAR1_EL1); refuse to turn them on without it
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
@@ -693,6 +767,15 @@ impl Boot {
                     net = Some(crate::virtio::Slirp::new(port, &self.net_options)?);
                     v
                 }
+                Kind::Console(k) => {
+                    let c = &self.consoles[k];
+                    let ConsoleBackend::Output(path) = &c.backend else {
+                        unreachable!("socket consoles are refused above")
+                    };
+                    let console = crate::virtio::Console::file(path)
+                        .map_err(|e| format!("console {:?}: {e}", c.id))?;
+                    crate::virtio::Virtio::model(irqs.clone(), gsi, console)
+                }
             };
             if p.pci {
                 bus.add(p.slot, 0, v.pci(p.slot))?;
@@ -753,8 +836,8 @@ impl Boot {
         if !self.kernel.is_empty() || self.initrd.is_some() || !self.cmdline.is_empty() {
             return Err("a firmware boot loads no kernel, initrd or command line".into());
         }
-        if self.rng || self.net || !self.disks.is_empty() {
-            return Err("a firmware boot has no virtio devices (no disk, network or entropy device)".into());
+        if self.rng || self.net || !self.disks.is_empty() || !self.consoles.is_empty() {
+            return Err("a firmware boot has no virtio devices (no disk, network, entropy device or console)".into());
         }
         if self.pci_testdev {
             return Err("a firmware boot has no PCI bus (debug.pci_testdev)".into());
@@ -1799,6 +1882,7 @@ mod placement_tests {
             rng: Some(other),
             disks: disks.to_vec(),
             net: Some(other),
+            consoles: vec![],
             testdev: false,
         }
     }
@@ -1827,11 +1911,9 @@ mod placement_tests {
         u.dedup();
         assert_eq!(u.len(), v.len(), "{what} collide: {v:?}");
     }
-    /// The invariants of any placement: distinct slots, pages and uids; MMIO lines exclusive (no other MMIO device and
-    /// no PCI function on them); every line in 16-23; disks dense per transport; NIC and entropy at their old places.
-    fn check(disks: &[Transport], other: Transport) -> Vec<Placed> {
-        let p = place(&wanted(disks, other)).unwrap();
-        assert_eq!(p.len(), disks.len() + 2);
+    /// Distinct slots, pages and uids; MMIO lines exclusive (no other MMIO device and no PCI function on them); every
+    /// line in 16-23.
+    fn collision_free(p: &[Placed]) {
         distinct(
             p.iter().filter(|q| q.pci).map(|q| q.slot).collect(),
             "slots",
@@ -1860,6 +1942,13 @@ mod placement_tests {
             "{:?}",
             lines.collect::<Vec<_>>()
         );
+    }
+    /// The invariants of any placement: distinct slots, pages and uids; MMIO lines exclusive (no other MMIO device and
+    /// no PCI function on them); every line in 16-23; disks dense per transport; NIC and entropy at their old places.
+    fn check(disks: &[Transport], other: Transport) -> Vec<Placed> {
+        let p = place(&wanted(disks, other)).unwrap();
+        assert_eq!(p.len(), disks.len() + 2);
+        collision_free(&p);
         let (mut m, mut pc) = (0u32, 0u8);
         for (k, &t) in disks.iter().enumerate() {
             let d = p.iter().find(|q| q.kind == Kind::Disk(k)).unwrap();
@@ -2005,7 +2094,7 @@ mod placement_tests {
         for (w, slot) in [
             (wanted(&[], Mmio), 1),
             (wanted(&[Mmio; 3], Mmio), 1),
-            (Wanted { rng: Some(Pci), disks: vec![], net: None, testdev: false }, 1),
+            (Wanted { rng: Some(Pci), disks: vec![], net: None, consoles: vec![], testdev: false }, 1),
             (wanted(&[], Pci), 1),
             (wanted(&[Pci], Pci), 4),
             (wanted(&[Pci; 3], Pci), 6),
@@ -2025,6 +2114,103 @@ mod placement_tests {
             place(&with(wanted(&[Pci; 29], Pci))).unwrap_err(),
             "debug.pci_testdev: PCI slots 1-31 are all used"
         );
+    }
+    fn with_consoles(disks: &[Transport], other: Transport, consoles: &[Transport]) -> Wanted {
+        Wanted {
+            consoles: consoles
+                .iter()
+                .enumerate()
+                .map(|(k, &t)| (format!("hvc{k}"), t))
+                .collect(),
+            ..wanted(disks, other)
+        }
+    }
+    /// Consoles come after the disks: the other devices keep their slots, pages, uids and MMIO lines (PCI functions'
+    /// shared lines may rotate), an MMIO console takes the page and uid after the disks' and the first free line, a PCI
+    /// console the slot after theirs, and the tables list each device once.
+    #[test]
+    fn consoles_are_placed_after_the_disks() {
+        // Up to three MMIO disks: with the NIC and entropy device on MMIO, three lines stay, for the two MMIO consoles
+        // and the PCI console's INTx.
+        for n in 0..=3 {
+            for disks in lists(n) {
+                for other in [Mmio, Pci] {
+                    let alone = place(&wanted(&disks, other)).unwrap();
+                    let p = place(&with_consoles(&disks, other, &[Mmio, Pci, Mmio])).unwrap();
+                    assert_eq!(p.len(), alone.len() + 3);
+                    collision_free(&p);
+                    for a in &alone {
+                        let b = p.iter().find(|q| q.kind == a.kind).unwrap();
+                        assert_eq!((b.pci, b.slot), (a.pci, a.slot), "{:?}", a.kind);
+                        if !a.pci {
+                            let (x, y) = (a.res, b.res);
+                            assert_eq!((y.uid, y.base, y.gsi), (x.uid, x.base, x.gsi));
+                        }
+                    }
+                    let m = disks.iter().filter(|&&t| t == Mmio).count() as u32;
+                    let pc = disks.len() as u32 - m;
+                    let held: Vec<u32> =
+                        alone.iter().filter(|q| !q.pci).map(|q| q.res.gsi).collect();
+                    let free: Vec<u32> = (16..24).filter(|l| !held.contains(l)).collect();
+                    let console = |k| p.iter().find(|q| q.kind == Kind::Console(k)).unwrap();
+                    for (k, i) in [(0, 0), (2, 1)] {
+                        let c = console(k);
+                        let page = 2 + m.max(1) + i;
+                        assert!(!c.pci);
+                        assert_eq!(
+                            (u32::from(c.res.uid), c.res.base, c.res.gsi),
+                            (page, 0xf000_0000 + page * 4096, free[i as usize])
+                        );
+                    }
+                    assert!(console(1).pci);
+                    assert_eq!(u32::from(console(1).slot), 3 + pc.max(1));
+                    let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
+                    assert_eq!(plan.manifest.len() + plan.functions.len(), p.len());
+                }
+            }
+        }
+    }
+    /// A console on MMIO when every line 16-23 is held by an MMIO device is a launch error naming it; so is one on PCI
+    /// when the disks hold every slot.
+    #[test]
+    fn mmio_without_free_gsi_is_refused() {
+        let full = with_consoles(&[Mmio; MAX_MMIO_DISKS], Mmio, &[Mmio]);
+        assert_eq!(
+            place(&full).unwrap_err(),
+            "console \"hvc0\": no interrupt line left on mmio (lines 16-23 are all held); use pci"
+        );
+        // One line fewer held: the console takes the last one, and a second console is refused.
+        let p = place(&with_consoles(&[Mmio; 5], Mmio, &[Mmio])).unwrap();
+        let c = p.iter().find(|q| q.kind == Kind::Console(0)).unwrap();
+        assert_eq!((c.res.uid, c.res.base, c.res.gsi), (7, 0xf000_7000, 23));
+        assert_eq!(
+            place(&with_consoles(&[Mmio; 5], Mmio, &[Mmio, Mmio])).unwrap_err(),
+            "console \"hvc1\": no interrupt line left on mmio (lines 16-23 are all held); use pci"
+        );
+        assert_eq!(
+            place(&with_consoles(&[Pci; MAX_PCI_DISKS], Pci, &[Pci])).unwrap_err(),
+            "console \"hvc0\": PCI slots 1-31 are all used; use mmio or fewer disks on pci"
+        );
+    }
+    /// Consoles and the test function: the consoles take their slots first, the test function the lowest slot still
+    /// free (a console's included), and neither moves the other's devices.
+    #[test]
+    fn the_test_function_comes_after_the_consoles() {
+        for (disks, consoles, slot) in [
+            (&[Pci][..], &[Pci][..], 5),
+            (&[Pci][..], &[Mmio][..], 4),
+            (&[Pci; 3][..], &[Pci, Pci][..], 8),
+            (&[][..], &[Mmio, Pci][..], 1),
+        ] {
+            let w = with_consoles(disks, Pci, consoles);
+            let before = place(&w).unwrap();
+            let p = place(&Wanted { testdev: true, ..w }).unwrap();
+            let t = p.last().unwrap();
+            assert_eq!((t.kind, t.pci, t.slot), (Kind::TestDev, true, slot));
+            assert_eq!(format!("{:?}", &p[..p.len() - 1]), format!("{before:?}"));
+        }
+        let full = Wanted { testdev: true, ..with_consoles(&[Pci; 28], Pci, &[Pci]) };
+        assert_eq!(place(&full).unwrap_err(), "debug.pci_testdev: PCI slots 1-31 are all used");
     }
 }
 
@@ -2065,7 +2251,12 @@ mod pin_tests {
     #[test]
     fn launch_plans_are_unchanged() {
         use Transport::{Mmio, Pci};
-        let mk = |disk, net, rng| Transports { disk, net, rng };
+        let mk = |disk, net, rng| Transports {
+            disk,
+            net,
+            rng,
+            console: Mmio,
+        };
         let mixes = [
             Transports::all(Mmio),
             Transports::all(Pci),
@@ -2166,7 +2357,12 @@ mod pin_tests {
     #[test]
     #[ignore]
     fn original_logic_matches_the_pins() {
-        let mk = |disk, net, rng| Transports { disk, net, rng };
+        let mk = |disk, net, rng| Transports {
+            disk,
+            net,
+            rng,
+            console: Mmio,
+        };
         use Transport::{Mmio, Pci};
         let mixes = [
             Transports::all(Mmio),

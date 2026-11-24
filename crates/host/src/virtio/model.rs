@@ -5,7 +5,7 @@
 //!
 //! Locking: [`Model::started`], [`Model::reset`] and the [`ModelPort::on_ready`] callback run under the device's state
 //! lock and only record and signal; [`Model::request`] and [`Model::drain`] run without it.
-// The console (the plan's next task) is the first device on this interface outside the tests.
+// The console's file backend delivers nothing: `ModelPort::deliver` and `on_ready` serve its socket backend (next).
 #![cfg_attr(not(test), expect(dead_code))]
 use super::{
     Arrival, Chain, Guest, Identity, Profile, Request, Virtio, descriptors_in, gather,
@@ -536,7 +536,7 @@ fn receive_room(chain: &[Descriptor]) -> Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{Copier, Guest, RNG_RESOURCE, reg, status, tests::device};
     use super::*;
     use crate::{
@@ -554,7 +554,7 @@ mod tests {
     const SIZES: [u16; 2] = [64, 256];
     /// The echo device: bytes transmitted on queue 1 are delivered back on queue 0 through its port. It offers feature
     /// bits 0 and 1, bit 1 depending on bit 0, and ten bytes of configuration.
-    struct Echo {
+    pub(in super::super) struct Echo {
         queues: [QueueSpec; 2],
         port: Mutex<Option<ModelPort>>,
         /// Every piece offered: (queue, bytes, last, writable).
@@ -692,7 +692,7 @@ mod tests {
         };
         hosted.lost.load(SeqCst)
     }
-    fn until(what: &str, f: impl Fn() -> bool) {
+    pub(in super::super) fn until(what: &str, f: impl Fn() -> bool) {
         let start = Instant::now();
         while !f() {
             assert!(
@@ -708,20 +708,34 @@ mod tests {
             .collect()
     }
 
-    /// A whole guest: both queues' rings and buffers in fixture RAM, the device's owner on a thread.
-    struct Rig {
+    /// A whole guest of a two-queue model (the echo device unless named): both queues' rings and buffers in fixture
+    /// RAM, the device's owner on a thread.
+    pub(in super::super) struct Rig<M = Echo> {
         b: crate::execution::Backing,
-        d: Arc<Virtio>,
-        model: Arc<Echo>,
+        pub d: Arc<Virtio>,
+        pub model: Arc<M>,
+        /// Each queue's size: its maximum.
+        sizes: [u16; 2],
         /// Per queue: the next descriptor and available index the driver uses.
         next: Mutex<[(u16, u16); 2]>,
     }
     impl Rig {
         fn new(stream: bool) -> Self {
-            let (d, model) = echo(stream);
+            Self::with(Arc::new(Echo::new(stream)))
+        }
+        fn port(&self) -> ModelPort {
+            self.model.port.lock().unwrap().clone().expect("started")
+        }
+    }
+    impl<M: Model + 'static> Rig<M> {
+        /// `model`'s device, started: every offered feature accepted.
+        pub fn with(model: Arc<M>) -> Self {
+            let d = Virtio::model(device().irqs.clone(), GSI, model.clone());
+            let queues = model.queues();
             let rig = Self {
                 b: io::backing_with(1, RAM),
                 d,
+                sizes: [queues[0].max, queues[1].max],
                 model,
                 next: Mutex::new([(0, 0); 2]),
             };
@@ -730,11 +744,11 @@ mod tests {
         }
         /// Negotiate, lay out both queues at their maximum size, DRIVER_OK.
         fn init(&self) {
-            assert_eq!(negotiate(&self.d, 0b11), 11);
+            assert_eq!(negotiate(&self.d, self.model.features()), 11);
             for (q, [desc, avail, used]) in RINGS.iter().enumerate() {
                 for (o, v) in [
                     (reg::QUEUE_SEL, q as u64),
-                    (reg::QUEUE_NUM, SIZES[q].into()),
+                    (reg::QUEUE_NUM, self.sizes[q].into()),
                     (reg::QUEUE_DESC_LOW, *desc),
                     (reg::QUEUE_DRIVER_LOW, *avail),
                     (reg::QUEUE_DEVICE_LOW, *used),
@@ -762,10 +776,7 @@ mod tests {
             *self.next.lock().unwrap() = [(0, 0); 2];
             self.init();
         }
-        fn port(&self) -> ModelPort {
-            self.model.port.lock().unwrap().clone().expect("started")
-        }
-        fn put(&self, gpa: u64, bytes: &[u8]) {
+        pub fn put(&self, gpa: u64, bytes: &[u8]) {
             let at = self.b.ram.range(gpa, bytes.len() as u64).unwrap();
             // SAFETY: fixture RAM in bounds; the device writes only buffers it was given.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
@@ -780,8 +791,8 @@ mod tests {
             unsafe { AtomicU16::from_ptr(self.b.ram.range(gpa, 2).unwrap().cast()) }
         }
         /// Post a chain of `(gpa, len, device-writable)` buffers on `q`; its head.
-        fn post(&self, q: usize, buffers: &[(u64, u32, bool)]) -> u16 {
-            let size = SIZES[q];
+        pub fn post(&self, q: usize, buffers: &[(u64, u32, bool)]) -> u16 {
+            let size = self.sizes[q];
             let mut next = self.next.lock().unwrap();
             let (first, index) = next[q];
             for (i, &(gpa, len, writable)) in buffers.iter().enumerate() {
@@ -808,15 +819,15 @@ mod tests {
         fn post_rx(&self, i: u64, len: u32) -> u16 {
             self.post(0, &[(RX + i * 0x1000, len, true)])
         }
-        fn kick(&self, q: u64) {
+        pub fn kick(&self, q: u64) {
             write(&self.d, reg::QUEUE_NOTIFY, q);
         }
-        fn used(&self, q: usize) -> u16 {
+        pub fn used(&self, q: usize) -> u16 {
             self.word(RINGS[q][2] + 2).load(SeqCst)
         }
         /// Used element `slot` of `q`: (head, length).
-        fn element(&self, q: usize, slot: u16) -> (u32, u32) {
-            let e = self.get(RINGS[q][2] + 4 + u64::from(slot % SIZES[q]) * 8, 8);
+        pub fn element(&self, q: usize, slot: u16) -> (u32, u32) {
+            let e = self.get(RINGS[q][2] + 4 + u64::from(slot % self.sizes[q]) * 8, 8);
             (
                 u32::from_le_bytes(e[..4].try_into().unwrap()),
                 u32::from_le_bytes(e[4..].try_into().unwrap()),
@@ -831,11 +842,11 @@ mod tests {
                 })
                 .collect()
         }
-        fn needs_reset(&self) -> bool {
+        pub fn needs_reset(&self) -> bool {
             self.d.lock().status & status::NEEDS_RESET != 0
         }
         /// Run the owner while `body` drives the guest; then stop it.
-        fn run(&self, body: impl FnOnce(&Self)) {
+        pub fn run(&self, body: impl FnOnce(&Self)) {
             let b = &self.b;
             let copy = move |spans: &mut [Transfer<'_>], publish: usize, permit: &CopyPermit| {
                 io::windowless_permit(b, spans, publish, permit)

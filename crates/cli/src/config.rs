@@ -5,7 +5,7 @@
 //! never a text tree. Paths of file values are resolved against the file's folder; flag and `--set` values are kept as given
 //! (so they mean the working directory, as before). [`to_boot`] turns the result into the library's [`Boot`].
 use crate::Cli;
-use natemu::linux::{Boot, Transport, Transports};
+use natemu::linux::{Boot, ConsoleBackend, Transport, Transports};
 use natemu::virtio::{PortForward, SlirpOptions};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -31,6 +31,11 @@ pub struct Nic {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rng {
     pub id: String,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Console {
+    pub id: String,
+    pub backend: ConsoleBackend,
 }
 
 /// The final configuration. Fields are final values (defaults filled in); `None` is "not given".
@@ -68,6 +73,7 @@ pub struct Config {
     pub disks: Vec<Disk>,
     pub nics: Vec<Nic>,
     pub rngs: Vec<Rng>,
+    pub consoles: Vec<Console>,
     pub check_reuse: bool,
     pub pool: bool,
     /// Test only: the PCI test function (`natemu::linux::Boot::pci_testdev`).
@@ -115,6 +121,7 @@ impl Config {
             disks: vec![],
             nics: vec![],
             rngs: vec![],
+            consoles: vec![],
             check_reuse: false,
             pool: true,
             pci_testdev: false,
@@ -153,6 +160,8 @@ struct FileConfig {
     nic: Vec<FNic>,
     #[serde(default)]
     rng: Vec<FRng>,
+    #[serde(default)]
+    console: Vec<FConsole>,
     debug: Option<FDebug>,
 }
 #[derive(Deserialize)]
@@ -171,6 +180,7 @@ struct FTransport {
     disk: Option<String>,
     nic: Option<String>,
     rng: Option<String>,
+    console: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +238,13 @@ struct FNic {
 #[serde(deny_unknown_fields)]
 struct FRng {
     id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FConsole {
+    id: String,
+    output: Option<PathBuf>,
+    socket: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +316,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
             one(t.disk, "disk", &mut cfg.transports.disk)?;
             one(t.nic, "nic", &mut cfg.transports.net)?;
             one(t.rng, "rng", &mut cfg.transports.rng)?;
+            one(t.console, "console", &mut cfg.transports.console)?;
         }
     }
     if let Some(s) = f.serial {
@@ -379,6 +397,19 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         });
     }
     cfg.rngs.extend(f.rng.into_iter().map(|r| Rng { id: r.id }));
+    for (i, c) in f.console.into_iter().enumerate() {
+        let backend = match (c.output, c.socket) {
+            (Some(o), None) => ConsoleBackend::Output(rel(base, &o)),
+            (None, Some(s)) => ConsoleBackend::Socket(rel(base, &s)),
+            (o, _) => {
+                return Err(format!(
+                    "{who}: console[{i}]: needs exactly one of output, socket; found {}",
+                    if o.is_none() { "none" } else { "both" }
+                ));
+            }
+        };
+        cfg.consoles.push(Console { id: c.id, backend });
+    }
     if let Some(d) = f.debug {
         cfg.check_reuse = d.check_reuse.unwrap_or(cfg.check_reuse);
         cfg.pool = d.pool.unwrap_or(cfg.pool);
@@ -543,6 +574,7 @@ fn apply_flags(
             "machine.transport.disk",
             "machine.transport.nic",
             "machine.transport.rng",
+            "machine.transport.console",
         ],
     ) {
         cfg.transports = cli.virtio_transport;
@@ -595,13 +627,14 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 30] = [
+const KEYS: [&str; 31] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
     "machine.transport.disk",
     "machine.transport.nic",
     "machine.transport.rng",
+    "machine.transport.console",
     "machine.pvpanic",
     "machine.smbios",
     "machine.ps2",
@@ -711,6 +744,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
             "machine.transport.disk",
             "machine.transport.nic",
             "machine.transport.rng",
+            "machine.transport.console",
         ]
     } else {
         vec![key]
@@ -747,6 +781,9 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "machine.transport.disk" => cfg.transports.disk = transport_word(text).map_err(err)?,
         "machine.transport.nic" => cfg.transports.net = transport_word(text).map_err(err)?,
         "machine.transport.rng" => cfg.transports.rng = transport_word(text).map_err(err)?,
+        "machine.transport.console" => {
+            cfg.transports.console = transport_word(text).map_err(err)?
+        }
         "machine.pvpanic" => cfg.pvpanic = boolish(text).map_err(err)?,
         "machine.smbios" => cfg.smbios = boolish(text).map_err(err)?,
         "machine.ps2" => cfg.ps2 = boolish(text).map_err(err)?,
@@ -828,8 +865,15 @@ pub fn validate(cfg: &Config) -> Res<()> {
     if cfg.firmware.is_some() && (cfg.initrd.is_some() || !cfg.cmdline.is_empty()) {
         return Err(format!("{who}: a firmware boot takes no initrd or kernel command line"));
     }
-    if cfg.firmware.is_some() && !(cfg.disks.is_empty() && cfg.nics.is_empty() && cfg.rngs.is_empty()) {
-        return Err(format!("{who}: a firmware boot has no virtio devices yet (no disk, nic or rng)"));
+    if cfg.firmware.is_some()
+        && !(cfg.disks.is_empty()
+            && cfg.nics.is_empty()
+            && cfg.rngs.is_empty()
+            && cfg.consoles.is_empty())
+    {
+        return Err(format!(
+            "{who}: a firmware boot has no virtio devices yet (no disk, nic, rng or console)"
+        ));
     }
     if cfg.fexc.is_none() {
         return Err(format!(
@@ -852,6 +896,12 @@ pub fn validate(cfg: &Config) -> Res<()> {
                 .iter()
                 .enumerate()
                 .map(|(i, d)| (&d.id, "rng", i + 1)),
+        )
+        .chain(
+            cfg.consoles
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (&d.id, "console", i + 1)),
         );
     let mut first: Vec<(&String, &str, usize)> = vec![];
     for (id, kind, n) in ids {
@@ -1001,6 +1051,15 @@ pub fn to_boot(
         .collect();
     boot.net = !cfg.nics.is_empty();
     boot.net_options = cfg.net_options();
+    boot.consoles = cfg
+        .consoles
+        .iter()
+        .map(|c| natemu::linux::ConsoleSpec {
+            id: c.id.clone(),
+            backend: c.backend.clone(),
+            transport: cfg.transports.console,
+        })
+        .collect();
     boot.pool = cfg.pool;
     boot.pci_testdev = cfg.pci_testdev;
     boot.check_reuse = cfg.check_reuse;

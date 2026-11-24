@@ -83,7 +83,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | --- | --- | --- | --- |
 | `[machine]` | `ram` | `2G` | Guest RAM: a size string (as `--ram`) or an integer of bytes |
 | | `vcpus` | `1` | Processors |
-| | `transport` | all `pci` with a file | `disk`, `nic`, `rng`, each `"mmio"` or `"pci"` |
+| | `transport` | all `pci` with a file | `disk`, `nic`, `rng`, `console`, each `"mmio"` or `"pci"` |
 | | `pvpanic` | `true` | The pvpanic device (ACPI `QEMU0001`, port 505H): a guest kernel panic ends the run (`natemu: Power(4)`, exit status 2) |
 | | `smbios` | `true` | SMBIOS 3.0 tables naming the machine `natemu` (what `dmidecode` and `/sys/class/dmi/id` show), the entry point at F0000H; a firmware boot or a Multiboot kernel ignores it |
 | | `ps2` | `true` | An 8042 controller with a PS/2 keyboard and mouse (no host input reaches them yet); `false` leaves port 64H a reset-only register |
@@ -107,6 +107,9 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `forward` | none | List of `[tcp\|udp:]HOST_PORT:GUEST_PORT` strings |
 | | `host_loopback` | `false` | The guest may reach the Mac's `127.0.0.1` via `10.0.2.2` |
 | `[[rng]]` | `id` | required | Entropy device |
+| `[[console]]` | `id` | required | A second console for the guest (see below) |
+| | `output` | none | A file: what the guest writes to the console is added to its end (created when missing) |
+| | `socket` | none | A Unix socket path (not supported yet: a launch with one is refused) |
 | `[debug]` | `pool` | `true` | Shared template pool |
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
@@ -149,6 +152,22 @@ interpreter, which does not yet run every instruction such code uses
 
 Virtio devices attach over PCI when a `--config` file is given and over MMIO when there is none
 (the old command lines). `machine.transport` or `--virtio-transport` overrides either.
+
+### A second console
+
+`[[console]]` gives the guest a console besides COM1: a virtio console, which Linux calls `/dev/hvc0` (the
+next one `/dev/hvc1`). It needs exactly one of `output` and `socket`. With `output = "console.log"`,
+everything the guest writes to `/dev/hvc0` is added to the end of that file, and the guest reads
+nothing from it. A guest that writes faster than the Mac takes the bytes waits for it, as it would at a
+slow terminal; at power-off natemu waits up to 2 seconds for the last bytes to reach the file, then
+drops what is left and says so on standard error. `machine.transport.console` chooses MMIO or PCI for
+every console.
+
+```toml
+[[console]]
+id = "log"
+output = "guest-console.log"
+```
 
 ### Serial: `stdout` as a keyword and as a file name
 
@@ -202,13 +221,17 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: no boot method: --kernel FILE, or [boot.kernel] in a --config file (or a firmware image: --firmware FILE)` | No kernel or firmware anywhere |
 | `c.toml: two boot methods: a kernel and a firmware image (...)` | A kernel and a firmware image both given |
 | `c.toml: [boot.firmware] needs image (or pass --firmware FILE)` | The table has no image |
-| `c.toml: a firmware boot takes no initrd or kernel command line` | Also `has no virtio devices yet` for a disk, nic or rng |
+| `c.toml: a firmware boot takes no initrd or kernel command line` | Also `has no virtio devices yet` for a disk, nic, rng or console |
 | `c.toml: no fexc: --fexc FILE, or [engine] fexc in a --config file` | No compiler anywhere |
 | `c.toml: device id "A b" must match [a-z0-9_-]+ (disk 1)` | An id has other characters |
 | `c.toml: device id "a" is used twice (disk 1 and nic 1)` | Ids are unique across all device kinds |
 | `c.toml: at most one [[nic]] is supported in M1; found 2` | Also for `[[rng]]` |
 | `c.toml: disks "a" and "b" are the same file; that is allowed only when both are readonly or snapshot` | One image, two writers |
 | `c.toml: nic[0].forward: bad forward "x": [tcp\|udp:]HOST_PORT:GUEST_PORT, decimal ports 1-65535` | A forward is malformed |
+| `c.toml: console[0]: needs exactly one of output, socket; found none` | Also `found both` |
+| `console "log": a socket console is not supported yet; use output = FILE` | `socket` is accepted in the file but not built yet |
+| `console "log": no interrupt line left on mmio (lines 16-23 are all held); use pci` | Every MMIO interrupt line is taken (6 MMIO disks with the NIC and entropy device) |
+| `console "log": PCI slots 1-31 are all used; use mmio or fewer disks on pci` | 29 disks on PCI leave no slot |
 | `--set bad: expected key=value` | `--set` without `=` |
 | `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
 | `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
@@ -230,6 +253,8 @@ none) and the key. All of these are found before the VM starts, and the process 
   `at most 6 disks on mmio (interrupt lines 16-23); use pci for more` (or
   `PCI slots 1-31 are all used: at most 29 disks on pci`).
 - One NIC and one entropy device.
+- A console on MMIO needs one of the interrupt lines 16-23 that no other MMIO device holds, and one on
+  PCI a slot after the disks'; a launch without one is refused, naming the console.
 - No `[boot.uefi]` yet.
 - Disk images are detected by content, not name (raw or qcow2; VMDK, VHDX, VDI, VHD and DMG are
   refused by name).
