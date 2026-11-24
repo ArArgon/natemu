@@ -58,7 +58,7 @@ def _kernel_symbols_recipe(out: pathlib.Path, inputs: list) -> None:
     import importlib.util
     spec = importlib.util.spec_from_file_location('sample_symbols_recipe', script)
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-    try: m.Kallsyms(m.bzimage_payload(pathlib.Path(bzimage).read_bytes())).write_table(out / 'kallsyms.txt')
+    try: m.kernel_symbols(bzimage).write_table(out / "kallsyms.txt")
     except RuntimeError as e: raise BuildFailure('kernel-symbols', str(e)) from None
 
 

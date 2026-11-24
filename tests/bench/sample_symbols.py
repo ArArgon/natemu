@@ -22,6 +22,7 @@ binaries are stripped, so most of libc's and cc1's functions have no name) name 
 sized function symbol. A block found in several files at once is ambiguous and named by the first, with the count noted.
 """
 import bisect
+import hashlib
 import collections
 import mmap
 import pathlib
@@ -32,6 +33,8 @@ import subprocess
 
 
 # --- the kernel ------------------------------------------------------------------------------------------------------
+MODULES = (0xffff_ffff_c000_0000, 0xffff_ffff_ff00_0000)
+MATCH_BYTES = 8           # a user block's guest bytes the image search keys on
 ZSTD_PATHS = ('/opt/homebrew/bin/zstd', '/usr/local/bin/zstd')     # Homebrew's, when PATH lacks it
 ZSTD_NEEDED = "Debian's kernel is zstd-compressed: reading its symbols needs Homebrew's zstd (brew install zstd) or Python 3.14+"
 
@@ -122,6 +125,7 @@ class Kallsyms:
         self.addrs = [a for a, _ in syms]
         self.names = [n for _, n in syms]
         self.text = self.lookup_addr('_text')
+        self.bzimage_sha256 = None
 
     def lookup_addr(self, name):
         try: return self.addrs[self.names.index(name)]
@@ -138,13 +142,23 @@ class Kallsyms:
 
 
     def write_table(self, path):
-        """The table as `ADDRESS NAME` lines (hex, sorted): testkit's kernel-symbols input, which the report reads."""
-        pathlib.Path(path).write_text(''.join(f'{a:x} {n}\n' for a, n in zip(self.addrs, self.names)))
+        """The table as `ADDRESS NAME` lines (hex, sorted) after a `# bzimage-sha256 HEX` line: testkit's kernel-symbols
+        input, which the report reads."""
+        pathlib.Path(path).write_text(f'# bzimage-sha256 {self.bzimage_sha256}\n'
+                                      + ''.join(f'{a:x} {n}\n' for a, n in zip(self.addrs, self.names)))
+
+    def module(self, addr):
+        """`addr` (less the slide) lies outside the image's text, in x86-64's module area (MODULES_VADDR, 0xffffffffc0000000
+        with KASLR's 1 GiB image, to MODULES_END)."""
+        etext = self.lookup_addr('_etext')
+        return MODULES[0] <= addr < MODULES[1] and not (self.text is not None and etext is not None and self.text <= addr < etext)
 
     @classmethod
     def from_table(cls, path):
         k = cls.__new__(cls)
-        rows = [line.split(' ', 1) for line in pathlib.Path(path).read_text().splitlines() if line.strip()]
+        lines = pathlib.Path(path).read_text().splitlines()
+        k.bzimage_sha256 = next((x.split()[2] for x in lines[:1] if x.startswith('# bzimage-sha256 ')), None)
+        rows = [line.split(' ', 1) for line in lines if line.strip() and not line.startswith('#')]
         k.addrs, k.names = [int(a, 16) for a, _ in rows], [n for _, n in rows]
         k.text = k.lookup_addr('_text')
         return k
@@ -153,8 +167,14 @@ class Kallsyms:
 def kernel_symbols(path):
     """The kernel's text symbols from a table (write_table's, the framework's {kernel_symbols}) or from a bzImage."""
     data = pathlib.Path(path).read_bytes()
-    if data[0x202:0x206] == b'HdrS': return Kallsyms(bzimage_payload(data))     # the bzImage's setup header
+    if data[0x202:0x206] == b'HdrS':                                            # the bzImage's setup header
+        k = Kallsyms(bzimage_payload(data)); k.bzimage_sha256 = hashlib.sha256(data).hexdigest()
+        return k
     return Kallsyms.from_table(path)
+
+
+def sha256(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
 
 def ktext(markers):
@@ -246,7 +266,7 @@ class Image:
                 try: self.files.append((Elf(name, e), off))
                 except struct.error: continue
 
-    def match(self, queries, key=8):
+    def match(self, queries, key=MATCH_BYTES):
         """{query id: [(Elf, vaddr), ...]} for queries {id: (page offset, guest bytes, 64-bit)}: every place an ELF file of
         that class holds the bytes in an executable segment at that page offset."""
         out = collections.defaultdict(list)

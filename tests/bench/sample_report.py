@@ -4,7 +4,7 @@
 NAME.report.json and NAME.report.md beside them.
 
     python3 tests/bench/sample_report.py --profile NAME [--markers FILE] [--perf FILE] [--profile NAME ...]
-                                         [--window SECONDS] [--require-place PLACE] [--kernel-symbols TABLE] [--image CPIO]
+                                         [--window SECONDS] [--require-place PLACE] [--kernel-symbols TABLE] [--boots BZIMAGE] [--image CPIO]
                                          [-- COMMAND ...]
 
 With `-- COMMAND`, the command runs first (a sampling boot: tools/bench/run.py --sample-us, tests/io/run_io5.py --sample-us)
@@ -29,7 +29,9 @@ place has no sample.
 
 Roles and symbols (the plan's chunk 1): each block sample's word gets its role from the object's records and the A64
 patterns (tests/bench/sample_roles.py), and its symbol (tests/bench/sample_symbols.py): kernel samples by the kallsyms of
-`--kernel-symbols TABLE` (the framework's kernel-symbols input; a bzImage is read too) with the KASLR slide from the profile's markers, user samples by finding their blocks' guest bytes in
+`--kernel-symbols TABLE` (the framework's kernel-symbols input; a bzImage is read too) with the KASLR slide from the
+profile's markers (`--boots BZIMAGE`: the kernel the run booted, which must be the table's), user samples by finding their
+blocks' guest bytes in
 the binaries of `--image CPIO` (the bench image; without it user samples stay at block level). Per phase: block samples by
 role, user and kernel and 64- and 32-bit apart, by group (FEX's body, its flag words, natemu's words, other), the shares
 the plan's section-7 rows read (split checks and probes, stack checks, REP string bodies, glibc AVX2/EVEX code, flag words,
@@ -204,7 +206,7 @@ class Attribution:
     def __init__(self, objects, kernel=None, slide=0, image=None):
         self.objects, self.kernel, self.slide, self.image = objects, kernel, slide, image
         self.info_of, self.user, self.sym_of = {}, {}, {}
-        self.ambiguous = self.matched = self.looked_up = 0
+        self.ambiguous = self.matched = self.looked_up = self.short = self.multi_in_file = 0
         self.reach = {}             # per block, the highest native offset sampled (set_reach)
         self.entry_of = {}
 
@@ -274,24 +276,36 @@ class Attribution:
             if k in self.user or privilege(k[2], k[0], True) != 'user': continue
             info = self.info(k)
             self.user[k] = None
-            if info and info['guest']: queries[k] = (k[0] & 0xfff, info['guest'], mode(k[2]) == '64')
+            if not (info and info['guest']): continue
+            if len(info['guest']) < sample_symbols.MATCH_BYTES: self.user[k] = 'short'; self.short += 1; continue
+            queries[k] = (k[0] & 0xfff, info['guest'], mode(k[2]) == '64')
         self.looked_up += len(queries)
         for k, hits in self.image.match(queries).items():
-            if len({e.name for e, _ in hits}) > 1: self.ambiguous += 1
+            files = sorted({e.name for e, _ in hits})
+            if len(files) > 1:
+                self.ambiguous += 1
+                self.user[k] = ('ambiguous', files)
+                continue
+            if len(hits) > 1: self.multi_in_file += 1     # the same bytes twice in one file: named by the first
             self.user[k] = hits[0]
             self.matched += 1
 
     def symbol(self, key, info, off):
-        """'kernel:NAME', 'FILE:NAME', 'FILE:?' (found, no symbol), 'kernel:?' or 'user:?' (not found)."""
+        """'kernel:NAME', 'kernel:module' (outside the image's text, in the module area), 'FILE:NAME', 'FILE:?' (found, no
+        symbol), 'ambiguous:F1|F2' (found in several files), 'user:short' (fewer guest bytes than a search needs), 'kernel:?'
+        or 'user:?' (not found)."""
         g = self.insn(info, off)
         if (key, g) in self.sym_of: return self.sym_of[(key, g)]
         rip, _, ctx = key
         if privilege(ctx, rip, True) == 'kernel':
-            s = self.kernel.lookup(rip + (g or 0) - self.slide) if self.kernel else None
-            name = f'kernel:{s[0]}' if s else 'kernel:?'
+            a = rip + (g or 0) - self.slide
+            s = self.kernel.lookup(a) if self.kernel else None
+            name = f'kernel:{s[0]}' if s else 'kernel:module' if self.kernel and self.kernel.module(a) else 'kernel:?'
         else:
             m = self.user.get(key)
             if m is None: name = 'user:?'
+            elif m == 'short': name = 'user:short'
+            elif m[0] == 'ambiguous': name = 'ambiguous:' + '|'.join(sample_symbols.basename(f) for f in m[1][:3])
             else:
                 elf, va = m
                 name = f'{sample_symbols.basename(elf.name)}:{elf.lookup(va + (g or 0)) or "?"}'
@@ -338,11 +352,11 @@ class Attribution:
         kcopy = {s[7:]: n for s, n in sym.items() if s.startswith('kernel:') and s[7:] in sample_symbols.KERNEL_COPY}
         hot_total = sum(hot.values())
         shares = dict(
-            split_checks_and_probes=pct(allr['split_check'] + allr['probe']), stack_checks=pct(allr['stack_check']),
+            split_checks_and_probes=pct(allr['split_check'] + allr['split_stub'] + allr['probe']), stack_checks=pct(allr['stack_check']),
             rep_string=pct(sum(rep.values())), rep_movs=pct(rep['movs']), rep_stos=pct(rep['stos']),
             glibc_avx2_evex_named=pct(avx2_named), libc_wide_vector_blocks=pct(wide_libc), flag_words=pct(allr['flags']),
             load_then_move=pct(allr['load_move']), kernel_copy_clear=pct(sum(kcopy.values())),
-            exits=pct(allr['exit_literal'] + allr['exit_computed']),
+            exits=pct(allr['exit_literal'] + allr['exit_computed']), x87_run=pct(allr['x87_run']),
             fex_body=pct(groups['fex_body']), fex_flags=pct(groups['fex_flags']), natemu=pct(groups['natemu']),
             hot50_fex_body_pct=round(100 * hot['fex_body'] / hot_total, 2) if hot_total else None,
             hot50_fex_flags_pct=round(100 * hot['fex_flags'] / hot_total, 2) if hot_total else None, fex_mem=pct(allr['fex_mem']))
@@ -350,7 +364,8 @@ class Attribution:
         for r, n in skid.items(): sg[roles_mod.GROUPS[r]] += n
         shares['skid'] = dict(
             fex_mem=pct(skid['fex_mem']), fex_body=pct(sg['fex_body']), fex_flags=pct(sg['fex_flags']), natemu=pct(sg['natemu']),
-            split_checks_and_probes=pct(skid['split_check'] + skid['probe']), flag_words=pct(skid['flags']),
+            split_checks_and_probes=pct(skid['split_check'] + skid['split_stub'] + skid['probe']), flag_words=pct(skid['flags']),
+            x87_run=pct(skid['x87_run']),
             exits=pct(skid['exit_literal'] + skid['exit_computed']),
             hot50_fex_body_pct=round(100 * skid_hot['fex_body'] / hot_total, 2) if hot_total else None,
             exit_samples_unresolved=unresolved)
@@ -643,6 +658,7 @@ class Profile:
             if a['beyond']: self.problems.append(f'{a["beyond"]} block samples past their object\'s code region')
             a['user_blocks_looked_up'], a['user_blocks_found'] = attribution.looked_up, attribution.matched
             a['user_blocks_ambiguous'] = attribution.ambiguous
+            a['user_blocks_short'], a['user_blocks_twice_in_a_file'] = attribution.short, attribution.multi_in_file
 
     def report(self, objects=None, top=50, attribution=None):
         names = [n for n, _, _ in self.phases.windows]
@@ -766,30 +782,31 @@ def attribution_markdown(rep):
            'Shares are % of the phase\'s EL0 samples; hot 50: FEX\'s body as % of the samples on the phase\'s top 50 blocks. '
            'AVX2/EVEX named: samples on a symbol named *_avx2* or *_evex*; libc wide: samples in libc.so.6 blocks that hold a '
            'VEX.256 or EVEX instruction (libc.so.6 is stripped: its string functions have no names).', '',
-           '| phase | block samples | FEX body | FEX flags | natemu | split + probe | stack | load-move | exits | REP str | '
+           '| phase | block samples | FEX body | FEX flags | natemu | split + probe | stack | load-move | exits | x87 run | REP str | '
            'AVX2/EVEX named | libc wide | kernel copy | hot 50 FEX body |',
-           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for ph in rep['phases']:
         a = ph.get('attribution')
         if not a: continue
         s = a['shares']
         out.append(f'| {ph["name"]} | {a["block_samples"]} | {p(s["fex_body"])} | {p(s["fex_flags"])} | {p(s["natemu"])} | '
                    f'{p(s["split_checks_and_probes"])} | {p(s["stack_checks"])} | {p(s["load_then_move"])} | {p(s["exits"])} | '
+                   f'{p(s["x87_run"])} | '
                    f'{p(s["rep_string"])} | {p(s["glibc_avx2_evex_named"])} | {p(s["libc_wide_vector_blocks"])} | '
                    f'{p(s["kernel_copy_clear"])} | {p(s["hot50_fex_body_pct"])} |')
     out += ['', '### One-word skid correction', '',
             'Each sample also counted on the next word executed (the next word of its block, or a linked exit\'s target '
             'block\'s first body word; sample_roles.NOT_MOVED: the validity case\'s chase phase put 58% of a slow load\'s '
             'samples on the word before it): % of EL0 samples, raw / corrected.', '',
-            '| phase | fex_mem | FEX body | FEX flags | natemu | split + probe | exits | hot 50 FEX body | exit samples unresolved |',
-            '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+            '| phase | fex_mem | FEX body | FEX flags | natemu | split + probe | exits | x87 run | hot 50 FEX body | exit samples unresolved |',
+            '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for ph in rep['phases']:
         a = ph.get('attribution')
         if not a: continue
         s, k = a['shares'], a['shares']['skid']
         rc = lambda x: f'{p(s[x])} / {p(k[x])}'
         out.append(f'| {ph["name"]} | {rc("fex_mem")} | {rc("fex_body")} | {rc("fex_flags")} | {rc("natemu")} | '
-                   f'{rc("split_checks_and_probes")} | {rc("exits")} | {p(s["hot50_fex_body_pct"])} / {p(k["hot50_fex_body_pct"])} | '
+                   f'{rc("split_checks_and_probes")} | {rc("exits")} | {rc("x87_run")} | {p(s["hot50_fex_body_pct"])} / {p(k["hot50_fex_body_pct"])} | '
                    f'{k["exit_samples_unresolved"]} |')
     a = whole['attribution']
     classes = sorted(a['roles'])
@@ -799,8 +816,11 @@ def attribution_markdown(rep):
     for r, n in a['all_roles'].items():
         out.append(f'| {r} | {roles_mod.GROUPS[r]} | ' + ' | '.join(str(a['roles'][c].get(r, 0)) for c in classes)
                    + f' | {100 * n / total:.1f} |')
-    out += ['', f'User blocks looked up in the image: {a.get("user_blocks_looked_up")}, found '
-            f'{a.get("user_blocks_found")} ({a.get("user_blocks_ambiguous")} in more than one file: named by the first).',
+    out += ['', f'User blocks looked up in the image: {a.get("user_blocks_looked_up")}; found in one file '
+            f'{a.get("user_blocks_found")} ({a.get("user_blocks_twice_in_a_file")} of them twice in it: named by the first), in '
+            f'several files {a.get("user_blocks_ambiguous")} (`ambiguous:`), not looked up (under '
+            f'{sample_symbols.MATCH_BYTES} guest bytes) {a.get("user_blocks_short")} (`user:short`). A bulk REP STOS loop '
+            '(--bulk, kernel code) counts as FEX body; its guest instruction counts in REP str.',
             '', '## Top blocks\' words (whole run)', '',
             'Per block: its symbol, then each sampled word as native offset (hex), role and samples.', '']
     for i, r in enumerate(whole['blocks']['top'], 1):
@@ -858,7 +878,7 @@ def main(argv):
     command = []
     if '--' in argv:
         i = argv.index('--'); argv, command = argv[:i], argv[i + 1:]
-    profiles, require, window, kernel_path, image_path = [], [], 1.0, None, None
+    profiles, require, window, kernel_path, image_path, boots = [], [], 1.0, None, None, None
     it = iter(argv)
     for a in it:
         if a == '--profile': profiles.append({'name': next(it)})
@@ -867,6 +887,7 @@ def main(argv):
             profiles[-1][a[2:]] = next(it)
         elif a == '--window': window = float(next(it))
         elif a in ('--kernel-symbols', '--kernel'): kernel_path = next(it)
+        elif a == '--boots': boots = next(it)
         elif a == '--image': image_path = next(it)
         elif a == '--require-place':
             place = next(it)
@@ -881,6 +902,8 @@ def main(argv):
     problems, kernel, image = [], None, None
     try:
         if kernel_path: kernel = sample_symbols.kernel_symbols(kernel_path)
+        if kernel is not None and boots and (got := sample_symbols.sha256(boots)) != kernel.bzimage_sha256:
+            problems.append(f'symbols: the run booted {boots} (sha256 {got[:16]}), the symbols are of {str(kernel.bzimage_sha256)[:16]}')
         if image_path: image = sample_symbols.Image(image_path)
     except (OSError, RuntimeError, struct.error, subprocess.CalledProcessError) as e:
         problems.append(f'symbols: {e}')

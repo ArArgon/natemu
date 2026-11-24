@@ -423,6 +423,43 @@ class Attribution(Base):
         self.assertEqual(r['phases'][0]['attribution']['shares']['skid']['exit_samples_unresolved'], 2)
         self.assertIn('### One-word skid correction', (self.d / 'case.report.md').read_text())
 
+    def test_user_blocks_found_ambiguous_short_and_twice(self):
+        import test_sample_symbols as ts
+        import sample_symbols
+        body = ts.Image.BLOCK
+        pad = lambda b, n: b + b'\xc3' * (n - len(b))
+        text = pad(pad(pad(b'\xcc' * 0x80 + body, 0x200) + body, 0x1080) + body, 0x1100)   # at 0x80 twice (pages 0, 1), at 0x200
+        files = [('usr/bin/prog', ts.elf64(0x40_1000, text, [(0x40_1080, 0x20, 'work')]), 0o100755),
+                 ('usr/bin/other', ts.elf64(0x40_1000, b'\xcc' * 0x200 + body, []), 0o100755),
+                 ('usr/bin/lib', ts.elf64(0x40_1000, b'\xcc' * 0x300 + body[:12] + b'\x90\x90', []), 0o100755)]
+        (self.d / 'i.cpio').write_bytes(ts.cpio(files))
+        image = sample_symbols.Image(self.d / 'i.cpio')
+        obj = code_object(0, b'\0' * 8)
+        U = [(0x5555_0080, 0x60), (0x5555_0200, 0x61), (0x5555_0300, 0x62), (0x5555_0400, 0x63)]
+        guests = [body, body, body[:12] + b'\x90\x90', body[:5]]
+        objects = [obj_record(rip, frame << 12, USER64, obj, g) for (rip, frame), g in zip(U, guests)]
+        write_objects(self.d / 'case.objects', objects)
+        a = sr.Attribution(sr.Objects(self.d / 'case.objects'), image=image)
+        keys = [(rip, frame, USER64) for rip, frame in U]
+        a.match_user(keys)
+        names = [a.symbol(k, a.info(k), 4) for k in keys]
+        self.assertEqual(names, ['prog:work', 'ambiguous:other|prog', 'lib:?', 'user:short'])
+        self.assertEqual((a.looked_up, a.matched, a.ambiguous, a.multi_in_file, a.short), (3, 2, 1, 1, 1))
+
+    def test_the_booted_kernel_must_be_the_symbols_kernel(self):
+        import test_sample_symbols as ts
+        import sample_symbols
+        k = sample_symbols.Kallsyms(ts.kallsyms_blob(ts.SYMS))
+        (self.d / 'bz').write_bytes(b'kernel one')
+        k.bzimage_sha256 = sample_symbols.sha256(self.d / 'bz')
+        k.write_table(self.d / 'k.txt')
+        recs, markers, objects = standard_run()
+        self.write(recs, markers, objects)
+        argv = ['--profile', str(self.name), '--kernel-symbols', str(self.d / 'k.txt'), '--boots', str(self.d / 'bz')]
+        self.assertEqual(sr.main(argv), 0)
+        (self.d / 'bz').write_bytes(b'kernel two')
+        self.assertEqual(sr.main(argv), 1)
+
     def test_kernel_symbols_take_the_slide_from_the_markers(self):
         import test_sample_symbols as ts
         import sample_symbols

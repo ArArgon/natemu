@@ -217,49 +217,49 @@ argv = ["python3", "tests/bench/coldtrip_report.py", "run", "--out", "{out}", "-
 # and (chunk 1) block samples by word role and the top symbols: the kernel's from the booted bzImage's kallsyms, the user's by
 # finding each block's guest bytes in the image's binaries. Their buckets are perturbed by sampling: reported, never a decision (the unperturbed -profile cases above decide).
 [suite.cases.guest-build-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample", "--markers", "{out}/build-sample.markers.tsv", "--perf", "{out}/build-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample", "--markers", "{out}/build-sample.markers.tsv", "--perf", "{out}/build-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-hackbench-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-luajit-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/luajit-sample", "--markers", "{out}/luajit-sample.markers.tsv", "--perf", "{out}/luajit-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/luajit-sample", "--markers", "{out}/luajit-sample.markers.tsv", "--perf", "{out}/luajit-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-sqlite-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/sqlite-sample", "--markers", "{out}/sqlite-sample.markers.tsv", "--perf", "{out}/sqlite-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/sqlite-sample", "--markers", "{out}/sqlite-sample.markers.tsv", "--perf", "{out}/sqlite-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-zstd-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/zstd-sample", "--markers", "{out}/zstd-sample.markers.tsv", "--perf", "{out}/zstd-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/zstd-sample", "--markers", "{out}/zstd-sample.markers.tsv", "--perf", "{out}/zstd-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-startup32-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/startup32-sample", "--markers", "{out}/startup32-sample.markers.tsv", "--perf", "{out}/startup32-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/startup32-sample", "--markers", "{out}/startup32-sample.markers.tsv", "--perf", "{out}/startup32-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "startup32",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-scimark32-sse2-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/scimark32-sse2-sample", "--markers", "{out}/scimark32-sse2-sample.markers.tsv", "--perf", "{out}/scimark32-sse2-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/scimark32-sse2-sample", "--markers", "{out}/scimark32-sse2-sample.markers.tsv", "--perf", "{out}/scimark32-sse2-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "scimark32-sse2-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "scimark32-sse2",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
 [suite.cases.guest-build-sample-4]
-argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample-4", "--markers", "{out}/build-sample-4.markers.tsv", "--perf", "{out}/build-sample-4.perf", "--kernel-symbols", "{kernel_symbols}", "--image", "{bench_image}",
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sample-4", "--markers", "{out}/build-sample-4.markers.tsv", "--perf", "{out}/build-sample-4.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample-4", "--emu", "natemu", "--vcpus", "4", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
@@ -394,7 +394,7 @@ argv = ["python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--input
 # and 10 s windows. Roles and kernel symbols as the guest cases' (io5 boots the same bzImage); user samples stay at block level:
 # its binaries are installed in the guest's disk during the run, which the inputs do not hold.
 [suite.cases.io5-solo32-sample]
-argv = ["python3", "tests/bench/sample_report.py", "--window", "10", "--kernel-symbols", "{kernel_symbols}",
+argv = ["python3", "tests/bench/sample_report.py", "--window", "10", "--kernel-symbols", "{kernel_symbols}", "--boots", "{io5_inputs}/vmlinuz",
         "--profile", "{out}/io5/sample-use", "--markers", "{out}/io5/markers-use.tsv", "--perf", "{out}/io5/perf-use.log",
         "--profile", "{out}/io5/sample-verify", "--markers", "{out}/io5/markers-verify.tsv", "--perf", "{out}/io5/perf-verify.log",
         "--", "python3", "tests/io/run_io5.py", "run", "--backend", "natemu", "--inputs", "{io5_inputs}", "--out", "{out}/io5",

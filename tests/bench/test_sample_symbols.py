@@ -70,10 +70,17 @@ class Kernel(unittest.TestCase):
     def test_the_table_the_framework_writes_reads_back(self):
         d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
         k = S.Kallsyms(kallsyms_blob(SYMS))
+        k.bzimage_sha256 = 'ab' * 32
         k.write_table(d / 'kallsyms.txt')
         t = S.kernel_symbols(d / 'kallsyms.txt')
-        self.assertEqual((t.addrs, t.names, t.text), (k.addrs, k.names, TEXT))
+        self.assertEqual((t.addrs, t.names, t.text, t.bzimage_sha256), (k.addrs, k.names, TEXT, 'ab' * 32))
         self.assertEqual(t.lookup(TEXT + 0x105), ('clear_page_erms', 5))
+
+    def test_module_text_lies_outside_the_image_in_the_module_area(self):
+        k = S.Kallsyms(kallsyms_blob(SYMS))
+        self.assertTrue(k.module(0xffff_ffff_c012_3456))
+        self.assertFalse(k.module(TEXT + 0x200))                         # the image's text
+        self.assertFalse(k.module(0xffff_8880_0000_1000))                # the direct map: no module
 
     def test_a_zstd_kernel_without_a_decompressor_says_what_to_install(self):
         import unittest.mock as um
