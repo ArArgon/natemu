@@ -1392,6 +1392,16 @@ impl Prepared {
                     result
                 })
             });
+            // The loops below end when their flag drops, also when `supervise` unwinds: the scope joins them before the
+            // panic goes on, so a flag left set would hold the process.
+            struct Off<'a>([&'a AtomicBool; 2]);
+            impl Drop for Off<'_> {
+                fn drop(&mut self) {
+                    self.0[0].store(false, SeqCst);
+                    self.0[1].store(true, SeqCst);
+                }
+            }
+            let off = Off([&sampling, &sampler_done]);
             // EL0 sampler: the ringing thread and the drain (`crate::sampler`).
             if let Some(s) = &self.sampler {
                 let (blocks, bell, done) = (backing.blocks(), machine.bell(), &sampler_done);
@@ -1409,8 +1419,7 @@ impl Prepared {
                 });
             }
             let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
-            sampling.store(false, SeqCst);
-            sampler_done.store(true, SeqCst);
+            drop(off); // the perf snapshots stop (`sampling` false), the sampler's threads end (`sampler_done`)
             for device in &self.virtio {
                 device.stop();
             }
