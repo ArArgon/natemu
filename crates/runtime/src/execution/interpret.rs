@@ -469,6 +469,8 @@ fn execute(s: &mut State, paging: Option<paging::Control>, i: &Insn) -> Result<(
         s,
         paging,
         pages: [[0; 2]; 4],
+        aliases: [0; 4],
+        data: true,
         count: 0,
         stopped: [0; 2],
     };
@@ -587,6 +589,12 @@ struct Mem<'a> {
     /// The pages the instruction's checks found: [linear page, guest-physical page | its class, [`RAM`], [`ROM`] or 0 for
     /// unassigned] (at most two checks of two pages: far RET's slots).
     pages: [[u64; 2]; 4],
+    /// For a [`MAPPED`] page of `pages`, the resident's alias of it (the region's, found by the check).
+    aliases: [u64; 4],
+    /// The core's data accesses (true), which may be [`MAPPED`]; a resident operation's (descriptor tables, far
+    /// transfers' and deliveries' frames: `transitions`) stop at a mapped page as at a device's, as translated code's
+    /// system transactions do (`segments::copy`'s `system` stop).
+    data: bool,
     count: usize,
     /// A memory stop's linear address and guest-physical page.
     stopped: [u64; 2],
@@ -595,6 +603,9 @@ struct Mem<'a> {
 /// unassigned.
 const RAM: u64 = 1;
 const ROM: u64 = 2;
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): a page of an enabled region, read and written as
+/// RAM is (plain loads and stores through the region's alias; never code, so no code-write protocol).
+const MAPPED: u64 = 3;
 impl Mem<'_> {
     /// The guest-physical page of `linear`'s page and its class ([`RAM`], [`ROM`], 0), from the checks made.
     fn page(&self, linear: u32) -> (u64, u64) {
@@ -606,9 +617,13 @@ impl Mem<'_> {
     }
     /// The resident's pointer to `n` bytes of guest RAM or ROM (the firmware image, the legacy ROM range) at `gpa`.
     fn pointer(&self, gpa: u64, n: u8) -> *mut u8 {
-        match ram_and_roms().range(gpa, u64::from(n)) {
-            Some(p) => p,
-            None => halt(self.s, stop::INTERP_BUG), // a RAM page whose bytes are not: a classification bug
+        if let Some(p) = ram_and_roms().range(gpa, u64::from(n)) {
+            return p;
+        }
+        let page = gpa & !4095;
+        match (0..self.count).find(|&k| self.pages[k][1] == page | MAPPED) {
+            Some(k) if (gpa & 4095) + u64::from(n) <= 4096 => (self.aliases[k] + (gpa & 4095)) as *mut u8,
+            _ => halt(self.s, stop::INTERP_BUG), // a RAM page whose bytes are not: a classification bug
         }
     }
     /// One Arm access suffices: `size` bytes at `linear` lie inside one 16-byte block (so inside a page).
@@ -617,9 +632,9 @@ impl Mem<'_> {
     }
     fn byte(&self, linear: u32) -> u32 {
         match self.page(linear) {
-            (g, RAM | ROM) => {
+            (g, RAM | ROM | MAPPED) => {
                 let p = self.pointer(g | u64::from(linear & 4095), 1);
-                // SAFETY: a guest RAM or image byte in the alias.
+                // SAFETY: a guest RAM, image or mapped byte in the alias.
                 u32::from(unsafe { p.read_volatile() })
             }
             _ => 0xff,
@@ -665,10 +680,18 @@ impl Memory for Mem<'_> {
             let (g, pat) = found[k];
             let page = g & !4095;
             let ram = mmio::ram(page);
+            let mut alias = 0;
             let class = if ram {
                 RAM
             } else if mmio::rom(page) {
                 ROM
+            } else if let Some(r) = (!super::lapic::claims(page)).then(|| mmio::mapped(page)).flatten() {
+                if !self.data {
+                    self.stopped = [va, page];
+                    return Err(Exit::Stop(stop::interp::DEVICE as u32));
+                }
+                alias = r.alias + (page - r.base);
+                MAPPED
             } else {
                 0
             };
@@ -691,6 +714,7 @@ impl Memory for Mem<'_> {
                 halt(self.s, stop::INTERP_BUG)
             }
             self.pages[self.count] = [va & !4095, page | class];
+            self.aliases[self.count] = alias;
             self.count += 1;
         }
         if owed || uncached {
@@ -703,7 +727,7 @@ impl Memory for Mem<'_> {
     fn read(&mut self, linear: u32, size: u8) -> u32 {
         if Self::single(linear, size) {
             return match self.page(linear) {
-                (g, RAM | ROM) => {
+                (g, RAM | ROM | MAPPED) => {
                     let p = self.pointer(g | u64::from(linear & 4095), size);
                     // SAFETY: `size` bytes of guest RAM or the image in the alias.
                     unsafe { load_word(p, size) }
@@ -718,19 +742,34 @@ impl Memory for Mem<'_> {
     /// A store to RAM; to the firmware image or an unassigned page, dropped.
     fn write(&mut self, linear: u32, size: u8, value: u32) {
         if Self::single(linear, size) {
-            if let (g, RAM) = self.page(linear) {
-                let p = self.pointer(g | u64::from(linear & 4095), size);
-                // SAFETY: `size` bytes of guest RAM in the alias.
-                self.stored(g, || unsafe { store_word(p, size, value) });
+            match self.page(linear) {
+                (g, RAM) => {
+                    let p = self.pointer(g | u64::from(linear & 4095), size);
+                    // SAFETY: `size` bytes of guest RAM in the alias.
+                    self.stored(g, || unsafe { store_word(p, size, value) });
+                }
+                (g, MAPPED) => {
+                    let p = self.pointer(g | u64::from(linear & 4095), size);
+                    // SAFETY: `size` bytes of a mapped region in its alias.
+                    unsafe { store_word(p, size, value) };
+                }
+                _ => {}
             }
             return;
         }
         for k in 0..u32::from(size) {
             let at = linear.wrapping_add(k);
-            if let (g, RAM) = self.page(at) {
-                let p = self.pointer(g | u64::from(at & 4095), 1);
-                // SAFETY: a guest RAM byte in the alias.
-                self.stored(g, || unsafe { p.write_volatile((value >> (8 * k)) as u8) });
+            match self.page(at) {
+                (g, RAM) => {
+                    let p = self.pointer(g | u64::from(at & 4095), 1);
+                    // SAFETY: a guest RAM byte in the alias.
+                    self.stored(g, || unsafe { p.write_volatile((value >> (8 * k)) as u8) });
+                }
+                (g, MAPPED) => {
+                    // SAFETY: a mapped byte in the region's alias.
+                    unsafe { self.pointer(g | u64::from(at & 4095), 1).write_volatile((value >> (8 * k)) as u8) };
+                }
+                _ => {}
             }
         }
     }
@@ -753,6 +792,10 @@ impl Memory for Mem<'_> {
         // No byte of it RAM or the image: all-ones read, the write ignored, nothing to lock.
         if class == 0 && last_class == 0 {
             return m;
+        }
+        // Mapped device memory: a split lock there is refused (as translated code's, a stated deviation).
+        if class == MAPPED || last_class == MAPPED {
+            mmio::stop_with(self.s, natemu_abi::execution::mmio::ATOMIC)
         }
         // Crossing 16 bytes, or partly RAM: under the VM's split lock, as translated code's (`split_lock`); a byte of the
         // image is read and its store dropped.

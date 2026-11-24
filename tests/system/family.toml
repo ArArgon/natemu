@@ -275,6 +275,41 @@ argv = ["tests/system/run_l3.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 smoke = true
 
+# Mapped device memory (docs/restructure/mapped-device-memory-plan.md, Task 2): bare programs on a region of the driver's
+# test device (`run-program --mapped-at`, `--mapped-control-at`).
+[suite.cases."mapped-load-store"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-load-store", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+smoke = true
+
+[suite.cases."mapped-permissions"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-permissions", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-host-fill"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-host-fill", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-uc"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-uc", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-refusals"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-refusals", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-interpreter"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-interpreter", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."lapic_beats_mapped_region"]
+argv = ["tests/system/run_mapped.py", "--only", "lapic_beats_mapped_region", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."overlapping_regions_pick_lowest"]
+argv = ["tests/system/run_mapped.py", "--only", "overlapping_regions_pick_lowest", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
 [suite.cases."l4a"]
 argv = ["tests/system/run_l4a.py", "--only", "qemu,xapic,halt,lint1", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

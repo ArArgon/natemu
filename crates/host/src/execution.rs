@@ -61,6 +61,15 @@ pub struct Backing {
     /// The template pool's writer, shared by the run's compilers ([`Compiler::pool`]); `None`: no pool in this backing.
     pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
+/// Mapped device memory: every region of `plan` gets its table entry, disabled (its alias and length, base 0), before any
+/// vCPU exists, so the table's `seq` is nonzero exactly when the VM has regions: a resident that reads `seq` 0 (no
+/// region, the default launch, which publishes nothing) skips the holding flag safely, as no publish can ever follow
+/// (`mmio::mapped` in the runtime). The publisher (the bus, the driver's test device) enables entries later.
+fn publish_disabled(table: &cache::MappedRegions, plan: &crate::vm::MappingPlan) {
+    for (i, &(alias, len)) in plan.aliases.iter().enumerate() {
+        table.publish(i, cache::MappedRegion { base: 0, len, alias, enabled: 0 });
+    }
+}
 impl Backing {
     /// The template pool's publication counters as the performance log's `pool {...}` line (`None`: no pool).
     pub fn pool_report(&self) -> Option<String> {
@@ -76,6 +85,7 @@ impl Backing {
     pub fn machine(&self, mapped: &[Arc<crate::pci::DeviceMemory>]) -> Result<Machine> {
         let machine = Machine::create(self.memory.clone(), mapped)?;
         self.map_mapped(machine.mapping());
+        publish_disabled(self.mapped_regions(), machine.mapping());
         Ok(machine)
     }
     /// Writes every window's alias of the VM's mapped device memory ([`crate::memory::mapped_spans`]): after the RAM and
@@ -7693,6 +7703,28 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// `Backing::machine`'s table rule: no region publishes nothing (`seq` stays 0, the default launch); regions publish
+    /// each entry disabled with its alias and length, so `seq` is nonzero before any vCPU runs.
+    #[test]
+    fn regions_are_published_before_any_vcpu() {
+        let table: Box<cache::MappedRegions> = Box::new(unsafe { std::mem::zeroed() });
+        publish_disabled(&table, &crate::vm::mapping_plan(1 << 30, &[]));
+        assert_eq!(table.read(), (0, [cache::MappedRegion::default(); exec::MAX_MAPPED_REGIONS]));
+        let plan = crate::vm::mapping_plan(1 << 30, &[2 << 20, 4 << 20]);
+        publish_disabled(&table, &plan);
+        let (seq, entries) = table.read();
+        assert_ne!(seq, 0);
+        for (i, e) in entries.iter().enumerate() {
+            let want = plan.aliases.get(i).map_or(cache::MappedRegion::default(), |&(alias, len)| cache::MappedRegion {
+                base: 0,
+                len,
+                alias,
+                enabled: 0,
+            });
+            assert_eq!(*e, want);
+        }
     }
 
     /// The mapped regions' alias (`exec::MAPPED_VA`, the const assert's bound: up to `MAX_MAPPED_BYTES` in the 3-4 GiB

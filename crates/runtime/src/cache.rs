@@ -3619,6 +3619,12 @@ fn split_word(k: usize) -> &'static AtomicU64 {
 pub fn holding() {
     split_word(3 + vcpu()).store(1, SeqCst);
 }
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): the region table in the global area, which only
+/// the host writes ([`area::MappedRegions`], a seqlock).
+pub fn mapped_regions() -> &'static area::MappedRegions {
+    // SAFETY: the table lies in the live global area at its fixed offset, aligned; its fields are atomics.
+    unsafe { &*global::<area::MappedRegions>(area::MAPPED) }
+}
 pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
     while split_word(0)
         .compare_exchange(0, vcpu() as u64 + 1, SeqCst, SeqCst)

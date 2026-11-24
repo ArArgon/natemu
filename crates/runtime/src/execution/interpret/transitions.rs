@@ -36,6 +36,8 @@ fn memory(s: &mut State, paging: Option<paging::Control>) -> Mem<'_> {
         s,
         paging,
         pages: [[0; 2]; 4],
+        aliases: [0; 4],
+        data: false,
         count: 0,
         stopped: [0; 2],
     }

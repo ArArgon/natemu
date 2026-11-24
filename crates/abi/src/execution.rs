@@ -1113,6 +1113,9 @@ pub mod cache {
         /// the alias as the firmware image's are; `(0, 0)`, the default, is none. Set by the host before any vCPU runs
         /// (`Backing::write_legacy_rom`, a direct boot with SMBIOS); never with a firmware image. Appended.
         pub legacy_rom: (u64, u64),
+        /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows installed onto a mapped region's
+        /// pages (a plain counter in every build; zero in a VM without regions). Appended.
+        pub mapped_installs: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32

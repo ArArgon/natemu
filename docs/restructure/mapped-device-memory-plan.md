@@ -43,11 +43,23 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   allocation (EL1-only alias; `Space::install` keeps refusing private-table targets).
 - **Allowed in mapped memory:** data loads and stores of every width and form translated code and the resident
   complete for RAM, including page-crossing stores (within one region, or RAM next to a region), string forms, vector
-  forms and aligned atomics. **Refused** (each a typed stop with a case, a stated deviation): instruction fetch
-  (`fetch::NOT_RAM`), page tables (`UNSUPPORTED_MODE`), split locks (`ATOMIC`), descriptor tables (`segments::copy`'s
-  `system` stop), and the resident's own frames and images there: stacks used for event delivery and system
-  transactions, XSAVE/FXSAVE images (the list is fixed by Task 2's audit). Virtio buffers or rings there are rejected
-  by `GuestRam::range` validation, as today (no device-to-device DMA).
+  forms and aligned atomics: every access translated code makes natively once the page is shadowed, and the
+  resident's completions of translated code's accesses (`access_aborted`, `split`, `vector_aligned`, `wrapped_load`),
+  and the boot-time interpreter's data accesses. **Refused** (each a typed stop, a stated deviation; the list is Task
+  2's audit; the `mapped-refusals` or `mapped-interpreter` sub-case covering each is named): instruction fetch (`no_code
+  fetch_not_ram`; `fetch`); page tables (`unsupported_mode`; `page-table`); split locks (`unsupported_mmio` `atomic`;
+  `split-lock`, and the interpreter's `split-lock`); a store crossing from a region onto a device or unassigned page,
+  or across two regions (`crossing`; `crossing-device`, `crossing-regions`); every access the resident makes through
+  its own walk (`segments::pages`), each `unsupported_mmio` `system`: through `segments::copy`/`linear`, one shared
+  check (`descriptor-table`, `idt`, `popf-stack`, `iret-frame`, `fxsave-image`, `xsave-image`, `x87-m80`,
+  `ldmxcsr-operand`, `gather-element`; the TSS, far transfers' and event delivery's frames and FSTP m80 go through the
+  same check with no case of their own), and the scalar completions with checks of their own (`rcl-operand`,
+  `enter-frame`, `ins-destination`, `vcvtps2ph-destination`, and `Span`'s, `maskmov-destination`); the interpreter's
+  resident operations (`interp_memory`; the interpreter's `descriptor-table`, whose check its far transfers' and
+  deliveries' frames share). Without a case: a compatibility-mode FS/GS string element (`form`), a compatibility-mode
+  load wrapping at 4 GiB beside a region (`crossing`), and the ACPI wakeup mailbox (RAM only, `unsupported_mode`, as
+  today). Virtio buffers or rings
+  there are rejected by `GuestRam::range` validation, as today (no device-to-device DMA).
 - **Memory type (stated deviation):** a mapped page runs natively whatever its PAT/MTRR type. For RAM, `translate`
   honours UC/WT/WP by stepping (`execution.rs` near 3771); a framebuffer mapped UC- by `ioremap` or `/dev/mem` would then
   step every access. Device memory has no side effects, so native access gives the same results.
@@ -124,7 +136,8 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   the BAR's decoded base changed, with multi-BAR's rule that a BAR decodes only wholly inside the window (a size probe
   of all-ones decodes nothing and so disables the region until the BAR is written back). Accesses that still reach the
   bus's `Window` for a mapped BAR's range read all-ones and drop writes.
-- Report counters: `remaps` (shootdowns run) and `mapped_installs` (shadows installed onto regions), beside the access
+- Report counters: `remaps` (shootdowns run) and `mapped_installs` (shadows installed onto regions; Task 2 counts it in
+  `cache::Control` and the driver reports it), beside the access
   counts in the run report.
 
 ### Shared state (`crates/abi`)
@@ -137,8 +150,11 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 
 ### Resident side
 
-- **Classification in `translate`** (`execution.rs` near 3765, where a non-RAM page returns early as a device page): a
-  page that is not RAM but lies in an enabled region takes a mapped branch: writable as for RAM (`Write && W && D`, the
+- **Classification in `translate`** (`execution.rs` near 3761, where a non-RAM page returned early as a device page): a
+  page that is not RAM, not this vCPU's APIC page (the APIC decodes first, `lapic_beats_mapped_region`) and not ROM, but
+  lies in an enabled region, takes a mapped branch (`install_mapped`; `translate` now says which class it found:
+  `Class::Ram(uncached)`, `Mapped(region)` or `Other`, the device path); overlapping enabled regions: the
+  lowest-numbered table entry (BAR order) holds the shared range (`overlapping_regions_pick_lowest`): writable as for RAM (`Write && W && D`, the
   D=1 read upgrade, the walk's A/D updates), global as the walk's G bit says (a full shadow reset drops global
   shadows too, so the shootdown still covers them; Linux's `ioremap` mappings are global), no memory-type stepping, no
   code mark, no WRITABLE_PAGES bit (those index RAM pages). The shadow is installed with a one-region `GuestRam` for
@@ -147,13 +163,24 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   then read the table (seqlock, retry while odd or moved), look up, install. That order is the whole protocol: either
   the mover's holder scan sees this vCPU's flag (and resets it), or this vCPU's table read comes after the publish.
   The same applies to an all-ones shadow installed over a page that a region may later cover (`install_ones`), so the
-  holding flags are complete for every shadow a remap can stale.
-- **Completion paths:** every site that accepts only RAM today (`mmio::ram(` and `guest_ram()` users: 56 in
-  `crates/runtime/src`, among them `access_aborted`'s device test near 4226, `wrapped_load` 4327, `split` 4585,
-  `split_lock` 4689, `mmio::string_operand`, `segments/span.rs` `Backing`, `half.rs`, `rotate.rs`, `stack.rs`,
-  `segments.rs` copies) is audited in Task 2: each either learns a `Mapped` backing (mixed RAM and mapped included),
-  or keeps refusing with a typed stop that the refusal list names. The interpreter's `Mem::check` gains the class with
-  plain loads and stores.
+  holding flags are complete for every shadow a remap can stale. One place (`execution.rs` `install_mapped`: the read,
+  then Task 3's `MAPPED_BEFORE_INSTALL` point, then the install); a capacity eviction between them clears the flag, so
+  the table is read again under a new one. `install_ones` reads the table too (no all-ones shadow over an enabled
+  region's page). A table never published (`seq` 0) has no region and never will: `Backing::machine` publishes every
+  region's entry, disabled, before any vCPU exists (for every region it maps, so no publisher can forget; unit test
+  `regions_are_published_before_any_vcpu`), so `seq` is nonzero exactly when the VM has regions; a VM without regions
+  pays one load of `seq` per non-RAM page and sets no flag. The flag's store is followed by a SeqCst fence before the
+  table's loads.
+- **Completion paths:** every site that accepts only RAM today (`mmio::ram(` and `guest_ram()` users: 55 in
+  `crates/runtime/src`, 57 matching lines less the two definitions, among them `access_aborted`'s device test near
+  4214, `wrapped_load` 4315, `split` 4569, `split_lock` 4680, `mmio::string_operand`, `segments/span.rs` `Backing`,
+  `half.rs`, `rotate.rs`, `stack.rs`, `segments.rs` copies) is audited in Task 2 (the list with each decision is in its
+  commit message): each either learns a `Mapped` backing (mixed RAM and one region included: `Class::memory`, guest
+  RAM plus the region, since `GuestRam` holds four regions and RAM takes three), or keeps refusing with a typed stop
+  that the refusal list names. What learns it: translated code's completions (above); the resident's own walk
+  (`segments::pages`) keeps RAM-only users, each refusing a mapped page with the `system` stop. The interpreter's
+  `Mem::check` gains the class (`MAPPED`) with plain loads and stores for the core's data accesses; its resident
+  operations (`transitions.rs`) stop at a mapped page as at a device's, and a LOCK crossing 16 bytes there is refused.
 - **Remap trigger:** after any exit whose device access may have changed the table, `REQUEST_PORT` or
   `REQUEST_DEVICE` answered `DONE` (also after `PENDING` polls), the resident compares `MappedRegions.seq` with its value
   before the request; if it moved, it runs `cache::remap_shootdown()` before resuming the guest. No completion flag is
@@ -170,10 +197,14 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 ### Test consumers
 
 - **Driver test device** (`crates/driver/src/drivers/test_devices.rs`, for bare programs under `natemu-host
-  run-program`, as the `--device-at` cases in `tests/system/run_l3.py`): `--mapped-at GPA,LEN` creates a region
-  enabled at a base, plus `--mapped-control-at GPA` a control page with registers `MOVE` (write a new base; 0 disables),
-  `SUM` (read: the host's 64-bit sum of the region's words) and `FILL` (write: the host fills the region with a pattern
-  derived from the value). This exercises the resident without PCI.
+  run-program`, as the `--device-at` cases in `tests/system/run_l3.py`): `--mapped-at GPA,LEN` (repeatable, in table
+  order; regions may overlap each other and the xAPIC page) creates a region enabled at a base, plus
+  `--mapped-control-at GPA` region 0's control page with 8-byte registers `MOVE` (+0, write a new base; 0 disables:
+  Task 3's, refused until then), `SUM` (+8, read: the host's 64-bit sum of the region's words) and `FILL` (+16, write:
+  the host fills the region, word k = value XOR k * 9E3779B97F4A7C15H). The output gains `mapped` (per region: the
+  accesses to its range that reached the host, its sum through `view()`, its nonzero words) and per vCPU
+  `mapped_installs` (`cache::Control::mapped_installs`). This exercises the resident without PCI; the cases are
+  `tests/system/run_mapped.py`'s, one framework case each.
 - **`SUM` reads through `view()`**, the second mapping, never the main one: each case that checks `SUM` also checks
   that guest stores reach another mapping of the object.
 - **PCI test function** (`debug.mapped_testdev`, multi-BAR's test-option style): BAR0 a 2 MiB mapped region, BAR2 a

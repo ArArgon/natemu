@@ -352,6 +352,11 @@ pub(super) fn copy(
 
 /// Both pages have been walked at the required permissions and are held against split locks.
 pub(super) fn copy_ram(s: &mut State, gpa: [u64; 2], first: usize, buf: &mut [u8], write: bool) {
+    copy_memory(s, &guest_ram(), gpa, first, buf, write)
+}
+/// [`copy_ram`] through `memory`: guest RAM, or RAM and one mapped region (mapped device memory: its pages are never
+/// code-marked, so the code-write protocol finds nothing for them).
+pub(super) fn copy_memory(s: &mut State, memory: &GuestRam, gpa: [u64; 2], first: usize, buf: &mut [u8], write: bool) {
     let (low, high) = buf.split_at_mut(first);
     for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
         if chunk.is_empty() {
@@ -361,11 +366,11 @@ pub(super) fn copy_ram(s: &mut State, gpa: [u64; 2], first: usize, buf: &mut [u8
             if cache::translated(gpa) {
                 FetchWrites(s).code_write(gpa);
             }
-            let done = guest_ram().copy_in(gpa, chunk);
+            let done = memory.copy_in(gpa, chunk);
             cache::rechecked(gpa);
             done
         } else {
-            guest_ram().copy_out(gpa, chunk)
+            memory.copy_out(gpa, chunk)
         };
         if !done {
             halt(s, stop::UNSUPPORTED_SYSTEM)
