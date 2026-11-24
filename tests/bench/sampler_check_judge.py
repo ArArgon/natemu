@@ -10,16 +10,19 @@ run's number, comes before them) and, in phase 5, stops (F8H 2) and starts (F8H 
 mark to the next mark; phase 7 ends at the next stop (init's, after the run). Samples are placed by their ring time. Per run:
 
   a  alu: at least 95% of the window's EL0 samples on one user block (the loop: its body and its linked back edge are one
-     block). If this fails twice the plan goes back to review.
+     block), and 95% of those locate (sample_report.locate) to a word of its object. If this fails twice the plan goes back
+     to review.
   b  call: both computed exits of the loop in the dispatcher: the indirect call (call test "not a call"), at least 90% of
      those to one target, the callee (small_fn: the not-a-call target sampled most), none of the callee's slot samples
      marked a return; and small_fn's `ret` (call test "call before": its target follows a call); and samples on the
      callee's block.
-  c  cross: samples in a shared probe, at least 95% of them charged to the window's top block (the loop's).
+  c  cross: samples in a shared probe, at least 95% of them charged to the loop's block (the top block of the window's
+     samples in a block, probes not counted).
   d  chase: recorded only: where the samples land in the top block (native offset: samples), for the per-word allowance.
   e  ctrl: e1 (mark 5 to the port's stop) and e3 (the port's start to init's stop) hold EL0 samples on phase a's block;
      e2 (stop to start) holds no sample rung after the stop except by the ringing pass in flight at it (a logged pass that
-     began before the stop); the stop and the start are the port's (cause port).
+     began before the stop), no logged pass that rang a bell and no halted sample after that pass; the stop and the start
+     are the port's (cause port).
   marks: the seven marks in order in both runs (init's own, 0x80 + the run's number, ignored; an older init's, the run's
      number before mark 1, is skipped by the search); the control port ignored nothing (sample_report's own check).
 
@@ -83,7 +86,7 @@ def top_block(samples):
     return c.most_common(1)[0] if c else (None, 0)
 
 
-def judge_run(n, t, ring, toggles, passes, end):
+def judge_run(n, t, ring, toggles, passes, end, halted=(), objects=None):
     """One run's checks: {phase: {...}}, problems."""
     out, problems = {}, []
     win = lambda k: between(ring, t[k - 1], t[k] if k < 7 else end)
@@ -97,6 +100,14 @@ def judge_run(n, t, ring, toggles, passes, end):
     if share < ALU_SHARE or not out['a']['user']:
         problems.append(f'run {n} a: {share}% of {len(a)} EL0 samples on one user block, want {ALU_SHARE}% or more')
     alu = blk
+    # a, end to end: the loop's samples find the loop's object and a word of its code (sample_report.locate).
+    if objects is None: problems.append(f'run {n} a: no objects file')
+    elif blk:
+        found = [sr.locate(objects, s) for s in a if in_block(s) and key(s) == blk]
+        words = sum(1 for x in found if x and x['word'] is not None)
+        out['a'].update(located=sum(1 for x in found if x), words=words)
+        if 100 * words < ALU_SHARE * len(found):
+            problems.append(f'run {n} a: {words} of the loop\'s {len(found)} samples locate to a word of its object, want {ALU_SHARE}%')
     # b
     b = el0(win(2))
     disp = [s for s in b if s['place'] == sr.DISPATCH]
@@ -118,7 +129,7 @@ def judge_run(n, t, ring, toggles, passes, end):
     if not on_callee: problems.append(f'run {n} b: no sample on the callee\'s block')
     # c
     c = el0(win(3))
-    blk_c, _ = top_block(c)
+    blk_c, _ = top_block([s for s in c if s['place'] == sr.BLOCK])     # the loop's own words, not its probe's
     probes = [s for s in c if s['place'] == sr.PROBE]
     charged = sum(1 for s in probes if key(s) == blk_c)
     pshare = round(100 * charged / len(probes), 2) if probes else 0.0
@@ -144,7 +155,12 @@ def judge_run(n, t, ring, toggles, passes, end):
     on = lambda xs: sum(1 for s in xs if in_block(s) and key(s) == alu)
     out['e'] = dict(e1=len(e1), e1_on_loop=on(e1), e2=len(e2), e2_in_flight=len(e2) - len(stray), e2_stray=len(stray),
                     e3=len(e3), e3_on_loop=on(e3), stop_seq=stop['value1'], start_seq=start['value1'])
+    rang = [p for p in passes if allowed < p['time'] < start['time'] and p['value4']]
+    looked = [h for h in halted if allowed < h['time'] < start['time']]
+    out['e'].update(e2_passes_rung=len(rang), e2_halted=len(looked))
     if stray: problems.append(f'run {n} e: {len(stray)} samples rung in the stopped window after the pass in flight')
+    if rang: problems.append(f'run {n} e: {len(rang)} ringing passes rang bells in the stopped window')
+    if looked: problems.append(f'run {n} e: {len(looked)} halted samples in the stopped window')
     if not on(e1): problems.append(f'run {n} e: no EL0 sample on the loop before the stop')
     if not on(e3): problems.append(f'run {n} e: no EL0 sample on the loop after the start (the sampler did not start again)')
     return out, problems
@@ -155,13 +171,15 @@ def judge(name):
     marks = sorted((h for h in host if h['kind'] == sr.MARK and h['value1'] < INIT_MARKS), key=lambda h: h['time'])
     toggles = sorted((h for h in host if h['kind'] == sr.TOGGLE), key=lambda h: (h['time'], h['value1']))
     passes = [h for h in host if h['kind'] == sr.PASS]
+    halted = [h for h in host if h['kind'] == sr.HALTED]
+    objects = sr.Objects(f'{name}.objects') if pathlib.Path(f'{name}.objects').exists() else None
     clocks = [h['time'] for h in host if h['kind'] == sr.CLOCK]
     found = runs(marks)
     res, problems = dict(marks=[m['value1'] for m in marks], runs={}), []
     if len(found) != 2: problems.append(f'marks 1-7 in order {len(found)} times, want 2 (one per run): {res["marks"]}')
     for n, t in enumerate(found, 1):
         end = next((x['time'] for x in toggles if x['time'] > t[6] and not x['value2']), max(clocks, default=t[6]))
-        r, p = judge_run(n, t, ring, toggles, passes, end)
+        r, p = judge_run(n, t, ring, toggles, passes, end, halted, objects)
         res['runs'][n] = r; problems += p
     res['problems'] = problems
     return res
