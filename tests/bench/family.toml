@@ -472,6 +472,21 @@ argv = ["python3", "tests/bench/run_paper.py", "run", "--inputs", "{io5_inputs}"
         "--boots", "1", "--speculation-barriers", "--perf-log"]
 env = { NATEMU_FEXC_FEATURE_OFF = "afp" }
 
+# The indirect plan's host kill-test (docs/restructure/indirect-cache-plan.md section 5; tests/bench/run_host_dispatch_micro.py):
+# host-native Arm code shaped like natemu's computed exits (today's shared slot `br`, step 1's branch per site for jumps and
+# calls, step 2's one-entry cache), 64 sites at the census's main-target shares in a short and a long period and an
+# interpreter pattern; five rounds, variants alternating; ns per exit, the plan's verdict in summary.md. Mechanism only: a
+# host-native number, never on the benchmarks page. About a minute. A suite of its own, so it prepares no guest input.
+[[suite]]
+name = "host-dispatch"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 900 }
+
+[suite.cases.host-dispatch-micro]
+argv = ["python3", "tests/bench/run_host_dispatch_micro.py", "--out", "{out}", "--rounds", "5"]
+
 # Four same-CPL far transfers per 64→32→64 user iteration. Both engines run identical program bytes.
 [[suite]]
 name = "mixed-far"
