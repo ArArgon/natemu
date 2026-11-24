@@ -212,10 +212,12 @@ def stopped(run: Run, line: str, status: int) -> list:
 # pci-multibar: what natemu's launch places for the test function (crates/host/src/pci/place.rs, testdev.rs) at the first
 # free slot S, as each function's `resource` lines (BAR: base, length, the kernel's IORESOURCE_ type bits):
 # function 0's BAR0 keeps the slot's 64 KiB stride address; the rest of memory goes from E0200000H largest first
-# (function 1's 64 KiB BAR2-3, then its BAR0); I/O from C000H, lowest function first.
+# (function 1's 64 KiB BAR2-3, then its BAR0); I/O from C000H, lowest function first. The judged bits also take
+# IORESOURCE_DISABLED and IORESOURCE_UNSET, expected clear: a BAR the kernel left unassigned or disabled fails.
 PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf')
 PCI_IO, PCI_MEM, PCI_PREFETCH, PCI_MEM_64 = 0x100, 0x200, 0x2000, 0x100000
-PCI_TYPE = PCI_IO | PCI_MEM | PCI_PREFETCH | PCI_MEM_64
+PCI_DISABLED, PCI_UNSET = 0x1000_0000, 0x2000_0000
+PCI_TYPE = PCI_IO | PCI_MEM | PCI_PREFETCH | PCI_MEM_64 | PCI_DISABLED | PCI_UNSET
 PCI_IO_WINDOW = 'root bus resource [io  0xc000-0xffff window]'
 PCI_PLACEMENT_ERRORS = ("can't claim", 'no space', 'failed to assign')
 
@@ -315,6 +317,8 @@ def self_check_pci_multibar():
            'other slot base': swap('0x00000000e0010000', '0x00000000e0020000'),
            'I/O as memory': swap('0x000000000000c0ff 0x0000000000040100', '0x000000000000c0ff 0x0000000000040200'),
            'not 64-bit': swap('0x00000000e020ffff 0x0000000000142200', '0x00000000e020ffff 0x0000000000042200'),
+           'BAR unset': swap('0x00000000e020ffff 0x0000000000142200', '0x00000000e020ffff 0x0000000020142200'),
+           'BAR disabled': swap('0x000000000000c0ff 0x0000000000040100', '0x000000000000c0ff 0x0000000010040100'),
            'extra BAR': swap('0000:00:01.0 5 0x0000000000000000', '0000:00:01.0 5 0x0000000000001000'),
            'no decoding': swap('0000:00:01.1 after 0003', '0000:00:01.1 after 0002'),
            'BAR0 zero': swap('0000:00:01.0 0x00000102 0x00000802', '0000:00:01.0 0x00000000 0x00000000'),
@@ -331,6 +335,8 @@ def self_check_pci_multibar():
     assert any('root bus resource' in x for x in judge(bad['no WordIO'])), judge(bad['no WordIO'])
     assert sum("can't" in x for x in judge(bad['no WordIO'])) == 2, judge(bad['no WordIO'])
     assert any('test functions' in x for x in judge(bad['no multi-function bit'])), judge(bad['no multi-function bit'])
+    assert any('01.1: BAR2 resource' in x for x in judge(bad['BAR unset'])), judge(bad['BAR unset'])
+    assert any('01.0: BAR1 resource' in x for x in judge(bad['BAR disabled'])), judge(bad['BAR disabled'])
     assert busybox_applets(b'x\0[\0[[\0dd\0devmem\0sh\0\0') == ['[', '[[', 'dd', 'devmem', 'sh']
     print(f'pci-multibar: {len(bad)} negative judge controls passed.')
 
