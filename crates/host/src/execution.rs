@@ -70,10 +70,18 @@ impl Backing {
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
     }
+    /// The VM of this backing with the device memory `mapped` (in order; empty: none, the default launch): the machine
+    /// maps each region above the backing ([`Machine::create`]), and every window's alias of it is written here before
+    /// any vCPU exists, so no machine maps a region its residents cannot reach. The only way to create a machine.
+    pub fn machine(&self, mapped: &[Arc<crate::pci::DeviceMemory>]) -> Result<Machine> {
+        let machine = Machine::create(self.memory.clone(), mapped)?;
+        self.map_mapped(machine.mapping());
+        Ok(machine)
+    }
     /// Writes every window's alias of the VM's mapped device memory ([`crate::memory::mapped_spans`]): after the RAM and
     /// firmware aliases (it replaces their entries, though none lies in its slots: `exec::MAPPED_VA`), before any vCPU
     /// runs. Nothing for a plan without regions.
-    pub fn map_mapped(&self, plan: &crate::vm::MappingPlan) {
+    fn map_mapped(&self, plan: &crate::vm::MappingPlan) {
         let spans = crate::memory::mapped_spans(plan);
         if spans.is_empty() {
             return;

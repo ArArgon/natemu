@@ -174,9 +174,9 @@ impl Machine {
         &self.plan
     }
     /// The VM mapping `memory` at `IPA` and each of `mapped` (at most `MAX_MAPPED_REGIONS`, `MAX_MAPPED_BYTES` together)
-    /// where [`mapping_plan`] places it, read/write and never executable. The resident's aliases of the regions are the
-    /// backing's to write (`execution::Backing::map_mapped`, from [`Machine::mapping`]).
-    pub fn create(memory: std::sync::Arc<Memory>, mapped: &[std::sync::Arc<crate::pci::DeviceMemory>]) -> Result<Self> {
+    /// where [`mapping_plan`] places it, read/write and never executable. Only through `execution::Backing::machine`,
+    /// which also writes the resident's aliases of the regions (from [`Machine::mapping`]).
+    pub(crate) fn create(memory: std::sync::Arc<Memory>, mapped: &[std::sync::Arc<crate::pci::DeviceMemory>]) -> Result<Self> {
         use natemu_abi::execution::{MAX_MAPPED_BYTES, MAX_MAPPED_REGIONS};
         let lens: Vec<u64> = mapped.iter().map(|m| m.len()).collect();
         if lens.len() > MAX_MAPPED_REGIONS || lens.iter().sum::<u64>() > MAX_MAPPED_BYTES {

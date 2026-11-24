@@ -14,7 +14,7 @@
 //! [`Boot::firmware`] the VM boots a firmware image instead of a kernel (the firmware boot mode, [`boot::firmware`]).
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Backing, Compiler, Stop};
-use crate::vm::{Machine, Vcpu, hv, require_vcpus};
+use crate::vm::{Vcpu, hv, require_vcpus};
 use crate::{Result, clock, compile_cache, devices, owners, uart};
 use natemu_abi::execution::{self as exec, State};
 use natemu_abi::guest_memory::GuestRam;
@@ -1104,8 +1104,7 @@ impl Prepared {
         }
         crate::perf::mark("run");
         let (backing, vcpus) = (&self.backing, self.backing.n);
-        let machine = Machine::create(backing.memory.clone(), &self.mapped)?;
-        backing.map_mapped(machine.mapping());
+        let machine = backing.machine(&self.mapped)?;
         self.irqs.attach(machine.doorbell());
         // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed (the
         // rule `irq.rs` sets for asynchronous sources; no Linux boot reads it today).

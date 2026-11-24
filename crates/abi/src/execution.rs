@@ -4706,7 +4706,7 @@ mod tests {
     fn seqlock_reader_never_sees_a_half_entry() {
         extern crate std;
         use super::cache::{MappedRegion, MappedRegions};
-        use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use core::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
         let entry = |k: u64| MappedRegion { base: k << 21, len: !k, alias: k.rotate_left(17), enabled: k as u32 | 1 };
         // SAFETY: plain atomics; all-zero is the empty table.
         let table: std::boxed::Box<MappedRegions> = std::boxed::Box::new(unsafe { core::mem::zeroed() });
@@ -4723,9 +4723,12 @@ mod tests {
                         core::hint::spin_loop();
                     }
                 }
-                done.store(true, Relaxed);
+                done.store(true, Release);
             });
-            while !done.load(Relaxed) {
+            // At least one read after the writer finished (seeing its last entry), so `seen` counts one even if this
+            // thread did not run while it wrote.
+            loop {
+                let finished = done.load(Acquire);
                 let (seq, regions) = table.read();
                 assert_eq!(seq & 1, 0);
                 let e = regions[3];
@@ -4734,6 +4737,9 @@ mod tests {
                     seen += 1;
                 }
                 assert!(regions.iter().enumerate().all(|(i, r)| i == 3 || *r == MappedRegion::default()));
+                if finished {
+                    break;
+                }
             }
         });
         assert!(seen > 0);

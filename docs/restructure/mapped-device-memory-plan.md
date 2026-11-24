@@ -107,12 +107,12 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   (it needs a Mach port), so it waits for the native front end.
 - Multi-BAR's memory BAR request gains `mapped: Option<Arc<DeviceMemory>>`. `Bus::install` (in `prepare`) collects the
   mapped regions into `Prepared` (`Prepared::mapped`, in BAR order; Task 2's driver test device passes its own list to
-  `Machine::create` the same way); the VM does not exist yet. `Machine::create(memory, mapped)` takes them: a pure
-  `vm::mapping_plan` counts them in the IPA size computation (`vm.rs`, from the backing size today) and places each at
-  `MAPPED_IPA + offset` (offsets the sum of the lengths before, so 2 MiB-aligned, in BAR order; `MAPPED_IPA` the first
-  1 GiB-aligned IPA at or above the backing's end), which `Machine::create` `hv_vm_map`s read/write and never
-  executable. The machine has no windows, so the backing writes the alias: `Backing::map_mapped(machine.mapping())`,
-  right after `Machine::create` and before any vCPU, `map_private`s `MAPPED_VA + offset` EL1 read/write in every window
+  `Backing::machine` the same way); the VM does not exist yet. `Backing::machine(mapped)`, the only way to create a
+  machine, takes them: `Machine::create(memory, mapped)` (crate-private) has a pure `vm::mapping_plan` count them in
+  the IPA size computation (`vm.rs`, from the backing size today) and place each at `MAPPED_IPA + offset` (offsets the
+  sum of the lengths before, so 2 MiB-aligned, in BAR order; `MAPPED_IPA` the first 1 GiB-aligned IPA at or above the
+  backing's end), and `hv_vm_map`s each read/write and never executable; then, since the machine has no windows,
+  `Backing::machine` itself `map_private`s `MAPPED_VA + offset` EL1 read/write in every window, before any vCPU
   (`memory.rs` `mapped_spans`, a `Span` whose target is backing-relative and 2 MiB-aligned: a target past the backing
   works arithmetically).
 - `MAPPED_VA` = `GUEST_RAM_VA + 3 GiB`: the alias slots of the 3-4 GiB hole, already present in the resident's tables

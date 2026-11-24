@@ -2228,7 +2228,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         }
     }
 
-    let machine = Machine::create(backing.memory().clone(), &[])?;
+    let machine = backing.machine(&[])?;
     irqs.attach(machine.doorbell());
     let stops = execution::Stops::new(&backing);
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
