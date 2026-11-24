@@ -51,7 +51,7 @@ DMTF DSP0134 (SMBIOS 3.x), the IBM PS/2 Technical Reference and the 8042 command
   `TESTKIT_BENCH_AT` baselines, `m1-perf`'s baseline commit and any A/B against an older commit still run. No
   benchmark number moves and no A/B is owed. Turning the devices on in benchmarks, with a matching control, is a later
   decision.
-- No new crate dependencies.
+- New dependencies are allowed when judicious (owner, November 24): name each, with its reason, in the commit that adds it; never a project's internal workspace crates. (As built, Task 4 expanded OpenVMM's `bitfield_struct` and `open_enum` uses by hand under the earlier rule; kept.)
 - Rust unit tests run in the framework as one unit (`tools/natemu-test run 'tests/unit/family.toml::rust/all'`; `-k
   rust` also works but adds the qcow, FP and FS sweeps); a step's named tests are read from that run's
   `.natemu/runs/<id>/junit.xml`. The steps below write `-k rust` for short. Runner cases are selected with `-k`.

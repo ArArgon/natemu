@@ -19,7 +19,7 @@ from a small allocator that keeps every existing virtio function's BAR0 where it
 code adapted from cloud-hypervisor (`pci/configuration.rs`) already models six BARs, I/O and 64-bit BARs and MSI-X
 tables in any BAR (`msix.rs`); its BAR write masking is completed by the bus's decode (below).
 
-**Tech stack:** Rust, `crates/host`. No new dependencies, no new adapted source.
+**Tech stack:** Rust, `crates/host`. No new adapted source. New dependencies are allowed when judicious (owner, November 24): name each, with its reason, in the commit that adds it; never a project's internal workspace crates.
 
 **Spec:** the Design section below; PCI Local Bus 3.0 (6.1 header, 6.2.1 multi-function, 6.2.5 BARs, 3.2.2.3.2
 configuration mechanism #1), ACPI 6.5 6.4.3.5 (address space descriptors). Reference reading only (MIT): OpenVMM

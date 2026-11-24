@@ -20,7 +20,7 @@ buffers: the owner captures chains, hands the device the readable bytes of a req
 host-originated data back through `Virtio::copy` (windowless, with code-page invalidation and the full-window
 fallbacks). Block and network keep their tuned paths; entropy stays as it is.
 
-**Tech stack:** Rust, `crates/host`. No new dependencies.
+**Tech stack:** Rust, `crates/host`. New dependencies are allowed when judicious (owner, November 24): name each, with its reason, in the commit that adds it; never a project's internal workspace crates.
 
 **Spec:** the Design section below; virtio 1.2 §5.3 (console), §4.1 and §4.2 (PCI and MMIO transports);
 `docs/restructure/io-plan.md` "Windowless copies with targeted invalidation" (the copy contract this plan keeps).

@@ -26,7 +26,7 @@ Moving or disabling the BAR rewrites the table; the vCPU whose access caused it 
 across its exit and makes every vCPU drop its shadows before it continues, through the shootdown the split lock
 already uses. Nothing is unmapped or remapped in the Hypervisor framework when a BAR moves.
 
-**Tech stack:** Rust: `crates/host`, `crates/runtime`, `crates/abi`, `crates/driver`. No new dependencies.
+**Tech stack:** Rust: `crates/host`, `crates/runtime`, `crates/abi`, `crates/driver`. New dependencies are allowed when judicious (owner, November 24): name each, with its reason, in the commit that adds it; never a project's internal workspace crates.
 
 **Spec:** the Design section below; PCI Local Bus 3.0 6.2.2 (Command register memory enable), 6.2.5 (BARs); Intel SDM
 Vol. 3A chapter 12 (memory types: the stated deviation below).
