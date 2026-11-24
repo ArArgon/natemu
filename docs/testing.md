@@ -357,7 +357,7 @@ in the framework yet: the drift canary and stored baselines (`tools/bench/canary
 ## Runner families
 
 The unit, fp and programs families have their own harnesses. The rest are runner families
-(`tests/{boot,static,system,smp,faults,io,interp}`; `interp`, the boot-time interpreter's cases and their QEMU and KVM
+(`tests/{boot,static,system,smp,faults,io,interp,devices}`; `interp`, the boot-time interpreter's cases and their QEMU and KVM
 answers, has [its own page](restructure/interp-cases.md), and so do `boot`'s real-code suites, kvm-unit-tests and OVMF,
 whose inputs the framework builds in the amd64 container: [real-code suites](restructure/real-code-suites.md)): each
 case is one invocation of a script in the family's
@@ -397,10 +397,11 @@ stale or natemu fails only sometimes; rerunning without `--diff` tells them apar
 
 The inputs those runners read can also be built on any machine instead of copied: `testkit.inputs.root()` makes a cache
 entry laid out like `natemu-raw` (the netboot kernel and initrd, the QEMU reference binary, the virtio block inputs and
-kernel package, the network tools' root, the i7 and s2d program corpora, the fio preparation and a static stress-ng; no
-expected answers) from pinned downloads and recipes in the repo (`tools/io/network-rootfs` for the network tools,
-`tools/io/fio-prep` for Debian's fio and its libraries, `tools/io/stress-ng` for stress-ng; each runs in the amd64 Debian
-container through Rosetta and needs Apple's `container`). `testkit.inputs.matrix_inputs()` is `run_io_matrix.py
+kernel package, the network tools' root, the i7 and s2d program corpora, the fio preparation, a static stress-ng and
+the devices family's initramfs, `tests/devices/run_platform.py prepare`'s folder; no expected answers) from pinned
+downloads and recipes in the repo (`tools/io/network-rootfs` for the network tools, `tools/io/fio-prep` for Debian's
+fio and its libraries, `tools/io/stress-ng` for stress-ng; each runs in the amd64 Debian container through Rosetta and
+needs Apple's `container`). `testkit.inputs.matrix_inputs()` is `run_io_matrix.py
 prepare`'s folder built from them, which `run_serial_stress.py` and `run_io_soak.py` read; they take the framework's
 stress-ng with `--stress-provenance <its provenance.json>`. The runner harness points each runner at it with
 `NATEMU_RAW_ROOT=<that folder>` and `NATEMU_STATE_ROOT=<the machine's state folder>`: the entry is read-only, and the
