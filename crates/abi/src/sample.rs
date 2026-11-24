@@ -6,8 +6,8 @@
 //! offset `LOOKUP_OFFSET + PCID_STUDY` in the vCPU's block of the backing) starts with a [`Head`] page, then [`CAPACITY`]
 //! records of [`RECORD_BYTES`] from [`RING`] (1 MiB). In sampling builds the study part holds nothing else (the hot-block
 //! table of the November experiments is gone); in other builds it is untouched. The resident is the only writer of records,
-//! `write`, `lost`, `resume_time`, `trips`, `stretches` and its counters; the host writes `bell` before the vCPU first runs, `ring_time` before each
-//! ring and `read` after each drain. A record is stored before `write` is published with release ordering; the host loads
+//! `write`, `lost`, `resume_time`, `trips`, the stretches ([`HEAD_STRETCHES`]) and its counters; the host writes `bell`
+//! before the vCPU first runs, `ring_time` before each ring and `read` after each drain. A record is stored before `write` is published with release ordering; the host loads
 //! `write` with acquire, copies the records up to it and publishes `read` (release). When the ring is full a record is not
 //! written and `lost` counts it.
 //!
@@ -83,17 +83,18 @@ pub struct Head {
     pub unknown_calls: u64,
     /// An INTID a wait's bell test acknowledged that is not a bell, held for `acknowledge` (INTID + 1; 0: none).
     pub held: u64,
-    /// Trips out of generated code so far ([`Ring::left`]).
+    /// Trips out of generated code so far ([`Ring::left`]); their stretches are at [`HEAD_STRETCHES`].
     pub trips: u64,
-    /// The last [`STRETCHES`] stretches of generated code, trip k's at `k % STRETCHES`: when it was resumed
-    /// (`resume_time`, as the trip out found it) and when it was left (CNTVCT at the start of `finish`, the first Rust the
-    /// gates call: after the gate's register save, a few tens of nanoseconds after the exception). A bell taken from
-    /// generated code finds its ring time among them ([`Stretches::class`]).
-    pub stretches: [[u64; 2]; STRETCHES],
 }
-/// Stretches of generated code [`Head::stretches`] keeps: the bell is taken 1.5-2 us after its ring, and between them a vCPU
-/// can make several trips (about 2.5 us apart on average in a configure step, much closer in bursts).
+/// Stretches of generated code the head keeps ([`HEAD_STRETCHES`]): the bell is taken 1.5-2 us after its ring, and between
+/// them a vCPU can make several trips (about 2.5 us apart on average in a configure step, much closer in bursts).
 pub const STRETCHES: usize = 16;
+/// In the head's page, after [`Head`]: the last [`STRETCHES`] stretches of generated code, trip k's at `k % STRETCHES`, two
+/// words each: when it was resumed (`resume_time`, as the trip out found it) and when it was left (CNTVCT at the start of
+/// `finish`, the first Rust the gates call: after the gate's register save, a few tens of nanoseconds after the exception).
+/// A bell taken from generated code finds its ring time among them ([`Stretches::class`]).
+pub const HEAD_STRETCHES: usize = 2048;
+const _: () = assert!(size_of::<Head>() <= HEAD_STRETCHES && HEAD_STRETCHES + 16 * STRETCHES <= RING);
 pub const HEAD_MAGIC: usize = core::mem::offset_of!(Head, magic);
 pub const HEAD_WRITE: usize = core::mem::offset_of!(Head, write);
 pub const HEAD_READ: usize = core::mem::offset_of!(Head, read);
@@ -102,7 +103,6 @@ pub const HEAD_BELL: usize = core::mem::offset_of!(Head, bell);
 pub const HEAD_RING_TIME: usize = core::mem::offset_of!(Head, ring_time);
 pub const HEAD_RESUME_TIME: usize = core::mem::offset_of!(Head, resume_time);
 pub const HEAD_TRIPS: usize = core::mem::offset_of!(Head, trips);
-pub const HEAD_STRETCHES: usize = core::mem::offset_of!(Head, stretches);
 
 /// Record kinds (bits 60-63 of word 2). The resident writes [`EL0`], [`RESIDENT`] and [`EL0_UNKNOWN`]; the host the others.
 pub const FILE: u8 = 0;
@@ -441,7 +441,7 @@ pub trait Places {
     /// [`BEFORE`] bytes of guest RAM at `gpa` (false: not RAM).
     fn read(&self, gpa: u64, out: &mut [u8; BEFORE]) -> bool;
 }
-/// The vCPU's last stretches of generated code ([`Head::trips`], [`Head::stretches`]), as a bell reads them.
+/// The vCPU's last stretches of generated code ([`Head::trips`], [`HEAD_STRETCHES`]), as a bell reads them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stretches {
     pub trips: u64,
@@ -692,7 +692,6 @@ impl Ring {
             unknown_calls: w(core::mem::offset_of!(Head, unknown_calls)),
             held: w(core::mem::offset_of!(Head, held)),
             trips: w(HEAD_TRIPS),
-            stretches: self.stretches().at,
         }
     }
     /// The stretches, word by word.
@@ -885,7 +884,7 @@ mod tests {
         assert_eq!(st.at[0], [16_000, 16_400]);
         assert_eq!(st.at[1], [17_000, 17_400]);
         assert_eq!(st.at[2], [2_000, 2_400]);
-        assert_eq!(ring.head().stretches, st.at);
+        assert_eq!(ring.head().trips, st.trips);
     }
 
     /// `at` holds a native offset + 4; one that does not fit is saturated and flagged, never wrapped.
