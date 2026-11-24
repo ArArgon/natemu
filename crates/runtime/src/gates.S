@@ -201,8 +201,14 @@ resume_exception:
     mov sp, x9
     ldr x9, [x16, #{fpcr_offset}]
     msr fpcr, x9
+    // Trip-cost plan step 1.4: FPSR written only when it differs from the frame's (experiment X1: a write of the value it
+    // holds costs about 6 ns); x10 is loaded from the frame below.
     ldr x9, [x16, #{fpsr_offset}]
+    mrs x10, fpsr
+    eor x10, x10, x9
+    cbz x10, 2f
     msr fpsr, x9
+2:
     ldp q0, q1, [x16, #({q_offset}+0)]
     ldp q2, q3, [x16, #({q_offset}+32)]
     ldp q4, q5, [x16, #({q_offset}+64)]

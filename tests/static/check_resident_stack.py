@@ -226,6 +226,23 @@ def nested(info, gate):
     return total + worst, problems
 
 
+def skip_targets(name, body, lands):
+    """Each conditional skip of `body` (`lands`: its normalized form -> the instruction right after what it skips) branches
+    exactly there (trip-cost plan section 7: SKIP alone would accept any target)."""
+    problems, insns = [], [i for _, i in body]
+    for k, (addr, ins) in enumerate(body):
+        m = re.match(r'(cbz|tbz) .*?0x([0-9a-f]+) <', ins)
+        if not m: continue
+        form = re.sub(r' 0x[0-9a-f]+ <.*>$', ' SKIP', ins)
+        to = lands.get(form)
+        if to is None: problems.append(f'{name}+{addr - body[0][0]:#x}: undeclared conditional skip `{ins}`'); continue
+        j = insns.index(to, k)
+        want = body[j][0]
+        if int(m[2], 16) != want:
+            problems.append(f'{name}+{addr - body[0][0]:#x}: `{form}` lands at {int(m[2], 16):#x}, want {want:#x} (after the write it skips)')
+    return problems
+
+
 def eret_problems(funcs, words, tops, profile=False):
     """The ERET path, the gates' save sequences and the vectors, instruction by instruction. `profile`: the EL0 sampler's
     resident, whose resume-time store is allowed (and required to store to `Head::resume_time`)."""
@@ -239,7 +256,7 @@ def eret_problems(funcs, words, tops, profile=False):
     want = (['cbz x3, SKIP', 'mrs x9, sctlr_el1', 'orr x9, x9, #0x2', 'msr sctlr_el1, x9', 'isb',
              'msr elr_el1, x1', 'msr spsr_el1, x2', 'mov x16, x0', 'ldr x9, [x16, #0xf8]', 'msr sp_el0, x9',
              'ldr x9, LIT', 'mov sp, x9', 'ldr x9, [x16, #0x308]', 'msr fpcr, x9', 'ldr x9, [x16, #0x310]',
-             'msr fpsr, x9'] + [f'ldp q{2 * i}, q{2 * i + 1}, [x16, {o(256 + 32 * i)}]' for i in range(16)] +
+             'mrs x10, fpsr', 'eor x10, x10, x9', 'cbz x10, SKIP', 'msr fpsr, x9'] + [f'ldp q{2 * i}, q{2 * i + 1}, [x16, {o(256 + 32 * i)}]' for i in range(16)] +
             [f'ldp x{r}, x{r + 1}, [x16{", " + o(8 * r) if r else ""}]' for r in range(0, 16, 2)] + ['ldr x17, [x16, #0x88]'] +
             [f'ldp x{r}, x{r + 1}, [x16, {o(8 * r)}]' for r in range(18, 30, 2)] +
             ['ldr x30, [x16, #0xf0]', 'ldr x16, [x16, #0x80]', 'eret'])    # (trip-cost plan step 1.1: pairs, x16 the base last)
@@ -263,8 +280,11 @@ def eret_problems(funcs, words, tops, profile=False):
         diff = next((f'#{k}: `{g}`, want `{w}`' for k, (g, w) in enumerate(zip(got, want)) if g != w),
                     f'{len(got)} instructions, want {len(want)}')
         problems.append(f'resume_exception restore sequence differs: {diff}')
-    elif literal(words, body, sp_literal) != tops['EXCEPTION_STACK_TOP']:
-        problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
+    else:
+        # Trip-cost plan section 7: every conditional skip lands right after what it skips.
+        problems += skip_targets('resume_exception', body, {'cbz x3, SKIP': 'msr elr_el1, x1', 'cbz x10, SKIP': 'ldp q0, q1, [x16, #0x100]'})
+        if literal(words, body, sp_literal) != tops['EXCEPTION_STACK_TOP']:
+            problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
     callers = {n for n, insns in funcs.items() for _, i in insns
                if re.match(r'bl? 0x[0-9a-f]+ <(resume_exception|enter_allocated)>$', i)} - {'resume_exception'}
     if callers != ERET_CALLERS:
