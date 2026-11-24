@@ -6,13 +6,16 @@ section 2). No disassembler: the classes come from the encodings.
 Roles, by who emits them (`GROUPS`):
 - FEX's body: `fex_alu`, `fex_mem` (a recorded access site), `fex_simd`, `fex_const` (movz/movk), `fex_state` (a load or
   store that is no access site: the guest-state page through x28), `fex_branch` (a branch that reaches no check stub),
-  `fex_fpctl` (FPSR and FPCR moves), `fex_other` (nop, barriers, other system words such as RDTSC's counter read); and its
-  flag words, `flags` (rmif, setf, cfinv, ccmp, cset, NZCV moves,
-  a write of the PF or AF register).
+  `fex_fpctl` (FPSR and FPCR moves), `fex_other` (nop, barriers, other system words such as RDTSC's counter read); a bulk
+  REP STOS loop (`--bulk`, kernel code) is FEX body too (its guest instruction counts in the report's REP share); and its
+  flag words, `flags` (rmif, setf, cfinv, ccmp, cset, NZCV moves, the PF/AF bookkeeping: a write of PF's or AF's register
+  by a word that sets no flags, unless it is the result its instruction moves on; a flag-setting `adds`/`subs` is the
+  instruction's own work, `fex_alu`, whatever it writes).
 - natemu's slice-1 words: the checks, each reached by the branch to its stub (`split_check` with its address word,
   `stack_check`, `align_check`, `guard_check` (a computed target's), `divide_check`, `fp_check` (SIMD, x87, pending, denormal
-  and FMA checks), `x87_check` (the x87 stack tag, guessed stack and FLDCW tests), `segment_check`); the stubs themselves
-  (`stub`: a `brk`, or a probing split stub's `adr` and `b`); `probe` (a sample in a shared probe, charged to its store's
+  and FMA checks), `x87_check` (the x87 stack tag, guessed stack and FLDCW tests), `segment_check`); `x87_run` (the test for
+  an open x87 run, its start and its end: FPSR, FPCR and the run byte); the stubs themselves (`split_stub`: a probing split
+  stub's `adr` and `b`; `stub`: a `brk`); `probe` (a sample in a shared probe, charged to its store's
   block); `load_move` (the move out of a load's temporary, slice 1's precise loads); `nzcv_save` (`mrs x25, nzcv`); `helper`
   (an `svc` to the resident's divide, x87 or string helpers); the exits (`exit_literal`: the guest-RIP move and `svc #LINK`,
   whose first word becomes the link `b` or its trampoline; `exit_computed`: `mov x0, xR; b <dispatcher>`); `entry` (a PIC
@@ -41,8 +44,9 @@ CHECK_ROLE = {SPLIT: 'split_check', STACK: 'stack_check', ALIGN: 'align_check', 
               SIMD: 'fp_check', X87: 'fp_check', PENDING: 'fp_check', DENORM: 'fp_check', X87TAG: 'x87_check',
               X87GUESS: 'x87_check', FLDCW: 'x87_check', SEGMENT: 'segment_check'}
 # The most words before a check's branch that belong to it (they write only x0-x2): the split check's address word with
-# a constant's moves, the segment check's record walk, the x87 guess's loads.
-CHECK_WORDS = {SPLIT: 6, STACK: 1, ALIGN: 1, GUARD: 1, DIVIDE: 2, SIMD: 3, X87: 7, PENDING: 4, DENORM: 1, X87TAG: 1,
+# a constant's moves, the segment check's record walk, the x87 guess's loads, idiv's overflow test (RAX ^ INT_MIN, RDX + 1
+# and RCX + 1 or-ed).
+CHECK_WORDS = {SPLIT: 6, STACK: 1, ALIGN: 1, GUARD: 1, DIVIDE: 5, SIMD: 3, X87: 7, PENDING: 4, DENORM: 1, X87TAG: 1,
                X87GUESS: 4, FLDCW: 3, SEGMENT: 12}
 RELOC_GUEST_RIP_LITERAL, RELOC_NAMED_SYMBOL_LITERAL, RELOC_GUEST_RIP_MOVE, RELOC_DISPATCH_BRANCH, RELOC_PROBE_BRANCH = 1, 2, 3, 4, 5
 SVC_LINK = 0xd400_0021
@@ -52,8 +56,8 @@ CLASS_FPR = 1
 GROUPS = {}
 for r in ('fex_alu', 'fex_mem', 'fex_simd', 'fex_const', 'fex_state', 'fex_branch', 'fex_fpctl', 'fex_other'): GROUPS[r] = 'fex_body'
 GROUPS['flags'] = 'fex_flags'
-for r in ('split_check', 'stack_check', 'align_check', 'guard_check', 'divide_check', 'fp_check', 'x87_check', 'segment_check',
-          'stub', 'probe', 'load_move', 'nzcv_save', 'helper', 'exit_literal', 'exit_computed', 'entry'): GROUPS[r] = 'natemu'
+for r in ('split_check', 'split_stub', 'stack_check', 'align_check', 'guard_check', 'divide_check', 'fp_check', 'x87_check',
+          'segment_check', 'x87_run', 'stub', 'probe', 'load_move', 'nzcv_save', 'helper', 'exit_literal', 'exit_computed', 'entry'): GROUPS[r] = 'natemu'
 for r in ('literal', 'beyond', 'far', 'none', 'unknown'): GROUPS[r] = 'other'
 ROLES = list(GROUPS)
 
@@ -118,6 +122,7 @@ def is_memory(w):
 def dest(w):
     """The register a data-processing or load word writes (Rd/Rt), or None for words that write no general register the
     window test should see (stores, branches, system words but mrs, SIMD data processing)."""
+    if flag_only(w): return None                             # rmif, setf, ccmp: the low bits are a mask, no register
     op0 = w >> 25 & 0xf
     if op0 in (0b1000, 0b1001): return w & 31                 # data processing, immediate
     if op0 in (0b0101, 0b1101):                               # data processing, register
@@ -129,6 +134,20 @@ def dest(w):
         return None
     if w & 0xfff0_0000 == 0xd530_0000: return w & 31          # mrs
     return None
+
+
+def flag_only(w):
+    """rmif, setf8/16, ccmp/ccmn: words that write NZCV only."""
+    return w & 0xffe0_7c10 == 0xba00_0400 or w & 0xffff_bc1f == 0x3a00_080d or w & 0x3fe0_0010 == 0x3a40_0000
+
+
+def sets_flags(w):
+    """A data-processing word with its S bit (adds, subs, ands, bics, adcs, sbcs; cmp, cmn, tst): the guest instruction's own
+    result and flags, whatever register it writes."""
+    s = w >> 29 & 1
+    return bool((w & 0x1f00_0000 == 0x1100_0000 and s) or (w & 0x1f80_0000 == 0x1200_0000 and w >> 29 & 3 == 3)
+                or (w & 0x1f00_0000 == 0x0b00_0000 and s) or (w & 0x1f00_0000 == 0x0a00_0000 and w >> 29 & 3 == 3)
+                or (w & 0x1fe0_0000 == 0x1a00_0000 and s))
 
 
 def is_mov_from(w, src):
@@ -154,8 +173,40 @@ def flag_word(w, flag_regs):
     if w & 0x3fe0_0010 == 0x3a40_0000: return True           # ccmp, ccmn
     if w & 0x7fe0_0c00 in (0x1a80_0400, 0x5a80_0000) and (w >> 5) & 31 == 31 and (w >> 16) & 31 == 31:
         return True                                          # cset, csetm
+    # FEX's PF and AF: PF's register holds a result whose low byte's parity is PF, AF's an operand xor whose bit 4 with the
+    # result's is AF. A flag-setting word is the instruction's own work even when it writes PF's register (cmp's `subs x26`,
+    # add's `adds x26` whose result is then moved to the guest register); any other write of either register is the
+    # bookkeeping (AF's `eor x27` and `mov x27`, a narrow compare's `sub w26`). roles() takes back a PF write whose value its
+    # instruction then moves into another register (the result, computed there).
     d = dest(w)
-    return d is not None and d in flag_regs and not is_memory(w)
+    return d is not None and d in flag_regs and not is_memory(w) and not sets_flags(w)
+
+
+# The x87 run's exact words: execution.rs RUN_END (frame::X87_RUN's byte at 0x414, the exception word at 0x4b4, the saved
+# FPCR at 0xb0), and the start's (the SIMD flag byte at 0x411, FCW at 0x4b0; `movz w1, #6`, or #0 without AFP).
+X87_RUN_TEST = 0x3950_5380                                   # ldrb w0, [x28, #X87_RUN] (then cbnz w0)
+RUN_END = [0xd53b_4420, 0x1200_1c00, 0xb944_b781, 0x2a00_0021, 0xb904_b781, 0xb940_b380, 0xd51b_4400, 0xd51b_443f, 0x3910_539f]
+RUN_START = [0xd53b_4420, None, 0x3950_4781, 0x2a00_0021, 0x3910_4781, 0xd51b_443f, 0x5280_0020, 0x3910_5380, 0xd53b_4400,
+             0xb900_b380, 0x7949_6380, 0x5ac0_0000, 0x5314_5400, (0x5280_00c1, 0x5280_0001), 0x2a00_5820, 0xd51b_4400]
+
+
+def x87_run_words(words, i):
+    """How many words of the x87 run's test, start or end begin at word i (0: none)."""
+    def at(seq, j):
+        if j + len(seq) > len(words): return False
+        for k, want in enumerate(seq):
+            w = words[j + k]
+            if want is None: ok = w & 0xff00_001f == 0x3400_0000                 # cbz w0
+            elif isinstance(want, tuple): ok = w in want
+            else: ok = w == want
+            if not ok: return False
+        return True
+    if words[i] == X87_RUN_TEST and i + 1 < len(words) and words[i + 1] & 0xff00_001f == 0x3500_0000:
+        return 2                                                                  # the test: ldrb w0; cbnz w0
+    if at(RUN_END, i):
+        return len(RUN_END) + (i + 9 < len(words) and words[i + 9] & 0xfc00_0000 == 0x1400_0000)
+    if at(RUN_START, i): return len(RUN_START)
+    return 0
 
 
 def pattern(w, flag_regs):
@@ -190,7 +241,7 @@ def roles(code: Code):
         i = off // 4
         if 0 <= i < n and out[i] is None: out[i] = role; return True
         return False
-    for off, kind, _, _, size, _ in code.relocs:
+    for off, kind, _, size, _, _ in code.relocs:      # (offset, kind, register, size, reserved, value)
         if kind in (RELOC_GUEST_RIP_LITERAL, RELOC_NAMED_SYMBOL_LITERAL) and size:
             for o in range(off - off % 4, off + size, 4): put(o, 'literal')
     stubs = {}
@@ -199,8 +250,9 @@ def roles(code: Code):
         no, kind = s[0], s[5]
         if kind in STUB_KINDS and no % 4 == 0:
             stubs[no] = kind
-            put(no, 'stub')
-            if no + 4 in probe_b: put(no + 4, 'stub')
+            role = 'split_stub' if kind == SPLIT else 'stub'
+            put(no, role)
+            if no + 4 in probe_b: put(no + 4, role)
     # Exits: a literal exit's guest-RIP move into x0 up to its svc #LINK; a computed exit's mov x0 and its b.
     for off, kind, reg, size, _, _ in code.relocs:
         if kind == RELOC_GUEST_RIP_MOVE and reg == 0:
@@ -213,6 +265,15 @@ def roles(code: Code):
         elif kind == RELOC_DISPATCH_BRANCH:
             put(off, 'exit_computed')
             if off >= 4 and words[off // 4 - 1] & 0xffe0_ffff == 0xaa00_03e0: put(off - 4, 'exit_computed')
+    # The x87 run's words (M2 task 4, tools/fexc/shim/fexc_sites.inc FexcX87RunStart, FexcHoistEmit, FexcX87RunEnd): the
+    # test for an open run, its start (FPSR's flags kept, the run byte set, FPCR switched to the x87's) and its end
+    # (execution.rs RUN_END, with the `b` back after it when it is the top test's out-of-line end).
+    i = 0
+    while i < n:
+        k = x87_run_words(words, i)
+        for j in range(i, i + k):
+            if out[j] is None: out[j] = 'x87_run'
+        i += max(k, 1)
     # Checks: the branch to a stub (and the far form's skip over it), then the words before it that write only x0-x2.
     for i, w in enumerate(words):
         at = i * 4
@@ -244,6 +305,15 @@ def roles(code: Code):
                 site_regs.append((no, regs, s[18] == CLASS_FPR))
         elif kind == FMA: put(no, 'fp_check')
     nexts = sorted(starts)
+    # A PF-register write whose value its instruction moves into another register is the result (alu), and so is the move.
+    for i, w in enumerate(words):
+        d = dest(w)
+        if out[i] is not None or d is None or d not in code.flag_regs or sets_flags(w) or flag_only(w): continue
+        end = next((x for x in nexts if x > 4 * i), n * 4)
+        for o in range(4 * i + 4, end, 4):
+            u = words[o // 4]
+            if is_mov_from(u, d) and dest(u) not in code.flag_regs: out[i] = 'fex_alu'; break
+            if dest(u) == d: break
     for no, regs, fpr in site_regs:
         end = next((x for x in nexts if x > no), n * 4)
         for r in regs:

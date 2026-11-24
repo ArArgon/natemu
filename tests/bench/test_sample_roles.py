@@ -63,7 +63,7 @@ class SiteRecords(unittest.TestCase):
         return roles(w, sites=sites, relocs=relocs)
 
     def test_a_split_check_is_the_words_its_stub_branch_ends(self):
-        self.assertEqual(self.split_block(), ['split_check'] * 4 + ['fex_mem'] + ['exit_literal'] * 3 + ['stub'] * 2)
+        self.assertEqual(self.split_block(), ['split_check'] * 4 + ['fex_mem'] + ['exit_literal'] * 3 + ['split_stub'] * 2)
 
     def test_without_its_stub_record_the_check_is_ordinary_code(self):
         r = self.split_block(with_stub=False)
@@ -80,12 +80,12 @@ class SiteRecords(unittest.TestCase):
         w = [0x9100_0020, ADD_X0_X1_7, EOR_X0_X0_X1, tbnz_w0_12(0x10, 0x18), STR_X4_X11_8, BRK_1]
         # add x0, x1, #0 belongs to the previous instruction (the PC table starts the store's at 8).
         r = roles(w, sites=[site(0x14, R.STORE, insn=8), site(0x18, R.SPLIT, g2=0x14, insn=8)], pcs=((4, 0), (8, 3)))
-        self.assertEqual(r, ['fex_alu', 'split_check', 'split_check', 'split_check', 'fex_mem', 'stub'])
+        self.assertEqual(r, ['fex_alu', 'split_check', 'split_check', 'split_check', 'fex_mem', 'split_stub'])
 
     def test_the_far_form_counts_both_branches(self):
         w = [ADD_X0_X1_7, EOR_X0_X0_X1, beq(0x0c, 0x14), b(0x10, 0x18), STR_X4_X11_8, BRK_1]
         r = roles(w, sites=[site(0x14, R.STORE), site(0x18, R.SPLIT, g2=0x14)])
-        self.assertEqual(r, ['split_check'] * 4 + ['fex_mem', 'stub'])
+        self.assertEqual(r, ['split_check'] * 4 + ['fex_mem', 'split_stub'])
 
 
 class Exits(unittest.TestCase):
@@ -106,15 +106,37 @@ class Patterns(unittest.TestCase):
         for w in (0xba1f_8682, 0xd500_401f, 0x3a00_080d, 0xfa40_1804, 0x9a9f_27f4, 0xd53b_4200, 0xd51b_4200):
             self.assertEqual(roles([w]), ['flags'], hex(w))
 
-    def test_a_write_of_pf_or_af_is_a_flag_word_only_where_the_object_says_where_they_are(self):
-        for w in (0xf100_04fa, 0xaa07_03fb):               # subs x26, x7, #1; mov x27, x7
-            self.assertEqual(roles([w]), ['flags'])
-            self.assertEqual(roles([w], sra=SRA[:16]), ['fex_alu'])
+    def test_pf_and_af_bookkeeping_is_flags_only_where_the_object_says_where_they_are(self):
+        # AF's operand (eor x27, x4, x6; mov x27, x7; mvn w27, w4) and a narrow compare's PF result (sub w26, w4, #0x37).
+        for w in (0xca06_009b, 0xaa07_03fb, 0x2a24_03fb, 0x5100_dc9a):
+            self.assertEqual(roles([w]), ['flags'], hex(w))
+            self.assertEqual(roles([w], sra=SRA[:16]), ['fex_alu'], hex(w))
         self.assertEqual(roles([0xaa1a_03e7]), ['fex_alu'])  # mov x7, x26: the result, read from PF's register
         # 32-bit code: EAX..EDI, then PF and AF (sra_count 10).
         sra32 = [4, 7, 5, 6, 8, 9, 10, 11, 26, 27]
-        self.assertEqual(roles([0x7100_04fa, 0xaa07_03fb], sra=sra32, bits=32), ['flags', 'flags'])
+        self.assertEqual(roles([0x5100_dc9a, 0xaa07_03fb], sra=sra32, bits=32), ['flags', 'flags'])
         self.assertEqual(roles([0xaa07_03ec], sra=sra32, bits=32), ['fex_alu'])   # mov x12, x7: x12 is R8 only in 64-bit code
+
+    def test_a_flag_setting_word_is_the_instructions_own_work_whatever_it_writes(self):
+        # cmp rax, rbx: subs x26, x4, x6; dec rcx: subs x26, x7, #1; add rax, rbx: adds x26, x4, x6; test: ands x26, x4, x4;
+        # cmp with no PF: subs xzr (cmp x4, x6); cmn w0, w4, lsl #24
+        for w in (0xeb06_009a, 0xf100_04fa, 0xab06_009a, 0xea04_009a, 0xeb06_009f, 0x2b04_601f):
+            self.assertEqual(roles([w]), ['fex_alu'], hex(w))
+
+    def test_a_pf_write_its_instruction_moves_on_is_the_result(self):
+        # add x26, x4, x6 (no S); mov x4, x26: the sum, computed in PF's register and moved to RAX
+        self.assertEqual(roles([0x8b06_009a, 0xaa1a_03e4]), ['fex_alu', 'fex_alu'])
+        # not when the move is in another instruction
+        self.assertEqual(roles([0x8b06_009a, 0xaa1a_03e4], pcs=((4, 0), (8, 3))), ['flags', 'fex_alu'])
+
+    def test_flag_only_words_write_no_register(self):
+        for w in (0xba1f_8682, 0x3a00_080d, 0xfa40_1804, 0xba5f_0aa2):     # rmif, setf8, ccmp, ccmp (Rn x21)
+            self.assertIsNone(R.dest(w), hex(w))
+        self.assertEqual(R.dest(0xf100_04fa), 26)
+        # So a flag word never joins a check's window (rmif's mask is not x0-x2).
+        w = [0xba1f_8682, ADD_X0_X1_7, EOR_X0_X0_X1, tbnz_w0_12(0x10, 0x18), STR_X4_X11_8, BRK_1]
+        r = roles(w, sites=[site(0x14, R.STORE), site(0x18, R.SPLIT, g2=0x14)])
+        self.assertEqual(r[0], 'flags')
 
     def test_other_encodings(self):
         cases = {0xd53b_4219: 'nzcv_save', 0xd53b_4420: 'fex_fpctl', 0xd51b_443f: 'fex_fpctl', 0x5280_0294: 'fex_const',
@@ -122,9 +144,32 @@ class Patterns(unittest.TestCase):
                  0xd53b_e054: 'fex_other', 0x0000_0000: 'literal', 0x8b14_016b: 'fex_alu', BRK_1: 'stub'}
         for w, want in cases.items(): self.assertEqual(roles([w]), [want], hex(w))
 
+    def test_the_x87_run_words(self):
+        top = [R.X87_RUN_TEST, 0x3500_0220]                  # ldrb w0, [x28, #X87_RUN]; cbnz w0, E
+        start = [0xd53b_4420, 0x3400_00a0] + R.RUN_START[2:13] + [0x5280_00c1] + R.RUN_START[14:]
+        end = R.RUN_END + [b(116, 12)]                        # the out-of-line end, back to the block's third word
+        r = roles(top + start + [0x1e62_2862] + end)
+        self.assertEqual(r, ['x87_run'] * 18 + ['fex_simd'] + ['x87_run'] * 10)
+        r = roles(R.RUN_END)
+        self.assertEqual(r, ['x87_run'] * 9)
+        # without AFP the start's movz w1 is #0; a near miss (one word changed) is no run
+        self.assertEqual(roles(start[:13] + [0x5280_0001] + start[14:]), ['x87_run'] * 16)
+        bad = list(R.RUN_END); bad[3] = 0x2a00_0022
+        self.assertNotIn('x87_run', roles(bad))
+        self.assertEqual(roles([R.X87_RUN_TEST, 0x3400_0220]), ['fex_state', 'fex_branch'])   # cbz: not the test
+
     def test_a_helper_call_takes_its_argument_moves(self):
         w = [0xb400_0287, 0xaa05_03e0, 0xaa04_03e1, 0xaa07_03e2, 0xd400_0061, 0xaa00_03f4]
         self.assertEqual(roles(w), ['fex_branch', 'helper', 'helper', 'helper', 'helper', 'fex_alu'])
+
+    def test_idivs_overflow_check_is_five_words(self):
+        # eor x0, x4, #1<<63; add x1, x5, #1; orr x0, x0, x1; add x1, x7, #1; orr x0, x0, x1; cbz x0, stub
+        w = [0xd241_0080, 0x9100_04a1, 0xaa01_0000, 0x9100_04e1, 0xaa01_0000, 0xb400_0020, BRK_1]
+        self.assertEqual(roles(w, sites=[site(0x1c, R.DIVIDE)]), ['divide_check'] * 6 + ['stub'])
+
+    def test_a_literal_slot_is_its_relocations_size(self):
+        r = roles([0x1111_1111, 0x2222_2222, 0xaa14_03e0], relocs=[reloc(4, R.RELOC_GUEST_RIP_LITERAL, size=8)])
+        self.assertEqual(r, ['literal', 'literal', 'fex_alu'])
 
 
 class LoadThenMove(unittest.TestCase):
@@ -194,7 +239,8 @@ class AdmissionFixtures(unittest.TestCase):
                 if s[5] in R.ACCESS_KINDS and s[0] % 4 == 0:
                     self.assertEqual(r[s[0] // 4], 'fex_mem', f'{f.name} {s[0]:#x}')
                     self.assertTrue(R.is_memory(c.words[s[0] // 4]), f'{f.name} {s[0]:#x}')
-                if s[5] in R.STUB_KINDS: self.assertEqual(r[s[0] // 4], 'stub', f'{f.name} {s[0]:#x}')
+                if s[5] in R.STUB_KINDS:
+                    self.assertEqual(r[s[0] // 4], 'split_stub' if s[5] == R.SPLIT else 'stub', f'{f.name} {s[0]:#x}')
 
 
 if __name__ == '__main__':
