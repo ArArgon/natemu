@@ -259,6 +259,9 @@ fn protocol_errors() {
     assert_eq!((code(&v), &v["id"]), (-32600, &json!(2)));
     c.send(r#"{"jsonrpc":"1.0","id":3,"method":"quit"}"#);
     assert_eq!(code(&c.recv()), -32600);
+    c.stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"\xff\"}\n").unwrap();
+    let v = c.recv();
+    assert_eq!((code(&v), &v["id"]), (-32700, &Value::Null), "invalid UTF-8: {v}");
     let v = c.call(4, "reboot", json!({}));
     assert_eq!(code(&v), -32601);
     // Task 3 adds the power button; until then the method is not found.
@@ -383,17 +386,19 @@ fn ninth_client_is_refused() {
         assert_eq!(c.status(10 + i as u64)["protocol"], 1, "the 8 are still served");
     }
     drop(clients.pop());
-    // The slot frees once the server has seen the client leave: retry until a new connection is served.
-    let end = Instant::now() + PATIENCE;
+    // The slot frees once the server has seen the client leave: retry until a new connection is served. A refused
+    // attempt may fail at the write (the server closed it first) or at the read.
+    let end = Instant::now() + Duration::from_secs(30);
     loop {
         let mut c = r.client();
-        c.send(r#"{"jsonrpc":"2.0","id":1,"method":"query_status"}"#);
-        let mut line = String::new();
-        if c.lines.read_line(&mut line).unwrap_or(0) > 0 {
-            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"query_status"}"#.to_string() + "\n";
+        let mut answer = String::new();
+        if c.stream.write_all(line.as_bytes()).is_ok() && c.lines.read_line(&mut answer).unwrap_or(0) > 0 {
+            assert_eq!(serde_json::from_str::<Value>(&answer).unwrap()["id"], 1);
             break;
         }
         assert!(Instant::now() < end, "a slot frees after a client leaves");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -533,6 +538,13 @@ fn socket_rules() {
     let e = serve(&r.path, target()).err().expect("a file is refused");
     assert!(e.contains("exists and is not a socket"), "{e}");
     assert_eq!(std::fs::read(&r.path).unwrap(), b"x", "and left alone");
+    // Something that appears at the path between the checks and the move into place is not replaced.
+    std::fs::remove_file(&r.path).unwrap();
+    std::fs::write(&r.path, b"y").unwrap();
+    let e = bind_private(&r.path).err().expect("the move into place does not replace");
+    assert!(e.contains("another program listens on this socket"), "{e}");
+    assert_eq!(std::fs::read(&r.path).unwrap(), b"y", "left alone");
+    assert_eq!(r.dir.names(), ["c.sock"], "no temporary folder left behind");
     let long = r.dir.path(&"x".repeat(110));
     let e = serve(&long, target()).err().expect("a long path is refused");
     assert!(e.contains("at most 103 bytes"), "{e}");

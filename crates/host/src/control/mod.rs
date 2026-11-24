@@ -106,8 +106,20 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
     let fail = |e: String| format!("control socket {}: {e}", path.display());
     crate::virtio::claim_socket_path(path).map_err(fail)?;
     let listener = bind_private(path).map_err(fail)?;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| fail(e.to_string()))?;
-    let (bell, ring) = UnixStream::pair().map_err(|e| fail(e.to_string()))?;
+    // From here on the socket is in place: a failure removes it.
+    let placed = (|| {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        let (bell, ring) = UnixStream::pair().map_err(|e| e.to_string())?;
+        no_sigpipe(&bell).map_err(|e| e.to_string())?;
+        Ok::<_, String>((meta, bell, ring))
+    })();
+    let (meta, bell, ring) = match placed {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(fail(e));
+        }
+    };
     let shared = Arc::new(Shared {
         input: target.ps2.map(|p| ps2::Input::start(p, ps2::STALL)),
         cancel: target.cancel,
@@ -136,8 +148,36 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
     })
 }
 
+/// A write to a peer that left fails with EPIPE instead of raising SIGPIPE.
+fn no_sigpipe(stream: &UnixStream) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    let ok = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        )
+    };
+    if ok == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// Moves `from` to `to` unless something is at `to` (`renamex_np` with `RENAME_EXCL`): EEXIST then.
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| ErrorKind::InvalidInput);
+    let (from, to) = (c(from)?, c(to)?);
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// A listening socket at `path`, mode 0600 before anyone can reach it: bound inside a fresh 0700 folder beside `path`,
-/// made 0600 there, then renamed into place (no process-wide umask, so it is safe with threads running).
+/// made 0600 there, then moved into place without replacing anything (no process-wide umask, so it is safe with
+/// threads running; something that appeared at `path` since the checks is refused as a live socket).
 fn bind_private(path: &Path) -> std::result::Result<UnixListener, String> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -163,7 +203,10 @@ fn bind_private(path: &Path) -> std::result::Result<UnixListener, String> {
         }
         let listener = UnixListener::bind(&temp).map_err(|e| e.to_string())?;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-        std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
+        rename_exclusive(&temp, path).map_err(|e| match e.kind() {
+            ErrorKind::AlreadyExists => "another program listens on this socket".to_string(),
+            _ => e.to_string(),
+        })?;
         renamed = true;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(listener)
@@ -254,20 +297,7 @@ impl Client {
         // An accepted socket inherits the listener's O_NONBLOCK.
         stream.set_nonblocking(false).ok()?;
         stream.set_write_timeout(Some(SEND_TIMEOUT)).ok()?;
-        let one: libc::c_int = 1;
-        // A write to a client that left fails with EPIPE instead of raising SIGPIPE.
-        let ok = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            )
-        };
-        if ok != 0 {
-            return None;
-        }
+        no_sigpipe(&stream).ok()?;
         let reader = stream.try_clone().ok()?;
         let client = Arc::new(Client { id, stream, out: Mutex::default(), changed: Condvar::new() });
         let c = client.clone();

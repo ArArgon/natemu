@@ -18,11 +18,15 @@ Without that key natemu opens no socket and the launch is the same as before.
 ## The socket
 
 - The socket is made when the VM is ready to start, before the guest runs, and removed when natemu exits.
-- Its mode is 0600, so only your user can connect. A path is at most 103 bytes.
+- Its mode is 0600, so only your user can connect. A path is at most 103 bytes. natemu makes the socket in a
+  temporary folder beside the path (named `.c` and a few characters) and then moves it into place, so a path within
+  about 10 bytes of the limit can be refused when the socket's own name is short.
 - A socket left behind by an earlier run is replaced. If another program is listening on the path, natemu refuses to
   start (`control socket vm.sock: another program listens on this socket`), and it also refuses a path where
   something other than a socket exists.
-- Up to 8 programs can be connected at once. A ninth connection is closed at once.
+- Up to 8 programs can be connected at once. A ninth connection is closed at once. A client's place frees only once
+  natemu has noticed it left: usually at once, up to about 1 second while its last answers are written, and up to 5
+  seconds if it left during a `send_input` the guest is not reading.
 
 ## Messages
 
@@ -53,7 +57,9 @@ The response to a request carries either `result` or `error`:
 {"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}
 ```
 
-Every request gets exactly one response, and the responses come in the order the requests arrived on that connection.
+Every request gets exactly one response while the connection lasts, and the responses come in the order the requests
+arrived on that connection. When the run ends (the `stopped` notification) or natemu closes the connection, requests
+still being carried out or not yet read may go unanswered.
 You may send several requests without waiting for answers. An error can have a `data` member with details: a string
 explaining it, or for -32001 an object naming the device.
 
@@ -232,6 +238,7 @@ An error's `message` is a short English phrase; programs should look at `code`.
 - A line of at most 1 MiB, either way.
 - natemu never waits for a slow client. Responses wait in a queue for each client; a client that lets more than 1 MiB
   pile up, or whose socket takes nothing for 1 second, is disconnected (and what it held is let go). The run goes on.
+  A single answer counts too: a batch whose answer array is over 1 MiB disconnects the client without an answer.
   A client that sends many requests without reading the answers should read them as it goes.
 - A `pointer_motion`'s `dx` and `dy` and a `scroll`'s `dy` are at most 65535 in size.
 
@@ -278,7 +285,12 @@ class Control:
             request["params"] = params
         self.sock.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
         while True:
-            message = json.loads(self.lines.readline())
+            line = self.lines.readline()
+            if not line:  # natemu closed the connection (the run ended): no answer is coming
+                raise ConnectionError("natemu closed the control connection")
+            message = json.loads(line)
+            if isinstance(message, list):
+                continue  # a batch's answer (this client sends none)
             if message.get("id") == self.next_id:
                 if "error" in message:
                     raise RuntimeError(message["error"])
