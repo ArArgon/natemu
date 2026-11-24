@@ -510,7 +510,7 @@ def run(args):
     clone(args.inputs / PYTHON, serve / 'py.tar.xz')
     server, host = serve_files(serve)
     result = {'image_format': args.image_format, 'transport': args.transport, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
-              'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, 'sample_us': getattr(args, 'sample_us', None), 'command': [str(c) for c in command(args, disk, 'CACHE')],
+              'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'i386': args.i386, 'perf_log': args.perf_log, **({'sample_us': args.sample_us} if getattr(args, 'sample_us', None) else {}), 'command': [str(c) for c in command(args, disk, 'CACHE')],
               'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None,
               'qemu': subprocess.run([QEMU, '--version'], capture_output=True, text=True).stdout.splitlines()[0] if args.backend == 'qemu' else None, 'phases': {}}
     try:
