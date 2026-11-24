@@ -112,7 +112,8 @@ pub struct ConsoleSpec {
 pub enum ConsoleBackend {
     /// What the guest writes is appended to this file (created when missing); the guest receives nothing.
     Output(PathBuf),
-    /// A Unix-domain socket natemu listens on (not built yet: a launch with one is refused).
+    /// A Unix-domain socket natemu listens on (removed at exit), one client at a time: what the client sends the guest
+    /// receives; what the guest writes goes to the client, or is discarded while none is connected.
     Socket(PathBuf),
 }
 
@@ -625,16 +626,6 @@ impl Boot {
             return Err("network: forwarding and host-loopback options require --net".into());
         }
         self.net_options.validate()?;
-        if let Some(c) = self
-            .consoles
-            .iter()
-            .find(|c| matches!(c.backend, ConsoleBackend::Socket(_)))
-        {
-            return Err(format!(
-                "console {:?}: a socket console is not supported yet; use output = FILE",
-                c.id
-            ));
-        }
         // PCID plan P1: the barriers' leaf SB needs FEAT_SB (the vCPU's ID_AA64ISAR1_EL1); refuse to turn them on without it
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
@@ -769,11 +760,13 @@ impl Boot {
                 }
                 Kind::Console(k) => {
                     let c = &self.consoles[k];
-                    let ConsoleBackend::Output(path) = &c.backend else {
-                        unreachable!("socket consoles are refused above")
-                    };
-                    let console = crate::virtio::Console::file(path)
-                        .map_err(|e| format!("console {:?}: {e}", c.id))?;
+                    let console = match &c.backend {
+                        ConsoleBackend::Output(path) => crate::virtio::Console::file(path),
+                        ConsoleBackend::Socket(path) => {
+                            crate::virtio::Console::socket(path, irqs.clone())
+                        }
+                    }
+                    .map_err(|e| format!("console {:?}: {e}", c.id))?;
                     crate::virtio::Virtio::model(irqs.clone(), gsi, console)
                 }
             };

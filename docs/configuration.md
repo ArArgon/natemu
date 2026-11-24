@@ -109,7 +109,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | `[[rng]]` | `id` | required | Entropy device |
 | `[[console]]` | `id` | required | A second console for the guest (see below) |
 | | `output` | none | A file: what the guest writes to the console is added to its end (created when missing) |
-| | `socket` | none | A Unix socket path (not supported yet: a launch with one is refused) |
+| | `socket` | none | A Unix socket natemu listens on: a program that connects talks to the guest's console (see below) |
 | `[debug]` | `pool` | `true` | Shared template pool |
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
@@ -162,6 +162,16 @@ nothing from it. A guest that writes faster than the Mac takes the bytes waits f
 slow terminal; at power-off natemu waits up to 2 seconds for the last bytes to reach the file, then
 drops what is left and says so on standard error. `machine.transport.console` chooses MMIO or PCI for
 every console.
+
+With `socket = "console.sock"`, natemu listens on that Unix socket (a path of at most 103 bytes) and
+removes it when it exits; a socket an earlier run left behind is replaced. One program at a time can
+connect, for example `nc -U console.sock` or `socat - UNIX-CONNECT:console.sock`: what it sends, the
+guest reads from `/dev/hvc0`, and what the guest writes, it receives. A second connection while one is
+open is closed at once. While nobody is connected, what the guest writes is dropped: the guest does not
+wait, and natemu says at exit on standard error how many bytes it dropped. After the program
+disconnects, the next one to connect gets the guest's later output. A connected program that stops
+reading makes the guest wait, as a slow terminal does; at power-off natemu waits for it at most 2
+seconds.
 
 ```toml
 [[console]]
@@ -229,7 +239,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: disks "a" and "b" are the same file; that is allowed only when both are readonly or snapshot` | One image, two writers |
 | `c.toml: nic[0].forward: bad forward "x": [tcp\|udp:]HOST_PORT:GUEST_PORT, decimal ports 1-65535` | A forward is malformed |
 | `c.toml: console[0]: needs exactly one of output, socket; found none` | Also `found both` |
-| `console "log": a socket console is not supported yet; use output = FILE` | `socket` is accepted in the file but not built yet |
+| `console "log": c.sock: exists and is not a socket` | Something other than a socket is at the `socket` path (also `another program listens on this socket`, and a path over 103 bytes) |
 | `console "log": no interrupt line left on mmio (lines 16-23 are all held); use pci` | Every MMIO interrupt line is taken (6 MMIO disks with the NIC and entropy device) |
 | `console "log": PCI slots 1-31 are all used; use mmio or fewer disks on pci` | 29 disks on PCI leave no slot |
 | `--set bad: expected key=value` | `--set` without `=` |

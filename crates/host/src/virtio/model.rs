@@ -5,8 +5,6 @@
 //!
 //! Locking: [`Model::started`], [`Model::reset`] and the [`ModelPort::on_ready`] callback run under the device's state
 //! lock and only record and signal; [`Model::request`] and [`Model::drain`] run without it.
-// The console's file backend delivers nothing: `ModelPort::deliver` and `on_ready` serve its socket backend (next).
-#![cfg_attr(not(test), expect(dead_code))]
 use super::{
     Arrival, Chain, Guest, Identity, Profile, Request, Virtio, descriptors_in, gather,
     queue::{Descriptor, Queue, Snapshot},
@@ -781,7 +779,7 @@ pub(super) mod tests {
             // SAFETY: fixture RAM in bounds; the device writes only buffers it was given.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
         }
-        fn get(&self, gpa: u64, len: usize) -> Vec<u8> {
+        pub fn get(&self, gpa: u64, len: usize) -> Vec<u8> {
             let at = self.b.ram.range(gpa, len as u64).unwrap();
             // SAFETY: as `put`; read after the used index says the device is done.
             unsafe { std::slice::from_raw_parts(at, len) }.to_vec()
@@ -816,7 +814,7 @@ pub(super) mod tests {
             first
         }
         /// Receive buffer `i` of `len` bytes, as its own chain.
-        fn post_rx(&self, i: u64, len: u32) -> u16 {
+        pub fn post_rx(&self, i: u64, len: u32) -> u16 {
             self.post(0, &[(RX + i * 0x1000, len, true)])
         }
         pub fn kick(&self, q: u64) {
@@ -834,7 +832,7 @@ pub(super) mod tests {
             )
         }
         /// Everything queue 0's used elements hold, in used order (each head is receive buffer `head`).
-        fn received(&self) -> Vec<u8> {
+        pub fn received(&self) -> Vec<u8> {
             (0..self.used(0))
                 .flat_map(|slot| {
                     let (head, len) = self.element(0, slot);
