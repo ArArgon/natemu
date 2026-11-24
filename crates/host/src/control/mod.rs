@@ -110,13 +110,18 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
     crate::virtio::claim_socket_path(path).map_err(fail)?;
     let listener = bind_private(path).map_err(fail)?;
     // From here on the socket is in place: a failure removes it.
+    let ps2 = target.ps2;
     let placed = (|| {
         let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         let (bell, ring) = UnixStream::pair().map_err(|e| e.to_string())?;
         no_sigpipe(&bell).map_err(|e| e.to_string())?;
-        Ok::<_, String>((meta, bell, ring))
+        let input = match ps2 {
+            Some(p) => Some(ps2::Input::start(p, ps2::STALL).map_err(|e| format!("an input thread: {e}"))?),
+            None => None,
+        };
+        Ok::<_, String>((meta, bell, ring, input))
     })();
-    let (meta, bell, ring) = match placed {
+    let (meta, bell, ring, input) = match placed {
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_file(path);
@@ -124,7 +129,7 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
         }
     };
     let shared = Arc::new(Shared {
-        input: target.ps2.map(|p| ps2::Input::start(p, ps2::STALL)),
+        input,
         power_button: target.power_button,
         cancel: target.cancel,
         status: target.status,

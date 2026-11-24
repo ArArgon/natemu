@@ -24,6 +24,8 @@ Without that key natemu opens no socket and the launch is the same as before.
 - A socket left behind by an earlier run is replaced. If another program is listening on the path, natemu refuses to
   start (`control socket vm.sock: another program listens on this socket`), and it also refuses a path where
   something other than a socket exists.
+- While the socket exists, natemu does not end a run because all its processors are halted (a guest idle in HLT may
+  be waiting for a key from a client); end such a run with [`quit`](#quit).
 - Up to 8 programs can be connected at once. A ninth connection is closed at once. A client's place frees only once
   natemu has noticed it left: usually at once, up to about 1 second while its last answers are written, and up to 5
   seconds if it left during a `send_input` the guest is not reading.
@@ -31,8 +33,9 @@ Without that key natemu opens no socket and the launch is the same as before.
 ## Messages
 
 Each message is one line: compact JSON (no newline inside it) followed by a newline (`\n`). Lines go both ways on
-the same connection. A line may be at most 1 MiB (1,048,576 bytes, without its newline). A longer line is answered
-with a parse error (-32700) and the connection is closed. Blank lines are ignored. A line that is not valid UTF-8 is a
+the same connection. A line a client sends may be at most 1 MiB (1,048,576 bytes, without its newline). A longer
+line is answered with a parse error (-32700) and the connection is closed. natemu's own lines have no such bound
+(a later method may answer with more, see [Limits](#limits)). Blank lines are ignored. A line that is not valid UTF-8 is a
 parse error. When a client closes its sending side, a last line without its newline still counts, and the client gets
 the answers to everything it sent before natemu closes the connection.
 
@@ -198,10 +201,10 @@ each answer knows the guest can see what it sent.
 
 natemu passes the bytes on as fast as the guest reads them, much faster than a real keyboard, so a guest program can
 fall behind even though its kernel got everything. A Linux program that reads the keyboard's `/dev/input/event*`
-device (a display server, for example) is kept at most 64 events, about 20 key presses and releases, and loses them
-all when it lets more pile up. To be sure such a program sees every key, send a few keys per `send_input` and let it
-read them before sending more (the guest cases in `tests/devices/run_control.py` send 6 and wait until the guest
-reports them).
+device (a display server, for example) is kept at most 64 events, about 20 key transitions (10 keys pressed and
+released), and loses what had piled up when it lets more arrive before reading. To be sure such a program sees every
+key, send a few keys per `send_input` and let it read them before sending more (the guest cases in
+`tests/devices/run_control.py` send 6 and wait until the guest reports them).
 
 If the guest takes nothing for 5 seconds (it hangs, or does not read the keyboard or mouse at all), `send_input` fails
 with -32003. The events not yet passed on are dropped, and what the guest already got stands: a key whose press
@@ -228,13 +231,15 @@ When the run ends, every connected client gets one notification, and then natemu
 | `cancelled` | it was cancelled: `quit`, Ctrl-A x, Ctrl-C or SIGTERM |
 | `error` | anything else: a processor stopped on something natemu does not support, the watchdog, a host error |
 
-natemu waits at most 1 second for the notification to be written; a client that is not reading may not get it.
+natemu waits at most 1 second for the notification to be written; a client that is not reading may not get it. A
+client that closed its sending side gets the answers to what it sent and then the connection closes, so it never
+gets `stopped`.
 
 ## Errors
 
 | Code | Meaning |
 | --- | --- |
-| -32700 | Parse error: the line is not JSON, not UTF-8, or longer than 1 MiB (the connection is then closed) |
+| -32700 | Parse error: the line is not JSON or not UTF-8, or it is longer than 1 MiB (only then is the connection closed) |
 | -32600 | Invalid request: not a request object, `jsonrpc` not `"2.0"`, `method` not a string, `params` neither object nor array, an id that is not a number, string or null, an unknown member, an empty batch |
 | -32601 | Method not found |
 | -32602 | Invalid params: wrong or missing parameters, an unknown event type or key name, a motion beyond 65535; `data` says what |
@@ -247,10 +252,11 @@ An error's `message` is a short English phrase; programs should look at `code`.
 ## Limits
 
 - 8 connections at once; a ninth is closed at once.
-- A line of at most 1 MiB, either way.
+- A line a client sends is at most 1 MiB. That is a protocol bound; natemu's lines have none.
 - natemu never waits for a slow client. Responses wait in a queue for each client; a client that lets more than 1 MiB
   pile up, or whose socket takes nothing for 1 second, is disconnected (and what it held is let go). The run goes on.
   A single answer counts too: a batch whose answer array is over 1 MiB disconnects the client without an answer.
+  This 1 MiB is natemu's queueing policy today, not a protocol bound: a method with large answers may raise it.
   A client that sends many requests without reading the answers should read them as it goes.
 - A `pointer_motion`'s `dx` and `dy` and a `scroll`'s `dy` are at most 65535 in size.
 

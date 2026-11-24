@@ -340,6 +340,20 @@ struct State {
     next: u64,
 }
 
+/// When the item being delivered must be in the 8042, and how far each delivered item moves that: the stall time for
+/// a job, [`RETRY`] while the thread only retries what the guest is owed (so a job queued meanwhile waits at most
+/// that long before its own stall time starts).
+struct Deadline {
+    at: Instant,
+    step: Duration,
+}
+
+impl Deadline {
+    fn new(step: Duration) -> Self {
+        Deadline { at: Instant::now() + step, step }
+    }
+}
+
 struct Inner {
     ps2: Ps2Input,
     stall: Duration,
@@ -359,8 +373,9 @@ pub struct Input {
 
 impl Input {
     /// Starts the keyboard's and the mouse's delivery threads; `stall` is how long a device may take nothing before
-    /// events fail ([`STALL`] in the server; shorter in tests).
-    pub fn start(ps2: Ps2Input, stall: Duration) -> Input {
+    /// events fail ([`STALL`] in the server; shorter in tests). If a thread cannot be started, the one already
+    /// started is stopped and the error returned.
+    pub fn start(ps2: Ps2Input, stall: Duration) -> std::io::Result<Input> {
         let inner = Arc::new(Inner {
             ps2,
             stall,
@@ -368,16 +383,14 @@ impl Input {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
-        let threads = [(Device::Keyboard, "control-keyboard"), (Device::Mouse, "control-mouse")]
-            .map(|(device, name)| {
-                let inner = inner.clone();
-                std::thread::Builder::new()
-                    .name(name.into())
-                    .spawn(move || inner.run(device))
-                    .expect("spawn an input thread")
-            })
-            .into();
-        Input { inner, threads: Mutex::new(threads) }
+        let input = Input { inner: inner.clone(), threads: Mutex::new(Vec::new()) };
+        for (device, name) in [(Device::Keyboard, "control-keyboard"), (Device::Mouse, "control-mouse")] {
+            let inner = inner.clone();
+            // On an error `input` is dropped, which stops and joins the thread already started.
+            let thread = std::thread::Builder::new().name(name.into()).spawn(move || inner.run(device))?;
+            input.threads.lock().unwrap_or_else(|e| e.into_inner()).push(thread);
+        }
+        Ok(input)
     }
 
     /// Delivers `client`'s events in order, each once the previous one is wholly in the 8042, and returns once the
@@ -488,7 +501,7 @@ impl Inner {
             }
             if Self::owed(&st.held, device) {
                 drop(st);
-                let _ = self.settle(device, &mut (Instant::now() + RETRY));
+                let _ = self.settle(device, &mut Deadline::new(RETRY));
                 st = self.lock();
                 continue;
             }
@@ -513,7 +526,7 @@ impl Inner {
     /// One job: first what the guest is owed, then the job's own bytes. Each item delivered moves the deadline to the
     /// stall time from then.
     fn process(&self, device: Device, job: &Job) -> Result<(), SendError> {
-        let deadline = &mut (Instant::now() + self.stall);
+        let deadline = &mut Deadline::new(self.stall);
         self.settle(device, deadline)?;
         match job.work {
             Work::Release => {
@@ -553,7 +566,7 @@ impl Inner {
     }
 
     /// Sends the guest every transition it is owed on `device`.
-    fn settle(&self, device: Device, deadline: &mut Instant) -> Result<(), SendError> {
+    fn settle(&self, device: Device, deadline: &mut Deadline) -> Result<(), SendError> {
         loop {
             match device {
                 Device::Keyboard => {
@@ -573,9 +586,9 @@ impl Inner {
         }
     }
 
-    fn outcome(&self, delivered: bool, deadline: &mut Instant) -> Result<(), SendError> {
+    fn outcome(&self, delivered: bool, deadline: &mut Deadline) -> Result<(), SendError> {
         if delivered {
-            *deadline = Instant::now() + self.stall;
+            deadline.at = Instant::now() + deadline.step;
             Ok(())
         } else if self.stop.load(SeqCst) {
             Err(SendError::Stopping)
@@ -584,13 +597,13 @@ impl Inner {
         }
     }
 
-    fn keyboard(&self, set2: &[u8], deadline: &mut Instant) -> Result<(), SendError> {
-        let delivered = self.ps2.wait_keyboard(set2, *deadline, &self.stop);
+    fn keyboard(&self, set2: &[u8], deadline: &mut Deadline) -> Result<(), SendError> {
+        let delivered = self.ps2.wait_keyboard(set2, deadline.at, &self.stop);
         self.outcome(delivered, deadline)
     }
 
-    fn mouse(&self, dx: i16, dy: i16, dz: i8, mask: u8, deadline: &mut Instant) -> Result<(), SendError> {
-        let delivered = self.ps2.wait_mouse(dx, dy, dz, mask, *deadline, &self.stop);
+    fn mouse(&self, dx: i16, dy: i16, dz: i8, mask: u8, deadline: &mut Deadline) -> Result<(), SendError> {
+        let delivered = self.ps2.wait_mouse(dx, dy, dz, mask, deadline.at, &self.stop);
         self.outcome(delivered, deadline)
     }
 }
@@ -620,7 +633,7 @@ mod tests {
         let b = board();
         b.command_with(0x60, 0x07);
         assert_eq!(b.mouse(&[0xf4]), [0xfa]);
-        let input = Input::start(b.input.clone(), stall);
+        let input = Input::start(b.input.clone(), stall).unwrap();
         (b, input)
     }
 
@@ -932,5 +945,29 @@ mod tests {
         input.release(A);
         let breaks: Vec<u8> = letters[..19].iter().flat_map(|c| c.set2_break().unwrap()).collect();
         assert_eq!(collect(&b, 38, 0), (breaks, vec![]));
+    }
+
+    /// While the thread only retries what the guest is owed, a delivered item moves its deadline by RETRY, not the
+    /// stall time: a job queued meanwhile fails about one stall time after it was sent, not two.
+    #[test]
+    fn retry_keeps_its_short_deadline() {
+        let stall = Duration::from_secs(1);
+        let (b, input) = setup(stall);
+        let letters = &KeyCode::ALL[..19];
+        input.send(A, &letters.iter().map(|&c| key(c, true)).collect::<Vec<_>>()).unwrap();
+        // A leaves with nobody reading: its 19 breaks (38 bytes) do not fit, the release stalls and the breaks stay
+        // owed, retried every RETRY.
+        input.release(A);
+        std::thread::sleep(stall + Duration::from_millis(300));
+        // Room for a few more bytes: the retry delivers some breaks, then the guest stops reading again.
+        for _ in 0..4 {
+            assert!(b.read().is_some());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let start = Instant::now();
+        assert_eq!(input.send(B, &[key(KeyCode::KeyZ, true)]), Err(SendError::Stalled));
+        let took = start.elapsed();
+        assert!(took >= stall, "{took:?}");
+        assert!(took < stall + Duration::from_millis(600), "{took:?}: the retry's deadline was moved by the stall time");
     }
 }
