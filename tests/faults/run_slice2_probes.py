@@ -20,7 +20,8 @@ hot loop at N and 2N iterations makes the same resident entries, and a forged li
 builds its link point's target) is refused at the reply (`bad_reply`, E2; the linker's own check stays behind it); every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
 (driver `--tamper`, `--tamper-after`): a link point reported outside its block is refused (`bad_reply`); a corrupted linked
 branch or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
-(`links_check`). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
+(`links_check`), as is a split block's probing stub's `adr`, re-pointed at its hot copy, aimed one word further
+(split-check plan step A; the same loop untampered passes the check). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
 loop, page-crossing), into another block's page, data on a loop's own code page, and FEX's upstream SelfModifyingCode tests
 must reach their end with QEMU's state (QEMU runs the self-modifying program itself). Nothing is keyed by probe name. Writes DIR/probes.json; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -425,6 +426,19 @@ def main():
             failures += not ok
             out.append({'name': f'tamper-after-{kind}', 'diffs': [] if ok else ['check failed (see the log)'], 'links_check': state and state['links_check'], 'stderr': err})
             print(f"tamper {kind} after the run: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
+        # Split-check plan step A: a split block's probing stub, whose `adr` the resident re-points at the block's hot copy
+        # (the loop's crossing store), aimed one word further after the run: the host's audit refuses it; untampered it
+        # accepts the re-pointed word.
+        cross = {'name': 'cross-loop', 'code': ref.assemble(f'mov rsi, {DATA + 0xffc:#x}\nmov ecx, 200\n1: mov [rsi], rax\n'
+                                                              'add rax, 3\ndec ecx\njnz 1b').hex(),
+                 'rip': CODE, 'gpr': gprs(), 'rflags': 0, 'memory': [{'addr': hex(DATA), 'data': '00' * 0x2000}]}
+        for kind, tampered in (('probe-adr', True), (None, False)):
+            state, err = run(f"cross-loop-{kind or 'untampered'}", cross, ['--tamper-after', kind] if kind else [])
+            ok = state is not None and state['stop'] == 'reached' and state['tampered'] == tampered and (state['links_check'] != 'ok') == tampered
+            failures += not ok
+            out.append({'name': f"tamper-after-{kind or 'none'}-cross", 'diffs': [] if ok else ['check failed (see the log)'],
+                        'links_check': state and state['links_check'], 'stderr': err})
+            print(f"tamper {kind} after a crossing loop: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
         state, err = run('untampered', add_chain(3, 40)[0], [])
         ok = state is not None and state['links_check'] == 'ok' and not state['tampered']
         failures += not ok

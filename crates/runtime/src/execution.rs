@@ -726,6 +726,13 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         s.linker += 1;
         // The block that ran the `svc` (one search: nothing below changes the cache before `find`).
         let ran = cache::block_at(elr.wrapping_sub(4));
+        // (Split-check plan step A: an exit through a split block's cold code, its link made already.)
+        if let Some(b) = ran
+            && let Some(o) = link_point_of(b, elr.wrapping_sub(4))
+            && cache::cold_exit(b, o)
+        {
+            cache::control().cold_exits += 1;
+        }
         // PIC study stage 3: shared code runs for the address its page-base slot names ([`cache::running_rip`]); its link
         // points' targets are its translation's, moved there (x0, built from the same slot, is the same).
         let here = ran.map_or(0, |b| cache::running_rip(b));
@@ -1703,6 +1710,8 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                         // (a probing split stub's branch, pointed at its shared probe: admitted as the placeholder)
                         || (staged(k) == DISPATCH_PLACEHOLDER && cache::probe_branch(u64::from(t.code) + 4 * k))
                         || run.is_some_and(|(o, admitted, split)| 4 * k == o && staged(k) == admitted && Some(code(k)) == split)
+                        // (split-check plan step A: a probing stub's `adr` re-pointed at the hot copy, as the word it stands for)
+                        || cache::admitted_adr(t, 4 * k) == Some(staged(k))
                 })
             };
             // (A shared translation's link points hold the rewritten moves' first word.)
@@ -4921,10 +4930,13 @@ unsafe fn split(
         }
         s.splits += 1;
         write_record(record(), &s);
+        // (Split-check plan step A: in the hot copy when it holds the next word, whose exits links patch; the cold code's
+        // would each leave through the linker.)
+        let next = u64::from(access.native_offset) + 4;
         self::resume(
             &s,
             resume,
-            b.code_va() + access.native_offset as u64 + 4,
+            cache::hot_at(b, next).map_or(b.code_va() + next, |at| natemu_abi::execution::cache::CODE_VA + at),
             spsr,
         )
     }

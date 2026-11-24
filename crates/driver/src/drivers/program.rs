@@ -15,7 +15,8 @@
 //! next block will not fit and the resident is about to flush (KIND `offset`: a link point outside the code, so the reply
 //! is refused; `word`: a linked point's branch; `record`: a link record),
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
-//! self-check must refuse (`links_check`); `--forge-stop` writes the stop word (`exec::STOP_WORD`) over the first
+//! self-check must refuse (`links_check`; KIND `probe-adr`: a split block's probing stub's `adr`, re-pointed at its hot
+//! copy, aimed one word further); `--forge-stop` writes the stop word (`exec::STOP_WORD`) over the first
 //! block's entry, a stop nobody armed (the resident must halt: `bad_stop`); `--forge-entry W[,W..]` writes those A64
 //! words there instead (generated code runs at EL0, so a system instruction must halt `trapped` and an access to the
 //! private window `private_access`); `--tamper target` changes a link point's target alone (its move unchanged: the reply
@@ -1043,15 +1044,49 @@ fn flushing_next(area: Area) -> bool {
 enum Corrupt {
     Word,
     Record,
+    ProbeAdr,
+}
+/// Split-check plan step A (`--tamper-after probe-adr`): the first probing split stub of a split block whose `adr` the
+/// resident re-pointed at its hot copy is aimed one word further (the probe would return past the word after the check);
+/// false when there is none.
+fn corrupt_probe_adr(area: Area) -> bool {
+    use natemu_abi::execution::probe;
+    let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    let word = |at: u64| area.read_record::<u32>(cache::CODE_OFFSET + at as usize);
+    for n in 0..control.blocks as usize {
+        let meta = area.read_record::<u32>(cache::LOOKUP_OFFSET + cache::INDEX + 4 * n) as usize;
+        let b: cache::Block = area.read_record(cache::META_OFFSET + meta);
+        if b.hot_size == 0 || b.code_size == 0 || b.flags & (cache::INSTANCE | cache::SYSTEM) != 0 {
+            continue;
+        }
+        let hot = b.hot_body()..=b.hot_body() + u64::from(b.hot_size);
+        for k in 0..b.sites_count as usize {
+            let site: natemu_abi::code_object::Site =
+                area.read_record(cache::META_OFFSET + meta + size_of::<cache::Block>() + k * size_of::<natemu_abi::code_object::Site>());
+            let at = u64::from(b.code) + u64::from(site.native_offset);
+            if site.kind != natemu_abi::code_object::kind::SPLIT {
+                continue;
+            }
+            if let Some(w) = probe::adr_x0_target(word(at), at).filter(|t| hot.contains(t)).and_then(|t| probe::adr_x0(at, t + 4)) {
+                area.copy(cache::CODE_OFFSET + at as usize, &w.to_le_bytes());
+                return true;
+            }
+        }
+    }
+    false
 }
 /// Corrupts the first linked point or its record; false when nothing is linked yet.
 fn corrupt(area: Area, kind: Corrupt) -> bool {
+    if let Corrupt::ProbeAdr = kind {
+        return corrupt_probe_adr(area);
+    }
     let Some((b, r)) = first_link(area) else {
         return false;
     };
     let at = cache::CODE_OFFSET + b.code as usize + r.offset() as usize;
     match kind {
         Corrupt::Word => area.copy(at, &0x1400_0001u32.to_le_bytes()), // b .+4
+        Corrupt::ProbeAdr => unreachable!(),
         Corrupt::Record => {
             let record = cache::LinkRecord {
                 original: r.original ^ 1 << 5,
@@ -1496,7 +1531,7 @@ pub(crate) struct Args {
     kick_events: Vec<String>,
     #[arg(long, value_name = "KIND", value_parser = ["offset", "word", "record", "system", "mmio", "next-page", "site", "site-kind", "armed", "dispatch", "target"])]
     tamper: Option<String>,
-    #[arg(long, value_name = "KIND", value_parser = ["word", "record"])]
+    #[arg(long, value_name = "KIND", value_parser = ["word", "record", "probe-adr"])]
     tamper_after: Option<String>,
     /// A real block device in the program fixture, with an optional finite backend schedule
     #[arg(long, requires = "io_script")]
@@ -1907,10 +1942,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         _ => tamper_target,
     });
     let tamper_after = args.tamper_after.as_deref().map(|kind| {
-        if kind == "word" {
-            Corrupt::Word
-        } else {
-            Corrupt::Record
+        match kind {
+            "word" => Corrupt::Word,
+            "probe-adr" => Corrupt::ProbeAdr,
+            _ => Corrupt::Record,
         }
     });
     let forged_entry = if forge_stop {

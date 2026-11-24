@@ -488,7 +488,9 @@ done
 ''')
         # The reference binary is copied into the work folder (a mount source of this container alone): containers of
         # concurrent runs that bind the same shared folder (the framework's input root) get "Permission denied" on it.
-        (workdir / 'reference').mkdir(exist_ok=True); shutil.copy2(qemu, workdir / 'reference' / qemu.name)
+        (workdir / 'reference').mkdir(exist_ok=True)
+        # (Once per folder: the copy is read-only, as its source, so a second batch into the same folder may not overwrite it.)
+        if not (workdir / 'reference' / qemu.name).exists(): shutil.copy2(qemu, workdir / 'reference' / qemu.name)
         args = ['container', 'run', '--rm', '--name', name, '--network', 'none', '--read-only', '--cpus', '2', '--memory', '512m',
                 '--mount', f'type=bind,source={workdir},target=/work',
                 '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/work/reference/' + qemu.name]

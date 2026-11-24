@@ -291,7 +291,7 @@ def program(seed, name, feature):
     raise ValueError(f'{name}: no encodable draw')
 
 
-STRIDES = ['store', 'load', 'rmw', 'index', 'split-store', 'split-load', 'push', 'push-below', 'recursion', 'xchg']
+STRIDES = ['store', 'load', 'rmw', 'index', 'split-store', 'split-load', 'push', 'push-below', 'recursion', 'xchg', 'cross-loop']
 
 
 def stride_program(kind, k, seed):
@@ -299,7 +299,11 @@ def stride_program(kind, k, seed):
     page made absent or read-only is first touched in that iteration: store/load/rmw with a pointer stepping 0x40, an index
     form `[rbx + i*8]`, a memory xchg (S3e), qword accesses stepping 3 bytes (a split access reaches the next page mid-loop), `push` crossing from
     one stack page to the one below, pushes running below the stack region (a fault without any mutation), and recursion one
-    level deeper per outer iteration."""
+    level deeper per outer iteration. `cross-loop` (split-check plan step A): every iteration's two 8-byte stores cross a page: the
+    first the DATA pair, the second the DATA pair before iteration `k` and the STACK pair from it on (a page of that pair
+    made absent or read-only faults in iteration `k`, the first page unwritten), the second in a block of its own whose
+    next word is its exit (`jmp`; the slice-2 VM has no SSE: 16-byte crossings are K1 `probe-copy`'s and `probe-share`'s): the probes return into the block's hot copy, and a store resumed after
+    its probe faulted goes on at the exit's trampoline."""
     rng = random.Random(seed)
     f = Flow(rng)
     gpr, rflags = gen.initial(rng)
@@ -316,6 +320,14 @@ def stride_program(kind, k, seed):
         f.put(f'mov rsi, {DATA + 0x1000 - 8 - 3 * k}'); f.put(f'mov r14d, {n}'); f.at(top)
         f.put('mov qword ptr [rsi], rax' if kind == 'split-store' else 'mov rax, qword ptr [rsi]')
         f.put('add rsi, 3'); f.put('dec r14d'); f.put(f'jnz {top}')
+    elif kind == 'cross-loop':
+        f.put(f'mov rsi, {DATA + 0x1000 - 4}'); f.put(f'mov rdi, {DATA + 0x1000 - 2}'); f.put(f'mov rbx, {STACK + 0x1000 - 3}')
+        f.put(f'mov r14d, {n}')
+        last = f.label()
+        f.at(top)
+        f.put('mov qword ptr [rsi], rax'); f.put('add rax, 3'); f.put('cmp r14d, 6'); f.put('cmovbe rdi, rbx'); f.put('dec r14d')
+        f.put(f'jz {last}'); f.put('mov qword ptr [rdi], rcx'); f.put(f'jmp {top}')
+        f.at(last); f.put('mov qword ptr [rdi], rcx')
     elif kind in ('push', 'push-below'):
         base = STACK + 0x1000 + 8 * k if kind == 'push' else STACK + 8 * k
         f.put(f'mov rsp, {base}'); f.put(f'mov r14d, {n}'); f.at(top)

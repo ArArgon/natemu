@@ -24,6 +24,9 @@ mark to the next mark; phase 7 ends at the next stop (init's, after the run). Sa
      e2 (stop to start) holds no sample rung after the stop except by the ringing pass in flight at it (a logged pass that
      began before the stop), no logged pass that rang a bell and no halted sample after that pass; the stop and the start
      are the port's (cause port).
+  f  cold exits (split-check plan step A): linker entries through a split block's cold code over the boot (natemu's
+     `cold_exits` on NAME.stderr) under 1% of the cross phase's iterations in both runs (NAME.serial's end lines): the probe
+     returns into the hot copy, whose exits are linked. Judged when NAME.stderr exists.
   marks: the seven marks in order in both runs (init's own, 0x80 + the run's number, ignored; an older init's, the run's
      number before mark 1, is skipped by the search); the control port ignored nothing (sample_report's own check).
 
@@ -31,12 +34,14 @@ Writes NAME.judge.json; exit 0 when the command, the report and every check pass
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import collections
 import json
+import re
 import subprocess
 
 import sample_report as sr
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ALU_SHARE = 95.0
+COLD_SHARE = 1.0           # f: cold exits per cross iteration, at most (%)
 PROBE_SHARE = 95.0
 CALL_SHARE = 90.0
 INIT_MARKS = 0x80          # init's marks, 0x80 + the run's number: not the program's phases
@@ -188,8 +193,26 @@ def judge(name):
     if not probes: problems.append('c: no probe sample in either run')
     elif res['c']['share'] < PROBE_SHARE:
         problems.append(f'c: {res["c"]["share"]}% of probe samples charged to the loop\'s block, want {PROBE_SHARE}%')
+    if pathlib.Path(f'{name}.stderr').exists():
+        res['f'], p = cold_exits(name); problems += p
     res['problems'] = problems
     return res
+
+
+def cold_exits(name):
+    """Check f: (the counts, problems) from NAME.stderr's `cold_exits` (summed over vCPUs) and NAME.serial's cross end lines."""
+    err = pathlib.Path(f'{name}.stderr').read_text(errors='replace')
+    serial = pathlib.Path(f'{name}.serial')
+    cold = [int(x) for x in re.findall(r'natemu-system-counts vcpu \d+ .* cold_exits (\d+)', err)]
+    iters = [int(x) for x in re.findall(r'NATEMU-SAMPLER end run=\d+ phase=\d+ name=cross .*?iters=(\d+)',
+                                        serial.read_text(errors='replace') if serial.exists() else '')]
+    out = dict(cold_exits=sum(cold) if cold else None, cross_iterations=sum(iters), runs=len(iters))
+    if not cold: return out, ['f: natemu printed no cold_exits count']
+    if len(iters) != 2: return out, [f'f: {len(iters)} cross end lines on the serial console, want 2']
+    out['share'] = round(100 * out['cold_exits'] / out['cross_iterations'], 4) if out['cross_iterations'] else None
+    if out['share'] is None or out['share'] >= COLD_SHARE:
+        return out, [f"f: {out['cold_exits']} cold exits over {out['cross_iterations']} cross iterations, want under {COLD_SHARE}%"]
+    return out, []
 
 
 def main(argv):

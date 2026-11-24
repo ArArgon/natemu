@@ -132,6 +132,14 @@ link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp`
 - `pic-now`: Y placed at RV3 first (absolute there), X at RV1, then X at RV3 (shared): its link into Y at RV3, an absolute
   block on its own page and frame, shares Y at link time and is local; RL then rewritten: both aliases run the new bytes.
 - `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
+Split-check plan step A (a probing split stub's `adr` re-pointed at its block's hot copy; natemu only, values asserted): frame
+RL holds PB (`mov ebx, 11; lea rax, [rel $$]`, then an 8-byte store of RAX across the CPU's pages d + 0x5000|0x6000 and a
+16-byte MOVUPS of (RAX, RBX) across d + 0x7000|0x8000, then `jmp r13`), the stored bytes cleared before each call and read
+back after it (r8, r9, r10; then r12, r14, r15):
+- `probe-copy` (`NATEMU_PIC=off`): PB placed at RV1 (split, its stubs' returns in its hot copy), then copied to RV2 of table
+  B (the copy's code from the template's words as admitted, its own split, the reuse check) and run there three times.
+- `probe-share`: PB placed at RV1, then shared at RV3 (the translation from the template's words as admitted, its proof)
+  and its instance run three times (at least one instance).
 Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
 Cross-vCPU reuse (the host-published template pool, chunk 3 of its plan; natemu only, run with `--pool`, block sizes default
 and 1, the reuse check on (`--code-shape`) and off; a DR7 write flushes the cache, so the next request finds no template of its
@@ -628,7 +636,12 @@ PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)],
              # link points given theirs (TAIL_POINTS), checked links made through them (TAIL_LINKS: the trampoline's jump and call).
              'indirect-sites': [(32, 3, None), (33, 3, None), (34, 2, None), (35, 2, None)]}
 # The resident's NATEMU_PIC per program (else the program driver's `all`).
-PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
+PIC_ENV = {'link-full': 'off', 'pic-user': 'user', 'probe-copy': 'off'}
+# Split-check plan step A (module docstring): PB at offset 0 of RL; the bytes it stores (8 at d + PB_8, 16 at d + PB_16).
+PROBE = ('probe-copy', 'probe-share')
+PB_8, PB_16 = 0x5ffc, 0x7ff8
+PB = lambda d: P.asm(f'mov ebx, 11\nlea rax, [rel $$]\nmov rdi, {d + PB_8:#x}\nmov [rdi], rax\nmovq xmm0, rax\nmovq xmm1, rbx\n'
+                     f'punpcklqdq xmm0, xmm1\nmov rdi, {d + PB_16:#x}\nmovups [rdi], xmm0\njmp r13')
 
 
 # Cross-vCPU reuse programs (module docstring). RLD: a frame of RL's bytes; PW, PWE: `pool-wrap`'s chain page and its end page.
@@ -734,6 +747,21 @@ def reuse_bodies(i, n=1):
                         + save(('r10', 'rax'), ('r12', 'rdx')) + cr3('tb') + call('x2', f'{RV2 + RX:#x}') + save(('r14', 'rax'), ('r15', 'rdx'))
                         + cr3('ta')),
         **pic_bodies(i, n),
+        **probe_bodies(i),
+    }
+
+
+def probe_bodies(i):
+    """Split-check plan step A's programs (module docstring)."""
+    d = P.SYS_D(i)
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    clear = f'    xor eax, eax\n    mov [{d + PB_8:#x}], rax\n    mov [{d + PB_16:#x}], rax\n    mov [{d + PB_16 + 8:#x}], rax\n'
+    read = lambda a, b, c: f'    mov {a}, [{d + PB_8:#x}]\n    mov {b}, [{d + PB_16:#x}]\n    mov {c}, [{d + PB_16 + 8:#x}]\n'
+    sse = '    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n'
+    calls = lambda tag, to: ''.join(clear + call(f'{tag}{r}', f'{to:#x}') for r in range(3))
+    return {
+        'probe-copy': sse + clear + call('b0', f'{RV1:#x}') + read('r8', 'r9', 'r10') + cr3('tb') + calls('b1', RV2) + read('r12', 'r14', 'r15') + cr3('ta'),
+        'probe-share': sse + clear + call('s0', f'{RV1:#x}') + read('r8', 'r9', 'r10') + calls('s1', RV3) + read('r12', 'r14', 'r15'),
     }
 
 
@@ -1061,6 +1089,8 @@ def reuse_memory(name, i):
         tramp[0x300:0x305] = b'\xe8' + (RV3 + IFO - (RVT + 0x305)).to_bytes(4, 'little', signed=True)
         tramp[0x305:0x308] = P.asm('jmp r13')
         return tables + [{'addr': f'0x{d + RL:x}', 'data': il_page().hex()}, {'addr': f'0x{d + RT:x}', 'data': tramp.hex()}]
+    if name in PROBE:
+        return tables + [{'addr': f'0x{d + RL:x}', 'data': PB(d).hex()}]
     if name in PIC:
         page = bytearray(0x1000)
         page[:len(Y(1))] = Y(1)
@@ -1118,6 +1148,8 @@ def reuse_either(name):
             # address spaces; the trampoline's jump and call reach their own aliases (RV3 from RVT, RV5 from RVT2).
             'indirect-sites': {'r8': {IL_SUM | IL_SUM << 32}, 'r9': {2 ** 64 - 1}, 'r10': {RV5}, 'r12': {RV3 + IFO}, 'r14': {RV5 + IFO},
                                'r15': {IL_SUM | IL_SUM << 32}},
+            'probe-copy': {'r8': {RV1}, 'r9': {RV1}, 'r10': {11}, 'r12': {RV2}, 'r14': {RV2}, 'r15': {11}},
+            'probe-share': {'r8': {RV1}, 'r9': {RV1}, 'r10': {11}, 'r12': {RV3}, 'r14': {RV3}, 'r15': {11}},
             'pool-peer': {'r8': {RV1}, 'r9': {RV1 + 17}, 'r10': {RV2}, 'r12': {RV2 + 17}},
             'pool-frame': {'r8': {RV1}, 'r10': {RV3}, 'r12': {RV3 + 17}},
             'pool-smc': {'r8': {1}, 'r9': {1}, 'r10': {3}, 'r12': {0x1000003}},
@@ -1132,7 +1164,7 @@ def reuse_either(name):
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
-REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n not in ('l1-pic', 'miss-pic', 'indirect-sites')}}
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), 'probe-copy': (1, 0), **{n: (1, 0) for n in PIC if n not in ('l1-pic', 'miss-pic', 'indirect-sites')}}
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
@@ -1621,7 +1653,7 @@ EITHER = {
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
-    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', 'miss-pic', 'indirect-sites', *POOL)},
+    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', 'miss-pic', 'indirect-sites', *POOL, 'probe-share')},
     # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
     # CPUID's way into B (eax = 2 from B's own code).
     'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
@@ -1680,7 +1712,7 @@ def program(name, n, k):
                       for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20), (LF1, CQ3, 0x300), (LF2, CQ3, 0x400))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic', 'indirect-sites') else [])
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic', 'indirect-sites', 'probe-share') else [])
             + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n) + relink_memory(name, i) + ret_memory(name, i)
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
@@ -2287,6 +2319,10 @@ def main():
                     reuse = c['stats']['k1']['reuse']
                     if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
                         problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
+                # Split-check plan step A: `probe-share` ran an instance of the shared translation (natemu_abi::pic::count INSTANCES).
+                for v, c in enumerate(out['cpus'] if out and name == 'probe-share' else []):
+                    if c['stats']['k1']['pic'][26] < 1:
+                        problems.append(f"cpu{v} pic instances {c['stats']['k1']['pic'][26]}, want at least 1")
                 # A block's death undoes its links out by its outbound list: no pass over the records (the pass's records count as scanned).
                 for v, c in enumerate(out['cpus'] if out and name in NO_SWEEP else []):
                     if c['stats']['k1']['scanned']:

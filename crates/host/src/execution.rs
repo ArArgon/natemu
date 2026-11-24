@@ -1749,6 +1749,35 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             if want != Some(word(at + 4)) {
                 return Err(format!("probing split stub at {:#x} of the block at {:#x}: word {:#010x}", site.native_offset, b.rip, word(at + 4)));
             }
+            // Split-check plan step A: the `adr`'s target as admitted (a target in the block's hot copy, where the resident
+            // re-points it, stands for the code word code + (t - hot_body)) is the word after the one branch to the stub.
+            let code = u64::from(b.code);
+            let t = exec::probe::adr_x0_target(word(at), at).unwrap_or(0);
+            let (body, h) = (b.hot_body(), u64::from(b.hot_size));
+            let admitted = if h != 0 && (body + u64::from(exec::ENTRY_OFFSET)..=body + h).contains(&t) { code + (t - body) } else { t };
+            let into = |o: u64| {
+                let w = word(o);
+                let d = if w & 0x7e00_0000 == 0x3600_0000 {
+                    (((w >> 5 & 0x3fff) << 18) as i32 >> 16) as i64 // tbz/tbnz
+                } else if w & 0x7e00_0000 == 0x3400_0000 || w & 0xff00_0010 == 0x5400_0000 {
+                    (((w >> 5 & 0x7_ffff) << 13) as i32 >> 11) as i64 // cbz/cbnz, b.cond
+                } else if w & 0xfc00_0000 == 0x1400_0000 {
+                    ((w << 6) as i32 >> 4) as i64 // b
+                } else {
+                    return false;
+                };
+                o.wrapping_add(d as u64) == at
+            };
+            let branches: Vec<u64> = (code..at).step_by(4).filter(|&o| into(o)).collect();
+            if branches.len() != 1 || admitted != branches[0] + 4 {
+                return Err(format!(
+                    "probing split stub at {:#x} of the block at {:#x}: its `adr` returns to {:#x}, branches to it from {:x?}",
+                    site.native_offset,
+                    b.rip,
+                    admitted.wrapping_sub(code),
+                    branches.iter().map(|o| o - code).collect::<Vec<_>>()
+                ));
+            }
         }
     }
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)

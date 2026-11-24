@@ -114,8 +114,9 @@ fn reserve(size: u64, hot: u64) -> Option<(u64, u64)> {
 /// Hot/cold: makes the hot copy of the block `b` (its record as it will be filed: `code`, `hot`, `hot_size`, links and
 /// computed exit; its code placed and relocated), each branch going where its target is now (a word of its body or its first
 /// exit: the hot copy's; another exit: that exit's trampoline; anything else: its code), and synchronizes it. False (nothing
-/// entered: the words written are above the hot fill point) when a word has no moved form.
-fn split(b: &mut Block) -> bool {
+/// entered: the words written are above the hot fill point) when a word has no moved form. `sites` are the block's (the
+/// record is not filed yet): its probing split stubs' returns are re-pointed at the hot copy ([`probe_returns`]).
+fn split(b: &mut Block, sites: impl Iterator<Item = Site>) -> bool {
     b.hot_body = b.hot_body_for();
     let (code, h, body) = (u64::from(b.code), u64::from(b.hot_size), b.hot_body());
     // (Word `h` of the body is written only by an exit's trampoline: a branch to a non-exit word there has no moved form.)
@@ -162,7 +163,65 @@ fn split(b: &mut Block) -> bool {
             rewrite(code + e + 36, branch(code + e + 36, body + u64::from(natemu_abi::execution::ENTRY_OFFSET) + 8));
         }
     }
+    probe_returns(b, sites);
     true
+}
+/// Split-check plan step A: the hot copy's word for code offset `o` of split block `b` (a code-area offset): its body's
+/// copy for ENTRY_OFFSET <= o < `hot_size`, or at `hot_size` the first exit's trampoline when it stands there in place (a
+/// store that is the last word before that exit resumes at it). `None`: not split, or no hot word stands for `o`.
+pub fn hot_at(b: &Block, o: u64) -> Option<u64> {
+    let (h, body) = (u64::from(b.hot_size), b.hot_body());
+    if h == 0 || o < u64::from(natemu_abi::execution::ENTRY_OFFSET) || o > h {
+        return None;
+    }
+    (o < h || b.trampolines().any(|(e, at)| e == u64::from(b.code) + h && at == body + h)).then_some(body + o)
+}
+/// Split-check plan step A, in [`split`] once it can no longer fail (beside the run end's return): each probing split stub
+/// (a SPLIT site whose first word is `adr x0, R`, R in the block's code, and whose second branches to a shared probe) gets
+/// `adr x0` to R's hot word ([`hot_at`]), so the probe returns into the hot copy, whose exits links patch, and not into the
+/// cold code, whose exits would all leave through the linker. Exact: the hot word is R moved unchanged (R is the word after
+/// the check, an x0/x1 write or the store: no branch), and so are the words from it to the store. A stub whose R has no
+/// hot word keeps its `adr`. The word stands for its admitted form ([`admitted_adr`]): a copy, a share, the PIC proof, the
+/// reuse check and the host's audit read that.
+fn probe_returns(b: &Block, sites: impl Iterator<Item = Site>) {
+    use natemu_abi::execution::probe;
+    let (code, size) = (u64::from(b.code), u64::from(b.code_size));
+    for s in sites.filter(|s| s.kind == natemu_abi::code_object::kind::SPLIT) {
+        let at = code + u64::from(s.native_offset);
+        let Some(r) = probe::adr_x0_target(word(at), at).filter(|&r| r >= code && r < code + size) else {
+            continue;
+        };
+        if !probe_branch(at + 4) {
+            continue;
+        }
+        if let Some(w) = hot_at(b, r - code).and_then(|t| probe::adr_x0(at, t)) {
+            rewrite(at, w);
+        }
+    }
+}
+/// Split-check plan step A: the admitted form of the word at code offset `o` of `b` when [`probe_returns`] rewrote it (a
+/// probing split stub's `adr x0` whose target lies in `b`'s hot copy): `adr x0` to the code word that hot word stands for,
+/// code + (t - hot_body). A PC-relative word, the same wherever the code is placed. `None`: any other word.
+pub fn admitted_adr(b: &Block, o: u64) -> Option<u32> {
+    use natemu_abi::execution::probe;
+    let (code, body, h) = (u64::from(b.code), b.hot_body(), u64::from(b.hot_size));
+    if h == 0 {
+        return None;
+    }
+    let at = code + o;
+    let t = probe::adr_x0_target(word(at), at)?;
+    if t < body + u64::from(natemu_abi::execution::ENTRY_OFFSET) || t > body + h {
+        return None;
+    }
+    sites(b).iter().any(|s| s.kind == natemu_abi::code_object::kind::SPLIT && u64::from(s.native_offset) == o).then(|| ())?;
+    probe::adr_x0(at, code + (t - body))
+}
+/// Split-check plan step A, the `cold_exits` count: a linker entry from `b`'s `svc` at code-area VA `svc` came through the
+/// cold code of a split block: its link point's trampoline is linked (no longer its admitted word), so the hot copy could
+/// not have reached the `svc`.
+pub fn cold_exit(b: &Block, offset: u64) -> bool {
+    b.hot_size != 0
+        && b.links.iter().any(|p| p.offset != 0 && u64::from(p.offset) == offset && word(b.link_at(p.offset)) != b.admitted_at(p))
 }
 /// M2 task 4 and reuse: for a block that begins with the test for an open x87 run, the offset of its run end's return
 /// word, the word as admitted (`b` to the block's third word) and, if the block is split, the word [`split`] put there
@@ -1434,7 +1493,7 @@ pub fn place(
         point_probes(code, staged_sites.iter().copied(), context);
         if hot != u64::MAX {
             (record.hot, record.hot_size) = (hot as u32, h_at);
-            if !split(&mut record) {
+            if !split(&mut record, staged_sites.iter().copied()) {
                 (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
             }
         }
@@ -1551,6 +1610,10 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         if probe_branch(o as u64) {
             return natemu_abi::execution::DISPATCH_PLACEHOLDER;
         }
+        // (Split-check plan step A: a probing stub's `adr` re-pointed at `t`'s hot copy, as admitted.)
+        if let Some(w) = admitted_adr(t, o as u64) {
+            return w;
+        }
         admitted
             .iter()
             .find(|&&(at, _)| at == o as u64)
@@ -1569,6 +1632,12 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         }
         for o in sites(t).iter().map(|s| u64::from(s.native_offset) + 4).filter(|&o| o + 4 <= size as u64 && probe_branch(o)) {
             at[o as usize..o as usize + 4].copy_from_slice(&natemu_abi::execution::DISPATCH_PLACEHOLDER.to_le_bytes());
+        }
+        // (Split-check plan step A: and their `adr` words as admitted, [`admitted_adr`]: the translation is never split.)
+        for o in sites(t).iter().map(|s| u64::from(s.native_offset)).filter(|&o| o + 4 <= size as u64) {
+            if let Some(w) = admitted_adr(t, o) {
+                at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+            }
         }
         // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
         let bits32 = bits32(t.context);
@@ -1718,6 +1787,10 @@ pub fn unlinked_word(t: &Block, o: usize) -> u32 {
     // (A probing split stub's branch, which the resident points at its shared probe: the placeholder it was admitted as.)
     if probe_branch(u64::from(t.code) + o) {
         return natemu_abi::execution::DISPATCH_PLACEHOLDER;
+    }
+    // (Split-check plan step A: its `adr`, which a split block's hot copy has the probe return to, [`admitted_adr`].)
+    if let Some(w) = admitted_adr(t, o) {
+        return w;
     }
     word(u64::from(t.code) + o)
 }
@@ -1875,6 +1948,13 @@ pub fn copy(
         if let Some((o, admitted, _)) = run {
             at[o as usize..o as usize + 4].copy_from_slice(&admitted.to_le_bytes());
         }
+        // (Split-check plan step A: the probing stubs' `adr` words as admitted, [`admitted_adr`]; this copy's own `split`
+        // re-points them at its hot copy.)
+        for o in sites(b).iter().map(|s| u64::from(s.native_offset)) {
+            if let Some(w) = admitted_adr(b, o) {
+                at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
         let bits32 = natemu_abi::execution::context_bits32(b.context);
         natemu_abi::execution::relocate_code_mode(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes, bits32)?;
         relocate(code, u64::from(b.dispatch_exit), dispatcher_for(b.context));
@@ -1907,7 +1987,7 @@ pub fn copy(
     };
     if hot != u64::MAX {
         (record.hot, record.hot_size) = (hot as u32, h_at);
-        if !split(&mut record) {
+        if !split(&mut record, sites(b).iter().copied()) {
             (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
         }
     }
@@ -2028,7 +2108,7 @@ pub fn copy_pooled(
     };
     if hot != u64::MAX {
         (record.hot, record.hot_size) = (hot as u32, h_at);
-        if !split(&mut record) {
+        if !split(&mut record, (0..e.sites_count()).map(|i| e.site(i))) {
             (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
         }
     }

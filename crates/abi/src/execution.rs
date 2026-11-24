@@ -1310,6 +1310,10 @@ pub mod cache {
         /// Mapped device memory: remap shootdowns this vCPU ran (`cache::remap_shootdown`, after a port or device exit that
         /// spanned a publish of the region table). Appended.
         pub remaps: u64,
+        /// Split-check plan step A: linker entries from a split block (one with a hot copy) at a link point whose trampoline
+        /// is linked already: the exit ran in the block's cold code (a linked hot copy never reaches the `svc`), the trip a
+        /// return into the cold code costs. A plain counter in every build. Appended.
+        pub cold_exits: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32

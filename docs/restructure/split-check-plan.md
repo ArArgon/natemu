@@ -1,7 +1,7 @@
 # Page-crossing stores: no linker trip when the probes pass (plan)
 
 November 23, 2026, on `m2-sampler`; revised after review the same day (step B deferred, step A's restore points
-completed). Design only: nothing here is built. One of the fixes the owner pooled
+completed). Step A is built (November 24, section 9); step B is not. One of the fixes the owner pooled
 after the [EL0 sampler findings](el0-sampler-findings.md) ("Split checks and probes >= 3%": **build**): no A/B of its
 own, one combined A/B and profile round at the end, correctness first, a kill-test.
 
@@ -260,3 +260,46 @@ stores across pages). Effort: about a day with its tests.
    own. Done after the last `return false`, as `run_return` is.
 3. A hot copy that does not hold R (R at or past `hot_size` without a trampoline there): `hot_at` returns none and the
    word stays cold, as today.
+
+## 9. Built: step A (November 24, 2026)
+
+As section 4.1 says, with these choices. `cache::hot_at` and the rewrite (`cache::probe_returns`, called by `split`
+with the block's sites, after the run end's return) are as planned; a stub is rewritten only when its `adr` targets the
+block's code and its second word already branches to a shared probe. `cache::admitted_adr` gives a rewritten word's
+admitted form (a target in the block's hot copy, `[hot_body + ENTRY_OFFSET, hot_body + hot_size]`, at a SPLIT site) and
+is what `copy` (its copied words), `share` (its copied words and the proof's original), `unlinked_word` and the reuse
+check use. The host's audit requires, for every probing stub, exactly one branch in the block's code to the stub and the
+admitted target the word after it. `split` in `execution.rs` resumes at `hot_at` of the store's next word.
+
+`cold_exits` (`cache::Control`, on natemu's `natemu-system-counts` line, in `run.py`'s `system_counts`) counts linker
+entries from a split block at a link point whose trampoline is linked already. Not the plan's "svc in the cold code":
+every unlinked exit's trampoline branches to its `svc` in the cold code, so that would count each first link too; a
+linked trampoline is what a hot copy cannot get past, so an entry there came through the cold code.
+
+Kill-test (one run each, M2 Max, not an A/B):
+
+| Case | Before (section 2) | Step A |
+| --- | --- | --- |
+| `guest-sampler-check-sample`: cross iterations in the 8 s window, run 1 / run 2 | 23,789,568 / 23,855,104 | 427,556,864 / 438,239,232 |
+| the same: `cold_exits` over the boot; judge c (probe samples on the loop) | not counted; passes | 0; 100% |
+| `guest-scimark32-sse2-sample`: linker entries; `patch` entries; `cold_exits` | 7.87 M; 6.93 M; not counted | 995,946; 89,136; 0 |
+| the same: LU Mflops, run 1 / run 2 (indication only) | about 2,550 (sampled run) | 3,690 / 3,684 |
+
+Tests. New: A1 is the loopfaults stride kind `cross-loop` (`tools/reference/gen_slice2.py`: two crossing 8-byte stores
+every iteration, the second moving to the STACK pair at iteration k, in a block whose next word is its `jmp`),
+QEMU-compared under every page mutation (the slice-2 VM has no SSE: the 16-byte crossings are K1's); A2 is K1 `probe-copy` and `probe-share` (`tests/system/run_k1.py`) and
+the probes shard's `--tamper-after probe-adr` (a rewritten `adr` aimed one word further must fail the host's audit; the
+untampered loop passes it); A3 is the sampler judge's check f (`cold_exits` under 1% of the cross iterations).
+Each was shown to fail on its mutation, one at a time: the rewritten `adr` aimed one word past R' (loopfaults: the
+`cross-loop` cases and many others); `copy` without the restore (`k1-probe-copy`: resident stop and the audit's
+refusal); `share` without it (`k1-probe-share`); the audit accepting any `adr` target (probes@2,
+`tamper-after-probe-adr-cross`); the rewrite switched off (`guest-sampler-check-sample`, check f: 44,649,303 cold exits
+over 44,630,016 cross iterations, one per iteration, which also shows the counter counts what it should).
+
+Narrow runs passed on the change (M2 Max): system `k1-c1`, `k1-c2@1-2`, `pic-*`, `indirect-*`, `ret-*`, `compat32*`,
+`m2`, `m3`, `s4`; faults `faults@1-5`, `probes@1-2`, `loopfaults-*`; smp `vector-ac`, `vector-split-smp`; unit.
+The gate is for the pooled change set.
+
+Also changed: `tools/reference/ref.py` copies the QEMU binary into a work folder once (a second batch into the same
+folder failed on the read-only copy when seeding loopfaults answers).
+

@@ -1470,9 +1470,10 @@ impl Prepared {
             for v in 0..vcpus {
                 let c: exec::cache::Control = backing.vcpu(v).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
                 eprintln!("natemu-fp-traps vcpu {v} traps {} steps {} hist {:?}", c.fp_traps, c.fp_steps, c.fp_hist);
-                // M2 task 4: system instructions the resident ran, by kind (hex, `execution::system`), and stack-check firings.
+                // M2 task 4: system instructions the resident ran, by kind (hex, `execution::system`), and stack-check firings;
+                // split-check plan step A: linker entries through a split block's cold code (`cold_exits`).
                 let kinds: Vec<String> = (0..128).filter(|&k| c.system_counts[k] != 0).map(|k| format!("{k:x}:{}", c.system_counts[k])).collect();
-                eprintln!("natemu-system-counts vcpu {v} stack {} kinds {}", c.stack_checks, kinds.join(","));
+                eprintln!("natemu-system-counts vcpu {v} stack {} kinds {} cold_exits {}", c.stack_checks, kinds.join(","), c.cold_exits);
             }
         }
         if let Some(e) = supervision.error {

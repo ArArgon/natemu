@@ -63,15 +63,17 @@ def fp_traps(stderr):
 
 
 def system_counts(stderr):
-    """Summed over vCPUs: the system instructions the resident ran, by kind (hex, natemu_abi::execution::system), and the stack
-    alignment check's firings (`stack`); None if natemu printed no line."""
-    lines = re.findall(r'natemu-system-counts vcpu \d+ stack (\d+) kinds (\S*)', stderr)
+    """Summed over vCPUs: the system instructions the resident ran, by kind (hex, natemu_abi::execution::system), the stack
+    alignment check's firings (`stack`) and the linker entries through a split block's cold code (`cold_exits`, split-check
+    plan step A; None from a natemu that does not print it); None if natemu printed no line."""
+    lines = re.findall(r'natemu-system-counts vcpu \d+ stack (\d+) kinds (\S*)(?: cold_exits (\d+))?', stderr)
     if not lines: return None
     kinds = {}
-    for _, ks in lines:
+    for _, ks, _ in lines:
         for kv in filter(None, ks.split(',')):
             k, v = kv.split(':'); kinds[k] = kinds.get(k, 0) + int(v)
-    return dict(stack=sum(int(l[0]) for l in lines), kinds=kinds)
+    cold = [int(l[2]) for l in lines if l[2]]
+    return dict(stack=sum(int(l[0]) for l in lines), kinds=kinds, cold_exits=sum(cold) if len(cold) == len(lines) else None)
 
 
 def main():
