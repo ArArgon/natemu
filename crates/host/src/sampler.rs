@@ -33,6 +33,9 @@ pub struct Options {
     pub interval_us: u64,
     /// Sampling is on from the start (default); off: until the guest's first start through the control port.
     pub from_start: bool,
+    /// Every answer served is written to `NAME.objects` (default); off: the file holds its header only (a measurement of
+    /// what writing it costs).
+    pub objects: bool,
 }
 impl Options {
     /// 4 kHz.
@@ -42,6 +45,7 @@ impl Options {
             name: name.into(),
             interval_us: Self::INTERVAL_US,
             from_start: true,
+            objects: true,
         }
     }
     /// `NAME.EXT`, the extension added to the whole name.
@@ -66,6 +70,8 @@ pub struct Sampler {
     pending: Mutex<Vec<[u64; 4]>>,
     samples: Mutex<Out>,
     pub(crate) objects: Arc<Objects>,
+    /// [`Options::objects`]: the compiler writes the answers it serves to `objects`.
+    pub(crate) objects_on: bool,
     /// Per vCPU: bells rung, halted samples recorded, records drained.
     rings: Vec<AtomicU64>,
     halted: Vec<AtomicU64>,
@@ -134,6 +140,7 @@ impl Sampler {
             pending: Mutex::default(),
             samples: Mutex::new(samples),
             objects: Arc::new(objects),
+            objects_on: options.objects,
             rings: counters(),
             halted: counters(),
             drained: counters(),

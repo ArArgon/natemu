@@ -89,6 +89,7 @@ def main():
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
     ap.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     ap.add_argument('--sample-us', type=int, help='natemu: sample every vCPU every N us into OUT/NAME.samples and OUT/NAME.objects (a profile; implies --perf-log; pass a `perf,profile` resident as --runtime)')
+    ap.add_argument('--sample-no-objects', action='store_true', help='with --sample-us: natemu writes no answers to OUT/NAME.objects (--profile-objects=false: what writing them costs)')
     a = ap.parse_args()
     if a.sample_us is not None:
         if a.emu != 'natemu' or a.sample_us < 1: ap.error('--sample-us N: natemu only, N at least 1')
@@ -109,7 +110,8 @@ def main():
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
                '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else []),
                *(w for kv in a.natemu_set for w in ('--set', kv)),
-               *(['--profile', f'{out}/{name}', '--profile-us', str(a.sample_us)] if a.sample_us else [])]
+               *(['--profile', f'{out}/{name}', '--profile-us', str(a.sample_us)] if a.sample_us else []),
+               *(['--profile-objects=false'] if a.sample_us and a.sample_no_objects else [])]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', f'{QMACHINE},hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
                '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,

@@ -5,7 +5,7 @@
 //!       [--ram SIZE] [--vcpus N] [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]]
 //!       [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE] [--page-currency on|off|check]
 //!       [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
-//!       [--net-host-loopback] [--virtio-transport SPEC] [--profile NAME [--profile-us N] [--profile-start run|guest]]
+//!       [--net-host-loopback] [--virtio-transport SPEC] [--profile NAME [--profile-us N] [--profile-start run|guest] [--profile-objects=BOOL]]
 //!
 //! Named arguments (clap; `natemu --help`); the configuration file is described in docs/configuration.md.
 //!
@@ -50,7 +50,8 @@
 //! help). `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` turns it off) is the shared template pool.
 //! `--profile NAME` (a measurement; a resident built with its `profile` feature) rings each vCPU's sample bell every
 //! `--profile-us` microseconds (250) and writes `NAME.samples` and `NAME.objects` (`natemu::sampler`); `--profile-start
-//! guest` waits for the guest's start through its control port (F8H), SIGUSR1 turns sampling off and on.
+//! guest` waits for the guest's start through its control port (F8H), SIGUSR1 turns sampling off and on;
+//! `--profile-objects=false` writes no answers to `NAME.objects` (what writing them costs).
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 //!
@@ -195,6 +196,17 @@ struct Cli {
     /// When sampling starts: `run` (the run's start) or `guest` (the guest's first start through port F8H)
     #[arg(long, value_name = "run|guest", value_parser = profile_start, action = clap::ArgAction::Set, default_value = "run", hide_default_value = true)]
     profile_start: bool,
+    /// Whether every answer served is written to NAME.objects (on by default; `--profile-objects=false`: the header only,
+    /// to measure what writing it costs)
+    #[arg(
+        long,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    profile_objects: bool,
 }
 
 /// `--profile-start`: whether sampling waits for the guest (`guest`) or starts with the run (`run`).

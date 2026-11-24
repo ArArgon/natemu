@@ -1358,6 +1358,13 @@ fn profile_options_reach_the_boot() {
     assert!(err(load_old(&["--profile", "x", "--profile-us", "0"])).contains("at least 1"));
     assert!(load_old(&["--profile", "x", "--profile-start", "later"]).is_err());
     assert!(err(load_old(&["--set", "debug.profile=x", "--set", "debug.profile_start=later"])).contains("run or guest"));
+    // The objects file: on by default, off by flag, file or --set; off needs a profile.
+    assert!(load_old(&["--profile", "x"]).unwrap().profile_objects);
+    assert!(!load_old(&["--profile", "x", "--profile-objects=false"]).unwrap().profile_objects);
+    assert!(!load_old(&["--set", "debug.profile=x", "--set", "debug.profile_objects=off"]).unwrap().profile_objects);
+    let (_, c) = load_file(&format!("{MIN}[debug]\nprofile = \"p\"\nprofile_objects = false\n"), &[]);
+    assert!(!c.unwrap().profile_objects);
+    assert!(err(load_old(&["--profile-objects=false"])).contains("need a profile"));
 }
 
 #[test]

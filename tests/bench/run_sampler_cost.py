@@ -4,7 +4,7 @@
 alternating (off then on in odd rounds, on then off in even ones), each configuration once per round, on this machine.
 
     python3 tests/bench/run_sampler_cost.py --out DIR --kernel BZIMAGE --initrd CPIO --fexc FEXC --natemu STUB --runtime RT
-        [--sample-us 250] [--rounds 3] [--configs build:1,hackbench:1,build:4]
+        [--sample-us 250] [--rounds 3] [--configs build:1,hackbench:1,build:4] [--no-objects]
 
 Both modes write the timing log (--perf-log), so they differ only in sampling. Per configuration and per run of the boot
 (run 1 cold, run 2 warm), it compares the medians over rounds of the wall time (run.py's host-timed START to END) and of
@@ -30,7 +30,8 @@ def boot(a, d, bench, vcpus, sample):
     """One run.py boot into folder d: (exit status, its bench.jsonl record or None)."""
     cmd = [sys.executable, str(ROOT / 'tools/bench/run.py'), '--out', str(d), '--name', bench, '--emu', 'natemu', '--vcpus', str(vcpus),
            '--bench', bench, '--kernel', a.kernel, '--initrd', a.initrd, '--fexc', a.fexc, '--natemu', a.natemu, '--runtime', a.runtime,
-           '--compile-cache', 'off', '--perf-log', *(['--sample-us', str(a.sample_us)] if sample else [])]
+           '--compile-cache', 'off', '--perf-log', *(['--sample-us', str(a.sample_us)] if sample else []),
+           *(['--sample-no-objects'] if sample and a.no_objects else [])]
     print(' '.join(cmd), flush=True)
     code = subprocess.run(cmd, cwd=ROOT).returncode
     f = d / 'bench.jsonl'
@@ -101,6 +102,7 @@ def main():
     ap.add_argument('--sample-us', type=int, default=250)
     ap.add_argument('--rounds', type=int, default=3)
     ap.add_argument('--configs', default='build:1,hackbench:1,build:4')
+    ap.add_argument('--no-objects', action='store_true', help='sampling runs write no NAME.objects (what writing it costs)')
     a = ap.parse_args()
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
     configs = [(c.split(':')[0], int(c.split(':')[1])) for c in a.configs.split(',')]

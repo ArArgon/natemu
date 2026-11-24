@@ -287,6 +287,14 @@ argv = ["python3", "tests/bench/run_sampler_cost.py", "--out", "{out}", "--kerne
         "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--sample-us", "{sample_us}", "--rounds", "3",
         "--configs", "build:1,hackbench:1,build:4"]
 
+# The same with the sampling runs' objects file off (natemu --profile-objects=false): what writing NAME.objects on the
+# translation request path costs, against guest-sampler-cost.
+[suite.cases.guest-sampler-cost-no-objects]
+timeout = 3600
+argv = ["python3", "tests/bench/run_sampler_cost.py", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}", "--sample-us", "{sample_us}", "--rounds", "3",
+        "--configs", "build:1,hackbench:1,build:4", "--no-objects"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]

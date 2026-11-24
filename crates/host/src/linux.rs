@@ -1269,7 +1269,7 @@ impl Prepared {
             compiler.shape = self.code_shape;
             compiler.accurate_fp = self.accurate_fp;
             compiler.report = true; // M2 task D: stop reports and the host-side progress check
-            compiler.objects = self.sampler.as_ref().map(|s| s.objects.clone());
+            compiler.objects = self.sampler.as_ref().filter(|s| s.objects_on).map(|s| s.objects.clone());
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),
                 ..Default::default()

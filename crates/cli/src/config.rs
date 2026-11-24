@@ -99,6 +99,8 @@ pub struct Config {
     pub profile: Option<PathBuf>,
     pub profile_us: Option<u64>,
     pub profile_start_guest: bool,
+    /// Whether the answers served go to NAME.objects (on by default).
+    pub profile_objects: bool,
 }
 
 impl Config {
@@ -150,6 +152,7 @@ impl Config {
             profile: None,
             profile_us: None,
             profile_start_guest: false,
+            profile_objects: true,
         }
     }
     /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
@@ -283,6 +286,7 @@ struct FDebug {
     profile: Option<PathBuf>,
     profile_us: Option<u64>,
     profile_start: Option<String>,
+    profile_objects: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -465,6 +469,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         cfg.watchdog = d.watchdog.or(cfg.watchdog);
         cfg.profile = d.profile.map(|p| rel(base, &p)).or(cfg.profile.take());
         cfg.profile_us = d.profile_us.or(cfg.profile_us);
+        cfg.profile_objects = d.profile_objects.unwrap_or(cfg.profile_objects);
         if let Some(v) = d.profile_start {
             cfg.profile_start_guest =
                 crate::profile_start(&v).map_err(|e| format!("{who}: debug.profile_start: {e}"))?;
@@ -646,6 +651,9 @@ fn apply_flags(
     if on("profile_start", &["debug.profile_start"]) {
         cfg.profile_start_guest = cli.profile_start;
     }
+    if on("profile_objects", &["debug.profile_objects"]) {
+        cfg.profile_objects = cli.profile_objects;
+    }
     if on(
         "virtio_transport",
         &[
@@ -706,7 +714,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 40] = [
+const KEYS: [&str; 41] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -747,6 +755,7 @@ const KEYS: [&str; 40] = [
     "debug.profile",
     "debug.profile_us",
     "debug.profile_start",
+    "debug.profile_objects",
 ];
 const DEVICE_KEYS: &str =
     "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
@@ -923,6 +932,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
             cfg.profile_us = Some(text.parse().map_err(|_| err(format!("bad microseconds {text:?}")))?)
         }
         "debug.profile_start" => cfg.profile_start_guest = crate::profile_start(text).map_err(err)?,
+        "debug.profile_objects" => cfg.profile_objects = boolish(text).map_err(err)?,
         _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())
@@ -987,8 +997,8 @@ pub fn validate(cfg: &Config) -> Res<()> {
             "{who}: no fexc: --fexc FILE, or [engine] fexc in a --config file"
         ));
     }
-    if cfg.profile.is_none() && (cfg.profile_us.is_some() || cfg.profile_start_guest) {
-        return Err(format!("{who}: debug.profile_us and debug.profile_start need a profile (--profile NAME)"));
+    if cfg.profile.is_none() && (cfg.profile_us.is_some() || cfg.profile_start_guest || !cfg.profile_objects) {
+        return Err(format!("{who}: debug.profile_us, debug.profile_start and debug.profile_objects need a profile (--profile NAME)"));
     }
     if cfg.profile_us == Some(0) {
         return Err(format!("{who}: debug.profile_us: at least 1"));
@@ -1182,6 +1192,7 @@ pub fn to_boot(
         name: name.clone(),
         interval_us: cfg.profile_us.unwrap_or(natemu::sampler::Options::INTERVAL_US),
         from_start: !cfg.profile_start_guest,
+        objects: cfg.profile_objects,
     });
     boot.transports = cfg.transports;
     boot.pvpanic = cfg.pvpanic;

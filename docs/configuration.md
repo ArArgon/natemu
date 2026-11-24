@@ -126,6 +126,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `profile` | none | Measurement: sample where every vCPU is into `NAME.samples` and `NAME.objects` (`--profile NAME`; needs a resident built with its `profile` feature, [the sampler plan](restructure/el0-sampler-plan.md)); SIGUSR1 turns sampling off and on |
 | | `profile_us` | `250` | The sampler's interval in microseconds (`--profile-us`) |
 | | `profile_start` | `"run"` | `run`: sample from the start; `guest`: from the guest's first start through port F8H (`--profile-start`) |
+| | `profile_objects` | `true` | Write every answer served to `NAME.objects`; `false`: its header only, to measure what writing it costs (`--profile-objects`) |
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
 
