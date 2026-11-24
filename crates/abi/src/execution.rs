@@ -1646,6 +1646,20 @@ pub mod cache {
             && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2
             && L2 + L2_ENTRIES * 16 <= INDEX
     );
+    // `Control::legacy_rom` is the struct's only tuple, and Rust gives tuples no layout guarantee. Control is shared by two
+    // binaries compiled separately (the host and the resident), so its layout is pinned here: 16 bytes, aligned to 8,
+    // directly after `segment_checks`, with element 0 first.
+    const _: () = assert!(
+        core::mem::size_of::<(u64, u64)>() == 16
+            && core::mem::align_of::<(u64, u64)>() == 8
+            && core::mem::offset_of!(Control, legacy_rom)
+                == (core::mem::offset_of!(Control, segment_checks) + core::mem::size_of::<u64>()).next_multiple_of(8)
+    );
+    const _: () = {
+        // SAFETY: both are 16 bytes of plain integers (the size is asserted above).
+        let words: [u64; 2] = unsafe { core::mem::transmute::<(u64, u64), [u64; 2]>((1, 2)) };
+        assert!(words[0] == 1 && words[1] == 2, "Control::legacy_rom: (start, end) in that order");
+    };
     const _: () = assert!(MAX_BLOCKS < L1_NEXT as usize);
     const _: () = assert!(
         WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS
