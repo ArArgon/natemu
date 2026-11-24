@@ -88,7 +88,9 @@ was pending while the vCPU was outside generated code: it is recorded as "reside
 sample is an EL0 sample at its PC. So the profile covers the whole vCPU: EL0, resident or host, halted. A ring that
 lands between that store and the `eret` (about 50 loads) is placed at EL0 on the resume PC: a window of tens of
 nanoseconds, stated in the findings. Rings that merge on the edge-triggered SPI are lost; the host counts its rings and
-the report compares them with the samples.
+the report compares them with the samples. (Since built differently: the bell arrives 1.5-2 us after its ring, so a ring
+before the last resume is classed among the resident's last 16 stretches of generated code, and one in an earlier stretch
+is EL0 with no place; [the findings' ring-time fix](el0-sampler-findings.md#the-ring-time-fix-november-24).)
 
 **A ring of samples, drained by the host.** Each sample is a 32-byte record: CNTVCT; kind (EL0, resident or host, halted);
 for EL0 the code-area PC and, when it is in a block, the block's RIP, source frame and code context, the native offset in

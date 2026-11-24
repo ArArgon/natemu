@@ -193,8 +193,9 @@ class Report(Base):
         self.assertIn('| all |', md); self.assertIn('| run1/one |', md); self.assertIn('`0x401000`', md)
 
     def test_el0_with_no_place_counts_as_el0_but_has_no_place(self):
-        """Version 2: a ring before the EL0 exit preceding the last resume (natemu_abi::sample::EL0_UNKNOWN) is EL0 time in
-        `el0_all_pct` and in its own kind, but in no place, privilege or EL0 share below it."""
+        """Version 2: a ring in an earlier stretch of generated code than the one the bell interrupted
+        (natemu_abi::sample::EL0_UNKNOWN) is EL0 time in `el0_all_pct` and in its own kind, but in no place, privilege or
+        EL0 share below it; `at` is how many stretches back."""
         recs, markers, objects = standard_run()
         resident = [i for i, r in enumerate(recs) if r[2] >> 60 == sr.RESIDENT]
         self.assertEqual(len(resident), 1)

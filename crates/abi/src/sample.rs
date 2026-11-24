@@ -7,8 +7,9 @@
 //! records of [`RECORD_BYTES`] from [`RING`] (1 MiB). In sampling builds the study part holds nothing else (the hot-block
 //! table of the November experiments is gone); in other builds it is untouched. The resident is the only writer of records,
 //! `write`, `lost`, `resume_time`, `trips`, the stretches ([`HEAD_STRETCHES`]) and its counters; the host writes `bell`
-//! before the vCPU first runs, `ring_time` before each ring and `read` after each drain. A record is stored before `write` is published with release ordering; the host loads
-//! `write` with acquire, copies the records up to it and publishes `read` (release). When the ring is full a record is not
+//! before the vCPU first runs, `ring_time` before each ring and `read` after each drain. A record is stored before `write`
+//! is published with release ordering; the host loads `write` with acquire, copies the records up to it and publishes
+//! `read` (release). When the ring is full a record is not
 //! written and `lost` counts it.
 //!
 //! **What a sample's time can and cannot say.** `ring_time` is one word per vCPU: a bell still pending when the next pass
@@ -459,15 +460,19 @@ pub enum Class {
 }
 impl Stretches {
     /// The stretch or the gap a ring at `rung` fell in. The last trip recorded is the bell's own: its stretch is the one the
-    /// bell interrupted. A ring at a resume is in that stretch, at an exit outside it; before the first stretch there was
-    /// none (outside, not old).
+    /// bell interrupted. A ring at a resume is in that stretch, at an exit outside it. A ring at or after the bell's own exit
+    /// is a later ring's time (the host stored it before the resident read `ring_time`: a preempted vCPU): outside, not old.
+    /// Before the first stretch there was none (outside, not old); with no trip recorded at all, nothing is known (old).
     pub fn class(&self, rung: u64) -> Class {
         let n = self.trips;
         if n == 0 {
             return Class::Outside { old: true };
         }
         let at = |k: u64| self.at[(k % STRETCHES as u64) as usize];
-        let resumed = at(n - 1)[0];
+        let [resumed, exit] = at(n - 1);
+        if rung >= exit {
+            return Class::Outside { old: false };
+        }
         if rung >= resumed {
             return Class::Here(resumed);
         }
@@ -834,11 +839,20 @@ mod tests {
             assert_eq!((s.kind, s.place, s.since), (EL0, BLOCK, 200), "{rung}");
         }
     }
+    /// At or after the bell's own exit: a later ring's time (the host rang again before the resident read `ring_time`), not
+    /// the interrupted stretch's: resident, not old.
+    #[test]
+    fn a_ring_after_the_bell_s_own_exit_is_resident() {
+        for rung in [1100, 1200] {
+            assert_eq!(class(rung), Sample { time: rung, kind: RESIDENT, ..Sample::default() }, "{rung}");
+        }
+    }
     /// Between two stretches (a ring at an exit included), and before the first: the resident's or the host's.
     #[test]
     fn a_ring_between_stretches_is_resident() {
         for rung in [700, 800, 899, 300, 450, 499, 0, 99] {
-            assert_eq!(class(rung), Sample { time: rung, kind: RESIDENT, since: (1100 - rung) as u32, ..Sample::default() }, "{rung}");
+            let want = Sample { time: rung, kind: RESIDENT, since: (1100 - rung) as u32, ..Sample::default() };
+            assert_eq!(class(rung), want, "{rung}");
         }
     }
     /// In an earlier stretch: EL0 with no place, whatever the PC; `frame` the ticks to that stretch's end, `at` how many

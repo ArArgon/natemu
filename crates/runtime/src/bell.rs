@@ -130,7 +130,7 @@ mod on {
         }
     }
     /// A trip out of generated code begins (`finish`, the first Rust every gate calls): the stretch it ends (the last
-    /// resume to now) is kept in `Head::stretches`, among which a bell taken from generated code finds its ring time
+    /// resume to now) is kept at `HEAD_STRETCHES`, among which a bell taken from generated code finds its ring time
     /// (`sample::record`). Taken after the gate's register save, so a few tens of nanoseconds late: a ring in that window
     /// is counted EL0 with no place rather than resident.
     #[inline(always)]
