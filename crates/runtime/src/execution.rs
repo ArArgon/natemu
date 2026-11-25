@@ -4321,9 +4321,13 @@ unsafe fn access_aborted(
             }
         }
     }
-    // Gather plan (2.4): an inline gather's element on a page that is not plain RAM (a device's, an unassigned one, a mapped
-    // region's) runs the gather alone, before any device access or all-ones shadow could complete the element here: its
-    // transaction stops or completes as it always did (`unsupported_mmio`, or the masked-off elements' completion).
+    // Gather plan (2.4): an inline gather's element whose access misses on a page that is not plain RAM (a device's, an
+    // unassigned one, a mapped region's) runs the gather alone, before the device path or an all-ones shadow could complete
+    // the element here: its transaction stops or completes as it does for a cut gather (`unsupported_mmio`, or the
+    // masked-off elements' completion). Only a page reached here, unshadowed, is decided so: an unassigned page an earlier
+    // read shadowed onto the all-ones page, or a mapped region's page already shadowed, is read by the element's plain load
+    // as any plain x86 load reads it (execution/gather.rs: which of the two a guest sees depends on shadow history). Device
+    // pages are never shadowed, so their elements always reach the transaction.
     if object::gather_element(site) && (device != [None; 2] || mapped) && b.flags & cache::STEP == 0 {
         step_from(s, f, b, site)
     }

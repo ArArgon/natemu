@@ -3299,6 +3299,43 @@ mod tests {
         assert!(admit_with((&patched(block, 0x1c, 0x72a1_0080, 0x1400_0002), block.1), false).is_err()); // b 0x24
     }
 
+    /// Gather plan (2.5), with `FEXC` set: fexc compiles no inline gather in 32-bit code, and admission refuses the mark of a
+    /// gather's element load in a 32-bit object (with and without the code shape): `movss xmm0, [eax]`, whose 4-byte load
+    /// into a vector register has the marked form, is admitted, and refused once its site carries the mark.
+    #[test]
+    fn gather_element_loads_are_refused_in_32_bit_objects() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let object = std::env::temp_dir().join(format!("natemu-admit-gather32-{}", std::process::id()));
+        let out = std::process::Command::new(&fexc)
+            .args(["--hex", "f30f1000", "--rip", "0x8048000", "--profile", "slice1", "--bitness", "32", "--push-run", "--narrow-cmp", "--ext-conds", "4", "--object"])
+            .arg(&object)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let o = std::fs::read(&object).unwrap();
+        let _ = std::fs::remove_file(&object);
+        let source = [0xf3, 0x0f, 0x10, 0x00];
+        let h: Header = super::super::record(&o, 0);
+        let admit = |o: &[u8], shape: bool| super::super::admit_mode(o, h.guest_rip, &source, u64::MAX, shape, false, true).map(|_| ());
+        admit(&o, true).unwrap();
+        let size = std::mem::size_of::<object::Site>();
+        let i = (0..h.sites_count as usize)
+            .find(|&i| {
+                let s = super::super::record::<object::Site>(&o, h.sites_offset as usize + i * size);
+                (s.kind, s.width, s.data_class) == (object::kind::LOAD, 4, object::CLASS_FPR)
+            })
+            .expect("the load site");
+        let mut marked = o.clone();
+        let at = h.sites_offset as usize + i * size + std::mem::offset_of!(object::Site, guest_offset2);
+        marked[at..at + 4].copy_from_slice(&object::GATHER_ELEMENT.to_le_bytes());
+        for shape in [false, true] {
+            let e = admit(&marked, shape).unwrap_err();
+            assert!(e.contains("a gather element site in a 32-bit object"), "{e}");
+        }
+    }
+
     /// M2 task 4, with `FEXC` set: the test for an open x87 run at the top of a 32-bit block of SSE code (`mulsd xmm0, xmm1`
     /// twice, so that a zero word pads the code after the run's end: a branch there is forward):
     /// `ldrb w0, [x28, #X87_RUN]` at 0x4, `cbnz w0, E` at 0x8, the run's end's nine words at E and the branch back to 0xc.

@@ -494,7 +494,7 @@ pub struct Boot {
     pub page_currency: u64,
     /// Fault-around plan chunk 1: `Compiler::writable_on_read` (default on; `--writable-on-read` / `NATEMU_WRITABLE_ON_READ`).
     pub writable_on_read: bool,
-    /// Gather plan: `Compiler::inline_gather` (default on; `[debug] inline_gather`, `--inline-gather` / `NATEMU_INLINE_GATHER`).
+    /// Gather plan: `Compiler::inline_gather` (default on; the CLI's `[debug] inline_gather` or `--set debug.inline_gather`; `NATEMU_INLINE_GATHER` overrides it in `execution::run`).
     pub inline_gather: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,

@@ -725,7 +725,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       // under alignment checking or a data breakpoint) in 64-bit code with no 0x67, FS or GS and without --no-inline-gather
       // runs inside the block (AVX128_VPGATHER: one FexcGatherLoad per element, whose sites the resident steps at a fault or a
       // page that is not plain RAM). Every other gather stays the cut above, as do the AVX-gated ones and the #UD encodings.
-      // (`fexc_bulk` last and through its FexcArg: only an answer holding such a gather is keyed by it.)
+      // (`fexc_bulk` last and through its FexcArg: only an answer holding such a gather is keyed by it.) This verdict is the only
+      // gate: the dispatcher's LOGMAN_THROW_A_FMT on the same conditions compiles to nothing in fexc (no ASSERTIONS_ENABLED),
+      // so a gather admitted here outside them would get the inline lowering anyway.
       if (x.map == 2 && x.pp == 1 && d.FexcVexOp >= 0x90 && d.FexcVexOp <= 0x93 && v.kind == SYSTEM && !v.ud && !v.gated &&
           !fexc_bits32 && !(f & DecodeFlags::FLAG_ADDRESS_SIZE) && !(f & DecodeFlags::FLAG_SEGMENTS) && !fexc_no_inline_gather &&
           fexc_bulk) {

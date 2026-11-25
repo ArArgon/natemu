@@ -248,7 +248,8 @@ enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, F
 // compiled with it is not reused for a request without it.
 inline FexcArg<bool, FEXC_ARG_PUSH_RUN> fexc_push_run;
 // Profile slice1 (perf chunk 26): the host asks for bulk REP STOS (`--bulk`: never for a single-instruction step, nor while
-// alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
+// alignment checking or a data breakpoint, DR7 R/W 01 or 11, gates the block: the host's `Cpu::bit_tests_cut`, part of the
+// code context): FexcStringOp stores the part of the string inside RDI's page
 // first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).
 inline FexcArg<bool, FEXC_ARG_BULK> fexc_bulk;
 // Bulk REP plan (section 14): `--no-bulk-movs`, for tools/fexc/replay.py only (the host never sends it): `--bulk` without

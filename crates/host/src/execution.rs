@@ -2913,7 +2913,7 @@ pub struct Compiler {
     pub writable_on_read: bool,
     /// Gather plan (docs/restructure/gather-fast-path-plan.md): the AVX2 gathers of a `--bulk` request in 64-bit code run inside
     /// the block (the default); false sends fexc `--no-inline-gather`, under which every gather stays the system cut (the
-    /// resident's transaction), as in a step (`[debug] inline_gather`, `--inline-gather`, `NATEMU_INLINE_GATHER`). Fixed for
+    /// resident's transaction), as in a step (the CLI's `[debug] inline_gather` or `--set debug.inline_gather`; NATEMU_INLINE_GATHER=on|off overrides it for every driver, [`run`]). Fixed for
     /// the process: the argument is part of the request, so of the persistent cache's key.
     pub inline_gather: bool,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
@@ -4170,13 +4170,13 @@ pub fn parse_page_currency(text: &str) -> std::result::Result<u64, String> {
     }
 }
 
-/// `--inline-gather`'s (and `NATEMU_INLINE_GATHER`'s) value (gather plan): whether the AVX2 gathers of a `--bulk` request run
+/// `NATEMU_INLINE_GATHER`'s value (gather plan; the CLI's `[debug] inline_gather` is a TOML boolean): whether the AVX2 gathers of a `--bulk` request run
 /// inside the block (on, the default) or stay the system cut (off: fexc's `--no-inline-gather`).
 pub fn parse_inline_gather(text: &str) -> std::result::Result<bool, String> {
     match text {
         "on" | "true" | "1" => Ok(true),
         "off" | "false" | "0" => Ok(false),
-        other => Err(format!("--inline-gather {other}: on or off")),
+        other => Err(format!("NATEMU_INLINE_GATHER={other}: on or off")),
     }
 }
 

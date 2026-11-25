@@ -20,6 +20,14 @@
 //! (SDM: "If any traps or interrupts are pending from already gathered elements, they will be delivered in lieu of the
 //! exception; in this case, EFLAG.RF is set to one"); the restart then meets the fault. A device page stops
 //! `unsupported_mmio` as any vector form's (M3); UC RAM is read in order like any RAM.
+//!
+//! Gather plan (docs/restructure/gather-fast-path-plan.md 2.4): a gather of a `--bulk` block in 64-bit code with no 0x67,
+//! FS or GS runs inside the block, one plain load per element, and reaches this transaction only at a fault, a UC, device,
+//! unassigned or mapped page its load missed on, a watchpoint, a code-page A/D update or a dead block (`step_from`). So
+//! an element on a mapped region's page stops `unsupported_mmio` here, but the inline path reads it as a plain load does
+//! once the page is shadowed onto the region (and an unassigned page an earlier read shadowed onto the all-ones page reads
+//! as ones there): which one a guest sees depends on shadow history. Device pages are never shadowed: their elements always
+//! come here.
 use super::segments::{Exception, copy, operand_range};
 use super::xsave::{set_ymm_hi, ymm_hi};
 use super::*;

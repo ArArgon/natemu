@@ -860,7 +860,8 @@ DEF_OP(FexcGatherLoad) {
   const auto Dst = GetVReg(Node), Mask = GetVReg(Op->Mask);
   const auto Addr = GetReg(Op->Addr);
   const bool Dbl = IROp->Size == IR::OpSize::i64Bit;
-  LOGMAN_THROW_A_FMT(Dbl || IROp->Size == IR::OpSize::i32Bit, "a gather element is 4 or 8 bytes");
+  // (AVX128_VPGATHER emits 4- and 8-byte elements only. No assertion here: fexc builds FEX without ASSERTIONS_ENABLED, so a
+  // LOGMAN_THROW_A_FMT would compile to nothing; admission refuses a marked site of another width.)
   ARMEmitter::ForwardLabel Skip;
   if (Dbl) umov<ARMEmitter::SubRegSize::i64Bit>(TMP1, Mask, Op->Lane);
   else umov<ARMEmitter::SubRegSize::i32Bit>(TMP1, Mask, Op->Lane);
