@@ -312,8 +312,8 @@ pub mod cache {
     /// Indirect plan step 1: each slot holds three forms of the same probe, [`SLOT_ORDINARY`] (ending in `br x1`, what a
     /// computed exit's `b` and a checked link reach), [`SLOT_LOOKUP`] (ending in `ret` with x1 the target; a miss returns
     /// x1 = [`DISPATCH_MISS`]), which the words appended to a block call with `bl` ([`TAIL_ENTRY_BYTES`]), and
-    /// [`SLOT_RETURN`] (ending in `ret x1`; a miss `ret x1` to the miss), for the return plan. An unbound slot's lookup and
-    /// return forms are the miss's two words alone.
+    /// [`SLOT_RETURN`] (ending in `ret x1`; a miss `ret x1` to the miss), written for the return plan and unreached since
+    /// that plan was removed (November 24). An unbound slot's lookup and return forms are the miss's two words alone.
     pub const DISPATCH: usize = SLOT + SLOT_BYTES;
     pub const DISPATCH_BYTES: usize = 0x8000;
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
@@ -334,40 +334,14 @@ pub mod cache {
     );
     /// Indirect plan step 1: the words the resident appends after a block's code for one exit ([`Block::tail`]): `bl` to
     /// its context's slot's [`SLOT_LOOKUP`] form, then `br x1` (a jump) or `blr x1` (a call), then `b` to
-    /// [`DISPATCH_MISS`] (a call's pad: the return plan's; unreached for a jump).
+    /// [`DISPATCH_MISS`] (the pad: unreached, for a call since the return plan was removed).
     pub const TAIL_ENTRY_BYTES: u32 = 12;
     /// [`Block::exit_forms`]: link point i is a direct call to its target (bit i); the computed exit is an indirect
     /// jump or call (it gets appended words); it is an indirect call.
     pub const FORM_CALL_POINTS: u32 = (1 << super::MAX_LINK_POINTS) - 1;
     pub const FORM_INDIRECT: u32 = 1 << super::MAX_LINK_POINTS;
     pub const FORM_INDIRECT_CALL: u32 = 2 << super::MAX_LINK_POINTS;
-    /// Return plan: the computed exit is a near return (`ret`, `ret imm16`): it leaves through its slot's [`SLOT_RETURN`]
-    /// form (`ret x1`), so it pops the return-address stack every call pushes.
-    pub const FORM_RETURN: u32 = 4 << super::MAX_LINK_POINTS;
-    /// Return plan: the block's pads are used (return prediction is on for it, `NATEMU_RETURN_PREDICT`); without it a block
-    /// has none, and the host gives it no call points and no return form either (its hint is step 1's alone).
-    pub const FORM_PADS: u32 = 8 << super::MAX_LINK_POINTS;
-    pub const FORMS: u32 = FORM_CALL_POINTS | FORM_INDIRECT | FORM_INDIRECT_CALL | FORM_RETURN | FORM_PADS;
-    /// Return plan: a slot's fourth form, for a checked link that is a call from absolute code (whose blocks have no
-    /// link-point words): `bl` to its lookup form, `blr x1`, `b` to the miss. Slot 0, never bound, holds the resident's
-    /// stubs there instead: [`PUSH_STUB`] and [`POP_STUB`]. Slot 0's [`SLOT_RETURN`] form is the miss's two words
-    /// (`adr x1, DISPATCH_MISS; ret x1`): a return of a block placed while its context had no slot leaves through it
-    /// ([`RETURN_MISS`]), so it pops too.
-    pub const SLOT_CALL: usize = 192;
-    /// Return plan: the push stub, `blr x1; b DISPATCH_MISS`: the resident continues a call that has not pushed yet here,
-    /// x1 the target's entry, x0 its RIP. Its `blr` pushes its second word, which no table names (the matching return is
-    /// mispredicted once; that word sends x0 to the miss).
-    pub const PUSH_STUB: usize = DISPATCH + SLOT_CALL;
-    /// Return plan: the pop stub, `ret x1`: the resident continues a return that has not popped yet here, x1 the entry it
-    /// chose, x0 its RIP.
-    pub const POP_STUB: usize = DISPATCH + SLOT_CALL + 8;
-    /// Return plan: where a return of a block placed with no slot for its context leaves (slot 0's return form).
-    pub const RETURN_MISS: usize = DISPATCH + SLOT_RETURN;
-    const _: () = assert!(SLOT_CALL >= SLOT_RETURN + SLOT_FORM_BYTES && SLOT_CALL + 12 <= DISPATCH_SLOT_BYTES);
-    /// Return plan: the call pair appended to a block whose last instruction is a direct call ([`Block::pair`]): `pair+0`
-    /// `bl` to the target's entry (a linked call's link word is `b pair+0`), `pair+4` the pad (`b` to the miss until a
-    /// return-table entry names it; then `b` to the full entry of the block at the call's return address).
-    pub const PAIR_BYTES: u32 = 8;
+    pub const FORMS: u32 = FORM_CALL_POINTS | FORM_INDIRECT | FORM_INDIRECT_CALL;
     /// `br x1`, `blr x1`, `ret`, `ret x1`.
     pub const BR_X1: u32 = 0xd61f_0020;
     pub const BLR_X1: u32 = 0xd63f_0020;
@@ -395,14 +369,6 @@ pub mod cache {
         let mut words = [0u32; DISPATCH_SLOT_BYTES / 4];
         let miss = |form: usize, end: u32| [adr_x1_word(at + 4 * form as u64, DISPATCH_MISS as u64), end];
         let forms = [(SLOT_LOOKUP / 4, RET), (SLOT_RETURN / 4, RET_X1)];
-        // (Return plan: the call form, a checked call from absolute code; slot 0's stubs.)
-        let c = SLOT_CALL / 4;
-        if at == DISPATCH as u64 {
-            (words[c], words[c + 1], words[c + 2]) = (BLR_X1, b_word(at + 4 * c as u64 + 4, DISPATCH_MISS as u64), RET_X1);
-        } else {
-            words[c] = bl_word(at + 4 * c as u64, at + SLOT_LOOKUP as u64);
-            (words[c + 1], words[c + 2]) = (BLR_X1, b_word(at + 4 * c as u64 + 8, DISPATCH_MISS as u64));
-        }
         match probe {
             None => {
                 words[0] = b_word(at, DISPATCH_MISS as u64);
@@ -423,13 +389,11 @@ pub mod cache {
         words
     }
     /// Indirect plan step 1: the three words appended at code-area offset `at` for one exit whose context's dispatcher slot
-    /// is at `slot` (the miss: none): `bl` to the slot's lookup form (with no slot, slot 0's, which returns x1 = the miss),
+    /// is at `slot` (the miss: none): `bl` to the slot's lookup form (with no slot, `b` to the miss: x0 holds the target),
     /// `br x1` or (`call`) `blr x1`, and the pad, `b` to the miss.
     pub const fn tail_words(at: u64, slot: u64, call: bool) -> [u32; 3] {
-        // (Return plan: with no slot, `bl` to slot 0's lookup form, the miss's words, so a call pushes on that path too.)
-        let slot = if slot == DISPATCH_MISS as u64 { DISPATCH as u64 } else { slot };
         [
-            bl_word(at, slot + SLOT_LOOKUP as u64),
+            if slot == DISPATCH_MISS as u64 { b_word(at, DISPATCH_MISS as u64) } else { bl_word(at, slot + SLOT_LOOKUP as u64) },
             if call { BLR_X1 } else { BR_X1 },
             b_word(at + 8, DISPATCH_MISS as u64),
         ]
@@ -496,25 +460,8 @@ pub mod cache {
                 assert_eq!(w[1], if call { 0xd63f_0020 } else { 0xd61f_0020 });
                 assert_eq!((w[2] >> 26, target(at + 8, w[2])), (0x05, Some(MISS)), "the pad");
                 let none = tail_words(at, MISS, call);
-                assert_eq!((none[0] >> 26, target(at, none[0])), (0x25, Some((DISPATCH + SLOT_LOOKUP) as u64)), "with no slot, slot 0's lookup");
+                assert_eq!((none[0] >> 26, target(at, none[0])), (0x05, Some(MISS)), "with no slot, `b` to the miss");
             }
-        }
-        /// Return plan: a slot's call form (`bl` its lookup form, `blr x1`, `b` the miss); slot 0's stubs (`blr x1; b` the
-        /// miss, `ret x1`) and its return form, the miss's words ending in `ret x1`.
-        #[test]
-        fn the_call_form_and_the_stubs() {
-            for (at, bound) in [((DISPATCH + 5 * DISPATCH_SLOT_BYTES) as u64, true), ((DISPATCH + 9 * DISPATCH_SLOT_BYTES) as u64, false)] {
-                let w = slot_form_words(at, bound.then(|| probe(at)));
-                let (c, pc) = (SLOT_CALL / 4, at + SLOT_CALL as u64);
-                assert_eq!((w[c] >> 26, target(pc, w[c])), (0x25, Some(at + SLOT_LOOKUP as u64)), "`bl` to its lookup form");
-                assert_eq!((w[c + 1], w[c + 2] >> 26, target(pc + 8, w[c + 2])), (BLR_X1, 0x05, Some(MISS)));
-            }
-            let w = slot_form_words(DISPATCH as u64, None);
-            let c = SLOT_CALL / 4;
-            assert_eq!((w[c], target(PUSH_STUB as u64 + 4, w[c + 1]), w[c + 2]), (BLR_X1, Some(MISS), RET_X1));
-            assert_eq!(POP_STUB, PUSH_STUB + 8);
-            let r = SLOT_RETURN / 4;
-            assert_eq!((target(RETURN_MISS as u64, w[r]), w[r + 1]), (Some(MISS), RET_X1), "slot 0's return form pops to the miss");
         }
         #[test]
         fn a_probe_return_maps_back_from_the_hot_copy_only_where_hot_word_stands() {
@@ -551,29 +498,14 @@ pub mod cache {
             b.rep_exits = 1;
             assert_eq!(b.tail_entries(), 2, "shared: and each link point but a REP self-exit");
             assert_eq!((b.tail(Some(0)), b.tail(Some(1)), b.tail(Some(2))), (None, None, Some(0x2_008c)));
-            // (Return plan: link point 2 is a call: its pair follows the entries; a shared block has no pad.)
-            assert_eq!((b.tail_bytes(), b.tail_extent(), b.pair(), b.pad()), (24, 32, Some(0x2_0098), None));
+            assert_eq!(b.tail_bytes(), 24);
             assert_eq!(b.tail_word(0x2_0084), Some((None, 1)));
             assert_eq!(b.tail_word(0x2_0094), Some((Some(2), 2)));
             assert_eq!((b.tail_word(0x2_0098), b.tail_word(0x2_007c)), (None, None), "past them, and the code's last word");
-            assert_eq!((b.pair_word(0x2_0098), b.pair_word(0x2_009c), b.pair_word(0x2_00a0)), (Some(0), Some(1), None));
             // A link point whose move and `svc` word end the code: its entry follows them directly.
             b.links[2].offset = 0x6c;
             assert_eq!((b.tail(None), b.tail(Some(2))), (Some(0x2_0080), Some(0x2_008c)));
             assert_eq!(b.tail_word(0x2_007c), None, "the `svc` word is no appended word");
-            (b.flags, b.exit_forms) = (0, b.exit_forms | FORM_PADS);
-            assert_eq!((b.tail_entries(), b.pair(), b.pad()), (1, Some(0x2_008c), Some(0x2_0090)), "absolute: the pair's pad");
-            b.exit_forms = FORM_INDIRECT | FORM_INDIRECT_CALL;
-            assert_eq!(b.pad(), None, "no pad with return prediction off");
-            b.exit_forms |= FORM_PADS;
-            assert_eq!((b.pair(), b.pad(), b.exit_branch(0x123)), (None, Some(0x2_0088), 0x2_0080), "an indirect call's third word");
-            b.exit_forms = FORM_RETURN;
-            assert_eq!((b.tail_extent(), b.pad(), b.exit_branch(0x400)), (0, None, 0x400 + SLOT_RETURN as u64), "a return");
-            assert_eq!(b.exit_branch(MISS), RETURN_MISS as u64, "a return with no slot pops through slot 0's form");
-            (b.rip, b.guest_bytes, b.context) = (0xffff_fffe, 5, (super::super::CodeMode::Compat32 as u64) << 2);
-            assert_eq!(b.end_rip(), 3, "32-bit code's return address wraps");
-            (b.rep_exits, b.exit_forms) = (0, 5);
-            assert_eq!((b.call_points(), b.pair()), (0, None), "two points marked as calls (a wrong hint): no pair");
             b.flags = PIC | INSTANCE;
             assert_eq!(b.tail_entries(), 0, "an instance has no code of its own");
         }
@@ -630,14 +562,7 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (RET_HINTS + RET_HINT_BYTES).next_multiple_of(BLOCK);
-    /// Return plan: the resident's hint table of pads, direct-mapped by a hash of a call's return address R (`cache::ret_hint`):
-    /// [R, (caller block number + 1) | pad offset << 32]. Only a candidate: used for a fill of R's entry only when the caller
-    /// block is alive, absolute, of the table's context, ends at R and has that pad (`cache::fill_l1`). Never read
-    /// by EL0 (after the data tables, not mapped there).
-    pub const RET_HINTS: usize = DL1 + DL1_BYTES;
-    pub const RET_HINT_ENTRIES: usize = 4096;
-    pub const RET_HINT_BYTES: usize = 16 * RET_HINT_ENTRIES;
+    pub const LOOKUP_BYTES: usize = (DL1 + DL1_BYTES).next_multiple_of(BLOCK);
     /// The dispatcher's data tables: table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves
     /// ([`DL1_EMPTY`]: none) and the address to branch to. Filling or emptying one is two stores: no code is written,
     /// nothing is synchronized. Each shadow space's upper root maps its own class's block of [`L1_SPACE_TABLES`] tables
@@ -1554,16 +1479,6 @@ pub mod cache {
     /// there and taken at the exit with RIP = x0.
     pub const PIC_TEST_LOOKUP: u64 = 12;
     pub const PIC_TEST_TRAMPOLINE: u64 = 13;
-    /// Return plan tests: on every entry of a block from the resident, the vCPU is entered through the push stub
-    /// ([`PIC_TEST_RAS`]) or the pop stub (+ 1) (unless a shadow is set: counted unbalanced), or on every second at a pad (+ 2: `b` to the miss or to this block's full entry) or a
-    /// call pair's `bl` (+ 3: the pair of a call to this block's RIP, `b` to the miss or `bl` to its entry) of another block of
-    /// its context (a dead block's when one has them), x0 the entered block's RIP, with its own doorbell rung: the stop there
-    /// must take that RIP (the programs' values as without the test; `pic::count::PUSH_ENTRIES`, `POP_ENTRIES`, `PAD_STOPS`,
-    /// `PAIR_STOPS`).
-    pub const PIC_TEST_RAS: u64 = 14;
-    /// (+ 4: every block placed as with no slot for its context, its exits armed at every second entry: a stop at a return's
-    /// computed exit, which leaves through slot 0's return form, continues through the pop stub.)
-    pub const PIC_TEST_RASES: u64 = 5;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     /// (Hot/cold layout: a split block's trampolines too.)
     pub const ARMED: usize = 3 * super::MAX_LINK_POINTS + 2;
@@ -1860,62 +1775,6 @@ pub mod cache {
         /// so a checked link's word there is always `b`, never a `nop` (the linker's `link`).
         pub fn tail_start(&self) -> u64 {
             u64::from(self.code) + u64::from(self.code_size)
-        }
-        /// The bytes its appended words reserve after its code (`code + code_size`): [`Block::tail_bytes`] and its call pair's [`PAIR_BYTES`]; 0 with none.
-        pub fn tail_extent(&self) -> u32 {
-            let pair = if self.call_points() != 0 { PAIR_BYTES } else { 0 };
-            self.tail_bytes() + pair
-        }
-        /// Return plan: its link point that is a direct call to its target ([`FORM_CALL_POINTS`] bit; not a REP self-exit),
-        /// in a record with code of its own. Exactly one: a hint marking more (another exit to the call's target, a `jcc T`
-        /// before `call T`) gets no pair at all, so a wrong hint never makes a jump push and never retargets the pair's `bl`
-        /// (the call then leaves as a plain link: unbalanced, never wrong).
-        pub fn call_points(&self) -> u32 {
-            if self.code_size == 0 || self.flags & (STEP | SYSTEM | INSTANCE) != 0 {
-                return 0;
-            }
-            let m = (0..super::MAX_LINK_POINTS)
-                .filter(|&k| self.exit_forms >> k & 1 != 0 && self.links[k].offset != 0 && self.rep_exits >> k & 1 == 0)
-                .fold(0u32, |m, k| m | 1 << k);
-            if m.count_ones() == 1 { m } else { 0 }
-        }
-        /// Return plan: the code-area offset of its call pair ([`PAIR_BYTES`]: `bl` to the call's target, then the pad),
-        /// after its appended entries, when it has call points; a linked call point's word is `b` to it.
-        pub fn pair(&self) -> Option<u64> {
-            (self.call_points() != 0).then(|| self.tail_start() + u64::from(self.tail_bytes()))
-        }
-        /// Return plan: its pad, the word a return to the address after its call reaches through a return-table entry: an
-        /// absolute block's (not [`PIC`]) call pair's second word, or its indirect call's appended words' third.
-        pub fn pad(&self) -> Option<u64> {
-            if self.flags & PIC != 0 || self.exit_forms & FORM_PADS == 0 {
-                return None;
-            }
-            match self.pair() {
-                Some(p) => Some(p + 4),
-                None => self.tail(None).filter(|_| self.tail_calls(None)).map(|t| t + 8),
-            }
-        }
-        /// The word of its call pair holding code-area offset `offset` (0 the `bl`, 1 the pad), if any.
-        pub fn pair_word(&self, offset: u64) -> Option<u32> {
-            let p = self.pair()?;
-            (offset >= p && offset < p + u64::from(PAIR_BYTES) && offset % 4 == 0).then(|| ((offset - p) / 4) as u32)
-        }
-        /// The guest address after its last instruction (a call's return address; 32-bit code's wraps at 4 GiB).
-        pub fn end_rip(&self) -> u64 {
-            let end = self.rip.wrapping_add(u64::from(self.guest_bytes));
-            if super::context_bits32(self.context) { end & 0xffff_ffff } else { end }
-        }
-        /// Return plan: where its computed exit branches, its context's dispatcher slot being at `slot` ([`DISPATCH_MISS`]:
-        /// none): its own appended words, the slot's return form for a return (slot 0's with none), else the slot.
-        pub fn exit_branch(&self, slot: u64) -> u64 {
-            let own = self.code_size != 0 && self.flags & (STEP | SYSTEM | INSTANCE) == 0;
-            match self.tail(None) {
-                Some(t) => t,
-                None if own && self.exit_forms & FORM_RETURN != 0 && self.dispatch_exit != 0 => {
-                    if slot == DISPATCH_MISS as u64 { RETURN_MISS as u64 } else { slot + SLOT_RETURN as u64 }
-                }
-                None => slot,
-            }
         }
         /// The code-area offset of an exit's appended words: link point `k`'s (`Some(k)`, a [`PIC`] block's) or the
         /// computed exit's (`None`); `None` when it has none.
@@ -4733,14 +4592,7 @@ pub struct State {
     /// are direct calls, whether its computed exit is an indirect jump or call), the host's hint from the guest bytes; a
     /// wrong hint changes only the words appended to the block, never a target.
     pub exit_forms: u64,
-    /// Return plan: how the resident continues the exit it is serving (its next [`enter`]): 0 directly, [`RAS_PUSH`] through
-    /// the push stub (a call that has not pushed), [`RAS_POP`] through the pop stub (a return that has not popped); with
-    /// [`State::ras_rip`], the exit's target. Resident-private.
-    pub ras: u64,
-    pub ras_rip: u64,
 }
-pub const RAS_PUSH: u64 = 1;
-pub const RAS_POP: u64 = 2;
 /// The default of [`State::halt_poll_max_us`]. Measured on an M2 Max (November 14, 2026; depth-1 4 KiB direct reads over
 /// virtio-PCI, host CPU per request in brackets). At 2 vCPUs, without polling: 68-70 MB/s (68-70 us). 15 us: 74-85 MB/s
 /// (63-75 us, four runs); 25 us: 89 MB/s (96-98 us); 40 us: 97 MB/s (85 us); 100 us with the disk owner's spin at 100 us: 124-129
@@ -4877,8 +4729,6 @@ impl State {
             halt_poll: 0,
             x87_guess: 0,
             exit_forms: 0,
-            ras: 0,
-            ras_rip: 0,
         }
     }
 }

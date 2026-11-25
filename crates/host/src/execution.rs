@@ -1552,35 +1552,20 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         };
         match w >> 26 {
             0x25 if slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_LOOKUP as u64 && serves(to) => Some(true),
-            // (Return plan: with no slot at its placement, slot 0's lookup form, the miss's words.)
-            0x25 if to == (cache::DISPATCH + cache::SLOT_LOOKUP) as u64 => Some(false),
+            0x05 if to == cache::DISPATCH_MISS as u64 => Some(false),
             _ => None,
         }
     };
-    let b_to = |at: u64, to: u64| 0x1400_0000 | (to.wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff;
-    let target_of = |at: u64, w: u32| at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
-    // Return plan: a pad's word: `b` to the miss, or to the full entry of a block with code.
-    let full_entries: std::collections::HashSet<u64> = blocks
-        .iter()
-        .filter(|t| t.flags & (cache::SYSTEM | cache::INSTANCE) == 0 && t.code_size != 0)
-        .map(|t| t.full_entry() - cache::CODE_VA)
-        .collect();
-    let pad_ok = |at: u64| {
-        let w = word(at);
-        w >> 26 == 0x05 && (target_of(at, w) == cache::DISPATCH_MISS as u64 || full_entries.contains(&target_of(at, w)))
-    };
-    // Every block's appended words: each entry `bl` to its context's lookup form (or slot 0's, with no slot), then `blr x1`
-    // for a call and `br x1` otherwise (its hint, `exit_forms`), then `b` to the miss (an absolute block's indirect call's: its
-    // pad, `b` to the miss or a full entry); a computed exit with them branches to them. A return's computed exit branches
-    // to a slot's return form, or slot 0's (return plan). A call pair: `b` to the miss or `bl` to a block's entry, then its
-    // pad (a shared block's: `b` to the miss).
-    for b in blocks.iter().filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0 && b.code_size != 0) {
+    // Every block's appended words: each entry `bl` to its context's lookup form (or `b` to the miss, with no slot), then
+    // `blr x1` for a call and `br x1` otherwise (its hint, `exit_forms`), then `b` to the miss; a computed exit with them
+    // branches to them, or to the miss with none bound.
+    for b in blocks.iter().filter(|b| b.tail_entries() != 0) {
         for point in [None].into_iter().chain((0..exec::MAX_LINK_POINTS).map(Some)) {
             let Some(at) = b.tail(point) else { continue };
             let bound = lookup_call(at, word(at), b.context);
             let second = if b.tail_calls(point) { 0xd63f_0020 } else { 0xd61f_0020 };
-            let third_ok = if b.pad() == Some(at + 8) { pad_ok(at + 8) } else { word(at + 8) == b_to(at + 8, cache::DISPATCH_MISS as u64) };
-            if bound.is_none() || word(at + 4) != second || !third_ok {
+            let pad = 0x1400_0000 | ((cache::DISPATCH_MISS as u64).wrapping_sub(at + 8) >> 2) as u32 & 0x03ff_ffff;
+            if bound.is_none() || word(at + 4) != second || word(at + 8) != pad {
                 return Err(format!(
                     "appended words of the block at {:#x} ({point:?}): {:#010x} {:#010x} {:#010x}",
                     b.rip,
@@ -1591,29 +1576,10 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             }
             if point.is_none() {
                 let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-                if word(exit) != b_to(exit, at) {
+                let to = if bound == Some(true) { at } else { cache::DISPATCH_MISS as u64 };
+                if word(exit) != 0x1400_0000 | (to.wrapping_sub(exit) >> 2) as u32 & 0x03ff_ffff {
                     return Err(format!("computed exit of the block at {:#x}: word {:#010x}", b.rip, word(exit)));
                 }
-            }
-        }
-        if b.tail(None).is_none() && b.dispatch_exit != 0 && b.exit_forms & cache::FORM_RETURN != 0 {
-            let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-            let to = target_of(exit, word(exit));
-            // (Its own context's slot's return form: the slot serving the block's context.)
-            let serves = |to: u64| control.slot_contexts.get((to - cache::DISPATCH as u64) as usize / cache::DISPATCH_SLOT_BYTES) == Some(&b.context);
-            let form = to == cache::RETURN_MISS as u64
-                || slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_RETURN as u64 && serves(to);
-            if word(exit) >> 26 != 0x05 || !form {
-                return Err(format!("return exit of the block at {:#x}: word {:#010x}", b.rip, word(exit)));
-            }
-        }
-        if let Some(pair) = b.pair() {
-            let first = word(pair);
-            let to = target_of(pair, first);
-            let call = first >> 26 == 0x25 && (entries.contains_key(&to) || entries.contains_key(&to.wrapping_sub(8)));
-            let second_ok = if b.pad().is_some() { pad_ok(pair + 4) } else { word(pair + 4) == b_to(pair + 4, cache::DISPATCH_MISS as u64) };
-            if !(call || first == b_to(pair, cache::DISPATCH_MISS as u64)) || !second_ok {
-                return Err(format!("call pair of the block at {:#x}: {:#010x} {:#010x}", b.rip, first, word(pair + 4)));
             }
         }
     }
@@ -1660,13 +1626,9 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 }
                 // A checked link: `b` to a dispatcher slot, or (indirect plan step 1, shared code) to its point's appended
                 // words, whose words the loop below checks.
+                let slot =
+                    |to: u64| slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == 0;
                 let k = b.links.iter().position(|q| q.offset == p.offset);
-                // (Return plan: a call from absolute code, to the slot's call form.)
-                let call = k.is_some_and(|k| b.call_points() >> k & 1 != 0) && b.flags & cache::PIC == 0;
-                let slot = |to: u64| {
-                    slots.contains(&to)
-                        && to % cache::DISPATCH_SLOT_BYTES as u64 == if call { cache::SLOT_CALL as u64 } else { 0 }
-                };
                 let own = |to: u64| k.and_then(|k| b.tail(Some(k))) == Some(to) && lookup_call(to, word(to), b.context).is_some();
                 if !branch(svc, w).is_some_and(|to| slot(to) || own(to)) {
                     return Err(format!("{}, its `svc` word {w:#010x}", bad()));
@@ -1692,15 +1654,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             // behind the target's test (its two words; the resident's `link_entry`), and between no others.
             let run_tested =
                 |t: &cache::Block| t.code_size != 0 && exec::run_test_end(|o| word(u64::from(t.code) + o), u64::from(t.code_size)).is_some();
-            // Return plan: a direct call's word is `b` to its block's pair (never a plain `b` to the target), whose first word
-            // is the `bl` that calls the target.
-            let k = b.links.iter().position(|q| q.offset == p.offset).unwrap_or(0);
-            let to = match b.pair().filter(|_| b.call_points() >> k & 1 != 0) {
-                Some(pair) if branch(at, w) == Some(pair) && word(pair) >> 26 == 0x25 => Some(target_of(pair, word(pair))),
-                Some(_) => return Err(format!("{}: a call, not through its pair", bad())),
-                None => branch(at, w),
-            };
-            let target = to.and_then(|to| {
+            let target = branch(at, w).and_then(|to| {
                 entries.get(&to).copied().filter(|&t| !(run_tested(b) && run_tested(&blocks[t]))).or_else(|| {
                     entries.get(&to.wrapping_sub(8)).copied().filter(|&t| run_tested(b) && run_tested(&blocks[t]))
                 })
@@ -4371,14 +4325,9 @@ pub fn run(
         Ok("tail2") => cache::PIC_TEST_TAIL + 2,
         Ok("lookup") => cache::PIC_TEST_LOOKUP,
         Ok("trampoline") => cache::PIC_TEST_TRAMPOLINE,
-        Ok("ras0") => cache::PIC_TEST_RAS,
-        Ok("ras1") => cache::PIC_TEST_RAS + 1,
-        Ok("ras2") => cache::PIC_TEST_RAS + 2,
-        Ok("ras3") => cache::PIC_TEST_RAS + 3,
-        Ok("ras4") => cache::PIC_TEST_RAS + 4,
         Ok(other) => {
             return Err(format!(
-                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal, tail0-tail2, lookup, trampoline or ras0-ras4"
+                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal or tail0-tail2"
             ));
         }
     };

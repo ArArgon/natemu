@@ -4,7 +4,9 @@ Status: step 1 built (section 13: the kill-test, what was built, the tests), Nov
 `m2-sampler` 810bd50b; its A/B is the owner's pooled round over all fixes. Revision 2, after an independent design review
 (section 12): step 1 accepted with fixes, taken in; step 2 deferred, and dropped by the kill-test. This plan goes first: it builds
 what the [return prediction plan](return-prediction-plan.md) then uses (the slot's forms, the words appended to a block, `blr`
-at indirect calls). Two plans, not one, because each has its own sampler number, benchmarks and A/B.
+at indirect calls). Two plans, not one, because each has its own sampler number, benchmarks and A/B. The return plan was
+removed on November 24 (its section 16); what this step built for it (the slot's return form, the pad after `blr x1`) stays,
+unreached.
 
 ## 1. Why
 

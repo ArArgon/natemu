@@ -30,14 +30,6 @@ of a shared translation's instance from the resident:
   trampoline of a live split block's computed exit that has appended words, with the doorbell rung: the stop takes the
   entered block's RIP (LOOKUP_STOPS, TRAMPOLINE_STOPS in some run; the values as without the test).
 
-- `ras0`, `ras1`, `ras2`, `ras3` (return plan): entered through the push stub, the pop stub, at a pad, or at a call pair's
-  `bl` (of a call to the entered block, or not linked: `b` to the miss; a dead block's when one has them), x0 the entered
-  block's RIP, with the vCPU's own doorbell rung: the stop there must take that RIP (every program's values as without
-  the test; PUSH_ENTRIES, POP_ENTRIES, PAD_STOPS, PAIR_STOPS in some run). The stubs at every entry: one under a shadow
-  (`miss-boundary`: after MOV SS and STI) is not through a stub and counted (SHADOW_UNBALANCED). Run on the programs that call
-  (`ret-pairs`, `ret-death`, `indirect-sites`) and `miss-boundary`. `ras4`: every block placed as with no slot (a return
-  leaves through slot 0's return form) and its exits armed: a stop at a return's exit continues through the pop stub.
-
 - `user` (and under each mode above): CPL-3 ports of K1 programs in two user address spaces switched by CR3 at CPL 0
   (the driver's `switch` hooks): `user-two`, `user-cow`, `user-twoframe`, `user-pfault` (a #PF at the alias's own RIP
   and CR2 in shared code reached by a local link), each with its exact values; under the stop modes each must stop at
@@ -60,9 +52,6 @@ import ref, run_k1 as K, run_k2, run_slice1_vm as vm, programs as P  # noqa: E40
 # `natemu_abi::pic::count`.
 SAME, ABS_TO_SHARED, UNPROVED, ENTRY_STOPS, SVC_STOPS, SHARES, INSTANCES, CHECKED = 10, 13, 19, 21, 24, 25, 26, 28
 TAILS, TAIL_CALLS, TAIL_POINTS, TAIL_STOPS, TAIL_DEAD_STOPS, LOOKUP_STOPS, TRAMPOLINE_STOPS = 32, 33, 34, 36, 37, 38, 39
-# Return plan: PUSH_ENTRIES, POP_ENTRIES, PAIR_STOPS, PAD_STOPS; the counter each `ras` mode must move.
-PUSH_ENTRIES, POP_ENTRIES, UNBALANCED, PAIR_STOPS, PAD_STOPS, SHADOW_UNBALANCED = 46, 47, 48, 49, 50, 51
-RAS_WANT = {'ras0': PUSH_ENTRIES, 'ras1': POP_ENTRIES, 'ras2': PAD_STOPS, 'ras3': PAIR_STOPS, 'ras4': POP_ENTRIES}
 MODES = 'and,str,body,svc,forge,forge-noncanonical,forge-half,tail0,tail1,tail2,lookup,trampoline,ac,fence,user'
 SVC_PROGRAMS = ('pic-two', 'pic-ctx', 'pic-xm', 'pic-twosrc')
 
@@ -229,12 +218,6 @@ def user(a, name, env):
 HALTS = ('bad_link', 'bad_stop', 'bad_reply', 'reuse_mismatch', 'status=4', 'unknown_abort')
 
 
-def no_slot(mode, problem):
-    """`ras4` places every block as with no slot: no checked link is made and no exit gets the step-1 lookup words' links (a
-    shortfall of those is expected there, nothing else)."""
-    return mode == 'ras4' and ('checked links' in problem or any(f'pic counter {k} ' in problem for k in range(32, 40)))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
@@ -265,7 +248,7 @@ def main():
                 want = SVC_STOPS if mode == 'svc' else ENTRY_STOPS + ['and', 'str', 'body'].index(mode)
                 if not pic[want] and (mode != 'svc' or pic[CHECKED]):
                     problems.append(f'no stop at the tested word (counter {want})')
-            user_bad += [f'{name}: {p}' for p in problems if not no_slot(mode, p)]
+            user_bad += [f'{name}: {p}' for p in problems]
         if mode == 'user':
             print(f"user: {'FAIL ' + '; '.join(user_bad) if user_bad else 'ok'} ({', '.join(USER)})", flush=True)
             failed += [mode] * bool(user_bad)
@@ -279,7 +262,7 @@ def main():
         report = json.loads((out / 'k1.json').read_text())['report']
         stats = [s['k1']['pic'] for r in report for s in r.get('stats') or [] if 'k1' in s]
         total = [sum(p[i] for p in stats) for i in range(len(stats[0]) if stats else 40)]
-        problems = [p for r in report for p in r['problems'] if not no_slot(mode, p)]
+        problems = [p for r in report for p in r['problems']]
         bad = []
         bad += user_bad
         if mode.startswith('forge'):
@@ -292,15 +275,6 @@ def main():
             want = LOOKUP_STOPS if mode == 'lookup' else TRAMPOLINE_STOPS
             if total[want] == 0:
                 bad.append(f'no stop at the tested word (counter {want})')
-        elif mode in RAS_WANT:
-            # (`ras4`: run_k1's own exit counts the step-1 shortfalls `no_slot` drops; its problems are judged here.)
-            if rc != 0 and mode != 'ras4' or problems:
-                bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
-            if total[RAS_WANT[mode]] == 0:
-                bad.append(f'no entry or stop at the tested place (counter {RAS_WANT[mode]})')
-            # (`miss-boundary` enters a block right after MOV SS and STI: those entries are never through a stub.)
-            if mode in ('ras0', 'ras1') and a.programs and 'miss-boundary' in a.programs and total[SHADOW_UNBALANCED] == 0:
-                bad.append(f'no entry under a shadow counted unbalanced (counter {SHADOW_UNBALANCED}): it went through a stub')
         elif mode.startswith('tail'):
             if rc != 0 or problems:
                 bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
@@ -323,15 +297,14 @@ def main():
             if missed or total[want] == 0:
                 bad.append(f'no stop at the tested word (counter {want}) in {missed or "any run"}')
         for k, name in [(SAME, 'local shared'), (CHECKED, 'checked'), (ABS_TO_SHARED, 'absolute into shared')]:
-            if total[k] == 0 and not (mode in RAS_WANT and a.programs and 'indirect-sites' not in a.programs) and not (mode == 'ras4' and k != SAME):
+            if total[k] == 0:
                 bad.append(f'no {name} link')
         if total[UNPROVED]:
             bad.append(f'{total[UNPROVED]} rewrites unproved')
         print(f"{mode}: {'FAIL ' + '; '.join(bad) if bad else 'ok'} (entry stops {total[ENTRY_STOPS:ENTRY_STOPS + 3]}, svc stops "
               f"{total[SVC_STOPS]}, tail stops {total[TAIL_STOPS]} (dead {total[TAIL_DEAD_STOPS]}), lookup/trampoline stops "
               f"{total[LOOKUP_STOPS]}/{total[TRAMPOLINE_STOPS]}, links local/checked/abs->shared "
-              f"{total[SAME]}/{total[CHECKED]}/{total[ABS_TO_SHARED]}, push/pop entries {total[PUSH_ENTRIES]}/{total[POP_ENTRIES]}, "
-              f"pair/pad stops {total[PAIR_STOPS]}/{total[PAD_STOPS]})", flush=True)
+              f"{total[SAME]}/{total[CHECKED]}/{total[ABS_TO_SHARED]})", flush=True)
         failed += [mode] * bool(bad)
         results.append((mode, bad))
     (a.out / 'results.json').write_text(json.dumps({'results': [{'name': m, 'outcome': 'fail' if b else 'match', 'diffs': b} for m, b in results]}) + '\n')

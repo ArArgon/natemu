@@ -814,16 +814,6 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             },
             None => {}
         }
-        // Return plan: a call's first execution (its `svc` ran, not its pair's `bl`) has not pushed: the target is entered
-        // through the push stub.
-        if let Some(b) = ran.filter(|b| b.flags & cache::STEP == 0) {
-            let at = link_point_of(b, elr.wrapping_sub(4));
-            if let Some(k) = b.links.iter().position(|p| p.offset != 0 && at == Some(u64::from(p.offset))) {
-                if b.call_points() >> k & 1 != 0 {
-                    (s.ras, s.ras_rip) = (RAS_PUSH, exit);
-                }
-            }
-        }
         enter(&mut s, target)
     }
 }
@@ -1595,7 +1585,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             // hint for the answer at this RIP.
             let at = u64::from(t.code) + u64::from(t.dispatch_exit);
             let slot = cache::dispatcher_for(copy.context);
-            let to = t.exit_branch(slot);
+            let to = t.tail(None).filter(|_| slot != cache::DISPATCH_MISS as u64).unwrap_or(slot);
             let dispatch = (t.dispatch_exit == 0
                 || code(u64::from(t.dispatch_exit) / 4)
                     == 0x1400_0000 | (to.wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff)
@@ -2369,51 +2359,10 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
             cache::kick(s.vcpu as usize);
         }
     }
-    // Return plan tests ([`cache::PIC_TEST_RAS`]): through a stub (the continuation below), or at a pad or a pair's `bl`.
-    let ras_test = cache::control().pic_test.wrapping_sub(cache::PIC_TEST_RAS);
-    // (Through a stub at every entry, the doorbell rung at every second: an entry with a shadow set is counted unbalanced.)
-    if ras_test < cache::PIC_TEST_RASES && s.ras == 0 && block.flags & cache::STEP == 0 && !block.starts_with_rep() {
-        match ras_test {
-            4 => {
-                if s.blocks % 2 == 0 && cache::arm(code) {
-                    s.stop_wanted = 1;
-                }
-            }
-            0 | 1 => {
-                (s.ras, s.ras_rip) = (if ras_test == 0 { RAS_PUSH } else { RAS_POP }, block.rip);
-                if s.blocks % 2 == 0 {
-                    cache::kick(s.vcpu as usize);
-                }
-            }
-            _ if s.blocks % 2 == 0 && s.shadow_entry == 0 && pc == code.entry() => {
-                if let Some(at) = cache::ras_for_test(block, ras_test == 3, s.blocks / 2) {
-                    (f.x[0], pc) = (block.rip, cache::CODE_VA + at);
-                    cache::kick(s.vcpu as usize);
-                }
-            }
-            _ => {}
-        }
-    }
     // (And the `svc`-word links of any block, absolute ones' into position-independent targets included.)
     if cache::control().pic_test == cache::PIC_TEST_SVC && s.blocks % 2 == 0 && cache::arm_svc(code)
     {
         s.stop_wanted = 1;
-    }
-    // Return plan: a call the resident continues before it pushed goes through the push stub (`blr x1`), a return before
-    // it popped through the pop stub (`ret x1`), x1 the entry, x0 the RIP (a stop there continues with it): so every call
-    // pushes and every return pops the return-address stack once. Not under a shadow (the block's first word must be the
-    // one entered), not where a test chose the word, nor into another block than the exit's target: counted unbalanced.
-    let ras = core::mem::take(&mut s.ras);
-    if ras != 0 {
-        let counts = &mut cache::control().pic_counts;
-        if s.shadow_entry != 0 || pc != code.entry() || block.rip != s.ras_rip || block.flags & cache::STEP != 0 {
-            counts[natemu_abi::pic::count::UNBALANCED] += 1;
-            counts[natemu_abi::pic::count::SHADOW_UNBALANCED] += u64::from(s.shadow_entry != 0);
-        } else {
-            let stub = if ras == RAS_PUSH { cache::PUSH_STUB } else { cache::POP_STUB };
-            counts[if ras == RAS_PUSH { natemu_abi::pic::count::PUSH_ENTRIES } else { natemu_abi::pic::count::POP_ENTRIES }] += 1;
-            (f.x[0], f.x[1], pc) = (block.rip, pc, cache::CODE_VA + stub as u64);
-        }
     }
     // (The shadow's first word is the one entered: a test entry's too.)
     if s.shadow_entry != 0 {
@@ -2466,11 +2415,10 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u6
         let Some(armed) = cache::disarm() else {
             halt_native([0, 0, frame.x[30]], stop::BAD_STOP)
         };
-        // PIC study stage 2 tests: the entry frame's x0 is zero again ([`enter`]); the indirect plan's tail tests' x1 too;
-        // and the return plan's entries through a stub, in every run.
-        (*shared()).initial.x[0] = 0;
-        (*shared()).initial.x[1] = 0;
+        // PIC study stage 2 tests: the entry frame's x0 is zero again ([`enter`]); the indirect plan's tail tests' x1 too.
         if cache::control().pic_test != 0 {
+            (*shared()).initial.x[0] = 0;
+            (*shared()).initial.x[1] = 0;
             (*shared()).initial.x[2] = 0;
             (*shared()).initial.x[30] = 0;
         }
@@ -2723,23 +2671,6 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         let mut s = at_once(s, frame.x[0]);
         completed(&mut s); // a block exited into the dispatcher
         s.stops_dispatch += 1;
-        // Return plan: before a return form's `ret x1` (or slot 0's) and at the pop stub the return has not popped; before
-        // a call form's `blr x1` and at the push stub the call has not pushed; inside a lookup form its caller's `bl` is
-        // not popped (counted unbalanced).
-        let o = (elr - cache::DISPATCH_VA) as usize;
-        let (slot, form) = (o / cache::DISPATCH_SLOT_BYTES, o % cache::DISPATCH_SLOT_BYTES);
-        s.ras = match form {
-            f if (cache::SLOT_RETURN..cache::SLOT_CALL).contains(&f) => RAS_POP,
-            f if slot == 0 && f == cache::SLOT_CALL => RAS_PUSH,
-            f if slot == 0 && f == cache::SLOT_CALL + 8 => RAS_POP,
-            f if slot != 0 && (f == cache::SLOT_CALL || f == cache::SLOT_CALL + 4) => RAS_PUSH,
-            f if (cache::SLOT_LOOKUP..cache::SLOT_RETURN).contains(&f) => {
-                cache::control().pic_counts[natemu_abi::pic::count::UNBALANCED] += 1;
-                0
-            }
-            _ => 0,
-        };
-        s.ras_rip = s.cpu.rip;
         unsafe { dispatch(&mut s) }
     }
     // PIC study (`pic-count` builds): in a link's counting stub, the exit's state: the vCPU stops at the target's start.
@@ -2759,9 +2690,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         // done and its target is in x0, which they never write), the vCPU stops at once, as in the dispatcher. `block_at`
         // holds no appended word, and a dead block's count too (its code still runs until it leaves): looked up here, on
         // `block_at`'s miss only, and never filtered by death.
-        // Return plan: before a call's `blr` it has not pushed (the push stub continues it); at a pad, x0 is the return
-        // address.
-        if let Some((b, point, w)) = cache::tail_at(elr) {
+        if let Some((b, _, _)) = cache::tail_at(elr) {
             let dead = b.flags & cache::DEAD != 0;
             let mut s = at_once(s, frame.x[0]);
             completed(&mut s);
@@ -2769,27 +2698,6 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
             let counts = &mut cache::control().pic_counts;
             counts[natemu_abi::pic::count::TAIL_STOPS] += 1;
             counts[natemu_abi::pic::count::TAIL_DEAD_STOPS] += u64::from(dead);
-            if w < 2 && b.tail_calls(point) {
-                (s.ras, s.ras_rip) = (RAS_PUSH, s.cpu.rip);
-            }
-            counts[natemu_abi::pic::count::PAD_STOPS] += u64::from(w == 2 && b.pad() == b.tail(point).map(|t| t + 8));
-            unsafe { dispatch(&mut s) }
-        }
-        // Return plan: in a call pair (appended words too, dead blocks' included). At its `bl` the call has not pushed and
-        // x0 is not set: the target is the call point's, and the push stub continues it; at its pad x0 is the return address.
-        if let Some((b, w)) = cache::pair_at(elr) {
-            let target = b.links.iter().enumerate().find(|&(k, _)| b.call_points() >> k & 1 != 0).map(|(_, p)| {
-                natemu_abi::pic::moved(p.target, b.rip, cache::running_rip(b), cache::bits32(b.context))
-            });
-            let rip = if w == 0 { target.unwrap_or(frame.x[0]) } else { frame.x[0] };
-            let mut s = at_once(s, rip);
-            completed(&mut s);
-            s.stops_dispatch += 1;
-            let counts = &mut cache::control().pic_counts;
-            counts[if w == 0 { natemu_abi::pic::count::PAIR_STOPS } else { natemu_abi::pic::count::PAD_STOPS }] += 1;
-            if w == 0 {
-                (s.ras, s.ras_rip) = (RAS_PUSH, rip);
-            }
             unsafe { dispatch(&mut s) }
         }
         bad(s)
@@ -2925,40 +2833,7 @@ unsafe fn stopped(
     s.stop_wanted = 0;
     s.stops_exit += 1;
     taken(&mut s);
-    // Return plan: a stop at a call's exit word comes before its push, at a return's before its pop: the target is entered
-    // through the push or the pop stub.
-    if let Some(b) = block {
-        s.ras = exit_ras(b, offset);
-        s.ras_rip = rip;
-    }
     unsafe { dispatch(&mut s) }
-}
-/// Return plan: a continuation through a stub the resident drops (it runs an instruction itself): counted unbalanced.
-fn ras_dropped(s: &mut State) {
-    if core::mem::take(&mut s.ras) != 0 {
-        cache::control().pic_counts[natemu_abi::pic::count::UNBALANCED] += 1;
-    }
-}
-/// Return plan: how the resident continues an exit of block `b` stopped at its exit word at native offset `offset` (a link
-/// point's first word or `svc` word, or its computed exit's `b`): through the push stub for a call (a direct call's point,
-/// an indirect call with words of its own), the pop stub for a return; else directly.
-fn exit_ras(b: &Block, offset: u64) -> u64 {
-    let point = b.links.iter().position(|p| p.offset != 0 && (u64::from(p.offset) == offset || cache::svc_slot(b, p) == offset));
-    match point {
-        Some(k) if b.call_points() >> k & 1 != 0 => RAS_PUSH,
-        Some(_) => 0,
-        None if b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit) => {
-            let code = cache::code_of(b);
-            if code.tail(None).is_some() && code.exit_forms & cache::FORM_INDIRECT_CALL != 0 {
-                RAS_PUSH
-            } else if code.tail(None).is_none() && code.exit_branch(cache::DISPATCH_MISS as u64) == cache::RETURN_MISS as u64 {
-                RAS_POP
-            } else {
-                0
-            }
-        }
-        None => 0,
-    }
 }
 
 /// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
@@ -3004,9 +2879,6 @@ const GP: [u64; 3] = [13, 0, 0];
 fn system(s: &mut State, i: System) {
     let p = crate::perf::enter(crate::perf::SYSTEM);
     s.systems += 1;
-    // Return plan: the resident runs this instruction itself; a continuation through a stub waiting for the exit's target
-    // goes (counted): a re-entry at that RIP after it must not push or pop.
-    ras_dropped(s);
     // A shadow covers this instruction and ends with it (X2: MOV SS and STI set theirs again in the transaction); the
     // boundary is not between REP iterations. A BT* form under alignment checking does not complete here (it is stepped).
     if i.kind != system::BT_ALIGNED {
@@ -3852,7 +3724,6 @@ fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
 /// [`code_written`]'s invalidation path and completes; its exit goes to the next instruction, which the next miss
 /// compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
 fn step(s: &mut State) -> ! {
-    ras_dropped(s);
     loop {
         s.steps += 1;
         // A system instruction whose decode is kept runs from it (K2), as a decoded reply below does.

@@ -1,6 +1,7 @@
 # Returns predicted by the Arm return stack (plan)
 
-Status: the smallest version is built (November 24, 2026, section 14: kill-test, build, tests). Plan of November 23, revision 3: revision 2 (the
+Status: **removed** (November 24, 2026, section 16), at the owner's request, after the slowdown section 15 measured. Before
+that: the smallest version was built (November 24, section 14: kill-test, build, tests). Plan of November 23, revision 3: revision 2 (the
 return stack balanced on every path, pads without link records, a host kill-test for mechanism and an in-VM one for the
 decision, the decision read on benchmarks the built version covers) was accepted with fixes by the independent re-review, and
 the fixes are taken in (section 13). Owner decision (November 23): the pad is an "external guarded entry" in INV-03-01's sense,
@@ -476,3 +477,20 @@ Off, movsb-1 is at 161176fb's level (3.66 in the bisect) and hackbench below its
 With the switch unset, the K1 programs `ret-pairs` and `ret-death` (in `k1-c1` and every K1 run) require the return plan's
 counters 40-47 to be zero (red with the switch forced on); `compat32-resident-limits` runs off and
 `compat32-resident-limits-ret` on.
+
+## 16. Removed (November 24, 2026)
+
+Return prediction was taken out of natemu on November 24 at the owner's request, because of the cause section 15 measured:
+a return address that ends several blocks (a loop header, a fall-through entry, a block placed from inside another) has
+one call pair per block, the return-table entry names one pad, and when the block that made the call is another one the
+`ret x1` mispredicts on every return. The code of cc06f0f2, 115f0b34, 7a51e342, 0264a2b9 and da574812 is gone: the call
+pairs and pads, the hint table, the push stub and `s.ras`, the admission forms `FORM_RETURN` and `FORM_PADS` and the
+`NATEMU_RETURN_PREDICT` switch, the audits in the host's `check_links` and the resident's `check_tails`, the counters
+40-47, and the cases `ret-pairs`, `ret-pairs-lc`, `ret-stop`, `ret-death`, `compat32-resident-limits-ret` (`ret32`),
+`micro-callchain` and the `guest-*-predict` bench cases. Return paths are as at 161176fb: returns leave through the slot's
+shared `br`, calls are plain links, and a block with no slot keeps its computed exit's `b` to the miss. What indirect
+step 1 laid down before this plan stays: the slot's `SLOT_RETURN` form (`ret x1`, now unreached), the pad word after an
+appended `blr x1`, and `FORM_CALL_POINTS`, whose bits pick `blr` for a call point's appended words.
+
+A redesign would need one shared push address per return address, whichever block makes the call: a call stub per return
+address shared by every block that ends there, with link records for the stub's users and the entries that name it.

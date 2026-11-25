@@ -95,16 +95,6 @@ mod on {
             })
         }
         fn tail(&self, pc: u64) -> Option<(BlockView, u16)> {
-            if let Some((b, w)) = cache::pair_at(pc) {
-                let view = BlockView {
-                    rip: b.rip,
-                    context: b.context,
-                    frame: b.source_gpa[0],
-                    dead: b.flags & DEAD != 0,
-                    ..BlockView::default()
-                };
-                return Some((view, w as u16 | sm::TAIL_CALL | sm::TAIL_PAIR));
-            }
             cache::tail_at(pc).map(|(b, point, w)| {
                 let view = BlockView {
                     rip: b.rip,

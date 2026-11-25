@@ -449,34 +449,18 @@ pub(crate) fn admit_user(
     (admitted.links, admitted.dispatch_exit, admitted.bulk) = (links, dispatch_exit, bulk);
     let end = wrap(rip.wrapping_add(u64::from(h.guest_bytes)), bits32);
     let tail = source.get(admitted.last as usize..h.guest_bytes as usize).unwrap_or(&[]);
-    admitted.exit_forms = predicted(exit_forms(tail, &admitted.links, admitted.dispatch_exit, end, bits32));
+    admitted.exit_forms = exit_forms(tail, &admitted.links, admitted.dispatch_exit, end, bits32);
     Ok(admitted)
-}
-
-/// Return plan (return-prediction-plan.md section 15): with `NATEMU_RETURN_PREDICT=1` a block's hint keeps its call points
-/// and its return form and gains [`FORM_PADS`]; otherwise (the default) both go, so calls are plain links and returns leave
-/// through the slot's shared `br` as before the plan, and the block has no pads: step 1's words alone. (Every block that
-/// ends at a return address pushes its own pad, and the return's entry can name only one: with two blocks ending at one
-/// return address, a loop's back edge and its first entry, every return of the loop mispredicted.)
-pub(crate) fn predicted(forms: u32) -> u32 {
-    use natemu_abi::execution::cache::{FORM_CALL_POINTS, FORM_PADS, FORM_RETURN};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var("NATEMU_RETURN_PREDICT").is_ok_and(|v| v == "1")) {
-        forms | FORM_PADS
-    } else {
-        forms & !(FORM_CALL_POINTS | FORM_RETURN)
-    }
 }
 
 /// Indirect plan step 1, the resident's hint for the words it appends to a block ([`natemu_abi::execution::cache::Block::exit_forms`]),
 /// from its last instruction `insn` (ending at `end`; legacy prefixes, and REX bytes in 64-bit code, before its opcode): a
 /// near direct call (E8) marks the link points to its target as calls, but `call $+5` (to the next instruction: it never
 /// returns, a get-PC idiom); FF /2 (a near indirect call) and FF /4 (a near indirect jump) give the computed exit its own
-/// words, ending in `blr` and `br`; a near return (C3, C2) gets its slot's return form (return plan). Anything else (a far
-/// branch) keeps the slot's shared branch. A wrong hint
+/// words, ending in `blr` and `br`. Anything else (a return, a far branch) keeps the slot's shared branch. A wrong hint
 /// changes only those words, never a target: every target is still the data table's or a link's.
 pub(crate) fn exit_forms(insn: &[u8], links: &[LinkPoint], dispatch_exit: Option<u32>, end: u64, bits32: bool) -> u32 {
-    use natemu_abi::execution::cache::{FORM_INDIRECT, FORM_INDIRECT_CALL, FORM_RETURN};
+    use natemu_abi::execution::cache::{FORM_INDIRECT, FORM_INDIRECT_CALL};
     let prefix = |b: u8| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3) || (!bits32 && b & 0xf0 == 0x40);
     let Some(o) = insn.iter().position(|&b| !prefix(b)) else {
         return 0;
@@ -488,8 +472,6 @@ pub(crate) fn exit_forms(insn: &[u8], links: &[LinkPoint], dispatch_exit: Option
         },
         (0xff, Some(2)) if dispatch_exit.is_some() => FORM_INDIRECT | FORM_INDIRECT_CALL,
         (0xff, Some(4)) if dispatch_exit.is_some() => FORM_INDIRECT,
-        // Return plan: a near return (C3, C2 imm16) leaves through its slot's return form, `ret x1`.
-        (0xc3 | 0xc2, _) if dispatch_exit.is_some() => FORM_RETURN,
         _ => 0,
     }
 }
@@ -1243,7 +1225,7 @@ mod tests {
     /// Indirect plan step 1: the exit forms' hint from the last instruction, in 64-bit and 32-bit code.
     #[test]
     fn exit_forms_from_the_last_instruction() {
-        use natemu_abi::execution::cache::{FORM_INDIRECT as J, FORM_INDIRECT_CALL as C, FORM_RETURN as R};
+        use natemu_abi::execution::cache::{FORM_INDIRECT as J, FORM_INDIRECT_CALL as C};
         let p = |target| LinkPoint { offset: 8, word: 0, target };
         let end = 0x1005;
         for bits32 in [false, true] {
@@ -1253,10 +1235,7 @@ mod tests {
             assert_eq!(forms(&[0xff, 0xe0], &[], true), J, "jmp rax / eax");
             assert_eq!(forms(&[0x3e, 0xff, 0x24, 0xc5, 0, 0, 0, 0], &[], true), J, "ds jmp [disp + rax*8]");
             assert_eq!(forms(&[0xff, 0xd0], &[], false), 0, "no computed exit: nothing to append");
-            assert_eq!(forms(&[0xc3], &[], true), R, "a return: the return form");
-            assert_eq!(forms(&[0xf3, 0xc3], &[], true), R, "rep ret");
-            assert_eq!(forms(&[0xc2, 8, 0], &[], true), R, "ret imm16");
-            assert_eq!(forms(&[0xcb], &[], true), 0, "a far return keeps the slot's branch");
+            assert_eq!(forms(&[0xc3], &[], true), 0, "a return keeps the slot's branch");
             assert_eq!(forms(&[0xff, 0x1d, 0, 0, 0, 0], &[], true), 0, "a far call");
             // E8 rel32 to 0x2005: the link point to it is a call; one to the block end is not; `call $+5` none.
             assert_eq!(forms(&[0xe8, 0, 0x10, 0, 0], &[p(0x2005), p(end)], false), 1);

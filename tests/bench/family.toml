@@ -18,23 +18,6 @@ argv = ["python3", "tools/bench/run_qemu.py", "--out", "{out}", "--reps", "3", "
 [suite.cases.micro-natemu]
 argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3"]
 
-# The return plan's in-VM kill-test (docs/restructure/return-prediction-plan.md section 6): call chains of depth 4, 16 and
-# 32 with four callers per level in a long-period order, one caller per level, trips at the bottom of depth 16 (CPUID: the
-# resident; IN: the host), and the `call` body; ns per iteration in results.json (`ns_per_iter`). Return prediction is off
-# by default: the case turns it on (NATEMU_RETURN_PREDICT=1); `micro-callchain-base` is the indirect plan's step 1 (ad452224).
-[suite.cases.micro-callchain]
-argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3",
-        "--bench", "call,chain4-d4,chain4-d16,chain4-d32,chain1-d16,chain4-d16-cpuid,chain4-d16-port"]
-env = { NATEMU_RETURN_PREDICT = "1" }
-
-# The same at the kill-test's base, the indirect plan's step 1 as built (ad452224: the slot's shared `br` for every return), with
-# this checkout's fexc (unchanged since): natemu at the base through its build folder.
-[suite.cases.micro-callchain-base]
-baseline = "ad452224"
-argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3",
-        "--bench", "call,chain4-d4,chain4-d16,chain4-d32,chain1-d16,chain4-d16-cpuid,chain4-d16-port"]
-env = { CARGO_TARGET_DIR = "{natemu_baseline}" }
-
 [suite.cases.smp-selftest]
 argv = ["python3", "tools/bench/smp/smp.py", "selftest", "--out", "{out}"]
 
@@ -246,19 +229,6 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sam
         "--", "python3", "tools/bench/run.py", "--out", "{out}", "--name", "build-sample", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
-
-# Return prediction's switch (return-prediction-plan.md section 15): repmicro and hackbench with NATEMU_RETURN_PREDICT=1, an A/B
-# of the switch on one commit and one binary against `guest-repmicro` and `guest-hackbench` (off, the default).
-[suite.cases.guest-repmicro-predict]
-argv = ["python3", "tests/bench/repmicro_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
-        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}"]
-env = { NATEMU_RETURN_PREDICT = "1" }
-
-[suite.cases.guest-hackbench-predict]
-argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "hackbench",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
-        "--compile-cache", "off"]
-env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases.guest-hackbench-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",
