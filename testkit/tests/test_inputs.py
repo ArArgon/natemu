@@ -370,3 +370,53 @@ def test_a_run_uses_the_inputs_it_prepared_even_if_the_builder_changes(monkeypat
     a = resources.derived('thing', recipe, ['x', 'builder-1'])
     b = resources.derived('thing', recipe, ['x', 'builder-2'])        # the config changed mid-run
     assert a == b and built == ['builder-1']
+
+
+def test_kms_pattern_builds_in_the_container_on_the_stress_ng_pins(monkeypatch, tmp_path):
+    """kms_pattern(): the container's /recipe holds exactly kms_pattern.c, its script and the stress-ng recipe's
+    sysroot pins; the entry is the static x86-64 binary, its build log and provenance; a dynamic binary is refused."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    monkeypatch.setattr(inputs.artifacts, 'build_env', lambda: 'env')
+    monkeypatch.setattr(inputs.artifacts, 'build_env_described', lambda: {'builder': 'test'})
+    seen = []
+    def fake(name, recipe, work, script='container.sh', pins_to=None, **kw):
+        seen.append((name, sorted(p.name for p in recipe.iterdir()), script, pins_to))
+        elf = bytearray(b'\x7fELF\x02\x01' + bytes(58)); struct.pack_into('<H', elf, 18, 62)
+        struct.pack_into('<Q', elf, 32, 64); struct.pack_into('<HH', elf, 54, 56, 1)
+        elf += struct.pack('<I', kind[0]) + bytes(52)
+        (work / 'kms_pattern').write_bytes(bytes(elf)); (work / 'build.log').write_text('ok')
+    kind = [1]                                  # PT_LOAD only: static
+    monkeypatch.setattr(inputs, '_in_container', fake)
+    d = inputs.kms_pattern()
+    assert seen == [('kms-pattern', ['debs.sha256', 'kms_pattern.c', 'kms_pattern.sh', 'packages.txt'], 'kms_pattern.sh',
+                     inputs._tools() / 'io' / 'stress-ng')]
+    assert sorted(p.name for p in d.iterdir()) == ['build.log', 'kms_pattern', 'provenance.json']
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c2'))
+    kind[0] = 3                                 # PT_INTERP: dynamic
+    with pytest.raises(inputs.BuildFailure, match='not fully static'):
+        inputs.kms_pattern()
+
+
+def test_display_inputs_runs_the_display_prepare(monkeypatch, tmp_path):
+    """tests/devices/run_display.py prepare, from kms_pattern() and the platform runner's three downloads; the input
+    root holds it at devices-display/display."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    files = {n: tmp_path / n for n in ('debian-netboot-linux', 'debian-kernel-deb', 'busybox-static-deb')}
+    for f in files.values(): f.write_text(f.name)
+    (tmp_path / 'kms').mkdir(); (tmp_path / 'kms' / 'kms_pattern').write_text('elf')
+    monkeypatch.setattr(inputs.resources, 'fetch', lambda n: files[n])
+    monkeypatch.setattr(inputs, 'kms_pattern', lambda: tmp_path / 'kms')
+    calls = []
+    def runner(script, *args):
+        a = dict(zip(args[1::2], args[2::2])); calls.append((script, args[0], a))
+        a['--out'].mkdir(); (a['--out'] / 'inputs.json').write_text('{}')
+    monkeypatch.setattr(inputs, '_runner', runner)
+    d = inputs.display_inputs()
+    script, command, a = calls[0]
+    assert script.as_posix().endswith('tests/devices/run_display.py') and command == 'prepare'
+    assert {k: v for k, v in a.items() if k != '--out'} == {'--kernel': str(files['debian-netboot-linux']),
+                                                           '--kernel-deb': str(files['debian-kernel-deb']),
+                                                           '--busybox-deb': str(files['busybox-static-deb']),
+                                                           '--kms-pattern': tmp_path / 'kms' / 'kms_pattern'}
+    assert d.name == 'display' and (d / 'inputs.json').exists()
+    assert inputs.DISPLAY == 'devices-display/display' and inputs.DISPLAY in inputs.PATHS

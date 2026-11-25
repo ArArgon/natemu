@@ -410,6 +410,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
                     started: std::time::Instant::now(),
                 },
                 irqs: prepared.irqs().clone(),
+                display: prepared.display(),
             },
         )?),
         None => None,

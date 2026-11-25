@@ -34,8 +34,9 @@ MATRIX = 'io-matrix-inputs-20261118-01'                     # run_io_matrix.py p
 PLATFORM = 'devices-platform/platform'                      # tests/devices/run_platform.py prepare's folder (its run --inputs)
 CONSOLE = 'devices-console/console'                         # tests/devices/run_console.py prepare's folder (its run --inputs)
 CONTROL = 'devices-control/control'                         # tests/devices/run_control.py prepare's folder (its run --inputs)
+DISPLAY = 'devices-display/display'                         # tests/devices/run_display.py prepare's folder (its run --inputs)
 PATHS = (NETBOOT_LINUX, NETBOOT_INITRD, QEMU_USER, BLOCK_INPUTS, BLOCK_KERNEL_DEB, NETWORK_ROOTFS, I7_PROGRAMS, S2D_PROGRAMS,
-         FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE, CONTROL)
+         FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE, CONTROL, DISPLAY)
 E2FSPROGS = pathlib.Path('/opt/homebrew/opt/e2fsprogs')     # Homebrew's: a host tool, checked (version and hashes key the image), not pinned
 
 
@@ -124,6 +125,49 @@ def control_inputs() -> pathlib.Path:
     return resources.derived('devices-control-inputs', _control_recipe,
                              srcs + [dev / 'run_control.py', dev / 'run_platform.py', lib / 'io_common.py',
                                      t / 'raw_root.py', t / 'play/mkcpio.py']) / 'control'
+
+
+def _kms_recipe(out: pathlib.Path, inputs: list) -> None:
+    source, script, pins = map(pathlib.Path, inputs[:3])
+    recipe = out / 'recipe'; recipe.mkdir()          # what the container's /recipe holds: exactly the keyed files
+    for f in (source, script, pins / 'packages.txt', pins / 'debs.sha256'): shutil.copy2(f, recipe / f.name)
+    work = out / 'work'; work.mkdir()
+    _in_container('kms-pattern', recipe, work, script=script.name, pins_to=pins)
+    b = (work / 'kms_pattern').read_bytes()
+    if b[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', b, 18)[0] != 62: raise BuildFailure('kms-pattern', 'not an x86-64 ELF')
+    ph, size, count = struct.unpack_from('<Q', b, 32)[0], *struct.unpack_from('<HH', b, 54)
+    if any(struct.unpack_from('<I', b, ph + i * size)[0] in (2, 3) for i in range(count)): raise BuildFailure('kms-pattern', 'not fully static')
+    for n in ('kms_pattern', 'build.log'): shutil.move(work / n, out / n)
+    (out / 'provenance.json').write_text(json.dumps({
+        'binary_sha256': hashlib.sha256(b).hexdigest(), 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'builder': artifacts.build_env_described()}, indent=1) + '\n')
+    shutil.rmtree(recipe); shutil.rmtree(work)
+
+
+def kms_pattern() -> pathlib.Path:
+    """tests/devices/kms_pattern.c built static for x86-64 (tests/devices/kms_pattern.sh) in the amd64 Debian builder,
+    on the stress-ng recipe's pinned sysroot (tools/io/stress-ng: gcc 14, glibc, the guest kernel's UAPI headers): the
+    folder holding kms_pattern, build.log and provenance.json."""
+    dev = paths.repo_root() / 'tests' / 'devices'
+    return resources.derived('kms-pattern', _kms_recipe, [dev / 'kms_pattern.c', dev / 'kms_pattern.sh',
+                                                          _tools() / 'io' / 'stress-ng', artifacts.build_env()])
+
+
+def _display_recipe(out: pathlib.Path, inputs: list) -> None:
+    kms, kernel, kernel_deb, busybox = inputs[:4]
+    _runner(paths.repo_root() / 'tests' / 'devices' / 'run_display.py', 'prepare', '--kernel', kernel, '--kernel-deb', kernel_deb,
+            '--busybox-deb', busybox, '--kms-pattern', pathlib.Path(kms) / 'kms_pattern', '--out', out / 'display')
+
+
+def display_inputs() -> pathlib.Path:
+    """tests/devices/run_display.py prepare's folder: the netboot kernel, Debian's BusyBox, the bochs DRM module and what
+    it depends on from the same kernel's package, and kms_pattern(), in display.cpio."""
+    t, lib, dev = _tools(), _lib(), paths.repo_root() / 'tests' / 'devices'
+    srcs = [str(kms_pattern())] + [str(resources.fetch(n)) for n in ('debian-netboot-linux', 'debian-kernel-deb', 'busybox-static-deb')]
+    return resources.derived('devices-display-inputs', _display_recipe,
+                             srcs + [dev / 'run_display.py', dev / 'run_platform.py', lib / 'io_common.py',
+                                     t / 'raw_root.py', t / 'play/mkcpio.py']) / 'display'
+
 
 
 def e2fsprogs() -> tuple[pathlib.Path, str]:
@@ -523,7 +567,7 @@ def components() -> dict[str, pathlib.Path]:
             QEMU_USER: artifacts.qemu_user(), BLOCK_INPUTS: block_inputs(), BLOCK_KERNEL_DEB: resources.fetch('debian-kernel-deb'),
             NETWORK_ROOTFS: network_rootfs(), I7_PROGRAMS: corpus('gen_i7.py'), S2D_PROGRAMS: corpus('gen_slice2.py'),
             FIO_PREP: fio_prep(), STRESS: stress_ng(), MATRIX: matrix_inputs(), PLATFORM: platform_inputs(),
-            CONSOLE: console_inputs(), CONTROL: control_inputs()}
+            CONSOLE: console_inputs(), CONTROL: control_inputs(), DISPLAY: display_inputs()}
 
 
 def root() -> pathlib.Path:

@@ -1,7 +1,8 @@
 # The control API
 
 natemu can listen on a Unix socket for a program on the Mac to drive the VM: type keys, move and click the mouse,
-quit, and ask how the run is going. A test, a debugger or a window that shows the guest can use it. This page is the
+quit, ask how the run is going and, with a display (`[display]`, [configuration](configuration.md)), take pictures
+of the screen or map the framebuffer. A test, a debugger or a window that shows the guest can use it. This page is the
 reference for writing such a client in any language. The protocol is JSON-RPC 2.0 (jsonrpc.org/specification), one
 JSON value per line.
 
@@ -34,8 +35,8 @@ Without that key natemu opens no socket and the launch is the same as before.
 
 Each message is one line: compact JSON (no newline inside it) followed by a newline (`\n`). Lines go both ways on
 the same connection. A line a client sends may be at most 1 MiB (1,048,576 bytes, without its newline). A longer
-line is answered with a parse error (-32700) and the connection is closed. natemu's own lines have no such bound (a
-later method may answer with more, see [Limits](#limits)). Blank lines are ignored. A line that is not valid UTF-8 is
+line is answered with a parse error (-32700) and the connection is closed. The bound is on what clients send only:
+natemu's own lines have none (a `snapshot` answer is several MiB, see [Limits](#limits)). Blank lines are ignored. A line that is not valid UTF-8 is
 a parse error. When a client closes its sending side, a last line without its newline still counts, and the client
 gets the answers to everything it sent before natemu closes the connection.
 
@@ -119,6 +120,10 @@ No parameters. Result:
 - `vcpus`: the number of processors the VM has.
 - `uptime_ms`: milliseconds since the socket was made.
 - `devices.ps2`: whether the VM has the PS/2 keyboard and mouse that `send_input` needs.
+- `devices.display`: only when the VM has a display: `null` while the guest shows no picture, else the mode, as
+  [`framebuffer`](#framebuffer) reports it without `size`
+  (`{"width":1024,"height":768,"stride":4096,"offset":0,"format":"x8r8g8b8"}`). A VM without a display has no
+  `display` member.
 
 ### `power_button`
 
@@ -129,6 +134,42 @@ ACPI `button` driver reports that as a KEY_POWER press on its "Power Button" inp
 Pressing again before the guest has handled the first press changes nothing. If the VM has no power button the answer
 is error -32001 with `data` `{"device": "power_button"}`; every VM natemu builds has one. While the run is stopping
 the answer is -32002 and nothing is pressed.
+
+### `snapshot`
+
+The picture the guest shows now, as a PNG. Parameters: `{"format": "png"}`, or none (PNG is the default and the only
+format). Result:
+
+```json
+{"width":640,"height":480,"png":"iVBORw0KGgoAAAANSUhEUgAAAoAAAAHgCAIAAAD..."}
+```
+
+`png` is the PNG file in base64 (RFC 4648, with padding): 8-bit RGB, as wide and tall as the guest's mode. natemu
+reads the mode once and copies the visible part of the framebuffer row by row, so a picture never mixes two modes;
+a row the guest rewrites during the copy may show part of each version, as a real screen would. Errors: -32001 with
+`data` `{"device": "display"}` when the VM has no display; -32004 when the guest has not turned the display on (no
+driver loaded yet, or it turned it off); -32005 when the picture is wider than 2560 or taller than 1600 pixels
+(`data` names the size and the limits); -32602 for another format.
+
+### `framebuffer`
+
+No parameters. The mode and the framebuffer itself, for a program that shows the screen without a copy per frame:
+
+```json
+{"width":640,"height":480,"stride":3200,"offset":51220,"format":"x8r8g8b8","size":16777216}
+```
+
+The answer's line comes with one file descriptor, passed as `SCM_RIGHTS` ancillary data on the message that carries
+the line's first bytes: the framebuffer's shared-memory object, `size` bytes, which the client maps read-only
+(`mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0)`; a writable mapping is refused). Read it with `recvmsg` (Python:
+`socket.recv_fds`); a client that reads with a buffered `readline`, or `socat`, loses the descriptor. The picture's
+row `y` starts at byte `offset + y * stride` of the mapping; each pixel is 4 bytes in `format`: `x8r8g8b8` is B, G,
+R and an unused byte in memory (the usual order), `b8g8r8x8` the unused byte, R, G, B (a guest that selected the
+big-endian order). The mapping follows the guest: it is the memory the guest draws into, so it changes as the guest
+draws and stays valid if the guest moves the framebuffer's PCI address. When the mode changes (see
+[`display_changed`](#the-display_changed-notification)) ask again for the new geometry; the descriptor stays the
+same object. In a batch, the descriptors of its `framebuffer` answers come with the batch's line, in the order of
+the answers; a `framebuffer` notification sends none. Errors: -32001 and -32004 as for `snapshot`.
 
 ## Input events
 
@@ -235,6 +276,21 @@ natemu waits at most 1 second for the notification to be written; a client that 
 client that closed its sending side gets the answers to what it sent and then the connection closes, so it never
 gets `stopped`.
 
+## The `display_changed` notification
+
+With a display, every connected client is told when the guest's mode changes (a mode set, a page flip that moves the
+offset, the display turned off):
+
+```json
+{"jsonrpc":"2.0","method":"display_changed","params":{"enabled":true,"width":640,"height":480,"stride":3200,"offset":51220,"format":"x8r8g8b8"}}
+{"jsonrpc":"2.0","method":"display_changed","params":{"enabled":false,"width":0,"height":0,"stride":0,"offset":0}}
+```
+
+At most one is sent every 50 ms: changes within that time after one are announced together at its end, with the
+mode as it is then, so the last notification always gives the current state. A guest that flips pages quickly
+therefore costs a client at most 20 lines a second. Only changes after a client connected are announced; ask
+`query_status` for the state when you connect.
+
 ## Errors
 
 | Code | Meaning |
@@ -243,21 +299,24 @@ gets `stopped`.
 | -32600 | Invalid request: not a request object, `jsonrpc` not `"2.0"`, `method` not a string, `params` neither object nor array, an id that is not a number, string or null, an unknown member, an empty batch |
 | -32601 | Method not found |
 | -32602 | Invalid params: wrong or missing parameters, an unknown event type or key name, a motion beyond 65535; `data` says what |
-| -32001 | The device the request needs is absent: `data` is `{"device": "ps2"}` or `{"device": "power_button"}` |
+| -32001 | The device the request needs is absent: `data` is `{"device": "ps2"}`, `{"device": "power_button"}` or `{"device": "display"}` |
 | -32002 | The run is stopping: the request was not carried out |
 | -32003 | The guest took no input for 5 seconds; the events not yet delivered were dropped |
+| -32004 | The display shows no picture: the guest has not turned it on (`snapshot`, `framebuffer`) |
+| -32005 | The picture is larger than a snapshot takes (2560 x 1600); `data` names the sizes |
 
 An error's `message` is a short English phrase; programs should look at `code`.
 
 ## Limits
 
 - 8 connections at once; a ninth is closed at once.
-- A line a client sends is at most 1 MiB. That is a protocol bound; natemu's lines have none.
+- A line a client sends is at most 1 MiB. That is a protocol bound on requests only; natemu's lines have none (a
+  `snapshot` of 2560 x 1600 can be over 16 MiB of base64).
 - natemu never waits for a slow client. Responses wait in a queue for each client; a client that lets more than 1 MiB
   pile up, or whose socket takes nothing for 1 second, is disconnected (and what it held is let go). The run goes on.
-  A single answer counts too: a batch whose answer array is over 1 MiB disconnects the client without an answer.
-  This 1 MiB is natemu's queueing policy today, not a protocol bound: a method with large answers may raise it.
-  A client that sends many requests without reading the answers should read them as it goes.
+  One answer larger than 1 MiB (a snapshot, or a large batch) is queued when nothing else waits for the client, so
+  a client that reads its answers gets it whole; anything queued behind it then counts against the 1 MiB. A client
+  that sends many requests without reading the answers should read them as it goes.
 - A `pointer_motion`'s `dx` and `dy` and a `scroll`'s `dy` are at most 65535 in size.
 
 ## Stability
@@ -265,7 +324,7 @@ An error's `message` is a short English phrase; programs should look at `code`.
 This is protocol 1, reported by `query_status`. Names on the wire do not change: renaming a method, a field, an event
 type or a key name would be a new protocol version. New methods, new event types, new key names, new members in a
 result and new notifications may be added within protocol 1, so a client should ignore members and notifications it
-does not know. A display adds methods for screen snapshots this way.
+does not know. The display's methods, error codes and notification were added this way.
 
 ## Examples
 

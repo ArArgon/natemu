@@ -26,6 +26,10 @@ zerocopy = { version = "=0.8.63", default-features = false }
 # The host crate alone: the decode of the instructions the resident executes (crates/host/src/system.rs). The decoder and
 # its per-instruction CPUID features (`instr_info`) only; Intel decoder behaviour (no `DecoderOptions::AMD`).
 iced-x86 = { version = "=1.22.0", default-features = false, features = ["std", "decoder", "instr_info"] }
+# The host crate alone: the display's snapshots (crates/host/src/display), PNG-encoded by image-rs's encoder and sent
+# base64 in the control API's JSON answer.
+png = "=0.18.1"
+base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 
 [profile.release]
 panic = "abort"

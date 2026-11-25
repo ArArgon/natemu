@@ -4,12 +4,18 @@
     vm.call('query_status')             # the result, or raises RpcError with the error's code
     vm.notify('quit')                   # no answer is ever sent
     vm.wait_stopped()                   # the `stopped` notification's reason, then the connection ends
+    vm.snapshot()                       # (width, height, PNG bytes)
+    fb, fd = vm.framebuffer()           # the mode and the framebuffer's descriptor (map it read-only)
 
-Lines that are not the answer being waited for (notifications, a batch's array) are kept in `notifications`; `stopped`
-is the only notification natemu sends today. Standard library only.
+Lines that are not the answer being waited for (notifications such as `stopped` and `display_changed`, a batch's
+array) are kept in `notifications`. Every read is a `recvmsg` (socket.recv_fds), so a descriptor natemu passes with
+an answer (`framebuffer`'s, as SCM_RIGHTS) is kept: the descriptors received while a call waits for its answer are
+that answer's. Standard library only.
 """
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
+import base64
 import json
+import os
 import socket
 import time
 
@@ -28,9 +34,12 @@ class Closed(ConnectionError):
 
 
 class Control:
+    MAX_FDS = 16                        # descriptors taken per recvmsg (a batch of framebuffer calls has one each)
+
     def __init__(self, sock: socket.socket):
         self.sock = sock
-        self.lines = sock.makefile('r', encoding='utf-8', newline='\n')
+        self.buffer = b''
+        self.fds = []                   # descriptors received and not yet given to an answer
         self.next_id = 0
         self.notifications = []         # every message that was not an awaited answer, in arrival order
 
@@ -53,19 +62,33 @@ class Control:
         """Disconnects: natemu lets go of every key and button this client held."""
         try: self.sock.shutdown(socket.SHUT_RDWR)
         except OSError: pass
-        self.lines.close()
         self.sock.close()
+        for fd in self.fds: os.close(fd)
+        self.fds = []
 
     def _send(self, message: dict):
         self.sock.sendall((json.dumps(message, separators=(',', ':')) + '\n').encode())
 
+    def _line(self) -> bytes:
+        """The next line natemu sent (without its newline), reading with recvmsg; raises Closed at the end."""
+        while b'\n' not in self.buffer:
+            data, fds, _, _ = socket.recv_fds(self.sock, 1 << 20, self.MAX_FDS)
+            self.fds += fds
+            if not data: raise Closed('natemu closed the control connection')
+            self.buffer += data
+        line, _, self.buffer = self.buffer.partition(b'\n')
+        return line
+
     def read(self):
         """The next message natemu sent (a dict, or a list for a batch's answer); raises Closed at the end."""
-        line = ''
-        while not line.strip():
-            line = self.lines.readline()
-            if not line: raise Closed('natemu closed the control connection')
+        line = b''
+        while not line.strip(): line = self._line()
         return json.loads(line)
+
+    def take_fds(self) -> list:
+        """The descriptors received so far and not yet taken (the caller closes them)."""
+        fds, self.fds = self.fds, []
+        return fds
 
     def call(self, method: str, params=None, timeout: float | None = None):
         """Sends a request and returns its result; raises RpcError for an error answer, Closed if none comes, and
@@ -113,6 +136,27 @@ class Control:
 
     def send_input(self, events: list, timeout: float | None = None):
         return self.call('send_input', {'events': events}, timeout)
+
+    def snapshot(self, timeout: float | None = None) -> tuple:
+        """The guest's picture: (width, height, the PNG file's bytes)."""
+        r = self.call('snapshot', {'format': 'png'}, timeout)
+        return r['width'], r['height'], base64.b64decode(r['png'], validate=True)
+
+    def framebuffer(self, timeout: float | None = None) -> tuple:
+        """The mode (width, height, stride, offset, format, size) and the framebuffer's descriptor, which the caller
+        maps read-only (mmap.mmap(fd, size, prot=mmap.PROT_READ)) and closes. Descriptors left over from earlier
+        answers are closed first, so the one returned came with this answer."""
+        for fd in self.take_fds(): os.close(fd)
+        r = self.call('framebuffer', None, timeout)
+        fds = self.take_fds()
+        if len(fds) != 1:
+            for fd in fds: os.close(fd)
+            raise RuntimeError(f'framebuffer: {len(fds)} descriptors came with the answer, expected 1')
+        return r, fds[0]
+
+    def display_changes(self) -> list:
+        """The `display_changed` notifications' params received so far, in order."""
+        return [m.get('params') for m in self.notifications if isinstance(m, dict) and m.get('method') == 'display_changed']
 
 
 def key(code: str, pressed: bool) -> dict:

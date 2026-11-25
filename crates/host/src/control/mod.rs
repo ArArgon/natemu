@@ -14,18 +14,27 @@
 //! as idle. [`Server::stopped`] queues the `stopped` notification for every client, waits for the writers at most
 //! [`SEND_TIMEOUT`], shuts every connection down and joins every thread; dropping the server does the same without the
 //! notification and removes the socket.
+//!
+//! **Display.** With a display ([`Target::display`]), `snapshot` answers the picture as a base64 PNG and `framebuffer`
+//! the mode with the framebuffer's read-only descriptor, sent as `SCM_RIGHTS` on the answer's first `sendmsg`. One
+//! thread (`control-display`) follows the display's change counter and sends every client `display_changed`, at most
+//! once per [`DISPLAY_CHANGED_EVERY`]: a change within that time after one sent is sent at its end, with the state
+//! then (so the last state is always sent, and a guest flipping its mode quickly costs a client one line per window).
+//! A snapshot's answer can exceed [`OUTPUT_CAP`]: a line is queued over the cap when nothing else waits for the client
+//! (a client that does not read is still dropped by the next line, or by the send timeout).
 pub mod protocol;
 pub mod ps2;
 
 use crate::irq::{Busy, Irqs};
 use crate::linux::Canceller;
+use crate::display::{Display, Mode, SnapshotError};
 use crate::ps2::Ps2Input;
 use protocol::{Call, Error, ErrorCode, Incoming, InputEvent, Request, Response, StopReason};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -45,6 +54,8 @@ pub const OUTPUT_CAP: usize = 1 << 20;
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(1);
 /// The largest |dx| and |dy| of a `pointer_motion` and |dy| of a `scroll`: beyond it, -32602.
 pub const MAX_MOTION: u32 = 65535;
+/// The least time between two `display_changed` notifications.
+pub const DISPLAY_CHANGED_EVERY: Duration = Duration::from_millis(50);
 
 /// What `query_status` reports besides the devices and the state.
 pub struct StatusSource {
@@ -65,6 +76,8 @@ pub struct Target {
     pub status: StatusSource,
     /// The busy guard's source.
     pub irqs: Irqs,
+    /// The display (`None`: `snapshot` and `framebuffer` are -32001).
+    pub display: Option<Arc<Display>>,
 }
 
 /// What the client threads share.
@@ -73,8 +86,15 @@ struct Shared {
     power_button: Option<crate::pm::PowerButton>,
     cancel: Canceller,
     status: StatusSource,
+    display: Option<Arc<Display>>,
     /// `quit` was asked or the run ended.
     stopping: AtomicBool,
+}
+
+/// What a call answers: its result, and the descriptors that go with the answer's line.
+struct Answer {
+    outcome: Result<Value, Error>,
+    fds: Vec<OwnedFd>,
 }
 
 /// A listening control socket ([`serve`]).
@@ -92,6 +112,8 @@ pub struct Server {
 
 struct Running {
     listener: JoinHandle<()>,
+    /// The `display_changed` thread, with a display.
+    watcher: Option<JoinHandle<()>>,
     _busy: Busy,
 }
 
@@ -133,6 +155,7 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
         power_button: target.power_button,
         cancel: target.cancel,
         status: target.status,
+        display: target.display,
         stopping: AtomicBool::new(false),
     });
     let clients = Arc::new(Mutex::new(Vec::new()));
@@ -147,13 +170,32 @@ pub fn serve(path: &Path, target: Target) -> crate::Result<Server> {
             return Err(fail(e.to_string()));
         }
     };
+    let watcher = match shared.display.clone() {
+        None => None,
+        Some(display) => {
+            let (s, c) = (shared.clone(), clients.clone());
+            let started = std::thread::Builder::new()
+                .name("control-display".into())
+                .spawn(move || watch_display(&display, &s, &c));
+            match started {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    shared.stopping.store(true, SeqCst);
+                    let _ = (&bell).write(&[1]);
+                    let _ = listener.join();
+                    let _ = std::fs::remove_file(path);
+                    return Err(fail(e.to_string()));
+                }
+            }
+        }
+    };
     Ok(Server {
         path: path.to_owned(),
         file: (meta.dev(), meta.ino()),
         shared,
         bell,
         clients,
-        running: Mutex::new(Some(Running { listener, _busy: target.irqs.busy() })),
+        running: Mutex::new(Some(Running { listener, watcher, _busy: target.irqs.busy() })),
     })
 }
 
@@ -274,6 +316,53 @@ fn listen(listener: UnixListener, bell: UnixStream, shared: Arc<Shared>, clients
     }
 }
 
+/// The `control-display` thread: each change of the display's published mode is sent to every client as
+/// `display_changed`, at most once per [`DISPLAY_CHANGED_EVERY`] (module documentation), until the server stops.
+fn watch_display(display: &Display, shared: &Shared, clients: &Mutex<Vec<Slot>>) {
+    let mut seen = display.changes();
+    let poll = Duration::from_millis(100);
+    while !shared.stopping.load(SeqCst) {
+        let now = display.wait_change(seen, poll);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        let line = protocol::notification("display_changed", display_changed(display.mode()));
+        let live: Vec<Arc<Client>> = lock(clients).iter().filter_map(|s| s.client.upgrade()).collect();
+        for c in &live {
+            c.push(line.clone(), Vec::new());
+        }
+        drop(live);
+        // The window: a change meanwhile is sent after it, with the state then.
+        let end = Instant::now() + DISPLAY_CHANGED_EVERY;
+        while !shared.stopping.load(SeqCst) && Instant::now() < end {
+            std::thread::sleep((end - Instant::now()).min(Duration::from_millis(10)));
+        }
+    }
+}
+
+/// `display_changed`'s parameters for the published mode `mode`.
+fn display_changed(mode: Option<Mode>) -> Value {
+    match mode {
+        Some(m) => json!({
+            "enabled": true, "width": m.width, "height": m.height, "stride": m.stride, "offset": m.offset,
+            "format": format(&m),
+        }),
+        None => json!({"enabled": false, "width": 0, "height": 0, "stride": 0, "offset": 0}),
+    }
+}
+
+/// A mode's pixel format, named as pixman and QEMU name it (the 32-bit value's channels from the top, little-endian):
+/// `x8r8g8b8` is B, G, R, X in memory, `b8g8r8x8` (the big-endian byte order) X, R, G, B.
+fn format(m: &Mode) -> &'static str {
+    if m.big_endian { "b8g8r8x8" } else { "x8r8g8b8" }
+}
+
+/// A mode as `query_status` and `framebuffer` report it.
+fn mode_json(m: &Mode) -> Value {
+    json!({"width": m.width, "height": m.height, "stride": m.stride, "offset": m.offset, "format": format(m)})
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -281,8 +370,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// What a connection's writer holds.
 #[derive(Default)]
 struct Out {
-    /// Lines (with their newline) not yet written.
-    queue: VecDeque<Vec<u8>>,
+    /// Lines (with their newline) not yet written, each with the descriptors sent with its first bytes.
+    queue: VecDeque<(Vec<u8>, Vec<OwnedFd>)>,
     /// Their bytes, and the line being written.
     bytes: usize,
     /// Close once the queue is written (an over-long line's -32700).
@@ -356,7 +445,7 @@ impl Client {
             if buf.len() > MAX_LINE && !buf[..=MAX_LINE].contains(&b'\n') {
                 let error = Error::new(ErrorCode::ParseError)
                     .with_data(json!(format!("a line is at most {MAX_LINE} bytes")));
-                self.push(Response { id: Value::Null, outcome: Err(error) }.to_line());
+                self.push(Response { id: Value::Null, outcome: Err(error) }.to_line(), Vec::new());
                 self.close_after_flush();
                 break;
             }
@@ -377,41 +466,48 @@ impl Client {
     fn line(&self, line: &[u8], shared: &Shared) {
         let Ok(text) = std::str::from_utf8(line) else {
             let error = Error::new(ErrorCode::ParseError).with_data(json!("a line is UTF-8"));
-            self.push(Response { id: Value::Null, outcome: Err(error) }.to_line());
+            self.push(Response { id: Value::Null, outcome: Err(error) }.to_line(), Vec::new());
             return;
         };
         if text.trim().is_empty() {
             return; // a blank line is nothing
         }
-        let answer = |r: Result<Request, protocol::Rejected>| match r {
+        // A notification's descriptors are dropped with its answer.
+        let mut fds = Vec::new();
+        let mut answer = |r: Result<Request, protocol::Rejected>| match r {
             Ok(request) => {
-                let outcome = shared.call(self.id, &request.call);
-                request.answer(outcome)
+                let a = shared.call(self.id, &request.call);
+                let response = request.answer(a.outcome);
+                if response.is_some() {
+                    fds.extend(a.fds);
+                }
+                response
             }
             Err(rejected) => rejected.response(),
         };
         match protocol::decode_line(text) {
             Incoming::Single(r) => {
                 if let Some(response) = answer(r) {
-                    self.push(response.to_line());
+                    self.push(response.to_line(), fds);
                 }
             }
             Incoming::Batch(requests) => {
-                let lines: Vec<String> = requests.into_iter().filter_map(answer).map(|r| r.to_line()).collect();
+                let lines: Vec<String> = requests.into_iter().filter_map(&mut answer).map(|r| r.to_line()).collect();
                 if !lines.is_empty() {
-                    self.push(format!("[{}]", lines.join(",")));
+                    self.push(format!("[{}]", lines.join(",")), fds);
                 }
             }
         }
     }
 
-    /// Queues `line` for the writer; over the output cap the client is disconnected instead.
-    fn push(&self, line: String) {
+    /// Queues `line` for the writer, `fds` to go with its first bytes; over the output cap the client is disconnected
+    /// instead, unless nothing else waits for it (one long answer, a snapshot's, is queued alone).
+    fn push(&self, line: String, fds: Vec<OwnedFd>) {
         let mut out = lock(&self.out);
         if out.dead || out.closing {
             return;
         }
-        if out.bytes + line.len() + 1 > OUTPUT_CAP {
+        if out.bytes > 0 && out.bytes + line.len() + 1 > OUTPUT_CAP {
             drop(out);
             self.kill();
             return;
@@ -419,7 +515,7 @@ impl Client {
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
         out.bytes += bytes.len();
-        out.queue.push_back(bytes);
+        out.queue.push_back((bytes, fds));
         self.changed.notify_all();
     }
 
@@ -479,7 +575,10 @@ impl Client {
                     out = self.changed.wait(out).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            if stream.write_all(&line).is_err() {
+            let (line, fds) = line;
+            let sent = if fds.is_empty() { Ok(0) } else { send_fds(&self.stream, &line, &fds) };
+            drop(fds); // sent (the peer holds its own) or not: this process's copies close
+            if sent.and_then(|n| stream.write_all(&line[n..])).is_err() {
                 self.kill();
                 return;
             }
@@ -492,10 +591,86 @@ impl Client {
     }
 }
 
+/// Sends the first bytes of `line` with `fds` as one `SCM_RIGHTS` message (one `sendmsg`, under the socket's send
+/// timeout); how many bytes went, at least one.
+fn send_fds(stream: &UnixStream, line: &[u8], fds: &[OwnedFd]) -> std::io::Result<usize> {
+    let raw: Vec<libc::c_int> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let data = std::mem::size_of_val(&raw[..]) as libc::c_uint;
+    let space = unsafe { libc::CMSG_SPACE(data) } as usize;
+    // u64 words: the control buffer aligned for cmsghdr.
+    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as libc::socklen_t;
+    // SAFETY: the control buffer holds one header and `raw`'s descriptors (CMSG_SPACE of their size); `iov` and
+    // `control` outlive the call.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(data) as libc::socklen_t;
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), raw.len());
+    }
+    loop {
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
+        if n > 0 {
+            return Ok(n as usize);
+        }
+        let e = std::io::Error::last_os_error();
+        if n < 0 && e.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(if n == 0 { ErrorKind::WriteZero.into() } else { e });
+    }
+}
+
 impl Shared {
-    /// Carries out one call for `client`.
-    fn call(&self, client: ps2::ClientId, call: &Call) -> Result<Value, Error> {
+    /// Carries out one call for `client`, with the descriptors its answer carries.
+    fn call(&self, client: ps2::ClientId, call: &Call) -> Answer {
         match call {
+            Call::Framebuffer => match self.framebuffer() {
+                Ok((value, fd)) => Answer { outcome: Ok(value), fds: vec![fd] },
+                Err(e) => Answer { outcome: Err(e), fds: Vec::new() },
+            },
+            call => Answer { outcome: self.call_plain(client, call), fds: Vec::new() },
+        }
+    }
+
+    /// `framebuffer`: the mode and a descriptor of the framebuffer (a duplicate of its read-only one).
+    fn framebuffer(&self) -> Result<(Value, OwnedFd), Error> {
+        let display = self.display.as_ref().ok_or_else(|| Error::no_device("display"))?;
+        let (mode, fd) = display.framebuffer().ok_or_else(|| Error::new(ErrorCode::DisplayNotEnabled))?;
+        let fd = fd.try_clone_to_owned().map_err(|e| {
+            Error::new(ErrorCode::NoDevice).with_data(json!({"device": "display", "error": e.to_string()}))
+        })?;
+        let mut value = mode_json(&mode);
+        value["size"] = json!(display.vram().len());
+        Ok((value, fd))
+    }
+
+    /// `snapshot`: the picture as a base64 PNG.
+    fn snapshot(&self) -> Result<Value, Error> {
+        use base64::Engine;
+        let display = self.display.as_ref().ok_or_else(|| Error::no_device("display"))?;
+        let frame = display.snapshot().map_err(|e| match e {
+            SnapshotError::NotEnabled => Error::new(ErrorCode::DisplayNotEnabled),
+            SnapshotError::TooLarge { width, height } => Error::new(ErrorCode::SnapshotTooLarge).with_data(json!({
+                "width": width, "height": height,
+                "max_width": crate::display::SNAPSHOT_MAX.0, "max_height": crate::display::SNAPSHOT_MAX.1,
+            })),
+        })?;
+        let png = base64::engine::general_purpose::STANDARD.encode(frame.png());
+        Ok(json!({"width": frame.width, "height": frame.height, "png": png}))
+    }
+
+    /// The calls whose answers carry no descriptor.
+    fn call_plain(&self, client: ps2::ClientId, call: &Call) -> Result<Value, Error> {
+        match call {
+            Call::Framebuffer => unreachable!("answered by call"),
+            Call::Snapshot(_) => self.snapshot(),
             Call::SendInput(p) => {
                 check_motion(&p.events)?;
                 let input = self.input.as_ref().ok_or_else(|| Error::no_device("ps2"))?;
@@ -520,13 +695,19 @@ impl Shared {
             }
             Call::QueryStatus => {
                 let stopping = self.stopping.load(SeqCst) || self.cancel.cancelled();
-                Ok(json!({
+                let mut status = json!({
                     "protocol": protocol::PROTOCOL,
                     "state": if stopping { "stopping" } else { "running" },
                     "vcpus": self.status.vcpus,
                     "uptime_ms": self.status.started.elapsed().as_millis() as u64,
                     "devices": { "ps2": self.input.is_some() },
-                }))
+                });
+                // With a display: its mode, null while none is published. Without one the member is absent, so a VM
+                // without a display answers as before the display existed.
+                if let Some(d) = &self.display {
+                    status["devices"]["display"] = d.mode().map_or(Value::Null, |m| mode_json(&m));
+                }
+                Ok(status)
             }
         }
     }
@@ -556,11 +737,15 @@ impl Server {
     }
 
     fn close(&self, reason: Option<StopReason>) {
-        let Some(Running { listener, _busy: busy }) = lock(&self.running).take() else { return };
+        let Some(Running { listener, watcher, _busy: busy }) = lock(&self.running).take() else { return };
         self.shared.stopping.store(true, SeqCst);
         // No new connection; the listener's socket closes with its thread.
         let _ = (&self.bell).write(&[1]);
         let _ = listener.join();
+        // No more display_changed (the thread sees `stopping` within its poll).
+        if let Some(w) = watcher {
+            let _ = w.join();
+        }
         let slots = std::mem::take(&mut *lock(&self.clients));
         // Pending input fails with -32002, so every reader can answer and move on.
         if let Some(input) = &self.shared.input {
@@ -570,7 +755,7 @@ impl Server {
         if let Some(reason) = reason {
             let line = protocol::stopped(reason);
             for c in &live {
-                c.push(line.clone());
+                c.push(line.clone(), Vec::new());
             }
             let deadline = Instant::now() + SEND_TIMEOUT;
             for c in &live {

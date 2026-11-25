@@ -16,6 +16,30 @@ pub enum Call {
     PowerButton,
     Quit,
     QueryStatus,
+    /// `snapshot`: the picture, in the format asked for (PNG, the only one).
+    Snapshot(Snapshot),
+    /// `framebuffer`: the mode and the framebuffer's descriptor.
+    Framebuffer,
+}
+
+/// `snapshot`'s parameters: `format`, `"png"` (the default, and the only one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    #[serde(default = "Snapshot::png")]
+    pub format: SnapshotFormat,
+}
+impl Snapshot {
+    fn png() -> SnapshotFormat {
+        SnapshotFormat::Png
+    }
+}
+
+/// A snapshot's encoding (wire `"png"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotFormat {
+    Png,
 }
 
 /// `send_input`'s parameters: the events, applied in order.
@@ -90,6 +114,10 @@ pub enum ErrorCode {
     Stopping,
     /// The guest stopped taking input; the events not yet delivered were discarded.
     InputStalled,
+    /// The display shows no picture: the guest has not enabled it.
+    DisplayNotEnabled,
+    /// The picture is larger than a snapshot takes.
+    SnapshotTooLarge,
 }
 
 impl ErrorCode {
@@ -102,6 +130,8 @@ impl ErrorCode {
             ErrorCode::NoDevice => -32001,
             ErrorCode::Stopping => -32002,
             ErrorCode::InputStalled => -32003,
+            ErrorCode::DisplayNotEnabled => -32004,
+            ErrorCode::SnapshotTooLarge => -32005,
         }
     }
     fn message(self) -> &'static str {
@@ -113,6 +143,8 @@ impl ErrorCode {
             ErrorCode::NoDevice => "Device absent",
             ErrorCode::Stopping => "The run is stopping",
             ErrorCode::InputStalled => "The guest stopped taking input",
+            ErrorCode::DisplayNotEnabled => "Display not enabled",
+            ErrorCode::SnapshotTooLarge => "The picture is too large for a snapshot",
         }
     }
 }
@@ -238,6 +270,16 @@ impl Request {
             "power_button" => none(Call::PowerButton)?,
             "quit" => none(Call::Quit)?,
             "query_status" => none(Call::QueryStatus)?,
+            "snapshot" => match params.clone() {
+                None => Call::Snapshot(Snapshot { format: SnapshotFormat::Png }),
+                Some(Value::Array(a)) if a.is_empty() => Call::Snapshot(Snapshot { format: SnapshotFormat::Png }),
+                Some(p @ Value::Object(_)) => match serde_json::from_value::<Snapshot>(p) {
+                    Ok(p) => Call::Snapshot(p),
+                    Err(e) => return Err(bad_params(e.to_string())),
+                },
+                _ => return Err(bad_params("snapshot takes params {\"format\": \"png\"}".into())),
+            },
+            "framebuffer" => none(Call::Framebuffer)?,
             _ => return Err(Rejected::new(id, ErrorCode::MethodNotFound)),
         };
         Ok(Request { id, call })
@@ -308,6 +350,11 @@ pub fn stopped(reason: StopReason) -> String {
         .expect("a notification serializes")
 }
 
+/// A notification (`method`, `params`) as one compact JSON line, without the newline.
+pub fn notification(method: &str, params: Value) -> String {
+    serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +393,21 @@ mod tests {
         for (m, call) in [("power_button", Call::PowerButton), ("quit", Call::Quit), ("query_status", Call::QueryStatus)] {
             assert_eq!(request(&format!(r#"{{"jsonrpc":"2.0","id":2,"method":"{m}"}}"#)).unwrap().call, call);
         }
+        // The display's methods: snapshot's format defaults to png and is the only one; framebuffer takes nothing.
+        let png = Call::Snapshot(Snapshot { format: SnapshotFormat::Png });
+        for params in ["", r#","params":{}"#, r#","params":[]"#, r#","params":{"format":"png"}"#] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":4,"method":"snapshot"{params}}}"#);
+            assert_eq!(request(&line).unwrap().call, png, "{line}");
+        }
+        for params in [r#"{"format":"jpeg"}"#, r#"{"format":"png","scale":2}"#, r#"["png"]"#] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":4,"method":"snapshot","params":{params}}}"#);
+            assert_eq!(request(&line).unwrap_err().error.code, ErrorCode::InvalidParams, "{line}");
+        }
+        assert_eq!(request(r#"{"jsonrpc":"2.0","id":5,"method":"framebuffer"}"#).unwrap().call, Call::Framebuffer);
+        assert_eq!(
+            notification("display_changed", serde_json::json!({"enabled": false})),
+            r#"{"jsonrpc":"2.0","method":"display_changed","params":{"enabled":false}}"#
+        );
         assert_eq!(
             stopped(StopReason::PowerOff),
             r#"{"jsonrpc":"2.0","method":"stopped","params":{"reason":"power_off"}}"#
@@ -432,8 +494,15 @@ mod tests {
         }
         // natemu's codes.
         assert_eq!(
-            [ErrorCode::NoDevice, ErrorCode::Stopping, ErrorCode::InputStalled].map(ErrorCode::code),
-            [-32001, -32002, -32003]
+            [
+                ErrorCode::NoDevice,
+                ErrorCode::Stopping,
+                ErrorCode::InputStalled,
+                ErrorCode::DisplayNotEnabled,
+                ErrorCode::SnapshotTooLarge
+            ]
+            .map(ErrorCode::code),
+            [-32001, -32002, -32003, -32004, -32005]
         );
         assert_eq!(
             Response { id: json!(9), outcome: Err(Error::no_device("ps2")) }.to_line(),

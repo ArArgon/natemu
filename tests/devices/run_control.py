@@ -549,16 +549,17 @@ def socket_folder(work: Path) -> tuple[Path, bool]:
     return folder, True
 
 
-def boot(args, name: str, work: Path) -> Run:
-    """One VM for case `name`, its driver on a thread; stopped at VM_SECONDS, or 20 s after the driver ended."""
-    case = CASES[name]
+def boot(args, name: str, work: Path, cases=None, cpio='control.cpio', key='control_case', driver=None) -> Run:
+    """One VM for case `name`, its driver on a thread; stopped at VM_SECONDS, or 20 s after the driver ended. Another
+    runner of this family (run_display.py) passes its own cases, initramfs, command-line key and Driver."""
+    case = (cases or CASES)[name]
     folder, made = socket_folder(work)
     sock = folder / 'c.sock'
     serial = work / 'serial.log'
     command = [str(args.natemu.resolve()), '--runtime', str(args.runtime.resolve()), '--fexc', str(args.fexc.resolve()),
-               '--kernel', str((args.inputs / 'linux').resolve()), '--initrd', str((args.inputs / 'control.cpio').resolve()),
+               '--kernel', str((args.inputs / 'linux').resolve()), '--initrd', str((args.inputs / cpio).resolve()),
                '--vcpus', str(args.vcpus), '--ram', '2G', '--compile-cache', 'off', '--serial', str(serial.resolve()),
-               '--cmdline', ' '.join([CMDLINE, *case.words, f'control_case={name}']), '--set', f'control.socket={sock}']
+               '--cmdline', ' '.join([CMDLINE, *getattr(case, 'words', ()), f'{key}={name}']), '--set', f'control.socket={sock}']
     for setting in args.set: command += ['--set', setting]
     write_json(work / 'command.json', command)
     env = {k: v for k, v in os.environ.items() if k not in ('NATEMU_PERF_LOG', 'NATEMU_COMPILE_CACHE')}   # settings the CLI reads (deprecated)
@@ -566,10 +567,11 @@ def boot(args, name: str, work: Path) -> Run:
     try:
         with (work / 'stdout.log').open('wb') as stdout, (work / 'stderr.log').open('wb') as stderr:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
-            driver = Driver(sock, serial, process)
+            driver = (driver or Driver)(sock, serial, process)
+            drive_case = case.drive if callable(case.drive) else globals()[case.drive]
 
             def drive():
-                try: globals()[case.drive](driver)
+                try: drive_case(driver)
                 except Exception as e: driver.control['error'] = f'{type(e).__name__}: {e}'
             thread = threading.Thread(target=drive, daemon=True)
             thread.start()
@@ -596,7 +598,11 @@ def boot(args, name: str, work: Path) -> Run:
                (work / 'stderr.log').read_text(errors='replace'), process.returncode, timeout, control)
 
 
-def prepare(args):
+def prepare(args, init=INIT, modules=MODULES, applets=APPLETS, cpio='control.cpio', files=None,
+            purpose="natemu's control socket observed by stock Linux evdev, psmouse and button (tests/devices)"):
+    """The initramfs: BusyBox with `applets`, `modules` and what they need, `init`, and `files` (path in the root ->
+    an executable to copy there; run_display.py's kms_pattern)."""
+    files = files or {}
     args.out.mkdir(parents=True, exist_ok=False)
     assert digest(args.kernel) == KERNEL_SHA, 'not the pinned Debian kernel'
     assert digest(args.kernel_deb) == KERNEL_DEB_SHA, 'not the pinned Debian kernel package'
@@ -605,40 +611,47 @@ def prepare(args):
     for name in ('bin', 'dev', 'proc', 'sys', 'tmp', 'lib/modules/' + KVER):
         (root / name).mkdir(parents=True, exist_ok=True)
     busybox = busybox_from(args.busybox_deb)
-    assert not set(APPLETS) - set(busybox_applets(busybox)), f'BusyBox lacks one of {APPLETS}'
+    assert not set(applets) - set(busybox_applets(busybox)), f'BusyBox lacks one of {applets}'
     (root / 'bin/busybox').write_bytes(busybox)
     (root / 'bin/busybox').chmod(0o755)
-    for applet in APPLETS: (root / 'bin' / applet).symlink_to('busybox')
-    modules = module_closure(args.kernel_deb, MODULES)
+    for applet in applets: (root / 'bin' / applet).symlink_to('busybox')
+    for rel, src in files.items():
+        (root / rel).write_bytes(src.read_bytes())
+        (root / rel).chmod(0o755)
+    modules = module_closure(args.kernel_deb, modules)
     for rel, data, _ in modules.values():
         dest = root / 'lib/modules' / KVER / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
     (root / 'lib/modules' / KVER / 'modules.dep').write_text(modules_dep(modules))
-    (root / 'init').write_text(INIT)
+    (root / 'init').write_text(init)
     (root / 'init').chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
     mkcpio = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mkcpio)
-    mkcpio.main(str(root), str(args.out / 'control.cpio'))
+    mkcpio.main(str(root), str(args.out / cpio))
     platform = Path(__file__).resolve().parent / 'run_platform.py'
-    manifest = {'purpose': "natemu's control socket observed by stock Linux evdev, psmouse and button (tests/devices)",
-                'kernel_version': KVER, 'sources': {p.name: digest(p) for p in (args.kernel, args.kernel_deb, args.busybox_deb)},
-                'producer': {str(p.relative_to(ROOT)): digest(p) for p in (Path(__file__).resolve(), platform, ROOT / 'tools/play/mkcpio.py')},
+    producer = Path(sys.modules['__main__'].__file__).resolve()
+    manifest = {'purpose': purpose,
+                'kernel_version': KVER, 'sources': {p.name: digest(p) for p in (args.kernel, args.kernel_deb, args.busybox_deb, *files.values())},
+                'producer': {str(p.relative_to(ROOT)): digest(p) for p in sorted({producer, Path(__file__).resolve(), platform, ROOT / 'tools/play/mkcpio.py'})},
                 'modules': {n: {'path': rel, 'sha256': digest(root / 'lib/modules' / KVER / rel), 'depends': deps}
                             for n, (rel, _, deps) in sorted(modules.items())},
                 'outputs': {str(p.relative_to(args.out)): digest(p)
-                            for p in (args.out / 'linux', args.out / 'control.cpio', root / 'init', root / 'bin/busybox')}}
+                            for p in (args.out / 'linux', args.out / cpio, root / 'init', root / 'bin/busybox', *(root / r for r in files))}}
     write_json(args.out / 'inputs.json', manifest)
     print(json.dumps(manifest, indent=2))
 
 
-def run(args):
+def run(args, cases=None, boot=boot, libs=()):
+    """One case's VM, judged; results.json in --out. run_display.py passes its cases, boot and extra libraries."""
+    cases = cases or CASES
     args.out.mkdir(parents=True, exist_ok=False)
     manifest = json.loads((args.inputs / 'inputs.json').read_text())
     for name, sha in manifest['outputs'].items(): assert digest(args.inputs / name) == sha, name
-    client = Path(control_client.__file__).resolve()
-    write_json(args.out / 'manifest.json', {'artifacts': {str(p.resolve()): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__), client)},
+    client = [Path(m.__file__).resolve() for m in (control_client, *libs)]
+    main = Path(sys.modules['__main__'].__file__).resolve()
+    write_json(args.out / 'manifest.json', {'artifacts': {str(p.resolve()): digest(p) for p in (args.natemu, args.runtime, args.fexc, main, *client)},
                                             'inputs': manifest, 'case': args.case, 'set': args.set, 'vcpus': args.vcpus,
                                             'seconds_per_vm': VM_SECONDS})
     with args.lock.open('a') as lock:
@@ -648,7 +661,7 @@ def run(args):
         t0 = time.monotonic()
         r = boot(args, args.case, work)
         seconds = time.monotonic() - t0
-    errors = CASES[args.case].judge(r)
+    errors = cases[args.case].judge(r)
     result = {'name': work.name, 'ok': not errors, 'errors': errors, 'returncode': r.returncode, 'timeout': r.timeout,
               'seconds': round(seconds, 1), 'control': r.control}
     write_json(work / 'result.json', result)

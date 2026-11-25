@@ -22,12 +22,13 @@ is not VGA): BAR0 the framebuffer, a mapped region (`DeviceMemory`); BAR2 a 4 Ki
 Bochs DISPI registers at 500H and the extended registers at 600H. No legacy VGA (no A0000H window, no 3C0H ports, no
 VGA BIOS): natemu boots kernels directly and the console stays on serial, and Linux's `bochs` driver drives the class
 0380H function through BAR2 alone. The host keeps the current mode (width, height, stride, offset) under the
-function's lock; the control server reads the framebuffer through `DeviceMemory::view()` for snapshots and hands out
-its read-only descriptor for `framebuffer`.
+function's lock; the control server reads the framebuffer through the `DeviceMemory`'s own mapping (aligned word
+loads, `DeviceMemory::read_words`; no second view is needed) for snapshots and hands out its read-only descriptor for
+`framebuffer`.
 
 **Tech stack:** Rust: `crates/host` (new module `display`), `crates/cli`; new crates `png` (image-rs, MIT/Apache-2.0:
 the encoder the owner asked for) and `base64` (MIT/Apache-2.0: the snapshot's JSON encoding). Python for the guest
-cases, with a small PNG reader in `tests/lib` on the standard library's `zlib`.
+cases, which decode snapshots with `pypng` (pure Python, MIT; pinned in `testkit/requirements.lock`).
 
 **Spec:** the Design section; QEMU's `docs/specs/standard-vga.rst` (the DISPI and MMIO register layout, as a
 specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references only, no code adapted (GPL): QEMU's
@@ -81,8 +82,11 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
   `flip_through_invalid_states`: the published mode is valid or absent after every write and correct after the last;
   `x_offset_moves_the_base`).
 - **The framebuffer moves:** Linux may reassign BAR0; a mapped client keeps a valid mapping (the object, not the
-  address, is shared) and snapshots follow the new base (Task 3 case `display` writes after a BAR move done by the
-  mapped-memory case's method; break: none needed beyond mapped memory's own).
+  address, is shared) and snapshots follow the new base, since both read the object, never a guest address (Task 3
+  `framebuffer_passes_the_descriptor`: a guest write is seen through the client's mapping). The guest case does not
+  move BAR0 under the bound driver: bochs-drm keeps the BAR's old address in its mappings, so writes after a sysfs move
+  would go nowhere whatever the device does; the move itself is mapped memory's case (`mapped-bar`), whose region
+  logic the display shares unchanged.
 
 ## Design
 
@@ -112,16 +116,23 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
 ### Host side and the control API
 
 - `Display` (`display/mod.rs`): the function, its `DeviceMemory`, the published mode. `Display::snapshot() ->
-  Result<Frame>` copies the visible area row by row through `view()` into an RGB buffer (dropping X, reordering B, G,
-  R), with the mode read once under the lock; `Display::framebuffer() -> (Mode, BorrowedFd)`.
-- PNG: `png` crate, 8-bit RGB, default compression; at most 2560 x 1600.
-- Control API (by its extension rules): `snapshot {"format":"png"}` -> `{"width","height","png": base64}`; errors
-  -32001 (no display) and -32004 (display not enabled). `framebuffer {}` -> `{"width","height","stride","offset",
-  "format":"x8r8g8b8","size"}` plus the read-only descriptor as `SCM_RIGHTS` (the control plan's rule: the client reads
-  with `recvmsg`). `display_changed` notification `{"width","height","stride","offset","enabled"}` on every published
-  mode change, coalesced to at most one per 50 ms per client. `query_status.devices.display`: `null` or the mode.
-- A snapshot response may exceed the control plan's 1 MiB request-line limit; the limit is on requests only (the
-  control branch's documentation fix).
+  Result<Frame, SnapshotError>` copies the visible area row by row (each row's covering 8-aligned words, sliced to the
+  row, since X_OFFSET x 4 can make a row start 4-aligned; clipped to the framebuffer) into an RGB buffer (dropping X,
+  reordering B, G, R), with the mode read once under the lock; `Display::framebuffer() -> Option<(Mode, BorrowedFd)>`;
+  `Display::wait_change(seen, timeout)` (a condition variable on the change counter) for the notification thread.
+- PNG: `png` crate, 8-bit RGB, default compression (its adaptive filter); at most 2560 x 1600: larger is refused with
+  -32005 (`data`: the size and the limits), never encoded.
+- Control API (by its extension rules): `snapshot {"format":"png"}` (params optional) -> `{"width","height","png":
+  base64}`; errors -32001 (no display, `data {"device":"display"}`), -32004 (display not enabled), -32005 (too large).
+  `framebuffer {}` -> `{"width","height","stride","offset","format","size"}` (`format` `x8r8g8b8`, or `b8g8r8x8` for
+  the big-endian order) plus the read-only descriptor as `SCM_RIGHTS` on the answer's first `sendmsg` (the control
+  plan's rule: the client reads with `recvmsg`; in a batch every `framebuffer` answer's descriptor, in order).
+  `display_changed` notification `{"enabled","width","height","stride","offset"}` (and `format` while enabled; zeros
+  when disabled) on every published mode change, at most one per 50 ms (one server thread sends to every client: a
+  change in the window after one is sent at its end with the state then). `query_status.devices.display`: `null` or
+  the mode, present only with a display (a VM without one answers exactly as before).
+- A snapshot response may exceed 1 MiB: the request-line limit is on requests only, and the output cap admits a line
+  larger than the cap when nothing else is queued for the client (`docs/control-api.md`, Limits).
 - `crates/cli`: `[display] device = "bochs"` (default `"none"`), `vram_mib` (16), `width`, `height` (1024, 768: the
   EDID's preferred mode); refused at configuration time, naming the key, when `vram_mib` is not a power of two from 4
   to 64, when `edid::fits` refuses the preferred mode, or when `vram_mib` cannot hold two preferred frames
@@ -143,7 +154,7 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
 | `crates/host/src/control/*` | `snapshot`, `framebuffer`, `display_changed`, status |
 | `crates/host/src/linux.rs` | the display on the bus; `Prepared::display()` |
 | `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `docs/configuration.md`, `docs/control-api.md` | `[display]`; the methods |
-| `tests/lib/png_read.py` (new), `tests/lib/control_client.py` | a PNG reader (zlib, filters 0-4); `snapshot` and `framebuffer` |
+| `tests/lib/control_client.py`, `testkit/requirements.{in,lock}` | `snapshot` and `framebuffer`; `pypng` for the judges |
 | `tests/devices/run_display.py`, `tests/devices/kms_pattern.c` (new), `testkit/inputs.py`, `tests/devices/family.toml` | the guest cases; the guest's KMS program and its container build |
 | `tests/bench/...` (the bench family the framework uses for guest benchmarks) | `display-fill` |
 | `README.md`, `docs/benchmarks.md` | one sentence that a display exists and how to look at it; the bench row |
@@ -195,30 +206,40 @@ beside `mapped-bar`, in the runner whose initramfs already carries stock modules
 ### Task 3: snapshots and the framebuffer through the control API
 
 **Files:** `crates/host/src/display/mod.rs`, `crates/host/src/control/*`, `docs/control-api.md`,
-`tests/lib/{png_read.py,control_client.py}`, `tests/devices/run_display.py`, `tests/devices/kms_pattern.c` (new),
-`testkit/inputs.py` (the display inputs recipe), `tests/devices/family.toml`.
+`tests/lib/control_client.py`, `testkit/requirements.{in,lock}` (pypng), `tests/devices/run_display.py` (the
+display-specific parts; it reuses `run_control.py`'s boot, prepare and run), `tests/devices/kms_pattern.c` (new),
+`testkit/inputs.py` (the display inputs recipe),
+`tests/devices/kms_pattern.sh` (new), `tests/devices/family.toml`.
 
 The guest draws with `kms_pattern`, a static x86-64 C program of raw DRM ioctls (kernel UAPI headers only, no libdrm),
-built by the display inputs recipe with `gcc -static` in the amd64 Debian container `testkit/inputs.py`'s
-`_in_container` already provides (the declared `container` prerequisite), and put in the case's initramfs. It opens
-`/dev/dri/card0`, creates an 800 x 480 dumb buffer (pitch 3,200), adds a 640 x 480 framebuffer on it with
-`pitches[0]` 3,200 and `offsets[0]` 16 x 3,200, maps it, writes the pattern (each pixel's colour a function of x and y,
-known to the runner), sets the CRTC to the 640 x 480 mode from the connector's list, prints `READY` and sleeps holding
-the mode (fbdev restores its own mode when the program exits). Its `bench` mode instead copies full frames into the
-mapped buffer for a byte count and prints the elapsed time. `/dev/fb0` is not used for checks: DRM's fbdev
+built by `testkit/inputs.py` `kms_pattern()` with `gcc -static` (`tests/devices/kms_pattern.sh`) in the amd64 Debian
+container `_in_container` already provides (the declared `container` prerequisite), on the stress-ng recipe's pinned
+sysroot (`tools/io/stress-ng/packages.txt` and `debs.sha256`: gcc 14, glibc and linux-libc-dev 6.12.107, the guest
+kernel's own UAPI headers), and put in the cases' initramfs (`display_inputs()`, `run_display.py prepare`). Like the
+other devices inputs, it is a component of the input root (`devices-display/display`). It opens `/dev/dri/card0`, creates an 800 x
+496 dumb buffer (pitch 3,200: 480 rows from row 16 must lie inside it, or ADDFB2 refuses the framebuffer), adds a 640
+x 480 framebuffer on it with `pitches[0]` 3,200 and `offsets[0]` 16 x 3,200, maps it, writes the pattern (each pixel's
+colour a function of x and y, known to the runner; the rest of the buffer magenta), sets the CRTC to the 640 x 480 mode
+from the connector's list, prints `READY` and sleeps holding the mode (fbdev restores its own mode when the program
+exits). Its `bench BYTES` mode instead sets the 1024 x 768 mode on a 1024 x 768 buffer, copies full frames into the
+mapped buffer for a byte count, then the same into a guest-RAM buffer, and prints both times. `/dev/fb0` is not used for checks: DRM's fbdev
 emulation draws into a shadow in guest RAM and copies it to VRAM about every 50 ms, and cannot set a pitch or offset.
 
 - [ ] **Step 1: unit tests**: `snapshot_converts_bgrx_to_rgb`, `snapshot_converts_big_endian`, `snapshot_honours_stride_and_offset`,
   `snapshot_while_disabled` (-32004), `png_round_trips` (decode with the `png` crate's decoder in the test),
-  `display_changed_is_coalesced`; `tests/lib` unit tests for `png_read.py` against PNGs the `png` crate wrote (filters
-  0-4, checked in as small fixtures generated by a Rust test, or generated by the case at run time).
+  `display_changed_is_coalesced`, and the server's `display_methods_need_the_display`, `framebuffer_passes_the_descriptor`
+  (the descriptor through `recvmsg`, mapped read-only, a writable map refused), `large_snapshot_is_answered`. The guest
+  cases decode snapshots with `pypng` (no PNG reader of our own).
 - [ ] **Step 2: guest cases**: `display` (1 vCPU, smoke): after the probe the init runs `kms_pattern`; at `READY` the
   runner takes a `framebuffer` (stride 3,200, width 640, height 480, an offset whose X part is nonzero unless the buffer
   happened to land aligned: the judge uses the reported offset), maps it read-only and compares every visible pixel with
   the pattern, takes a `snapshot` and compares the same pixels (`snapshot_matches_guest_pattern`), and checks a
-  `display_changed` arrived for the mode set; `display-boot-console` (the fbcon text console: the init writes a line of
-  text to `/dev/tty1`, waits 200 ms for fbdev's deferred copy, and the snapshot is not uniform);
-  `display-off` (no `[display]`: `snapshot` gives -32001, no 1234:1111 in `lspci -n`).
+  `display_changed` arrived for the mode set; `display-boot-console` (the fbcon text console: the init writes a few lines
+  to `/dev/tty1`, "natemu bochs display", `uname -a` and the mode from /sys, waits 1 s for fbdev's deferred copy, and
+  the 1024 x 768 snapshot shows text: two colours or more, 0.05 % to 25 % of the pixels not the background's);
+  `display-off` (no `[display]`: `snapshot` and `framebuffer` give -32001, no 1234:1111 among /sys/bus/pci/devices'
+  vendor and device files, the same as `lspci -n` gives, and `modprobe bochs` makes no /dev/dri/card0). `display` and
+  `display-boot-console` write their snapshots to `{out}/display.png` and `{out}/boot-console.png`.
 - [ ] **Step 3: run**; FAIL. **Step 4: implement.** **Step 5: run**; PASS. Show `display` fails with B and R swapped
   and with the offset ignored.
 - [ ] **Step 6: commit** `display: PNG snapshots and the framebuffer over the control socket`.

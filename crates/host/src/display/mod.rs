@@ -8,10 +8,19 @@
 //!
 //! A launch describes its display with a [`Spec`] (`[display]`: the framebuffer's size and the EDID's preferred mode),
 //! checked by [`Spec::check`] before anything is built.
+//!
+//! **Pictures.** [`Display::snapshot`] copies the visible picture into an RGB [`Frame`] ([`Frame::png`] encodes it):
+//! the mode is read once under the lock, so a snapshot never mixes two modes' geometry, and every row is read through
+//! aligned word loads clipped to the framebuffer, so a snapshot never reads past it whatever the guest does meanwhile
+//! (a row the guest rewrites during the copy may show part old, part new, as a scan-out would).
+//! [`Display::framebuffer`] hands out the mode with the framebuffer's read-only descriptor, for a client to map.
+//! [`Display::wait_change`] lets the control server follow the change counter without polling.
 use crate::devices::{Access, mask};
 use crate::pci::configuration::PciConfiguration;
 use crate::pci::{BARS, Bar, BarKind, Bars, DeviceMemory, Function};
-use std::sync::{Arc, Mutex};
+use std::os::fd::BorrowedFd;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 pub mod bochs;
 pub mod edid;
@@ -93,6 +102,8 @@ pub struct Display {
     vram: Arc<DeviceMemory>,
     edid: [u8; 128],
     state: Mutex<State>,
+    /// Notified when the change counter moves.
+    changed: Condvar,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -114,6 +125,7 @@ impl Display {
             edid: edid::block(preferred.0, preferred.1),
             vram,
             state: Mutex::new(State::default()),
+            changed: Condvar::new(),
         })
     }
     /// The framebuffer.
@@ -132,6 +144,96 @@ impl Display {
     pub fn published(&self) -> (Option<Mode>, u64) {
         let s = lock(&self.state);
         (s.mode, s.changes)
+    }
+}
+
+/// The largest picture a snapshot takes (`snapshot` refuses a larger one rather than encode it).
+pub const SNAPSHOT_MAX: (u32, u32) = (2560, 1600);
+
+/// Why there is no snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// No mode is published: the guest has not enabled the display (or is changing its mode).
+    NotEnabled,
+    /// The picture is larger than [`SNAPSHOT_MAX`].
+    TooLarge { width: u32, height: u32 },
+}
+
+/// A picture: `width` x `height` pixels, 3 bytes each (R, G, B), row after row from the top.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgb: Vec<u8>,
+}
+
+impl Frame {
+    /// The picture as a PNG: 8-bit RGB, default compression (the `png` crate's encoder).
+    pub fn png(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        // Writing to a Vec fails only on a size the frame cannot have (its buffer holds exactly width x height pixels).
+        let mut writer = encoder.write_header().expect("a PNG header for the frame's size");
+        writer.write_image_data(&self.rgb).expect("the frame's pixels");
+        writer.finish().expect("the PNG's end");
+        out
+    }
+}
+
+/// The picture `mode` shows in a framebuffer of `len` bytes that `read(offset, words)` reads (8-aligned word loads):
+/// each row's covering aligned words, sliced to the row; a row, or part of one, past the framebuffer reads black.
+pub fn frame(mode: &Mode, len: u64, mut read: impl FnMut(u64, &mut [u64])) -> Frame {
+    let (w, h) = (mode.width as usize, mode.height as usize);
+    let mut rgb = vec![0u8; w * h * 3];
+    let mut words = vec![0u64; w / 2 + 2];
+    let mut bytes = vec![0u8; 8 * words.len()];
+    for y in 0..h {
+        let start = mode.offset + y as u64 * u64::from(mode.stride);
+        let end = (start + 4 * w as u64).min(len);
+        if start >= end {
+            continue;
+        }
+        let first = start & !7;
+        let n = (end - first).div_ceil(8) as usize;
+        read(first, &mut words[..n]);
+        for (k, word) in words[..n].iter().enumerate() {
+            bytes[8 * k..8 * k + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let row = &bytes[(start - first) as usize..(end - first) as usize];
+        let out = &mut rgb[3 * w * y..3 * w * (y + 1)];
+        for (px, rgb) in row.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+            // Little-endian x8r8g8b8 is B, G, R, X in memory; big-endian is X, R, G, B.
+            let (r, g, b) = if mode.big_endian { (px[1], px[2], px[3]) } else { (px[2], px[1], px[0]) };
+            rgb.copy_from_slice(&[r, g, b]);
+        }
+    }
+    Frame { width: mode.width, height: mode.height, rgb }
+}
+
+impl Display {
+    /// The picture the guest shows now (module documentation), or why there is none.
+    pub fn snapshot(&self) -> Result<Frame, SnapshotError> {
+        let mode = self.mode().ok_or(SnapshotError::NotEnabled)?;
+        if mode.width > SNAPSHOT_MAX.0 || mode.height > SNAPSHOT_MAX.1 {
+            return Err(SnapshotError::TooLarge { width: mode.width, height: mode.height });
+        }
+        Ok(frame(&mode, self.vram.len(), |at, words| self.vram.read_words(at, words)))
+    }
+    /// The published mode and the framebuffer's read-only descriptor (`DeviceMemory::fd`), none while no mode is
+    /// published.
+    pub fn framebuffer(&self) -> Option<(Mode, BorrowedFd<'_>)> {
+        self.mode().map(|m| (m, self.vram.fd()))
+    }
+    /// Waits until the change counter differs from `seen`, at most `timeout`; the counter then.
+    pub fn wait_change(&self, seen: u64, timeout: Duration) -> u64 {
+        let s = lock(&self.state);
+        let (s, _) = self
+            .changed
+            .wait_timeout_while(s, timeout, |s| s.changes == seen)
+            .unwrap_or_else(|e| e.into_inner());
+        s.changes
     }
 }
 
@@ -171,6 +273,7 @@ impl Function for Display {
                 if mode != s.mode {
                     s.mode = mode;
                     s.changes += 1;
+                    self.changed.notify_all();
                 }
                 Access::Completed(0)
             }
@@ -623,5 +726,159 @@ mod tests {
         assert!(e.starts_with("PCI 1e.0 BAR0 (Mem64, 0x200000 bytes): no room left in the memory window"), "{e}");
         let alone: Vec<_> = bochs::requests(VRAM_MIB_MAX * 2 * MIB).into_iter().map(|q| at(1, 0, q)).collect();
         assert!(place(&alone).unwrap_err().contains("PCI 01.0 BAR2"), "128 MiB leaves no room even for BAR2");
+    }
+
+    /// Writes 32-bit pixels at byte `at` (4-aligned) of the framebuffer through its word stores.
+    fn poke(d: &Display, at: u64, pixels: &[u32]) {
+        let first = at & !7;
+        let n = (at + 4 * pixels.len() as u64 - first).div_ceil(8) as usize;
+        let mut words = vec![0u64; n];
+        d.vram().read_words(first, &mut words);
+        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        for (i, p) in pixels.iter().enumerate() {
+            let k = (at - first) as usize + 4 * i;
+            bytes[k..k + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        let words: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        d.vram().write_words(first, &words);
+    }
+    /// A pixel of the test pattern: a function of x and y in each channel.
+    fn colour(x: u32, y: u32) -> [u8; 3] {
+        [(x * 7 + y) as u8, (y * 5 + 3) as u8, (x ^ y.wrapping_mul(3)) as u8]
+    }
+    /// `colour` as little-endian x8r8g8b8 (the u32 0xXXRRGGBB, with junk in X).
+    fn xrgb(x: u32, y: u32) -> u32 {
+        let [r, g, b] = colour(x, y);
+        0xa5 << 24 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+    }
+    fn expected(w: u32, h: u32) -> Vec<u8> {
+        (0..h).flat_map(|y| (0..w).flat_map(move |x| colour(x, y))).collect()
+    }
+
+    /// Little-endian x8r8g8b8 (B, G, R, X in memory) becomes R, G, B; X is dropped.
+    #[test]
+    fn snapshot_converts_bgrx_to_rgb() {
+        let d = display(16);
+        let (w, h) = (64u32, 64u32);
+        for y in 0..h {
+            poke(&d, u64::from(y * w * 4), &(0..w).map(|x| xrgb(x, y)).collect::<Vec<_>>());
+        }
+        modeset(&d, w as u16, h as u16);
+        let f = d.snapshot().unwrap();
+        assert_eq!((f.width, f.height), (w, h));
+        assert_eq!(f.rgb, expected(w, h));
+        // one pixel by hand: 0x00112233 is R 11H, G 22H, B 33H
+        poke(&d, 0, &[0xff11_2233]);
+        assert_eq!(d.snapshot().unwrap().rgb[..3], [0x11, 0x22, 0x33]);
+    }
+
+    /// With the big-endian byte order selected (X, R, G, B in memory) the same picture comes out.
+    #[test]
+    fn snapshot_converts_big_endian() {
+        let d = display(16);
+        let (w, h) = (64u32, 70u32);
+        for y in 0..h {
+            poke(&d, u64::from(y * w * 4), &(0..w).map(|x| xrgb(x, y).swap_bytes()).collect::<Vec<_>>());
+        }
+        modeset(&d, w as u16, h as u16);
+        write(&d, BYTE_ORDER, 4, 0xbebe_bebe);
+        assert!(d.mode().unwrap().big_endian);
+        assert_eq!(d.snapshot().unwrap().rgb, expected(w, h));
+        // the same memory read as little-endian is not the picture
+        write(&d, BYTE_ORDER, 4, 0x1e1e_1e1e);
+        assert_ne!(d.snapshot().unwrap().rgb, expected(w, h));
+    }
+
+    /// Rows `stride` apart from `offset`: the picture is the visible part of a wider buffer at a 4-aligned (not
+    /// 8-aligned) offset, and nothing outside it shows. A mode past the framebuffer is clipped, never read past.
+    #[test]
+    fn snapshot_honours_stride_and_offset() {
+        let d = display(16);
+        // a 100 x 80 buffer of pattern at Y_OFFSET 3, X_OFFSET 5 (offset 3 x 400 + 20: 4 mod 8), pitch 100 pixels
+        let (bw, bh, w, h, xo, yo) = (100u32, 80u32, 64u32, 64u32, 5u32, 3u32);
+        for y in 0..bh {
+            poke(&d, u64::from(y * bw * 4), &(0..bw).map(|x| if x >= xo && y >= yo { xrgb(x - xo, y - yo) } else { 0xffff_ffff }).collect::<Vec<_>>());
+        }
+        set(&d, XRES, w as u16);
+        set(&d, YRES, h as u16);
+        set(&d, VIRT_WIDTH, bw as u16);
+        set(&d, X_OFFSET, xo as u16);
+        set(&d, Y_OFFSET, yo as u16);
+        set(&d, BPP, 32);
+        set(&d, ENABLE, ENABLED);
+        let m = d.mode().unwrap();
+        assert_eq!((m.stride, m.offset), (400, 3 * 400 + 20));
+        assert_eq!(m.offset % 8, 4, "a 4-aligned offset");
+        assert_eq!(d.snapshot().unwrap().rgb, expected(w, h));
+        // an odd width: the row's last pixel ends mid-word
+        set(&d, XRES, 65);
+        assert_eq!(d.snapshot().unwrap().rgb, expected(65, h));
+        // clipped: a mode whose last rows lie past a 4 KiB framebuffer reads them black, and reads nothing past it
+        let len = 4096u64;
+        let mode = Mode { width: 8, height: 4, stride: 1024, offset: 2020, big_endian: false };
+        let mut reads = Vec::new();
+        let f = frame(&mode, len, |at, words| {
+            reads.push((at, words.len()));
+            words.fill(0x0000_0001_0000_0001);
+        });
+        assert!(reads.iter().all(|&(at, n)| at % 8 == 0 && at + 8 * n as u64 <= len), "{reads:?}");
+        let row = |y: usize| &f.rgb[24 * y..24 * (y + 1)];
+        assert_eq!(row(0), [0, 0, 1].repeat(8), "row 0 whole");
+        assert_eq!(row(1), [0, 0, 1].repeat(8), "row 1 whole");
+        assert_eq!(&row(2)[..21], [0, 0, 1].repeat(7), "row 2: seven pixels before the end");
+        assert_eq!(&row(2)[21..], [0, 0, 0], "the eighth past the end, black");
+        assert_eq!(row(3), [0; 24], "row 3 past the end, black");
+    }
+
+    /// No published mode: no snapshot and no framebuffer; a mode past the snapshot bound is refused, not encoded.
+    #[test]
+    fn snapshot_while_disabled() {
+        let d = display(64);
+        assert_eq!(d.snapshot(), Err(SnapshotError::NotEnabled), "no driver yet");
+        assert!(d.framebuffer().is_none());
+        modeset(&d, 640, 480);
+        assert!(d.snapshot().is_ok());
+        assert_eq!(d.framebuffer().map(|(m, _)| m), Some(mode(640, 480)));
+        set(&d, ENABLE, 0);
+        assert_eq!(d.snapshot(), Err(SnapshotError::NotEnabled), "disabled");
+        modeset(&d, 2560, 1600);
+        assert_eq!(d.snapshot().map(|f| (f.width, f.height)), Ok((2560, 1600)), "the largest");
+        modeset(&d, 2561, 1600);
+        assert_eq!(d.snapshot(), Err(SnapshotError::TooLarge { width: 2561, height: 1600 }));
+        modeset(&d, 1024, 1601);
+        assert_eq!(d.snapshot(), Err(SnapshotError::TooLarge { width: 1024, height: 1601 }));
+    }
+
+    /// The PNG decodes (with the `png` crate's decoder) to the frame: 8-bit RGB, the same pixels.
+    #[test]
+    fn png_round_trips() {
+        for (w, h) in [(64u32, 64u32), (640, 480), (65, 1)] {
+            let f = Frame { width: w, height: h, rgb: expected(w, h) };
+            let png = f.png();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let mut reader = png::Decoder::new(std::io::Cursor::new(&png)).read_info().unwrap();
+            let mut out = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut out).unwrap();
+            assert_eq!((info.width, info.height), (w, h));
+            assert_eq!((info.color_type, info.bit_depth), (png::ColorType::Rgb, png::BitDepth::Eight));
+            assert_eq!(&out[..info.buffer_size()], &f.rgb[..], "{w} x {h}");
+        }
+    }
+
+    /// `wait_change` returns at once when the counter has moved, at a change, or at its timeout.
+    #[test]
+    fn wait_change_follows_the_counter() {
+        let d = display(16);
+        let t = std::time::Instant::now();
+        assert_eq!(d.wait_change(0, Duration::from_millis(30)), 0);
+        assert!(t.elapsed() >= Duration::from_millis(30));
+        let waiter = {
+            let d = d.clone();
+            std::thread::spawn(move || d.wait_change(0, Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        modeset(&d, 640, 480);
+        assert_eq!(waiter.join().unwrap(), 1);
+        assert_eq!(d.wait_change(0, Duration::from_secs(30)), 1, "already moved");
     }
 }

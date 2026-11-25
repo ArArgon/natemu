@@ -3,6 +3,7 @@
 //! correctness.
 use super::protocol::StopReason;
 use super::*;
+use std::sync::Arc;
 use crate::ps2::testing::{board, Board};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -60,6 +61,10 @@ fn rig(ps2: bool) -> Rig {
 }
 
 fn rig_with(ps2: bool, pm: bool) -> Rig {
+    rig_full(ps2, pm, None)
+}
+
+fn rig_full(ps2: bool, pm: bool, display: Option<Arc<Display>>) -> Rig {
     let dir = Dir::new();
     let path = dir.path("c.sock");
     let board = board();
@@ -79,6 +84,7 @@ fn rig_with(ps2: bool, pm: bool) -> Rig {
         cancel: cancel.clone(),
         status: StatusSource { vcpus: 2, started: Instant::now() },
         irqs: board.irqs.clone(),
+        display,
     };
     let server = serve(&path, target).unwrap();
     Rig { dir, path, board, cancel, pm, server: Some(server) }
@@ -155,7 +161,13 @@ impl Client {
             request["params"] = params; // null: no params member
         }
         self.send(&request.to_string());
-        let r = self.recv();
+        // Past notifications (a display's display_changed can come at any time).
+        let r = loop {
+            let r = self.recv();
+            if r.get("id").is_some() || r.is_array() {
+                break r;
+            }
+        };
         assert_eq!(r["id"], json!(id), "{r}");
         r
     }
@@ -533,6 +545,7 @@ fn socket_rules() {
         cancel: Canceller::detached(),
         status: StatusSource { vcpus: 1, started: Instant::now() },
         irqs: r.board.irqs.clone(),
+        display: None,
     };
     let e = serve(&r.path, target()).err().expect("a live socket is refused");
     assert!(e.contains("another program listens on this socket"), "{e}");
@@ -593,4 +606,308 @@ fn power_button_without_the_device_is_refused() {
     let mut c = r.client();
     let v = c.call(1, "power_button", json!({}));
     assert_eq!((&v["error"]["code"], &v["error"]["data"]), (&json!(-32001), &json!({"device": "power_button"})), "{v}");
+}
+
+// ---- the display's methods -----------------------------------------------------------------------------------------
+
+use crate::display::bochs::{BPP, BYTE_ORDER, DISPI, ENABLE, ENABLED, VIRT_WIDTH, X_OFFSET, XRES, Y_OFFSET, YRES};
+use crate::pci::{DeviceMemory, Function};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+/// A display with a framebuffer of `mib` MiB.
+fn display(mib: u64) -> Arc<Display> {
+    Display::new(DeviceMemory::new(mib << 20).unwrap(), (1024, 768))
+}
+fn dispi(d: &Display, index: usize, value: u16) {
+    d.bar_access(0, 2, DISPI + 2 * index as u64, 2, Some(value.into()));
+}
+/// A mode as Linux's driver sets it: `w` x `h` in rows of `pitch` pixels from pixel (`x`, `y`).
+fn modeset(d: &Display, (w, h): (u16, u16), pitch: u16, (x, y): (u16, u16)) {
+    dispi(d, ENABLE, 0);
+    for (r, v) in [(BPP, 32), (XRES, w), (YRES, h), (VIRT_WIDTH, pitch), (X_OFFSET, x), (Y_OFFSET, y)] {
+        dispi(d, r, v);
+    }
+    dispi(d, ENABLE, ENABLED | 0x40);
+}
+/// The test picture's pixel (x, y) as R, G, B.
+fn colour(x: u32, y: u32) -> [u8; 3] {
+    [(x * 3 + y) as u8, (y * 7) as u8, (x ^ y) as u8]
+}
+/// Fills a `pitch`-pixel-wide buffer at byte 0 with the picture placed at (`x0`, `y0`), x8r8g8b8 little-endian.
+fn paint(d: &Display, pitch: u32, rows: u32, (x0, y0): (u32, u32)) {
+    let mut words = Vec::new();
+    for y in 0..rows {
+        for x in (0..pitch).step_by(2) {
+            let px = |x: u32| {
+                if x < x0 || y < y0 {
+                    return 0xdead_beef_u64;
+                }
+                let [r, g, b] = colour(x - x0, y - y0);
+                u64::from(r) << 16 | u64::from(g) << 8 | u64::from(b) | 0x7f << 24
+            };
+            words.push(px(x) | px(x + 1) << 32);
+        }
+    }
+    d.vram().write_words(0, &words);
+}
+fn picture(w: u32, h: u32) -> Vec<u8> {
+    (0..h).flat_map(|y| (0..w).flat_map(move |x| colour(x, y))).collect()
+}
+/// A PNG's size and RGB pixels (the `png` crate's decoder).
+fn decode(png: &[u8]) -> (u32, u32, Vec<u8>) {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+    let mut out = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut out).unwrap();
+    assert_eq!((info.color_type, info.bit_depth), (png::ColorType::Rgb, png::BitDepth::Eight));
+    out.truncate(info.buffer_size());
+    (info.width, info.height, out)
+}
+fn snapshot_of(c: &mut Client, id: u64) -> Value {
+    c.call(id, "snapshot", json!({"format": "png"}))
+}
+fn png_of(answer: &Value) -> (u32, u32, Vec<u8>) {
+    use base64::Engine;
+    let b64 = answer["result"]["png"].as_str().unwrap_or_else(|| panic!("a snapshot: {answer}"));
+    let (w, h, rgb) = decode(&base64::engine::general_purpose::STANDARD.decode(b64).unwrap());
+    assert_eq!((answer["result"]["width"].as_u64(), answer["result"]["height"].as_u64()), (Some(w.into()), Some(h.into())));
+    (w, h, rgb)
+}
+
+/// Without a display, `snapshot` and `framebuffer` are -32001 naming it, and `query_status` has no display member.
+#[test]
+fn display_methods_need_the_display() {
+    let r = rig(true);
+    let mut c = r.client();
+    for (id, method) in [(1, "snapshot"), (2, "framebuffer")] {
+        let v = c.call(id, method, Value::Null);
+        assert_eq!(v["error"], json!({"code": -32001, "message": "Device absent", "data": {"device": "display"}}), "{v}");
+    }
+    assert_eq!(c.status(3)["devices"], json!({"ps2": true}), "as before the display existed");
+    let v = c.call(4, "snapshot", json!({"format": "jpeg"}));
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+}
+
+/// Before the guest enables the display (and after it disables it): -32004, never an empty picture; query_status says
+/// null. Once enabled: the picture and the mode.
+#[test]
+fn snapshot_while_disabled() {
+    let d = display(16);
+    let r = rig_full(true, false, Some(d.clone()));
+    let mut c = r.client();
+    let disabled = json!({"code": -32004, "message": "Display not enabled"});
+    assert_eq!(snapshot_of(&mut c, 1)["error"], disabled);
+    assert_eq!(c.call(2, "framebuffer", json!({}))["error"], disabled);
+    assert_eq!(c.status(3)["devices"], json!({"ps2": true, "display": null}));
+    paint(&d, 640, 480, (0, 0));
+    modeset(&d, (640, 480), 640, (0, 0));
+    assert_eq!(png_of(&snapshot_of(&mut c, 4)), (640, 480, picture(640, 480)));
+    assert_eq!(
+        c.status(5)["devices"]["display"],
+        json!({"width": 640, "height": 480, "stride": 2560, "offset": 0, "format": "x8r8g8b8"})
+    );
+    dispi(&d, ENABLE, 0);
+    assert_eq!(snapshot_of(&mut c, 6)["error"], disabled, "disabled again");
+    assert_eq!(c.status(7)["devices"]["display"], Value::Null);
+    // past the snapshot bound: refused, naming the sizes
+    modeset(&d, (2600, 1000), 2600, (0, 0));
+    let v = snapshot_of(&mut c, 8);
+    assert_eq!(v["error"]["code"], -32005, "{v}");
+    assert_eq!(v["error"]["data"], json!({"width": 2600, "height": 1000, "max_width": 2560, "max_height": 1600}));
+}
+
+/// A client that reads with `recvmsg`, keeping the descriptors that come with the bytes.
+struct FdClient {
+    stream: UnixStream,
+    buffer: Vec<u8>,
+    fds: Vec<OwnedFd>,
+}
+impl FdClient {
+    fn connect(path: &Path) -> Self {
+        let stream = UnixStream::connect(path).unwrap();
+        stream.set_read_timeout(Some(PATIENCE)).unwrap();
+        FdClient { stream, buffer: Vec::new(), fds: Vec::new() }
+    }
+    fn send(&self, line: &[u8]) {
+        (&self.stream).write_all(line).unwrap();
+    }
+    /// The next answer (notifications skipped) and every descriptor received since the last answer.
+    fn answer(&mut self) -> (Value, Vec<OwnedFd>) {
+        loop {
+            while let Some(at) = self.buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=at).collect();
+                let v: Value = serde_json::from_slice(&line).unwrap();
+                if v.get("id").is_some() || v.is_array() {
+                    return (v, std::mem::take(&mut self.fds));
+                }
+            }
+            let mut buf = vec![0u8; 64 << 10];
+            let mut control = vec![0u64; 64];
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = (8 * control.len()) as libc::socklen_t;
+            let n = unsafe { libc::recvmsg(self.stream.as_raw_fd(), &mut msg, 0) };
+            assert!(n > 0, "recvmsg: {n} {}", std::io::Error::last_os_error());
+            assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0, "control data cut");
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    assert_eq!(((*cmsg).cmsg_level, (*cmsg).cmsg_type), (libc::SOL_SOCKET, libc::SCM_RIGHTS));
+                    let k = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
+                    let p = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
+                    self.fds.extend((0..k).map(|i| OwnedFd::from_raw_fd(*p.add(i))));
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+                }
+            }
+            self.buffer.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+}
+
+/// `framebuffer` answers the mode and the framebuffer's size with one descriptor (SCM_RIGHTS on the answer's line):
+/// mapped read-only it shows the picture at the reported offset and stride, as the guest writes it; it cannot be
+/// mapped for writing. A batch's descriptors come with its line, in order; a notification's are not sent.
+#[test]
+fn framebuffer_passes_the_descriptor() {
+    let d = display(16);
+    let r = rig_full(true, false, Some(d.clone()));
+    // a 640 x 480 picture in rows of 800 pixels, from pixel (5, 16): the offset is 4 mod 8
+    paint(&d, 800, 496, (5, 16));
+    modeset(&d, (640, 480), 800, (5, 16));
+    let mut c = FdClient::connect(&r.path);
+    c.send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"framebuffer\"}\n");
+    let (v, fds) = c.answer();
+    let offset = 16 * 3200 + 5 * 4;
+    assert_eq!(
+        v["result"],
+        json!({"width": 640, "height": 480, "stride": 3200, "offset": offset, "format": "x8r8g8b8", "size": 16 << 20}),
+        "{v}"
+    );
+    assert_eq!(fds.len(), 1, "one descriptor");
+    let fd = fds[0].as_raw_fd();
+    let len = 16usize << 20;
+    let writable = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
+    assert_eq!(writable, libc::MAP_FAILED, "not writable");
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+    assert_ne!(base, libc::MAP_FAILED);
+    let fb = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), len) };
+    let mut seen = Vec::new();
+    for y in 0..480usize {
+        for x in 0..640usize {
+            let p = &fb[offset + y * 3200 + 4 * x..][..4];
+            seen.extend_from_slice(&[p[2], p[1], p[0]]);
+        }
+    }
+    assert_eq!(seen, picture(640, 480), "the visible pixels through the client's mapping");
+    // the guest writes: the client's mapping sees it (the same object, no copy)
+    d.vram().write_words(offset as u64 - 4, &[0x00ab_cdef_0000_0000]);
+    assert_eq!(&fb[offset..offset + 3], [0xef, 0xcd, 0xab]);
+    unsafe { libc::munmap(base, len) };
+    // a batch: two descriptors with its line; a notification's is dropped, the next answer carries none
+    c.send(
+        b"[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"framebuffer\"},{\"jsonrpc\":\"2.0\",\"method\":\"framebuffer\"},\
+          {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"framebuffer\"}]\n",
+    );
+    let (v, fds) = c.answer();
+    assert_eq!(v.as_array().map(|a| a.len()), Some(2), "{v}");
+    assert_eq!(fds.len(), 2);
+    c.send(b"{\"jsonrpc\":\"2.0\",\"method\":\"framebuffer\"}\n{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"query_status\"}\n");
+    let (v, fds) = c.answer();
+    assert_eq!((v["id"].as_u64(), fds.len()), (Some(4), 0));
+    // the big-endian byte order is reported
+    d.bar_access(0, 2, BYTE_ORDER, 4, Some(0xbebe_bebe));
+    c.send(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"framebuffer\"}\n");
+    assert_eq!(c.answer().0["result"]["format"], "b8g8r8x8");
+}
+
+/// A snapshot whose answer is larger than the output cap (a noisy 1024 x 768 picture: about 3 MiB of base64) is
+/// answered whole; the client's next request is answered after it.
+#[test]
+fn large_snapshot_is_answered() {
+    let d = display(16);
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    let noise: Vec<u64> = (0..(1024 * 768 / 2))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        })
+        .collect();
+    d.vram().write_words(0, &noise);
+    modeset(&d, (1024, 768), 1024, (0, 0));
+    let r = rig_full(true, false, Some(d.clone()));
+    let mut c = r.client();
+    c.send(r#"{"jsonrpc":"2.0","id":1,"method":"snapshot"}"#);
+    let mut line = String::new();
+    c.lines.read_line(&mut line).unwrap();
+    assert!(line.len() > OUTPUT_CAP, "{} bytes", line.len());
+    let v: Value = serde_json::from_str(&line).unwrap();
+    let bytes: Vec<u8> = noise.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let rgb: Vec<u8> = bytes.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+    assert_eq!(png_of(&v), (1024, 768, rgb));
+    assert_eq!(c.status(2)["state"], "running");
+}
+
+/// `display_changed` follows the published mode: once per change when changes are rare, and at most one per
+/// DISPLAY_CHANGED_EVERY while the guest changes the mode quickly, the last always the state after the last change.
+#[test]
+fn display_changed_is_coalesced() {
+    let d = display(16);
+    let r = rig_full(true, false, Some(d.clone()));
+    let mut c = r.client();
+    assert_eq!(c.status(1)["state"], "running", "connected before the first change");
+    let next = |c: &mut Client| -> (Value, Instant) {
+        let v = c.recv();
+        assert_eq!(v["method"], "display_changed", "{v}");
+        (v["params"].clone(), Instant::now())
+    };
+    // one change: one notification, promptly
+    modeset(&d, (640, 480), 800, (5, 16));
+    let (p, _) = next(&mut c);
+    assert_eq!(p, json!({"enabled": true, "width": 640, "height": 480, "stride": 3200, "offset": 51220, "format": "x8r8g8b8"}));
+    // a storm: 400 mode changes (each modeset is two: unpublished, then published) over about 400 ms
+    std::thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    for k in 0..400u16 {
+        modeset(&d, (640 + k % 7, 480), 1024, (0, 0));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let storm = start.elapsed();
+    let last = d.mode().unwrap();
+    // read everything until 300 ms pass with nothing
+    c.stream.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut got = Vec::new();
+    loop {
+        let mut line = String::new();
+        match c.lines.read_line(&mut line) {
+            Ok(n) if n > 0 => {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                got.push((v["params"].clone(), Instant::now()));
+            }
+            _ => break,
+        }
+    }
+    c.stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    let most = (storm.as_millis() / DISPLAY_CHANGED_EVERY.as_millis()) as usize + 3;
+    assert!(!got.is_empty() && got.len() <= most, "{} notifications in {storm:?} (at most {most})", got.len());
+    assert_eq!(
+        got.last().unwrap().0,
+        json!({"enabled": true, "width": last.width, "height": 480, "stride": 4096, "offset": 0, "format": "x8r8g8b8"}),
+        "the last is the state after the storm"
+    );
+    // disabled: enabled false
+    dispi(&d, ENABLE, 0);
+    let (p, _) = next(&mut c);
+    assert_eq!(p, json!({"enabled": false, "width": 0, "height": 0, "stride": 0, "offset": 0}));
+    // a second client gets them too
+    let mut other = r.client();
+    assert_eq!(other.status(2)["state"], "running");
+    modeset(&d, (800, 600), 800, (0, 0));
+    for client in [&mut c, &mut other] {
+        let v = client.recv();
+        assert_eq!((v["method"].as_str(), v["params"]["width"].as_u64()), (Some("display_changed"), Some(800)), "{v}");
+    }
 }

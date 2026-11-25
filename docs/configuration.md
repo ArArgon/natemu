@@ -202,7 +202,8 @@ output = "guest-console.log"
 1111H), which Linux's `bochs` driver runs. It is a PCI device, at the lowest PCI slot no other device uses (after the
 `[debug]` test devices), so the guest gets a PCI bus for it even when every other device is on `mmio`; turning it on
 moves no other device. The guest draws into the display's video memory directly, at full speed. Nothing on the Mac
-shows the picture yet; the console stays on the serial port.
+shows the picture in a window yet, and the console stays on the serial port; a program can take pictures of the screen
+(PNG) or map the video memory through the [control API](control-api.md#snapshot) (`[control] socket`).
 
 `vram_mib` is the size of the video memory: a power of two from 4 to 64. 64 is the most because natemu places
 every PCI device's memory in one 256 MiB range, largest first, and a 128 MiB one would fill the part of that range
