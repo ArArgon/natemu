@@ -1487,7 +1487,8 @@ fn display_keys() {
         ("colour = 1\n", "vm.toml: display"),
     ] {
         let e = err(load_file(&format!("{MIN}[display]\n{toml}"), &[]).1);
-        assert!(e.starts_with(want), "{toml}: {e}");
+        // The file is named by its whole path (a temporary folder's), so the message ends with what is checked.
+        assert!(e.contains(want) && e.split(want).next().unwrap().ends_with("/"), "{toml}: {e}");
     }
     let e = err(load_old(&["--set", "display.device=vga"]));
     assert!(e.contains("--set display.device: unknown display device \"vga\""), "{e}");

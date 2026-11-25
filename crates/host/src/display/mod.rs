@@ -592,7 +592,7 @@ mod tests {
 
     /// [`VRAM_MIB_MAX`] is what launch-time placement admits: at 64 MiB the display's BARs place beside every other
     /// function a launch can have (the virtio functions, the PCI test function, the mapped-memory test function); at
-    /// 128 MiB BAR0 alone fills the window from E8000000H and its BAR2 is refused.
+    /// 128 MiB BAR0 alone fills the window from E8000000H and the next BAR placed is refused (alone, its own BAR2).
     #[test]
     fn vram_max_is_what_placement_admits() {
         use crate::pci::place::{Request, place};
@@ -617,7 +617,10 @@ mod tests {
         let placed = with_display(VRAM_MIB_MAX).unwrap();
         let bar0 = placed.iter().find(|p| p.request.slot == 31 && p.request.bar == 0).unwrap();
         assert_eq!(bar0.base, 0xe400_0000);
-        assert!(with_display(VRAM_MIB_MAX * 2).unwrap_err().contains("PCI 1f.0 BAR2"));
+        // Largest first: the 128 MiB BAR0 fills the window from E8000000H, so the next BAR placed (the 2 MiB 64-bit BAR0
+        // of slot 30, the largest left) finds no room.
+        let e = with_display(VRAM_MIB_MAX * 2).unwrap_err();
+        assert!(e.starts_with("PCI 1e.0 BAR0 (Mem64, 0x200000 bytes): no room left in the memory window"), "{e}");
         let alone: Vec<_> = bochs::requests(VRAM_MIB_MAX * 2 * MIB).into_iter().map(|q| at(1, 0, q)).collect();
         assert!(place(&alone).unwrap_err().contains("PCI 01.0 BAR2"), "128 MiB leaves no room even for BAR2");
     }
