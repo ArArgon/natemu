@@ -1,0 +1,20 @@
+[package]
+name = "natemu-viewer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# A window on a running natemu's display: a client of its control socket (docs/control-api.md) that maps the
+# framebuffer and sends keyboard and mouse input (docs/viewer.md). Build it with `cargo build --release -p natemu-viewer`.
+# macOS only (winit is built without its Linux back ends), so it is not a default member: a plain `cargo build` of the
+# workspace elsewhere leaves it out. The unit family's rust-viewer suite names it.
+# winit opens the window and reads the keyboard and mouse; softbuffer puts the pixels in it (both MIT or Apache-2.0).
+[dependencies]
+serde_json.workspace = true
+libc.workspace = true
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "=0.4.8", default-features = false }
+
+[[bin]]
+name = "natemu-viewer"
+path = "src/main.rs"

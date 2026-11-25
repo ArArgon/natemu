@@ -219,9 +219,11 @@ output = "guest-console.log"
 `[display] device = "bochs"` gives the guest a display: the device QEMU calls `bochs-display` (vendor 1234H, device
 1111H), which Linux's `bochs` driver runs. It is a PCI device, at the lowest PCI slot no other device uses (after the
 `[debug]` test devices), so the guest gets a PCI bus for it even when every other device is on `mmio`; turning it on
-moves no other device. The guest draws into the display's video memory directly, at full speed. Nothing on the Mac
-shows the picture in a window yet, and the console stays on the serial port; a program can take pictures of the screen
-(PNG) or map the video memory through the [control API](control-api.md#snapshot) (`[control] socket`).
+moves no other device. The guest draws into the display's video memory directly, at full speed. `natemu-viewer` shows
+the picture in a window and passes the keyboard and mouse to the guest ([the viewer](viewer.md)); it and other
+programs reach the display through the [control API](control-api.md#snapshot) (`[control] socket`), which can also
+take pictures of the screen (PNG) or map the video memory. The console stays on the serial port unless the kernel
+command line also names the screen (`console=tty0`).
 
 `vram_mib` is the size of the video memory: a power of two from 4 to 64. 64 is the most because natemu places
 every PCI device's memory in one 256 MiB range, largest first, and a 128 MiB one would fill the part of that range

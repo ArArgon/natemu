@@ -162,8 +162,9 @@ the floating-point mode, which hardware speed-ups it uses, and where it caches t
 A launch can also be described in a TOML file (`--config FILE`), which adds several disks and
 read-only disks; see [docs/configuration.md](docs/configuration.md).
 
-natemu can also give the guest a simple screen (`[display] device = "bochs"` in that file). There is no window yet: a
-program on the Mac asks natemu for a picture of the screen, as a PNG, through its control socket; see
+natemu can also give the guest a simple screen (`[display] device = "bochs"` in that file). To see it in a window and
+use the guest's keyboard and mouse, run `natemu-viewer` beside natemu; see [docs/viewer.md](docs/viewer.md). Other
+programs on the Mac can take pictures of the screen, or type into the guest, through natemu's control socket; see
 [docs/control-api.md](docs/control-api.md).
 
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,

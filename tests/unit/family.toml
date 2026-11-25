@@ -12,7 +12,7 @@ name = "unit"
 name = "rust"
 kind = "units"
 harness = "units"
-params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp", "rust-fs-sweep", "rust-admission"] }
+params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp", "rust-fs-sweep", "rust-admission", "rust-viewer"] }
 needs = { cores = 4, perf = true }
 
 [[suite]]
@@ -28,6 +28,15 @@ kind = "units"
 harness = "units"
 params = { tool = "nextest", fexc = true, filter = "test(/afp/)" }
 needs = { cores = 1, perf = true }
+
+[[suite]]
+name = "rust-viewer"
+# The viewer's own tests (crates/viewer: key names, mode parsing, motion merging, release resends): on their own, so a
+# viewer change runs only these. The viewer is not a default workspace member (macOS only), so `-p` names it.
+kind = "units"
+harness = "units"
+params = { tool = "nextest", filter = "package(natemu-viewer)", args = ["-p", "natemu-viewer"] }
+needs = { cores = 1 }
 
 [[suite]]
 name = "rust-fs-sweep"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/abi", "crates/host", "crates/cli", "crates/driver", "crates/runtime", "crates/qcow"]
+members = ["crates/abi", "crates/host", "crates/cli", "crates/driver", "crates/runtime", "crates/qcow", "crates/viewer"]
 default-members = ["crates/abi", "crates/host", "crates/cli", "crates/driver", "crates/qcow"]
 resolver = "3"
 
