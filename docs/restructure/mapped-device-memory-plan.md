@@ -117,8 +117,11 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   IOSurface by global ID). Task 1's `view()` test and Task 2's `SUM` (computed through `view()`) make the shared-memory
   half a framework case. An IOSurface (for a Metal front end) is the alternative; it cannot travel over a Unix socket
   (it needs a Mach port), so it waits for the native front end.
-- Multi-BAR's memory BAR request gains `mapped: Option<Arc<DeviceMemory>>`. `Bus::install` (in `prepare`) collects the
-  mapped regions into `Prepared` (`Prepared::mapped`, in BAR order; Task 2's driver test device passes its own list to
+- A multi-BAR function names a mapped BAR with `Function::mapped(bar) -> Option<Arc<DeviceMemory>>` (as built: a
+  trait method defaulting to `None`, so no other function changes; the request tuple is unchanged). `Bus::publish_to`
+  gives the bus the table (`Backing::mapped_table`; the backing exists in `prepare` before the bus); `Bus::install`
+  (in `prepare`) returns `pci::Mapped` (the regions in (slot, function, BAR) order, the table's entry order, and a
+  publish counter), which the launch puts into `Prepared` (`Prepared::mapped`; Task 2's driver test device passes its own list to
   `Backing::machine` the same way); the VM does not exist yet. `Backing::machine(mapped)`, the only way to create a
   machine, takes them: `Machine::create(memory, mapped)` (crate-private) has a pure `vm::mapping_plan` count them in
   the IPA size computation (`vm.rs`, from the backing size today) and place each at `MAPPED_IPA + offset` (offsets the
@@ -138,7 +141,10 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
   bus's `Window` for a mapped BAR's range read all-ones and drop writes.
 - Report counters: `remaps` (shootdowns run) and `mapped_installs` (shadows installed onto regions; Task 2 counts it in
   `cache::Control` and the driver reports it), beside the access
-  counts in the run report.
+  counts in the run report. As built for Linux (Task 4): `Prepared::mapped_report` (the table at the end, the bus's
+  publishes, per vCPU `mapped_installs` and `remaps`), which the `natemu` CLI prints as one `natemu: mapped {...}` line
+  on standard error before the stop line, only with regions (the default launch prints nothing new); `k1_stats` gains
+  `mapped` (`installs`, `remaps`), absent while both are zero.
 
 ### Shared state (`crates/abi`)
 
@@ -230,7 +236,18 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - **PCI test function** (`debug.mapped_testdev`, multi-BAR's test-option style): BAR0 a 2 MiB mapped region, BAR2 a
   4 KiB MMIO page with the same `SUM` and `FILL` registers, for Linux guest cases. Identity (decided November 23; the
   owner had no preference): vendor 1B36H, device 0005H as multi-BAR's test function, with its own subsystem ID and
-  revision, documented as natemu's test function (no driver binds either; it is never on by default).
+  revision, documented as natemu's test function (no driver binds either; it is never on by default). As built:
+  subsystem 1B36H:0100H, revision 01H, class 00FFH; BAR0-1 64-bit prefetchable memory (so the control page is BAR2),
+  BAR2 32-bit memory; function 0 of the lowest PCI slot still free (after `debug.pci_testdev`'s), no INTx line.
+- **Linux guest tool** (Task 4, as built): `read()` and `write()` of `/dev/mem` stop at the end of RAM on x86
+  (`valid_phys_addr_range` against `high_memory`), so `dd` cannot reach a BAR above it; and BusyBox's `devmem` maps
+  afresh each time, so it cannot hold a shadow across a move. `mapped-bar` therefore uses a small static program
+  (`bin/mapped-tool`, nasm source in `tests/devices/run_platform.py`): `i`/`o` copy standard input into and the region
+  out to standard output through an mmap of `/dev/mem`; `w` (pinned to the last CPU) maps the old base once and spins
+  on it in plain loads, and must read all-ones after the move (a stale shadow keeps the old value). The old base is
+  read back with `devmem`'s 8-byte loads at four offsets, not copied: there it is a device page, where natemu refuses
+  the kernel's `rep movsq` (`unsupported_mmio`). The named break shows at 2 vCPUs (the probe stays stale); at 1 vCPU
+  only `remaps` catches it (the probe's context switch drops its shadows).
 
 ## File structure
 
@@ -244,7 +261,8 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 | `crates/driver/src/drivers/{test_devices.rs,program.rs}` | `--mapped-at`, `--mapped-control-at` |
 | `tests/system/family.toml`, `tests/system/run_l3.py` (or a sibling runner in `tests/system`) | bare-program cases |
 | `crates/host/src/pci/mapped_testdev.rs` (new), `crates/cli/src/config.rs`, `crates/cli/src/config/tests.rs`, `docs/configuration.md` | the PCI test function and its key |
-| `tests/devices/run_pci.py`, `tests/devices/family.toml` | the Linux guest case `mapped-bar` |
+| `tests/devices/run_platform.py` (the multi-BAR case's runner; no `run_pci.py` exists), `tests/devices/family.toml` | the Linux guest case `mapped-bar` |
+| `crates/host/src/linux.rs`, `crates/cli/src/main.rs` | the test function's placement and `Prepared::mapped_report`; the CLI's `natemu: mapped` line |
 | `docs/restructure/contracts.md` | the new memory class, its refusals, the memory-type deviation and the remap rule |
 
 ## Tasks
@@ -328,13 +346,15 @@ device's `MOVE` register.
 ### Task 4: PCI mapped BARs and the Linux guest case
 
 **Files:** create `crates/host/src/pci/mapped_testdev.rs`; modify `crates/host/src/pci/mod.rs`, `crates/cli/src/config.rs`,
-`crates/cli/src/config/tests.rs`, `docs/configuration.md`, `tests/devices/run_pci.py`, `tests/devices/family.toml`,
-`docs/restructure/contracts.md`.
+`crates/cli/src/config/tests.rs`, `docs/configuration.md`, `tests/devices/run_platform.py`, `tests/devices/family.toml`,
+`docs/restructure/contracts.md` (as built also `crates/host/src/linux.rs`, `crates/host/src/execution.rs`,
+`crates/cli/src/main.rs`).
 
 - [ ] **Step 1: unit tests** in `pci/mod.rs`: `mapped_bar_publishes_on_base_write`, `memory_enable_off_disables_region`,
   `size_probe_disables_then_restore_enables`, `no_publish_without_decode_change`.
 - [ ] **Step 2: the guest case `mapped-bar`** (`--set debug.mapped_testdev=true`, 1 and 2 vCPUs): the init enables the
-  function (`echo 1 > enable`), writes a 2 MiB pattern into BAR0 through `/dev/mem` (`dd` at the BAR's offset), reads
+  function (`echo 1 > enable`), writes a 2 MiB pattern into BAR0 through `/dev/mem` (as built through an mmap of it,
+  `mapped-tool i`: `dd`'s `write()` stops at the end of RAM), reads
   BAR2's `SUM` with `devmem` and compares with the pattern's sum; writes `FILL` and reads the pattern back; then
   disables memory decoding through the sysfs `config` file, writes a new BAR0 base, re-enables, and checks the data at
   the new address and all-ones at the old one. S5 ends the run.
@@ -344,6 +364,7 @@ device's `MOVE` register.
 - [ ] **Step 4: contracts**: `docs/restructure/contracts.md` gains the mapped-memory class, its refusals, the memory-type
   deviation and the remap rule, with the cases that enforce each.
 - [ ] **Step 5: run** `tools/natemu-test run` then `--gate`; PASS. **Commit** `pci: mapped BARs and their test function`.
+  (As built: the gate runs once at the branch's final tip, not per task.)
 
 ## Cost
 

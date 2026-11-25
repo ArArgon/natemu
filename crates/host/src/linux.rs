@@ -147,6 +147,8 @@ struct Wanted {
     consoles: Vec<(String, Transport)>,
     /// The test function ([`Boot::pci_testdev`]).
     testdev: bool,
+    /// The mapped-memory test function ([`Boot::mapped_testdev`]).
+    mapped_testdev: bool,
 }
 #[cfg(test)]
 impl Wanted {
@@ -159,6 +161,7 @@ impl Wanted {
             net: net.then_some(t.net),
             consoles: vec![],
             testdev: false,
+            mapped_testdev: false,
         }
     }
 }
@@ -171,6 +174,8 @@ enum Kind {
     Console(usize),
     /// The test function's two functions ([`crate::pci::testdev`]): no virtio device, no INTx line.
     TestDev,
+    /// The mapped-memory test function ([`crate::pci::mapped_testdev`]): function 0 of its slot, no INTx line.
+    MappedTestDev,
 }
 /// Where one device lives: both the ACPI tables and the device wiring in `prepare` read this, so they cannot disagree.
 #[derive(Clone, Copy, Debug)]
@@ -197,7 +202,8 @@ struct Placed {
 /// console. Returned in wiring order: entropy, disk 0, network, disks 1 and up, the consoles, then the test function
 /// ([`Wanted::testdev`]) at the lowest slot no other function holds, the consoles' included (its functions 0 and 1; no
 /// INTx line, no `_PRT` entry); none free is an error. Consoles are placed first, so the test function never moves a
-/// console, and without consoles it takes the slot it took before them.
+/// console, and without consoles it takes the slot it took before them. The mapped-memory test function
+/// ([`Wanted::mapped_testdev`]) comes last, at the lowest slot still free (its function 0; no INTx line, no `_PRT` entry).
 ///
 /// Per-disk transports exist only in the library: the CLI and the config file have one `transport.disk` for all disks
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
@@ -324,16 +330,22 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
             }
         };
     }
-    if w.testdev {
+    for (on, kind, key) in [
+        (w.testdev, Kind::TestDev, "debug.pci_testdev"),
+        (w.mapped_testdev, Kind::MappedTestDev, "debug.mapped_testdev"),
+    ] {
+        if !on {
+            continue;
+        }
         let held: Vec<u8> = out.iter().filter(|p| p.pci).map(|p| p.slot).collect();
         let slot = (1..32u8)
             .find(|s| !held.contains(s))
-            .ok_or("debug.pci_testdev: PCI slots 1-31 are all used")?;
+            .ok_or(format!("{key}: PCI slots 1-31 are all used"))?;
         out.push(Placed {
-            kind: Kind::TestDev,
+            kind,
             pci: true,
             slot,
-            // Unused: `res` is read only off PCI, and the test function has no INTx line.
+            // Unused: `res` is read only off PCI, and the test functions have no INTx line.
             res: boot::acpi::VirtioMmio {
                 uid: 0,
                 base: 0,
@@ -393,7 +405,7 @@ fn plan_tables_with(
     let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
     for p in placed {
-        if p.kind == Kind::TestDev {
+        if matches!(p.kind, Kind::TestDev | Kind::MappedTestDev) {
             // no INTx line: no `_PRT` entry
         } else if p.pci {
             functions.push((p.slot, p.intx));
@@ -529,6 +541,10 @@ pub struct Boot {
     /// 0 and 1 of the lowest free PCI slot, with the I/O window it needs; it installs the bus even when every virtio device
     /// is on MMIO. Default off.
     pub pci_testdev: bool,
+    /// Test only (`[debug] mapped_testdev`): the mapped-memory test function ([`crate::pci::mapped_testdev`]: BAR0 2 MiB
+    /// of mapped device memory, BAR2 its control page) as function 0 of the lowest PCI slot still free; it installs the bus
+    /// even when every virtio device is on MMIO. Default off.
+    pub mapped_testdev: bool,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -575,6 +591,7 @@ impl Boot {
             smbios: false,
             ps2: false,
             pci_testdev: false,
+            mapped_testdev: false,
             firmware: None,
         }
     }
@@ -592,6 +609,7 @@ impl Boot {
                 .map(|c| (c.id.clone(), c.transport))
                 .collect(),
             testdev: self.pci_testdev,
+            mapped_testdev: self.mapped_testdev,
         })
     }
 
@@ -727,11 +745,16 @@ impl Boot {
         let mut virtio = Vec::new();
         let mut serials = Vec::new();
         let mut bus = crate::pci::Bus::new();
+        let mut mapped = crate::pci::Mapped { regions: Vec::new(), publishes: Arc::default() };
         let mut net = None;
         for p in &placed {
             if p.kind == Kind::TestDev {
                 bus.add(p.slot, 0, crate::pci::testdev::TestDev::new(0))?;
                 bus.add(p.slot, 1, crate::pci::testdev::TestDev::new(1))?;
+                continue;
+            }
+            if p.kind == Kind::MappedTestDev {
+                bus.add(p.slot, 0, crate::pci::mapped_testdev::MappedTestDev::new()?)?;
                 continue;
             }
             let gsi = if p.pci { p.intx } else { p.res.gsi } as usize;
@@ -747,7 +770,7 @@ impl Boot {
                     }
                     disk
                 }
-                Kind::TestDev => unreachable!("added above"),
+                Kind::TestDev | Kind::MappedTestDev => unreachable!("added above"),
                 Kind::Net => {
                     let (v, port) = crate::virtio::Virtio::network(
                         irqs.clone(),
@@ -785,12 +808,16 @@ impl Boot {
                     ["absent", "present"][usize::from(bus.io_window())]
                 ));
             }
-            bus.install(&mut devices)?;
+            // Mapped BARs publish into the backing's region table; their device memory goes to `Backing::machine` in the
+            // bus's order, which is the table's.
+            bus.publish_to(Arc::new(backing.mapped_table()));
+            mapped = bus.install(&mut devices)?;
         }
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
-            mapped: Vec::new(),
+            mapped: mapped.regions,
+            mapped_publishes: mapped.publishes,
             loaded,
             uart,
             devices: devices.freeze(),
@@ -835,6 +862,9 @@ impl Boot {
         }
         if self.pci_testdev {
             return Err("a firmware boot has no PCI bus (debug.pci_testdev)".into());
+        }
+        if self.mapped_testdev {
+            return Err("a firmware boot has no PCI bus (debug.mapped_testdev)".into());
         }
         if !exec::firmware_size(firmware.image.len() as u64) {
             return Err(format!(
@@ -907,6 +937,7 @@ impl Boot {
         Ok(Prepared {
             backing,
             mapped: Vec::new(),
+            mapped_publishes: Arc::default(),
             loaded,
             uart,
             devices: devices.freeze(),
@@ -951,6 +982,8 @@ pub struct Prepared {
     /// Mapped device memory, in creation order (a mapped BAR's request order): the VM maps each above the backing and
     /// every window aliases it at `MAPPED_VA` (`vm::mapping_plan`). Empty: none, the default launch.
     mapped: Vec<Arc<crate::pci::DeviceMemory>>,
+    /// The bus's publishes of mapped BARs ([`crate::pci::Mapped::publishes`]).
+    mapped_publishes: Arc<std::sync::atomic::AtomicU64>,
     loaded: Loaded,
     uart: Arc<Mutex<uart::Uart>>,
     devices: Arc<devices::Devices>,
@@ -1413,6 +1446,29 @@ impl Prepared {
     pub fn board(&self) -> &clock::Board {
         &self.board
     }
+    /// Mapped device memory after (or during) the run, `None` without any region (the default launch): each region's
+    /// table entry (`base`, `len`, `enabled`), the bus's publishes, and per vCPU the shadows installed onto regions
+    /// (`mapped_installs`) and the remap shootdowns it ran (`remaps`, `cache::Control`).
+    pub fn mapped_report(&self) -> Option<serde_json::Value> {
+        if self.mapped.is_empty() {
+            return None;
+        }
+        let (_, entries) = self.backing.mapped_regions().read();
+        let regions: Vec<_> = entries[..self.mapped.len()]
+            .iter()
+            .map(|r| serde_json::json!({"base": r.base, "len": r.len, "enabled": r.enabled}))
+            .collect();
+        let control = |v| -> exec::cache::Control {
+            self.backing.vcpu(v).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL)
+        };
+        let n = self.backing.n;
+        Some(serde_json::json!({
+            "regions": regions,
+            "publishes": self.mapped_publishes.load(SeqCst),
+            "mapped_installs": (0..n).map(|v| control(v).mapped_installs).collect::<Vec<_>>(),
+            "remaps": (0..n).map(|v| control(v).remaps).collect::<Vec<_>>(),
+        }))
+    }
     pub fn devices(&self) -> &devices::Devices {
         &self.devices
     }
@@ -1706,6 +1762,34 @@ mod tests {
         std::fs::remove_file(&resident).unwrap();
     }
 
+    /// The mapped-memory test function: the bus at the lowest free slot (function 0, vendor 1B36H device 0005H subsystem
+    /// 0100H), its region handed to the machine (one, 2 MiB), and the run report's `mapped` part; neither without it.
+    #[test]
+    fn the_mapped_test_function_installs_its_region() {
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-mapped-{}.elf", std::process::id()));
+        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        for on in [true, false] {
+            let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+            (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+            (boot.rng, boot.pci_testdev, boot.mapped_testdev) = (true, true, on);
+            let prepared = boot.prepare().unwrap();
+            assert_eq!(prepared.mapped.iter().map(|m| m.len()).collect::<Vec<_>>(), if on { vec![2 << 20] } else { vec![] });
+            assert_eq!(prepared.mapped_report().is_some(), on);
+            let d = prepared.devices();
+            // the test function at slot 1, the mapped one at slot 2
+            d.port(0, 0xcf8, 4, Some(1 << 31 | 2 << 11)).unwrap();
+            assert_eq!(d.port(0, 0xcfc, 4, None), Ok(if on { 0x0005_1b36 } else { 0xffff_ffff }));
+            d.port(0, 0xcf8, 4, Some(1 << 31 | 2 << 11 | 11 << 2)).unwrap();
+            assert_eq!(d.port(0, 0xcfc, 4, None), Ok(if on { 0x0100_1b36 } else { 0xffff_ffff }));
+        }
+        let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+        (boot.ram, boot.code_bytes, boot.mapped_testdev) = (64 << 20, exec::cache::MAX_BLOCK_BYTES, true);
+        let prepared = boot.prepare().unwrap();
+        assert!(prepared.devices().find(crate::pci::platform::WINDOW.0.into()).is_some(), "the bus with every virtio device on MMIO");
+        std::fs::remove_file(&resident).unwrap();
+    }
+
     /// R2's blocker: the chipset must post into the guest memory of the `Prepared` it ends up in, after `prepare`
     /// returned and the value moved (it once kept a pointer to `prepare`'s local backing). No VM: COM1's THRE interrupt
     /// (IER bit 1) raises ISA IRQ 4, which the I/O APIC routes to vCPU 0 as vector 0x41.
@@ -1882,6 +1966,7 @@ mod placement_tests {
             net: Some(other),
             consoles: vec![],
             testdev: false,
+            mapped_testdev: false,
         }
     }
     fn lists(n: usize) -> Vec<Vec<Transport>> {
@@ -2092,7 +2177,7 @@ mod placement_tests {
         for (w, slot) in [
             (wanted(&[], Mmio), 1),
             (wanted(&[Mmio; 3], Mmio), 1),
-            (Wanted { rng: Some(Pci), disks: vec![], net: None, consoles: vec![], testdev: false }, 1),
+            (Wanted { rng: Some(Pci), disks: vec![], net: None, consoles: vec![], testdev: false, mapped_testdev: false }, 1),
             (wanted(&[], Pci), 1),
             (wanted(&[Pci], Pci), 4),
             (wanted(&[Pci; 3], Pci), 6),

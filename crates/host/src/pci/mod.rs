@@ -1,8 +1,11 @@
 //! Generic PCI layer adapted from cloud-hypervisor (see the header of each file), and natemu's own bus: configuration
 //! mechanism #1 (PCI Local Bus 3.0 3.2.2.3.2), a host bridge at 00:00.0, up to eight functions per slot, launch-time BAR
 //! placement ([`place`]), and routing of the PCI memory window, and of the I/O window when a function has an I/O BAR, to
-//! whichever function's BAR currently decodes an address.
+//! whichever function's BAR currently decodes an address. A mapped BAR ([`Function::mapped`]) is not routed: the bus
+//! publishes where it decodes into the VM's region table ([`Table`]) and the guest reads and writes its device memory
+//! natively (docs/restructure/mapped-device-memory-plan.md).
 pub mod configuration;
+pub mod mapped_testdev;
 pub mod memory;
 pub mod msix;
 pub mod place;
@@ -13,10 +16,15 @@ use crate::devices::{Access, Device, Devices, Direct, mask};
 use configuration::{
     PciBarRegionType, PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType,
 };
+use natemu_abi::execution::cache::{MappedRegion, MappedRegions};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering::SeqCst},
 };
+
+/// The region table the bus publishes mapped BARs into: `execution::Backing::mapped_table`, an owned handle (unit tests
+/// use a table of their own).
+pub type Table = Arc<dyn std::ops::Deref<Target = MappedRegions> + Send + Sync>;
 
 pub mod platform {
     /// The 32-bit memory window the bus forwards, `[start, end)`: natemu's choice, and the window the ACPI root
@@ -88,6 +96,13 @@ pub trait Function: Send + Sync {
     fn bars(&self) -> [Option<Bar>; BARS];
     /// Launch-time BAR requests: (index, kind, len), len a power of two (memory at least 16, I/O at least 4).
     fn bar_requests(&self) -> Vec<(u8, BarKind, u64)>;
+    /// The device memory that memory BAR `bar` maps, fixed at creation, its length the BAR's; `None` (the default): an
+    /// emulated BAR. A mapped BAR is not routed: while it decodes, guest accesses inside it run natively on the object,
+    /// and an access that still reaches the bus (`bar_access`) should read all-ones and drop its write. The bus publishes
+    /// it into the region table on each effective decode change ([`Bus::install`]).
+    fn mapped(&self, _bar: u8) -> Option<Arc<DeviceMemory>> {
+        None
+    }
     /// Program BAR `index` to `base` at launch, decoding still off.
     fn assign(&self, index: u8, base: u64);
     /// An access inside BAR `bar`; `offset` from its base. Tokens must be below 2^52. An access to an I/O BAR must not
@@ -240,6 +255,8 @@ type Slots = [[Option<Arc<dyn Function>>; FUNCTIONS]; SLOTS];
 /// The functions on bus 0, by slot and function (00:00.0 is the host bridge).
 pub struct Bus {
     slots: Slots,
+    /// Where mapped BARs are published ([`Bus::publish_to`]).
+    table: Option<Table>,
 }
 impl Default for Bus {
     fn default() -> Self {
@@ -250,7 +267,7 @@ impl Bus {
     pub fn new() -> Self {
         let mut slots: Slots = std::array::from_fn(|_| std::array::from_fn(|_| None));
         slots[0][0] = Some(Arc::new(HostBridge::new()));
-        Bus { slots }
+        Bus { slots, table: None }
     }
     /// Function `function` of slot `slot`: slots 1-31 (slot 0 is the host bridge's), functions 0-7, function 0 before
     /// any other of its slot (PCI 3.0 6.2.1: a device implements function 0; software scans the others only when
@@ -297,18 +314,75 @@ impl Bus {
         }
         requests
     }
+    /// The region table mapped BARs are published into: required before [`Bus::install`] when some function has one.
+    pub fn publish_to(&mut self, table: Table) {
+        self.table = Some(table);
+    }
     /// Places every requested BAR ([`place::place`]; `Err` names a BAR that does not fit) and programs it, decoding
     /// still off; then registers the configuration ports (0xCF8..0xD00), the whole memory window and, when some BAR is
     /// an I/O BAR ([`Bus::io_window`]), the whole I/O window. All are fixed from here on.
-    pub fn install(self, devices: &mut Devices) -> crate::Result<()> {
+    ///
+    /// Mapped BARs ([`Function::mapped`]): returned in (slot, function, BAR) order, which is their region table entry's
+    /// index: the launch passes this list, in this order, to `execution::Backing::machine`, which maps each object and
+    /// publishes every entry disabled before any vCPU exists. From then on the configuration ports publish entry i (base,
+    /// length, the resident's alias of it, `vm::mapping_plan`'s for this order, and whether it decodes) after each
+    /// configuration write to its function that changes whether or where it decodes: memory decoding on, and the BAR
+    /// wholly inside [`platform::WINDOW`] (as the window decodes; a size probe's all-ones lies outside it). That handler
+    /// runs in the writing vCPU's port exit, under the ports' registry lock (the single writer), so the resident's remap
+    /// trigger sees each publish. `Err` when a mapped BAR is not a memory BAR of its object's length, when one already
+    /// decodes, or when there is no table ([`Bus::publish_to`]).
+    pub fn install(self, devices: &mut Devices) -> crate::Result<Mapped> {
         let requests = self.requests();
         for p in place::place(&requests)? {
             let r = p.request;
             let f = self.slots[usize::from(r.slot)][usize::from(r.function)].as_ref();
             f.expect("a requesting function").assign(r.bar, p.base);
         }
+        let mut found = Vec::new();
+        for r in &requests {
+            let f = self.slots[usize::from(r.slot)][usize::from(r.function)].as_ref().unwrap();
+            let Some(m) = f.mapped(r.bar) else { continue };
+            let what = format!("PCI {:02x}.{} BAR{}", r.slot, r.function, r.bar);
+            if r.kind == BarKind::Io || m.len() != r.len {
+                return Err(format!("{what}: a mapped BAR is a memory BAR of its device memory's length"));
+            }
+            if f.bars()[usize::from(r.bar)].is_some() {
+                return Err(format!("{what}: a mapped BAR decodes before the launch"));
+            }
+            found.push((r.slot, r.function, r.bar, m));
+        }
+        // `requests` is in (slot, function) order, each function's in its request order: sort by BAR too.
+        found.sort_by_key(|&(s, f, b, _)| (s, f, b));
+        let lens: Vec<u64> = found.iter().map(|m| m.3.len()).collect();
+        // The aliases do not depend on where the backing ends (any nonzero end).
+        let aliases = crate::vm::mapping_plan(1, &lens).aliases;
+        let publishes = Arc::new(AtomicU64::new(0));
+        let mapped = match (&self.table, found.is_empty()) {
+            (_, true) => None,
+            (None, false) => return Err("PCI: mapped BARs without a region table".into()),
+            (Some(table), false) => Some(MappedBars {
+                table: table.clone(),
+                entries: found
+                    .iter()
+                    .zip(&aliases)
+                    .map(|((s, f, b, m), &(alias, _))| MappedBar {
+                        at: (usize::from(*s), usize::from(*f)),
+                        bar: *b,
+                        len: m.len(),
+                        alias,
+                        decoding: None,
+                    })
+                    .collect(),
+                publishes: publishes.clone(),
+            }),
+        };
+        let installed = Mapped {
+            regions: found.into_iter().map(|m| m.3).collect(),
+            publishes,
+        };
         let io = requests.iter().any(|r| r.kind == BarKind::Io);
-        let (ports, window, io_window) = self.into_parts();
+        let (mut ports, window, io_window) = self.into_parts();
+        ports.mapped = mapped;
         devices.register_ports(0xcf8, 8, Arc::new(Mutex::new(ports)))?;
         let size = u64::from(platform::WINDOW.1 - platform::WINDOW.0);
         devices.register(
@@ -324,7 +398,7 @@ impl Bus {
                 Arc::new(Mutex::new(io_window)),
             )?;
         }
-        Ok(())
+        Ok(installed)
     }
     fn into_parts(self) -> (ConfigPorts, Window, IoWindow) {
         // The present functions in (slot, function) order: the order the window decodes in.
@@ -345,6 +419,7 @@ impl Bus {
             ConfigPorts {
                 address: 0,
                 slots: slots.clone(),
+                mapped: None,
             },
             Window {
                 slots,
@@ -362,6 +437,60 @@ impl Bus {
 struct ConfigPorts {
     address: u32,
     slots: Arc<Slots>,
+    /// The mapped BARs and where they decode as last published ([`Bus::install`]); `None`: none.
+    mapped: Option<MappedBars>,
+}
+
+/// What [`Bus::install`] gives the launch about mapped BARs.
+pub struct Mapped {
+    /// Their device memory, in region table order: the list `execution::Backing::machine` takes.
+    pub regions: Vec<Arc<DeviceMemory>>,
+    /// Publishes made so far (effective decode changes).
+    pub publishes: Arc<AtomicU64>,
+}
+/// The mapped BARs, entry i of the region table each, and where each decodes as last published.
+struct MappedBars {
+    table: Table,
+    entries: Vec<MappedBar>,
+    publishes: Arc<AtomicU64>,
+}
+struct MappedBar {
+    /// (slot, function).
+    at: (usize, usize),
+    bar: u8,
+    len: u64,
+    alias: u64,
+    /// The base it decodes at, as last published (`None`: disabled; every entry starts so, as `Backing::machine`
+    /// publishes it).
+    decoding: Option<u64>,
+}
+impl MappedBars {
+    /// After a configuration write to function `at`: publishes each of its mapped BARs whose decoding changed.
+    fn update(&mut self, slots: &Slots, at: (usize, usize)) {
+        for (i, e) in self.entries.iter_mut().enumerate().filter(|(_, e)| e.at == at) {
+            let f = slots[at.0][at.1].as_ref().expect("a function with a mapped BAR");
+            let now = f.bars()[usize::from(e.bar)].filter(in_window).map(|b| b.base);
+            if now == e.decoding {
+                continue;
+            }
+            e.decoding = now;
+            self.table.publish(
+                i,
+                MappedRegion {
+                    base: now.unwrap_or(0),
+                    len: e.len,
+                    alias: e.alias,
+                    enabled: u32::from(now.is_some()),
+                },
+            );
+            self.publishes.fetch_add(1, SeqCst);
+        }
+    }
+}
+/// Whether memory BAR `bar` lies wholly inside [`platform::WINDOW`], so that it decodes.
+fn in_window(bar: &Bar) -> bool {
+    let (lo, hi) = (u64::from(platform::WINDOW.0), u64::from(platform::WINDOW.1));
+    bar.kind != BarKind::Io && bar.base >= lo && bar.base.checked_add(bar.len).is_some_and(|end| end <= hi)
 }
 impl ConfigPorts {
     /// The function the address register selects: enabled (bit 31), bus 0 (23:16), slot (15:11) and function (10:8)
@@ -405,6 +534,10 @@ impl Device for ConfigPorts {
             4..=7 if offset - 4 + size <= 4 => {
                 if let Some((f, reg, _)) = self.selected() {
                     f.config_write(reg, offset - 4, &value.to_le_bytes()[..size as usize]);
+                    let a = self.address as usize;
+                    if let Some(m) = &mut self.mapped {
+                        m.update(&self.slots, (a >> 11 & 0x1f, a >> 8 & 7));
+                    }
                 }
             }
             _ => {}
@@ -434,12 +567,10 @@ impl Window {
     /// overlap (a guest error, kept deterministic): the function, its token prefix (slot << 6 | function << 3 | BAR),
     /// the BAR and the offset in it. A BAR not wholly inside the window does not decode; I/O BARs are not in it.
     fn decode(&self, addr: u64, size: u64) -> Option<(&Arc<dyn Function>, u64, u8, u64)> {
-        let (lo, hi) = (u64::from(platform::WINDOW.0), u64::from(platform::WINDOW.1));
         self.present.iter().find_map(|p| {
             p.f.bars().iter().enumerate().find_map(|(i, bar)| {
-                let bar = bar.filter(|b| b.kind != BarKind::Io)?;
-                let end = bar.base.checked_add(bar.len)?;
-                (bar.base >= lo && end <= hi && addr >= bar.base && addr + size <= end)
+                let bar = bar.filter(in_window)?;
+                (addr >= bar.base && addr + size <= bar.base + bar.len)
                     .then(|| (&p.f, p.at << 3 | i as u64, i as u8, addr - bar.base))
             })
         })
@@ -1277,7 +1408,7 @@ mod tests {
         let mut bus = Bus::new();
         bus.add(6, 0, c).unwrap();
         bus.add(6, 1, e).unwrap();
-        let err = bus.install(&mut Devices::new(1 << 30)).unwrap_err();
+        let err = bus.install(&mut Devices::new(1 << 30)).err().unwrap();
         assert!(err.contains("PCI 06.1 BAR3"), "{err}");
     }
 
@@ -1494,5 +1625,156 @@ mod tests {
         // the I/O window walks the same list, once per function
         assert!(io.decode(0x1000, 4).is_none());
         assert_eq!(calls(), [1; 5]);
+    }
+
+    /// Mapped BARs (docs/restructure/mapped-device-memory-plan.md): the bus publishes into the region table on each
+    /// effective decode change, and only then.
+    mod mapped {
+        use super::*;
+        use crate::pci::mapped_testdev::{MappedTestDev, REGION};
+        use natemu_abi::execution::MAPPED_VA;
+
+        struct TestTable(Box<MappedRegions>);
+        impl std::ops::Deref for TestTable {
+            type Target = MappedRegions;
+            fn deref(&self) -> &MappedRegions {
+                &self.0
+            }
+        }
+        /// Two mapped test functions at slots 5 and 3 (added in that order), installed with a table of their own whose
+        /// entries are published disabled, as `Backing::machine` does; the table, the bus's report and the devices.
+        fn installed() -> (Arc<TestTable>, Mapped, Devices) {
+            // SAFETY: a table of plain atomics, all zero (no region, seq 0).
+            let table = Arc::new(TestTable(Box::new(unsafe { std::mem::zeroed() })));
+            let mut b = Bus::new();
+            for slot in [5, 3] {
+                b.add(slot, 0, MappedTestDev::new().unwrap()).unwrap();
+            }
+            b.publish_to(table.clone());
+            let mut d = Devices::new(1 << 30);
+            let mapped = b.install(&mut d).unwrap();
+            for i in 0..2 {
+                table.publish(i, MappedRegion { base: 0, len: REGION, alias: MAPPED_VA + i as u64 * REGION, enabled: 0 });
+            }
+            (table, mapped, d)
+        }
+        fn cfg_write(d: &Devices, slot: u32, reg: u32, offset: u64, size: u64, value: u64) {
+            d.port(0, 0xcf8, 4, Some(address(slot, 0, reg))).unwrap();
+            d.port(0, 0xcfc + offset as u16, size, Some(value)).unwrap();
+        }
+        fn cfg_read(d: &Devices, slot: u32, reg: u32) -> u32 {
+            d.port(0, 0xcf8, 4, Some(address(slot, 0, reg))).unwrap();
+            d.port(0, 0xcfc, 4, None).unwrap() as u32
+        }
+        fn entry(t: &TestTable, i: usize) -> (u64, u64, u64, u32) {
+            let r = t.read().1[i];
+            (r.base, r.len, r.alias, r.enabled)
+        }
+        /// BAR0's placed base on slot `slot`.
+        fn bar0(d: &Devices, slot: u32) -> u64 {
+            u64::from(cfg_read(d, slot, 4) & !0xf) | u64::from(cfg_read(d, slot, 5)) << 32
+        }
+
+        #[test]
+        fn mapped_bar_publishes_on_base_write() {
+            let (t, m, d) = installed();
+            // regions in (slot, function, BAR) order: slot 3's first
+            assert_eq!(m.regions.len(), 2);
+            let (b3, b5) = (bar0(&d, 3), bar0(&d, 5));
+            assert!(b3 % REGION == 0 && b5 % REGION == 0 && b3 != b5, "{b3:#x} {b5:#x}");
+            let seq = t.read().0;
+            cfg_write(&d, 3, 1, 0, 2, 0b10);
+            assert_eq!(entry(&t, 0), (b3, REGION, MAPPED_VA, 1), "slot 3 is entry 0");
+            assert_eq!(entry(&t, 1), (0, REGION, MAPPED_VA + REGION, 0), "slot 5 still off");
+            assert_eq!(m.publishes.load(SeqCst), 1);
+            // a new base, decoding on: published at once (the low dword; the high one stays 0)
+            let new = 0xe800_0000u64;
+            cfg_write(&d, 3, 4, 0, 4, new | 0xc);
+            assert_eq!(entry(&t, 0), (new, REGION, MAPPED_VA, 1));
+            assert_eq!((m.publishes.load(SeqCst), t.read().0), (2, seq + 4));
+            // a base write of 2 bytes moves it too (bits 31:16)
+            cfg_write(&d, 3, 4, 2, 2, 0xea00);
+            assert_eq!(entry(&t, 0).0, 0xea00_0000);
+            // the other function's BAR0 publishes its own entry
+            cfg_write(&d, 5, 1, 0, 2, 0b10);
+            assert_eq!(entry(&t, 1), (b5, REGION, MAPPED_VA + REGION, 1));
+            assert_eq!(m.publishes.load(SeqCst), 4);
+            // the window no longer routes the mapped range: an access that reaches the bus reads all-ones
+            let (dev, off) = d.find(0xea00_0000).unwrap();
+            let w = dev.lock().unwrap().direct().unwrap();
+            assert!(matches!(w.access(0, off, 4, None), Access::Completed(0xffff_ffff)));
+        }
+
+        #[test]
+        fn memory_enable_off_disables_region() {
+            let (t, m, d) = installed();
+            let b3 = bar0(&d, 3);
+            cfg_write(&d, 3, 1, 0, 2, 0b10);
+            assert_eq!(entry(&t, 0), (b3, REGION, MAPPED_VA, 1));
+            cfg_write(&d, 3, 1, 0, 2, 0);
+            assert_eq!(entry(&t, 0), (0, REGION, MAPPED_VA, 0));
+            // a byte write of the Command register turns it on again
+            cfg_write(&d, 3, 1, 0, 1, 0b10);
+            assert_eq!(entry(&t, 0), (b3, REGION, MAPPED_VA, 1));
+            assert_eq!(m.publishes.load(SeqCst), 3);
+        }
+
+        #[test]
+        fn size_probe_disables_then_restore_enables() {
+            let (t, m, d) = installed();
+            let b3 = bar0(&d, 3);
+            cfg_write(&d, 3, 1, 0, 2, 0b10);
+            // the probe, decoding on (Linux turns decoding off first; a guest need not): the size mask lies outside the
+            // window, so the region is off until the BAR is written back
+            cfg_write(&d, 3, 4, 0, 4, 0xffff_ffff);
+            assert_eq!(cfg_read(&d, 3, 4), 0xffe0_000c, "2 MiB, 64-bit prefetchable");
+            assert_eq!(entry(&t, 0).3, 0);
+            cfg_write(&d, 3, 5, 0, 4, 0xffff_ffff);
+            assert_eq!(entry(&t, 0).3, 0, "nor above 4 GiB");
+            cfg_write(&d, 3, 5, 0, 4, 0);
+            assert_eq!(entry(&t, 0).3, 0, "still the low probe");
+            assert_eq!(m.publishes.load(SeqCst), 2, "one publish for the probe's whole span");
+            cfg_write(&d, 3, 4, 0, 4, b3);
+            assert_eq!(entry(&t, 0), (b3, REGION, MAPPED_VA, 1));
+            assert_eq!(m.publishes.load(SeqCst), 3);
+        }
+
+        #[test]
+        fn no_publish_without_decode_change() {
+            let (t, m, d) = installed();
+            let (seq, b3) = (t.read().0, bar0(&d, 3));
+            // decoding off: base writes, probes and other registers publish nothing
+            cfg_write(&d, 3, 4, 0, 4, 0xe800_0000);
+            cfg_write(&d, 3, 4, 0, 4, 0xffff_ffff);
+            cfg_write(&d, 3, 4, 0, 4, b3);
+            cfg_write(&d, 3, 15, 0, 1, 9);
+            cfg_write(&d, 3, 1, 0, 2, 0b01);
+            assert_eq!((m.publishes.load(SeqCst), t.read().0), (0, seq));
+            cfg_write(&d, 3, 1, 0, 2, 0b11);
+            assert_eq!((m.publishes.load(SeqCst), t.read().0), (1, seq + 2));
+            // decoding on: the same Command again, the same base again, the upper half 0 again, BAR2 moved, the latency
+            // timer, and the other function's registers with its decoding off
+            cfg_write(&d, 3, 1, 0, 2, 0b11);
+            cfg_write(&d, 3, 1, 0, 1, 0b11);
+            cfg_write(&d, 3, 4, 0, 4, b3 | 0xc);
+            cfg_write(&d, 3, 5, 0, 4, 0);
+            cfg_write(&d, 3, 6, 0, 4, 0xe900_0000);
+            cfg_write(&d, 3, 3, 1, 1, 0x40);
+            cfg_write(&d, 5, 4, 0, 4, 0xe800_0000);
+            assert_eq!((m.publishes.load(SeqCst), t.read().0), (1, seq + 2));
+            assert_eq!(entry(&t, 0), (b3, REGION, MAPPED_VA, 1));
+        }
+
+        #[test]
+        fn install_refuses_mapped_bars_without_a_table() {
+            let mut b = Bus::new();
+            b.add(3, 0, MappedTestDev::new().unwrap()).unwrap();
+            let err = b.install(&mut Devices::new(1 << 30)).err().unwrap();
+            assert!(err.contains("without a region table"), "{err}");
+            // and a bus without mapped BARs needs none
+            let mut b = Bus::new();
+            b.add(3, 0, Stub::new(1, bar(3))).unwrap();
+            assert!(b.install(&mut Devices::new(1 << 30)).unwrap().regions.is_empty());
+        }
     }
 }

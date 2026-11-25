@@ -100,6 +100,24 @@ argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--
         "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "pci-multibar", "--vcpus", "2",
         "--set", "debug.pci_testdev=true"]
 
+# mapped-bar (mapped-device-memory plan Task 4): the mapped-memory test function (debug.mapped_testdev: vendor 1B36H
+# device 0005H subsystem 0100H), no driver bound. BAR0 is 2 MiB of host-backed device memory the guest reads and writes
+# natively: the init writes a pattern into it through an mmap of /dev/mem and reads it back, compares BAR2's SUM (the
+# host's sum, through a second mapping of the object) and FILL (the host's pattern), then moves BAR0 through the sysfs
+# config file (decoding off, a new base, decoding on) while a probe on the last CPU holds a mapping of the old base: it
+# must read all-ones afterwards (the remap shootdown), the data is at the new base and the old one reads all-ones. The
+# host's `natemu: mapped` line: the table at the end, publishes, and per vCPU installs and remaps (at least one per
+# publish). S5 ends the run. At 1 and 2 vCPUs.
+[suite.cases."mapped-bar-1cpu"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "mapped-bar", "--vcpus", "1",
+        "--set", "debug.mapped_testdev=true"]
+
+[suite.cases."mapped-bar-2cpu"]
+argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}",
+        "--inputs", "{raw}/devices-platform/platform", "--out", "{out}", "--case", "mapped-bar", "--vcpus", "2",
+        "--set", "debug.mapped_testdev=true"]
+
 # virtio-console (tests/devices/run_console.py): the cases.
 [[suite]]
 name = "devices-console"

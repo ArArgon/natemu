@@ -1020,6 +1020,20 @@ pub struct K1 {
     scanned_stale: u64,
     chain_dropped: u64,
     relisted: u64,
+    /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows installed onto regions and remap
+    /// shootdowns run (`Control::mapped_installs`, `remaps`); absent while both are zero (always without regions).
+    #[serde(skip_serializing_if = "K1Mapped::is_empty")]
+    mapped: K1Mapped,
+}
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Mapped {
+    installs: u64,
+    remaps: u64,
+}
+impl K1Mapped {
+    fn is_empty(&self) -> bool {
+        self.installs | self.remaps == 0
+    }
 }
 fn writers_empty(w: &[u64; natemu_abi::writers::count::COUNT]) -> bool {
     w.iter().all(|&n| n == 0)
@@ -1304,6 +1318,7 @@ impl K1 {
             scanned_stale: c.scanned_stale,
             chain_dropped: c.chain_dropped,
             relisted: c.relisted,
+            mapped: K1Mapped { installs: c.mapped_installs, remaps: c.remaps },
         }
     }
 }
