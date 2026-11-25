@@ -60,7 +60,7 @@
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import argparse, json, pathlib, statistics, subprocess, sys, time
+import argparse, json, os, pathlib, statistics, subprocess, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
@@ -170,12 +170,12 @@ def syscall_program(user, kernel, regs, extra=''):
             f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nregion 0x3e0000 0x10000\n{extra}')
 
 
-def driver(a, text, work, extra=()):
+def driver(a, text, work, extra=(), env=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     t0 = time.perf_counter()
     run = subprocess.run([a.host, a.runtime, 'run-program', a.fexc, work / 'program.txt', work, *vm.frame_alias_args(), '--watchdog-ms', '600000', *map(str, extra)],
-                         capture_output=True, text=True, timeout=900)
+                         capture_output=True, text=True, timeout=900, env=env)
     dt = time.perf_counter() - t0
     return dt, (json.loads(run.stdout) if run.returncode == 0 else None), run.stderr[-1500:]
 
@@ -2574,7 +2574,12 @@ def gather(a, report):
     - `ac`: CPL 3 with CR0.AM and RFLAGS.AC: misaligned elements, no #AC (a misaligned MOV after it: #AC).
     - `uc`: elements on a UC page: read (the UC count grows). `mmio`: an element on a device page stops `unsupported_mmio`; a
       masked-off one there completes.
-    - `tso`: two vCPUs: vCPU 1 stores X then Y (a counter) 100,000 times; vCPU 0 loads Y, then gathers X: never older."""
+    - `tso`: two vCPUs: vCPU 1 stores X then Y (a counter) 100,000 times; vCPU 0 loads Y, then gathers X: never older.
+    Gather plan (docs/restructure/gather-fast-path-plan.md 4): every case runs inline (the default: the gathers of a block
+    inside its code) and cut (`[debug] inline_gather = false`, NATEMU_INLINE_GATHER=off: the transaction, as before). The
+    inline runs also assert that the inline path ran: no gather decoded and no step where nothing faults (`forms`: only the
+    0x67 and FS gathers decoded; `user-nc-masked`, `mmio-masked`), a step at every fault (`fault-*`, `user-*`, `mmio`); and
+    `middle`, `fresh`, `pte-a` (below) are the inline path's own."""
     asm, failures, runs = ref.assemble, [], []
     D, T, R, FIXV, TABLES, IDTR, LOG = 0x400000, 0x600000, 0x700000, 0x680000, 0x300000, 0x300800, 0x310000
     B = D + 0x5000                       # the common base; D..D+0xa000 mapped, the fault page FP = B - 0x1000 in fault runs
@@ -2584,7 +2589,17 @@ def gather(a, report):
     rng = __import__('random').Random(20261105)
     rb = lambda n: bytes(rng.getrandbits(8) for _ in range(n))
 
+    # Gather plan (docs/restructure/gather-fast-path-plan.md 4): every sub-case runs with the gathers inside generated code
+    # (`inline`, the default) and with `[debug] inline_gather = false` (`cut`: NATEMU_INLINE_GATHER=off, every gather the
+    # resident's transaction, as before the plan), at block sizes default and 1 (a one-instruction block is no step).
+    RUNS = [(m, b) for m in ('inline', 'cut') for b in (None, 1)]
+    current = ['inline']
+    def drive(text, tag, block, mode, extra=()):
+        current[0] = mode
+        env = None if mode == 'inline' else dict(os.environ, NATEMU_INLINE_GATHER='off')
+        return driver(a, text, a.out / 'gather' / mode / tag, ([block] if block else []) + list(extra), env=env)
     def record(tag, problems, extra=None):
+        tag = f'{current[0]}/{tag}'
         runs.append({'case': tag, 'ok': not problems, 'problems': problems, **(extra or {})})
         print(json.dumps(runs[-1]), flush=True)
         if problems: failures.append(f'gather {tag}: {problems}')
@@ -2656,6 +2671,7 @@ def gather(a, report):
     d, x, m = inputs(4, 4, 1, [0x40 * j - 0x200 for j in range(8)], 4, 'msb')
     cases.append(dict(insn=insn('vpgatherdd', 4, 4, 1, 0, 1, 2, 'rdi', 4, 8, seg='fs:'), regs=(0, 1, 2), breg=7, bval=B - FSB, form=(4, 4, 1),
                       d=d, x=x, m=m, addr=lambda ix: B - FSB + ix * 4 + 8 + FSB))
+    CUT_FORMS = 3   # the two 0x67 gathers and the FS one
     body = ''
     for i, c in enumerate(cases):
         rd, ri, rm = c['regs']
@@ -2665,11 +2681,11 @@ def gather(a, report):
     code = asm(body + 'nop')
     table = b''.join(c['d'] + c['x'] + c['m'] for c in cases)
     for cpl in (3, 0):
-        for block in (None, 1):
+        for mode, block in RUNS:
             text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl {cpl}\nsse 1\nxcr0 7\nfsbase {FSB:#x}\nmemory {D:#x} {pattern.hex()}\n'
                     f'memory {T:#x} {table.hex()}\nmemory {R:#x} {bytes(64 * len(cases)).hex()}\nregion 0x3e0000 0x10000\n')
             tag = f'forms-cpl{cpl}-{block}'
-            _, out, err = driver(a, text, a.out / 'gather' / tag, [block] if block else [])
+            _, out, err = drive(text, tag, block, mode)
             problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
             if out and not problems:
                 for i, c in enumerate(cases):
@@ -2678,7 +2694,10 @@ def gather(a, report):
                     if e or got != wd + wm:
                         problems.append(f"{c['insn']}: dest {got[:32][::-1].hex()} mask {got[32:][::-1].hex()}, want {wd[::-1].hex()} {wm[::-1].hex()}")
                 decodes = out['stats']['decodes'].get(f'{0x7a:#x}', 0)
-                if block is None and decodes == 0: problems.append('no gather decoded')
+                if mode == 'cut' and block is None and decodes == 0: problems.append('no gather decoded')
+                # Inline: only the 0x67 and FS gathers are the resident's (one decode each); none is stepped.
+                if mode == 'inline' and (decodes, out['stats']['steps']) != (CUT_FORMS, 0):
+                    problems.append(f"inline: {decodes} gathers decoded, want {CUT_FORMS}; {out['stats']['steps']} steps, want 0")
             record(tag, problems[:6], {'cases': len(cases)})
 
     # CPL 0 with the program's own IDT (#DB 1, #PF 14): handlers log (CR2 or DR6, error, RIP, RFLAGS, vector, -, YMM0, YMM2)
@@ -2741,9 +2760,9 @@ def gather(a, report):
             model.append((name, entries, wd + wm, d + x + m))
         text, lab = idt_program(body, f'memory {T:#x} {b"".join(c[3] for c in model).hex()}\nmemory {R:#x} {bytes(64 * len(model)).hex()}\n'
                                       f'memory {FIXV:#x} {fix.hex()}\nunmap {FP:#x}\n')
-        for block in (None, 1):
+        for mode, block in RUNS:
             tag = f'fault-{mn}-{"xy"[L]}-{block}'
-            _, out, err = driver(a, text, a.out / 'gather' / tag, [block] if block else [])
+            _, out, err = drive(text, tag, block, mode)
             problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
             if out and not problems:
                 k = 0
@@ -2756,6 +2775,8 @@ def gather(a, report):
                     if mem(out, R + 64 * i, 64) != want:
                         problems.append(f'{name}: after the restart dest+mask {mem(out, R + 64 * i, 64)[::-1].hex()}, want {want[::-1].hex()}')
                 if count(out) != k: problems.append(f'{count(out)} handler entries, want {k}')
+                # Inline: each fault was taken at an element load and the gather run alone (its transaction gave the state).
+                if mode == 'inline' and out['stats']['steps'] < k: problems.append(f"inline: {out['stats']['steps']} steps for {k} faults")
             record(tag, problems[:6])
 
     # user-*: CPL 3, one fault each through the driver's logging IDT; the state at the fault from `xmm`/`ymmh`.
@@ -2764,10 +2785,10 @@ def gather(a, report):
         code, lab = asm(f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov {base}, {bval:#x}\n'
                         f'g: {insn(mn, ew, iw, L, 0, 1, 2, base, s, 0)}\nnop', labels=True)
         wd, wm, e = gather_model(ew, iw, L, d, m, x, lambda ix: bval + ix * s, read or reader(cpl=3))
-        for block in (None, 1):
+        for mode, block in RUNS:
             text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nsse 1\nxcr0 7\nmemory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\n'
                     f'region 0x3e0000 0x10000\n{extra}')
-            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+            _, out, err = drive(text, f'{name}-{block}', block, mode)
             problems = [f'driver: {err}'] if not out else []
             if out:
                 f = [int(v, 0) for v in out['fault']]
@@ -2776,6 +2797,10 @@ def gather(a, report):
                 else:
                     wf = [e[0], e[1] if e[0] == 14 else 0, e[2] if e[0] == 14 else 0, CODE + lab['g']]
                     if out['stop'] != 'guest_fault' or f != wf: problems.append(f"stop {out['stop']} fault {[hex(v) for v in f]}, want {[hex(v) for v in wf]}")
+                # Inline: a fault steps the gather (its transaction), a gather that completes runs in its block.
+                steps, decodes = out['stats']['steps'], out['stats']['decodes'].get(f'{0x7a:#x}', 0)
+                if mode == 'inline' and (steps < 1 if e else (steps, decodes) != (0, 0)):
+                    problems.append(f'inline: {steps} steps, {decodes} gathers decoded')
                 if (ymm(out, 0), ymm(out, 2)) != (wd, wm):
                     problems.append(f'dest {ymm(out, 0)[::-1].hex()} mask {ymm(out, 2)[::-1].hex()}, want {wd[::-1].hex()} {wm[::-1].hex()}')
             record(f'{name}-{block}', problems)
@@ -2792,10 +2817,10 @@ def gather(a, report):
         load = f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\n' if 'xcr0 7' in extra else ''
         code, lab = asm(f'{load}mov rax, {B:#x}\n{pre}g: .byte {",".join("0x" + hexs[i:i + 2] for i in range(0, len(hexs), 2))}\nnop', labels=True)
         regs = rb(96)
-        for block in (None, 1):
+        for mode, block in RUNS:
             text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl {cpl}\nsse 1\n{extra}memory {D:#x} {pattern.hex()}\nmemory {T:#x} {regs.hex()}\n'
                     'region 0x3e0000 0x10000\n')
-            _, out, err = driver(a, text, a.out / 'gather' / f'ud-{name}-{block}', [block] if block else [])
+            _, out, err = drive(text, f'ud-{name}-{block}', block, mode)
             problems = [f'driver: {err}'] if not out else []
             if out:
                 f = [int(v, 0) for v in out['fault']]
@@ -2827,8 +2852,8 @@ def gather(a, report):
             wd, wm, e = gather_model(4, 4, 1, *cur[:2], cur[2], lambda ix: B + ix * 4, read)
             if not e: break
             cur = (wd, wm, f if f is not None else cur[2])
-        for block in (None, 1):
-            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+        for mode, block in RUNS:
+            _, out, err = drive(text, f'{name}-{block}', block, mode)
             problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')}"])
             if out and not problems:
                 got = [logs(out, k) for k in range(min(count(out), 16))]
@@ -2869,10 +2894,10 @@ def gather(a, report):
         d, x, m = inputs(4, 4, 1, [0x48 * j if on(j) else 0x1000 + 0x48 * j for j in range(8)], 4, kind)
         code = asm(f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\nvpgatherdd ymm0, [rdi + ymm1*4], ymm2\n'
                    f'vmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\nnop')
-        for block in (None, 1):
+        for mode, block in RUNS:
             text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nsse 1\nxcr0 7\nmemory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\n'
                     f'memory {R:#x} {bytes(64).hex()}\nregion 0x3e0000 0x10000\n{extra}')
-            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+            _, out, err = drive(text, f'{name}-{block}', block, mode)
             problems = [f'driver: {err}'] if not out else []
             if out:
                 if out['stop'] != ok_stop or (ok_stop == 'resident' and not out['reason'].startswith('unsupported_mmio')):
@@ -2881,6 +2906,15 @@ def gather(a, report):
                     wd, wm, _ = gather_model(4, 4, 1, d, m, x, lambda ix: B + ix * 4, reader())
                     if mem(out, R, 64) != wd + wm or not out['stats']['k1'].get('uncached', {}).get('resident', 0):
                         problems.append(f"result {mem(out, R, 64)[::-1].hex()} uncached {out['stats']['k1'].get('uncached')}")
+                elif name == 'mmio-masked':
+                    wd, wm, _ = gather_model(4, 4, 1, d, m, x, lambda ix: B + ix * 4, reader())
+                    if mem(out, R, 64) != wd + wm: problems.append(f'result {mem(out, R, 64)[::-1].hex()}, want {(wd + wm)[::-1].hex()}')
+                # Inline: an element on the device page runs the gather alone (its transaction stops); masked off, nothing
+                # touches the page and the gather completes in its block.
+                steps, decodes = out['stats']['steps'], out['stats']['decodes'].get(f'{0x7a:#x}', 0)
+                if mode == 'inline' and name == 'mmio' and steps < 1: problems.append('inline: the device element was not stepped')
+                if mode == 'inline' and name == 'mmio-masked' and (steps, decodes) != (0, 0):
+                    problems.append(f'inline: {steps} steps, {decodes} gathers decoded')
             record(f'{name}-{block}', problems)
     # ac: CR0.AM and RFLAGS.AC at CPL 3: misaligned elements raise no #AC (exception class 12); the misaligned MOV after
     # the gather does (#AC(0) there: alignment checking was on).
@@ -2889,10 +2923,10 @@ def gather(a, report):
     code, lab = asm(f'mov rax, cr0\nor rax, 0x40000\nmov cr0, rax\npushfq\nor qword ptr [rsp], 0x40000\npopfq\nsw: nop\n'
                     f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\n'
                     f'vpgatherdq ymm0, [rdi + xmm1*1], ymm2\nvmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\nx: mov eax, [{B + 1:#x}]\nnop', labels=True)
-    for block in (None, 1):
+    for mode, block in RUNS:
         text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nswitch {CODE + lab["sw"]:#x} 3\nsse 1\nxcr0 7\n'
                 f'memory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\nmemory {R:#x} {bytes(64).hex()}\nregion 0x3e0000 0x10000\n')
-        _, out, err = driver(a, text, a.out / 'gather' / f'ac-{block}', [block] if block else [])
+        _, out, err = drive(text, f'ac-{block}', block, mode)
         problems = [f'driver: {err}'] if not out else []
         if out:
             f = [int(v, 0) for v in out['fault']]
@@ -2906,16 +2940,68 @@ def gather(a, report):
              f'mov rdi, {B:#x}\n1: mov rax, [{B + 0x200:#x}]\nvmovdqa ymm2, ymm4\nvpinsrq xmm1, xmm5, qword ptr [{T:#x}], 0\n'
              f'vpgatherqq ymm0, [rdi + ymm1*1], ymm2\nvmovq rbx, xmm0\ncmp rbx, rax\njae 2f\ninc r8\n2: dec ecx\njnz 1b\nnop')
     c1 = asm(f'mov ecx, {N}\nxor eax, eax\n1: inc rax\nmov [{B + 0x100:#x}], rax\nmov [{B + 0x200:#x}], rax\ndec ecx\njnz 1b\nnop')
-    for block in (None, 1):
+    for mode, block in RUNS:
         text = (f'body {CODE:#x} {c0.hex()}\nbody 0x200000 {c1.hex()}\nmemory {D:#x} {bytes(0xa000).hex()}\nmemory {T:#x} {(0x100).to_bytes(8, "little").hex()}\n'
                 'region 0x3e0000 0x10000\n'
                 f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\nsse 1\nxcr0 7\ncpu\nrip 0x200000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
-        _, out, err = driver(a, text, a.out / 'gather' / f'tso-{block}', [block] if block else [])
+        _, out, err = drive(text, f'tso-{block}', block, mode)
         problems = [f'driver: {err}'] if not out else []
         if out:
             stops = [c['stop'] for c in out['cpus']]
             if stops != ['reached', 'reached'] or int(out['cpus'][0]['gpr'][8], 0): problems.append(f"stops {stops} violations {out['cpus'][0]['gpr'][8]}")
         record(f'tso-{block}', problems)
+
+    # Gather plan (4), the inline path's own cases (both modes; the inline run also asserts how it ran):
+    # - `middle`: element 3 of eight faults (#PF) in a block of several instructions: the instructions before it done once,
+    #   the #PF at the gather with elements 0..2 done (the transaction's partial state), the restart completes, the
+    #   instruction after it runs once; inline: the fault was stepped.
+    # - `fresh`: the elements on four pages no access touched before: the shadow misses are retried in place, never stepped
+    #   (inline: retries, no step, no decode); the result is the model's.
+    # - `pte-a`: the masked-off elements on a present page whose PTE.A is clear: it stays clear (the inline `tbz` skipped
+    #   their loads: a load would have walked the page and set A; a fault and a step would not show that).
+    offs = [0x100 + 0x48 * j for j in range(8)]
+    offs[3] = -0x800
+    d, x, m = inputs(4, 4, 1, offs, 4, 'all')
+    fx = inputs(4, 4, 1, [0x100 + 0x48 * j for j in range(8)], 4, 'none')[1]
+    body = (f'mov qword ptr [{FIXP:#x}], {FIXV:#x}\nvmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\n'
+            f'mov rdi, {B:#x}\ninc r8\nadd r9, 2\ng: vpgatherdd ymm0, [rdi + ymm1*4], ymm2\ninc r10\nvmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\n')
+    text, lab = idt_program(body, f'memory {T:#x} {(d + x + m).hex()}\nmemory {R:#x} {bytes(64).hex()}\nmemory {FIXV:#x} {fx.hex()}\nunmap {FP:#x}\n')
+    read = reader(unmapped={FP})
+    fd, fm, fe = gather_model(4, 4, 1, d, m, x, lambda ix: B + ix * 4, read)
+    wd, wm, _ = gather_model(4, 4, 1, fd, fm, fx, lambda ix: B + ix * 4, read)
+    for mode, block in RUNS:
+        _, out, err = drive(text, f'middle-{block}', block, mode)
+        problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')}"])
+        if out and not problems:
+            g = logs(out, 0)
+            if count(out) != 1 or (g['vector'], g['a'], g['rip'], g['d'], g['m']) != (14, fe[1], CODE + lab['g'], fd, fm):
+                problems.append(f"{count(out)} entries; #{g['vector']} cr2 {g['a']:#x} rip {g['rip']:#x} dest {g['d'][::-1].hex()} mask {g['m'][::-1].hex()}")
+            if mem(out, R, 64) != wd + wm: problems.append(f'result {mem(out, R, 64)[::-1].hex()}, want {(wd + wm)[::-1].hex()}')
+            gp = [int(v, 0) for v in out['gpr']]
+            if gp[8:11] != [1, 2, 1]: problems.append(f'r8..r10 {gp[8:11]}, want [1, 2, 1]')
+            if mode == 'inline' and out['stats']['steps'] < 1: problems.append('inline: the fault was not stepped')
+        record(f'middle-{block}', problems)
+    for name, offs, kind, extra in (('fresh', [0x900 * j - 0x2400 for j in range(8)], 'msb', ''),
+                                    ('pte-a', [0x48 * j + (0x2000 if j % 2 else 0) for j in range(8)], 'sparse', f'entry {B + 0x2000:#x} 1 clear 0x20\n')):
+        d, x, m = inputs(4, 4, 1, offs, 4, kind)
+        wd, wm, _ = gather_model(4, 4, 1, d, m, x, lambda ix: B + ix * 4, reader())
+        code = asm(f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\nvpgatherdd ymm0, [rdi + ymm1*4], ymm2\n'
+                   f'vmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\nnop')
+        for mode, block in RUNS:
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nsse 1\nxcr0 7\nmemory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\n'
+                    f'memory {R:#x} {bytes(64).hex()}\nregion 0x3e0000 0x10000\n{extra}')
+            _, out, err = drive(text, f'{name}-{block}', block, mode)
+            problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')}"])
+            if out and not problems:
+                if mem(out, R, 64) != wd + wm: problems.append(f'result {mem(out, R, 64)[::-1].hex()}, want {(wd + wm)[::-1].hex()}')
+                st = out['stats']
+                steps, decodes = st['steps'], st['decodes'].get(f'{0x7a:#x}', 0)
+                if mode == 'inline' and (steps, decodes) != (0, 0): problems.append(f'inline: {steps} steps, {decodes} gathers decoded')
+                if mode == 'inline' and name == 'fresh' and st['retries'] < 1: problems.append('inline: no shadow miss retried')
+                if name == 'pte-a':
+                    a_bit = [p['accessed'] for p in out['pages'] if int(p['va'], 16) == B + 0x2000]
+                    if a_bit != [False]: problems.append(f'the masked-off page: accessed {a_bit}, want [False]')
+            record(f'{name}-{block}', problems)
     report['gather'] = {'runs': runs, 'failures': failures}
     return failures
 
