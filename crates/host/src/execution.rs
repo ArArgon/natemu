@@ -61,6 +61,30 @@ pub struct Backing {
     /// The template pool's writer, shared by the run's compilers ([`Compiler::pool`]); `None`: no pool in this backing.
     pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
+fn mapped_regions(memory: &Memory) -> &cache::MappedRegions {
+    let at = cache::GLOBAL_OFFSET + cache::MAPPED;
+    assert!(at % 8 == 0 && at + size_of::<cache::MappedRegions>() <= memory.1);
+    // SAFETY: inside the backing, aligned, plain atomics shared with the residents.
+    unsafe { &*memory.0.add(at).cast::<cache::MappedRegions>() }
+}
+/// The region table of a backing, owned ([`Backing::mapped_table`]).
+#[derive(Clone)]
+pub struct MappedTable(Arc<Memory>);
+impl std::ops::Deref for MappedTable {
+    type Target = cache::MappedRegions;
+    fn deref(&self) -> &cache::MappedRegions {
+        mapped_regions(&self.0)
+    }
+}
+/// Mapped device memory: every region of `plan` gets its table entry, disabled (its alias and length, base 0), before any
+/// vCPU exists, so the table's `seq` is nonzero exactly when the VM has regions: a resident that reads `seq` 0 (no
+/// region, the default launch, which publishes nothing) skips the holding flag safely, as no publish can ever follow
+/// (`mmio::mapped` in the runtime). The publisher (the bus, the driver's test device) enables entries later.
+fn publish_disabled(table: &cache::MappedRegions, plan: &crate::vm::MappingPlan) {
+    for (i, &(alias, len)) in plan.aliases.iter().enumerate() {
+        table.publish(i, cache::MappedRegion { base: 0, len, alias, enabled: 0 });
+    }
+}
 impl Backing {
     /// The template pool's publication counters as the performance log's `pool {...}` line (`None`: no pool).
     pub fn pool_report(&self) -> Option<String> {
@@ -69,6 +93,37 @@ impl Backing {
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
+    }
+    /// The VM of this backing with the device memory `mapped` (in order; empty: none, the default launch): the machine
+    /// maps each region above the backing ([`Machine::create`]), and every window's alias of it is written here before
+    /// any vCPU exists, so no machine maps a region its residents cannot reach. The only way to create a machine.
+    pub fn machine(&self, mapped: &[Arc<crate::pci::DeviceMemory>]) -> Result<Machine> {
+        let machine = Machine::create(self.memory.clone(), mapped)?;
+        self.map_mapped(machine.mapping());
+        publish_disabled(self.mapped_regions(), machine.mapping());
+        Ok(machine)
+    }
+    /// Writes every window's alias of the VM's mapped device memory ([`crate::memory::mapped_spans`]): after the RAM and
+    /// firmware aliases (it replaces their entries, though none lies in its slots: `exec::MAPPED_VA`), before any vCPU
+    /// runs. Nothing for a plan without regions.
+    fn map_mapped(&self, plan: &crate::vm::MappingPlan) {
+        let spans = crate::memory::mapped_spans(plan);
+        if spans.is_empty() {
+            return;
+        }
+        for v in 0..self.n {
+            map_private(&self.memory, v * self.stride, &spans);
+        }
+    }
+    /// The region table in the global area, which the host alone writes (`MappedRegions::publish`).
+    pub fn mapped_regions(&self) -> &cache::MappedRegions {
+        mapped_regions(&self.memory)
+    }
+    /// The region table as an owned handle (it keeps the backing mapped): for a device that publishes from its handler
+    /// (the PCI bus, a test device). A publish made in a vCPU's port or device exit is what the resident's remap trigger
+    /// sees (`seq` moved across the exit); one made by any other thread is not.
+    pub fn mapped_table(&self) -> MappedTable {
+        MappedTable(self.memory.clone())
     }
     /// Guest RAM through the host's alias.
     ///
@@ -965,6 +1020,20 @@ pub struct K1 {
     scanned_stale: u64,
     chain_dropped: u64,
     relisted: u64,
+    /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows installed onto regions and remap
+    /// shootdowns run (`Control::mapped_installs`, `remaps`); absent while both are zero (always without regions).
+    #[serde(skip_serializing_if = "K1Mapped::is_empty")]
+    mapped: K1Mapped,
+}
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Mapped {
+    installs: u64,
+    remaps: u64,
+}
+impl K1Mapped {
+    fn is_empty(&self) -> bool {
+        self.installs | self.remaps == 0
+    }
 }
 fn writers_empty(w: &[u64; natemu_abi::writers::count::COUNT]) -> bool {
     w.iter().all(|&n| n == 0)
@@ -1249,6 +1318,7 @@ impl K1 {
             scanned_stale: c.scanned_stale,
             chain_dropped: c.chain_dropped,
             relisted: c.relisted,
+            mapped: K1Mapped { installs: c.mapped_installs, remaps: c.remaps },
         }
     }
 }
@@ -7666,6 +7736,78 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// `Backing::machine`'s table rule: no region publishes nothing (`seq` stays 0, the default launch); regions publish
+    /// each entry disabled with its alias and length, so `seq` is nonzero before any vCPU runs.
+    #[test]
+    fn regions_are_published_before_any_vcpu() {
+        let table: Box<cache::MappedRegions> = Box::new(unsafe { std::mem::zeroed() });
+        publish_disabled(&table, &crate::vm::mapping_plan(1 << 30, &[]));
+        assert_eq!(table.read(), (0, [cache::MappedRegion::default(); exec::MAX_MAPPED_REGIONS]));
+        let plan = crate::vm::mapping_plan(1 << 30, &[2 << 20, 4 << 20]);
+        publish_disabled(&table, &plan);
+        let (seq, entries) = table.read();
+        assert_ne!(seq, 0);
+        for (i, e) in entries.iter().enumerate() {
+            let want = plan.aliases.get(i).map_or(cache::MappedRegion::default(), |&(alias, len)| cache::MappedRegion {
+                base: 0,
+                len,
+                alias,
+                enabled: 0,
+            });
+            assert_eq!(*e, want);
+        }
+    }
+
+    /// The mapped regions' alias (`exec::MAPPED_VA`, the const assert's bound: up to `MAX_MAPPED_BYTES` in the 3-4 GiB
+    /// hole's slots, below the firmware image's) in a backing with RAM above 3 GiB and the largest firmware image: no RAM
+    /// or firmware alias entry lies in its slots before it is written, and writing it changes no other entry of any
+    /// window's alias tables; each of its entries is an EL1 read/write, never executable block onto the region's IPA.
+    #[test]
+    fn alias_fits_the_hole_slots() {
+        let path = std::env::temp_dir().join(format!("natemu-mapped-alias-{}.elf", std::process::id()));
+        std::fs::write(&path, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let ram = exec::LOW_RAM_END as usize + cache::BLOCK;
+        let image = vec![0xcc; exec::MAX_FIRMWARE_BYTES as usize];
+        let b = prepare_with_firmware(path.to_str().unwrap(), cache::CODE_BYTES, 2, ram, false, &image).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let plan = crate::vm::mapping_plan(IPA + b.memory.1 as u64, &[exec::MAX_MAPPED_BYTES / 8; 8]);
+        let tables = exec::RAM_TABLES_OFFSET..exec::RAM_TABLES_OFFSET + (exec::PRIVATE_GIBS - 1) * 4096;
+        // The table word of private offset `at` (2 MiB blocks, one level-2 table per GiB after the first).
+        let word = |at: usize| exec::RAM_TABLES_OFFSET + ((at >> 30) - 1) * 4096 + (at % (1 << 30)) / cache::BLOCK * 8;
+        let slots: Vec<usize> = plan
+            .aliases
+            .iter()
+            .flat_map(|&(va, len)| ((va - PRIVATE) as usize..(va - PRIVATE + len) as usize).step_by(cache::BLOCK))
+            .collect();
+        assert_eq!(slots.len() * cache::BLOCK, exec::MAX_MAPPED_BYTES as usize);
+        let read = |window: usize, at: usize| u64::from_le_bytes(b.memory.read::<8>(window + at));
+        let snapshot = |window: usize| -> Vec<u64> { tables.clone().step_by(8).map(|at| read(window, at)).collect() };
+        let before: Vec<Vec<u64>> = (0..b.n).map(|v| snapshot(v * b.stride)).collect();
+        let firmware = word((exec::GUEST_RAM_VA - PRIVATE + exec::FIRMWARE_END - exec::MAX_FIRMWARE_BYTES) as usize);
+        for v in 0..b.n {
+            let window = v * b.stride;
+            assert_ne!(read(window, firmware), 0, "the firmware alias is there");
+            assert_ne!(read(window, word((exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize)), 0, "high RAM");
+            for &at in &slots {
+                assert_eq!(read(window, word(at)), 0, "a RAM or firmware alias entry at {at:#x}");
+                assert!(word(at) < firmware);
+            }
+        }
+        b.map_mapped(&plan);
+        let (pxn, uxn, ap) = (1u64 << 53, 1u64 << 54, 3u64 << 6);
+        for v in 0..b.n {
+            let window = v * b.stride;
+            let mut expected = before[v].clone();
+            for (k, &at) in slots.iter().enumerate() {
+                let d = read(window, word(at));
+                assert_eq!((d & 3, d & (pxn | uxn), d & ap), (1, pxn | uxn, 0), "{d:#x}");
+                assert_eq!(d & 0x0000_ffff_ffe0_0000, plan.maps[0].0 + (k * cache::BLOCK) as u64);
+                expected[(word(at) - tables.start) / 8] = d;
+            }
+            assert_eq!(snapshot(window), expected, "window {v}: only the region slots changed");
+        }
     }
 
     /// The legacy ROM page (SMBIOS's entry point at F0000H) in a prepared backing: the bytes land in the hole's backing,

@@ -201,6 +201,95 @@ impl Device for TestSource {
     }
 }
 
+/// Mapped device memory's test device (docs/restructure/mapped-device-memory-plan.md, `run-program --mapped-at GPA,LEN`
+/// and `--mapped-control-at GPA`): the control page of region 0. 8-byte registers: `MOVE` (+0, write: a new base for
+/// region 0, published into the region table from this handler, so the writing vCPU's exit spans the publish and its
+/// resident runs the remap shootdown; 0 disables the region; a base the driver does not allow, see
+/// [`MappedControl::allowed`], is refused), `SUM` (+8, read: the wrapping 64-bit sum of the region's words, read through a
+/// second, read-only mapping of the object, [`natemu::pci::memory::View`], never the guest's) and `FILL` (+16, write: the
+/// host fills the region, word k = [`fill_word`]`(value, k)`). Any other access is refused.
+pub struct MappedControl {
+    pub memory: Arc<natemu::pci::DeviceMemory>,
+    view: natemu::pci::memory::View,
+    /// The region table, region 0's alias and the vCPUs' halt hints (and their number), set once the machine exists (the
+    /// device is registered before it).
+    pub target: Arc<std::sync::OnceLock<(natemu::execution::MappedTable, u64, natemu::execution::io::HaltedView, usize)>>,
+    /// `MOVE`s published.
+    pub publishes: Arc<std::sync::atomic::AtomicU64>,
+    /// The vCPUs parked in a HLT when the last `MOVE` was published (`halted_peer_drops_on_wake` checks that its peers
+    /// were: else its shootdown met running peers only).
+    pub halted_at_publish: Arc<std::sync::Mutex<Vec<usize>>>,
+    /// Whether region 0 may be enabled at a base (every page clear of RAM, ROM, the driver's devices and this page).
+    pub allowed: Box<dyn Fn(u64) -> bool + Send>,
+}
+impl MappedControl {
+    pub(crate) const MOVE: u64 = 0;
+    pub(crate) const SUM: u64 = 8;
+    pub(crate) const FILL: u64 = 16;
+    pub fn new(memory: Arc<natemu::pci::DeviceMemory>, allowed: Box<dyn Fn(u64) -> bool + Send>) -> natemu::Result<Self> {
+        let view = memory.view()?;
+        Ok(Self {
+            memory,
+            view,
+            target: Default::default(),
+            publishes: Default::default(),
+            halted_at_publish: Default::default(),
+            allowed,
+        })
+    }
+    /// The sum of the region's words through the view.
+    pub fn sum(&self) -> u64 {
+        region_sum(&self.view, self.memory.len())
+    }
+}
+/// The wrapping sum of `len` bytes' words of `view`.
+pub fn region_sum(view: &natemu::pci::memory::View, len: u64) -> u64 {
+    let mut words = vec![0u64; 4096];
+    let mut sum = 0u64;
+    for at in (0..len).step_by(8 * words.len()) {
+        view.read_words(at, &mut words);
+        sum = words.iter().fold(sum, |a, &w| a.wrapping_add(w));
+    }
+    sum
+}
+/// `FILL`'s pattern: word `k` of the region for the value written.
+pub fn fill_word(value: u64, k: u64) -> u64 {
+    value ^ k.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+impl Device for MappedControl {
+    fn read(&mut self, _vcpu: usize, offset: u64, size: u64) -> Option<u64> {
+        (offset == Self::SUM && size == 8).then(|| self.sum())
+    }
+    fn write(&mut self, _vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
+        match (offset, size) {
+            (Self::FILL, 8) => {
+                let words: Vec<u64> = (0..self.memory.len() / 8).map(|k| fill_word(value, k)).collect();
+                self.memory.write_words(0, &words);
+                true
+            }
+            (Self::MOVE, 8) if value == 0 || (self.allowed)(value) => {
+                let Some((table, alias, halted, n)) = self.target.get() else {
+                    return false;
+                };
+                *self.halted_at_publish.lock().unwrap() = (0..*n).filter(|&v| halted.halted(v)).collect();
+                // The single writer: this device, under its registry lock (the driver's publishes precede every vCPU).
+                table.publish(
+                    0,
+                    natemu_abi::execution::cache::MappedRegion {
+                        base: value,
+                        len: self.memory.len(),
+                        alias: *alias,
+                        enabled: u32::from(value != 0),
+                    },
+                );
+                self.publishes.fetch_add(1, SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

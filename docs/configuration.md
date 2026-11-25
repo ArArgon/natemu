@@ -119,6 +119,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `inspect` | `true` | SIGINFO (Ctrl-T in a terminal, `kill -INFO`) prints every vCPU's state and the run goes on |
 | | `watchdog` | `60` | Seconds a vCPU may run guest code without a host exit before the run ends with its report; a vCPU waiting that long in the host (outside a compile) is reported once and the run goes on |
 | | `pci_testdev` | `false` | Test option: a PCI test device for guest test programs (see below) |
+| | `mapped_testdev` | `false` | Test option: a PCI test device whose memory the guest reads and writes directly (see below) |
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
 
@@ -129,6 +130,13 @@ table of tests; function 1 also has a 64 KiB memory region in which every 4-byte
 guest gets a PCI bus for it even when every other device is on `mmio`, and the bus then also passes the I/O ports
 C000H-FFFFH to its devices. The launch fails when all 31 slots are taken. The register layout is described in
 `crates/host/src/pci/testdev.rs`.
+
+`mapped_testdev = true` is a test option too. It adds natemu's own test device (vendor 1B36H, device 0005H, subsystem
+0100H) as function 0 of the lowest PCI slot still free. Its first memory region, 2 MiB, is memory held by natemu that
+the guest reads and writes at full speed, wherever the guest places it; its second, 4 KiB, has two registers: one reads
+the sum of the first region's contents and one fills it with a pattern. When it is on, natemu prints one more line to
+standard error before the stop line, `natemu: mapped {...}`, with how often the guest moved the region and how the
+processors followed. The register layout is described in `crates/host/src/pci/mapped_testdev.rs`.
 
 `[boot]` must name exactly one boot method: `[boot.kernel]` or `[boot.firmware]`; `[boot.uefi]` is refused
 for now.

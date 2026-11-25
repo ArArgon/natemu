@@ -152,6 +152,19 @@ pub const STACK_BYTES: usize = 0x8000;
 /// [`RAM_TABLES_OFFSET`], written by the host, never mapped); the backing holds RAM after every vCPU's block (the host's
 /// `Backing`).
 pub const GUEST_RAM_VA: u64 = PRIVATE + (2 << 30);
+/// Mapped device memory: the resident's EL1-only alias of the VM's mapped regions, region i at `MAPPED_VA` plus the sum of
+/// the lengths before it (host `vm::mapping_plan`). The alias slots of the 3-4 GiB PC hole: present in every window's
+/// tables and never used by RAM (the hole is not RAM; RAM above 3 GiB is aliased from 4 GiB), below the firmware image's.
+pub const MAPPED_VA: u64 = GUEST_RAM_VA + (3 << 30);
+/// At most this many regions, of at most [`MAX_MAPPED_BYTES`] together (the PCI memory window's 256 MiB).
+pub const MAX_MAPPED_REGIONS: usize = 8;
+pub const MAX_MAPPED_BYTES: u64 = 256 << 20;
+const _: () = assert!(
+    MAPPED_VA == GUEST_RAM_VA + LOW_RAM_END
+        && MAPPED_VA + MAX_MAPPED_BYTES <= GUEST_RAM_VA + FIRMWARE_END - MAX_FIRMWARE_BYTES
+        && FIRMWARE_END == HIGH_RAM_START
+        && MAPPED_VA + MAX_MAPPED_BYTES <= PRIVATE + PRIVATE_BYTES
+);
 /// Capacity follows the private page-table space below the resident stacks.
 pub const MAX_GUEST_RAM_BYTES: usize =
     MAX_GUEST_PHYS_BYTES - (HIGH_RAM_START - LOW_RAM_END) as usize;
@@ -705,7 +718,81 @@ pub mod cache {
         /// The fast miss path's entry (fast-miss plan section 5): before its checks, with the target and the state record as the
         /// miss left them.
         pub const MISS_FAST_CHECK: u64 = 13;
+        /// Mapped device memory's install (`execution.rs` `install_mapped`): after the region table's read, before the
+        /// shadow's install (the holder race: a remap published while a vCPU is held here).
+        pub const MAPPED_BEFORE_INSTALL: u64 = 14;
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
+    }
+
+    /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): the region table, a [`MappedRegions`] after
+    /// the scheduling-test metadata. All zero (no region, `seq` 0) when the VM maps none.
+    pub const MAPPED: usize =
+        (io_test::BASE + (io_test::HOST + 1) * io_test::STRIDE).next_multiple_of(64);
+    const _: () = assert!(MAPPED + core::mem::size_of::<MappedRegions>() <= CODE_PAGES);
+    /// One region as [`MappedRegions::read`] gives it: its guest-physical `base` and `len` (bytes), the resident's alias
+    /// of its first byte (`alias`, at [`super::MAPPED_VA`] or above) and whether it decodes (`enabled` nonzero).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct MappedRegion {
+        pub base: u64,
+        pub len: u64,
+        pub alias: u64,
+        pub enabled: u32,
+    }
+    #[repr(C)]
+    pub struct MappedSlot {
+        base: core::sync::atomic::AtomicU64,
+        len: core::sync::atomic::AtomicU64,
+        alias: core::sync::atomic::AtomicU64,
+        enabled: core::sync::atomic::AtomicU32,
+        reserved: u32,
+    }
+    /// The region table: written only by the host (one writer at a time: the bus's lock), read by residents. A seqlock:
+    /// `seq` is even while the entries are stable and odd while one is being written, so a reader that sees the same
+    /// even `seq` before and after its reads saw one publication's entries whole. No field of [`Control`]: it is shared.
+    #[repr(C)]
+    pub struct MappedRegions {
+        pub seq: core::sync::atomic::AtomicU64,
+        pub entries: [MappedSlot; super::MAX_MAPPED_REGIONS],
+    }
+    impl MappedRegions {
+        /// Replaces entry `i` (the single writer only).
+        pub fn publish(&self, i: usize, region: MappedRegion) {
+            use core::sync::atomic::{Ordering::{Relaxed, Release}, fence};
+            let seq = self.seq.load(Relaxed);
+            self.seq.store(seq + 1, Relaxed);
+            fence(Release);
+            let e = &self.entries[i];
+            e.base.store(region.base, Relaxed);
+            e.len.store(region.len, Relaxed);
+            e.alias.store(region.alias, Relaxed);
+            e.enabled.store(region.enabled, Relaxed);
+            self.seq.store(seq + 2, Release);
+        }
+        /// A consistent copy of every entry and the (even) `seq` it was published under; retries while a write is in
+        /// progress or one completed during the reads.
+        pub fn read(&self) -> (u64, [MappedRegion; super::MAX_MAPPED_REGIONS]) {
+            use core::sync::atomic::{Ordering::{Acquire, Relaxed}, fence};
+            loop {
+                let seq = self.seq.load(Acquire);
+                if seq & 1 != 0 {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                let regions = core::array::from_fn(|i| {
+                    let e = &self.entries[i];
+                    MappedRegion {
+                        base: e.base.load(Relaxed),
+                        len: e.len.load(Relaxed),
+                        alias: e.alias.load(Relaxed),
+                        enabled: e.enabled.load(Relaxed),
+                    }
+                });
+                fence(Acquire);
+                if self.seq.load(Relaxed) == seq {
+                    return (seq, regions);
+                }
+            }
+        }
     }
 
     /// The word and bit of `rip` in [`Control::x87_varied`].
@@ -1029,6 +1116,12 @@ pub mod cache {
         /// the alias as the firmware image's are; `(0, 0)`, the default, is none. Set by the host before any vCPU runs
         /// (`Backing::write_legacy_rom`, a direct boot with SMBIOS); never with a firmware image. Appended.
         pub legacy_rom: (u64, u64),
+        /// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows installed onto a mapped region's
+        /// pages (a plain counter in every build; zero in a VM without regions). Appended.
+        pub mapped_installs: u64,
+        /// Mapped device memory: remap shootdowns this vCPU ran (`cache::remap_shootdown`, after a port or device exit that
+        /// spanned a publish of the region table). Appended.
+        pub remaps: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -4616,6 +4709,55 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// The region table's seqlock: a reader racing a writer that publishes whole entries derived from one counter never
+    /// gets a mix of two publications (every field of an entry it returns comes from the same one), and `seq` is even.
+    #[test]
+    fn seqlock_reader_never_sees_a_half_entry() {
+        extern crate std;
+        use super::cache::{MappedRegion, MappedRegions};
+        use core::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let entry = |k: u64| MappedRegion { base: k << 21, len: !k, alias: k.rotate_left(17), enabled: k as u32 | 1 };
+        // SAFETY: plain atomics; all-zero is the empty table.
+        let table: std::boxed::Box<MappedRegions> = std::boxed::Box::new(unsafe { core::mem::zeroed() });
+        // A fixed number of writes, each followed by a short pause of varying length: a writer that never pauses would
+        // starve the reader (every read retried), and the varying pauses put reads across every point of a write.
+        const WRITES: u64 = 100_000;
+        let done = AtomicBool::new(false);
+        let mut seen = 0u64;
+        std::thread::scope(|t| {
+            t.spawn(|| {
+                for k in 1..=WRITES {
+                    table.publish(3, entry(k));
+                    for _ in 0..k % 64 {
+                        core::hint::spin_loop();
+                    }
+                }
+                done.store(true, Release);
+            });
+            // At least one read after the writer finished (seeing its last entry), so `seen` counts one even if this
+            // thread did not run while it wrote.
+            loop {
+                let finished = done.load(Acquire);
+                let (seq, regions) = table.read();
+                assert_eq!(seq & 1, 0);
+                let e = regions[3];
+                if e != MappedRegion::default() {
+                    assert_eq!(e, entry(e.base >> 21), "a half entry under seq {seq}");
+                    seen += 1;
+                }
+                assert!(regions.iter().enumerate().all(|(i, r)| i == 3 || *r == MappedRegion::default()));
+                if finished {
+                    break;
+                }
+            }
+        });
+        assert!(seen > 0);
+        assert_eq!(table.read(), (2 * WRITES, {
+            let mut r = [MappedRegion::default(); super::MAX_MAPPED_REGIONS];
+            r[3] = entry(WRITES);
+            r
+        }));
+    }
     /// Every shared probe of a page-crossing store ([`super::probe`]), decoded field by field: for each (bitness, address
     /// register, width) the probe saves the return in d0, sends an armed breakpoint and (64-bit) a wrapping store or (32-bit)
     /// one above 4 GiB to its `brk`, probes exactly the store's first and last byte through its register, and returns through

@@ -377,6 +377,14 @@ unsafe fn copy_spans(spans: &[Span]) {
     }
 }
 
+/// Which vCPUs are parked in a HLT ([`Backing::halted_view`]; the same hint as [`Backing::halted`]).
+#[derive(Clone)]
+pub struct HaltedView(Arc<Memory>, usize);
+impl HaltedView {
+    pub fn halted(&self, v: usize) -> bool {
+        v >= self.1 || quiescent(&self.0, v).load(SeqCst) == 1
+    }
+}
 impl Backing {
     #[cfg(feature = "testing")]
     pub fn io_window_status(&self) -> WindowStatus {
@@ -552,6 +560,10 @@ impl Backing {
     /// at any moment.
     pub fn halted(&self, v: usize) -> bool {
         v >= self.n || quiescent(&self.memory, v).load(SeqCst) == 1
+    }
+    /// [`Self::halted`] as an owned handle (it keeps the backing mapped), for a device's handler.
+    pub fn halted_view(&self) -> HaltedView {
+        HaltedView(self.memory.clone(), self.n)
     }
     /// As [`Self::copy_guest_with_permit`], without pausing vCPUs in the usual case (the
     /// "windowless copies" design in `docs/restructure/io-plan.md`). `transfers[..publish]` is the

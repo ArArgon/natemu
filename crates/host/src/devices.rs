@@ -248,6 +248,14 @@ impl Devices {
         }
         Ok(if data.is_some() { 0 } else { value })
     }
+    /// The unassigned-page counts ([reads, writes], as [`Devices::report`]'s) of the pages in `[start, end)`: for mapped
+    /// device memory, the accesses to a region's range that reached the host instead of the region.
+    pub fn page_accesses(&self, start: u64, end: u64) -> [u64; 2] {
+        let pages = self.page_counts.lock().unwrap_or_else(|e| e.into_inner());
+        pages
+            .range(start..end)
+            .fold([0, 0], |[r, w], (_, &[reads, writes])| [r + reads, w + writes])
+    }
     /// L3: the run report's port and unassigned-page counts.
     pub fn report(&self) -> AccessCounts {
         let ports = self.port_counts.lock().unwrap_or_else(|e| e.into_inner());

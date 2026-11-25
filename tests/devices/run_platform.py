@@ -16,6 +16,7 @@ import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().par
 import argparse
 import dataclasses
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -39,6 +40,255 @@ KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e
 MODULES = ('pvpanic_mmio', 'psmouse')
 APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'ls', 'basename', 'readlink', 'dmesg', 'sync',
            'poweroff', 'reboot', 'sleep', 'stty')
+# mapped-bar (debug.mapped_testdev, crates/host/src/pci/mapped_testdev.rs): the test function's identity, its region,
+# the pattern the guest writes into it (word k, little-endian), the value it writes to FILL (the host's pattern is
+# MAPPED_FILL ^ k * 9E3779B97F4A7C15H) and the base it moves the region to.
+MAPPED_SUBSYSTEM = '0x0100'
+MAPPED_REGION = 2 << 20
+MAPPED_FILL = 0x0123_4567_89AB_CDEF
+MAPPED_NEW = 0xE800_0000
+MAPPED_TOOL = 'bin/mapped-tool'
+# Read back at the old base after the move with devmem's 8-byte loads (it is a device page there, where natemu refuses
+# string forms: a copy through write() would stop unsupported_mmio): each must be all-ones.
+MAPPED_OLD_OFFSETS = (0, 0x1000, 0x1_0000, MAPPED_REGION - 8)
+MASK64 = (1 << 64) - 1
+
+
+def mapped_pattern() -> bytes:
+    return b''.join(((k * 0x2545_F491_4F6C_DD1D + 0x5851_F42D_4C95_7F2D) & MASK64).to_bytes(8, 'little')
+                    for k in range(MAPPED_REGION // 8))
+
+
+def mapped_fill() -> bytes:
+    return b''.join((MAPPED_FILL ^ (k * 0x9E37_79B9_7F4A_7C15) & MASK64).to_bytes(8, 'little') for k in range(MAPPED_REGION // 8))
+
+
+def word_sum(data: bytes) -> int:
+    return sum(int.from_bytes(data[i:i + 8], 'little') for i in range(0, len(data), 8)) & MASK64
+
+
+# The mapped-bar case's tool (its header says more): copies data into and out of the region through an mmap of
+# /dev/mem (read() and write() of /dev/mem stop at the end of RAM), and holds a mapping of one page across the region's
+# move (BusyBox's devmem maps afresh each time, so only a long-lived mapping can see a shadow the move left stale).
+# Assembled by prepare with nasm.
+MAPPED_TOOL_ASM = r'''; mapped-tool MODE ADDRESS ARG (numbers hexadecimal, 0x optional): a static x86-64 Linux program, `nasm -f bin` makes the
+; whole ELF file. It maps physical ADDRESS through /dev/mem (O_SYNC, MAP_SHARED): read() and write() of /dev/mem stop at
+; the end of RAM on x86 (valid_phys_addr_range), so BusyBox's dd cannot reach a BAR above it; mmap can.
+;   i ADDRESS LEN   standard input into the LEN bytes at ADDRESS (read() straight into the mapping)
+;   o ADDRESS LEN   the LEN bytes at ADDRESS to standard output (write() straight from the mapping)
+;   w ADDRESS MASK  pins itself to the CPU set MASK (sched_setaffinity), maps the page at ADDRESS read-only, reads its
+;                   first 8 bytes and prints `armed   VALUE`; then reads them again in a loop of plain loads (no system
+;                   call, no exit to the host: what translated code does with a shadow it holds) until they differ, at
+;                   most 30 s (CLOCK_MONOTONIC every 65536 reads), and prints `changed VALUE` (exit 0) or
+;                   `stale   VALUE` (exit 1). VALUE is 16 hexadecimal digits.
+; Errors exit 2 (arguments), 3 (affinity), 4 (open), 5 (mmap) or 6 (a short or failed read or write).
+bits 64
+org 0x400000
+ehdr:
+    db 0x7f, 'ELF', 2, 1, 1, 0
+    times 8 db 0
+    dw 2, 62                                   ; ET_EXEC, EM_X86_64
+    dd 1
+    dq start, phdr - ehdr, 0
+    dd 0
+    dw 64, 56, 1, 0, 0, 0
+phdr:
+    dd 1, 7                                    ; PT_LOAD, read/write/execute
+    dq 0, ehdr, ehdr, file_end - ehdr, file_end - ehdr, 0x1000
+
+start:
+    cmp qword [rsp], 4
+    jne usage
+    mov rdi, [rsp + 16]
+    movzx r13d, byte [rdi]                     ; the mode
+    cmp byte [rdi + 1], 0
+    jne usage
+    mov rdi, [rsp + 24]
+    call hex
+    mov r12, rax                               ; the address
+    mov rdi, [rsp + 32]
+    call hex
+    mov rbp, rax                               ; the length or the CPU set
+    cmp r13d, 'w'
+    je watch
+    cmp r13d, 'i'
+    je copy
+    cmp r13d, 'o'
+    jne usage
+
+copy:
+    call open_mem
+    mov rsi, rbp
+    mov edx, 3                                 ; PROT_READ | PROT_WRITE
+    call map
+    mov r12, rax
+    xor ebx, ebx                               ; bytes done
+.next:
+    cmp rbx, rbp
+    jae .done
+    mov rdx, rbp
+    sub rdx, rbx
+    lea rsi, [r12 + rbx]
+    xor edi, edi                               ; read(0, ...)
+    xor eax, eax
+    cmp r13d, 'i'
+    je .call
+    mov edi, 1                                 ; write(1, ...)
+    mov eax, 1
+.call:
+    syscall
+    mov edi, 6
+    test rax, rax
+    jle exit
+    add rbx, rax
+    jmp .next
+.done:
+    xor edi, edi
+    jmp exit
+
+watch:
+    mov [rel mask], rbp
+    mov eax, 203                               ; sched_setaffinity(0, 8, &mask)
+    xor edi, edi
+    mov esi, 8
+    lea rdx, [rel mask]
+    syscall
+    mov edi, 3
+    test rax, rax
+    jnz exit
+    call open_mem
+    mov esi, 4096
+    mov edx, 1                                 ; PROT_READ
+    call map
+    mov r12, rax
+    mov rbx, [r12]
+    mov rax, rbx
+    lea rsi, [rel armed]
+    call report
+    call now
+    lea r15, [rax + 30]                        ; the deadline, in seconds
+.outer:
+    mov r14d, 0x10000
+.inner:
+    mov rax, [r12]
+    cmp rax, rbx
+    jne .changed
+    dec r14d
+    jnz .inner
+    call now
+    cmp rax, r15
+    jb .outer
+    mov rax, [r12]
+    lea rsi, [rel stale]
+    call report
+    mov edi, 1
+    jmp exit
+.changed:
+    lea rsi, [rel changed]
+    call report
+    xor edi, edi
+exit:
+    mov eax, 60
+    syscall
+usage:
+    mov edi, 2
+    jmp exit
+
+; r8 = a descriptor of /dev/mem, opened O_RDWR | O_SYNC
+open_mem:
+    mov eax, 2
+    lea rdi, [rel devmem]
+    mov esi, 0x101002
+    xor edx, edx
+    syscall
+    mov edi, 4
+    test rax, rax
+    js exit
+    mov r8, rax
+    ret
+
+; rax = mmap(0, rsi, edx, MAP_SHARED, r8, r12)
+map:
+    mov r9, r12
+    xor edi, edi
+    mov r10d, 1
+    mov eax, 9
+    syscall
+    mov edi, 5
+    cmp rax, -4095
+    jae exit
+    ret
+
+; rax = CLOCK_MONOTONIC's seconds
+now:
+    sub rsp, 16
+    mov eax, 228
+    mov edi, 1
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    ret
+
+; rax = the hexadecimal number at rdi (0x optional); a byte that is not a digit is a usage error
+hex:
+    xor eax, eax
+    cmp word [rdi], '0x'
+    jne .next
+    add rdi, 2
+.next:
+    movzx ecx, byte [rdi]
+    test ecx, ecx
+    jz .end
+    cmp ecx, '9'
+    jbe .digit
+    or ecx, 0x20
+    sub ecx, 'a' - 10 - '0'
+.digit:
+    sub ecx, '0'
+    cmp ecx, 15
+    ja usage
+    shl rax, 4
+    or rax, rcx
+    inc rdi
+    jmp .next
+.end:
+    ret
+
+; writes the 8-byte label at rsi, then rax as 16 hexadecimal digits and a newline, to standard output
+report:
+    lea rdi, [rel line]
+    mov ecx, 8
+    rep movsb
+    mov ecx, 16
+.digit:
+    rol rax, 4
+    mov edx, eax
+    and edx, 15
+    lea r8, [rel digits]
+    mov dl, [r8 + rdx]
+    mov [rdi], dl
+    inc rdi
+    dec ecx
+    jnz .digit
+    mov byte [rdi], 10
+    mov eax, 1
+    mov edi, 1
+    lea rsi, [rel line]
+    mov edx, 25
+    syscall
+    ret
+
+devmem:  db '/dev/mem', 0
+armed:   db 'armed   '
+changed: db 'changed '
+stale:   db 'stale   '
+digits:  db '0123456789abcdef'
+align 8
+mask:    dq 0
+line:    times 32 db 0
+file_end:
+'''
 VM_SECONDS = 120
 CMDLINE = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 PVPANIC_CAPABILITY = '/sys/bus/platform/devices/QEMU0001:00/capability'
@@ -111,6 +361,64 @@ case_pci_multibar() {
   pass
 }
 
+# mapped-bar (debug.mapped_testdev): the mapped-memory test function (vendor 1b36, device 0005, subsystem 0100), no
+# driver bound. `enable` turns memory decoding on, which maps BAR0 (2 MiB of device memory); the init writes the
+# pattern (/mapped-pattern) into it and reads it back (bin/mapped-tool i and o: through an mmap of /dev/mem, whose
+# read and write stop at the end of RAM), reads BAR2's SUM (the host's sum of the region's words), writes FILL and reads
+# the host's pattern back and SUM again. Then the move: the probe (mapped-tool w, on the last CPU) maps
+# BAR0's first page and spins on it; the init turns memory decoding off through the sysfs config file,
+# writes BAR0's new base (MAPPED_NEW), turns decoding on again, and the probe must see its old mapping read all-ones
+# (no shadow of the old base survives on any vCPU); the region's data must be at the new base and all-ones at the old
+# (devmem loads at MAPPED_OLD_OFFSETS).
+le_bytes() {
+  v=$1 n=$2 out=
+  while test "$n" -gt 0; do out="$out\\$(printf %03o $((v & 255)))"; v=$((v >> 8)); n=$((n - 1)); done
+  printf "$out"
+}
+# The configuration writes run pinned to CPU 0, the probe on the last CPU: at 2 vCPUs the writing vCPU is never the probe's.
+cfg_write() { le_bytes "$4" "$3" | busybox taskset 1 busybox dd of="$1/config" bs="$3" seek=$(($2 / $3)) count=1 conv=notrunc 2>/dev/null || fail "config write $2"; }
+region_digest() { { /@MAPPED_TOOL@ o "$1" @MAPPED_REGION_HEX@ || echo "tool exit $?"; } | busybox sha256sum | while read -r sum _; do echo "$sum"; done; }
+case_mapped_bar() {
+  for applet in devmem hexdump dd printf sha256sum taskset; do
+    busybox --list | grep -x "$applet" >/dev/null || fail "BusyBox has no $applet applet"
+  done
+  dev=
+  for d in /sys/bus/pci/devices/*; do
+    test "$(cat "$d/vendor") $(cat "$d/device") $(cat "$d/subsystem_device")" = '0x1b36 0x0005 @MAPPED_SUBSYSTEM@' && dev=$d
+  done
+  test -n "$dev" || fail "no mapped test function (1b36:0005, subsystem @MAPPED_SUBSYSTEM@)"
+  echo "PLATFORM-MAPPED-FUNCTION $(basename "$dev")"
+  echo 1 > "$dev/enable" || fail enable
+  cmd=$((0x$(pci_command "$dev")))
+  echo "PLATFORM-MAPPED-COMMAND $cmd"
+  bar=0
+  while test $bar -lt 6 && read -r start end flags; do eval "bar$bar=$start"; bar=$((bar + 1)); done < "$dev/resource"
+  echo "PLATFORM-MAPPED-BARS $bar0 $bar2"
+  /@MAPPED_TOOL@ i "$bar0" @MAPPED_REGION_HEX@ < /mapped-pattern || fail "pattern write: mapped-tool exit $?"
+  echo "PLATFORM-MAPPED-DIGEST pattern $(region_digest "$bar0")"
+  echo "PLATFORM-MAPPED-SUM pattern $(busybox devmem $((bar2 + 8)) 64)"
+  busybox devmem $((bar2 + 16)) 64 @MAPPED_FILL@ || fail "FILL"
+  echo "PLATFORM-MAPPED-DIGEST fill $(region_digest "$bar0")"
+  echo "PLATFORM-MAPPED-SUM fill $(busybox devmem $((bar2 + 8)) 64)"
+  old=$(printf 0x%x $((bar0))) new=@MAPPED_NEW@
+  /@MAPPED_TOOL@ w $old $(printf %x $((1 << ($(nproc) - 1)))) > /tmp/probe.out 2>&1 &
+  probe=$!
+  n=0
+  until grep -q '^armed' /tmp/probe.out || test $n -ge 30; do sleep 1; n=$((n + 1)); done
+  cfg_write "$dev" 4 2 $((cmd & ~2))
+  cfg_write "$dev" 16 4 $((new))
+  cfg_write "$dev" 20 4 0
+  cfg_write "$dev" 4 2 $cmd
+  wait $probe
+  echo "PLATFORM-MAPPED-PROBE-STATUS $?"
+  while read -r line; do echo "PLATFORM-MAPPED-PROBE $line"; done < /tmp/probe.out
+  echo "PLATFORM-MAPPED-MOVED $old $new $(busybox hexdump -s 16 -n 8 -e '2/4 "%08x "' "$dev/config")"
+  echo "PLATFORM-MAPPED-DIGEST new $(region_digest $new)"
+  echo PLATFORM-MAPPED-OLD $(for at in @MAPPED_OLD_OFFSETS@; do busybox devmem $((old + at)) 64; done)
+  echo "PLATFORM-MAPPED-SUM moved $(busybox devmem $((bar2 + 8)) 64)"
+  pass
+}
+
 # pvpanic-panic: the stock driver finds the ACPI device and its capability (PANICKED and CRASH_LOADED), then a panic
 # (panic=0: the kernel does not reboot) must end the run through the device. platform_skip_capability (the runner's
 # --skip-capability) goes straight to the panic.
@@ -167,13 +475,18 @@ case_platform_off() {
 
 case "$name" in
   pci-multibar) case_pci_multibar;;
+  mapped-bar) case_mapped_bar;;
   pvpanic-panic) case_pvpanic_panic;;
   platform) case_platform;;
   platform-off) case_platform_off;;
   *) fail "unknown case '$name'";;
 esac
 fail "case $name returned"
-'''.replace('@KVER@', KVER).replace('@CAPABILITY@', PVPANIC_CAPABILITY).replace('@MOUSE_PHYS@', PS2_MOUSE_PHYS)
+'''.replace('@KVER@', KVER).replace('@CAPABILITY@', PVPANIC_CAPABILITY).replace('@MOUSE_PHYS@', PS2_MOUSE_PHYS) \
+   .replace('@MAPPED_SUBSYSTEM@', MAPPED_SUBSYSTEM) \
+   .replace('@MAPPED_FILL@', hex(MAPPED_FILL)).replace('@MAPPED_NEW@', hex(MAPPED_NEW)).replace('@MAPPED_TOOL@', MAPPED_TOOL) \
+   .replace('@MAPPED_REGION_HEX@', f'{MAPPED_REGION:x}') \
+   .replace('@MAPPED_OLD_OFFSETS@', ' '.join(map(str, MAPPED_OLD_OFFSETS)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,7 +527,7 @@ def stopped(run: Run, line: str, status: int) -> list:
 # function 0's BAR0 keeps the slot's 64 KiB stride address; the rest of memory goes from E0200000H largest first
 # (function 1's 64 KiB BAR2-3, then its BAR0); I/O from C000H, lowest function first. The judged bits also take
 # IORESOURCE_DISABLED and IORESOURCE_UNSET, expected clear: a BAR the kernel left unassigned or disabled fails.
-PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf')
+PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf', 'sha256sum', 'taskset')
 PCI_IO, PCI_MEM, PCI_PREFETCH, PCI_MEM_64 = 0x100, 0x200, 0x2000, 0x100000
 PCI_DISABLED, PCI_UNSET = 0x1000_0000, 0x2000_0000
 PCI_TYPE = PCI_IO | PCI_MEM | PCI_PREFETCH | PCI_MEM_64 | PCI_DISABLED | PCI_UNSET
@@ -341,6 +654,109 @@ def self_check_pci_multibar():
     print(f'pci-multibar: {len(bad)} negative judge controls passed.')
 
 
+# mapped-bar: where natemu's launch places the function's BARs (crates/host/src/pci/place.rs: memory BARs from E0200000H,
+# largest first) and what the host reports at the end (`natemu: mapped {...}` on standard error, before the stop line).
+MAPPED_BAR0, MAPPED_BAR2 = 0xE020_0000, 0xE040_0000
+MAPPED_LINE = re.compile(r'^natemu: mapped (\{.*\})$', re.M)
+
+
+def judge_mapped_bar(run: Run) -> list:
+    errors = common(run)
+    marks = lambda tag: re.findall(rf'^PLATFORM-MAPPED-{tag} (.*)$', run.serial, re.M)
+    pattern, fill = mapped_pattern(), mapped_fill()
+    sha = lambda data: hashlib.sha256(data).hexdigest()
+    if hexes(' '.join(marks('BARS'))) != [MAPPED_BAR0, MAPPED_BAR2]:
+        errors.append(f'BARs {marks("BARS")}, expected BAR0 at {MAPPED_BAR0:#x} and BAR2 at {MAPPED_BAR2:#x}')
+    if [int(c) & 2 for c in marks('COMMAND')] != [2]: errors.append(f'Command after enable {marks("COMMAND")}: no memory decoding')
+    digests = dict(m.split(None, 1) for m in marks('DIGEST') if len(m.split()) == 2)
+    want = {'pattern': sha(pattern), 'fill': sha(fill), 'new': sha(fill)}
+    for what, digest in want.items():
+        if digests.get(what) != digest: errors.append(f'region digest {what} {digests.get(what)!r}, expected {digest}')
+    if [hexes(m) for m in marks('OLD')] != [[MASK64] * len(MAPPED_OLD_OFFSETS)]:
+        errors.append(f'old base reads {marks("OLD")}, expected all-ones at offsets {MAPPED_OLD_OFFSETS}')
+    sums = {m.split()[0]: hexes(m.split(None, 1)[1]) if len(m.split()) == 2 else None for m in marks('SUM')}
+    for what, data in (('pattern', pattern), ('fill', fill), ('moved', fill)):
+        if sums.get(what) != [word_sum(data)]: errors.append(f'SUM {what} {sums.get(what)}, expected [{word_sum(data):#x}]')
+    probe = [m.split() for m in marks('PROBE')]
+    ones, first = MASK64, int.from_bytes(fill[:8], 'little')
+    if probe != [['armed', f'{first:016x}'], ['changed', f'{ones:016x}']] or marks('PROBE-STATUS') != ['0']:
+        errors.append(f'probe {probe} status {marks("PROBE-STATUS")}: expected its mapping of the old base to read '
+                      f'{first:016x}, then all-ones once the region moved (a stale shadow keeps the old value)')
+    moved = marks('MOVED')
+    if not moved or hexes(moved[0]) != [MAPPED_BAR0, MAPPED_NEW, MAPPED_NEW | 0xC, 0]:
+        errors.append(f'move {moved}, expected BAR0 from {MAPPED_BAR0:#x} to {MAPPED_NEW:#x} (64-bit prefetchable)')
+    reports = MAPPED_LINE.findall(run.stderr)
+    host = json.loads(reports[-1]) if reports else {}
+    if not host: errors.append('no "natemu: mapped" report on standard error')
+    else:
+        if host.get('regions') != [{'base': MAPPED_NEW, 'len': MAPPED_REGION, 'enabled': 1}]:
+            errors.append(f'region table at the end {host.get("regions")}, expected one region enabled at {MAPPED_NEW:#x}')
+        publishes, remaps, installs = host.get('publishes', 0), host.get('remaps', []), host.get('mapped_installs', [])
+        if publishes < 3: errors.append(f'{publishes} publishes, expected at least 3 (enable, decoding off, decoding on)')
+        if len(remaps) != run.vcpus or sum(remaps) < publishes:
+            errors.append(f'remaps {remaps}: expected at least one per publish ({publishes}), each in the exit that made it')
+        if len(installs) != run.vcpus or not sum(installs): errors.append(f'mapped_installs {installs}: expected some')
+    if 'PLATFORM-PASS' not in run.serial: errors.append('the init did not finish (no PLATFORM-PASS)')
+    return errors + stopped(run, 'natemu: Power(1)', 0)
+
+
+def self_check_mapped_bar():
+    """mapped-bar's judge on a synthetic passing log and its negative controls, among them what the remap break gives
+    (the probe's mapping of the old base still reading the region)."""
+    pattern, fill = mapped_pattern(), mapped_fill()
+    sha = lambda data: hashlib.sha256(data).hexdigest()
+    first = int.from_bytes(fill[:8], 'little')
+    lines = [f'PLATFORM-BEGIN case=mapped-bar cpus=2 kernel={KVER}', 'PLATFORM-MAPPED-FUNCTION 0000:00:01.0',
+             'PLATFORM-MAPPED-COMMAND 2', f'PLATFORM-MAPPED-BARS 0x{MAPPED_BAR0:016x} 0x{MAPPED_BAR2:016x}',
+             f'PLATFORM-MAPPED-DIGEST pattern {sha(pattern)}', f'PLATFORM-MAPPED-SUM pattern 0x{word_sum(pattern):016X}',
+             f'PLATFORM-MAPPED-DIGEST fill {sha(fill)}', f'PLATFORM-MAPPED-SUM fill 0x{word_sum(fill):016X}',
+             'PLATFORM-MAPPED-PROBE-STATUS 0', f'PLATFORM-MAPPED-PROBE armed {first:016x}',
+             'PLATFORM-MAPPED-PROBE changed ffffffffffffffff',
+             f'PLATFORM-MAPPED-MOVED 0x{MAPPED_BAR0:x} 0x{MAPPED_NEW:x} {MAPPED_NEW | 0xc:08x} 00000000 ',
+             f'PLATFORM-MAPPED-DIGEST new {sha(fill)}', 'PLATFORM-MAPPED-OLD' + ' 0xFFFFFFFFFFFFFFFF' * len(MAPPED_OLD_OFFSETS),
+             f'PLATFORM-MAPPED-SUM moved 0x{word_sum(fill):016X}', 'PLATFORM-PASS']
+    host = {'regions': [{'base': MAPPED_NEW, 'len': MAPPED_REGION, 'enabled': 1}], 'publishes': 3,
+            'mapped_installs': [700, 3], 'remaps': [3, 0]}
+    stderr = f'natemu: mapped {json.dumps(host)}\nnatemu: Power(1)\n'
+    good = Run('mapped-bar', 2, '\n'.join(lines) + '\n', stderr, 0, False, None)
+    judge = CASES['mapped-bar'].judge
+    assert not judge(good), judge(good)
+    def swap(old, new): return dataclasses.replace(good, serial=good.serial.replace(old, new))
+    def host_with(**kv): return dataclasses.replace(good, stderr=f'natemu: mapped {json.dumps(host | kv)}\nnatemu: Power(1)\n')
+    stale = good.serial.replace('PROBE-STATUS 0', 'PROBE-STATUS 1').replace('changed ffffffffffffffff', f'stale   {first:016x}')
+    bad = {'stale shadow': dataclasses.replace(good, serial=stale),
+           'probe never armed': swap(f'PLATFORM-MAPPED-PROBE armed {first:016x}\n', ''),
+           'probe saw no data': swap(f'armed {first:016x}', 'armed ffffffffffffffff'),
+           'old base serves data': swap('MAPPED-OLD 0xFFFFFFFFFFFFFFFF', 'MAPPED-OLD 0x0123456789ABCDEF'),
+           'no old read': swap('PLATFORM-MAPPED-OLD', 'PLATFORM-MAPPED-NOT-OLD'),
+           'new base empty': swap(f'DIGEST new {sha(fill)}', f'DIGEST new {sha(bytes([255]) * MAPPED_REGION)}'),
+           'pattern lost': swap(f'DIGEST pattern {sha(pattern)}', f'DIGEST pattern {sha(bytes(MAPPED_REGION))}'),
+           'no FILL': swap(f'DIGEST fill {sha(fill)}', f'DIGEST fill {sha(pattern)}'),
+           'SUM': swap(f'SUM pattern 0x{word_sum(pattern):016X}', 'SUM pattern 0xFFFFFFFFFFFFFFFF'),
+           'SUM after the move': swap(f'SUM moved 0x{word_sum(fill):016X}', 'SUM moved 0x0000000000000000'),
+           'other BAR0': swap(f'0x{MAPPED_BAR0:016x} 0x{MAPPED_BAR2:016x}', f'0x{MAPPED_BAR0 + MAPPED_REGION:016x} 0x{MAPPED_BAR2:016x}'),
+           'not moved': swap(f'{MAPPED_NEW | 0xc:08x} 00000000', f'{MAPPED_BAR0 | 0xc:08x} 00000000'),
+           'no decoding': swap('COMMAND 2', 'COMMAND 0'),
+           'no host report': dataclasses.replace(good, stderr='natemu: Power(1)\n'),
+           'table not moved': host_with(regions=[{'base': MAPPED_BAR0, 'len': MAPPED_REGION, 'enabled': 1}]),
+           'table off': host_with(regions=[{'base': 0, 'len': MAPPED_REGION, 'enabled': 0}]),
+           'no remaps': host_with(remaps=[0, 0]),
+           'fewer remaps': host_with(remaps=[1, 1]),
+           'no publishes': host_with(publishes=0, remaps=[0, 0]),
+           'no installs': host_with(mapped_installs=[0, 0]),
+           'one vCPU listed': host_with(remaps=[3]),
+           'guest failure': swap('PLATFORM-PASS', 'PLATFORM-FAIL pattern write'),
+           'no pass': swap('PLATFORM-PASS', ''),
+           'cpus': dataclasses.replace(good, vcpus=1),
+           'stopped': dataclasses.replace(good, stderr=stderr.replace('Power(1)', 'UnsupportedMmio'), returncode=2)}
+    for what, r in bad.items(): assert judge(r), f'mapped-bar {what}: passed'
+    assert any('stale shadow' in x for x in judge(bad['stale shadow'])), judge(bad['stale shadow'])
+    assert any('remaps' in x for x in judge(bad['no remaps'])), judge(bad['no remaps'])
+    assert len(mapped_pattern()) == len(mapped_fill()) == MAPPED_REGION
+    assert '@' not in INIT[INIT.index('# mapped-bar'):INIT.index('# pvpanic-panic')], 'a placeholder left in case_mapped_bar'
+    print(f'mapped-bar: {len(bad)} negative judge controls passed.')
+
+
 def judge_pvpanic_panic(run: Run) -> list:
     errors = common(run)
     if 'skip-capability' not in run.options:
@@ -437,6 +853,7 @@ class Case:
 
 CASES = {
     'pci-multibar': Case((), judge_pci_multibar),
+    'mapped-bar': Case((), judge_mapped_bar),
     'pvpanic-panic': Case(('panic=0',), judge_pvpanic_panic),
     'platform': Case((), judge_platform),
     'platform-off': Case(('reboot=k',), judge_platform_off),
@@ -510,6 +927,11 @@ def prepare(args):
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
     (root / 'lib/modules' / KVER / 'modules.dep').write_text(modules_dep(modules))
+    (root / 'mapped-pattern').write_bytes(mapped_pattern())
+    tool_asm = args.out / 'mapped-tool.asm'
+    tool_asm.write_text(MAPPED_TOOL_ASM)
+    subprocess.run(['nasm', '-f', 'bin', '-o', str(root / MAPPED_TOOL), str(tool_asm)], check=True, timeout=60)
+    (root / MAPPED_TOOL).chmod(0o755)
     (root / 'init').write_text(INIT)
     (root / 'init').chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
@@ -522,7 +944,8 @@ def prepare(args):
                 'modules': {n: {'path': rel, 'sha256': digest(root / 'lib/modules' / KVER / rel), 'depends': deps}
                             for n, (rel, _, deps) in sorted(modules.items())},
                 'outputs': {str(p.relative_to(args.out)): digest(p)
-                            for p in (args.out / 'linux', args.out / 'platform.cpio', root / 'init', root / 'bin/busybox')}}
+                            for p in (args.out / 'linux', args.out / 'platform.cpio', root / 'init', root / 'bin/busybox',
+                                      root / MAPPED_TOOL)}}
     write_json(args.out / 'inputs.json', manifest)
     print(json.dumps(manifest, indent=2))
 
@@ -708,6 +1131,7 @@ def self_check():
     assert any('QEMU0001' in e for e in judge(off_bad['pvpanic on'])), judge(off_bad['pvpanic on'])
     assert any('serio' in e for e in judge(off_bad['PS/2 on'])), judge(off_bad['PS/2 on'])
     self_check_pci_multibar()
+    self_check_mapped_bar()
     print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad) + len(off_bad)} negative '
           'judge controls passed; no VM launched.')
 

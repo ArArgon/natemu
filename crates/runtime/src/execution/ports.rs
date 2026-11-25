@@ -71,6 +71,8 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> (u64, bool)
         return (v, false);
     }
     let exchange = MMIO_VA as *mut Mmio;
+    // Mapped device memory: the region table's `seq` before the request (a configuration write may move a region).
+    let seq = super::mapped_seq();
     unsafe {
         let completed = read_record(exchange).completed;
         let request = Mmio {
@@ -95,7 +97,10 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> (u64, bool)
             halt(s, stop::BAD_REPLY)
         }
         match m.status {
-            status::DONE => (m.value & mask(size), s.reply == REPLY_PORT_POWER),
+            status::DONE => {
+                super::remapped(s, seq);
+                (m.value & mask(size), s.reply == REPLY_PORT_POWER)
+            }
             status::UNASSIGNED | status::DEVICE => halt(s, stop::UNSUPPORTED_PORT),
             _ => halt(s, stop::BAD_REPLY),
         }

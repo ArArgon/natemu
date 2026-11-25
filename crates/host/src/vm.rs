@@ -102,8 +102,9 @@ pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
 
 /// Guest memory rights: read/write/execute.
 const MAPPED: u64 = 7;
-/// Read only (HV_MEMORY_READ), and the all-ones page's size (the host's page size).
+/// Read only (HV_MEMORY_READ), write (HV_MEMORY_WRITE), and the all-ones page's size (the host's page size).
 const READ: u64 = 1;
+const WRITE: u64 = 2;
 const ALL_ONES: u64 = natemu_abi::ALL_ONES_BYTES;
 const _: () = assert!(GIC_REDISTRIBUTORS + (32 << 20) <= natemu_abi::ALL_ONES_IPA);
 /// IPAs of the GIC's distributor (64 KiB) and redistributor region (128 KiB per vCPU, 32 MiB), below guest memory.
@@ -137,16 +138,60 @@ pub struct Machine {
     /// The mapped backing, owned while the VM maps it (R2 review: a borrow could end, and `mem::forget` of the machine
     /// would leave the VM mapping freed memory; an owned `Arc` leaks with it instead).
     memory: std::sync::Arc<Memory>,
+    /// The mapped device memory, owned while the VM maps it (as `memory`), and where it is mapped.
+    mapped: Vec<std::sync::Arc<crate::pci::DeviceMemory>>,
+    plan: MappingPlan,
     /// The VM exists (not yet destroyed).
     live: bool,
 }
+/// Where [`Machine::create`] maps device memory: `maps` the IPA and length of each region, in order, from the first
+/// 1 GiB-aligned IPA at or above the backing's end, each at the sum of the lengths before it (lengths are 2 MiB
+/// multiples, so every offset is 2 MiB-aligned); `aliases` the resident's alias of each (`MAPPED_VA` plus the same
+/// offset); `ipa_bits` the IPA size that holds the backing and every region.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MappingPlan {
+    pub ipa_bits: u32,
+    pub maps: Vec<(u64, u64)>,
+    pub aliases: Vec<(u64, u64)>,
+}
+/// The [`MappingPlan`] of regions of `regions` bytes beside a backing whose IPA range ends at `backing_end`.
+pub fn mapping_plan(backing_end: u64, regions: &[u64]) -> MappingPlan {
+    let first = backing_end.next_multiple_of(1 << 30);
+    let mut plan = MappingPlan::default();
+    let mut offset = 0;
+    for &len in regions {
+        plan.maps.push((first + offset, len));
+        plan.aliases.push((natemu_abi::execution::MAPPED_VA + offset, len));
+        offset += len;
+    }
+    let end = if regions.is_empty() { backing_end } else { first + offset };
+    plan.ipa_bits = 64 - (end - 1).leading_zeros();
+    plan
+}
 impl Machine {
-    pub fn create(memory: std::sync::Arc<Memory>) -> Result<Self> {
+    /// Where the VM maps its device memory ([`mapping_plan`]; empty without any).
+    pub fn mapping(&self) -> &MappingPlan {
+        &self.plan
+    }
+    /// The VM mapping `memory` at `IPA` and each of `mapped` (at most `MAX_MAPPED_REGIONS`, `MAX_MAPPED_BYTES` together)
+    /// where [`mapping_plan`] places it, read/write and never executable. Only through `execution::Backing::machine`,
+    /// which also writes the resident's aliases of the regions (from [`Machine::mapping`]).
+    pub(crate) fn create(memory: std::sync::Arc<Memory>, mapped: &[std::sync::Arc<crate::pci::DeviceMemory>]) -> Result<Self> {
+        use natemu_abi::execution::{MAX_MAPPED_BYTES, MAX_MAPPED_REGIONS};
+        let lens: Vec<u64> = mapped.iter().map(|m| m.len()).collect();
+        if lens.len() > MAX_MAPPED_REGIONS || lens.iter().sum::<u64>() > MAX_MAPPED_BYTES {
+            return Err(format!(
+                "{} mapped regions of {:#x} bytes: at most {MAX_MAPPED_REGIONS} of {MAX_MAPPED_BYTES:#x} together",
+                lens.len(),
+                lens.iter().sum::<u64>()
+            ));
+        }
+        let plan = mapping_plan(IPA + memory.1 as u64, &lens);
         unsafe {
             let config = hv_vm_config_create();
-            // M1: the IPA space must hold the whole backing (guest RAM included); HVF's default IPA size (36 bits on
-            // this host) is raised when it does not, up to its maximum.
-            let bits = 64 - (IPA + memory.1 as u64 - 1).leading_zeros();
+            // M1: the IPA space must hold the whole backing (guest RAM included) and the mapped regions above it; HVF's
+            // default IPA size (36 bits on this host) is raised when it does not, up to its maximum.
+            let bits = plan.ipa_bits;
             let (mut default, mut max) = (0, 0);
             let sized = hv(
                 hv_vm_config_get_default_ipa_size(&mut default),
@@ -170,6 +215,8 @@ impl Machine {
         let mut machine = Self {
             spi: 0,
             memory,
+            mapped: mapped.to_vec(),
+            plan,
             live: true,
         };
         let (base, bytes) = (machine.memory.0, machine.memory.1);
@@ -219,6 +266,14 @@ impl Machine {
             machine.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
         }
         unsafe { hv(hv_vm_map(base.cast(), IPA, bytes, MAPPED), "hv_vm_map")? };
+        for (region, &(ipa, len)) in machine.mapped.iter().zip(&machine.plan.maps) {
+            unsafe {
+                hv(
+                    hv_vm_map(region.as_ptr().cast(), ipa, len as usize, READ | WRITE),
+                    "hv_vm_map device memory",
+                )?
+            };
+        }
         // L3 (amendment): the shared all-ones page that shadows of unassigned guest-physical pages map, read-only here too.
         // ponytail: one page per VM leaked for the process (a VM per process today); free it with the VM if VMs come and go.
         let ones = unsafe {
@@ -512,5 +567,44 @@ mod tests {
     fn ffi_layout_matches_sdk() {
         assert_eq!(size_of::<HvExit>(), 32);
         assert_eq!(std::mem::offset_of!(HvExit, exception), 8);
+    }
+    /// Without device memory the plan is today's: no maps, no aliases, the IPA bits of the backing's last byte (no VM is
+    /// created here).
+    #[test]
+    fn empty_plan_matches_today() {
+        for bytes in [0x1_0000u64, 0x1234_5000, (1 << 30) - IPA, 7 << 30, 63 << 30] {
+            let today = 64 - (IPA + bytes - 1).leading_zeros();
+            assert_eq!(
+                mapping_plan(IPA + bytes, &[]),
+                MappingPlan { ipa_bits: today, maps: vec![], aliases: vec![] },
+                "{bytes:#x}"
+            );
+        }
+    }
+    /// Regions go from the first 1 GiB-aligned IPA at or above the backing's end, one after another in order; their
+    /// aliases at the same offsets from `MAPPED_VA`.
+    #[test]
+    fn plan_places_regions_above_backing() {
+        use natemu_abi::execution::MAPPED_VA;
+        const M: u64 = 1 << 20;
+        let p = mapping_plan(IPA + 0x1234_5000, &[2 * M, 32 * M, 4 * M]);
+        let first = 2 << 30;
+        assert_eq!(p.maps, [(first, 2 * M), (first + 2 * M, 32 * M), (first + 34 * M, 4 * M)]);
+        assert_eq!(p.aliases, [(MAPPED_VA, 2 * M), (MAPPED_VA + 2 * M, 32 * M), (MAPPED_VA + 34 * M, 4 * M)]);
+        assert!(p.maps.iter().all(|&(ipa, _)| ipa >= IPA + 0x1234_5000 && ipa % (2 * M) == 0));
+        // A backing ending on a GiB boundary: the regions start right there.
+        assert_eq!(mapping_plan(3 << 30, &[2 * M]).maps, [(3 << 30, 2 * M)]);
+    }
+    /// The IPA size grows to hold the regions above the backing.
+    #[test]
+    fn plan_grows_ipa_bits() {
+        const M: u64 = 1 << 20;
+        // A small backing ends below 2 GiB (31 bits); a region at 2 GiB needs 32.
+        assert_eq!(mapping_plan(IPA + 0x1234_5000, &[]).ipa_bits, 31);
+        assert_eq!(mapping_plan(IPA + 0x1234_5000, &[2 * M]).ipa_bits, 32);
+        // A backing ending just below 64 GiB: 36 bits alone, 37 with a region at 64 GiB.
+        let end = (64 << 30) - (2 * M);
+        assert_eq!(mapping_plan(end, &[]).ipa_bits, 36);
+        assert_eq!(mapping_plan(end, &[256 * M]).ipa_bits, 37);
     }
 }

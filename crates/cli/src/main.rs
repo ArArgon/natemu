@@ -416,6 +416,10 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     };
     // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
     let stop = prepared.run().and_then(|mut outcome| {
+        // `debug.mapped_testdev`: the region table at the end and each vCPU's installs and remap shootdowns.
+        if let Some(mapped) = prepared.mapped_report() {
+            eprintln!("natemu: mapped {mapped}");
+        }
         if let Some(e) = prepared.serial_error() {
             return Err(format!("serial output: {e}"));
         }

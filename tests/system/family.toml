@@ -275,6 +275,63 @@ argv = ["tests/system/run_l3.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 smoke = true
 
+# Mapped device memory (docs/restructure/mapped-device-memory-plan.md, Task 2): bare programs on a region of the driver's
+# test device (`run-program --mapped-at`, `--mapped-control-at`).
+[suite.cases."mapped-load-store"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-load-store", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+smoke = true
+
+[suite.cases."mapped-permissions"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-permissions", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-host-fill"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-host-fill", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-uc"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-uc", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-refusals"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-refusals", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."mapped-interpreter"]
+argv = ["tests/system/run_mapped.py", "--only", "mapped-interpreter", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."lapic_beats_mapped_region"]
+argv = ["tests/system/run_mapped.py", "--only", "lapic_beats_mapped_region", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+[suite.cases."overlapping_regions_pick_lowest"]
+argv = ["tests/system/run_mapped.py", "--only", "overlapping_regions_pick_lowest", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+
+# Task 3: moving and disabling a region (the control page's MOVE), at 2 and 4 vCPUs.
+
+[suite.cases."remap_is_visible_after_flag"]
+argv = ["tests/system/run_mapped.py", "--only", "remap_is_visible_after_flag", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."install_races_publish"]
+argv = ["tests/system/run_mapped.py", "--only", "install_races_publish", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."halted_peer_drops_on_wake"]
+argv = ["tests/system/run_mapped.py", "--only", "halted_peer_drops_on_wake", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."disable_then_enable"]
+argv = ["tests/system/run_mapped.py", "--only", "disable_then_enable", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
+[suite.cases."remap_under_load"]
+argv = ["tests/system/run_mapped.py", "--only", "remap_under_load", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 4, perf = true }
+
 [suite.cases."l4a"]
 argv = ["tests/system/run_l4a.py", "--only", "qemu,xapic,halt,lint1", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

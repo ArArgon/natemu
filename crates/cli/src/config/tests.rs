@@ -1019,6 +1019,23 @@ fn debug_pci_testdev_is_off_by_default_and_reaches_the_boot() {
     assert!(err(load_old(&["--set", "debug.pci_testdev=maybe"])).contains("bad boolean"));
 }
 
+/// `[debug] mapped_testdev` (test only): off by default, on from the file or `--set`, carried into the launch.
+#[test]
+fn debug_mapped_testdev_is_off_by_default_and_reaches_the_boot() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "RT".into(), vec![7], None).unwrap();
+    let (_, c) = load_file(MIN, &[]);
+    let c = c.unwrap();
+    assert!(!c.mapped_testdev && !boot(&c).mapped_testdev);
+    let (_, c) = load_file(&format!("{MIN}[debug]\nmapped_testdev = true\n"), &[]);
+    let c = c.unwrap();
+    assert!(c.mapped_testdev && !c.pci_testdev && boot(&c).mapped_testdev);
+    let (_, c) = load_file(&format!("{MIN}[debug]\nmapped_testdev = true\n"), &["--set", "debug.mapped_testdev=off"]);
+    assert!(!c.unwrap().mapped_testdev, "--set overrides the file");
+    assert!(load_old(&["--set", "debug.mapped_testdev=on"]).unwrap().mapped_testdev);
+    assert!(err(load_old(&["--set", "debug.mapped_testdev=maybe"])).contains("bad boolean"));
+}
+
 #[test]
 fn a_file_boot_is_the_same_boot_as_the_flags() {
     let _env = lock();

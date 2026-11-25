@@ -43,6 +43,22 @@
 //! access, unassigned-page access or UART output happened, the output gains `ports` (per port touched: reads, writes,
 //! unassigned), `unassigned_pages` (per page: reads = shadow fills, writes) and `uart` (the bytes transmitted, hex).
 //!
+//! Mapped device memory (docs/restructure/mapped-device-memory-plan.md): `--mapped-at GPA,LEN` (repeatable, in table
+//! order) gives the VM a region of LEN bytes (a power of two, 2 MiB to 256 MiB; `natemu::pci::DeviceMemory`) enabled at
+//! guest-physical GPA (page-aligned, below 4 GiB, outside RAM, the firmware image and legacy ROM, the driver's device pages
+//! and the control page; regions may overlap each other: the lowest-numbered wins, and may cover the xAPIC page: the
+//! APIC wins), its table entries published
+//! before any vCPU runs; `--mapped-control-at GPA` registers region 0's control page (`test_devices::MappedControl`: `MOVE`
+//! at +0, a new base for region 0 or 0 to disable it, published from the handler; `SUM` at +8, `FILL` at +16). The output
+//! gains `mapped` (per region: `base` and `enabled` as the table holds them at the end, `len`, `accesses`, the [reads,
+//! writes] of its initial range that reached the host, `sum`, its words' sum through a second mapping, `words`, its first
+//! nonzero words as [offset, value], `publishes`, the `MOVE`s published, and `halted_at_publish`, the vCPUs parked in a HLT at the last one) and per vCPU `mapped_installs` (shadows
+//! installed onto regions) and `remaps` (remap shootdowns run). `--mapped-hold SIG,ACK,GO,DONE` (io-test-hooks build): when
+//! the guest stores 1 at SIG the driver arms vCPU 1's `MAPPED_BEFORE_INSTALL` hold and stores 1 at ACK; once vCPU 1 is
+//! held there (after its table read, before its install) it stores 1 at GO, waits for the control page's publish and then
+//! up to 300 ms for the guest's 1 at DONE, and releases; it writes one `mapped-hold:` line (`done_before_release`: DONE was
+//! stored while vCPU 1 was still held).
+//!
 //! L4a: the VM has the I/O APIC at 0xFEC00000 and the 8259 pair with its ELCR (`irq`), the UART's IRQ4 wired into both.
 //! `--irq-source PORT` registers the asynchronous test source (`test_devices::TestSource`) on PORT..PORT+7: a 32-bit OUT at PORT
 //! asks a host thread to pulse (bit 8 clear) or assert (bit 8 set) line bits 7:0 after bits 31:16 microseconds, an OUT at
@@ -337,6 +353,11 @@ struct Description {
 fn number(text: &str) -> Result<u64> {
     let digits = text.strip_prefix("0x").unwrap_or(text);
     u64::from_str_radix(digits, 16).map_err(|_| format!("bad number {text}"))
+}
+/// `--mapped-at GPA,LEN` (hex).
+fn mapped_at(text: &str) -> Result<(u64, u64)> {
+    let (gpa, len) = text.split_once(',').ok_or(format!("{text}: GPA,LEN"))?;
+    Ok((number(gpa)?, number(len)?))
 }
 fn hex(text: &str) -> Result<Vec<u8>> {
     (0..text.len())
@@ -1416,6 +1437,15 @@ pub(crate) struct Args {
     /// A test device's page (repeatable)
     #[arg(long, value_name = "GPA", value_parser = number)]
     device_at: Vec<u64>,
+    /// Mapped device memory (repeatable, in table order): a region of LEN bytes enabled at GPA (module doc)
+    #[arg(long, value_name = "GPA,LEN", value_parser = mapped_at)]
+    mapped_at: Vec<(u64, u64)>,
+    /// The control page of the first mapped region (`test_devices::MappedControl`)
+    #[arg(long, value_name = "GPA", value_parser = number, requires = "mapped_at")]
+    mapped_control_at: Option<u64>,
+    /// The holder race's controller (io-test-hooks build; module doc): `SIG,ACK,GO,DONE` guest-physical words (hex)
+    #[arg(long, value_name = "SIG,ACK,GO,DONE", requires = "mapped_control_at")]
+    mapped_hold: Option<String>,
     /// The asynchronous test source's ports
     #[arg(long, value_name = "PORT", value_parser = number)]
     irq_source: Option<u64>,
@@ -1578,6 +1608,52 @@ fn miss_hold(
         Ok(json!({"kind": kind, "acted": acted, "hits": h.get(0, HITS), "timeout": h.get(0, TIMEOUT)}))
     })();
     eprintln!("miss-hold: {}", row.unwrap_or_else(|e| json!({"error": e.to_string()})));
+}
+
+/// `--mapped-hold` (module doc): the controller of the holder race's point on vCPU 1. Writes one `mapped-hold:` line.
+#[cfg(feature = "io-test-hooks")]
+fn mapped_hold(backing: &execution::Backing, publishes: &std::sync::atomic::AtomicU64, spec: &str, ended: &AtomicBool) {
+    use natemu::execution::io_test::{HITS, Hooks, MAPPED_BEFORE_INSTALL, REACHED, TIMEOUT};
+    use std::time::{Duration, Instant};
+    let h = Hooks::new(backing);
+    let began = Instant::now();
+    let wait = |done: &dyn Fn() -> bool, limit: Duration| {
+        while !done() {
+            if ended.load(SeqCst) || began.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        true
+    };
+    let words: Vec<u64> = spec.split(',').filter_map(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()).collect();
+    let row = (|| -> Result<Value> {
+        let [sig, ack, go, done] = words[..] else {
+            return Err("mapped-hold: SIG,ACK,GO,DONE".into());
+        };
+        if !wait(&|| h.guest_u64(sig) == Some(1), Duration::from_secs(20)) {
+            return Err("mapped-hold: the guest never signalled".into());
+        }
+        let tag = h.arm(1, MAPPED_BEFORE_INSTALL)?;
+        let before = publishes.load(SeqCst);
+        h.set_guest_u64(ack, 1);
+        let reached = wait(&|| h.get(1, REACHED) == tag, Duration::from_secs(20));
+        if reached {
+            h.set_guest_u64(go, 1);
+        }
+        let published = reached && wait(&|| publishes.load(SeqCst) > before, Duration::from_secs(20));
+        // The mover's shootdown waits for vCPU 1, which is held: DONE stays 0 until the release (the protocol), unless
+        // the mover skipped it.
+        let at = Instant::now();
+        while published && h.guest_u64(done) != Some(1) && at.elapsed() < Duration::from_millis(300) && !ended.load(SeqCst) {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let done_before_release = h.guest_u64(done) == Some(1);
+        h.release(1, tag);
+        Ok(json!({"reached": reached, "published": published, "done_before_release": done_before_release,
+                  "hits": h.get(1, HITS), "timeout": h.get(1, TIMEOUT)}))
+    })();
+    eprintln!("mapped-hold: {}", row.unwrap_or_else(|e| json!({"error": e.to_string()})));
 }
 
 /// `hold-publish-*`: once the backend schedule holds its first call, arm the host hook before a
@@ -1764,6 +1840,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         strict,
         entry_ends,
         device_at,
+        mapped_at,
+        mapped_control_at,
         irq_source,
         lost,
         code_bytes,
@@ -1983,6 +2061,53 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let mut source = super::test_devices::TestSource::new(&irqs);
         source.veto = irq_veto;
         registry.register_ports(port as u32, 8, Arc::new(Mutex::new(source)))?;
+    }
+    // Mapped device memory: each `--mapped-at` region's object, outside RAM and every device page of the driver's, page
+    // aligned; the control page of region 0, a registered device.
+    let mut mapped = Vec::new();
+    for &(gpa, len) in &mapped_at {
+        let memory = natemu::pci::DeviceMemory::new(len)?;
+        let end = gpa.checked_add(len).filter(|&e| gpa % 4096 == 0 && e <= exec::FIRMWARE_END);
+        // (ROM decodes before a region: the firmware image and the legacy ROM range are refused here.)
+        let rom = |p: u64| {
+            p >= exec::FIRMWARE_END - firmware.len() as u64
+                || d.spaces[0].legacy_rom.as_ref().is_some_and(|(at, b)| (at & !4095..at + b.len() as u64).contains(&p))
+        };
+        let clear = |p: u64| {
+            !exec::ram_contains(ram_bytes, p) && !rom(p) && registry.find(p).is_none() && Some(p) != mapped_control_at
+        };
+        if end.is_none() || !(gpa..end.unwrap()).step_by(4096).all(clear) {
+            return Err(format!("--mapped-at {gpa:#x},{len:#x}: page-aligned, below 4 GiB, outside RAM, ROM, the control page and the devices"));
+        }
+        let view = memory.view()?;
+        mapped.push((gpa, memory, view));
+    }
+    let mut mapped_control = None;
+    if let Some(gpa) = mapped_control_at {
+        // `MOVE`'s bases: page-aligned, below the chipset's pages (FEC00000H up), every page outside RAM, the firmware
+        // image, the legacy ROM range, the test devices' pages and this page (the registry is fixed before any vCPU runs;
+        // the I/O APIC, HPET and xAPIC pages lie above the limit).
+        let len = mapped[0].1.len();
+        let image = exec::FIRMWARE_END - firmware.len() as u64;
+        let legacy = d.spaces[0].legacy_rom.as_ref().map(|(at, b)| (at & !4095, at + b.len() as u64));
+        let devices: Vec<u64> = test_devices.keys().copied().collect();
+        let allowed = move |base: u64| {
+            base % 4096 == 0
+                && base.checked_add(len).is_some_and(|end| end <= 0xFEC0_0000.min(image))
+                && (base..base + len).step_by(4096).all(|p| {
+                    !exec::ram_contains(ram_bytes, p)
+                        && !legacy.is_some_and(|(a, b)| (a..b).contains(&p))
+                        && !devices.contains(&p)
+                        && p != gpa
+                })
+        };
+        let control = super::test_devices::MappedControl::new(mapped[0].1.clone(), Box::new(allowed))?;
+        mapped_control = Some((control.target.clone(), control.publishes.clone(), control.halted_at_publish.clone()));
+        registry.register(gpa, 4096, Arc::new(Mutex::new(control)))?;
+    }
+    #[cfg(not(feature = "io-test-hooks"))]
+    if args.mapped_hold.is_some() {
+        return Err("--mapped-hold needs an io-test-hooks build".into());
     }
     let io_control = args
         .io_script
@@ -2228,7 +2353,22 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         }
     }
 
-    let machine = Machine::create(backing.memory().clone())?;
+    let machine = backing.machine(&mapped.iter().map(|m| m.1.clone()).collect::<Vec<_>>())?;
+    // Every region's entry, before any vCPU runs (a table never published has no region: `mmio::mapped`).
+    for (i, (gpa, memory, _)) in mapped.iter().enumerate() {
+        backing.mapped_regions().publish(
+            i,
+            exec::cache::MappedRegion {
+                base: *gpa,
+                len: memory.len(),
+                alias: machine.mapping().aliases[i].0,
+                enabled: 1,
+            },
+        );
+    }
+    if let Some((target, ..)) = &mapped_control {
+        let _ = target.set((backing.mapped_table(), machine.mapping().aliases[0].0, backing.halted_view(), n));
+    }
     irqs.attach(machine.doorbell());
     let stops = execution::Stops::new(&backing);
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
@@ -2411,6 +2551,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     result
                 })
             });
+            #[cfg(feature = "io-test-hooks")]
+            if let (Some(spec), Some((_, publishes, _))) = (args.mapped_hold.as_deref(), &mapped_control) {
+                let (backing, ended) = (&backing, &all_ended);
+                scope.spawn(move || mapped_hold(backing, publishes, spec, ended));
+            }
             #[cfg(feature = "io-test-hooks")]
             if let Some(spec) = args.miss_hold.as_deref() {
                 let (backing, machine, stops, ended) = (&backing, &machine, &stops, &all_ended);
@@ -2771,6 +2916,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             result.machine = Some(machine_result(backing.vcpu(v), m, tables, &result));
         }
         result.startup = startup_result(backing.vcpu(v), d.cpus[v].wait_sipi, pending);
+        if !mapped.is_empty() {
+            let control: cache::Control = backing.vcpu(v).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+            result.mapped_installs = Some(control.mapped_installs);
+            result.remaps = Some(control.remaps);
+        }
         let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
         result.kicks = Some(kick_report(backing.vcpu(v), &stops));
         // With test devices, or once the vCPU made a device access (X3: its xAPIC page) or had one refused.
@@ -2825,8 +2975,40 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             Some(output.iter().map(|b| format!("{b:02x}")).collect()),
         )
     };
+    // Mapped device memory: each region, the accesses to its range that reached the host (the unassigned rule's counts:
+    // none when every access ran natively), the sum of its words through the second mapping, and its nonzero words.
+    let (_, table) = backing.mapped_regions().read();
+    let mapped = mapped
+        .iter()
+        .enumerate()
+        .map(|(i, (gpa, memory, view))| {
+            let mut words = vec![0u64; (memory.len() / 8) as usize];
+            view.read_words(0, &mut words);
+            MappedReport {
+                base: Hex(table[i].base),
+                enabled: table[i].enabled != 0,
+                publishes: if i == 0 { mapped_control.as_ref().map_or(0, |(_, n, _)| n.load(SeqCst)) } else { 0 },
+                halted_at_publish: if i == 0 {
+                    mapped_control.as_ref().map_or(vec![], |(.., h)| h.lock().unwrap().clone())
+                } else {
+                    vec![]
+                },
+                len: Hex(memory.len()),
+                accesses: registry.page_accesses(*gpa, gpa + memory.len()),
+                sum: Hex(super::test_devices::region_sum(view, memory.len())),
+                words: words
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| **w != 0)
+                    .take(MappedReport::WORDS)
+                    .map(|(k, w)| (Hex(8 * k as u64), Hex(*w)))
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
     let extra = RunExtra {
         devices: (!devices.is_empty()).then_some(devices),
+        mapped: (!mapped.is_empty()).then_some(mapped),
         fixture,
         io_disk: io_control.as_ref().map(|control| control.report()),
         io_net: args.io_net.then(|| packet_trace.json()),
@@ -2853,11 +3035,30 @@ struct TestDeviceReport {
     order_errors: u64,
     log: Vec<(u64, u64, u64, u64, Hex)>,
 }
+/// A mapped region at the run's end: its base and length, [reads, writes] that reached the host for its range, the sum of
+/// its words (read through the object's second mapping) and its first nonzero words, (offset, value).
+#[derive(Serialize)]
+struct MappedReport {
+    base: Hex,
+    enabled: bool,
+    publishes: u64,
+    /// The vCPUs parked in a HLT at the last `MOVE`'s publish.
+    halted_at_publish: Vec<usize>,
+    len: Hex,
+    accesses: [u64; 2],
+    sum: Hex,
+    words: Vec<(Hex, Hex)>,
+}
+impl MappedReport {
+    const WORDS: usize = 4096;
+}
 /// The run's members after the vCPUs' results, each where there is one.
 #[derive(Serialize)]
 struct RunExtra {
     #[serde(skip_serializing_if = "Option::is_none")]
     devices: Option<Vec<TestDeviceReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped: Option<Vec<MappedReport>>,
     /// An I/O fixture's result, under its name.
     #[serde(flatten)]
     fixture: Option<Members<&'static str, Value>>,
@@ -3228,6 +3429,8 @@ fn report(
         mmio: None,
         machine: None,
         startup: None,
+        mapped_installs: None,
+        remaps: None,
     })
 }
 /// M2 Part 2: a vCPU's `startup` output (module doc), for a `wait-for-sipi` section, a pending word with INIT or SIPI state,
@@ -3336,6 +3539,12 @@ struct CpuResult {
     /// M2 Part 2: INIT and SIPI (module doc).
     #[serde(skip_serializing_if = "Option::is_none")]
     startup: Option<Value>,
+    /// Mapped device memory: shadows installed onto a region's pages (`cache::Control::mapped_installs`), with regions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped_installs: Option<u64>,
+    /// Mapped device memory: remap shootdowns run (`cache::Control::remaps`), with regions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaps: Option<u64>,
 }
 /// Guest bytes at `addr`, as lowercase hex.
 #[derive(Serialize)]
@@ -4021,6 +4230,8 @@ mod json_tests {
             }),
             machine: None,
             startup: None,
+            mapped_installs: None,
+            remaps: None,
         }
     }
     /// The former `report` + `kick_report` + mmio line for `r`.
@@ -4304,6 +4515,7 @@ mod json_tests {
                     format!("{one}{devices}}}")
                 };
                 let extra = RunExtra {
+                    mapped: None,
                     devices: full.then(|| {
                         vec![TestDeviceReport {
                             gpa: Hex(gpa),

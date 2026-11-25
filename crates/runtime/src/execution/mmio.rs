@@ -18,6 +18,9 @@
 //! either side, sites without a completion record, pages no device claims, accesses a device refuses, and system
 //! instructions' and deliveries' own accesses to device pages ([`system_access`]).
 //!
+//! Mapped device memory (docs/restructure/mapped-device-memory-plan.md) is not a device page: a page of an enabled region
+//! of the host's table ([`mapped`]) is shadowed onto the region by `translate` and accessed natively, as RAM is.
+//!
 //! Cost: each device access ends its block (the resident dispatches at the next RIP, an L1/L2 lookup, not a re-entry of
 //! the rest of the block) and, unless [`local`] serves it, makes one host exit plus polls if completion is deferred.
 use super::*;
@@ -29,6 +32,45 @@ use natemu_abi::execution::{
 /// `gpa` is guest RAM (anything else is a device page, or ROM: [`rom`]).
 pub(super) fn ram(gpa: u64) -> bool {
     guest_ram().range(gpa, 1).is_some()
+}
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): an enabled region of the host's table, which the
+/// resident reaches through its EL1 alias (`alias` backs guest-physical `base` .. `base + len`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Region {
+    pub base: u64,
+    pub len: u64,
+    pub alias: u64,
+}
+impl Region {
+    /// Guest RAM and this region: the memory of an access whose pages are RAM or in this region (`GuestRam` holds four
+    /// regions; RAM takes three at most, so one mapped region fits and two never are joined: an access touching two
+    /// regions is refused by its caller).
+    pub fn memory(self) -> GuestRam {
+        // SAFETY: the host maps the region's alias EL1 read/write for the VM's life (`Backing::machine`), disjoint from
+        // RAM's; alias and base are page-aligned (so they agree modulo 8).
+        unsafe { guest_ram().and(self.base, self.len, self.alias) }
+    }
+}
+/// The enabled region holding `gpa`, a page that is not RAM (callers test RAM first: no RAM path reads the table), or
+/// `None`. Overlapping regions: the lowest-numbered entry wins. The install protocol: this vCPU's holding flag
+/// (`cache::holding`, SeqCst) is set before the table is read, so a host remap's shootdown (Task 3) either finds the flag
+/// or this read sees the new table. A table never published (`seq` 0) has no region and never will: `Backing::machine`
+/// publishes every region's entry (disabled) before any vCPU exists, so `seq` is nonzero exactly in a VM with regions,
+/// and that case skips the flag.
+pub(super) fn mapped(gpa: u64) -> Option<Region> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let table = cache::mapped_regions();
+    if table.seq.load(Relaxed) == 0 {
+        return None;
+    }
+    cache::holding();
+    // The flag's store before the table's loads (store then load: the read's Acquire alone would not order them).
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let (_, regions) = table.read();
+    regions
+        .iter()
+        .find(|r| r.enabled != 0 && gpa.wrapping_sub(r.base) < r.len)
+        .map(|r| Region { base: r.base, len: r.len, alias: r.alias })
 }
 /// `gpa`, which is not RAM, is ROM: read as RAM, a store to it dropped, as x86 drops a store to ROM. Asked only on the paths
 /// that found a page outside RAM, so RAM's paths are as without one. Either the firmware image ([`image`]) or (the
@@ -98,6 +140,15 @@ pub(super) fn ones(
     touched: [Option<u64>; 2],
     device: [Option<u64>; 2],
 ) -> bool {
+    // Mapped device memory: the caller's walk found these pages in no enabled region (or found this vCPU's APIC page or
+    // ROM, which decode first: `translate`); one found in a region now was published since (a remap race). Every shadow
+    // goes and `true` is returned: `access_aborted` then retries the access, classifying the page again (the reset moves
+    // the generation, so the retry is progress); `wrapped_load` goes on and reads the page as all-ones (its copy reads a
+    // page outside RAM so), a read that linearizes before the publish (legal: it raced the move).
+    if device.iter().flatten().any(|&g| mapped(g).is_some() && !super::lapic::claims(g) && !rom(g)) {
+        super::reset_shadows(s);
+        return true;
+    }
     readable_pages(s, touched, device).unwrap_or_else(|why| refuse(*s, f, b, site, why))
 }
 
@@ -122,6 +173,12 @@ fn readable_pages(s: &mut State, touched: [Option<u64>; 2], mut device: [Option<
     }
     if device.iter().flatten().any(|&g| super::lapic::claims(g)) {
         return Ok(false);
+    }
+    // Mapped device memory: a page of an enabled region is never shadowed onto the all-ones page. Translated code's
+    // accesses classify it first (`translate`) and never come here with one; the resident's own reads that do (a
+    // compatibility FS/GS string) have no completion for it.
+    if device.iter().flatten().any(|&g| mapped(g).is_some()) {
+        return Err(status::FORM);
     }
     // A page already shadowed onto the all-ones page (the access aborted on its other page) is not asked about again.
     let ones = |va: Option<u64>| {
@@ -152,8 +209,8 @@ fn readable_pages(s: &mut State, touched: [Option<u64>; 2], mut device: [Option<
         return Ok(false);
     }
     for (va, gpa) in touched.into_iter().zip(fresh) {
-        if let (Some(va), Some(_)) = (va, gpa) {
-            super::install_ones(s, va);
+        if let (Some(va), Some(gpa)) = (va, gpa) {
+            super::install_ones(s, va, gpa);
         }
     }
     Ok(true)
@@ -316,6 +373,8 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     let value = match image.or_else(|| local(&mut s, gpa, width, data)) {
         Some(v) => v,
         None => unsafe {
+            // Mapped device memory: the region table's `seq` before the request (compared once it is answered).
+            let seq = super::mapped_seq();
             let done = read_record(exchange()).completed;
             let request = Mmio {
                 gpa,
@@ -344,7 +403,7 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                 // until the accepted access finishes and dispatch selects the next instruction.
                 reset_shadows(&mut s);
             }
-            loop {
+            let value = loop {
                 match m.status {
                     status::DONE => break m.value,
                     status::UNASSIGNED | status::DEVICE | status::FAILED => {
@@ -372,7 +431,11 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                     halt(&s, stop::BAD_REPLY)
                 }
                 m = read_record(exchange());
-            }
+            };
+            // The access (its polls included) spanned a publish of the region table (a test device's `MOVE`, a BAR
+            // write): no vCPU keeps a shadow of the old table before this one runs the guest again.
+            super::remapped(&mut s, seq);
+            value
         },
     };
     // Committed: the load's register with x86's merge, RIP past the instruction (it completed: shadows and RF end with it).

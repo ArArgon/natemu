@@ -3720,8 +3720,37 @@ impl CodePages for DataWrites<'_> {
     }
 }
 
+/// What [`translate`] found at a page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Guest RAM; whether of type UC (or a write to WT/WP RAM), whose access runs its instruction alone.
+    Ram(bool),
+    /// A page of this mapped region, shadowed onto it.
+    Mapped(mmio::Region),
+    /// Anything else: a device's page, an unassigned page, ROM (not shadowed here: the device path).
+    Other,
+}
+impl Class {
+    /// The memory of an access whose pages are `classes`: RAM (`guest_ram`) with at most one mapped region, `None` when a
+    /// page is neither or the pages lie in two regions.
+    fn memory(classes: &[Class]) -> Option<GuestRam> {
+        let mut region = None;
+        for c in classes {
+            match *c {
+                Class::Ram(_) => {}
+                Class::Mapped(r) if region.is_none_or(|q| q == r) => region = Some(r),
+                _ => return None,
+            }
+        }
+        Some(region.map_or_else(guest_ram, mmio::Region::memory))
+    }
+    fn uncached(self) -> bool {
+        self == Class::Ram(true)
+    }
+}
+
 /// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
-/// fault stops with the precise state. Returns the guest-physical address of `va` and whether it is UC RAM, or `None`
+/// fault stops with the precise state. Returns the guest-physical address of `va` and its [`Class`] (RAM: whether UC), or `None`
 /// when the walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
 /// faults and walks again, as x86 re-walks). A device page (not guest RAM) is walked but not shadowed: its address is
 /// returned for the device path (L3: an unassigned one may then be shadowed onto the all-ones page, `mmio::ones`). Translated pages are shadowed read-only whatever the
@@ -3730,6 +3759,9 @@ impl CodePages for DataWrites<'_> {
 /// November 2): a page of UC RAM is shadowed only for the step block, whose one instruction it serves until the next
 /// boundary ([`uncached_end`]); for any other block it is walked (its faults and A/D updates, the code-write protocol for
 /// a write) but not shadowed, and the caller runs the instruction alone ([`access_aborted`]) or completes it ([`split`]).
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): a page that is not RAM, not this vCPU's APIC
+/// page and not ROM, but in an enabled region of the host's table, is shadowed onto the region ([`install_mapped`]) and
+/// found [`Class::Mapped`]: native whatever its memory type, writable as RAM is, never code- or table-marked.
 fn translate(
     s: &mut State,
     f: &NativeFrame,
@@ -3737,7 +3769,7 @@ fn translate(
     site: &Site,
     va: u64,
     access: Access,
-) -> Option<(u64, bool)> {
+) -> Option<(u64, Class)> {
     let control = controls(s);
     let walk = paging::walk(
         &mut GuestTables::observed(
@@ -3758,7 +3790,16 @@ fn translate(
         // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
         // shadowed; the caller completes the access through the device path ([`mmio::device`]). (M2 Part 2: the firmware
         // image too, whose reads [`mmio::ones`] then shadows and whose stores [`mmio::device`] drops.)
-        Ok(t) if !mmio::ram(t.gpa) => Some((t.gpa, false)),
+        Ok(t) if !mmio::ram(t.gpa) => Some((
+            t.gpa,
+            match (!lapic::claims(t.gpa) && !mmio::rom(t.gpa))
+                .then(|| install_mapped(s, va, &t, access))
+                .flatten()
+            {
+                Some(region) => Class::Mapped(region),
+                None => Class::Other,
+            },
+        )),
         // M2: WB, WT, WP and WC RAM run natively under TSO (Apple silicon is coherent, and HVF's stage 2 maps RAM Normal
         // write-back): WT, WP and WB have x86's processor ordering (SDM Vol.3 Table 14-2), and WC's weak ordering allows
         // every TSO outcome. UC is strongly ordered (a UC- PAT entry gives UC unless the MTRRs say WC, Table 14-7): see above.
@@ -3793,7 +3834,7 @@ fn translate(
                 }
             }
             if !shadow {
-                return Some((t.gpa, true));
+                return Some((t.gpa, Class::Ram(true)));
             }
             cache::control().memory_types[kind as usize] += 1;
             let old = tables::descriptor(s.cpu.cpl, va);
@@ -3813,7 +3854,7 @@ fn translate(
                 }
                 c.uncached_count += 1;
             }
-            Some((t.gpa, uncached))
+            Some((t.gpa, Class::Ram(uncached)))
         }
         Err(Fault::Page { address, error }) => guest_fault(*s, f, b, site, [14, address, error]),
         Err(Fault::Noncanonical) => guest_fault(*s, f, b, site, noncanonical(site)),
@@ -4211,8 +4252,9 @@ unsafe fn access_aborted(
                 write_record(record(), &s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
             },
-            Some((gpa, _)) if !mmio::ram(gpa) => device[k] = Some(gpa),
-            Some((_, uc)) => uncached |= uc,
+            Some((gpa, Class::Other)) => device[k] = Some(gpa),
+            // Mapped device memory: shadowed, the retry runs natively (any form, the page's type whatever it is).
+            Some((_, c)) => uncached |= c.uncached(),
         }
     }
     // L3 (amendment): a read whose non-RAM pages are all unassigned shadows them onto the all-ones page and retries, so
@@ -4302,17 +4344,24 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
     if s.cpu.dr[5] & DR7_ENABLES != 0 && hits != 0 && b.flags & cache::STEP == 0 {
         step_from(s, f, b, site)
     }
-    let mut gpa = [0; 2];
+    let (mut gpa, mut class) = ([0; 2], [Class::Other; 2]);
+    let generation = s.shadow_generation;
     for (k, va) in [address, 0].into_iter().enumerate() {
-        let Some((pa, _)) = translate(&mut s, f, b, site, va, if rmw { Access::Write } else { Access::Read }) else {
+        let Some((pa, c)) = translate(&mut s, f, b, site, va, if rmw { Access::Write } else { Access::Read }) else {
             unsafe {
                 write_record(record(), &s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
             }
         };
-        gpa[k] = pa & !4095 | va & 4095;
+        (gpa[k], class[k]) = (pa & !4095 | va & 4095, c);
     }
-    let mixed = gpa.iter().any(|&p| !mmio::ram(p));
+    // Mapped device memory: RAM and one region's pages are read as RAM is; a region beside a page that is neither (or a
+    // second region) has no completion here.
+    let memory = Class::memory(&class);
+    let mixed = memory.is_none();
+    if mixed && class.iter().any(|c| matches!(c, Class::Mapped(_))) {
+        mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::CROSSING)
+    }
     if mixed {
         // A read-modify-write has no device completion, on any page that is not RAM (both write walks have succeeded;
         // nothing is committed).
@@ -4325,12 +4374,17 @@ unsafe fn wrapped_load(mut s: State, f: &NativeFrame, b: &Block, site: &Site, ad
         }
     }
     split_wait(&mut s, &gpa);
+    if reclassify(&s, generation, &class) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, elr, spsr)
+        }
+    }
     let mut bytes = [0u8; 32];
     unsafe { asm!("dmb ish") };
-    if mixed {
-        segments::copy_mixed(&mut s, gpa, first, &mut bytes[..width], false);
-    } else {
-        segments::copy_ram(&mut s, gpa, first, &mut bytes[..width], false);
+    match &memory {
+        None => segments::copy_mixed(&mut s, gpa, first, &mut bytes[..width], false),
+        Some(m) => segments::copy_memory(&mut s, m, gpa, first, &mut bytes[..width], false),
     }
     unsafe { asm!("dsb ish") };
     if s.cpu.dr[5] & DR7_ENABLES != 0 {
@@ -4395,11 +4449,13 @@ unsafe fn vector_aligned(
     }
     let touched = pages(address, width as u64).unwrap(); // the abort path checked the whole range first
     let mut gpa = [0; 2];
+    let mut class = [Class::Ram(false); 2];
     let mut uncached = false;
+    let generation = s.shadow_generation;
     // Complete all walks before touching data, so a fault on the second page leaves the entire access uncommitted.
     for (k, va) in touched.into_iter().enumerate() {
         if let Some(va) = va {
-            let Some((pa, uc)) = translate(
+            let Some((pa, c)) = translate(
                 &mut s,
                 f,
                 b,
@@ -4412,18 +4468,21 @@ unsafe fn vector_aligned(
                     resume(&s, &raw const (*shared()).captured, elr, spsr)
                 }
             };
-            gpa[k] = pa;
-            uncached |= uc;
+            (gpa[k], class[k]) = (pa, c);
+            uncached |= c.uncached();
         }
     }
-    if touched
-        .into_iter()
-        .enumerate()
-        .any(|(k, va)| va.is_some() && !mmio::ram(gpa[k]))
-    {
+    // Mapped device memory: RAM and one region's pages are accessed as RAM is.
+    let Some(memory) = Class::memory(&class) else {
         mmio::device(s, f, b, site, Some(gpa[0]).filter(|_| touched[1].is_none()))
-    }
+    };
     split_wait(&mut s, &gpa[..1 + usize::from(touched[1].is_some())]);
+    if reclassify(&s, generation, &class) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, elr, spsr)
+        }
+    }
     let head = width.min((4096 - (address & 4095)) as usize);
     let parts = [(gpa[0], head), (gpa[1], width - head)];
     let mut bytes = [0u8; 32];
@@ -4441,7 +4500,7 @@ unsafe fn vector_aligned(
     let mut offset = 0;
     for (pa, count) in parts {
         if count != 0 {
-            let Some(ptr) = guest_ram().range(pa, count as u64) else {
+            let Some(ptr) = memory.range(pa, count as u64) else {
                 halt(&s, stop::SHADOW)
             };
             for at in (0..count).step_by(8) {
@@ -4553,9 +4612,10 @@ unsafe fn split(
     }
     // A contended walk resumes at the stub, which takes this path again.
     let p = crate::perf::enter(crate::perf::SHADOW);
+    let generation = s.shadow_generation;
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
     crate::perf::leave(p);
-    let [Some((gpa0, uc0)), Some((gpa1, uc1))] = gpa else {
+    let [Some((gpa0, c0)), Some((gpa1, c1))] = gpa else {
         unsafe {
             write_record(record(), &s);
             resume(&s, &raw const (*shared()).captured, again, spsr)
@@ -4565,12 +4625,21 @@ unsafe fn split(
     // (M2 checkpoint C: a store that wraps to linear 0 through FS or GS and meets only RAM and firmware pages is made, the
     // bytes for the image dropped, as the resident's own stores there.)
     let wrapped = address + width as u64 > 1 << 32 && s.cpu.code_mode() != Some(CodeMode::Bits64);
+    // Mapped device memory: a store across two pages of one region, or between RAM and a region, is made as RAM's.
+    let memory = Class::memory(&[c0, c1]);
+    let (uc0, uc1) = (c0.uncached(), c1.uncached());
     let rom = wrapped && access.rmw == object::RMW_NONE && [gpa0, gpa1].iter().all(|&p| mmio::ram(p) || mmio::rom(p));
-    if (!mmio::ram(gpa0) || !mmio::ram(gpa1)) && !rom {
+    if memory.is_none() && !rom {
         mmio::refuse(s, f, b, stub, if wrapped && access.rmw != object::RMW_NONE { natemu_abi::execution::mmio::FORM } else { natemu_abi::execution::mmio::CROSSING })
     }
     let gpa = [gpa0, gpa1];
     split_wait(&mut s, &gpa);
+    if reclassify(&s, generation, &[c0, c1]) {
+        unsafe {
+            write_record(record(), &s);
+            resume(&s, &raw const (*shared()).captured, again, spsr)
+        }
+    }
     // One data register: a general one, or the low `width` bytes of a vector one (I5a); or MOVAPS m128's X-register pair
     // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike); or a VEX.256 operand's Q-register pair
     // (I8: `stp qA, qB`, 32 bytes, low half first).
@@ -4594,7 +4663,8 @@ unsafe fn split(
         segments::copy_mixed(&mut s, gpa, head, &mut bytes[..width], true);
         None
     } else {
-        let (Some(to0), Some(to1)) = (guest_ram().range(gpa[0], head as u64), guest_ram().range(gpa[1], (width - head) as u64)) else {
+        let memory = memory.unwrap_or_else(|| halt(&s, stop::SHADOW));
+        let (Some(to0), Some(to1)) = (memory.range(gpa[0], head as u64), memory.range(gpa[1], (width - head) as u64)) else {
             halt(&s, stop::SHADOW)
         };
         Some((to0, to1))
@@ -4677,10 +4747,9 @@ unsafe fn split_lock(
                 write_record(record(), &s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
             },
-            Some((g, _)) if !mmio::ram(g) => {
-                mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::ATOMIC)
-            }
-            Some((g, _)) => gpa[k] = g & !4095,
+            // Mapped device memory too: a split lock there is refused (a stated deviation).
+            Some((g, Class::Ram(_))) => gpa[k] = g & !4095,
+            Some(_) => mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::ATOMIC),
         }
     }
     if gpa[1] == u64::MAX {
@@ -4840,15 +4909,98 @@ pub(super) fn split_wait(s: &mut State, gpa: &[u64]) {
 
 /// L3 (amendment): shadows linear page `va` (of an unassigned guest-physical page) read-only onto the all-ones page; on
 /// table capacity exhaustion evicts every shadow once and retries.
-fn install_ones(s: &mut State, va: u64) {
+/// Mapped device memory: never onto a page of an enabled region (`gpa`'s; the table read after this vCPU's holding flag
+/// is set, `mmio::mapped`, so a remap's shootdown sees this shadow): then nothing is installed and every shadow goes (the
+/// region was published after the caller classified the page, a remap race), so the retried access is progress
+/// (`access_aborted`'s no-progress test sees the generation move) and classifies the page again.
+fn install_ones(s: &mut State, va: u64, gpa: u64) {
+    if mmio::mapped(gpa).is_some() {
+        return reset_shadows(s);
+    }
     if tables::install_ones(s.cpu.cpl, va).is_ok() {
         return;
     }
     reset_shadows(s);
     s.evictions += 1;
+    // The reset cleared the holding flag: the table is read again under a new one.
+    if mmio::mapped(gpa).is_some() {
+        return;
+    }
     if tables::install_ones(s.cpu.cpl, va).is_err() {
         halt(s, stop::SHADOW)
     }
+}
+
+/// Mapped device memory, the remap trigger (docs/restructure/mapped-device-memory-plan.md): the region table's `seq`,
+/// read before a port or device request ([`remapped`] compares it once the request is answered).
+pub(super) fn mapped_seq() -> u64 {
+    cache::mapped_regions().seq.load(core::sync::atomic::Ordering::Acquire)
+}
+/// After a port or device exit answered `DONE` (its polls included): if the region table's `seq` moved since `before`
+/// (this exit's device published, or another vCPU's did meanwhile), runs the remap shootdown and resets this vCPU's own
+/// shadows before the guest runs again. A `before` of 0 is a VM without regions (`Backing::machine` publishes every
+/// region before any vCPU runs, so `seq` is nonzero from the start exactly when there are any, and 0 never moves): no
+/// second load then.
+#[inline(always)]
+pub(super) fn remapped(s: &mut State, before: u64) {
+    if before != 0 && mapped_seq() != before {
+        remap(s)
+    }
+}
+#[cold]
+#[inline(never)]
+fn remap(s: &mut State) {
+    let vcpus = s.vcpus as usize;
+    cache::remap_shootdown(vcpus, || {
+        let bits = cache::take_shadows();
+        if bits != 0 {
+            serve_peers(s, bits)
+        }
+    });
+    reset_shadows(s);
+}
+/// A completion that read the region table (a [`Class::Mapped`] page among `class`) and then waited ([`split_wait`],
+/// which may serve a peer's shadow drop: a remap's shootdown among them) accesses the region only if no reset came in
+/// between (`generation`, the shadow generation before its walks); else its classes may name a table older than a remap
+/// that has since completed, and it retries the instruction (the retry walks and classifies again). RAM-only accesses never
+/// retry: RAM does not move.
+fn reclassify(s: &State, generation: u64, class: &[Class]) -> bool {
+    s.shadow_generation != generation && class.iter().any(|c| matches!(c, Class::Mapped(_)))
+}
+
+/// Mapped device memory (docs/restructure/mapped-device-memory-plan.md): shadows linear page `va`, which the walk `t`
+/// translated (for `access`) to non-RAM page `t.gpa`, onto that page of the enabled region holding it, and returns the
+/// region; `None` when no enabled region holds the page (nothing installed: the device path). The install protocol, in
+/// this one place: this vCPU's holding flag (SeqCst), then the table read (`mmio::mapped`), then the install, so a remap's
+/// shootdown either finds the flag or this read sees the new table; a reset in between (capacity) clears the flag, so the
+/// table is read again. Writable as RAM's: W and D (the D=1 read upgrade of fault-around chunk 1 with it, unless that is
+/// off), the walk's A/D updates made; global as the walk's G with CR4.PGE. No memory-type stepping (a stated deviation:
+/// device memory has no side effects), no code mark and no writable-page bit (those index RAM's pages; no fetch or walk
+/// uses a mapped page), no split wait (split locks are refused on mapped pages: none holds one).
+fn install_mapped(s: &mut State, va: u64, t: &paging::Translation, access: Access) -> Option<mmio::Region> {
+    let writable = t.writable
+        && t.dirty
+        && (access == Access::Write || cache::control().writable_on_read_off == 0);
+    let global = t.global && s.cpu.cr4 & CR4_PGE != 0;
+    let mut region = mmio::mapped(t.gpa)?;
+    // The holder race's test point: held here, after the table read, while a peer publishes and shoots down.
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::MAPPED_BEFORE_INSTALL);
+    let mut evicted = false;
+    loop {
+        match tables::install(s.cpu.cpl, va, &region.memory(), t.gpa, writable, global) {
+            Ok(()) => break,
+            Err(shadow::Error::Capacity) if !evicted => {
+                reset_shadows(s);
+                s.evictions += 1;
+                evicted = true;
+                region = mmio::mapped(t.gpa)?;
+            }
+            Err(_) => halt(s, stop::SHADOW),
+        }
+    }
+    cache::control().mapped_installs += 1;
+    Some(region)
 }
 
 /// M2 Part 2: shadows linear page `va` read-only with page `gpa` of the firmware image ([`mmio::ones`]: x86 reads ROM as

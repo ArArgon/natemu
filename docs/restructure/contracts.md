@@ -509,6 +509,55 @@ address. Page-walk addresses are not masked.
 - Grid: device, hole.
 - Observable today: guest (registers, memory) and internal (service records).
 - Kind: design (machine map). All-ones open bus is a PC convention.
+- Later change (mapped device memory, November 24, 2026): a fourth class, mapped device memory, is directly mapped
+  (contract 69); the rule above holds for every other device endpoint.
+
+**69. Mapped device memory is a page class of its own: read and written natively where its region decodes, refused
+with a typed stop where it cannot be, and never reachable at a base it has left.**
+([mapped-device-memory-plan.md](mapped-device-memory-plan.md); added November 24, 2026, numbered after contract 68.)
+- The class: a page that is not RAM, not this vCPU's xAPIC page (which decodes first) and not ROM, inside an enabled
+  region of the region table (`cache::MappedRegions`, at most 8 regions, 256 MiB together, fixed at launch: only bases
+  and enables change). Overlapping regions: the lowest-numbered entry wins. A region overlapping an emulated BAR (a
+  guest error) is served natively there, whatever the bus window's lowest-function-first rule would pick. The shadow is writable exactly as for RAM
+  (guest W and D, the walk's A/D), never code- or table-marked; no guest-physical address resolves to anything but the
+  region's own object (contract 21 holds: the alias maps only its allocation, EL1 only). Data accesses of every width
+  and form translated code and the resident complete for RAM complete there too, page-crossing stores within one region
+  or between RAM and a region, string, vector and aligned atomic forms included, and the boot-time interpreter's data
+  accesses.
+  Enforced by: `tests/system/run_mapped.py` cases `mapped-load-store` (zero device accesses to the region), `mapped-permissions`,
+  `mapped-host-fill`, `mapped-interpreter/data`, `lapic_beats_mapped_region`, `overlapping_regions_pick_lowest`; the
+  Linux guest case `mapped-bar` (`tests/devices`, through `/dev/mem`).
+- Refusals (each a typed stop, a stated deviation): instruction fetch (`no_code`, `fetch_not_ram`; case `fetch`); a page
+  table there (`unsupported_mode`; `page-table`); a split lock (`unsupported_mmio` `atomic`; `split-lock`, and the
+  interpreter's); a store crossing from a region onto a device or unassigned page, or across two regions (`crossing`;
+  `crossing-device`, `crossing-regions`); every access the resident makes through its own walk (`unsupported_mmio`
+  `system`: `descriptor-table`, `idt`, `popf-stack`, `iret-frame`, `fxsave-image`, `xsave-image`, `x87-m80`,
+  `ldmxcsr-operand`, `gather-element`, `rcl-operand`, `enter-frame`, `ins-destination`, `vcvtps2ph-destination`,
+  `maskmov-destination`); the interpreter's resident operations (`interp_memory`; its `descriptor-table`). Without a
+  case: a compatibility-mode FS/GS string element, a compatibility-mode load wrapping at 4 GiB beside a region, the ACPI
+  wakeup mailbox. Virtio rings and buffers there are refused by `GuestRam::range` validation (no device-to-device DMA).
+  Enforced by: `run_mapped.py`'s `mapped-refusals/*` and `mapped-interpreter/*` sub-cases.
+- Memory type (stated deviation): a mapped page runs natively whatever its PAT/MTRR type (RAM honours UC/WT/WP by
+  stepping); device memory has no side effects, so the results are the same. Enforced by: `mapped-uc` (a UC mapping:
+  zero device accesses, `mapped_installs` > 0); `mapped-bar` maps the region UC through `/dev/mem` with `O_SYNC`.
+- The remap rule: the host publishes the table (seqlock, one writer) before any vCPU runs (at launch: `Backing::machine`
+  writes every region's disabled entry, and run-program writes its enabled ones) and afterwards only from a device
+  handler running in a vCPU's port or device exit: the PCI bus's configuration writes, on each effective decode change
+  of a mapped BAR (memory decoding and the BAR wholly inside the window; a size probe disables it), and the driver
+  test device's `MOVE` write. A VM without regions never publishes (`seq` stays 0), so its resident makes a single
+  `seq` load per exit, no second one, and sets no flag; the resident compares the table's `seq`
+  across every port and device exit and, when it moved, runs `cache::remap_shootdown` (every peer holding shadows resets,
+  halted ones before they next run guest code) and resets its own shadows before the guest resumes. Installs set their
+  holding flag before reading the table. After the shootdown no vCPU holds a shadow built from the old table: the old
+  base reads all-ones and drops stores, the new one serves the region.
+  Enforced by: `run_mapped.py` cases `remap_is_visible_after_flag`, `install_races_publish`, `halted_peer_drops_on_wake`,
+  `disable_then_enable`, `remap_under_load`; `mapped-bar` (a long-lived guest mapping of the old base reads all-ones
+  after the BAR moves, the data is at the new base, `remaps` at least one per publish); host unit tests
+  `pci::tests::mapped::{mapped_bar_publishes_on_base_write, memory_enable_off_disables_region,
+  size_probe_disables_then_restore_enables, no_publish_without_decode_change}` and `regions_are_published_before_any_vcpu`.
+- Observable today: guest (values, faults, typed stops), host (`SUM` through a second mapping of the object, the
+  `natemu: mapped` line: the table, publishes, per-vCPU `mapped_installs` and `remaps`).
+- Kind: design (the class, the refusals and the remap protocol); the memory type is a stated deviation.
 
 **27. Paged and paging-off owners can share physical source and data, and each
 resolves routes by its own rules.** A source change invalidates both kinds of
