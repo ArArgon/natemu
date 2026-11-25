@@ -5,7 +5,10 @@
 //! The published mode and its change counter live under one lock, so a reader takes both, or the mode alone, whole:
 //! never one geometry's width with another's height. The counter counts changes of the published value: a mode
 //! published, unpublished, or replaced by a different one. A re-evaluation that yields the same value does not count.
-use crate::devices::Access;
+//!
+//! A launch describes its display with a [`Spec`] (`[display]`: the framebuffer's size and the EDID's preferred mode),
+//! checked by [`Spec::check`] before anything is built.
+use crate::devices::{Access, mask};
 use crate::pci::configuration::PciConfiguration;
 use crate::pci::{BARS, Bar, BarKind, Bars, DeviceMemory, Function};
 use std::sync::{Arc, Mutex};
@@ -23,6 +26,55 @@ pub struct Mode {
     pub stride: u32,
     pub offset: u64,
     pub big_endian: bool,
+}
+
+/// The framebuffer's least and greatest size, in MiB (`[display] vram_mib`, a power of two between them). The greatest is
+/// what launch-time BAR placement admits beside BAR2 and the other functions (`crate::pci::place`): memory BARs go
+/// from the PCI window's start + 2 MiB upward, largest first, naturally aligned, so a 128 MiB BAR0 lands at E8000000H
+/// and fills the window to its end, leaving no room for anything after it; 64 MiB lands at E4000000H with 128 MiB above
+/// it free (`vram_max_is_what_placement_admits`). 64 MiB holds two frames of 2560 x 1600, the largest snapshot.
+pub const VRAM_MIB_MIN: u64 = 4;
+pub const VRAM_MIB_MAX: u64 = 64;
+
+/// A launch's display (`[display]`): `vram_mib` MiB of framebuffer and the EDID's preferred mode, `width` x `height`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spec {
+    pub vram_mib: u64,
+    pub width: u32,
+    pub height: u32,
+}
+impl Default for Spec {
+    /// 16 MiB (QEMU's `bochs-display` default) and 1024 x 768.
+    fn default() -> Self {
+        Spec { vram_mib: 16, width: 1024, height: 768 }
+    }
+}
+impl Spec {
+    /// `Err` naming the `display.` key when the framebuffer size is not a power of two from [`VRAM_MIB_MIN`] to
+    /// [`VRAM_MIB_MAX`], when the EDID cannot describe the preferred mode ([`edid::fits`]), or when the framebuffer holds
+    /// fewer than two frames of it (Linux's `drm_vram_helper_mode_valid` drops a mode larger than half of video memory).
+    pub fn check(&self) -> Result<(), String> {
+        let Spec { vram_mib: v, width: w, height: h } = *self;
+        if !v.is_power_of_two() || !(VRAM_MIB_MIN..=VRAM_MIB_MAX).contains(&v) {
+            return Err(format!(
+                "display.vram_mib: {v}: a power of two from {VRAM_MIB_MIN} to {VRAM_MIB_MAX} (MiB)"
+            ));
+        }
+        if !edid::fits(w, h) {
+            return Err(format!(
+                "display.width, display.height: {w} x {h}: not a mode the EDID can describe (each at least 64, at most \
+                 4095, and a 60 Hz pixel clock of at most 655.25 MHz)"
+            ));
+        }
+        let two = 2 * 4 * u64::from(w) * u64::from(h);
+        if v << 20 < two {
+            let need = two.div_ceil(1 << 20).next_power_of_two();
+            return Err(format!(
+                "display.vram_mib: {v} MiB holds fewer than two {w} x {h} frames; {w} x {h} needs at least {need}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The registers and what they publish, under one lock.
@@ -98,6 +150,10 @@ impl Function for Display {
     fn bar_requests(&self) -> Vec<(u8, BarKind, u64)> {
         self.requests.clone()
     }
+    /// BAR0 maps the framebuffer.
+    fn mapped(&self, bar: u8) -> Option<Arc<DeviceMemory>> {
+        (bar == 0).then(|| self.vram.clone())
+    }
     fn assign(&self, index: u8, base: u64) {
         self.bars.assign(&mut lock(&self.config), index, base);
     }
@@ -118,9 +174,9 @@ impl Function for Display {
                 }
                 Access::Completed(0)
             }
-            // BAR0 is mapped once the mapped-BAR request exists, and then never reaches here; until then an access
-            // reads 0 and a write is dropped (the framebuffer is reached through `vram`).
-            0 => Access::Completed(0),
+            // BAR0 is mapped (`mapped`): guest accesses run natively on `vram`, and one that still reaches the bus
+            // reads all-ones and its write is dropped (`Function::mapped`'s rule).
+            0 => Access::Completed(if value.is_none() { mask(size) } else { 0 }),
             _ => Access::Refused,
         }
     }
@@ -194,6 +250,14 @@ mod tests {
             "BAR0 the framebuffer, BAR2 4 KiB of registers"
         );
         assert_eq!(d.bar_requests()[0].2, d.vram().len());
+        assert!(d.mapped(0).is_some_and(|m| Arc::ptr_eq(&m, d.vram())), "BAR0 maps the framebuffer");
+        assert!(d.mapped(2).is_none(), "BAR2 is emulated");
+        // BAR0 through the bus: all-ones, the write dropped
+        assert_eq!(completed(d.bar_access(0, 0, 16, 4, None)), 0xffff_ffff);
+        d.bar_access(0, 0, 16, 8, Some(5));
+        let mut w = [1u64];
+        d.vram().read_words(16, &mut w);
+        assert_eq!(w, [0], "the framebuffer unchanged");
         let other = DeviceMemory::new(16 * MIB).unwrap();
         assert!(!Arc::ptr_eq(d.vram(), &other));
         // sizing reads back the lengths and kinds: 16 MiB prefetchable, 4 KiB not; no BAR1, 3-5
@@ -494,5 +558,67 @@ mod tests {
         assert_eq!(d.changes(), 4 * flips - 1);
         assert!(mixed.is_empty(), "{} mixed modes, first {:?}", mixed.len(), mixed.first());
         assert!(seen_a > 0 && seen_b > 0, "the reader saw both ({seen_a}, {seen_b})");
+    }
+
+    /// `[display]`'s rules: the framebuffer a power of two from 4 to 64 MiB, a preferred mode the EDID describes, two
+    /// frames of it in the framebuffer; each refusal names its key.
+    #[test]
+    fn spec_check() {
+        let spec = |vram_mib, width, height| Spec { vram_mib, width, height };
+        assert_eq!(Spec::default(), spec(16, 1024, 768));
+        let fine = [spec(16, 1024, 768), spec(4, 640, 480), spec(64, 2560, 1600), spec(32, 2560, 1600), spec(4, 64, 64)];
+        for ok in [&fine[..], &[spec(64, 4095, 2048)]].concat() {
+            assert_eq!(ok.check(), Ok(()), "{ok:?}");
+        }
+        for (bad, key, what) in [
+            (spec(3, 640, 480), "display.vram_mib: 3:", "not a power of two"),
+            (spec(2, 640, 480), "display.vram_mib: 2:", "below 4"),
+            (spec(128, 1024, 768), "display.vram_mib: 128:", "above what placement admits"),
+            (spec(0, 1024, 768), "display.vram_mib: 0:", "zero"),
+            (spec(16, 63, 480), "display.width, display.height: 63 x 480", "too narrow"),
+            (spec(16, 640, 4096), "display.width, display.height: 640 x 4096", "too tall"),
+            (spec(64, 4095, 2497), "display.width, display.height: 4095 x 2497", "pixel clock"),
+            (spec(16, 1920, 1200), "display.vram_mib: 16 MiB holds fewer than two 1920 x 1200 frames", "two frames"),
+            (spec(4, 1024, 768), "display.vram_mib: 4 MiB", "two frames: 6 MiB"),
+        ] {
+            let e = bad.check().expect_err(what);
+            assert!(e.starts_with(key), "{what}: {e}");
+        }
+        assert!(spec(16, 1920, 1200).check().unwrap_err().ends_with("needs at least 32"));
+        // exactly two frames fit: 1024 x 1024 in 8 MiB
+        assert_eq!(spec(8, 1024, 1024).check(), Ok(()));
+        assert!(spec(8, 1024, 1025).check().is_err());
+    }
+
+    /// [`VRAM_MIB_MAX`] is what launch-time placement admits: at 64 MiB the display's BARs place beside every other
+    /// function a launch can have (the virtio functions, the PCI test function, the mapped-memory test function); at
+    /// 128 MiB BAR0 alone fills the window from E8000000H and its BAR2 is refused.
+    #[test]
+    fn vram_max_is_what_placement_admits() {
+        use crate::pci::place::{Request, place};
+        let at = |slot: u8, function: u8, (bar, kind, len): (u8, BarKind, u64)| Request { slot, function, bar, kind, len };
+        let others = |slot: u8| {
+            let mut r: Vec<Request> = (1..slot - 2).map(|s| at(s, 0, (0, BarKind::Mem32, 0x8000))).collect();
+            let testdev = slot - 2;
+            r.push(at(testdev, 0, (0, BarKind::Mem32, 0x1000)));
+            r.push(at(testdev, 0, (1, BarKind::Io, 0x100)));
+            r.push(at(testdev, 1, (0, BarKind::Mem32, 0x1000)));
+            r.push(at(testdev, 1, (1, BarKind::Io, 0x100)));
+            r.push(at(testdev, 1, (2, BarKind::Mem64, 0x1_0000)));
+            r.push(at(slot - 1, 0, (0, BarKind::Mem64, 2 * MIB)));
+            r.push(at(slot - 1, 0, (2, BarKind::Mem32, 0x1000)));
+            r
+        };
+        let with_display = |vram_mib: u64| {
+            let mut r = others(31);
+            r.extend(bochs::requests(vram_mib * MIB).into_iter().map(|q| at(31, 0, q)));
+            place(&r)
+        };
+        let placed = with_display(VRAM_MIB_MAX).unwrap();
+        let bar0 = placed.iter().find(|p| p.request.slot == 31 && p.request.bar == 0).unwrap();
+        assert_eq!(bar0.base, 0xe400_0000);
+        assert!(with_display(VRAM_MIB_MAX * 2).unwrap_err().contains("PCI 1f.0 BAR2"));
+        let alone: Vec<_> = bochs::requests(VRAM_MIB_MAX * 2 * MIB).into_iter().map(|q| at(1, 0, q)).collect();
+        assert!(place(&alone).unwrap_err().contains("PCI 01.0 BAR2"), "128 MiB leaves no room even for BAR2");
     }
 }

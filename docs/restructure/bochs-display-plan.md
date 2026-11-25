@@ -48,9 +48,12 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
   height at least 64, and `offset + stride x height` within the framebuffer. A geometry that fails it (including the
   intermediate states the driver passes through while it pans) unpublishes the mode until a later write makes it valid
   again; ENABLE is never cleared by the device.
-- The framebuffer size is fixed at launch (`vram_mib`, a power of two from 4 to 256, default 16), and must hold two
+- The framebuffer size is fixed at launch (`vram_mib`, a power of two from 4 to 64, default 16), and must hold two
   frames of the preferred mode (`vram_mib` MiB at least 2 x width x height x 4: Linux's `drm_vram_helper_mode_valid`
-  filters out a mode larger than half of VRAM); the mapped-memory limits apply.
+  filters out a mode larger than half of VRAM); the mapped-memory limits apply. 64 is what launch-time BAR placement
+  (`pci/place.rs`) admits: memory BARs go from E0200000H upward, largest first, naturally aligned, so a 128 MiB BAR0
+  lands at E8000000H and fills the 256 MiB window to its end, leaving no room for BAR2 (256 MiB would be the whole
+  window); 64 MiB lands at E4000000H with the window's upper half free, and holds two 2560 x 1600 frames.
 - New crates are named with their reason in the commit that adds them; nothing GPL or LGPL is adapted.
 - Rust unit tests run in the framework as one unit (`tests/unit/family.toml`'s `rust/all`); each new check is shown to
   fail against a deliberate break named in its step. Tests only through `tools/natemu-test`; the gate passes before
@@ -86,7 +89,9 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
 ### The function (`crates/host/src/display/bochs.rs`)
 
 - Identity: vendor 1234H, device 1111H, revision 2, class 0380H, subsystem 1AF4H:1100H, no interrupt pin, header type
-  0. BAR0: `vram_mib` of 32-bit memory, mapped (`DeviceMemory`); BAR2: 4 KiB of 32-bit memory.
+  0. BAR0: `vram_mib` of 32-bit prefetchable memory, mapped (`DeviceMemory`, named by `Function::mapped(0)`); BAR2:
+  4 KiB of 32-bit memory. An access to BAR0 that still reaches the bus reads all-ones and its write is dropped (the
+  trait's rule for a mapped BAR).
 - BAR2 layout (as `standard-vga.rst`): 000H-07FH the EDID block (128 bytes, read-only; 080H-3FFH read 0); 400H-41FH
   reserved (VGA ports on a VGA-class device; here read 0, writes dropped); 500H-515H the DISPI registers, 16 bits
   each at 500H + 2 x index; 600H-607H the extended registers: 600H the extended region's size (8), 604H the framebuffer
@@ -117,11 +122,16 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
   mode change, coalesced to at most one per 50 ms per client. `query_status.devices.display`: `null` or the mode.
 - A snapshot response may exceed the control plan's 1 MiB request-line limit; the limit is on requests only (the
   control branch's documentation fix).
-- `crates/cli`: `[display] device = "bochs"` (default none), `vram_mib` (16), `width`, `height` (1024, 768: the EDID's
-  preferred mode); refused when `vram_mib` cannot hold two preferred frames.
-- BAR0 is prefetchable in QEMU; natemu's `BarKind` has no prefetchable flag, and Linux's driver does not need one, so
-  BAR0 is plain 32-bit memory (a stated difference, not worth a `BarKind` change). The display is a PCI function, so it gives the guest a PCI bus even when every virtio
-  device is on MMIO, as `pci_testdev` does.
+- `crates/cli`: `[display] device = "bochs"` (default `"none"`), `vram_mib` (16), `width`, `height` (1024, 768: the
+  EDID's preferred mode); refused at configuration time, naming the key, when `vram_mib` is not a power of two from 4
+  to 64, when `edid::fits` refuses the preferred mode, or when `vram_mib` cannot hold two preferred frames
+  (`display::Spec::check`, which the launch also applies, so the library never panics in `edid::block`).
+- BAR0 is prefetchable, as QEMU's: the BAR request's `BarKind` gives the width and the function's PCI configuration
+  sets the prefetchable bit (as the mapped-memory test function's BAR0). The display is a PCI function, function 0 of
+  the lowest PCI slot still free, placed after the test functions (`debug.pci_testdev`, `debug.mapped_testdev`), with no
+  INTx line and no `_PRT` entry: a launch without it keeps every slot, and turning it on moves no other function. It
+  gives the guest a PCI bus even when every virtio device is on MMIO, as `pci_testdev` does. `Prepared::display()`
+  hands the function (its framebuffer and published mode) to the control server.
 
 ## File structure
 
@@ -145,7 +155,8 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
 **Files:** `crates/host/src/display/{mod.rs,bochs.rs,edid.rs}`, `crates/host/src/lib.rs`.
 
 **Interfaces:** `Display::new(vram: Arc<DeviceMemory>, preferred: (u32, u32)) -> Arc<Display>` implementing
-`pci::Function` with BAR0 mapped; `Display::mode() -> Option<Mode>`, `Display::changes() -> u64`; `edid::block(w, h)
+`pci::Function` with BAR0 mapped (the trait method `Function::mapped(0)` returns the framebuffer; mapped memory's Task 4
+names a mapped BAR by that method, not by a field of the BAR request); `Display::mode() -> Option<Mode>`, `Display::changes() -> u64`; `edid::block(w, h)
 -> [u8; 128]`.
 
 - [ ] **Step 1: unit tests**: `identity_and_bars` (IDs, class, BAR0 mapped of `vram_mib`, BAR2 4 KiB),
@@ -161,13 +172,23 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
 
 ### Task 2: launch and configuration
 
-**Files:** `crates/host/src/linux.rs`, `crates/cli/src/*`, `docs/configuration.md`.
+**Files:** `crates/host/src/linux.rs`, `crates/host/src/display/mod.rs` (`Spec`), `crates/cli/src/*`,
+`docs/configuration.md`, `tests/devices/run_platform.py` and `tests/devices/family.toml` (the case `display-probe` sits
+beside `mapped-bar`, in the runner whose initramfs already carries stock modules).
 
-- [ ] **Step 1: tests**: config tests for `[display]` (keys, defaults, `vram_mib` limits, unknown device refused);
+**Interfaces:** `display::Spec { vram_mib, width, height }` with `Spec::check() -> Result<(), String>`;
+`linux::Boot::display: Option<display::Spec>`; `linux::Prepared::display() -> Option<Arc<display::Display>>`.
+
+- [ ] **Step 1: tests**: config tests for `[display]` (keys, defaults, `vram_mib` limits 4-64, unknown device refused);
   a `tests/devices` case `display-probe`: the guest loads `bochs` (a module in Debian's kernel; the family's initramfs
   recipe adds it and `drm_kms_helper`, and the self-check fails without them), and `/sys/class/drm/card0` exists,
   `card0-Virtual-1/modes` lists 1024x768 first and 800x600 and 640x480, dmesg names `bochs-drm` with
-  `Found bochs VGA, ID 0xb0c5.` and `Found EDID data blob.`, and `/dev/dri/card0` exists.
+  `Found bochs VGA, ID 0xb0c5.` and `Found EDID data blob.`, and `/dev/dri/card0` exists. As Linux 6.12 prints them
+  (case `display-probe`, M4): the two lines carry the `[drm] ` prefix, not the device's; `bochs-drm` is named by
+  `bochs-drm 0000:00:01.0: enabling device (0000 -> 0002)` and `[drm] Initialized bochs-drm 1.0.0 for 0000:00:01.0 on
+  minor 0`. The initramfs takes bochs's dependencies from the kernel package's `depends=` (drm, drm_kms_helper,
+  drm_ttm_helper, drm_vram_helper, ttm); its `modules.dep` lists each module's dependencies in an order BusyBox's
+  modprobe can load from the end (ttm after drm), which the runner's older order did not give for shared ones.
 - [ ] **Step 2: run**; FAIL. **Step 3: implement.** **Step 4: run**; PASS.
 - [ ] **Step 5: commit** `display: a Bochs display on the PCI bus from [display]`.
 

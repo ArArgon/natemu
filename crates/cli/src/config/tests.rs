@@ -1446,3 +1446,57 @@ fn control_socket_key() {
     let e = err(load_old(&["--set", "control.socket=a", "--set", "control.socket=b"]));
     assert!(e.contains("--set control.socket: set twice"), "{e}");
 }
+
+/// `[display]`: off by default (`device = "none"`), 16 MiB at 1024 x 768; `device = "bochs"` from the file or `--set`
+/// carries the spec into the launch; `--set` wins over the file; an unknown device, a framebuffer size that is not a
+/// power of two from 4 to 64 MiB, a mode the EDID cannot describe and a framebuffer under two frames are refused, each
+/// naming its key; an unknown key is refused; a firmware boot has no PCI bus for it.
+#[test]
+fn display_keys() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "RT".into(), vec![7], None).unwrap();
+    let default = natemu::display::Spec { vram_mib: 16, width: 1024, height: 768 };
+    let c = load_old(&[]).unwrap();
+    assert!(!c.display_on && c.display == default && boot(&c).display.is_none(), "no display by default");
+    let (_, c) = load_file(MIN, &[]);
+    assert!(boot(&c.unwrap()).display.is_none());
+    let (_, c) = load_file(&format!("{MIN}[display]\ndevice = \"bochs\"\n"), &[]);
+    assert_eq!(boot(&c.unwrap()).display, Some(default), "the defaults");
+    let (_, c) = load_file(&format!("{MIN}[display]\ndevice = \"bochs\"\nvram_mib = 32\nwidth = 1920\nheight = 1080\n"), &[]);
+    let want = natemu::display::Spec { vram_mib: 32, width: 1920, height: 1080 };
+    assert_eq!(boot(&c.unwrap()).display, Some(want));
+    let c = load_old(&["--set", "display.device=bochs", "--set", "display.vram_mib=64", "--set", "display.width=2560",
+                       "--set", "display.height=1600"]).unwrap();
+    assert_eq!(boot(&c).display, Some(natemu::display::Spec { vram_mib: 64, width: 2560, height: 1600 }));
+    let (_, c) = load_file(&format!("{MIN}[display]\ndevice = \"bochs\"\nwidth = 800\n"), &["--set", "display.device=none",
+                                                                                             "--set", "display.width=640"]);
+    let c = c.unwrap();
+    assert!(!c.display_on && c.display.width == 640 && boot(&c).display.is_none(), "--set wins over the file");
+    // refusals, each naming the key
+    for (toml, want) in [
+        ("device = \"vga\"\n", "vm.toml: display.device: unknown display device \"vga\": bochs or none"),
+        ("device = \"bochs\"\nvram_mib = 3\n", "vm.toml: display.vram_mib: 3: a power of two from 4 to 64 (MiB)"),
+        ("device = \"bochs\"\nvram_mib = 2\n", "vm.toml: display.vram_mib: 2: a power of two"),
+        ("device = \"bochs\"\nvram_mib = 128\n", "vm.toml: display.vram_mib: 128: a power of two from 4 to 64"),
+        ("device = \"bochs\"\nvram_mib = 4\n", "vm.toml: display.vram_mib: 4 MiB holds fewer than two 1024 x 768 frames"),
+        ("device = \"bochs\"\nwidth = 63\n", "vm.toml: display.width, display.height: 63 x 768: not a mode the EDID"),
+        ("device = \"bochs\"\nvram_mib = 64\nwidth = 4095\nheight = 2497\n", "vm.toml: display.width, display.height: 4095 x 2497"),
+        ("vram_mib = 5\n", "vm.toml: display.vram_mib: 5:"),
+        ("width = -1\n", "vm.toml: display.width"),
+        ("device = 1\n", "vm.toml: display.device"),
+        ("colour = 1\n", "vm.toml: display"),
+    ] {
+        let e = err(load_file(&format!("{MIN}[display]\n{toml}"), &[]).1);
+        assert!(e.starts_with(want), "{toml}: {e}");
+    }
+    let e = err(load_old(&["--set", "display.device=vga"]));
+    assert!(e.contains("--set display.device: unknown display device \"vga\""), "{e}");
+    let e = err(load_old(&["--set", "display.vram_mib=lots"]));
+    assert!(e.contains("--set display.vram_mib: bad count \"lots\""), "{e}");
+    let e = err(load_old(&["--set", "display.device=bochs", "--set", "display.vram_mib=256"]));
+    assert!(e.contains("config: display.vram_mib: 256"), "{e}");
+    let e = err(load_old(&["--set", "display.depth=32"]));
+    assert!(e.contains("--set display.depth: unknown key"), "{e}");
+    let e = err(load_args(&["--fexc", "f", "--firmware", "fw", "--set", "display.device=bochs"]));
+    assert!(e.contains("a firmware boot has no PCI bus for the display"), "{e}");
+}

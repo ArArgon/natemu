@@ -90,6 +90,10 @@ pub struct Config {
     pub watchdog: Option<u64>,
     /// The control API's socket (`[control] socket`, docs/control-api.md); None = no control socket.
     pub control_socket: Option<PathBuf>,
+    /// The display (`[display] device = "bochs"`, default `"none"`): QEMU's `bochs-display` on the PCI bus.
+    pub display_on: bool,
+    /// `[display] vram_mib`, `width`, `height` (16, 1024, 768); checked by `natemu::display::Spec::check`.
+    pub display: natemu::display::Spec,
 }
 
 impl Config {
@@ -136,6 +140,8 @@ impl Config {
             inspect: true,
             watchdog: None,
             control_socket: None,
+            display_on: false,
+            display: natemu::display::Spec::default(),
         }
     }
     /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
@@ -170,6 +176,7 @@ struct FileConfig {
     console: Vec<FConsole>,
     debug: Option<FDebug>,
     control: Option<FControl>,
+    display: Option<FDisplay>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -271,6 +278,14 @@ struct FDebug {
 #[serde(deny_unknown_fields)]
 struct FControl {
     socket: Option<PathBuf>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FDisplay {
+    device: Option<String>,
+    vram_mib: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 /// A file value's path: relative ones are taken from the file's folder.
@@ -444,7 +459,24 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         }
         cfg.control_socket = Some(rel(base, &socket));
     }
+    if let Some(d) = f.display {
+        if let Some(v) = d.device {
+            cfg.display_on = display_device(&v).map_err(|e| format!("{who}: display.device: {e}"))?;
+        }
+        cfg.display.vram_mib = d.vram_mib.unwrap_or(cfg.display.vram_mib);
+        cfg.display.width = d.width.unwrap_or(cfg.display.width);
+        cfg.display.height = d.height.unwrap_or(cfg.display.height);
+    }
     Ok(())
+}
+
+/// `[display] device`: `"bochs"` (the display on) or `"none"`.
+fn display_device(v: &str) -> Res<bool> {
+    match v {
+        "bochs" => Ok(true),
+        "none" => Ok(false),
+        _ => Err(format!("unknown display device {v:?}: bochs or none")),
+    }
 }
 
 fn transport_word(v: &str) -> Res<Transport> {
@@ -648,7 +680,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 33] = [
+const KEYS: [&str; 37] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -682,6 +714,10 @@ const KEYS: [&str; 33] = [
     "debug.inspect",
     "debug.watchdog",
     "control.socket",
+    "display.device",
+    "display.vram_mib",
+    "display.width",
+    "display.height",
 ];
 const DEVICE_KEYS: &str =
     "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
@@ -847,6 +883,12 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         }
         "control.socket" if text.is_empty() => return Err(err("an empty path".into())),
         "control.socket" => cfg.control_socket = Some(path()),
+        "display.device" => cfg.display_on = display_device(text).map_err(err)?,
+        "display.vram_mib" => {
+            cfg.display.vram_mib = text.parse().map_err(|_| err(format!("bad count {text:?}")))?
+        }
+        "display.width" => cfg.display.width = text.parse().map_err(|_| err(format!("bad count {text:?}")))?,
+        "display.height" => cfg.display.height = text.parse().map_err(|_| err(format!("bad count {text:?}")))?,
         _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())
@@ -901,6 +943,11 @@ pub fn validate(cfg: &Config) -> Res<()> {
             "{who}: a firmware boot has no virtio devices yet (no disk, nic, rng or console)"
         ));
     }
+    if cfg.firmware.is_some() && cfg.display_on {
+        return Err(format!("{who}: a firmware boot has no PCI bus for the display ([display] device)"));
+    }
+    // [display]'s values, whether or not the device is on: the framebuffer's size and the preferred mode.
+    cfg.display.check().map_err(|e| format!("{who}: {e}"))?;
     if cfg.fexc.is_none() {
         return Err(format!(
             "{who}: no fexc: --fexc FILE, or [engine] fexc in a --config file"
@@ -1089,6 +1136,7 @@ pub fn to_boot(
     boot.pool = cfg.pool;
     boot.pci_testdev = cfg.pci_testdev;
     boot.mapped_testdev = cfg.mapped_testdev;
+    boot.display = cfg.display_on.then_some(cfg.display);
     boot.check_reuse = cfg.check_reuse;
     boot.transports = cfg.transports;
     boot.pvpanic = cfg.pvpanic;

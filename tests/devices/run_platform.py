@@ -36,8 +36,10 @@ KERNEL_SHA = '2b2358b37674d2505350528875bb17afae2a36522a9e8a9417eaca65a7da0e08' 
 KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99'    # its package (debian-kernel-deb)
 # Stock modules the cases load (module names; files are found by name in the kernel package, `-` and `_` alike), each
 # with the modules its `depends=` names, transitively. pvpanic_mmio needs pvpanic; psmouse (the PS/2 task) needs none
-# (serio, libps2 and i8042 are built in: CONFIG_SERIO_I8042=y, CONFIG_SERIO_LIBPS2=y).
-MODULES = ('pvpanic_mmio', 'psmouse')
+# (serio, libps2 and i8042 are built in: CONFIG_SERIO_I8042=y, CONFIG_SERIO_LIBPS2=y). bochs (display-probe) is the
+# DRM driver of the Bochs display; drm_kms_helper and the rest of DRM (drm, drm_vram_helper, drm_ttm_helper, ttm, ...)
+# come through its depends=. The self-check requires every module the init loads to be here.
+MODULES = ('pvpanic_mmio', 'psmouse', 'bochs', 'drm_kms_helper')
 APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'ls', 'basename', 'readlink', 'dmesg', 'sync',
            'poweroff', 'reboot', 'sleep', 'stty')
 # mapped-bar (debug.mapped_testdev, crates/host/src/pci/mapped_testdev.rs): the test function's identity, its region,
@@ -289,6 +291,16 @@ mask:    dq 0
 line:    times 32 db 0
 file_end:
 '''
+# display-probe ([display] device = "bochs", crates/host/src/display): the function's identity, the driver that binds
+# it, where natemu's launch places its BARs (crates/host/src/pci/place.rs: the only function, at slot 1; memory BARs from
+# E0200000H largest first, naturally aligned: BAR0's 16 MiB at E1000000H, BAR2's 4 KiB after it), the modes the EDID
+# gives (the preferred 1024 x 768 first, then the standard timings) and the driver's dmesg lines.
+DISPLAY_ID = '0x1234 0x1111'
+DISPLAY_DRIVER = 'bochs-drm'
+DISPLAY_VRAM = 16 << 20
+DISPLAY_BAR0, DISPLAY_BAR2 = 0xE100_0000, 0xE200_0000
+DISPLAY_MODES = ('1024x768', '800x600', '640x480')
+DISPLAY_DMESG = ('Found bochs VGA, ID 0xb0c5.', 'Found EDID data blob.')
 VM_SECONDS = 120
 CMDLINE = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 PVPANIC_CAPABILITY = '/sys/bus/platform/devices/QEMU0001:00/capability'
@@ -419,6 +431,33 @@ case_mapped_bar() {
   pass
 }
 
+# display-probe ([display] device = "bochs"): the stock bochs DRM driver binds the display (1234:1111) and reads its
+# EDID. Reported for the runner to judge: the function and its driver, BAR0 and BAR2 of `resource`, whether
+# /sys/class/drm/card0 and /dev/dri/card0 exist, the connector's modes (card0-Virtual-1/modes, up to 20 s for the
+# connector to appear) and dmesg's lines of the driver and DRM.
+case_display_probe() {
+  modprobe bochs || fail modprobe-bochs
+  n=0
+  until test -e /sys/class/drm/card0-Virtual-1/modes || test $n -ge 20; do sleep 1; n=$((n + 1)); done
+  for d in /sys/bus/pci/devices/*; do
+    test "$(cat "$d/vendor") $(cat "$d/device")" = '@DISPLAY_ID@' || continue
+    driver=none
+    test -e "$d/driver" && driver=$(basename "$(readlink "$d/driver")")
+    echo "PLATFORM-DISPLAY-FUNCTION $(basename "$d") $driver"
+    bar=0
+    while test $bar -lt 6 && read -r start end flags; do eval "bar$bar='$start $end'"; bar=$((bar + 1)); done < "$d/resource"
+    echo "PLATFORM-DISPLAY-BARS $bar0 $bar2"
+  done
+  for path in /sys/class/drm/card0 /dev/dri/card0; do
+    if test -e $path; then echo "PLATFORM-DISPLAY-PATH $path present"; else echo "PLATFORM-DISPLAY-PATH $path absent"; fi
+  done
+  test -e /sys/class/drm/card0-Virtual-1/modes && cat /sys/class/drm/card0-Virtual-1/modes | while read -r mode; do
+    echo "PLATFORM-DISPLAY-MODE $mode"
+  done
+  dmesg | grep -i -e bochs -e drm | while read -r line; do echo "PLATFORM-DISPLAY-DMESG $line"; done
+  pass
+}
+
 # pvpanic-panic: the stock driver finds the ACPI device and its capability (PANICKED and CRASH_LOADED), then a panic
 # (panic=0: the kernel does not reboot) must end the run through the device. platform_skip_capability (the runner's
 # --skip-capability) goes straight to the panic.
@@ -476,6 +515,7 @@ case_platform_off() {
 case "$name" in
   pci-multibar) case_pci_multibar;;
   mapped-bar) case_mapped_bar;;
+  display-probe) case_display_probe;;
   pvpanic-panic) case_pvpanic_panic;;
   platform) case_platform;;
   platform-off) case_platform_off;;
@@ -486,7 +526,7 @@ fail "case $name returned"
    .replace('@MAPPED_SUBSYSTEM@', MAPPED_SUBSYSTEM) \
    .replace('@MAPPED_FILL@', hex(MAPPED_FILL)).replace('@MAPPED_NEW@', hex(MAPPED_NEW)).replace('@MAPPED_TOOL@', MAPPED_TOOL) \
    .replace('@MAPPED_REGION_HEX@', f'{MAPPED_REGION:x}') \
-   .replace('@MAPPED_OLD_OFFSETS@', ' '.join(map(str, MAPPED_OLD_OFFSETS)))
+   .replace('@MAPPED_OLD_OFFSETS@', ' '.join(map(str, MAPPED_OLD_OFFSETS))).replace('@DISPLAY_ID@', DISPLAY_ID)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -757,6 +797,97 @@ def self_check_mapped_bar():
     print(f'mapped-bar: {len(bad)} negative judge controls passed.')
 
 
+def judge_display_probe(run: Run) -> list:
+    """display-probe: one display function, bound by bochs-drm, its BARs where the launch placed them; card0 in sysfs
+    and /dev/dri; the connector's modes the EDID's, preferred first; the driver's dmesg lines; the framebuffer a mapped
+    region decoding at BAR0 (the host's `natemu: mapped` line); S5."""
+    errors = common(run)
+    if 'PLATFORM-PASS' not in run.serial.splitlines(): errors.append('the init never reported PLATFORM-PASS')
+    functions = re.findall(r'^PLATFORM-DISPLAY-FUNCTION (\S+) (\S+)$', run.serial, re.M)
+    if len(functions) != 1 or functions[0][1] != DISPLAY_DRIVER:
+        errors.append(f'display functions (address, driver) {functions}, expected one bound by {DISPLAY_DRIVER}')
+    bars = hexes(' '.join(re.findall(r'^PLATFORM-DISPLAY-BARS (.*)$', run.serial, re.M)))
+    want = [DISPLAY_BAR0, DISPLAY_BAR0 + DISPLAY_VRAM - 1, DISPLAY_BAR2, DISPLAY_BAR2 + 0xfff]
+    if bars != want: errors.append(f'BAR0 and BAR2 (start, end) {bars}, expected {[hex(b) for b in want]}')
+    paths = dict(re.findall(r'^PLATFORM-DISPLAY-PATH (\S+) (\w+)$', run.serial, re.M))
+    for path in ('/sys/class/drm/card0', '/dev/dri/card0'):
+        if paths.get(path) != 'present': errors.append(f'{path}: {paths.get(path, "not reported")}, expected present')
+    modes = re.findall(r'^PLATFORM-DISPLAY-MODE (.*)$', run.serial, re.M)
+    if modes[:1] != [DISPLAY_MODES[0]] or not set(DISPLAY_MODES) <= set(modes):
+        errors.append(f'card0-Virtual-1 modes {modes}: expected {DISPLAY_MODES[0]} first and {", ".join(DISPLAY_MODES[1:])}')
+    dmesg = [re.sub(r'^\[[^]]*\] ?', '', l) for l in re.findall(r'^PLATFORM-DISPLAY-DMESG (.*)$', run.serial, re.M)]
+    for line in DISPLAY_DMESG:
+        if not any(l.endswith(line) for l in dmesg): errors.append(f'no "{line}" in dmesg (its DRM lines: {dmesg})')
+    if not any(DISPLAY_DRIVER in l for l in dmesg): errors.append(f'dmesg never names {DISPLAY_DRIVER} (its DRM lines: {dmesg})')
+    report = [json.loads(m) for m in MAPPED_LINE.findall(run.stderr)]
+    want_region = {'base': DISPLAY_BAR0, 'len': DISPLAY_VRAM, 'enabled': 1}
+    if len(report) != 1 or report[0].get('regions') != [want_region]:
+        errors.append(f'host mapped report {report}: expected one region {want_region} (the framebuffer, decoding)')
+    errors += stopped(run, 'natemu: Power(1)', 0)
+    return errors
+
+
+def self_check_display_probe():
+    """display-probe's judge on a synthetic passing log (the line shapes Linux 6.12's bochs driver gives) and its
+    negative controls."""
+    lines = [f'PLATFORM-BEGIN case=display-probe cpus=1 kernel={KVER}', f'PLATFORM-DISPLAY-FUNCTION 0000:00:01.0 {DISPLAY_DRIVER}',
+             f'PLATFORM-DISPLAY-BARS 0x{DISPLAY_BAR0:016x} 0x{DISPLAY_BAR0 + DISPLAY_VRAM - 1:016x} '
+             f'0x{DISPLAY_BAR2:016x} 0x{DISPLAY_BAR2 + 0xfff:016x}',
+             'PLATFORM-DISPLAY-PATH /sys/class/drm/card0 present', 'PLATFORM-DISPLAY-PATH /dev/dri/card0 present',
+             'PLATFORM-DISPLAY-MODE 1024x768', 'PLATFORM-DISPLAY-MODE 800x600', 'PLATFORM-DISPLAY-MODE 640x480',
+             'PLATFORM-DISPLAY-DMESG [    1.000000] [drm] Found bochs VGA, ID 0xb0c5.',
+             'PLATFORM-DISPLAY-DMESG [    1.000001] [drm] Framebuffer size 16384 kB @ 0xe1000000, mmio @ 0xe2000000.',
+             'PLATFORM-DISPLAY-DMESG [    1.000002] [drm] Found EDID data blob.',
+             f'PLATFORM-DISPLAY-DMESG [    1.000003] [drm] Initialized {DISPLAY_DRIVER} 1.0.0 for 0000:00:01.0 on minor 0',
+             'PLATFORM-PASS']
+    host = {'regions': [{'base': DISPLAY_BAR0, 'len': DISPLAY_VRAM, 'enabled': 1}], 'publishes': 1,
+            'mapped_installs': [40], 'remaps': [1]}
+    stderr = f'natemu: mapped {json.dumps(host)}\nnatemu: Power(1)\n'
+    good = Run('display-probe', 1, '\n'.join(lines) + '\n', stderr, 0, False, None)
+    judge = CASES['display-probe'].judge
+    assert not judge(good), judge(good)
+    def swap(old, new): return dataclasses.replace(good, serial=good.serial.replace(old, new))
+    def host_with(**kv): return dataclasses.replace(good, stderr=f'natemu: mapped {json.dumps(host | kv)}\nnatemu: Power(1)\n')
+    bad = {'no driver': swap(f'0000:00:01.0 {DISPLAY_DRIVER}', '0000:00:01.0 none'),
+           'no function': swap(f'PLATFORM-DISPLAY-FUNCTION 0000:00:01.0 {DISPLAY_DRIVER}\n', ''),
+           'two functions': swap('PLATFORM-DISPLAY-BARS', f'PLATFORM-DISPLAY-FUNCTION 0000:00:02.0 {DISPLAY_DRIVER}\nPLATFORM-DISPLAY-BARS'),
+           'BAR0 elsewhere': swap(f'0x{DISPLAY_BAR0:016x} ', f'0x{DISPLAY_BAR0 + DISPLAY_VRAM:016x} '),
+           'no card0': swap('/sys/class/drm/card0 present', '/sys/class/drm/card0 absent'),
+           'no /dev/dri/card0': swap('PLATFORM-DISPLAY-PATH /dev/dri/card0 present\n', ''),
+           'other preferred mode': swap('MODE 1024x768\nPLATFORM-DISPLAY-MODE 800x600', 'MODE 800x600\nPLATFORM-DISPLAY-MODE 1024x768'),
+           'no 640x480': swap('PLATFORM-DISPLAY-MODE 640x480\n', ''),
+           'no modes': dataclasses.replace(good, serial=re.sub(r'^PLATFORM-DISPLAY-MODE.*\n', '', good.serial, flags=re.M)),
+           'no EDID': swap('[drm] Found EDID data blob.', '[drm] No EDID found.'),
+           'other ID': swap('ID 0xb0c5.', 'ID 0xb0c0.'),
+           'no driver line': swap(f'Initialized {DISPLAY_DRIVER}', 'Initialized simpledrm'),
+           'no host report': dataclasses.replace(good, stderr='natemu: Power(1)\n'),
+           'framebuffer not decoding': host_with(regions=[{'base': DISPLAY_BAR0, 'len': DISPLAY_VRAM, 'enabled': 0}]),
+           'guest failure': swap('PLATFORM-PASS', 'PLATFORM-FAIL modprobe-bochs'),
+           'no pass': swap('PLATFORM-PASS', ''),
+           'stopped': dataclasses.replace(good, stderr=stderr.replace('Power(1)', 'UnsupportedMmio'), returncode=2)}
+    for what, r in bad.items(): assert judge(r), f'display-probe {what}: passed'
+    assert any('expected 1024x768 first' in x for x in judge(bad['other preferred mode'])), judge(bad['other preferred mode'])
+    # Every module the init loads is in MODULES (so prepare puts it and its dependencies in the initramfs): without bochs
+    # and drm_kms_helper, display-probe's modprobe would fail in the guest.
+    loaded = set(re.findall(r'\bmodprobe (\w+)', INIT))
+    assert {'bochs', 'pvpanic_mmio', 'psmouse'} <= loaded, loaded
+    assert loaded <= set(MODULES), f'the init loads {sorted(loaded - set(MODULES))}, which MODULES lacks'
+    assert {'bochs', 'drm_kms_helper'} <= set(MODULES), 'display-probe needs bochs and drm_kms_helper in MODULES'
+    # modules.dep with shared dependencies: each module's line lists its dependencies, every one before those it
+    # depends on (modprobe loads from the end), so drm, under both ttm and drm_kms_helper, comes last.
+    deps = {'bochs': ['drm_vram_helper', 'drm_kms_helper', 'drm'], 'drm_vram_helper': ['ttm', 'drm_kms_helper', 'drm'],
+            'ttm': ['drm'], 'drm_kms_helper': ['drm'], 'drm': [], 'pvpanic_mmio': ['pvpanic'], 'pvpanic': []}
+    dep = {line.split(':')[0]: line.split(':')[1].split() for line in modules_dep({n: (n, b'', d) for n, d in deps.items()}).splitlines()}
+    assert dep['pvpanic_mmio'] == ['pvpanic'] and dep['drm'] == [], dep
+    for name, line in dep.items():
+        for i, m in enumerate(line):
+            assert not set(deps[m]) & set(line[:i]), f'{name}: {m} after a module it depends on in {line}'
+            assert set(deps[m]) <= set(line), f'{name}: {m} misses a dependency in {line}'
+    assert dep['bochs'][-1] == 'drm', dep['bochs']
+    assert '@' not in INIT[INIT.index('# display-probe'):INIT.index('# pvpanic-panic')], 'a placeholder left in case_display_probe'
+    print(f'display-probe: {len(bad)} negative judge controls passed.')
+
+
 def judge_pvpanic_panic(run: Run) -> list:
     errors = common(run)
     if 'skip-capability' not in run.options:
@@ -854,6 +985,7 @@ class Case:
 CASES = {
     'pci-multibar': Case((), judge_pci_multibar),
     'mapped-bar': Case((), judge_mapped_bar),
+    'display-probe': Case((), judge_display_probe),
     'pvpanic-panic': Case(('panic=0',), judge_pvpanic_panic),
     'platform': Case((), judge_platform),
     'platform-off': Case(('reboot=k',), judge_platform_off),
@@ -899,13 +1031,17 @@ def module_closure(deb: Path, names) -> dict:
 
 
 def modules_dep(modules: dict) -> str:
-    """modules.dep: each module's transitive dependencies, nearest first (modprobe loads them from the end)."""
+    """modules.dep: each module's transitive dependencies, every one before all it depends on (BusyBox's modprobe loads
+    them from the end). A depth-first post-order is a load order (each module after its dependencies); the line is it
+    reversed, so a module two others share (drm, under ttm and drm_kms_helper) is loaded before either."""
     def chain(name):
-        got = []
-        for d in modules[name][2]:
-            for x in [d, *chain(d)]:
-                if x not in got: got.append(x)
-        return got
+        order = []
+        def visit(m):
+            for d in modules[m][2]:
+                if d not in order: visit(d)
+            if m not in order: order.append(m)
+        visit(name)
+        return order[-2::-1]
     return ''.join(f'{rel}:' + ''.join(' ' + modules[d][0] for d in chain(n)) + '\n' for n, (rel, _, _) in sorted(modules.items()))
 
 
@@ -1132,6 +1268,7 @@ def self_check():
     assert any('serio' in e for e in judge(off_bad['PS/2 on'])), judge(off_bad['PS/2 on'])
     self_check_pci_multibar()
     self_check_mapped_bar()
+    self_check_display_probe()
     print(f'Init shell syntax, {len(CASES)} case dispatch(es) and {len(bad) + len(platform_bad) + len(off_bad)} negative '
           'judge controls passed; no VM launched.')
 

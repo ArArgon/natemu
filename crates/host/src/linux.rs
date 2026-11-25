@@ -149,6 +149,8 @@ struct Wanted {
     testdev: bool,
     /// The mapped-memory test function ([`Boot::mapped_testdev`]).
     mapped_testdev: bool,
+    /// The display ([`Boot::display`]).
+    display: bool,
 }
 #[cfg(test)]
 impl Wanted {
@@ -162,6 +164,7 @@ impl Wanted {
             consoles: vec![],
             testdev: false,
             mapped_testdev: false,
+            display: false,
         }
     }
 }
@@ -176,6 +179,8 @@ enum Kind {
     TestDev,
     /// The mapped-memory test function ([`crate::pci::mapped_testdev`]): function 0 of its slot, no INTx line.
     MappedTestDev,
+    /// The display ([`crate::display`]): function 0 of its slot, no INTx line.
+    Display,
 }
 /// Where one device lives: both the ACPI tables and the device wiring in `prepare` read this, so they cannot disagree.
 #[derive(Clone, Copy, Debug)]
@@ -203,7 +208,10 @@ struct Placed {
 /// ([`Wanted::testdev`]) at the lowest slot no other function holds, the consoles' included (its functions 0 and 1; no
 /// INTx line, no `_PRT` entry); none free is an error. Consoles are placed first, so the test function never moves a
 /// console, and without consoles it takes the slot it took before them. The mapped-memory test function
-/// ([`Wanted::mapped_testdev`]) comes last, at the lowest slot still free (its function 0; no INTx line, no `_PRT` entry).
+/// ([`Wanted::mapped_testdev`]) comes next, at the lowest slot still free (its function 0; no INTx line, no `_PRT` entry),
+/// and the display ([`Wanted::display`]) last, the same way. Each later one takes a slot no earlier one wanted, so a
+/// launch without the display (every launch before it existed) keeps every slot it had, and turning the display on
+/// moves no other function.
 ///
 /// Per-disk transports exist only in the library: the CLI and the config file have one `transport.disk` for all disks
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
@@ -333,6 +341,7 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
     for (on, kind, key) in [
         (w.testdev, Kind::TestDev, "debug.pci_testdev"),
         (w.mapped_testdev, Kind::MappedTestDev, "debug.mapped_testdev"),
+        (w.display, Kind::Display, "display.device"),
     ] {
         if !on {
             continue;
@@ -345,7 +354,7 @@ fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
             kind,
             pci: true,
             slot,
-            // Unused: `res` is read only off PCI, and the test functions have no INTx line.
+            // Unused: `res` is read only off PCI, and the test functions and the display have no INTx line.
             res: boot::acpi::VirtioMmio {
                 uid: 0,
                 base: 0,
@@ -405,7 +414,7 @@ fn plan_tables_with(
     let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
     for p in placed {
-        if matches!(p.kind, Kind::TestDev | Kind::MappedTestDev) {
+        if matches!(p.kind, Kind::TestDev | Kind::MappedTestDev | Kind::Display) {
             // no INTx line: no `_PRT` entry
         } else if p.pci {
             functions.push((p.slot, p.intx));
@@ -545,6 +554,11 @@ pub struct Boot {
     /// of mapped device memory, BAR2 its control page) as function 0 of the lowest PCI slot still free; it installs the bus
     /// even when every virtio device is on MMIO. Default off.
     pub mapped_testdev: bool,
+    /// The display (`[display] device = "bochs"`, [`crate::display`]): QEMU's `bochs-display` as function 0 of the lowest
+    /// PCI slot still free (after the test functions), no INTx line; BAR0 its framebuffer of `vram_mib` MiB of mapped
+    /// device memory, the EDID's preferred mode `width` x `height` ([`crate::display::Spec::check`] refuses others). It
+    /// installs the bus even when every virtio device is on MMIO. Default none.
+    pub display: Option<crate::display::Spec>,
     /// M2 Part 2, the firmware boot mode (docs/restructure/firmware-mode.md; default none): boot this firmware image instead
     /// of a kernel. It lies at guest-physical [4 GiB - its size, 4 GiB), read and fetched as RAM, its stores dropped (x86's
     /// ROM); vCPU 0 starts in the SDM's power-on state at the reset vector ([`boot::firmware::Start`]), the others in the
@@ -592,6 +606,7 @@ impl Boot {
             ps2: false,
             pci_testdev: false,
             mapped_testdev: false,
+            display: None,
             firmware: None,
         }
     }
@@ -610,6 +625,7 @@ impl Boot {
                 .collect(),
             testdev: self.pci_testdev,
             mapped_testdev: self.mapped_testdev,
+            display: self.display.is_some(),
         })
     }
 
@@ -644,6 +660,9 @@ impl Boot {
             return Err("network: forwarding and host-loopback options require --net".into());
         }
         self.net_options.validate()?;
+        if let Some(spec) = &self.display {
+            spec.check()?;
+        }
         // PCID plan P1: the barriers' leaf SB needs FEAT_SB (the vCPU's ID_AA64ISAR1_EL1); refuse to turn them on without it
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
@@ -747,6 +766,7 @@ impl Boot {
         let mut bus = crate::pci::Bus::new();
         let mut mapped = crate::pci::Mapped { regions: Vec::new(), publishes: Arc::default() };
         let mut net = None;
+        let mut display = None;
         for p in &placed {
             if p.kind == Kind::TestDev {
                 bus.add(p.slot, 0, crate::pci::testdev::TestDev::new(0))?;
@@ -755,6 +775,14 @@ impl Boot {
             }
             if p.kind == Kind::MappedTestDev {
                 bus.add(p.slot, 0, crate::pci::mapped_testdev::MappedTestDev::new()?)?;
+                continue;
+            }
+            if p.kind == Kind::Display {
+                let spec = self.display.expect("placed only with a display");
+                let vram = crate::pci::DeviceMemory::new(spec.vram_mib << 20)?;
+                let d = crate::display::Display::new(vram, (spec.width, spec.height));
+                bus.add(p.slot, 0, d.clone())?;
+                display = Some(d);
                 continue;
             }
             let gsi = if p.pci { p.intx } else { p.res.gsi } as usize;
@@ -770,7 +798,7 @@ impl Boot {
                     }
                     disk
                 }
-                Kind::TestDev | Kind::MappedTestDev => unreachable!("added above"),
+                Kind::TestDev | Kind::MappedTestDev | Kind::Display => unreachable!("added above"),
                 Kind::Net => {
                     let (v, port) = crate::virtio::Virtio::network(
                         irqs.clone(),
@@ -846,7 +874,7 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
-            ps2,
+            ps2,            display,
         })
     }
 
@@ -865,6 +893,9 @@ impl Boot {
         }
         if self.mapped_testdev {
             return Err("a firmware boot has no PCI bus (debug.mapped_testdev)".into());
+        }
+        if self.display.is_some() {
+            return Err("a firmware boot has no PCI bus (display.device)".into());
         }
         if !exec::firmware_size(firmware.image.len() as u64) {
             return Err(format!(
@@ -966,7 +997,7 @@ impl Boot {
             serial_input: Mutex::new(None),
             debug_exit,
             pvpanic,
-            ps2,
+            ps2,            display: None,
         })
     }
 
@@ -1017,6 +1048,8 @@ pub struct Prepared {
     pvpanic: Option<Arc<crate::pvpanic::PvPanicStats>>,
     /// [`Boot::ps2`]: the 8042's host input.
     ps2: Option<crate::ps2::Ps2Input>,
+    /// [`Boot::display`]: the display function.
+    display: Option<Arc<crate::display::Display>>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -1499,6 +1532,10 @@ impl Prepared {
     pub fn ps2(&self) -> Option<&crate::ps2::Ps2Input> {
         self.ps2.as_ref()
     }
+    /// [`Boot::display`]: the display function, its framebuffer and published mode (`None` without a display).
+    pub fn display(&self) -> Option<Arc<crate::display::Display>> {
+        self.display.clone()
+    }
     /// The fixed power button of the PM block, which a host thread presses ([`crate::pm::PowerButton::press`]). The PM
     /// block is on every board, so this is always `Some`; it is an `Option` as the control socket's `Target` is.
     pub fn power_button(&self) -> Option<crate::pm::PowerButton> {
@@ -1781,6 +1818,41 @@ mod tests {
         std::fs::remove_file(&resident).unwrap();
     }
 
+    /// The display: QEMU's `bochs-display` identity at the lowest free slot, its framebuffer the launch's only mapped region
+    /// (of `vram_mib`), `Prepared::display` the function; a spec `check` refuses is a launch error; none without it.
+    #[test]
+    fn the_display_installs_its_framebuffer() {
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-display-{}.elf", std::process::id()));
+        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let spec = crate::display::Spec { vram_mib: 8, ..Default::default() };
+        for display in [Some(spec), None] {
+            let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+            (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+            (boot.rng, boot.display) = (true, display);
+            let prepared = boot.prepare().unwrap();
+            let on = display.is_some();
+            assert_eq!(prepared.mapped.iter().map(|m| m.len()).collect::<Vec<_>>(), if on { vec![8 << 20] } else { vec![] });
+            assert_eq!(prepared.display().is_some(), on);
+            if let Some(d) = prepared.display() {
+                assert!(Arc::ptr_eq(d.vram(), &prepared.mapped[0]), "the framebuffer is the mapped region");
+                assert_eq!(d.mode(), None);
+            }
+            let d = prepared.devices();
+            assert_eq!(d.find(crate::pci::platform::WINDOW.0.into()).is_some(), on, "the bus with the rng on MMIO");
+            if on {
+                d.port(0, 0xcf8, 4, Some(1 << 31 | 1 << 11)).unwrap();
+                assert_eq!(d.port(0, 0xcfc, 4, None), Ok(0x1111_1234), "01.0: the display");
+            }
+        }
+        let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+        (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+        boot.display = Some(crate::display::Spec { vram_mib: 4, ..Default::default() });
+        let e = boot.prepare().err().expect("4 MiB holds fewer than two 1024 x 768 frames");
+        assert!(e.starts_with("display.vram_mib: 4 MiB"), "{e}");
+        std::fs::remove_file(&resident).unwrap();
+    }
+
     /// The mapped-memory test function: the bus at the lowest free slot (function 0, vendor 1B36H device 0005H subsystem
     /// 0100H), its region handed to the machine (one, 2 MiB), and the run report's `mapped` part; neither without it.
     #[test]
@@ -1986,6 +2058,7 @@ mod placement_tests {
             consoles: vec![],
             testdev: false,
             mapped_testdev: false,
+            display: false,
         }
     }
     fn lists(n: usize) -> Vec<Vec<Transport>> {
@@ -2196,7 +2269,7 @@ mod placement_tests {
         for (w, slot) in [
             (wanted(&[], Mmio), 1),
             (wanted(&[Mmio; 3], Mmio), 1),
-            (Wanted { rng: Some(Pci), disks: vec![], net: None, consoles: vec![], testdev: false, mapped_testdev: false }, 1),
+            (Wanted { rng: Some(Pci), disks: vec![], net: None, consoles: vec![], testdev: false, mapped_testdev: false, display: false }, 1),
             (wanted(&[], Pci), 1),
             (wanted(&[Pci], Pci), 4),
             (wanted(&[Pci; 3], Pci), 6),
@@ -2215,6 +2288,34 @@ mod placement_tests {
         assert_eq!(
             place(&with(wanted(&[Pci; 29], Pci))).unwrap_err(),
             "debug.pci_testdev: PCI slots 1-31 are all used"
+        );
+    }
+    /// The display: the lowest slot still free after the test functions, no `_PRT` entry and no I/O window; every other
+    /// function where it was without it; the bus even with every virtio device on MMIO.
+    #[test]
+    fn the_display_takes_the_lowest_free_slot_last() {
+        for (w, slot) in [
+            (wanted(&[], Mmio), 1),
+            (Wanted { testdev: true, ..wanted(&[], Mmio) }, 2),
+            (Wanted { testdev: true, mapped_testdev: true, ..wanted(&[], Mmio) }, 3),
+            (wanted(&[Pci], Pci), 4),
+            (Wanted { testdev: true, mapped_testdev: true, ..wanted(&[Pci; 3], Pci) }, 8),
+            (wanted(&[Pci; 28], Pci), 31),
+        ] {
+            let before = place(&w).unwrap();
+            let p = place(&Wanted { display: true, ..w }).unwrap();
+            let d = p.last().unwrap();
+            assert_eq!((d.kind, d.pci, d.slot), (Kind::Display, true, slot));
+            assert_eq!(format!("{:?}", &p[..p.len() - 1]), format!("{before:?}"), "nothing else moves");
+            let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
+            let old = plan_tables(1, boot::ACPI_NVS.0, &before, 1 << 30).unwrap();
+            assert_eq!(plan.functions, old.functions, "no _PRT entry");
+            assert_eq!(plan.io_window, old.io_window, "no I/O BAR");
+            assert!(plan.layout.pci);
+        }
+        assert_eq!(
+            place(&Wanted { display: true, ..wanted(&[Pci; 29], Pci) }).unwrap_err(),
+            "display.device: PCI slots 1-31 are all used"
         );
     }
     fn with_consoles(disks: &[Transport], other: Transport, consoles: &[Transport]) -> Wanted {

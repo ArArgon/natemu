@@ -111,6 +111,9 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `output` | none | A file: what the guest writes to the console is added to its end (created when missing) |
 | | `socket` | none | A Unix socket natemu listens on: a program that connects talks to the guest's console (see below) |
 | `[control]` | `socket` | none | A Unix socket natemu listens on for programs that drive the VM: keyboard and mouse input, quit, status ([the control API](control-api.md)) |
+| `[display]` | `device` | `"none"` | `"bochs"` gives the guest a display (see below) |
+| | `vram_mib` | `16` | The display's video memory in MiB: 4, 8, 16, 32 or 64 |
+| | `width`, `height` | `1024`, `768` | The picture size the display tells the guest it prefers |
 | `[debug]` | `pool` | `true` | Shared template pool |
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
@@ -193,6 +196,31 @@ id = "log"
 output = "guest-console.log"
 ```
 
+### A display
+
+`[display] device = "bochs"` gives the guest a display: the device QEMU calls `bochs-display` (vendor 1234H, device
+1111H), which Linux's `bochs` driver runs. It is a PCI device, at the lowest PCI slot no other device uses (after the
+`[debug]` test devices), so the guest gets a PCI bus for it even when every other device is on `mmio`; turning it on
+moves no other device. The guest draws into the display's video memory directly, at full speed. Nothing on the Mac
+shows the picture yet; the console stays on the serial port.
+
+`vram_mib` is the size of the video memory: a power of two from 4 to 64. 64 is the most because natemu places
+every PCI device's memory in one 256 MiB range, largest first, and a 128 MiB one would fill the part of that range
+it lands in. `width` and `height` are the picture size the display reports as its preferred one (in its EDID, the
+description a monitor gives its computer), with 800 x 600 and 640 x 480 as the other sizes it offers. Each must be
+at least 64 and at most 4095, and very large sizes are refused (at 60 pictures a second they would need a faster
+signal than an EDID can describe; 4095 x 2048 is accepted). The video memory must hold two pictures of the preferred
+size (`vram_mib` MiB at least 2 x width x height x 4 bytes), because Linux offers only sizes that fit twice: 1920 x
+1080 needs 16, 2560 x 1600 needs 32. These limits are checked when natemu starts, even with `device = "none"`. A
+firmware boot has no PCI bus, so it refuses the display.
+
+```toml
+[display]
+device = "bochs"
+width = 1280
+height = 800
+```
+
 ### Serial: `stdout` as a keyword and as a file name
 
 `[serial] output = "stdout"` (and `--set serial.output=stdout`) means standard output. The flag
@@ -257,6 +285,11 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `control socket vm.sock: another program listens on this socket` | Another natemu (or program) uses the `[control] socket` path (also `exists and is not a socket`, and a path over 103 bytes) |
 | `console "log": no interrupt line left on mmio (lines 16-23 are all held); use pci` | Every MMIO interrupt line is taken (6 MMIO disks with the NIC and entropy device) |
 | `console "log": PCI slots 1-31 are all used; use mmio or fewer disks on pci` | 29 disks on PCI leave no slot |
+| `c.toml: display.device: unknown display device "vga": bochs or none` | Only the Bochs display exists |
+| `c.toml: display.vram_mib: 3: a power of two from 4 to 64 (MiB)` | `vram_mib` is not 4, 8, 16, 32 or 64 |
+| `c.toml: display.width, display.height: 63 x 768: not a mode the EDID can describe (...)` | A side under 64 or over 4095, or a size too large for 60 pictures a second |
+| `c.toml: display.vram_mib: 4 MiB holds fewer than two 1024 x 768 frames; 1024 x 768 needs at least 8` | The video memory is too small for the preferred size |
+| `c.toml: a firmware boot has no PCI bus for the display ([display] device)` | A firmware boot with the display on |
 | `--set bad: expected key=value` | `--set` without `=` |
 | `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
 | `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
@@ -280,6 +313,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 - One NIC and one entropy device.
 - A console on MMIO needs one of the interrupt lines 16-23 that no other MMIO device holds, and one on
   PCI a slot after the disks'; a launch without one is refused, naming the console.
+- One display, of at most 64 MiB of video memory (see [A display](#a-display)).
 - No `[boot.uefi]` yet.
 - Disk images are detected by content, not name (raw or qcow2; VMDK, VHDX, VDI, VHD and DMG are
   refused by name).
