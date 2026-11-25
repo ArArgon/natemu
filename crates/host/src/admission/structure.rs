@@ -4367,7 +4367,15 @@ mod tests {
             let unmarked = field(elements[n / 2], g2, &object::NONE32.to_le_bytes());
             let e = admit((&unmarked, f.1)).unwrap_err();
             assert!(e.contains("gather at guest offset 0x0"), "{e}");
-            assert!(!super::super::admit(&unmarked, h.guest_rip, f.1, u64::MAX, false, false).unwrap().bulk);
+            // (Without the code shape the object stays a bulk one while any of its element loads is marked; with none marked
+            // it is an ordinary one, whose loads a step may hold.)
+            assert!(super::super::admit(&unmarked, h.guest_rip, f.1, u64::MAX, false, false).unwrap().bulk);
+            let mut none = f.0.to_vec();
+            for &i in &elements {
+                let at = h.sites_offset as usize + i * size + g2;
+                none[at..at + 4].copy_from_slice(&object::NONE32.to_le_bytes());
+            }
+            assert!(!super::super::admit(&none, h.guest_rip, f.1, u64::MAX, false, false).unwrap().bulk);
             for (off, value) in [(std::mem::offset_of!(object::Site, width), 16), (std::mem::offset_of!(object::Site, data_class), object::CLASS_GPR)] {
                 let e = admit_with((&field(elements[0], off, &[value]), f.1), false).unwrap_err();
                 assert!(e.contains("access site"), "{e}");
