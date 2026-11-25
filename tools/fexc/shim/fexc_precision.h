@@ -26,6 +26,7 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   // Perf chunk 26: a bulk REP STOS's stores (a site); it also writes RCX's and RDI's static registers itself, so as for every
   // access no value is coalesced into a static register across it, and the incoming flags stay live there.
   case OP_FEXCREPSTOS: case OP_FEXCREPMOVS: return true;   // (bulk REP plan: REP MOVS too, and RSI's static register)
+  case OP_FEXCGATHERLOAD: return true;   // gather plan: an inline gather's element load (a site)
   // LOCK read-modify-writes (I3)
   case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND: case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR:
   case OP_ATOMICFETCHXOR: case OP_ATOMICFETCHNEG: case OP_CAS: case OP_CASPAIR: return true;
@@ -41,6 +42,7 @@ inline bool LoadsInto(FEXCore::IR::IROps Op) {
   switch (Op) {
   case OP_LOADMEM: case OP_LOADMEMTSO: case OP_ATOMICSWAP: case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND:
   case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR: case OP_ATOMICFETCHXOR: return true;
+  case OP_FEXCGATHERLOAD: return true;   // (gather plan: its `ldr s|d`)
   default: return false;
   }
 }
@@ -483,7 +485,8 @@ template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, cons
   return Flag;
 }
 // The ops that commit an instruction's effect: everything with a side effect but the NZCV writers (the incoming NZCV is saved
-// for a fault point after one, patch 0006), instruction markers, loads, prefetches and FEX's rounding-mode bookkeeping.
+// for a fault point after one, patch 0006), instruction markers, loads (the gather plan's FexcGatherLoad, a load with side effects,
+// among them), prefetches and FEX's rounding-mode bookkeeping.
 inline bool Commits(FEXCore::IR::IROps Op) {
   using namespace FEXCore::IR;
   switch (Op) {
@@ -494,7 +497,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
-  case OP_ROTATEFLAGS: case OP_FEXCFLUSH: case OP_FEXCSEGMENTBASE: return false;   // (the operand check of a limited FS or GS: a fault point, no effect)
+  case OP_ROTATEFLAGS: case OP_FEXCFLUSH: case OP_FEXCSEGMENTBASE: case OP_FEXCGATHERLOAD: return false;   // (the operand check of a limited FS or GS: a fault point, no effect)
   default: return HasSideEffects(Op);
   }
 }
@@ -1196,7 +1199,7 @@ inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
   case OP_ADCNZCV: case OP_SBBNZCV: case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ:
   case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS: case OP_FCMP: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
   case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCREPMOVS: case OP_FEXCX87SVC:
-  case OP_FEXCFMACHECK:
+  case OP_FEXCFMACHECK: case OP_FEXCGATHERLOAD:
     return true;
   default: return false;
   }

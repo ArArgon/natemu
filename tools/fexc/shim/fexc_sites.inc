@@ -848,6 +848,27 @@ DEF_OP(FexcRepMovs) {
   (void)cbnz(X, TMP2, &Element);
   (void)Bind(&Skip);
 }
+// Gather plan (docs/restructure/gather-fast-path-plan.md 2.2): one element of an AVX2 gather inside the block (FEX's
+// `FexcGatherLoad`, AVX128_VPGATHER under `--bulk`): the mask element's sign bit into x0 (TMP1, as the REP ops use it), a
+// skip of the load when it is clear (no access, so no fault, for a masked-off element), and the element's plain load, the
+// op's one memory word and its site (kind LOAD, FPR class, the element's width; `guest_offset2` FEXC_GATHER_ELEMENT). When
+// skipped the result register holds nothing of the element: the dispatcher's blend takes the destination's there. Writes
+// x0 and the result only; no NZCV. Admission pins these words (structure.rs, `gather_elements`).
+//   umov w0|x0, vM.s|d[lane]; tbz w0|x0, #31|#63, 1f; ldr s|d<out>, [xA]; 1:
+DEF_OP(FexcGatherLoad) {
+  const auto Op = IROp->C<IR::IROp_FexcGatherLoad>();
+  const auto Dst = GetVReg(Node), Mask = GetVReg(Op->Mask);
+  const auto Addr = GetReg(Op->Addr);
+  const bool Dbl = IROp->Size == IR::OpSize::i64Bit;
+  LOGMAN_THROW_A_FMT(Dbl || IROp->Size == IR::OpSize::i32Bit, "a gather element is 4 or 8 bytes");
+  ARMEmitter::ForwardLabel Skip;
+  if (Dbl) umov<ARMEmitter::SubRegSize::i64Bit>(TMP1, Mask, Op->Lane);
+  else umov<ARMEmitter::SubRegSize::i32Bit>(TMP1, Mask, Op->Lane);
+  (void)tbz(TMP1, Dbl ? 63 : 31, &Skip);
+  if (Dbl) ldr(Dst.D(), Addr, 0);
+  else ldr(Dst.S(), Addr, 0);
+  (void)Bind(&Skip);
+}
 // DPPS's first add level, between VFAddV's two `faddp` (SDM DPPS: "Exceptions are determined separately for each add and
 // multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
 // exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.
@@ -1398,6 +1419,10 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   case IROps::OP_FEXCREPSTOS:   // perf chunk 26: the bulk loop's `stp` (found below), at an iteration boundary
   case IROps::OP_FEXCREPMOVS:   // bulk REP plan: the same, and its `ldp` (the word before the `stp`, recorded below)
     S.kind = FEXC_SITE_STORE_PAIR; S.width = 16; S.intent = 1; S.data_class = 0;
+    break;
+  case IROps::OP_FEXCGATHERLOAD:   // gather plan (2.3): the element's `ldr s|d` (found below), marked as a gather's element
+    S.kind = FEXC_SITE_LOAD; S.width = Size; S.data_class = 1; S.data_reg[0] = GetVReg(Node).Idx();
+    S.guest_offset2 = FEXC_GATHER_ELEMENT;
     break;
   case IROps::OP_ATOMICFETCHNEG: {
     if (!fexc_slice1) { S.kind = FEXC_SITE_OTHER; break; }   // FEX's CAS loop

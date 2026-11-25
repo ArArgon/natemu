@@ -254,6 +254,11 @@ inline FexcArg<bool, FEXC_ARG_BULK> fexc_bulk;
 // Bulk REP plan (section 14): `--no-bulk-movs`, for tools/fexc/replay.py only (the host never sends it): `--bulk` without
 // FexcRepMovs, so a reply that differs from the old compiler's is checked to differ by that op alone.
 inline bool fexc_no_bulk_movs;
+// Gather plan (docs/restructure/gather-fast-path-plan.md): `--no-inline-gather` (the host's `[debug] inline_gather = false`): every
+// AVX2 gather stays the system cut, as without `--bulk`. Without it, a gather of a `--bulk` request in 64-bit code with no 0x67,
+// FS or GS runs inside the block (AVX128_VPGATHER: one FexcGatherLoad per element). Not a FexcArg: fixed for the host process,
+// and part of the request (so of the persistent cache's key).
+inline bool fexc_no_inline_gather;
 // Profile slice1 (perf chunk 15): the request is at CPL 0 (`--cpl0`, from the host; never for a single-instruction step):
 // the one-byte CLI and STI are translated inline (patch 0031, `FexcInterruptFlagOp`; the rules are `Cut`'s).
 inline FexcArg<bool, FEXC_ARG_CPL0> fexc_cpl0;
@@ -409,6 +414,9 @@ inline std::set<uint64_t> fexc_x87_int_pair;
 // a call that returns a double in ST(0)) loads a double without the quieting multiply, so without an x87 run (FEX's FLDF64).
 inline std::set<uint64_t> fexc_x87_fp;
 constexpr uint32_t FEXC_X87_INT64 = 0xC000'0001u, FEXC_X87_INT_RIP = 0x20, FEXC_X87_INT = 0x28, FEXC_X87_INT_ST0 = 0x30;
+// Gather plan (2.3): the guest_offset2 of each element load of an inline AVX2 gather (FexcGatherLoad: kind LOAD, FPR, 4 or 8
+// bytes): a guest fault there, or a page that is not plain RAM, runs the gather alone through the resident's transaction.
+constexpr uint32_t FEXC_GATHER_ELEMENT = 0xC000'0002u;
 inline std::set<uint64_t> fexc_x87_hold;       // guest RIP of each x87 store to memory that converts first (FST m32, FIST*, FISTTP)
 inline bool fexc_x87_hold_wanted = false, fexc_x87_held = false, fexc_x87_fp_seen = false;   // the instruction at the emit cursor
 // A fault point after a floating-point op of its own x87 instruction that fexc_x87_hold does not list (none known): the unit is

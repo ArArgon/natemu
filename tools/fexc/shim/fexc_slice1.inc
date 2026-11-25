@@ -325,6 +325,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   if (masked) { Verdict v = Sys("vmaskmovps/pd, vpmaskmovd/q, vmaskmovdqu: the resident's masked move"); v.avx = true; return v; }
   // The AVX2 gathers: the resident's transaction, element by element with the SDM's partial progress at a fault (the host's
   // `system::GATHER`); AVX-gated first. FEX's gather (an element loop with no per-element site and no partial mask) is not used.
+  // (Gather plan: with `--bulk` in 64-bit code, the cut is lifted in Classify and natemu's inline lowering runs instead.)
   if (gather) { Verdict v = Sys("vgather*/vpgather*: the resident's element-by-element gather"); v.avx = true; return v; }
   // VLDMXCSR m32: the resident's LDMXCSR transaction (the host's VLDMXCSR: no CR0.EM/CR4.OSFXSR gating, the AVX gating being
   // this cut's). Perf chunk 25: VSTMXCSR m32 (VEX.L 0, VEX.vvvv 1111b: else #UD above) translated as STMXCSR, AVX-gated.
@@ -719,6 +720,17 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
         v = Sys("AVX form gated by CR4.OSXSAVE, XCR0[2:1] or CR0.TS (#UD/#NM)");
         v.gated = true;
         return v;
+      }
+      // Gather plan (docs/restructure/gather-fast-path-plan.md 2.1, 2.6): a gather of a `--bulk` request (never a step, nor
+      // under alignment checking or a data breakpoint) in 64-bit code with no 0x67, FS or GS and without --no-inline-gather
+      // runs inside the block (AVX128_VPGATHER: one FexcGatherLoad per element, whose sites the resident steps at a fault or a
+      // page that is not plain RAM). Every other gather stays the cut above, as do the AVX-gated ones and the #UD encodings.
+      // (`fexc_bulk` last and through its FexcArg: only an answer holding such a gather is keyed by it.)
+      if (x.map == 2 && x.pp == 1 && d.FexcVexOp >= 0x90 && d.FexcVexOp <= 0x93 && v.kind == SYSTEM && !v.ud && !v.gated &&
+          !fexc_bits32 && !(f & DecodeFlags::FLAG_ADDRESS_SIZE) && !(f & DecodeFlags::FLAG_SEGMENTS) && !fexc_no_inline_gather &&
+          fexc_bulk) {
+        v = Allow();
+        v.avx = true;
       }
     }
     break;

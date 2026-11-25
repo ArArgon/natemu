@@ -429,7 +429,7 @@ static void ResetGlobals() {
   fexc_sites.clear(); fexc_x87_maps.clear(); memset(fexc_x87_slots, 0xff, 8); fexc_x87_slots_guest = ~0u; fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0; fexc_self_exits = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
-  fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_no_bulk_movs = false; fexc_x87_fpcr = 0; fexc_x87.clear();
+  fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_no_bulk_movs = false; fexc_no_inline_gather = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_guess = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_x87_quiet.clear(); fexc_x87_int_pair.clear(); fexc_x87_fp.clear(); fexc_x87_hold.clear(); fexc_x87_hold_wanted = fexc_x87_held = fexc_x87_fp_seen = fexc_x87_hold_missing = fexc_x87_hold_all = false; fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
   fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_limited_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED; fexc_probe_branches.clear();
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
@@ -452,7 +452,7 @@ struct Setup {
   std::vector<std::pair<std::string, bool>> overrides;
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
-  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, no_bulk_movs = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
+  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, no_bulk_movs = false, no_inline_gather = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0, x87_guess = 0;
   uint8_t limited_segments = 0;   // M2 checkpoint C (--fs-limited 1, --gs-limited 2): 32-bit code only
   uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2, --ds-null 4, --es-null 8): 32-bit code only
@@ -492,6 +492,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--x87-gated") s.x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
     else if (a == "--cpl0") s.cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
     else if (a == "--no-bulk-movs") s.no_bulk_movs = true;   // replay.py only: --bulk without FexcRepMovs
+    else if (a == "--no-inline-gather") s.no_inline_gather = true;   // slice1 (gather plan): every AVX2 gather a system cut, as without --bulk
     else if (a == "--bulk") s.bulk = true;             // slice1 (perf chunk 26): not a step, no alignment gating: bulk REP STOS
     else if (a == "--push-run") s.push_run = true;     // (slice1; the host always asks) one RSP alignment check covers aligned stack stores (fexc_hook.h)
     else if (a == "--narrow-cmp") s.narrow_cmp = true; // (slice1; the host always asks) 8/16-bit compares with an inline constant (fexc_hook.h)
@@ -517,7 +518,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--ds-null] [--es-null] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--ds-null] [--es-null] [--cpl0] [--tsc] [--bulk] [--no-inline-gather] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
   // The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load, and the
@@ -557,7 +558,7 @@ static int CheckWindow(uint64_t rip, uint64_t bitness, size_t size) {
 static bool ExtAbandon(IR::IRListView& View);   // (below, with the compile attempt)
 static void Arm(const Setup& s) {
   fexc_sse_gated = s.sse_gated; fexc_avx_gated = s.avx_gated; fexc_alignment_gated = s.alignment_gated; fexc_x87_gated = s.x87_gated;
-  fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_bulk = s.bulk; fexc_no_bulk_movs = s.no_bulk_movs; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
+  fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_bulk = s.bulk; fexc_no_bulk_movs = s.no_bulk_movs; fexc_no_inline_gather = s.no_inline_gather; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
   fexc_x87_guess = s.x87_guess; fexc_x87_unmasked = s.x87_unmasked; fexc_daz = s.daz; fexc_ftz = s.ftz; fexc_accurate = s.accurate;
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
