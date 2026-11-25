@@ -57,9 +57,16 @@ machines, because timings depend on the machine. (A gate may run as a mosaic, it
 commit, since pass and fail do not; a benchmark never may.) QEMU, on the same Mac as natemu, and the real-x86 reference
 are the control group, measured under natemu's conditions (nothing else running, the same inputs and options); a control
 older than natemu's numbers says when it was measured. The page's numbers come from the machine that holds the control
-group (today the M4). A change's effect is an A/B: both commits on one machine, alternating, over at least three rounds,
-the noise the spread across rounds and a difference counted only beyond it; a comparison with older page numbers does
-not measure a change. The A/B and what caused the difference go in the commit message, or in the plan or findings page
+group (today the M4). A change's effect is its runs against the baseline's on one machine, a difference counted only
+beyond the case's noise (the spread of its repeated runs on that machine). Run as little as the decision needs:
+- **Reuse what exists.** Any run of the baseline on that machine with the same cases, inputs and options counts; do not
+  measure it again. A case's noise, once known on a machine, is reused too.
+- **One run of the change**, and another only when its difference is within about twice the noise.
+- **Only the cases the change can move**; the full set once per change set.
+- **Fail fast.** Build both sides and run one short case before a long run; stop at the first difference far beyond
+  the noise and find its cause first.
+
+A comparison with the page's numbers does not measure a change (they may come from another machine or another day). The A/B and what caused the difference go in the commit message, or in the plan or findings page
 of the work; an A/B on another machine is evidence there, never the page's numbers. The page may say in a sentence what
 moved a number, without the old value. An experiment (a profile, a prototype, an A/B of two builds, a case run with
 other options) may show its numbers where it is discussed, labelled as an experiment; they become the page's numbers
