@@ -2849,5 +2849,110 @@ class ApproxSdm(unittest.TestCase):
             self.assertTrue(self.span_ok(sp, True, False, False) or self.span_ok(sp, True, False, True), sp)
 
 
+# Gather plan (docs/restructure/gather-fast-path-plan.md): the eight AVX2 gathers at VEX.128 and VEX.256, (mnemonic, element
+# bytes, index bytes, VEX.L); and their address forms (base and displacement, either or neither, an RSP or RBP base).
+GATHER_FORMS = [(m, ew, iw, L) for m, ew, iw in (('vpgatherdd', 4, 4), ('vpgatherqd', 4, 8), ('vpgatherdq', 8, 4), ('vpgatherqq', 8, 8),
+                                                 ('vgatherdps', 4, 4), ('vgatherqps', 4, 8), ('vgatherdpd', 8, 4), ('vgatherqpd', 8, 8))
+                for L in (0, 1)]
+GATHER_ADDRESSES = ['rdi + {x}*4', '{x}*8 + 0x40', '{x}*1', 'r13 + {x}*2 - 0x80', 'rsp + {x}*8 + 0x7f', 'rbp + {x}*1']
+GATHER_ELEMENT = 0xC000_0002   # crates/abi code_object::GATHER_ELEMENT
+
+
+def gather_asm(mn, ew, iw, L, addr='rdi + {x}*4', regs=(0, 1, 2), seg=''):
+    n = (16 << L) // max(ew, iw)
+    dw, xw = 'ymm' if n * ew == 32 else 'xmm', 'ymm' if n * iw == 32 else 'xmm'
+    d, x, m = regs
+    return f'{mn} {dw}{d}, {seg}[{addr.format(x=f"{xw}{x}")}], {dw}{m}', n
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class GatherInline(unittest.TestCase):
+    """Gather plan 2.1-2.6: with `--bulk` every gather of 64-bit code with no 0x67, FS or GS is translated inside its block,
+    one element load per element (FexcGatherLoad: `umov w0|x0, vM.s|d[i]; tbz w0|x0, #31|#63, +8; ldr s|d, [xA]`, the
+    `ldr` a load site of the element's width into a vector register marked GATHER_ELEMENT), with no spill area; every other
+    gather stays the system cut, and the #UD encodings stay #UD."""
+
+    def words(self, d):
+        code = bytes.fromhex(d['code']['hex'])
+        lay = d['code']['layout']
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
+        with tempfile.TemporaryDirectory() as t:
+            return check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+
+    def test_every_form_inline_with_bulk(self):
+        for mn, ew, iw, L in GATHER_FORMS:
+            for k, addr in enumerate(GATHER_ADDRESSES):
+                regs = [(0, 1, 2), (8, 15, 4), (3, 9, 14), (12, 5, 13), (7, 6, 10), (1, 2, 3)][k]
+                text, n = gather_asm(mn, ew, iw, L, addr, regs)
+                with self.subTest(text):
+                    d, rc = run(x86_asm([text]), RIP, '--bulk')
+                    self.assertEqual((rc, d['status'], d['guest']['instructions_translated'], d['guest']['end']['reason']),
+                                     (0, 'ok', 1, 'end_of_input'), d.get('guest'))
+                    self.assertEqual(d['code']['layout']['spill_bytes'], 0)
+                    sites = d['sites']
+                    self.assertEqual([(s['kind'], s['width'], s['data_class'], s['guest_offset2'], s['intent'], s['rmw'], s['imm'])
+                                      for s in sites], [('load', ew, 'fpr', GATHER_ELEMENT, 'read', 'none', 0)] * n)
+                    self.assertEqual({s['segment'] for s in sites}, {'ss' if addr.startswith(('rsp', 'rbp')) else 'ds'})
+                    dis = self.words(d)
+                    r, bit = ('x0', '0x3f') if ew == 8 else ('w0', '0x1f')
+                    for s in sites:
+                        o = s['native_offset']
+                        self.assertRegex(dis[o - 8], rf'^mov\.{"d" if ew == 8 else "s"} {r}, v\d+\[\d\]$')
+                        self.assertEqual(dis[o - 4], f'tbz {r}, #{bit}, {o + 4:#x}')
+                        self.assertEqual(dis[o], f'ldr {"d" if ew == 8 else "s"}{s["data_regs"][0]}, [x{s["base_reg"]}]')
+                    # Nothing else of the block reads or writes guest memory: every other access is the guest-state page's.
+                    others = [o for o, w in dis.items() if (a := check_sites.native_access(w)) and a[2] not in ('x28', 'sp')
+                              and o not in {s['native_offset'] for s in sites}]
+                    self.assertEqual(others, [], text)
+
+    def test_a_gather_among_other_instructions(self):
+        # Its element sites are its own, between the instructions around it; nothing of it is written before its last one
+        # (verify_precision's P1 proves it on its corpus; here: no store to the guest-state page before the last element).
+        text, n = gather_asm('vpgatherdd', 4, 4, 1)
+        d, rc = run(x86_asm(['add rax, rbx', text, 'mov qword ptr [rsi], rcx']), RIP, '--bulk')
+        self.assertEqual((rc, d['guest']['instructions_translated']), (0, 3))
+        g = [s for s in d['sites'] if s['guest_offset2'] == GATHER_ELEMENT]
+        self.assertEqual(len(g), n)
+        dis = self.words(d)
+        last = max(s['native_offset'] for s in g)
+        start = min(s['insn_native_offset'] for s in g)
+        self.assertFalse([w for o, w in dis.items() if start <= o < last and w.startswith('st')], dis)
+
+    def test_cut_when_the_inline_path_does_not_apply(self):
+        text, _ = gather_asm('vpgatherdd', 4, 4, 1)
+        x = x86_asm([text])
+        cases = {'no --bulk': (x, ()), '--no-inline-gather': (x, ('--bulk', '--no-inline-gather')),
+                 '--bulk --no-inline-gather order': (x, ('--no-inline-gather', '--bulk')),
+                 '0x67': ('67' + x, ('--bulk',)), 'fs': ('64' + x, ('--bulk',)), 'gs': ('65' + x, ('--bulk',))}
+        for name, (h, extra) in cases.items():
+            with self.subTest(name):
+                d, rc = run(PRE + h + PRE, RIP, *extra)
+                g = d['guest']
+                self.assertEqual((rc, g['instructions_translated'], g['end']['reason']), (0, 2, 'system_instruction'), (name, g['end']))
+                self.assertIn('gather', g['end']['detail'], name)
+                self.assertFalse([s for s in d['sites'] if s['guest_offset2'] == GATHER_ELEMENT], name)
+        # The AVX gating stays a (gated) cut with --bulk; 32-bit code keeps the cut. A one-instruction block of a --bulk request
+        # is no step (review B1): inline.
+        d, _ = run(x + PRE, RIP, '--bulk', '--avx-gated')
+        self.assertEqual((d['guest']['instructions_translated'], d['guest']['end'].get('cut_gated', False)), (0, True), d['guest']['end'])
+        d, _ = run(x + PRE, RIP, '--bulk', '--max-insts', '1')
+        self.assertEqual((d['guest']['instructions_translated'], len([s for s in d['sites'] if s['guest_offset2'] == GATHER_ELEMENT])), (1, 8))
+        d, _ = run('01d8' + x + '01d8', 0x2000, '--bulk', '--bitness', '32')
+        self.assertEqual((d['guest']['instructions_translated'], d['guest']['end']['reason']), (1, 'system_instruction'), d['guest']['end'])
+
+    def test_ud_encodings_stay_ud_with_bulk(self):
+        # fexc_slice1.inc's gather #UD rules come before the table: a register operand, no SIB byte, destination, index and
+        # mask not all different; LOCK and a 66 before VEX are #UD too.
+        for h in ('c4e27590048890', 'c4e26d900c8890', 'c4e26d90148890', 'c4e26d900090', 'c4e26d90c190'):
+            with self.subTest(h):
+                d, _ = run(h + PRE, RIP, '--bulk')
+                e = d['guest']['end']
+                self.assertEqual((d['guest']['instructions_translated'], e['reason'], e.get('cut_ud', False)), (0, 'system_instruction', True), e)
+        for h in ('f0c4e26d900408', '66c4e26d900408'):
+            with self.subTest(h):
+                d, _ = run(PRE + h + PRE, RIP, '--bulk')
+                self.assertEqual((d['guest']['instructions_translated'], d['guest']['end']['reason']), (2, 'system_instruction'))
+
+
 if __name__ == '__main__':
     unittest.main()

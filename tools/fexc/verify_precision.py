@@ -23,7 +23,9 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       no fused pair sites; every site says completed_effects=none;
   P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips), but the `cbz x7` (RCX = 0; `cbz w7`,
       ECX = 0, with 0x67) of a
-      REP string instruction to that instruction's end (the next PC entry or its literal exit), which accesses nothing (I2);
+      REP string instruction to that instruction's end (the next PC entry or its literal exit), which accesses nothing (I2),
+      and the `tbz w0|x0, #31|#63` over exactly the next word, an inline gather's element load (a GATHER_ELEMENT site):
+      a masked-off element is not read (the gather plan);
   P6  for annotated programs (`insns`, the generator's flag annotations): for each site and each arithmetic flag, the last
       earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules; an
       instruction that leaves the flag undefined defines nothing, which matches the compiler's InvalidateFlags-as-write
@@ -1037,7 +1039,16 @@ def verify(d, tmp, insns=None):
             nxt = i['offset'] + i['size']
             ends[i['offset']] = {e['native_offset'] for e in d['pc_table']['entries'] if e['guest_offset'] == nxt} | \
                 {r['offset'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and int(r['guest_rip'], 16) == rip + nxt}
-    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp) if not (s[4].startswith(('cbz x7,', 'cbz w7,')) and s[2] in ends.get(s[0], ()))]
+    # P5 (gather plan): an inline gather's element load (a FexcGatherLoad site, `guest_offset2` GATHER_ELEMENT) is skipped,
+    # with no access, when its mask element's sign bit is clear (SDM: a masked-off element is not read): `tbz w0|x0, #31|#63`
+    # right before the site's word to the word after it, the site's width selecting the bit.
+    element = {x['native_offset']: x for x in d['sites'] if x['kind'] == 'load' and x['guest_offset2'] == GATHER_ELEMENT}
+    def mask_skip(s):
+        e = element.get(s[3])
+        return e is not None and s[1] == s[3] - 4 and s[2] == s[3] + 4 and \
+            s[4] == {4: 'tbz w0, #0x1f, ', 8: 'tbz x0, #0x3f, '}.get(e['width'], '?') + hex(s[2])
+    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp)
+            if not (s[4].startswith(('cbz x7,', 'cbz w7,')) and s[2] in ends.get(s[0], ())) and not mask_skip(s)]
     if insns:
         out += stale_flags(d, insns, dis, order)
         out += df_stores(d, insns, dis, order)
@@ -1052,6 +1063,7 @@ def cost(d, tmp):
 
 
 BITS = []          # ['--bitness', '32'] under --bits32
+GATHER_ELEMENT = 0xC000_0002   # crates/abi code_object::GATHER_ELEMENT: an inline gather's element load (P5)
 
 
 def compile_(fexc, hexs, rip, extra=()):
@@ -1201,7 +1213,25 @@ def adversarial():
                                 for a in asm]})
     for name, (rip, asm, fixture_rules) in GUARDED.items():
         progs.append({'name': name, 'code': ref.assemble('\n'.join(asm)).hex(), 'rip': rip} | ({'asm': asm} if fixture_rules else {}))
+    for asm in gathers():   # the gather plan's inline gathers (`--bulk`), compared with check_sites' gather model too
+        progs.append({'name': asm[0], 'code': ref.assemble('\n'.join(asm)).hex(), 'rip': '0x102000', 'asm': asm, 'extra': ['--bulk']})
     return progs
+
+
+def gathers():
+    """Gather plan: every AVX2 gather form inline (`--bulk`), with and without base and displacement, an RBP base (SS), high
+    registers, and a gather between two other instructions (its sites among theirs)."""
+    out = []
+    for mn, ew, iw in (('vpgatherdd', 4, 4), ('vpgatherqd', 4, 8), ('vpgatherdq', 8, 4), ('vpgatherqq', 8, 8),
+                       ('vgatherdps', 4, 4), ('vgatherqps', 4, 8), ('vgatherdpd', 8, 4), ('vgatherqpd', 8, 8)):
+        for L in (0, 1):
+            n = (16 << L) // max(ew, iw)
+            dw, xw = 'ymm' if n * ew == 32 else 'xmm', 'ymm' if n * iw == 32 else 'xmm'
+            for k, (d, x, m, addr) in enumerate(((0, 1, 2, 'rdi + {x}*4'), (3, 9, 14, '{x}*8 + 0x40'), (12, 5, 13, 'r13 + {x}*2 - 0x80'),
+                                                 (7, 6, 10, 'rbp + {x}*1'))):
+                g = f'{mn} {dw}{d}, [{addr.format(x=f"{xw}{x}")}], {dw}{m}'
+                out.append(['add rax, rbx', g, 'mov qword ptr [rsi], rcx'] if k == 3 else [g])
+    return out
 
 
 SHARD = (0, 1)     # (I, N): every N-th program from the I-th (--shard)

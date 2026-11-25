@@ -55,6 +55,7 @@ WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i i
 STUBS = ('guard', 'split', 'divide', 'align', 'stack', 'fldcw', 'x87tag', 'x87guess', 'segment')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
+GATHER = re.compile(r'v(?:p)?gather(d|q)(d|q|ps|pd)')   # (index size, element: d/ps 4 bytes, q/pd 8)
 STRING = re.compile(r'(?:(?:rep|repe|repne)\s+)?(movs|stos|lods|scas|cmps)([bwdq]?)\b(.*)')
 # I2: one element's accesses (movs: [RSI] then [RDI]; cmps: [RDI] then [RSI]).
 STRING_ACCESSES = {'movs': ['load', 'store'], 'stos': ['store'], 'lods': ['load'], 'scas': ['load'], 'cmps': ['load', 'load']}
@@ -98,6 +99,13 @@ def expected(asm):
         return [(k, w) for k in STRING_ACCESSES[x[1]]]
     locked = asm.startswith('lock ')
     mn, _, rest = asm[5 if locked else 0:].partition(' ')
+    # Gather plan (docs/restructure/gather-fast-path-plan.md): an AVX2 gather compiled inline (`--bulk`, 64-bit, no 0x67/FS/GS)
+    # has one element load per element of its form, lowest first, each the element's width (FexcGatherLoad's `ldr s|d`): the
+    # loads an all-active mask makes, every one a site whatever the mask holds at run time (a masked-off element skips its
+    # site's word, no access: verify_precision's P5 exception). n = the form's bytes / the wider of element and index.
+    if (g := GATHER.fullmatch(mn)):
+        ew, iw = (8 if g[2] in ('q', 'pd') else 4), (8 if g[1] == 'q' else 4)
+        return [('load', ew)] * ((32 if 'ymm' in rest else 16) // max(ew, iw))
     ops = [o.strip() for o in rest.split(',')] if rest else []
     mem = [i for i, o in enumerate(ops) if '[' in o]
     ptr = lambda o: dict(WIDTH, xmmword=16, ymmword=32)[o.split(' ptr')[0].split()[-1]]
@@ -328,7 +336,7 @@ def code_vs_sites(sites, dis, code):
 
 def check_program(p, tmp):
     problems = []
-    d = run(p['code'], p['rip'], tmp, '--object', str(tmp / 'o.bin'))
+    d = run(p['code'], p['rip'], tmp, '--object', str(tmp / 'o.bin'), *p.get('extra', ()))   # (`extra`: e.g. the gathers' --bulk)
     if d['status'] == 'no_code':   # slice1: the program starts with a cut instruction
         g = d['guest']
         ok = PROFILE and g['instructions_translated'] == 0 and g['end']['reason'] == 'unsupported_form' and g['end']['rip'] == p['rip'] \

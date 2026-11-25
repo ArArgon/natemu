@@ -15,7 +15,8 @@ import check_sites  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1])); from raw_root import RAW_ROOT  # noqa: E402
 FEXC = os.environ.get('FEXC', str(RAW_ROOT / 'fexc-native-20261026-01/series20/obj/fexc'))
 BR = [re.compile(r'b\.\w+\s+0x([0-9a-f]+)$'), re.compile(r'(?:cbz|cbnz)\s+\w+,\s+0x([0-9a-f]+)$'),
-      re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#\d+,\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
+      # (objdump prints a tbz/tbnz bit number in hex, `tbz w0, #0x1f, 0x2c`: both forms are matched.)
+      re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#(?:0x[0-9a-f]+|\d+),\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
 
 
 def skips(d, tmp):

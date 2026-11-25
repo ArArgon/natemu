@@ -288,6 +288,26 @@ def only_bulk_movs(old, new, answer_without):
     return None if only_probes(old, without) is None else 'differs without FexcRepMovs too'
 
 
+GATHER_ELEMENT = 0xC000_0002   # crates/abi code_object::GATHER_ELEMENT
+
+
+def has_inline_gather(reply) -> bool:
+    """The reply's object holds an inline gather's element load (a site whose guest_offset2 is GATHER_ELEMENT)."""
+    p = parse(reply)
+    return bool(p) and any(struct.unpack_from('<I', site, 8)[0] == GATHER_ELEMENT for site in p[4])
+
+
+def only_inline_gather(old, new, answer_without):
+    """Gather plan: an intended change of 64-bit output, bounded here. None when NEW's reply holds an inline gather and NEW's
+    reply to the same request with `--no-inline-gather` (every gather the system cut, as before) is OLD's, or differs from it
+    only as only_bulk_read (the gather's read of `--bulk` is gone with the flag: none) or only_probes allows; else what
+    differs. So every other word of the reply is OLD's."""
+    if not has_inline_gather(new): return 'no inline gather in the new reply'
+    without = answer_without()
+    if without == old: return None
+    return None if only_probes(old, without) is None else 'differs without the inline gathers too'
+
+
 def only_bulk_read(old, new):
     """Bulk REP plan (section 14): NEW reads `--bulk` for every REP MOVSB/MOVSQ it decodes (a request without the flag: a
     step, alignment gating; or with it, for an instruction decoded past the block's final end), so its args_read may also
@@ -428,7 +448,7 @@ def main():
     stream = a.stream or record(a)
     old, new = serve(a.old), serve(a.fexc)
     old32 = serve(a.old32) if a.old32 else None
-    n = differ = n32 = probes = movs = 0
+    n = differ = n32 = probes = movs = gathers = 0
     same32 = moves32 = differ32 = uncaught = 0
     size32 = [0, 0]   # the 32-bit replies' code bytes, OLD32's and NEW's
     code_size = lambda r: (lambda p: len(p[3]) if p else 0)(parse(r))
@@ -463,6 +483,9 @@ def main():
             if ro != rn and only_bulk_read(ro, rn) is None:
                 movs += 1
                 continue
+            if ro != rn and b'--bulk\0' in args and only_inline_gather(ro, rn, lambda: answer(new, with_arg(rec, b'--no-inline-gather\0'))) is None:
+                gathers += 1
+                continue
             if ro != rn and (why := only_probes(ro, rn)) is not None:
                 differ += 1
                 if differ <= 5:
@@ -474,7 +497,8 @@ def main():
     same = os.path.realpath(a.old) == os.path.realpath(a.fexc)
     print(f'replay: {n} requests ({stream.stat().st_size >> 20} MiB), {differ} differences' +
           (f'; {probes} more replies differ only by split stubs that probe (M2 task 4: only_probes)' if probes else '') +
-          (f'; {movs} more differ only by bulk REP MOVS (only_bulk_movs, only_bulk_read)' if movs else '') + (' (OLD is NEW: the self-check only)' if same else '') +
+          (f'; {movs} more differ only by bulk REP MOVS (only_bulk_movs, only_bulk_read)' if movs else '') +
+          (f'; {gathers} more differ only by inline gathers (only_inline_gather)' if gathers else '') + (' (OLD is NEW: the self-check only)' if same else '') +
           (f'; {n32} of them for 32-bit code, answered by NEW only (none compared: --old32 compares them)' if n32 and not old32 else ''))
     if old32:
         growth = 100 * (size32[1] - size32[0]) / max(size32[0], 1)
