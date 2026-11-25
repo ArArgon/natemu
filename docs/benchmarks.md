@@ -10,6 +10,7 @@ natemu compared with QEMU TCG, both running the same x86 Linux guest on the same
 | 32-bit programs, 8 items, 1 vCPU (the CPython build at 4) | **5.1×** (geometric mean; 0.97× to 83×; **4.1×** without the x87 builds) |
 | Context-switch-heavy Debian workload (cloud image), 4 vCPUs, November 14 | **1.7×** |
 | OpenGL on the CPU (glmark2 on llvmpipe), 4 vCPUs, the glmark2 score | **15×** (AVX2); **23×** (SSE4.1) |
+| Web browsing (Speedometer 3.1 in Firefox), 4 vCPUs, the Speedometer score | **1.6×** |
 
 32-bit and 64-bit code are summarised separately. A program measured in several builds or kernels (c-ray's builds,
 SciMark's five kernels) counts as one item, the geometric mean of its ratios. At 4 vCPUs the c-ray item is `cray`
@@ -30,7 +31,8 @@ much, is in the commit messages and the pages of the work that moved it.
 - **natemu:** each table names its commit: 3b13c1d0 (November 24, 2026) for the 64-bit and 32-bit programs and the
   display, 9f35eb96 (November 22, 2026) for the CPython builds and Paper, 670fab60 (November 23, 2026) for the 32-bit
   segment cases. At 3b13c1d0 the CPython-build, Paper and segment cases measured within their noise of the numbers shown. 79fbd75e
-  (November 25, 2026, branch `gather-fast-path`) for OpenGL on the CPU.
+  (November 25, 2026, branch `gather-fast-path`) for OpenGL on the CPU, and 9db554b9 (November 25, 2026, branch
+  `dayday-bench`: the same natemu and compiler as 79fbd75e) for web browsing.
 - **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`, on the same M4. Its CPU model is matched to the
   features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9 of 10 tests we
   compared, so it is not used. Its numbers are older than natemu's; each table says when they were measured.
@@ -318,6 +320,61 @@ glmark2's start-up; the median is not affected.
 With SSE4.1 natemu reaches 92% of the real x86 machine's score; with AVX2 50%, and below its own SSE4.1 score, while
 real x86 gains 19% from AVX2. natemu runs each 256-bit AVX2 operation as two 128-bit halves, so AVX2 brings it little
 here, and its gathers, now run inside the translated code, are still a load per element.
+
+## Web browsing (Speedometer 3.1)
+
+Speedometer 3.1, the browser benchmark that the WebKit, Chromium and Firefox engine teams maintain together, in Firefox
+ESR 140 without a screen (headless). Speedometer drives 20 small web apps the way a user would (adding and completing
+to-do items in the same app written with React, Angular, Vue, jQuery and others, laying out news pages, typing into code
+and rich-text editors, drawing charts) and times each; an iteration's score is 1000 divided by the geometric mean of its
+20 suites' times in milliseconds, higher is better. The guest is Debian 13 with Firefox, Speedometer's files and a small
+web server that serves them from inside the guest, which has no outside network: a results hook in the page sends the numbers to
+that server, which prints them on the console. Firefox starts with a fresh profile each boot, so every boot loads and
+translates the browser from nothing. Each boot runs Speedometer's 20 suites 5 times (`iterationCount=5`); its score is
+the mean of the 5 iterations' scores.
+
+Bench case `speedometer-natemu` (4 vCPUs, 4 GiB, translation cache off); Apple M4; natemu 9db554b9; November 25, 2026.
+QEMU 11.1.2 on the same M4 (TCG, the CPU model of the other guest benchmarks): case `speedometer-qemu`, the same day.
+Real x86: case `speedometer-kvm`, the same kernel and guest under KVM on the Ryzen with the same CPU model, the same
+day. The median of 3 boots:
+
+| | Speedometer score | the 3 boots |
+| --- | ---: | ---: |
+| natemu | **2.33** | 2.27 to 2.36 |
+| QEMU | **1.43** | 1.39 to 1.45 |
+| real x86 | **16.1** | 16.1 to 16.2 |
+
+natemu is 1.6 times as fast as QEMU here and reaches 14% of the real x86 machine's score. Within a boot the 5
+iterations differ more than the boots do (Speedometer's own spread is 13 to 17% on natemu, 6 to 8% on QEMU, 5 to 7% on
+real x86). Each suite's time per iteration, in ms (lower is better; the median of the 3 boots' means):
+
+| Suite | natemu | QEMU | speed-up | real x86 |
+| --- | ---: | ---: | ---: | ---: |
+| `TodoMVC-JavaScript-ES5` | 423 | 832 | 2.0× | 73 |
+| `TodoMVC-JavaScript-ES6-Webpack-Complex-DOM` | 352 | 770 | 2.2× | 73 |
+| `TodoMVC-WebComponents` | 187 | 348 | 1.9× | 30 |
+| `TodoMVC-React-Complex-DOM` | 493 | 609 | 1.2× | 62 |
+| `TodoMVC-React-Redux` | 479 | 675 | 1.4× | 68 |
+| `TodoMVC-Backbone` | 456 | 538 | 1.2× | 49 |
+| `TodoMVC-Angular-Complex-DOM` | 489 | 682 | 1.4× | 62 |
+| `TodoMVC-Vue` | 326 | 399 | 1.2× | 35 |
+| `TodoMVC-jQuery` | 995 | 2564 | 2.6× | 215 |
+| `TodoMVC-Preact-Complex-DOM` | 172 | 209 | 1.2× | 19 |
+| `TodoMVC-Svelte-Complex-DOM` | 139 | 189 | 1.4× | 18 |
+| `TodoMVC-Lit-Complex-DOM` | 206 | 296 | 1.4× | 26 |
+| `NewsSite-Next` | 859 | 1815 | 2.1× | 154 |
+| `NewsSite-Nuxt` | 643 | 1410 | 2.2× | 124 |
+| `Editor-CodeMirror` | 356 | 349 | 0.98× | 30 |
+| `Editor-TipTap` | 617 | 1143 | 1.9× | 103 |
+| `Charts-observable-plot` | 602 | 711 | 1.2× | 65 |
+| `Charts-chartjs` | 600 | 1306 | 2.2× | 95 |
+| `React-Stockcharts-SVG` | 956 | 1275 | 1.3× | 103 |
+| `Perf-Dashboard` | 687 | 1635 | 2.4× | 132 |
+
+A browser runs JavaScript compiled by its own JIT, in several processes per vCPU, so natemu translates a stream of
+freshly written code and switches address spaces often; its lead over QEMU is far smaller here than on the compiled
+programs above. The debug tier's `speedometer-profile` ([testing](testing.md#the-debug-tier)) shows where natemu's
+time goes in this workload.
 
 ## CPU vulnerability mitigations
 
