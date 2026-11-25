@@ -419,6 +419,25 @@ def paper_inputs() -> pathlib.Path:
     return resources.derived('paper-inputs', _paper_recipe, [str(resources.fetch(n)) for n in names]) / 'inputs'
 
 
+def _glmark2_recipe(out: pathlib.Path, inputs: list) -> None:
+    recipe = pathlib.Path(inputs[0])
+    _in_container('glmark2', recipe, out, memory='8g')
+    f = out / 'userland.cpio.zst'
+    if not f.is_file() or f.stat().st_size % 4: raise BuildFailure('glmark2', f'no 4-byte-padded {f.name} produced')
+    sha = hashlib.sha256(f.read_bytes()).hexdigest()
+    (out / 'provenance.json').write_text(json.dumps({
+        'userland_sha256': sha, 'recipe_sha256': recipe_sha256(recipe), 'builder': artifacts.build_env_described()}, indent=1) + '\n')
+
+
+def glmark2_inputs() -> pathlib.Path:
+    """tests/bench/run_glmark2.py's guest userland (tools/bench/glmark2): Debian's glmark2, Mesa's llvmpipe, Xvfb and
+    BusyBox from a fixed snapshot.debian.org date, the installed package list pinned by the recipe's packages.txt, built
+    in the amd64 Debian builder. userland.cpio.zst, packages.txt and provenance.json (the archive's sha256, recorded,
+    never required, and the machine that built it)."""
+    recipe = _tools() / 'bench' / 'glmark2'
+    return resources.derived('bench-glmark2', _glmark2_recipe, [recipe, artifacts.build_env()])
+
+
 def recipe_sha256(recipe: pathlib.Path) -> str:
     """sha256 of the recipe folder's `sha256sum` listing (every file, sorted relative paths)."""
     files = sorted(p for p in recipe.rglob('*') if p.is_file() and '__pycache__' not in p.parts)

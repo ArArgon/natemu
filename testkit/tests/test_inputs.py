@@ -441,3 +441,22 @@ def test_display_inputs_runs_the_display_prepare(monkeypatch, tmp_path):
                                                            '--kms-pattern': tmp_path / 'kms' / 'kms_pattern'}
     assert d.name == 'display' and (d / 'inputs.json').exists()
     assert inputs.DISPLAY == 'devices-display/display' and inputs.DISPLAY in inputs.PATHS
+
+
+def test_glmark2_inputs_record_the_userland_and_refuse_an_unpadded_one(monkeypatch, tmp_path):
+    """tools/bench/glmark2 in the amd64 builder: userland.cpio.zst (a multiple of 4 bytes, so a cpio can follow it),
+    packages.txt, and provenance.json recording the archive's hash, never requiring one."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    seen = []
+    def fake(name, recipe, work, **kw):
+        seen.append((name, recipe)); (work / 'userland.cpio.zst').write_bytes(b'zstd'); (work / 'packages.txt').write_text('glmark2-x11 1\n')
+    monkeypatch.setattr(inputs, '_in_container', fake)
+    d = inputs.glmark2_inputs()
+    prov = json.loads((d / 'provenance.json').read_text())
+    assert prov['userland_sha256'] == hashlib.sha256(b'zstd').hexdigest()
+    assert seen[0][0] == 'glmark2' and seen[0][1].as_posix().endswith('tools/bench/glmark2')
+    assert prov['recipe_sha256'] == inputs.recipe_sha256(seen[0][1]) and inputs.artifacts.BENCH_BUILDER in prov['builder']
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c2'))
+    monkeypatch.setattr(inputs, '_in_container', lambda name, recipe, work, **kw: (work / 'userland.cpio.zst').write_bytes(b'odd'))
+    with pytest.raises(BuildFailure, match='4-byte-padded'):
+        inputs.glmark2_inputs()

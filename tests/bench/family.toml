@@ -514,6 +514,47 @@ argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "natemu", "
 argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "qemu", "--inputs", "{display_inputs}", "--out", "{out}",
         "--qemu", "{qemu_system}"]
 
+# OpenGL on the CPU (docs/benchmarks.md; tests/bench/run_glmark2.py): glmark2 2023.01 off-screen under Xvfb on Mesa's
+# llvmpipe, ten 5-second scenes, 4 vCPUs, 4 GiB, 5 boots (the median per scene), the first boot also checking glmark2's
+# validation. The guest userland is the input glmark2-inputs (tools/bench/glmark2, testkit/inputs.py:glmark2_inputs).
+# llvmpipe samples textures with AVX2 gathers (docs/restructure/gather-fast-path-plan.md); the -sse41 cases hold it to
+# SSE4.1 (GALLIUM_OVERRIDE_CPU_CAPS=sse4.1), which uses none. natemu runs with its translation cache off, as the other
+# guest benchmarks. The control group: QEMU (the pinned 11.1.2, TCG, the guest benchmarks' CPU model) on the same Mac,
+# and real x86: the -kvm cases boot the same kernel and initramfs under KVM on the x86 machine (NATEMU_X86_HOST, the
+# same CPU model), so they run only when seeding (TESTKIT_SEED_ANSWERS=1), like io5-solo32-reference.
+[[suite]]
+name = "glmark2"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 1500 }
+
+[suite.cases.glmark2-natemu]
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}"]
+
+[suite.cases.glmark2-natemu-sse41]
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}", "--caps", "sse4.1"]
+
+[suite.cases.glmark2-qemu]
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "qemu", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}", "--qemu", "{qemu_system}"]
+
+[suite.cases.glmark2-qemu-sse41]
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "qemu", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}", "--qemu", "{qemu_system}", "--caps", "sse4.1"]
+
+[suite.cases.glmark2-kvm]
+remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}"]
+
+[suite.cases.glmark2-kvm-sse41]
+remote = true
+argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
+        "--out", "{out}", "--caps", "sse4.1"]
+
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
 # (tests/bench/plugins/indirect.c, artifacts.census_plugin). Counts per guest instruction, not timings: a case claims cores
