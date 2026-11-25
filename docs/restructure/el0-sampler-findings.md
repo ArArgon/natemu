@@ -2,7 +2,8 @@
 
 November 23, 2026, `m2-sampler` at a7cd8e82, all on the M2 Max (machine C2CACF57), one round: chunk 4 of the
 [EL0 sampler plan](el0-sampler-plan.md). Measurement only: nothing in natemu changed. Profiles, not timings: no number
-here goes on the [benchmarks page](../benchmarks.md), and no table mixes machines.
+here goes on the [benchmarks page](../benchmarks.md), and no table mixes machines. The round after the fixes is
+[at the end](#profile-round-after-the-fixes-november-24).
 
 What ran (every case through `tools/natemu-test`, one run each, outputs kept):
 
@@ -267,3 +268,161 @@ configure steps be read. The FEX-body row needs a tighter skid model before `bui
 - Pool them: no A/B per fix; one combined A/B against this page's commit and one profile round over all of them at the
   end, with the gate. Each fix keeps its own kill-test and correctness tests.
 - No FEX code-quality track for now.
+
+## Profile round after the fixes (November 24)
+
+The same sample cases ran again on the M2 Max at 0e296fc4, one run each, outputs kept: `guest-build-sample`,
+`guest-build-sample-4`, `guest-hackbench-sample`, `guest-luajit-sample`, `guest-sqlite-sample`, `guest-zstd-sample`,
+`guest-startup32-sample`, `guest-scimark32-sse2-sample` and `io5-solo32-sample`. This round has the fixes that were kept:
+bulk REP MOVS (64-bit, its first cut), page-crossing step A, trip cost steps 0, 1.1-1.2 and 2, and the sampler's
+ring-time fix. Return prediction and indirect step 1 were built and then removed. These are profiles, not timings. The
+November 23 columns are that round's runs of the same cases on the same machine (a7cd8e82), also one run each. Bench
+phases are run1; io5 rows are the use launch's steps.
+
+All guests passed. `io5-solo32-sample` failed one check of its report: one block sample (of 8.7 M) was counted past its
+object's code region. The cause was in the report, not the sampler. The block was a pool copy, and the report matched it
+by page offset to an answer served when its frame held another file page, so the bytes were different. The report was
+fixed (4653b169) and rerun on the kept outputs. Nothing else in the case's tables moved, and they are read below from
+that rerun. hackbench placed only 927 EL0 samples in run1 (most of its EL0 time has no place), so its place and role
+rows are weak.
+
+**The EL0/resident split.** % of the non-halted samples, beside the guest bucket's % of busy time in the same run. "No
+place" (new this round) is a ring that fell in an earlier stretch of generated code. It counts as EL0 time but has no
+place, role or symbol.
+
+| Case, phase | Nov 23: EL0 / bucket | Nov 24: EL0, no place, **sum** / bucket |
+| --- | ---: | ---: |
+| `guest-build-sample` run1 | 47.7 / 55.2 | 49.9, 7.3, **57.2** / 56.8 |
+| `guest-build-sample-4` run1 | 42.1 / 48.2 | 42.4, 6.9, **49.3** / 48.8 |
+| `guest-hackbench-sample` run1 | 3.2 / 38.4 | 1.6, 35.3, **36.9** / 38.3 |
+| `guest-luajit-sample` run1 | 67.3 / 71.4 | 66.8, 4.1, **70.9** / 70.6 |
+| `guest-sqlite-sample` run1 | 53.1 / 73.1 | 57.4, 20.2, **77.6** / 77.3 |
+| `guest-zstd-sample` run1 | 91.3 / 91.2 | 91.5, 0.8, **92.3** / 91.1 |
+| `guest-startup32-sample` run1 | 52.5 / 72.9 | 59.0, 20.2, **79.2** / 78.4 |
+| `guest-scimark32-sse2-sample` run1 | 92.6 / 95.0 | 99.6, 0.0, **99.6** / 98.4 |
+| `io5-solo32-sample` configure | 23.4 / 37.0 | 23.4, 12.3, **35.7** / 36.4 |
+| `io5-solo32-sample` make | 60.4 / 68.1 | 62.9, 7.8, **70.7** / 68.7 |
+| `io5-solo32-sample` i386-configure | 25.4 / 39.4 | 25.4, 13.3, **38.7** / 39.2 |
+| `io5-solo32-sample` i386-make | 65.6 / 71.9 | 66.5, 7.0, **73.5** / 71.5 |
+
+The sum is within 1.5 points of the bucket on every row except the make steps, which are 2 points over (the ring-time fix
+section found the same excess). Sampled EL0 time can now be read beside the buckets on every case, configure and
+hackbench included.
+
+**Resident buckets**, % of busy time (all vCPUs, from the phase's timing-log snapshots), November 23 / November 24.
+"link" is the linker together with relink and patch. "other" is every bucket not shown (place, shadow, tlb, delivery,
+fetch, enter_copy, stop, start).
+
+| Case, phase | guest | host | helper | link | abort | lookup + miss | enter + system | pool + reuse | irq | other |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `build` run1 | 55.2 / 56.8 | 18.9 / 20.5 | 3.4 / 3.3 | 7.8 / 6.0 | 2.2 / 2.1 | 3.3 / 3.0 | 2.2 / 1.9 | 0.8 / 0.7 | 1.4 / 1.3 | 4.8 / 4.3 |
+| `build-4` run1 | 48.2 / 48.8 | 22.2 / 21.5 | 2.9 / 2.6 | 8.2 / 7.9 | 2.1 / 2.2 | 2.9 / 3.0 | 2.2 / 2.1 | 5.4 / 5.9 | 1.8 / 1.7 | 4.2 / 4.4 |
+| `hackbench` run1 | 38.4 / 38.3 | 0.4 / 0.4 | 0.0 / 0.0 | 18.0 / 18.2 | 0.5 / 0.4 | 5.2 / 5.1 | 34.9 / 35.2 | 0.0 / 0.0 | 1.1 / 1.1 | 1.6 / 1.3 |
+| `luajit` run1 | 71.4 / 70.6 | 9.2 / 9.9 | 0.0 / 0.0 | 4.7 / 4.5 | 3.1 / 3.0 | 1.3 / 1.3 | 1.7 / 1.7 | 3.2 / 3.5 | 1.2 / 1.2 | 4.3 / 4.2 |
+| `sqlite` run1 | 73.1 / 77.3 | 3.3 / 3.5 | 19.7 / 15.3 | 0.4 / 0.4 | 0.7 / 0.7 | 0.2 / 0.1 | 0.4 / 0.4 | 0.0 / 0.0 | 1.2 / 1.1 | 1.0 / 1.0 |
+| `zstd` run1 | 91.2 / 91.1 | 4.0 / 4.4 | 0.0 / 0.0 | 1.0 / 0.7 | 0.6 / 0.7 | 0.3 / 0.2 | 0.8 / 0.7 | 0.0 / 0.1 | 1.2 / 1.2 | 0.9 / 0.9 |
+| `startup32` run1 | 72.9 / 78.4 | 3.1 / 3.3 | 16.6 / 12.8 | 2.3 / 1.4 | 0.6 / 0.5 | 0.9 / 0.6 | 1.0 / 0.7 | 0.0 / 0.0 | 1.3 / 1.2 | 1.3 / 1.1 |
+| `scimark32-sse2` run1 | 95.0 / 98.4 | 0.2 / 0.3 | 0.0 / 0.0 | 2.1 / 0.0 | 0.0 / 0.0 | 0.4 / 0.0 | 0.9 / 0.0 | 0.0 / 0.0 | 1.0 / 1.0 | 0.4 / 0.1 |
+| io5 configure | 37.0 / 36.4 | 9.3 / 9.1 | 2.2 / 2.0 | 10.4 / 11.0 | 6.6 / 6.4 | 10.0 / 9.8 | 7.3 / 7.5 | 6.4 / 6.7 | 1.4 / 1.3 | 9.5 / 9.8 |
+| io5 make | 68.1 / 68.7 | 3.2 / 3.1 | 1.9 / 1.8 | 9.0 / 8.5 | 3.0 / 3.1 | 4.5 / 4.6 | 1.6 / 1.5 | 1.5 / 1.6 | 2.2 / 2.0 | 4.8 / 4.9 |
+| io5 i386-configure | 39.4 / 39.2 | 7.0 / 7.5 | 2.2 / 2.0 | 10.2 / 9.5 | 7.0 / 6.5 | 10.6 / 11.0 | 6.4 / 6.7 | 5.2 / 6.1 | 1.3 / 1.3 | 10.6 / 10.2 |
+| io5 i386-make | 71.9 / 71.5 | 2.6 / 2.8 | 1.6 / 1.4 | 7.0 / 7.2 | 2.9 / 2.9 | 4.4 / 4.5 | 1.3 / 1.4 | 1.5 / 1.7 | 2.2 / 2.0 | 4.6 / 4.6 |
+
+The cases' timing logs explain two of the buckets. `host` on `build` is mostly compilation: on vCPU 0 over the whole
+run, `translate` (fexc, admission and staging) is 3.04 of the 3.91 s of host exits. `helper` is the PCMPxSTRx helper,
+`svc #STRING` (trip-cost step 0). Over the run it makes 35.4 M trips on `sqlite`, 36.3 M on `startup32` and 5.8 M on
+`build`, and there are almost no x87 helper trips.
+
+**Dispatch.** % of placed EL0 samples on November 24, split by the call test. Every row is within a point of
+November 23 (section 2), except hackbench, whose dispatch share went from 6.2 to 7.7 on few samples.
+
+| Case, phase | block | dispatch | return | not a call | unknown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `build` run1 | 88.5 | 11.5 | 7.2 | 4.2 | 0.2 |
+| `build-4` run1 | 89.2 | 10.8 | 6.5 | 3.9 | 0.4 |
+| `hackbench` run1 | 92.3 | 7.7 | 7.6 | 0.1 | 0.0 |
+| `luajit` run1 | 95.3 | 4.7 | 2.5 | 2.2 | 0.0 |
+| `sqlite` run1 | 89.0 | 11.0 | 5.5 | 5.5 | 0.0 |
+| `zstd` run1 | 99.2 | 0.8 | 0.8 | 0.0 | 0.0 |
+| `startup32` run1 | 88.6 | 11.4 | 7.2 | 3.6 | 0.6 |
+| `scimark32-sse2` run1 | 97.5 | 2.5 | 2.5 | 0.0 | 0.0 |
+| io5 configure | 89.0 | 10.9 | 6.3 | 3.5 | 1.1 |
+| io5 make | 88.8 | 11.2 | 7.4 | 3.3 | 0.5 |
+| io5 i386-configure | 87.1 | 12.9 | 7.6 | 3.9 | 1.3 |
+| io5 i386-make | 87.9 | 12.1 | 8.5 | 3.3 | 0.4 |
+
+**Roles.** % of placed EL0 samples on November 24, raw / with the one-word skid correction (section 1). The stack
+check and REP string columns are raw only.
+
+| Case, phase | FEX body | FEX flags | natemu | split + probe | exits | stack | REP str | hot 50 FEX body |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `build` run1 | 66.3 / 41.9 | 5.3 / 11.5 | 16.8 / 35.1 | 2.8 / 3.9 | 7.4 / 0.5 | 3.1 | 2.0 | 72.7 / 51.3 |
+| `build-4` run1 | 66.7 / 42.1 | 5.3 / 11.6 | 17.3 / 35.5 | 2.4 / 3.7 | 8.5 / 1.3 | 3.1 | 2.1 | 73.5 / 52.6 |
+| `hackbench` run1 | 77.1 / 45.2 | 2.3 / 10.7 | 12.9 / 36.5 | 2.9 / 3.1 | 3.0 / 1.2 | 4.5 | 6.2 | 89.2 / 55.3 |
+| `luajit` run1 | 70.7 / 58.5 | 3.9 / 13.8 | 20.7 / 23.0 | 4.6 / 7.3 | 13.8 / 0.1 | 1.5 | 0.6 | 70.1 / 65.4 |
+| `sqlite` run1 | 68.0 / 46.6 | 3.8 / 12.1 | 17.2 / 30.3 | 5.4 / 6.1 | 9.1 / 0.2 | 1.8 | 0.4 | 72.7 / 61.3 |
+| `zstd` run1 | 74.4 / 58.9 | 11.6 / 21.5 | 13.1 / 18.8 | 2.4 / 3.6 | 8.6 / 0.1 | 0.5 | 0.9 | 74.7 / 59.9 |
+| `startup32` run1 | 67.7 / 38.6 | 3.5 / 10.9 | 17.4 / 39.1 | 4.3 / 7.4 | 8.6 / 0.6 | 3.2 | 7.9 | 71.3 / 49.2 |
+| `scimark32-sse2` run1 | 81.0 / 43.7 | 1.8 / 9.2 | 14.8 / 44.7 | 9.7 / 22.3 | 0.3 / 0.0 | 2.0 | 0.0 | 83.0 / 44.8 |
+| io5 configure | 64.2 / 43.7 | 3.9 / 9.0 | 20.9 / 36.4 | 3.3 / 4.1 | 10.7 / 5.4 | 2.7 | 4.0 | 74.2 / 58.2 |
+| io5 make | 64.7 / 40.7 | 3.9 / 10.9 | 20.1 / 37.2 | 2.6 / 4.1 | 10.8 / 1.6 | 3.4 | 1.0 | 70.2 / 48.0 |
+| io5 i386-configure | 60.8 / 35.6 | 3.6 / 9.7 | 22.1 / 41.2 | 2.7 / 3.5 | 10.1 / 5.3 | 3.6 | 3.1 | 68.8 / 38.1 |
+| io5 i386-make | 63.2 / 36.5 | 4.2 / 9.6 | 20.3 / 41.7 | 2.3 / 4.8 | 9.1 / 1.2 | 5.2 | 4.6 | 67.6 / 40.0 |
+
+Most rows are within a point or two of section 3, and the larger moves are listed below. Of the REP share that is left,
+the user part is 32-bit code, which the first cut does not cover: `rep movsd` 7.5 on `startup32`, and `rep movsd` 3.3
+plus `rep stosd` 1.0 on i386-make. The kernel part is `rep stosq` and `rep movsq`: 6.2 on hackbench and 3.7 on
+configure. A bulk STOS loop's samples count in this column too, so it can stay high where the bulk loop runs.
+
+**Top symbols** (% of placed EL0, run1). These are unchanged on `build` (`cc1:?` 32.8, `as:?` 7.4, `libc.so.6:?` 3.1),
+`sqlite` (`speedtest1:?` 82.8), `startup32` (`speedtest1-32:?` 75.9, `user:short` 11.7), `luajit` (code luajit generated
+57.8, `luajit:?` 31.9) and `zstd` (`ZSTD_RowFindBestMatch_noDict_5_6` 70.4). On hackbench, `clear_page_rep` fell from 9.6
+to 3.6, and `arch_exit_to_user_mode_prepare` (7.2) and `entry_SYSCALL_64` (4.9) now lead. On scimark32-sse2 the mix
+of its benchmark kernels moved (`LU_factor` 10.5 to 22.2, `SOR_execute` 28.8 to 24.9). The io5 steps stay at block
+level (`user:?` 52-86).
+
+### Where time goes now
+
+Generated code is 91-98% of busy time on zstd and scimark32-sse2, 69-78% on luajit, sqlite, startup32 and the make
+steps, 49-57% on `build`, and 36-39% on hackbench and the configure steps. Outside generated code, `build` spends it
+compiling, sqlite and startup32 in the PCMPxSTRx helper, and hackbench and configure in trips: linker, lookup, miss,
+entry, system instructions and aborts. Inside generated code the mix is as on November 23. About 9 in 10 placed samples
+are in blocks and 1 in 10 in the dispatcher. FEX's own body is 61-81% raw and 36-59% corrected. natemu's words are
+13-22% raw, mostly linked exits (which are skid, by the correction), stack and split checks.
+
+### What changed against November 23
+
+- **The sampler now places EL0 time.** EL0 plus no place matches the guest bucket. Before, sqlite, startup32 and
+  hackbench were undercounted by 20-35 points. The placed shares are as before, since the samples placed are the same
+  kind.
+- **Page-crossing step A** took away scimark32-sse2's resident time. Its link bucket went from 2.1% of busy to 0, its
+  lookup, miss, enter and system buckets from 1.3 to 0, and its guest bucket from 95.0 to 98.4. Its probes now return
+  into the hot copy, whose exits are linked. Its split checks are still there (raw 10.4 to 9.7). The corrected share
+  rose because the mix of its benchmark kernels moved.
+- **Trip cost step 2** shows on the helper-heavy cases. The helper bucket went from 19.7 to 15.3% on `sqlite` and from
+  16.6 to 12.8% on `startup32`, and their guest buckets rose 4.2 and 5.5 points. These are the same helper trips, made
+  cheaper.
+- **Bulk REP MOVS** (64-bit) removed most of zstd's REP share (run1 6.7 to 0.9% of placed EL0) and a third of `build`'s
+  (3.2 to 2.0). hackbench's kernel `clear_page_rep` share also fell (9.6 to 3.6), on few samples.
+- **io5 did not change**: every step's guest bucket and resident mix is within a point of November 23. The fixes kept do
+  not touch its costs, which are kernel trips, links, aborts, misses and 32-bit code.
+- **Dispatch did not change** (returns 6.3-8.5% and not-a-call 3.3-5.5% of placed EL0 on `build`, `sqlite`, `startup32`
+  and the io5 steps), because both dispatch fixes were removed.
+
+### The largest remaining costs
+
+1. **Resident trips on configure-like and kernel-heavy work.** This is root cause A of the architecture review (currency
+   per address space). On io5 configure / i386-configure the resident takes 54 / 53% of busy time: the linker 11.0 / 9.5,
+   lookup and miss 9.8 / 11.0, enter and system 7.5 / 6.7, pool 6.7 / 6.1 and abort 6.4 / 6.5. On hackbench, enter and
+   system take 35.2% and the linker 18.2%. On the make / i386-make steps the linker takes 8.5 / 7.2%, and lookup and
+   miss 4.6 / 4.5.
+2. **Compilation on `build`.** The host bucket is 20.5% of busy (21.5% at 4 vCPUs, 9.9% on luajit, 9.1% on configure).
+   On `build` most of it is `translate` (fexc, admission and staging: 3.04 of 3.91 s on vCPU 0).
+3. **PCMPxSTRx helper trips.** They take 15.3% of busy on `sqlite` and 12.8% on `startup32` (35-36 M `svc #STRING` trips a
+   run), 3.3% on `build` and 2.0% on configure. Trip-cost step 5, which removes these trips, was not built.
+4. **The dispatcher.** It takes 11-13% of placed EL0 on `build`, `sqlite`, `startup32` and every io5 step: returns
+   6.3-8.5% and not-a-call 3.3-5.5%. Both fixes tried were removed as slowdowns, so it needs a different design.
+5. **Code inside blocks**, raw / corrected % of placed EL0. Flag words are 11.6 / 21.5 on zstd and 5.3 / 11.5 on `build`;
+   the flag-liveness fix was not built. Split checks are 9.7 / 22.3 on scimark32-sse2; step A removed the probes' linker
+   trips, not the checks. 32-bit `rep movsd` is 7.5 on `startup32` and 3.3 on i386-make, outside bulk REP's first cut.
+   Stack checks are 5.2 on i386-make.
