@@ -418,6 +418,28 @@ class Attribution(Base):
         self.assertEqual((a['beyond'], a['all_roles']['entry'], a['block_samples']), (1, 1, 3))
         self.assertEqual(a['all_roles'].get('stack_check'), 1)           # push-run's first word: its stack check
 
+    def test_a_page_match_short_of_the_sampled_words_is_no_object(self):
+        # io5-solo32-sample (M2 Max, November 24): a pool copy at another RIP of the frame's page offset, whose answer was
+        # served on another frame while this frame held other bytes, sampled past the page match's region: no object known
+        # (not a fault); the same sample on the block the answer was served for exactly stays one.
+        o, obj, c = self.fixture_objects()
+        rip, other, end = c['guest_rip'], c['guest_rip'] + 0x5000, c['code_region_end']
+        self.assertIsNone(sr.locate(o, sr.sample(el0(0, other, sr.BLOCK, USER64, at=end, frame=0x55))))
+        self.assertEqual(sr.locate(o, sr.sample(el0(0, other, sr.BLOCK, USER64, at=4, frame=0x55)))['how'], 'page')
+        self.assertTrue(sr.locate(o, sr.sample(el0(0, rip, sr.BLOCK, USER64, at=end, frame=0x55)))['beyond'])
+        recs = [header(1), hostrec(sr.CLOCK, T0, value1=1), hostrec(sr.TOGGLE, T0, value1=0, value2=1, value3=0, value4=sr.RUN),
+                hostrec(sr.CLOCK, T0 + S, value1=1, value2=1), hostrec(sr.VCPU, T0 + S, value1=0, value2=4, value3=0, value4=4),
+                el0(T0 + 1, rip, sr.BLOCK, USER64, at=4, frame=0x55), el0(T0 + 2, other, sr.BLOCK, USER64, at=4, frame=0x55),
+                el0(T0 + 3, other, sr.BLOCK, USER64, at=end, frame=0x55),
+                el0(T0 + 4, other + 0x1000, sr.BLOCK, USER64, at=4, frame=0x55),
+                *counts(0, rings=4, written=4, drained=4), *run_counts()]
+        write_samples(self.d / 'case.samples', recs)
+        problems, r = self.report()
+        self.assertEqual(problems, [])
+        a = r['phases'][0]['attribution']
+        # (Word 1 is push-run's stack check: the exact block's and the other page match's, which reaches it.)
+        self.assertEqual((a['beyond'], a['all_roles']['stack_check'], a['all_roles']['none'], a['page_mismatch_blocks']), (0, 2, 2, 1))
+
     def test_the_report_gives_roles_per_class_and_the_top_blocks_words(self):
         recs, markers, objects = standard_run()
         problems, r = self.report(markers=self.write(recs, markers, objects))

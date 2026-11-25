@@ -39,8 +39,10 @@ the binaries of `--image CPIO` (the bench image; without it user samples stay at
 role, user and kernel and 64- and 32-bit apart, by group (FEX's body, its flag words, natemu's words, other), the shares
 the plan's section-7 rows read (split checks and probes, stack checks, REP string bodies, glibc AVX2/EVEX code, flag words,
 load-then-move, the kernel's copy and clear routines, FEX's body on the top 50 blocks), and the top 30 symbols; the top
-50 blocks of the whole run with each word's role and count. A sample past an object's code region (`beyond`) is a
-problem."""
+50 blocks of the whole run with each word's role and count. A sample past the code region of its block's own answer (`beyond`)
+is a problem; a block whose only objects are answers served for other RIPs of its frame's page offset (a page match) none
+of which reaches its sampled words has no object known (`none`): the frame held other bytes when those were served, and
+the block's code came from the pool, from an answer served on another frame."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import bisect
 import collections
@@ -122,7 +124,9 @@ def mode(context):
 # --- the objects file ------------------------------------------------------------------------------------------------
 class Objects:
     """NAME.objects: every distinct answer served, indexed by (RIP, frame, context) and by (frame, page offset, context)
-    (a block placed from a template at another RIP of the same page offset has the bytes of the answer it came from)."""
+    (a block placed from a template at another RIP of the same page offset has the bytes of the answer it came from, if the
+    frame held the same bytes then: a frame can hold other pages over a run, and a pool copy's answer may have been served
+    on another frame, so a page match is checked against the block's sampled offsets)."""
 
     def __init__(self, path):
         self.path = pathlib.Path(path)
@@ -184,12 +188,19 @@ def locate(objects, s):
     served for it; else {record, how ('exact' or 'page'), candidates (answers with that key: their bytes differ), offset
     (the native offset in the object's code: a PIC block's full entry is at -4; None when it did not fit the record, FAR),
     word_index, word (its 4 bytes; None outside the code region: FEX's tail is not placed), beyond (a sample past the code
-    region: a fault the report counts)}. The first candidate is taken."""
+    region: a fault the report counts)}. The first candidate is taken; of a page match, the first whose code region holds
+    the offset, and None (no object known) when none does."""
     if s['place'] not in (BLOCK, PROBE, STEP): return None
     hits, how = objects.find(s['rip'], s['frame'], s['context'])
     if not hits: return None
-    r = objects.record(hits[0])
     off = offset(s)
+    r = objects.record(hits[0])
+    if how == 'page' and off is not None:
+        # (A page match is the answer served for another RIP, of the bytes the frame held then: the first whose code region
+        # holds the offset. None does: the block's code is another answer (the frame held other bytes when these were
+        # served, and the block's came from the pool, served on another frame), so no object is known.)
+        r = next((x for x in map(objects.record, hits) if x['code'] and off + 4 <= x['code']['code_region_end']), None)
+        if r is None: return None
     c, word = r['code'], None
     # Admission places the code region only (code_region_end); FEX's tail after it is stripped, so no sample lies there.
     beyond = bool(c) and off is not None and (off < -4 or off + 4 > c['code_region_end'])
@@ -211,7 +222,7 @@ class Attribution:
     def __init__(self, objects, kernel=None, slide=0, image=None):
         self.objects, self.kernel, self.slide, self.image = objects, kernel, slide, image
         self.info_of, self.user, self.sym_of = {}, {}, {}
-        self.ambiguous = self.matched = self.looked_up = self.short = self.multi_in_file = 0
+        self.ambiguous = self.matched = self.looked_up = self.short = self.multi_in_file = self.page_mismatch = 0
         self.reach = {}             # per block, the highest native offset sampled (set_reach)
         self.entry_of = {}
 
@@ -226,14 +237,20 @@ class Attribution:
         sampled offset, else the one with the largest region."""
         if key in self.info_of: return self.info_of[key]
         info = None
-        hits, _ = self.objects.find(*key) if self.objects is not None else ([], None)
+        hits, how = self.objects.find(*key) if self.objects is not None else ([], None)
         codes = []
         for h in hits:
             r = self.objects.record(h)
             try: codes.append((roles_mod.Code(r['object']), r))
             except (ValueError, IndexError, struct.error): continue
+        reach = self.reach.get(key, -4)
+        if how == 'page' and codes and not any(c.region_end > reach for c, _ in codes):
+            # A page match (answers served for other RIPs of the frame's page offset) none of whose code regions holds every
+            # sampled word: they are of bytes the frame held before, and the block's code is an answer served on another
+            # frame (a pool copy), so its object is not known (role `none`, counted `page_mismatch`; locate's rule too).
+            codes = []
+            self.page_mismatch += 1
         if codes:
-            reach = self.reach.get(key, -4)
             c, r = next(((c, r) for c, r in codes if c.region_end > reach), max(codes, key=lambda x: x[0].region_end))
             if c:
                 insns, guest, bits = c.word_insns(), r['guest'], 64 if mode(key[2]) == '64' else 32
@@ -679,6 +696,7 @@ class Profile:
             a['user_blocks_looked_up'], a['user_blocks_found'] = attribution.looked_up, attribution.matched
             a['user_blocks_ambiguous'] = attribution.ambiguous
             a['user_blocks_short'], a['user_blocks_twice_in_a_file'] = attribution.short, attribution.multi_in_file
+            a['page_mismatch_blocks'] = attribution.page_mismatch
 
     def report(self, objects=None, top=50, attribution=None):
         names = [n for n, _, _ in self.phases.windows]
@@ -850,7 +868,9 @@ def attribution_markdown(rep):
             f'{a.get("user_blocks_found")} ({a.get("user_blocks_twice_in_a_file")} of them twice in it: named by the first), in '
             f'several files {a.get("user_blocks_ambiguous")} (`ambiguous:`), not looked up (under '
             f'{sample_symbols.MATCH_BYTES} guest bytes) {a.get("user_blocks_short")} (`user:short`). A bulk REP STOS loop '
-            '(--bulk, kernel code) counts as FEX body; its guest instruction counts in REP str.',
+            '(--bulk, kernel code) counts as FEX body; its guest instruction counts in REP str. Blocks whose only objects are '
+            f'answers for other RIPs of their frame and page offset that do not reach their sampled words (the frame held '
+            f'other bytes then; role `none`): {a.get("page_mismatch_blocks")}.',
             '', '## Top blocks\' words (whole run)', '',
             'Per block: its symbol, then each sampled word as native offset (hex), role and samples.', '']
     for i, r in enumerate(whole['blocks']['top'], 1):
