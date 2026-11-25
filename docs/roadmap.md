@@ -207,7 +207,7 @@ weeks for a first demonstration.
   the channel it reads. (From my own knowledge of the firmware project, unverified.)
 - **P1** Platform pieces that do not exist yet (checked in the code today): the flash
   or firmware-config device from the spike, a host input source for the PS/2 keyboard
-  and mouse (the controller exists; the display front end will add the source), and
+  and mouse (built November 24, 2026: the control API's `send_input`, [control-api.md](control-api.md)), and
   SMBIOS tables for a firmware boot (a direct boot has them; the firmware's come with M3). The ACPI tables already include the PCI root bridge with resources and
   interrupt routing.
 - **P1** Multi-BAR, multi-function PCI. **Built** (branch `claude/pci-multibar-44dd6e`,
@@ -224,7 +224,8 @@ weeks for a first demonstration.
 - **P1** Boot Linux the way a PC does (firmware, bootloader, kernel) from the existing
   virtio disk, alongside the current direct-boot path.
 - **P1** Display for the firmware and installers: a framebuffer device with resolution
-  changes. Input comes from the PS/2 controller above.
+  changes. Built for Linux guests November 24, 2026: a Bochs-style PCI display on mapped device memory
+  ([plan](restructure/bochs-display-plan.md)); the firmware's own driver for it comes with this milestone's firmware. Input comes from the PS/2 controller above.
 - **P1** Decide whether Secure Boot variables are supported (Windows 11 expects a
   Secure-Boot-capable machine). Real variable protection normally needs System
   Management Mode, which stays out of scope.
@@ -243,6 +244,13 @@ for any P2 or P3 item that slipped from M1–M3, and the owner can reorder what 
 - **P1** A Linux desktop session usable end to end: display, keyboard and mouse,
   clipboard (needs a guest-side helper agent).
 - **P3** Audio (if not done in M2).
+- **P2** A 64-bit PCI memory window above RAM (backlog, owner November 24, 2026): today every memory BAR is placed in
+  one 256 MiB window below 4 GiB, which caps the display's `vram_mib` at 64 (a 128 MiB BAR fills the window under the
+  launch placement, `pci/place.rs`); a 4K desktop needs 128, and virtio-gpu's host-visible memory needs 64-bit BARs.
+  Work: a second, 64-bit range in the root bridge's ACPI `_CRS`, placement of 64-bit prefetchable BARs there, the
+  display's BAR0 as one; first step, audit the device paths (registry ranges, the resident's claim cache, request
+  records, the advertised physical address width) for addresses above 4 GiB. A smaller stopgap if 4K comes first:
+  first-fit placement in the existing window.
 - **P3** A display path better than the M3 framebuffer, sized to what a Windows desktop
   needs (this absorbs the display-acceleration item that was in M4).
 - **P3** Shared folders (if not done in M2).
@@ -253,7 +261,8 @@ for any P2 or P3 item that slipped from M1–M3, and the owner can reorder what 
   existing source audit favours an emulated USB controller or USB/IP), once the emulated
   controller from M2 is solid.
 - **P3** Whole-VM save/restore, last and only if cheap; not a priority.
-- **P3** A management interface (control API) if it turns out easy; front ends build on it.
+- **P3** A management interface (control API) if it turns out easy; front ends build on it. Built November 24,
+  2026: JSON-RPC 2.0 over a Unix socket ([control-api.md](control-api.md)); a minimal viewer is the next front end.
 - **Exit:** the P1 desktop session works and every P2/P3 item is done or explicitly
   deferred.
 

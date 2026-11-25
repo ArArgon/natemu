@@ -24,7 +24,8 @@ natemu boots the unmodified Debian 13 cloud image with networking and a disk. It
   also set in the `--config` file, writes what the guest prints there to a file on the Mac, or lets a program on the
   Mac type into it and read its output through a Unix socket (a connection point that looks like a file). A launch
   with a `--config` file uses a PCI bus by default; one without it uses MMIO devices (PCI with
-  `--virtio-transport pci`). No display, keyboard, sound, USB or shared folders.
+  `--virtio-transport pci`). A simple screen with a keyboard and mouse can be added too, but there is no window to
+  look at it yet (see [Using natemu](#using-natemu)). No sound, USB or shared folders.
 - **Networking:** IPv4 only, through NAT, with port forwarding. No IPv6 or bridged networking.
 - **CPU:** 64-bit programs only. No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
 - **Performance:** Linux's default Meltdown protection is slow under natemu; see
