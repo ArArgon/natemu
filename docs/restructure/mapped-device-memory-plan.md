@@ -68,7 +68,7 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - The region set is fixed at launch (which functions have mapped BARs and their sizes); only bases and enables change
   at run time; at most 8 regions, total at most the PCI window's 256 MiB.
 - **No cost on RAM paths:** every audited site tests RAM first and consults the region table only for a page that is
-  not RAM; RAM installs do not read the table; the remap trigger is two loads of `seq` per port or device exit (before the request and once it is answered). Tasks 2
+  not RAM; RAM installs do not read the table; the remap trigger is one load of `seq` per port or device exit without regions (`seq` 0 at the start means none, ever), two with (before the request and once it is answered); split locks run as before. Tasks 2
   and 3 each end with an A/B (below) that shows no benchmark moves beyond its noise.
 - The host never waits for a vCPU inside a device handler (`devices.rs` contract): the remap wait runs in the
   resident, as the split-lock owner's does.
@@ -313,10 +313,9 @@ aliases: Vec<(u64 /*va*/, u64 /*len*/)> }` used by `Machine::create`; `MappedReg
   mapped pages (stores reach the device path: access count nonzero) and with `split`'s `CROSSING` refusal kept;
   `mapped-permissions` fails with mapped shadows installed writable regardless of the walk; `mapped-refusals` fails
   with fetch allowed.
-- [ ] **Step 4b: A/B**, on one machine, alternating three rounds: `TESTKIT_BENCH_AT=<parent> tools/natemu-test run
-  --tier bench -k <cases>` then the checkout, for the 64-bit guest benchmarks and one I/O workload (`io5-solo`), with
-  no mapped region; record rounds and spread in the commit message; any difference beyond the spread is a defect to fix
-  before the commit, not a page update.
+- [ ] **Step 4b: A/B** runs once for the branch at the end: one run of the base aeb0f6f5 and one of the tip, the 14
+  cases, judged against the round-to-round noise the Task 2 and Task 3 experiments measured on the M4; a case that moves
+  clearly beyond it gets a targeted rerun.
 - [ ] **Step 5: commit** `runtime: mapped device memory as a page class, read and written natively`.
 
 ### Task 3: moving and disabling a region
@@ -340,7 +339,9 @@ device's `MOVE` register.
   **Step 4: run**; PASS. Show `remap_is_visible_after_flag` fails when only the moving vCPU drops its shadows,
   `install_races_publish` fails with `holding()` moved after the table read and the hold point (at the read itself the flag is set before the mover scans, so that placement cannot fail; the held vCPU first resets its shadows by toggling CR4.PGE, since any RAM install sets the flag), and `halted_peer_drops_on_wake` fails when
   the shootdown skips quiescent peers.
-- [ ] **Step 4b: A/B** as in Task 2 (the remap trigger adds a load to every port and device exit).
+- [ ] **Step 4b: A/B** runs once for the branch at the end: one run of the base aeb0f6f5 and one of the tip, the 14
+  cases, judged against the round-to-round noise the Task 2 and Task 3 experiments measured on the M4; a case that moves
+  clearly beyond it gets a targeted rerun.
 - [ ] **Step 5: commit** `runtime: a mapped region moves with a VM-wide shadow shootdown`.
 
 ### Task 4: PCI mapped BARs and the Linux guest case

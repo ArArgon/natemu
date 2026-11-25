@@ -3635,7 +3635,25 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
     }
     split_word(1).store((gpa[0] >> 12) + 1, SeqCst);
     split_word(2).store((gpa[1] >> 12) + 1, SeqCst);
-    shoot_peers(vcpus, &mut serve);
+    let mut counts = [0; area::MAX_VCPUS];
+    let mut requested = 0u64;
+    for p in (0..vcpus).filter(|&p| p != vcpu()) {
+        counts[p] = resets_of(p);
+        if split_word(3 + p).load(SeqCst) == 0 {
+            continue;
+        }
+        requested |= 1 << p;
+        ask_shadows(p);
+    }
+    // Let peers reset concurrently; serialize only the locked memory access.
+    while requested != 0 {
+        let p = requested.trailing_zeros() as usize;
+        while resets_of(p) == counts[p] {
+            serve();
+            core::hint::spin_loop();
+        }
+        requested &= requested - 1;
+    }
 }
 /// Makes every other vCPU that may hold a shadow (its holding flag set) drop all of them ([`SHADOWS`], a kick) and waits
 /// for each one's reset counter to move, calling `serve` meanwhile (two vCPUs shooting each other down both progress).
@@ -3643,6 +3661,9 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
 /// clear either holds nothing, or is between a reset (flag cleared, then the counter moved) and its next `holding()`,
 /// after which it reads the published state anew. A vCPU that stopped for good reset first (`execution.rs`
 /// `halt`): its flag is clear and it is never waited for. Halted peers are woken by the kick and counted by counter.
+/// [`split_begin`]'s scan, kept as its own copy so the split lock's path is as before mapped device memory.
+#[cold]
+#[inline(never)]
 fn shoot_peers(vcpus: usize, serve: &mut impl FnMut()) {
     let mut counts = [0; area::MAX_VCPUS];
     let mut requested = 0u64;
@@ -3675,6 +3696,8 @@ fn shoot_peers(vcpus: usize, serve: &mut impl FnMut()) {
 /// read): the publication (the host's seqlock stores, made before this vCPU's exit returned, or seen through `seq`) is
 /// followed here by `fence(SeqCst)`, then each peer's flag is loaded (SeqCst). Either this load sees a peer's flag, so the
 /// peer is asked and its shadows go, or the peer's table read follows the publication and sees the new table.
+#[cold]
+#[inline(never)]
 pub fn remap_shootdown(vcpus: usize, mut serve: impl FnMut()) {
     core::sync::atomic::fence(SeqCst);
     shoot_peers(vcpus, &mut serve);

@@ -4938,10 +4938,12 @@ pub(super) fn mapped_seq() -> u64 {
 }
 /// After a port or device exit answered `DONE` (its polls included): if the region table's `seq` moved since `before`
 /// (this exit's device published, or another vCPU's did meanwhile), runs the remap shootdown and resets this vCPU's own
-/// shadows before the guest runs again. One load of `seq` here, one before the request; a VM without regions never
-/// publishes after its start, so `seq` never moves there.
+/// shadows before the guest runs again. A `before` of 0 is a VM without regions (`Backing::machine` publishes every
+/// region before any vCPU runs, so `seq` is nonzero from the start exactly when there are any, and 0 never moves): no
+/// second load then.
+#[inline(always)]
 pub(super) fn remapped(s: &mut State, before: u64) {
-    if mapped_seq() != before {
+    if before != 0 && mapped_seq() != before {
         remap(s)
     }
 }

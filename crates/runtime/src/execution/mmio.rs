@@ -145,7 +145,7 @@ pub(super) fn ones(
     // goes and `true` is returned: `access_aborted` then retries the access, classifying the page again (the reset moves
     // the generation, so the retry is progress); `wrapped_load` goes on and reads the page as all-ones (its copy reads a
     // page outside RAM so), a read that linearizes before the publish (legal: it raced the move).
-    if device.iter().flatten().any(|&g| !super::lapic::claims(g) && !rom(g) && mapped(g).is_some()) {
+    if device.iter().flatten().any(|&g| mapped(g).is_some() && !super::lapic::claims(g) && !rom(g)) {
         super::reset_shadows(s);
         return true;
     }

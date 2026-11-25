@@ -43,6 +43,7 @@ fn memory(s: &mut State, paging: Option<paging::Control>) -> Mem<'_> {
         checks: [(0, 0, false); 4],
         checked: 0,
         generation: 0,
+        log: 0,
     }
 }
 
