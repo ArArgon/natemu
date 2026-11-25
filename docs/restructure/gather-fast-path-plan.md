@@ -165,9 +165,15 @@ before the table).
 ## 5. Measurement
 
 One A/B on the M2 Max (the machine of the experiment) against this branch's base, on the llvmpipe experiment, plus the
-benchmarks a gather change can move (none of the existing bench programs is known to use gathers; `guest-scimark` and the
-CPython build are checked once). The experiment's numbers stay labelled as an experiment; the separate bench-case work
+benchmarks a gather change can move. The experiment's numbers stay labelled as an experiment; the separate bench-case work
 makes them citable.
+
+**No existing bench case can move** (checked November 25): the M4's bench runs at 3b13c1d0, the commit of
+[benchmarks.md](../benchmarks.md)'s numbers and the same natemu code as this branch's base (no change under `crates`,
+`tools`, `third_party`, `testkit` or `tests/bench` between them), hold 118 `bench.jsonl` files with 116 system-instruction
+tables (`kinds`) over every 64-bit and 32-bit case, `guest-avx` included: none counts a single GATHER (kind `7a`). Their
+guest code never reaches the changed path, and fexc's output for every other instruction is unchanged, so no bench case
+was re-run and the page is unchanged.
 
 ## 6. Review
 
