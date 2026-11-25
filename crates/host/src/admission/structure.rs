@@ -4349,7 +4349,8 @@ mod tests {
                 refuse(at - 4, tbz + (1 << 5)); // over the ldr and the word after it
                 refuse(at - 4, tbz - (1 << 19)); // bit 30|62
                 refuse(at - 8, word(f, at - 8) | 1); // umov into w1|x1
-                refuse(at, word(f, at) | 1 << 10); // ldr s|d, [xA, #4|#8]
+                // ldr s|d, [xA, #4|#8]: no longer the recorded site (object validation)
+                refused(f, at, word(f, at), word(f, at) | 1 << 10, "does not describe its instruction");
             }
             // A branch into the first element's `ldr` from the word before its `umov`.
             let at = site(elements[0]).native_offset;

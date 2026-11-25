@@ -6520,7 +6520,9 @@ mod tests {
             assert!(e.contains("--bulk"), "{e}");
             c.bulk = true;
         }
-        c.inline_gather = false;
+        // (A fresh compiler: the answers kept in memory are not keyed by the flag, which is fixed for the process.)
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.shape, c.bulk, c.inline_gather) = (true, true, false);
         let body = c.body(forms[0].0, 0x1000, None);
         assert!(String::from_utf8_lossy(&body).contains("--no-inline-gather\0--bulk") || String::from_utf8_lossy(&body).contains("--bulk\0--no-inline-gather"));
         for (code, _) in forms {
