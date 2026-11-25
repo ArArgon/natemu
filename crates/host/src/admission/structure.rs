@@ -644,6 +644,21 @@ fn x86_rep_movs(insn: &[u8]) -> Option<u32> {
         _ => None,
     }
 }
+/// Gather plan (docs/restructure/gather-fast-path-plan.md 2.5): an AVX2 gather that fexc may compile inline in 64-bit code
+/// (C4 VEX, map 0F38, pp 66, opcode 90..93; no 0x67, FS or GS prefix: those stay the resident's): its element width and number
+/// of elements (the form's 16 or 32 bytes over the wider of element and index). `None` for anything else (a 66, F2, F3 or REX
+/// before VEX is #UD, a system cut).
+fn x86_gather(insn: &[u8]) -> Option<(u8, u32)> {
+    let o = insn.iter().position(|b| !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e))?;
+    let [0xc4, p1, p2, op, ..] = insn[o..] else {
+        return None;
+    };
+    if p1 & 0x1f != 2 || p2 & 3 != 1 || !(0x90..=0x93).contains(&op) {
+        return None;
+    }
+    let (ew, iw) = (if p2 & 0x80 != 0 { 8 } else { 4 }, if op & 1 != 0 { 8 } else { 4 });
+    Some((ew as u8, (16u32 << (p2 >> 2 & 1)) / ew.max(iw)))
+}
 /// Bulk REP plan (section 14): how a word of [`bulk_movs_words`] is compared: exactly, or as a cbz/cbnz/tbnz to the sequence's
 /// end (S), to its element loop's entry (E), or back to the rounds' `ldp` (B) or the element `ldr` (L).
 #[derive(Clone, Copy, PartialEq)]
@@ -805,7 +820,8 @@ struct Verifier<'a> {
 }
 
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
-/// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26).
+/// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26), a bulk REP MOVS sequence or an inline
+/// gather's element load (gather plan): whether only a `--bulk` request may have it.
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
     let operands = segment_operands(c)?;
     // A block with an operand check relies on the exact memory-word, stub and control-flow rules of the code shape, also in
@@ -817,7 +833,14 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
     v.segment_bases(&operands)?;
     v.words()?;
     v.exits()?;
+    // Gather plan (2.5): an inline gather's element loads exist only in 64-bit `--bulk` code; such an object is a bulk one,
+    // which a request without `--bulk` (a step) refuses, so a step never holds one (the resident's STEP guard is the other half).
+    let gather = c.accesses.iter().any(object::gather_element);
+    if gather && c.bits32 {
+        return Err("a gather element site in a 32-bit object".into());
+    }
     if c.shape {
+        v.gathers()?;
         v.stub_checks()?;
         v.aligned_before = v.aligned();
         v.sites()?;
@@ -832,7 +855,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
             ));
         }
     }
-    Ok((v.links, v.dispatch, !v.bulk.is_empty()))
+    Ok((v.links, v.dispatch, !v.bulk.is_empty() || gather))
 }
 
 /// M2 checkpoint C: an instruction's memory operand through a limited FS or GS, from an independent decode of the source.
@@ -1215,6 +1238,48 @@ impl<'a> Verifier<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// Gather plan (2.5), code shape: fexc's inline gather exactly. Every translated instruction that is a gather fexc may
+    /// compile inline ([`x86_gather`]) has as many access sites as its form has elements, all of them element loads
+    /// ([`object::GATHER_ELEMENT`]) of the element's width into a vector register, and no element load is anything else's.
+    /// Each is FexcGatherLoad's three words `umov w0|x0, vM.s|d[i]; tbz w0|x0, #31|#63, +8; ldr s|d<t>, [xA]` (the `tbz` bit
+    /// the element's sign bit, skipping exactly the `ldr`, which is the site as recorded), and no branch enters the `tbz` or
+    /// the `ldr`. (Which lane and mask register the `umov` reads are temporaries' and cannot be named here: fexc's tests
+    /// and the system family's gathers cover them.)
+    fn gathers(&self) -> Result<(), String> {
+        let mut starts: Vec<u32> = self.c.pcs.iter().map(|p| p.guest_offset).filter(|&g| g < self.c.guest_bytes).collect();
+        starts.dedup();
+        for g in starts {
+            let fail = |what: &str| Err(format!("gather at guest offset {g:#x}: {what}"));
+            let sites: Vec<&Site> = self.c.accesses.iter().filter(|s| s.guest_offset == g).collect();
+            let Some((ew, n)) = x86_gather(self.guest_insn(g)) else {
+                if sites.iter().any(|s| object::gather_element(s)) {
+                    return fail("an element load in an instruction that is no inline gather");
+                }
+                continue;
+            };
+            if sites.len() != n as usize || !sites.iter().all(|s| object::gather_element(s)) {
+                return fail(&format!("{} access sites, not its {n} element loads", sites.len()));
+            }
+            let (umov, tbz, ldr) = if ew == 8 { ((0xffef_fc1f, 0x4e08_3c00), 0xb6f8_0040, 0xfd40_0000) } else { ((0xffe7_fc1f, 0x0e04_3c00), 0x36f8_0040, 0xbd40_0000) };
+            for s in sites {
+                let at = s.native_offset;
+                let w = self.word(at);
+                let ok = at >= ENTRY_OFFSET + 8
+                    && (s.width, s.data_class, s.imm, s.index_reg) == (ew, object::CLASS_FPR, 0, object::NO_REG)
+                    && self.word(at - 8) & umov.0 == umov.1
+                    && self.word(at - 4) == tbz
+                    && w & 0xffff_fc00 == ldr
+                    && (w >> 5 & 31, w & 31) == (u32::from(s.base_reg), u32::from(s.data_reg[0]))
+                    && self.instruction(at - 8).is_some_and(|(h, _)| h == g)
+                    && self.branches_into(at - 8, at).next().is_none();
+                if !ok {
+                    return fail(&format!("its element load at {at:#x} is not `umov w0|x0; tbz w0|x0, #31|#63, +8; ldr s|d` as recorded"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Perf chunk 26: the backward branch at `at` to `to` is the back edge of a bulk REP STOS loop (fexc_sites.inc
@@ -4251,6 +4316,74 @@ mod tests {
         for src in [&[0xb9, 0x40, 0, 0, 0, 0xf3, 0x40, 0xa5][..], &[0xb9, 0x40, 0, 0, 0, 0xf2, 0x48, 0xa5]] {
             let e = admit_with((MOVSQ.0, src), false).unwrap_err();
             assert!(e.contains("not forward"), "{e}");
+        }
+    }
+    /// Gather plan (2.5): fexc's inline gathers (`--bulk`: `vpgatherdd ymm0, [rdi + ymm1*4], ymm2`, eight 4-byte elements;
+    /// `vpgatherqq ymm0, [ymm1*8 + 0x40], ymm2`, four 8-byte ones with no base) are admitted with and without the code shape,
+    /// as bulk objects (so a step's request refuses them, and no step holds one). With the code shape, each element load is
+    /// pinned: a `tbz` moved past the `ldr` or testing another bit, a `umov` from w1, an `ldr` with an offset, a branch into
+    /// the `ldr`, an unmarked element load, one site fewer, and the marks on an instruction that is no inline gather (other
+    /// guest bytes, or a 0x67 or FS prefix) are refused; object validation admits a marked element load only of a 4- or 8-byte
+    /// load into a vector register.
+    #[test]
+    fn gather_element_loads_are_pinned() {
+        const DD: (&[u8], &[u8]) = fixture!("gather-dd-bulk");
+        const QQ: (&[u8], &[u8]) = fixture!("gather-qq-bulk");
+        let word = |f: (&[u8], &[u8]), at: u32| u32::from_le_bytes(f.0[128 + at as usize..][..4].try_into().unwrap());
+        for (f, ew, n) in [(DD, 4u8, 8usize), (QQ, 8, 4)] {
+            let h: Header = super::super::record(f.0, 0);
+            assert_eq!(h.code_offset, 128);
+            for shape in [true, false] {
+                let a = super::super::admit(f.0, h.guest_rip, f.1, u64::MAX, shape, false).unwrap();
+                assert!(a.bulk, "an inline gather makes a bulk object");
+            }
+            let size = std::mem::size_of::<object::Site>();
+            let site = |i: usize| super::super::record::<object::Site>(f.0, h.sites_offset as usize + i * size);
+            let elements: Vec<usize> = (0..h.sites_count as usize).filter(|&i| object::gather_element(&site(i))).collect();
+            assert_eq!(elements.len(), n);
+            assert!(elements.iter().all(|&i| (site(i).width, site(i).data_class) == (ew, object::CLASS_FPR)));
+            let refuse = |at: u32, new: u32| refused(f, at, word(f, at), new, "gather at guest offset 0x0");
+            for &i in &elements {
+                let at = site(i).native_offset;
+                let tbz = word(f, at - 4);
+                refuse(at - 4, tbz + (1 << 5)); // over the ldr and the word after it
+                refuse(at - 4, tbz - (1 << 19)); // bit 30|62
+                refuse(at - 8, word(f, at - 8) | 1); // umov into w1|x1
+                refuse(at, word(f, at) | 1 << 10); // ldr s|d, [xA, #4|#8]
+            }
+            // A branch into the first element's `ldr` from the word before its `umov`.
+            let at = site(elements[0]).native_offset;
+            refuse(at - 12, 0x1400_0003);
+            // The site table: an element unmarked, an element dropped (its row made a stub-less OTHER... an unmarked plain
+            // load is all that is left of it), the mark on a 16-byte or a general-register load (object validation).
+            let field = |i: usize, off: usize, bytes: &[u8]| {
+                let mut o = f.0.to_vec();
+                let at = h.sites_offset as usize + i * size + off;
+                o[at..at + bytes.len()].copy_from_slice(bytes);
+                o
+            };
+            let g2 = std::mem::offset_of!(object::Site, guest_offset2);
+            let unmarked = field(elements[n / 2], g2, &object::NONE32.to_le_bytes());
+            let e = admit((&unmarked, f.1)).unwrap_err();
+            assert!(e.contains("gather at guest offset 0x0"), "{e}");
+            assert!(!super::super::admit(&unmarked, h.guest_rip, f.1, u64::MAX, false, false).unwrap().bulk);
+            for (off, value) in [(std::mem::offset_of!(object::Site, width), 16), (std::mem::offset_of!(object::Site, data_class), object::CLASS_GPR)] {
+                let e = admit_with((&field(elements[0], off, &[value]), f.1), false).unwrap_err();
+                assert!(e.contains("access site"), "{e}");
+            }
+            // The guest bytes: no gather (VEX.66.0F38 98, an FMA: same length), the VEX.L bit flipped (another element
+            // count), a 0x67 or FS prefix (the cut's): refused with the code shape.
+            let mut fma = f.1.to_vec();
+            fma[3] = 0x98;
+            let mut other_l = f.1.to_vec();
+            other_l[2] ^= 4;
+            for src in [fma, other_l] {
+                let e = admit((f.0, &src)).unwrap_err();
+                assert!(e.contains("gather at guest offset 0x0"), "{src:02x?}: {e}");
+            }
+            assert_eq!(super::x86_gather(&[&[0x67][..], f.1].concat()), None);
+            assert_eq!(super::x86_gather(&[&[0x64][..], f.1].concat()), None);
+            assert_eq!(super::x86_gather(&[&[0x3e][..], f.1].concat()), Some((ew, n as u32)));
         }
     }
     #[test]

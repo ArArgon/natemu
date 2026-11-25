@@ -2911,6 +2911,11 @@ pub struct Compiler {
     /// Fault-around plan chunk 1: [`cache::Control::writable_on_read_off`] (a demand read installs the shadow writable when the leaf has D
     /// set and grants the write; on by default; `--writable-on-read on|off`, [`parse_writable_on_read`]; `NATEMU_WRITABLE_ON_READ` overrides it).
     pub writable_on_read: bool,
+    /// Gather plan (docs/restructure/gather-fast-path-plan.md): the AVX2 gathers of a `--bulk` request in 64-bit code run inside
+    /// the block (the default); false sends fexc `--no-inline-gather`, under which every gather stays the system cut (the
+    /// resident's transaction), as in a step (`[debug] inline_gather`, `--inline-gather`, `NATEMU_INLINE_GATHER`). Fixed for
+    /// the process: the argument is part of the request, so of the persistent cache's key.
+    pub inline_gather: bool,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
     /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|user64|all` overrides it (`user64`: 32-bit code not shared, copied).
     pub pic: u64,
@@ -3155,6 +3160,7 @@ impl Compiler {
             check_reuse: false,
             page_currency: cache::PAGES_ON,
             writable_on_read: true,
+            inline_gather: true,
             pic: cache::PIC_USER,
             pic_check_local: false,
             deadline: COMPILE_DEADLINE,
@@ -3620,8 +3626,9 @@ impl Compiler {
                                 return Err(format!("reuse check: the kept admitted form at {rip:#x} is not admission's").into());
                             }
                             // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
+                            // (Bulk REP plan and gather plan: a bulk REP MOVS sequence or an inline gather's element load too.)
                             if a.bulk && !self.bulk {
-                                return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
+                                return Err(format!("object refused: a bulk REP STOS loop, REP MOVS sequence or inline gather in a request without --bulk at {rip:#x}").into());
                             }
                             // Option (d): kept for the next hit, from the admission at the answer's own RIP.
                             if let Some(e) = kept.filter(|e| e.rip == rip) {
@@ -3824,7 +3831,7 @@ impl Compiler {
             arg(&mut body, b"--x87-guess");
             arg(&mut body, format!("{:#x}", self.x87_guess).as_bytes());
         }
-        for (on, a) in [(self.cpl0, &b"--cpl0"[..]), (self.tsc, b"--tsc"), (self.bulk, b"--bulk")] {
+        for (on, a) in [(self.cpl0, &b"--cpl0"[..]), (self.tsc, b"--tsc"), (self.bulk, b"--bulk"), (!self.inline_gather, b"--no-inline-gather")] {
             if on {
                 arg(&mut body, a);
             }
@@ -4163,6 +4170,16 @@ pub fn parse_page_currency(text: &str) -> std::result::Result<u64, String> {
     }
 }
 
+/// `--inline-gather`'s (and `NATEMU_INLINE_GATHER`'s) value (gather plan): whether the AVX2 gathers of a `--bulk` request run
+/// inside the block (on, the default) or stay the system cut (off: fexc's `--no-inline-gather`).
+pub fn parse_inline_gather(text: &str) -> std::result::Result<bool, String> {
+    match text {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => Err(format!("--inline-gather {other}: on or off")),
+    }
+}
+
 /// `--writable-on-read`'s (and `NATEMU_WRITABLE_ON_READ`'s) value: whether a demand read installs the shadow writable (chunk 1 of the
 /// fault-around plan) or read-only (before it).
 pub fn parse_writable_on_read(text: &str) -> std::result::Result<bool, String> {
@@ -4252,6 +4269,11 @@ pub fn run(
         control + std::mem::offset_of!(cache::Control, writable_on_read_off),
         u64::from(!writable),
     );
+    // Gather plan: `inline_gather`, overridden by NATEMU_INLINE_GATHER=on|off (every driver reads it; the CLI's `[debug]
+    // inline_gather`).
+    if let Ok(v) = std::env::var("NATEMU_INLINE_GATHER") {
+        compiler.inline_gather = parse_inline_gather(&v)?;
+    }
     let pic = match std::env::var("NATEMU_PIC").as_deref() {
         Ok("off") => cache::PIC_OFF,
         Ok("user") => cache::PIC_USER,
@@ -5843,7 +5865,7 @@ mod tests {
                 }
             }
             args.extend(c.x87.iter().cloned());
-            for (on, a) in [(c.cpl0, "--cpl0"), (c.tsc, "--tsc"), (c.bulk, "--bulk")] {
+            for (on, a) in [(c.cpl0, "--cpl0"), (c.tsc, "--tsc"), (c.bulk, "--bulk"), (!c.inline_gather, "--no-inline-gather")] {
                 if on {
                     args.push(a.into());
                 }
@@ -5856,9 +5878,10 @@ mod tests {
         }
         for supported in [0, u64::MAX, 0b1011] {
             let mut c = Compiler::with_features(Path::new("/nonexistent"), supported, None);
-            for flags in 0..64u32 {
+            for flags in 0..128u32 {
                 (c.sse_gated, c.avx_gated, c.alignment_gated) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
                 (c.cpl0, c.tsc, c.bulk) = (flags & 8 != 0, flags & 16 != 0, flags & 32 != 0);
+                c.inline_gather = flags & 64 == 0;
                 c.push_run = flags % 5 != 0;
                 c.x87 = if flags % 3 == 0 { vec![] } else { vec!["--x87".into(), "mode".into()] };
                 for limit in [None, Some(1), Some(64)] {
@@ -6447,6 +6470,62 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.contains("--bulk"), "{e}");
+    }
+
+    /// Gather plan (2.5, 4), with `FEXC` set: a `--bulk` request translates an AVX2 gather inside its block (a bulk object, one
+    /// GATHER_ELEMENT load site per element), a request without it (a step, an alignment-gated block) and one with
+    /// `inline_gather` off (fexc's `--no-inline-gather`) leave it the resident's (`system::GATHER`), and an inline gather's
+    /// object answered for a request without `--bulk` is refused. The flag is part of the request, so answers made with and
+    /// without it are not shared.
+    #[test]
+    fn gathers_inline_only_when_asked() {
+        use natemu_abi::code_object::{self as object, Header, Site};
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.shape = true;
+        // vpgatherdd ymm0, [rdi + ymm1*4], ymm2; vpgatherqq ymm0, [ymm1*8 + 0x40], ymm2 (no base); vpgatherqd xmm0, [rdi +
+        // xmm1*4], xmm2 (two elements)
+        let forms: [(&[u8], usize); 3] = [
+            (&[0xc4, 0xe2, 0x6d, 0x90, 0x04, 0x8f], 8),
+            (&[0xc4, 0xe2, 0xed, 0x91, 0x04, 0xcd, 0x40, 0, 0, 0], 4),
+            (&[0xc4, 0xe2, 0x69, 0x91, 0x04, 0x8f], 2),
+        ];
+        let sites = |o: &[u8]| -> Vec<Site> {
+            let h: Header = unsafe { std::ptr::read_unaligned(o.as_ptr().cast()) };
+            (0..h.sites_count as usize)
+                .map(|i| unsafe {
+                    std::ptr::read_unaligned(o[h.sites_offset as usize + i * std::mem::size_of::<Site>()..].as_ptr().cast())
+                })
+                .collect()
+        };
+        let system = |c: &mut super::Compiler, code: &[u8]| {
+            matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::System(i) if i.kind == exec::system::GATHER)
+        };
+        c.bulk = true;
+        for (code, n) in forms {
+            let Code::Block(b) = c.compile(code, 0x1000, false, &mut ()).unwrap() else {
+                panic!("{code:02x?}: no block")
+            };
+            assert!(b.bulk, "{code:02x?}");
+            let Answer::Object(o) = c.answers.find(code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else {
+                panic!()
+            };
+            assert_eq!(sites(&o).iter().filter(|s| object::gather_element(s)).count(), n, "{code:02x?}");
+            assert!(system(&mut c, &[&[0x67][..], code].concat()) && system(&mut c, &[&[0x64][..], code].concat()));
+            c.bulk = false;
+            assert!(system(&mut c, code), "{code:02x?} without --bulk");
+            let e = c.answered(&Answer::Object(o), code, 0x1000, &mut (), None, None).err().unwrap();
+            assert!(e.contains("--bulk"), "{e}");
+            c.bulk = true;
+        }
+        c.inline_gather = false;
+        let body = c.body(forms[0].0, 0x1000, None);
+        assert!(String::from_utf8_lossy(&body).contains("--no-inline-gather\0--bulk") || String::from_utf8_lossy(&body).contains("--bulk\0--no-inline-gather"));
+        for (code, _) in forms {
+            assert!(system(&mut c, code), "{code:02x?} with inline_gather off");
+        }
     }
 
     #[test]

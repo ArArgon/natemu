@@ -3585,6 +3585,13 @@ fn guest_fault(
     site: &Site,
     [vector, cr2, error]: [u64; 3],
 ) -> ! {
+    // Gather plan (2.4): a guest fault at an inline gather's element load (the state is the state before the gather: none
+    // of it is written before its last element's load) runs the gather alone, through the resident's transaction, which
+    // completes the elements below the faulting one before the fault is delivered (SDM VPGATHERDD and the like). A step block
+    // never holds such a site (admission's bulk rule; `aborted` halts at one).
+    if object::gather_element(site) && b.flags & cache::STEP == 0 {
+        step_from(s, f, b, site)
+    }
     bank_at(&mut s, f, b, site);
     // The crash tripwire: a user-mode fault in generated code that looks like a crash, noted with its block.
     if s.cpu.cpl == 3 && (vector == 6 || vector == 13 || (vector == 14 && cr2 < 0x1_0000)) {
@@ -4030,6 +4037,11 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         {
             step_from(s, f, b, &site)
         }
+        // Gather plan (2.4): an inline gather's element load in a step block would step into itself; admission keeps it out
+        // of every non-bulk object, so one here is the producer's or the host's error.
+        if object::gather_element(&site) && b.flags & cache::STEP != 0 {
+            halt(&s, stop::SITE_MISMATCH)
+        }
         // A flat segment's end precedes the alignment or watchpoint decision. Data aborts and split
         // stores make the same extent check in their handlers, before walking either page.
         if (site.kind == object::kind::ALIGN || esr >> 26 == 0x34)
@@ -4291,7 +4303,7 @@ unsafe fn access_aborted(
     // Every page the access touches, in address order, before the retry. A contended walk resumes at once, outside
     // the no-progress test (the abort repeats until the walk wins; the watchdog contains a livelock). M3: a device page
     // among them (walked, so every fault it owes came first) takes the device path instead of a retry.
-    let (mut device, mut uncached) = ([None; 2], false);
+    let (mut device, mut uncached, mut mapped) = ([None; 2], false, false);
     for (k, va) in touched.into_iter().flatten().enumerate() {
         let p = crate::perf::enter(crate::perf::SHADOW);
         let translated = translate(&mut s, f, b, site, va, access);
@@ -4303,8 +4315,17 @@ unsafe fn access_aborted(
             },
             Some((gpa, Class::Other)) => device[k] = Some(gpa),
             // Mapped device memory: shadowed, the retry runs natively (any form, the page's type whatever it is).
-            Some((_, c)) => uncached |= c.uncached(),
+            Some((_, c)) => {
+                uncached |= c.uncached();
+                mapped |= matches!(c, Class::Mapped(_));
+            }
         }
+    }
+    // Gather plan (2.4): an inline gather's element on a page that is not plain RAM (a device's, an unassigned one, a mapped
+    // region's) runs the gather alone, before any device access or all-ones shadow could complete the element here: its
+    // transaction stops or completes as it always did (`unsupported_mmio`, or the masked-off elements' completion).
+    if object::gather_element(site) && (device != [None; 2] || mapped) && b.flags & cache::STEP == 0 {
+        step_from(s, f, b, site)
     }
     // L3 (amendment): a read whose non-RAM pages are all unassigned shadows them onto the all-ones page and retries, so
     // every read form runs natively; anything else (a write, a device's page) takes the device path.

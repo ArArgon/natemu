@@ -82,6 +82,8 @@ pub struct Config {
     pub mapped_testdev: bool,
     pub page_currency: u64,
     pub writable_on_read: bool,
+    /// Gather plan: `natemu::linux::Boot::inline_gather` (the AVX2 gathers inside generated code; on by default).
+    pub inline_gather: bool,
     pub perf_log: Option<PathBuf>,
     /// SIGINFO (Ctrl-T) prints every vCPU's state and the run goes on (`natemu::execution::inspect_on_signal`).
     pub inspect: bool,
@@ -143,6 +145,7 @@ impl Config {
             mapped_testdev: false,
             page_currency: natemu::execution::parse_page_currency("on").unwrap(),
             writable_on_read: true,
+            inline_gather: true,
             perf_log: None,
             inspect: true,
             watchdog: None,
@@ -280,6 +283,7 @@ struct FDebug {
     mapped_testdev: Option<bool>,
     page_currency: Option<String>,
     writable_on_read: Option<bool>,
+    inline_gather: Option<bool>,
     perf_log: Option<PathBuf>,
     inspect: Option<bool>,
     watchdog: Option<u64>,
@@ -464,6 +468,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
                 .map_err(|e| format!("{who}: debug.page_currency: {e}"))?;
         }
         cfg.writable_on_read = d.writable_on_read.unwrap_or(cfg.writable_on_read);
+        cfg.inline_gather = d.inline_gather.unwrap_or(cfg.inline_gather);
         cfg.perf_log = d.perf_log.map(|p| rel(base, &p)).or(cfg.perf_log.take());
         cfg.inspect = d.inspect.unwrap_or(cfg.inspect);
         cfg.watchdog = d.watchdog.or(cfg.watchdog);
@@ -714,7 +719,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 41] = [
+const KEYS: [&str; 42] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -744,6 +749,7 @@ const KEYS: [&str; 41] = [
     "debug.mapped_testdev",
     "debug.page_currency",
     "debug.writable_on_read",
+    "debug.inline_gather",
     "debug.perf_log",
     "debug.inspect",
     "debug.watchdog",
@@ -914,6 +920,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "debug.writable_on_read" => {
             cfg.writable_on_read = natemu::execution::parse_writable_on_read(text).map_err(err)?
         }
+        "debug.inline_gather" => cfg.inline_gather = boolish(text).map_err(err)?,
         "debug.perf_log" => cfg.perf_log = Some(path()),
         "debug.inspect" => cfg.inspect = boolish(text).map_err(err)?,
         "debug.watchdog" => {
@@ -1159,6 +1166,7 @@ pub fn to_boot(
     boot.accurate_fp = cfg.fp;
     boot.page_currency = cfg.page_currency;
     boot.writable_on_read = cfg.writable_on_read;
+    boot.inline_gather = cfg.inline_gather;
     boot.rng = !cfg.rngs.is_empty();
     boot.disks = cfg
         .disks

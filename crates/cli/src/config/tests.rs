@@ -969,13 +969,14 @@ fn file_forwards_and_debug_values_use_the_old_parsers() {
     let _env = lock();
     let (_, c) = load_file(
         &format!(
-            "{MIN}[[nic]]\nid = \"n\"\nforward = [\"2222:22\", \"udp:9:8\"]\nhost_loopback = true\n[debug]\npage_currency = \"check\"\nwritable_on_read = false\npool = false\n"
+            "{MIN}[[nic]]\nid = \"n\"\nforward = [\"2222:22\", \"udp:9:8\"]\nhost_loopback = true\n[debug]\npage_currency = \"check\"\nwritable_on_read = false\ninline_gather = false\npool = false\n"
         ),
         &[],
     );
     let c = c.unwrap();
     assert_eq!(c.nics[0].forward.len(), 2);
-    assert!(c.nics[0].host_loopback && !c.pool && !c.writable_on_read);
+    assert!(c.nics[0].host_loopback && !c.pool && !c.writable_on_read && !c.inline_gather);
+    assert!(load_file(MIN, &[]).1.unwrap().inline_gather, "inline_gather is on by default");
     assert_eq!(
         c.page_currency,
         crate::parse_page_currency("check").unwrap()

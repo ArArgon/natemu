@@ -494,6 +494,8 @@ pub struct Boot {
     pub page_currency: u64,
     /// Fault-around plan chunk 1: `Compiler::writable_on_read` (default on; `--writable-on-read` / `NATEMU_WRITABLE_ON_READ`).
     pub writable_on_read: bool,
+    /// Gather plan: `Compiler::inline_gather` (default on; `[debug] inline_gather`, `--inline-gather` / `NATEMU_INLINE_GATHER`).
+    pub inline_gather: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,
     /// PCID plan P1 (owner, November 5): turn on the resident's page-walk speculation barriers. Off by default; on, the
@@ -593,6 +595,7 @@ impl Boot {
             check_reuse: false,
             page_currency: exec::cache::PAGES_ON,
             writable_on_read: true,
+            inline_gather: true,
             code_shape: false,
             speculation_barriers: false,
             accurate_fp: false,
@@ -873,6 +876,7 @@ impl Boot {
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
             writable_on_read: self.writable_on_read,
+            inline_gather: self.inline_gather,
             code_shape: self.code_shape,
             accurate_fp: self.accurate_fp,
             ran: AtomicBool::new(false),
@@ -999,6 +1003,7 @@ impl Boot {
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
             writable_on_read: self.writable_on_read,
+            inline_gather: self.inline_gather,
             code_shape: self.code_shape,
             accurate_fp: self.accurate_fp,
             ran: AtomicBool::new(false),
@@ -1065,6 +1070,7 @@ pub struct Prepared {
     check_reuse: bool,
     page_currency: u64,
     writable_on_read: bool,
+    inline_gather: bool,
     code_shape: bool,
     accurate_fp: bool,
     /// [`Prepared::run`] has started: the backing is used.
@@ -1266,6 +1272,7 @@ impl Prepared {
             compiler.check_reuse = self.check_reuse;
             compiler.page_currency = self.page_currency;
             compiler.writable_on_read = self.writable_on_read;
+            compiler.inline_gather = self.inline_gather;
             compiler.shape = self.code_shape;
             compiler.accurate_fp = self.accurate_fp;
             compiler.report = true; // M2 task D: stop reports and the host-side progress check

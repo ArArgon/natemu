@@ -702,6 +702,11 @@ fn admit_records(
             // (M2 task 4: or the mark of a FISTP m64's integer store, an 8-byte store of a general register.)
             || (s.guest_offset2 != object::NONE32
                 && !(s.guest_offset2 == object::X87_INT64 && (s.kind, s.width, s.data_class) == (object::kind::STORE, 8, object::CLASS_GPR))
+                // (Gather plan: or the mark of an inline gather's element load, a 4- or 8-byte load into a vector register.)
+                && !(s.guest_offset2 == object::GATHER_ELEMENT
+                    && s.kind == object::kind::LOAD
+                    && matches!(s.width, 4 | 8)
+                    && s.data_class == object::CLASS_FPR)
                 && object::completion(s).is_none_or(|c| {
                     let end = s.guest_offset + u32::from(c.length);
                     let next = pcs.iter().map(|p| p.guest_offset).filter(|&g| g > s.guest_offset).min().unwrap_or(h.guest_bytes);

@@ -117,6 +117,16 @@ pub const SEG_GS: u8 = 5;
 /// FISTTP m64 that stores the integer its block's FILD m64 loaded (fexc; no [`Completion`] has these top bits). At a fault
 /// there the resident keeps that integer for the instruction's rerun ([`crate::execution::frame::X87_INT`]).
 pub const X87_INT64: u32 = 0xC000_0001;
+/// Gather plan (docs/restructure/gather-fast-path-plan.md 2.3), in the `guest_offset2` slot of a 4- or 8-byte load site with a
+/// vector data register: one element load of an AVX2 gather that runs inside the block (fexc's FexcGatherLoad, only in a
+/// `--bulk` object). Every guest-state write of the gather comes after its last element's load, so the state at the site is
+/// the state before the gather; a guest fault there, or a page that is not plain RAM, runs the gather alone (the resident's
+/// transaction gives the SDM's partial progress). No [`Completion`] has these top bits.
+pub const GATHER_ELEMENT: u32 = 0xC000_0002;
+/// Whether `site` is an element load of an inline gather ([`GATHER_ELEMENT`]).
+pub fn gather_element(site: &Site) -> bool {
+    site.guest_offset2 == GATHER_ELEMENT && site.kind == kind::LOAD
+}
 /// An [`kind::X87MAP`] record: x87 register r (its number) is the low 64 bits of host register v`reg[r]` (`NO_REG`: as the
 /// guest-state page holds it), TOP is `top` and the abridged tag byte `tags`. Numbers, not changes: applying it again
 /// changes nothing.
@@ -485,6 +495,9 @@ mod tests {
             site(kind::LOAD, 2, 0x8000_1002), // a 1-byte destination for a 2-byte access
             site(kind::STORE, 4, 0x8000_2833), // a store naming a register
             site(kind::ATOMIC, 4, 0x8000_2803),
+            site(kind::STORE, 8, X87_INT64), // the marks of the x87 integer store and of a gather's element load
+            site(kind::LOAD, 4, GATHER_ELEMENT),
+            site(kind::LOAD, 8, GATHER_ELEMENT),
             Site {
                 rmw: RMW_LOAD,
                 ..site(kind::LOAD, 4, 0x8000_2803)
@@ -492,6 +505,9 @@ mod tests {
         ] {
             assert_eq!(completion(&bad), None, "{bad:?}");
         }
+        // Gather plan: only a load site carries the element mark.
+        assert!(gather_element(&site(kind::LOAD, 4, GATHER_ELEMENT)) && gather_element(&site(kind::LOAD, 8, GATHER_ELEMENT)));
+        assert!(!gather_element(&site(kind::STORE, 4, GATHER_ELEMENT)) && !gather_element(&site(kind::LOAD, 4, X87_INT64)));
     }
 
     #[test]
