@@ -4,7 +4,8 @@ reference, KVM on the x86 machine (docs/benchmarks.md, "Web browsing"); speedome
 
     tests/bench/run_speedometer.py run --emu natemu|qemu|kvm --kernel BZIMAGE --inputs SPEEDOMETER_INPUTS --out DIR
         [--boots 3] [--iterations 5] [--vcpus 4] [--ram 4] [--cap 900]
-        [--fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--natemu-set KEY=VALUE ...]]   (natemu)
+        [--fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--compile-cache off|warm [--compile-cache-mb 8192]]
+         [--natemu-set KEY=VALUE ...]]                                                                 (natemu)
         [--qemu QEMU_SYSTEM]                                                                           (qemu)
 
 The guest is the Debian 6.12.107 kernel the other guest benchmarks boot and an initramfs: the input speedometer-inputs
@@ -21,7 +22,13 @@ iteration's score and each suite's mean time in ms. Each of BOOTS boots is one l
 holds the median of the boots' scores with their spread (min, max) and each suite's median of the boots' means. 3 boots
 of 5 iterations keep a case under about 10 minutes on an M4 (natemu about 140 s a boot, QEMU about 200 s).
 
-natemu: 4 vCPUs, 4 GiB, its translation cache off (as the other guest benchmarks); with --perf-log (the debug case,
+natemu: 4 vCPUs, 4 GiB, its translation cache off (as the other guest benchmarks): every boot translates Firefox from
+nothing. --compile-cache warm (speedometer-natemu-warm, speedometer-profile-warm) is how a desktop runs it instead, its
+translated code kept on disk from earlier sessions: natemu's persistent cache is a folder in OUT (compile-cache, its cap
+--compile-cache-mb, large enough that nothing is evicted), filled by one untimed boot of the same iterations (boot 0,
+recorded in bench.jsonl as the fill, never in the summary; it must pass too), then the BOOTS timed boots reuse it (and
+add to it, as later sessions would). The folder's packs and bytes after each boot are recorded; it is removed at the
+end. With --perf-log (the debug case,
 with the `perf` resident as --runtime) each boot writes its timing log, OUT/boot-I.perf, summarized as the Web Tooling
 profile is (guest_userland.perf_summary: buckets as shares of cpu_ns, host.translate, CR3 loads and the TLB bucket's
 cost, shadow resets, evictions, page faults, INVLPGs): a browser is many processes per vCPU, so CR3 loads matter here.
@@ -33,6 +40,7 @@ import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().par
 import argparse
 import json
 import re
+import shutil
 import signal
 import stat
 import statistics
@@ -144,23 +152,32 @@ def run(args) -> int:
     made = gu.make_initrd(args.inputs, initrd, tail())
     cmdline = f'{CMDLINE} spiter={args.iterations}'
     (args.out / 'bench.jsonl').unlink(missing_ok=True)
-    boots = []
+    boots, filled = [], None
+    cache = args.out / 'compile-cache' if args.compile_cache == 'warm' else 'off'
+    if cache != 'off' and cache.exists(): shutil.rmtree(cache)
+    first = 0 if cache != 'off' else 1
     try:
         remote = gu.boots_kvm(args, initrd, [cmdline] * args.boots, 'speedometer') if args.emu == 'kvm' else None
-        for i in range(1, args.boots + 1):
-            serial, perf = args.out / f'boot-{i}.serial', (args.out / f'boot-{i}.perf' if args.perf_log else None)
+        for i in range(first, args.boots + 1):
+            fill = i == 0
+            serial = args.out / f'boot-{i}.serial'
+            perf = args.out / f'boot-{i}.perf' if args.perf_log and not fill else None
             if remote: b = remote[i - 1]
-            elif args.emu == 'natemu': b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmdline, serial, perf), args.cap)
+            elif args.emu == 'natemu':
+                b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmdline, serial, perf, cache, args.compile_cache_mb), args.cap)
             else: b = gu.boot_local(args.out, i, gu.qemu_command(args, initrd, cmdline, serial), args.cap)
             r = parse(b.pop('text'))
-            r.update(boot=i, **b)
+            r.update(boot=i, fill=fill, **b)
+            if cache != 'off': r['compile_cache'] = gu.cache_size(cache)
             r['problems'] = problems(r, args.iterations, args.vcpus) + (['capped'] if r['capped'] else [])
             if perf:
                 r['perf'] = gu.perf_summary(perf.read_text(errors='replace')) if perf.exists() else None
                 if not r['perf']: r['problems'].append('the timing log has no vcpu lines')
-            boots.append(r)
+            if fill: filled = r
+            else: boots.append(r)
             with open(args.out / 'bench.jsonl', 'a') as f: f.write(json.dumps({'name': args.name, 'emu': args.emu, **r}) + '\n')
-            print(f'boot {i}: {r["seconds"]} s, score {r["score_text"]}' +
+            print(f'boot {i}{" (fills the compile cache, untimed)" if fill else ""}: {r["seconds"]} s, score {r["score_text"]}' +
+                  (f', compile cache {r["compile_cache"]["packs"]} packs, {r["compile_cache"]["bytes"] / 2**20:.0f} MiB' if cache != 'off' else '') +
                   (f'; problems: {"; ".join(r["problems"])}' if r['problems'] else '') +
                   (f'; page errors: {r["page_errors"][:3]}' if r['page_errors'] else '') +
                   (f'; contended by {r["contended"]}' if r['contended'] else ''), flush=True)
@@ -168,10 +185,12 @@ def run(args) -> int:
             if r['problems']: break
     finally:
         initrd.unlink(missing_ok=True)
-    ok = len(boots) == args.boots and not any(b['problems'] for b in boots)
+        if cache != 'off': shutil.rmtree(cache, ignore_errors=True)
+    ok = len(boots) == args.boots and not any(b['problems'] for b in boots) and not (filled and filled['problems'])
     result = {'name': args.name, 'emu': args.emu, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'boots': len(boots),
               'iterations': args.iterations, 'inputs': made, 'kernel': digest(args.kernel), 'pass': ok,
-              'ua': boots[0]['ua'] if boots else None, 'perf_log': args.perf_log}
+              'ua': boots[0]['ua'] if boots else None, 'perf_log': args.perf_log, 'compile_cache': args.compile_cache}
+    if filled: result['fill'] = {k: filled[k] for k in ('score', 'score_text', 'seconds', 'compile_cache', 'problems')}
     if args.emu == 'natemu': result.update(natemu=digest(args.natemu), runtime=digest(args.runtime))
     if args.emu == 'qemu': result['qemu'] = subprocess.run([str(args.qemu), '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     if args.emu == 'kvm' and boots: result['reference'] = boots[0].get('reference')
@@ -205,12 +224,16 @@ def main():
     r.add_argument('--cap', type=float, default=900, help='seconds per boot')
     r.add_argument('--fexc', type=Path); r.add_argument('--natemu', type=Path); r.add_argument('--runtime', type=Path)
     r.add_argument('--perf-log', action='store_true', help="natemu: each boot's timing log, OUT/boot-I.perf, summarized (pass a `perf` resident as --runtime)")
+    r.add_argument('--compile-cache', choices=('off', 'warm'), default='off',
+                   help="natemu: off (every boot translates from nothing) or warm (an untimed boot fills a persistent cache in OUT that the timed boots reuse)")
+    r.add_argument('--compile-cache-mb', type=int, default=8192, help='natemu, warm: the persistent cache\'s cap in MiB')
     r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
     r.add_argument('--qemu', type=Path)
     args = a.parse_args()
     if args.emu == 'natemu' and not (args.fexc and args.natemu and args.runtime): a.error('--emu natemu needs --fexc, --natemu and --runtime')
     if args.emu == 'qemu' and not args.qemu: a.error('--emu qemu needs --qemu')
     if args.perf_log and args.emu != 'natemu': a.error('--perf-log is natemu only')
+    if args.compile_cache != 'off' and args.emu != 'natemu': a.error('--compile-cache warm is natemu only')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     return run(args)
 

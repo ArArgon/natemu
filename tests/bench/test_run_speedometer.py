@@ -51,6 +51,81 @@ class Summary(unittest.TestCase):
         self.assertEqual(len(s['score_text']), 3)
 
 
+def args(out, **kw):
+    import argparse
+    a = dict(emu='natemu', name='sp', kernel=out / 'k', inputs=out / 'in', out=out / 'o', boots=3, iterations=5, vcpus=4, ram=4,
+             cap=900, fexc=out / 'fexc', natemu=out / 'natemu', runtime=out / 'rt', perf_log=False, compile_cache='off',
+             compile_cache_mb=8192, natemu_set=[], qemu=None)
+    a.update(kw)
+    return argparse.Namespace(**a)
+
+
+class CompileCache(unittest.TestCase):
+    def test_natemu_command_keeps_off_by_default_and_takes_a_folder_and_cap(self):
+        a = args(pathlib.Path('/x'))
+        off = sp.gu.natemu_command(a, 'initrd', 'cmd', 'serial')
+        self.assertEqual(off[off.index('--compile-cache') + 1], 'off')
+        self.assertNotIn('--compile-cache-mb', off)
+        self.assertNotIn('--compile-cache-mb', sp.gu.natemu_command(a, 'initrd', 'cmd', 'serial', cache_mb=64))   # no cap for off
+        on = sp.gu.natemu_command(a, 'initrd', 'cmd', 'serial', pathlib.Path('/x/cc'), cache='/x/cache', cache_mb=8192)
+        self.assertEqual(on[on.index('--compile-cache') + 1:on.index('--compile-cache') + 4], ['/x/cache', '--compile-cache-mb', '8192'])
+        self.assertEqual(on[on.index('--perf-log') + 1], pathlib.Path('/x/cc'))
+
+    def run_with(self, compile_cache, perf_log=False, fill_ok=True, boots=3):
+        """run() with the boots faked: each writes a pack into the cache folder it was given and a console with a score."""
+        import tempfile
+        from unittest import mock
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        for f in ('k', 'natemu', 'rt'): (tmp / f).write_bytes(b'x')
+        a = args(tmp, compile_cache=compile_cache, perf_log=perf_log, boots=boots)
+        seen = []
+
+        def boot(out, i, cmd, cap):
+            cache = cmd[cmd.index('--compile-cache') + 1]
+            seen.append((i, str(cache), '--perf-log' in cmd))
+            if cache != 'off':                                   # natemu makes the folder, then writes packs into it
+                pathlib.Path(cache).mkdir(parents=True, exist_ok=True); (pathlib.Path(cache) / f'{i}.pack').write_bytes(b'p')
+            text = console(score=1.0 + i) if fill_ok or i else console(done=False)
+            return {'text': text, 'seconds': 1.0, 'capped': False, 'exit': 0, 'contended': [], 'command': [str(c) for c in cmd]}
+
+        def initrd(inputs, dest, tail):
+            dest.write_bytes(b'i'); return {}
+        perf = 'vcpu ' + json.dumps({'vcpu': 0, 'cpu_ns': 10, 'resident': {'buckets': {'guest': [10, 1]}}})
+        real_boot = boot
+        def boot_perf(out, i, cmd, cap):
+            if '--perf-log' in cmd: pathlib.Path(cmd[cmd.index('--perf-log') + 1]).write_text(perf + '\n')
+            return real_boot(out, i, cmd, cap)
+        with mock.patch.object(sp.gu, 'boot_local', boot_perf), mock.patch.object(sp.gu, 'make_initrd', initrd), \
+                mock.patch('builtins.print'):
+            rc = sp.run(a)
+        return rc, seen, json.loads((a.out / 'result.json').read_text()), a.out
+
+    def test_cold_boots_with_the_cache_off(self):
+        rc, seen, r, _ = self.run_with('off')
+        self.assertEqual((rc, seen), (0, [(1, 'off', False), (2, 'off', False), (3, 'off', False)]))
+        self.assertEqual((r['score']['all'], r['compile_cache']), ([2.0, 3.0, 4.0], 'off'))
+        self.assertNotIn('fill', r)
+
+    def test_warm_fills_the_cache_untimed_then_the_timed_boots_reuse_it_and_it_is_removed(self):
+        rc, seen, r, out = self.run_with('warm')
+        cache = str(out / 'compile-cache')
+        self.assertEqual((rc, seen), (0, [(0, cache, False), (1, cache, False), (2, cache, False), (3, cache, False)]))
+        self.assertEqual(r['score']['all'], [2.0, 3.0, 4.0])                 # the fill (score 1.0) is not in the summary
+        self.assertEqual((r['fill']['score'], r['fill']['compile_cache']), (1.0, {'packs': 1, 'bytes': 1}))
+        self.assertFalse((out / 'compile-cache').exists())
+        lines = [json.loads(l) for l in (out / 'bench.jsonl').read_text().splitlines()]
+        self.assertEqual([(l['boot'], l['fill'], l['compile_cache']['packs']) for l in lines], [(0, True, 1), (1, False, 2), (2, False, 3), (3, False, 4)])
+
+    def test_the_warm_profile_logs_only_its_timed_boot(self):
+        rc, seen, r, _ = self.run_with('warm', perf_log=True, boots=1)
+        self.assertEqual([(i, p) for i, _, p in seen], [(0, False), (1, True)])
+        self.assertEqual((rc, len(r['perf']), r['perf'][0]['cpu_ns']), (0, 1, 10))
+
+    def test_a_failed_fill_fails_the_case_and_nothing_is_timed(self):
+        rc, seen, r, _ = self.run_with('warm', fill_ok=False)
+        self.assertEqual((rc, [i for i, *_ in seen], r['pass'], r['fill']['problems']), (1, [0], False, ['no results (no /done)']))
+
+
 class Tail(unittest.TestCase):
     def test_the_appended_cpio_holds_the_init_hook_server_profile_and_policies(self):
         t = sp.tail()

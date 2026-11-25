@@ -364,7 +364,10 @@ the recipe's `packages.txt`, and Speedometer at a fixed commit of its release/3.
 and the files of `tests/bench/speedometer` (the results hook, the guest's web server, Firefox's profile and policies).
 Speedometer is served from inside the guest, which has only its loopback network. `speedometer-natemu` and
 `speedometer-qemu` are natemu and the control group; `speedometer-kvm` boots the same guest under KVM on the x86 machine
-and, like `glmark2-kvm`, runs only when seeding (one at a time there, under its own lock file).
+and, like `glmark2-kvm`, runs only when seeding (one at a time there, under its own lock file). `speedometer-natemu-warm` runs Firefox as a
+desktop does, its translated code kept on disk from earlier sessions: natemu's persistent compile cache is a folder in
+the case's own, filled by one untimed boot of the same iterations, and the 3 timed boots reuse it (`--compile-cache
+warm`; the folder is removed at the end). Every other case keeps the cache off.
 
 `io5-solo32` is the 32-bit toolchain build (`tests/io/run_io5.py --i386`): in one boot of the Debian cloud image, CPython's
 `./configure` and `make -j4` by the 64-bit userland and then by a Debian i386 userland that `debootstrap` installs in the
@@ -426,6 +429,8 @@ Its suite `debug` (`tests/bench/family.toml`), 4 vCPUs, 4 GiB, the translation c
   `shadow` and `abort` each about a quarter of `cpu_ns`.
 - `speedometer-profile`: Speedometer 3.1 as the `speedometer` bench cases boot it (the same input), one boot of 5
   iterations, with its score: a browser runs many processes on each vCPU, so CR3 loads and the `tlb` bucket show here.
+- `speedometer-profile-warm`: the same with the compile cache warm, as `speedometer-natemu-warm` (one untimed boot
+  fills it, the profiled boot reuses it), so translating Firefox's own code drops out of the profile.
 
 ## Runner families
 

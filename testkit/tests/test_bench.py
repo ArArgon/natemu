@@ -384,9 +384,14 @@ def test_speedometer_and_the_debug_profiles_get_their_userlands_and_resident():
     reqs = HARNESS.requirements(fam, suites['speedometer'], None)
     assert Requirement('input', 'speedometer-inputs') in reqs and Requirement('artifact', 'qemu-system') in reqs
     debug = suites['debug']
-    assert debug.extra['tier'] == 'debug' and set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile'}
+    assert debug.extra['tier'] == 'debug'
+    assert set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile', 'speedometer-profile-warm'}
     reqs = HARNESS.requirements(fam, debug, None)
     assert {Requirement('input', 'web-tooling-inputs'), Requirement('input', 'speedometer-inputs'),
             Requirement('artifact', 'perf-runtime')} <= set(reqs)
     for spec in debug.extra['cases'].values():
         assert '{runtime_perf}' in spec['argv'] and '--perf-log' in spec['argv']
+    # Only the -warm cases keep a compile cache; every other case runs with the runner's default, off.
+    warm = {c for s in (suites['speedometer'], debug) for c, spec in s.extra['cases'].items()
+            if '--compile-cache' in spec['argv'] and spec['argv'][spec['argv'].index('--compile-cache') + 1] == 'warm'}
+    assert warm == {'speedometer-natemu-warm', 'speedometer-profile-warm'}

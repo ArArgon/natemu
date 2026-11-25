@@ -65,11 +65,21 @@ def make_initrd(inputs: Path, dest: Path, tail: bytes) -> dict:
             'versions': versions.read_text().strip().splitlines() if versions.is_file() else None}
 
 
-def natemu_command(args, initrd: Path, cmdline: str, serial: Path, perf: Path | None = None) -> list:
-    """natemu with its translation cache off (as the other guest benchmarks); `perf`: its timing log there."""
+def natemu_command(args, initrd: Path, cmdline: str, serial: Path, perf: Path | None = None,
+                   cache: Path | str = 'off', cache_mb: int | None = None) -> list:
+    """natemu with its persistent translation cache `cache`: 'off' (the default, as the other guest benchmarks: every boot
+    translates from nothing) or a folder, with `cache_mb` its cap in MiB (natemu's own default without); `perf`: its
+    timing log there."""
     return [args.natemu, '--runtime', args.runtime, '--fexc', args.fexc, '--kernel', args.kernel, '--initrd', initrd,
             '--cmdline', cmdline, '--vcpus', str(args.vcpus), '--ram', f'{args.ram}G', '--serial', serial,
-            '--compile-cache', 'off', *(['--perf-log', perf] if perf else []), *(w for kv in args.natemu_set for w in ('--set', kv))]
+            '--compile-cache', cache, *(['--compile-cache-mb', str(cache_mb)] if cache_mb and cache != 'off' else []),
+            *(['--perf-log', perf] if perf else []), *(w for kv in args.natemu_set for w in ('--set', kv))]
+
+
+def cache_size(d: Path) -> dict:
+    """A compile-cache folder's packs: how many, and their bytes."""
+    packs = list(d.glob('*.pack')) if d.is_dir() else []
+    return {'packs': len(packs), 'bytes': sum(p.stat().st_size for p in packs)}
 
 
 def qemu_command(args, initrd: Path, cmdline: str, serial: Path) -> list:
@@ -150,7 +160,8 @@ def boots_kvm(args, initrd: Path, cmdlines: list, tag: str) -> list:
 
 
 # The counters perf_summary() reports, summed over vCPUs: (section, key) of a `vcpu` line.
-COUNTERS = [('state', 'evictions'), ('state', 'shadow_resets'), ('state', 'compiles'), ('state', 'systems'),
+COUNTERS = [('state', 'evictions'), ('state', 'shadow_resets'), ('state', 'compiles'), ('state', 'disk_hits'),
+            ('state', 'systems'),
             ('k1', 'page_faults'), ('k1', 'cr3_loads'), ('k1', 'global_flushes'), ('k1', 'kept_resets'), ('k1', 'invlpgs'),
             ('k1', 'killed'), ('k1', 'tlb_us'), ('k1', 'page_fault_us'), ('k1', 'invlpg_us')]
 

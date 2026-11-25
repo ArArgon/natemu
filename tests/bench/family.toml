@@ -577,6 +577,14 @@ argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "
 argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "qemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
         "--out", "{out}", "--name", "speedometer-qemu", "--qemu", "{qemu_system}"]
 
+# speedometer-natemu-warm: as a desktop runs Firefox, its translated code kept on disk from earlier sessions: natemu's
+# persistent compile cache in the case's folder, filled by one untimed boot of the same iterations, then the 3 timed
+# boots reuse it (run_speedometer.py --compile-cache warm).
+[suite.cases.speedometer-natemu-warm]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-natemu-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "warm"]
+
 [suite.cases.speedometer-kvm]
 remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
 argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
@@ -593,6 +601,8 @@ argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "kvm", "--k
 # `shadow` and `abort` each about a quarter of cpu_ns).
 # speedometer-profile: Speedometer 3.1 as the speedometer suite's cases boot it, one boot of 5 iterations: a browser is
 # many processes per vCPU, so CR3 loads and the TLB bucket's cost show here.
+# speedometer-profile-warm: the same with the persistent compile cache warm (as speedometer-natemu-warm: one untimed
+# boot fills it, the profiled boot reuses it), so translation of Firefox's own code drops out of the profile.
 [[suite]]
 name = "debug"
 kind = "bench"
@@ -609,6 +619,11 @@ argv = ["python3", "tests/bench/run_web_tooling.py", "run", "--emu", "natemu", "
 argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
         "--out", "{out}", "--name", "speedometer-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--perf-log", "--boots", "1"]
+
+[suite.cases.speedometer-profile-warm]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-profile-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--perf-log", "--boots", "1", "--compile-cache", "warm"]
 
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
