@@ -230,7 +230,7 @@ decision read from profile cases; the census addition dropped; the kill-test's s
 
 ## 13. Findings: step 1 built (November 23, 2026)
 
-**Kill-test** (bench case `host-dispatch-micro`, `tests/bench/run_host_dispatch_micro.py`, M2 Max, run at 810bd50b; host-native,
+**Kill-test** (bench case `host-dispatch-micro`, `tests/bench/run_host_dispatch_micro.py`, at fc09a6a9, removed with step 1; M2 Max; host-native,
 mechanism only, not a guest number). Five rounds of 2^24 exits per variant and pattern, variants alternating; ns per exit, median
 (spread across rounds):
 
@@ -329,10 +329,11 @@ owner's pooled round. Earlier commits were built through `TESTKIT_BENCH_AT`. Res
 4.64; deef6f63 (step 1) 5.17; 161176fb (step 1 and bulk REP) 4.91; 0264a2b9 (every fix, return prediction off) 4.96 and 4.96.
 That is +7-12% with a noise of about 2%. `guest-luajit` read +4-6%, near its noise, and 7zip was within noise.
 
-**Diagnosis.** Two builds of da574812 (0264a2b9 plus test and switch fixes) changed only where the words lead, on the same
-case and machine, one run each:
+**Diagnosis (an experiment).** Two diagnostic builds of da574812 (0264a2b9 plus test and switch fixes) were never merged.
+They changed only where the words lead, and each ran once through the bench case `guest-luajit-interp` on the same machine.
+Their numbers are one run each from uncommitted patches: evidence for the cause, not benchmark numbers.
 
-| Build | A computed exit | Run 2 (s) | Run |
+| Build | A computed exit | Run 2 (s), one run | Run |
 | --- | --- | ---: | --- |
 | da574812 as built (0264a2b9's figure) | `b` to its words: `bl` the lookup form, `ret`, the site's own `br x1` | 4.96 | (pooled round) |
 | D2 | `b` to its words, whose first word is `b` to the slot's ordinary form: the shared `br x1` | 4.875 | 20261124-163031-5a77 |
@@ -355,8 +356,8 @@ commits):
 - the sampler's `TAIL` place and its slot-form classes;
 - pic counters 32-39;
 - the host's and the `link-check` resident's audits of the appended words;
-- the cases `indirect-sites-lc` and `indirect-stop`, run_k1's `--link-check`, and `host-dispatch-micro` (fc09a6a9; this
-  section's kill-test numbers are reproducible at 810bd50b).
+- the cases `indirect-sites-lc` and `indirect-stop`, run_k1's `--link-check`, and `host-dispatch-micro` (added in fc09a6a9, which
+  section 13's kill-test ran; running the case at fc09a6a9 repeats those numbers).
 
 **Kept:**
 - `indirect-sites` (the K1 program) and `compat32-resident-limits`' `indirect32`, as tests of indirect jumps and calls
@@ -366,8 +367,7 @@ commits):
 
 **After the revert** (`guest-luajit-interp`, M2 Max, run 2, alternating with a7cd8e82 built through `TESTKIT_BENCH_AT`, two
 rounds): reverted 4.57 and 4.58 s, a7cd8e82 4.53 and 4.59 s. Step 1's slowdown is gone. Two earlier single runs of the reverted
-tree (4.76, 4.78) came while other sessions' work held the machine between windows and did not repeat in the alternating
-rounds.
+tree (4.76, 4.78; not flagged as contended) did not repeat in the alternating rounds, and their cause is not known.
 
 A per-site branch would have to cost nothing on the predicted path before it is worth retrying. That means words in the
 hot copy, no `bl`/`ret`, and a benchmark whose shared branch mispredicts. The census's `build` and `sqlite` would be such
