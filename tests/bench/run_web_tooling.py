@@ -3,7 +3,7 @@
 resident, reporting where the time goes (docs/testing.md, "The debug tier").
 
     tests/bench/run_web_tooling.py run --emu natemu --kernel BZIMAGE --inputs WEB_TOOLING_INPUTS --out DIR
-        --fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--vcpus 4] [--ram 4] [--cap 1500]
+        --fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--sample-us N] [--vcpus 4] [--ram 4] [--cap 1500]
         [--natemu-set KEY=VALUE ...]
 
 The guest is the Debian 6.12.107 kernel the other guest benchmarks boot and an initramfs: the input web-tooling-inputs
@@ -19,6 +19,12 @@ mean as the benchmark prints them, Node's peak RSS and, from the timing log, gue
 buckets as shares of the vCPUs' busy time, host.translate and the state and K1 counters (shadow resets, evictions, page
 faults, CR3 loads, INVLPGs). OUT/report.md says the same as text. A profile, not a timing: the runs/s are those of a
 `perf` build and never go on the benchmarks page.
+
+--sample-us N (web-tooling-sample, the `perf` and `profile` resident as --runtime; implies --perf-log): natemu's EL0
+sampler every N us into OUT/NAME.samples and OUT/NAME.objects, the console's WTB-BEGIN, WTB-END and WTB-KTEXT lines
+stamped on arrival in OUT/NAME.markers.tsv (as NATEMU-BENCH-START, -END, -KTEXT: the report's boot, run1 and after phases
+and the kernel's _text), and the userland's ELF files as OUT/userland.cpio, for tests/bench/sample_report.py, which the
+case runs around this script (its --image).
 Exit 0 when every tool ran and the timing log (if asked for) has its vCPU lines; 3 when another VM ran during the
 boot (contended); 1 otherwise."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -42,11 +48,14 @@ GUEST = r'''#!/bin/sh
 B=/bin/busybox
 $B mount -t proc proc /proc; $B mount -t sysfs sys /sys; $B mount -t devtmpfs dev /dev; $B mount -t tmpfs tmp /tmp
 export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo "WTB-KTEXT $($B grep ' _text$' /proc/kallsyms | $B cut -d' ' -f1)"
 echo "WTB-BEGIN cpus=$(nproc) node=$(node --version) $(grep MemTotal /proc/meminfo | tr -s ' ')"
 { node -r /wtb/rss.js /wtb/cli.js; echo "rc=$?"; } 2>&1 | $B sed 's/^/WTB /'
 echo "WTB-END uptime=$(cut -d' ' -f1 /proc/uptime)"
 $B sync; $B poweroff -f
 '''
+# The console lines a sampled boot's markers stamp (guest_userland.Stamper): the report's phases and the kernel's _text.
+MARKS = [(r'^WTB-KTEXT ([0-9a-f]+)', r'NATEMU-BENCH-KTEXT \1'), (r'^WTB-BEGIN ', 'NATEMU-BENCH-START'), (r'^WTB-END ', 'NATEMU-BENCH-END')]
 RSS = b'// Preloaded with node -r: the peak resident set at exit.\nprocess.on("exit", () => console.log(`WTB-MAXRSS ${Math.round(process.resourceUsage().maxRSS / 1024)} MiB`));\n'
 
 
@@ -93,9 +102,13 @@ def run(args) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     initrd = args.out / 'initrd.img'
     made = gu.make_initrd(args.inputs, initrd, tail())
-    perf = args.out / f'{args.name}.perf' if args.perf_log else None
+    perf = args.out / f'{args.name}.perf' if args.perf_log or args.sample_us else None
+    sample = (args.out / args.name, args.sample_us) if args.sample_us else None
+    stamper = gu.Stamper(args.out / f'{args.name}.markers.tsv', MARKS) if sample else None
+    if sample: gu.elf_image(args.inputs / 'userland.cpio.zst', args.out / 'userland.cpio')
     try:
-        b = gu.boot_local(args.out, 1, gu.natemu_command(args, initrd, CMDLINE, args.out / 'boot-1.serial', perf), args.cap)
+        b = gu.boot_local(args.out, 1, gu.natemu_command(args, initrd, CMDLINE, args.out / 'boot-1.serial', perf, sample=sample),
+                          args.cap, stamper)
     finally:
         initrd.unlink(missing_ok=True)
     r = parse(b.pop('text'))
@@ -126,6 +139,7 @@ def main():
     r.add_argument('--inputs', type=Path, required=True, help='the web-tooling-inputs folder (testkit/inputs.py:web_tooling_inputs)')
     r.add_argument('--out', type=Path, required=True)
     r.add_argument('--perf-log', action='store_true', help="natemu's timing log, OUT/NAME.perf, summarized (pass a `perf` resident as --runtime)")
+    r.add_argument('--sample-us', type=int, help="natemu's EL0 sampler every N us (pass a `perf,profile` resident as --runtime; implies --perf-log)")
     r.add_argument('--vcpus', type=int, default=4); r.add_argument('--ram', type=int, default=4, help='GiB')
     r.add_argument('--cap', type=float, default=1500, help='seconds for the boot')
     r.add_argument('--fexc', type=Path, required=True); r.add_argument('--natemu', type=Path, required=True)

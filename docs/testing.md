@@ -316,7 +316,7 @@ tools/natemu-test run --tier bench -k guest-zstd      # one
 
 `TESTKIT_BENCH_AT=REV tools/natemu-test run --tier bench ...` measures natemu and its compiler as committed at REV
 instead of the checkout's (built from `git archive`, cached), with the same cases, kernel and image: a baseline for
-the same round. `TESTKIT_BENCH_VCPUS=4` runs the guest benchmarks at 4 vCPUs (default 1). Benchmarks keep the machine
+the same round. The profile and sampling cases' residents (`{runtime_perf}`, `{runtime_profile}`) are built at REV too. `TESTKIT_BENCH_VCPUS=4` runs the guest benchmarks at 4 vCPUs (default 1). Benchmarks keep the machine
 they always measured: a case that starts the `natemu` CLI gets `--set machine.pvpanic=false`, `--set
 machine.smbios=false` and `--set machine.ps2=false` (through its runner's `--natemu-set`), each when the build's source
 tree has that key, so an older build (a `TESTKIT_BENCH_AT` baseline, m1-perf's baseline commit) runs unchanged
@@ -431,6 +431,18 @@ Its suite `debug` (`tests/bench/family.toml`), 4 vCPUs, 4 GiB, the translation c
   iterations, with its score: a browser runs many processes on each vCPU, so CR3 loads and the `tlb` bucket show here.
 - `speedometer-profile-warm`: the same with the compile cache warm, as `speedometer-natemu-warm` (one untimed boot
   fills it, the profiled boot reuses it), so translating Firefox's own code drops out of the profile.
+- `web-tooling-sample` and `speedometer-sample`: the same workloads (one boot each) under natemu's EL0 sampler, as the
+  bench family's `-sample` cases: the resident with its `perf` and `profile` features (`{runtime_profile}`), `--profile`
+  every `{sample_us}` us, then `tests/bench/sample_report.py` with the kernel's symbols and the userland's ELF files,
+  which the runner writes as `userland.cpio` in the case folder. Its report (`NAME.report.md`) gives where the vCPUs
+  were: samples by kind and place, the top blocks and symbols, block samples by word role (FEX's body, flag words, split
+  checks and probes, dispatch slots and the rest). The phases are the boot, the benchmark (`run1`) and after, from the
+  console lines the runner stamps as they arrive. JavaScript the engines compiled at run time is in no file, so its
+  blocks stay at block level.
+
+The profile and sampling cases also summarize the resident's `host` bucket by what the vCPU thread did on the host
+(serving translation requests, writing the timing log, ports and the rest). `TESTKIT_BENCH_AT=REV` runs them with the
+profiling residents of REV too, beside REV's host and compiler.
 
 ## Runner families
 

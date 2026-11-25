@@ -7,7 +7,9 @@ this Mac or under KVM on the x86 machine (as tests/bench/run_glmark2.py does); a
 The timing log's `vcpu` lines are each vCPU's totals at exit. perf_summary() sums them over the vCPUs: `cpu_ns` (the
 vCPU threads' busy time; the resident's buckets other than `halted` add up to it), each resident bucket's time as a
 share of it (`guest`: translated guest code; `shadow`: building shadow page tables; `abort`: stage-2 and shadow aborts;
-`host`: exits to the host; `link`, `system`, `tlb` (CR3 loads and other TLB flushes), ...), the host's translation time
+`host`: exits to the host, split by what the vCPU thread did on the host meanwhile (`host_split`: its parts other than
+`run`, hv_vcpu_run itself: `translate` serving compile requests, `log` writing the timing log, `exit`, `signal`, `port`,
+`step` and the rest, and what no part accounts for, the world switches); `link`, `system`, `tlb` (CR3 loads and other TLB flushes), ...), the host's translation time
 (`host.translate`: ns and count, with its request parts (`fexc`, `admit`, `lookup`, `disk_get`, ...) and the answers by
 source: memory, the persistent compile cache on disk, fexc), and the state and K1 counters
 that show how the shadow tables fare (state.evictions, state.shadow_resets, k1.page_faults, k1.cr3_loads,
@@ -67,14 +69,40 @@ def make_initrd(inputs: Path, dest: Path, tail: bytes) -> dict:
 
 
 def natemu_command(args, initrd: Path, cmdline: str, serial: Path, perf: Path | None = None,
-                   cache: Path | str = 'off', cache_mb: int | None = None) -> list:
+                   cache: Path | str = 'off', cache_mb: int | None = None, sample: tuple | None = None) -> list:
     """natemu with its persistent translation cache `cache`: 'off' (the default, as the other guest benchmarks: every boot
     translates from nothing) or a folder, with `cache_mb` its cap in MiB (natemu's own default without); `perf`: its
-    timing log there."""
+    timing log there; `sample` (NAME, US): the EL0 sampler every US us into NAME.samples and NAME.objects (`--profile`,
+    a resident built with `perf` and `profile`), as tools/bench/run.py --sample-us."""
     return [args.natemu, '--runtime', args.runtime, '--fexc', args.fexc, '--kernel', args.kernel, '--initrd', initrd,
             '--cmdline', cmdline, '--vcpus', str(args.vcpus), '--ram', f'{args.ram}G', '--serial', serial,
             '--compile-cache', cache, *(['--compile-cache-mb', str(cache_mb)] if cache_mb and cache != 'off' else []),
-            *(['--perf-log', perf] if perf else []), *(w for kv in args.natemu_set for w in ('--set', kv))]
+            *(['--perf-log', perf] if perf else []), *(w for kv in args.natemu_set for w in ('--set', kv)),
+            *(['--profile', sample[0], '--profile-us', str(sample[1])] if sample else [])]
+
+
+def elf_image(src: Path, dest: Path) -> dict:
+    """dest: a newc cpio of the ELF files of the userland src (userland.cpio.zst), for tests/bench/sample_report.py
+    --image, which finds sampled user blocks' guest bytes in an uncompressed cpio's ELF files (sample_symbols.Image)."""
+    import tempfile
+    from sample_symbols import cpio_files, zstd_tool
+    import mmap
+    with tempfile.NamedTemporaryFile(dir=dest.parent, suffix='.cpio') as raw:
+        exe = zstd_tool()
+        if exe is None:
+            from compression import zstd
+            with zstd.open(src, 'rb') as z:
+                while chunk := z.read(1 << 24): raw.write(chunk)
+        else:
+            subprocess.run([exe, '-dc', str(src)], stdout=raw, check=True)
+        raw.flush()
+        with open(raw.name, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d, open(dest, 'wb') as out:
+            n = 0
+            for ino, (name, (off, size)) in enumerate(sorted(cpio_files(d).items()), 1):
+                if size >= 4 and d[off:off + 4] == b'\x7fELF':
+                    entry(out, ino, name, stat.S_IFREG | 0o644, d[off:off + size]); n += 1
+            entry(out, 0, 'TRAILER!!!', 0)
+    return {'files': n, 'bytes': dest.stat().st_size}
 
 
 def cache_size(d: Path) -> dict:
@@ -90,10 +118,31 @@ def qemu_command(args, initrd: Path, cmdline: str, serial: Path) -> list:
             '-append', cmdline, '-display', 'none', '-monitor', 'none', '-serial', f'file:{serial}', '-no-reboot']
 
 
-def boot_local(out: Path, i: int, cmd: list, cap: float) -> dict:
+class Stamper:
+    """Writes the console lines a sampled boot's report cuts phases at, stamped on arrival with CLOCK_UPTIME_RAW ns (the
+    samples' clock), as tools/bench/run.py's NAME.markers.tsv: `NS TAB TEXT`, TEXT being `marks`' replacement for the first
+    line each of its patterns matches (`(regex, text)`, `\\1` taking a group), so tests/bench/sample_report.py reads them
+    as NATEMU-BENCH-START, -END and -KTEXT lines."""
+
+    def __init__(self, path: Path, marks: list):
+        self.f, self.marks, self.done, self.lines = open(path, 'w'), [(re.compile(r), t) for r, t in marks], set(), 0
+
+    def feed(self, text: str, ns: int | None = None):
+        lines = text[:text.rfind('\n') + 1].splitlines()
+        ns = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) if ns is None else ns
+        for line in lines[self.lines:]:
+            for k, (rx, t) in enumerate(self.marks):
+                if k not in self.done and (m := rx.search(line)):
+                    self.done.add(k); self.f.write(f'{ns}\t{m.expand(t)}\n')
+        self.lines = len(lines); self.f.flush()
+
+    def close(self): self.f.close()
+
+
+def boot_local(out: Path, i: int, cmd: list, cap: float, stamper: Stamper | None = None) -> dict:
     """One boot on this Mac, its console in OUT/boot-I.serial (the command's --serial or -serial file:), stdout and
     stderr beside it: the console text, the seconds it took, whether it hit `cap`, its exit status and the other VMs
-    seen while it ran (contended)."""
+    seen while it ran (contended). `stamper`: fed the console as it arrives (a sampled boot's markers)."""
     serial = out / f'boot-{i}.serial'
     serial.unlink(missing_ok=True)
     before = others()
@@ -101,13 +150,19 @@ def boot_local(out: Path, i: int, cmd: list, cap: float) -> dict:
     p = subprocess.Popen([str(c) for c in cmd], stdin=subprocess.DEVNULL, stdout=open(out / f'boot-{i}.stdout', 'wb'),
                          stderr=open(out / f'boot-{i}.stderr', 'wb'), start_new_session=True)
     seen, last, capped = set(before), 0.0, False
+
+    def stamp():
+        if stamper and serial.exists(): stamper.feed(serial.read_text(errors='replace'))
     try:
         while p.poll() is None:
             if time.monotonic() - t0 > cap: capped = True; break
             time.sleep(0.25)
+            stamp()
             if time.monotonic() - last >= 0.5: seen |= set(others()); last = time.monotonic()
+        stamp()
     finally:
         if p.poll() is None: stop_group(p)
+        if stamper: stamper.close()
     return {'text': serial.read_text(errors='replace') if serial.exists() else '', 'seconds': round(time.monotonic() - t0, 2),
             'capped': capped, 'exit': p.returncode, 'contended': sorted(seen), 'command': [str(c) for c in cmd]}
 
@@ -190,9 +245,13 @@ def perf_summary(text: str) -> dict | None:
         for k, ns in v.get('parts', {}).items(): parts[k] = parts.get(k, 0) + ns
     sources = [sum(v.get('sources', [0, 0, 0])[i] for v in vcpus) for i in range(3)]
     tlb = buckets.get('tlb', [0, 0])
+    hb = buckets.get('host', [0, 0])[0]
+    parts_h = {k: ns for k, (ns, _) in sorted(host.items(), key=lambda kv: -kv[1][0]) if k != 'run' and ns}
+    split = {k: {'ns': ns, 'of_host': round(ns / hb, 4) if hb else None} for k, ns in parts_h.items()}
+    split['unaccounted'] = {'ns': hb - sum(parts_h.values()), 'of_host': round((hb - sum(parts_h.values())) / hb, 4) if hb else None}
     loads = counters['k1.cr3_loads'] + counters['k1.global_flushes']
     return {'vcpus': len(vcpus), 'cpu_ns': cpu, 'halted_ns': halted[0], 'buckets': shares,
-            'host': {k: {'ns': ns, 'count': n} for k, (ns, n) in host.items()},
+            'host': {k: {'ns': ns, 'count': n} for k, (ns, n) in host.items()}, 'host_split': split,
             'translate': {'ns': host.get('translate', [0, 0])[0], 'count': host.get('translate', [0, 0])[1],
                           'parts_ns': dict(sorted(parts.items(), key=lambda kv: -kv[1])),
                           'answers': dict(zip(('memory', 'disk', 'fexc'), sources))},
@@ -213,6 +272,9 @@ def perf_lines(s: dict | None) -> list:
     if t.get('parts_ns'):
         out.append('  parts: ' + ', '.join(f'{k} {ns / 1e9:.2f} s' for k, ns in t['parts_ns'].items() if ns >= 1e7))
         out.append('  answers: ' + ', '.join(f'{k} {n:,}' for k, n in t['answers'].items()))
+    if s.get('host_split') and 'host' in s['buckets']:
+        out.append(f'host bucket {s["buckets"]["host"]["ns"] / 1e9:.2f} s: ' +
+                   ', '.join(f'{k} {100 * (v["of_host"] or 0):.0f}%' for k, v in s['host_split'].items() if abs(v['of_host'] or 0) >= 0.005))
     c = s['cr3']
     out.append(f'CR3 loads {c["loads"]:,}: tlb bucket {c["tlb_ns"] / 1e9:.2f} s ({100 * (c["tlb_share"] or 0):.1f}% of cpu_ns)' +
                (f', {c["ns_per_flush"]:,} ns per flush' if c['ns_per_flush'] else ''))

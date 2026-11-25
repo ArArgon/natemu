@@ -55,7 +55,7 @@ def args(out, **kw):
     import argparse
     a = dict(emu='natemu', name='sp', kernel=out / 'k', inputs=out / 'in', out=out / 'o', boots=3, iterations=5, vcpus=4, ram=4,
              cap=900, fexc=out / 'fexc', natemu=out / 'natemu', runtime=out / 'rt', perf_log=False, compile_cache='off',
-             compile_cache_mb=8192, natemu_set=[], qemu=None)
+             compile_cache_mb=8192, natemu_set=[], qemu=None, sample_us=None)
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -71,30 +71,34 @@ class CompileCache(unittest.TestCase):
         self.assertEqual(on[on.index('--compile-cache') + 1:on.index('--compile-cache') + 4], ['/x/cache', '--compile-cache-mb', '8192'])
         self.assertEqual(on[on.index('--perf-log') + 1], pathlib.Path('/x/cc'))
 
-    def run_with(self, compile_cache, perf_log=False, fill_ok=True, boots=3):
+    def run_with(self, compile_cache, perf_log=False, fill_ok=True, boots=3, sample_us=None):
         """run() with the boots faked: each writes a pack into the cache folder it was given and a console with a score."""
         import tempfile
         from unittest import mock
         tmp = pathlib.Path(tempfile.mkdtemp())
         for f in ('k', 'natemu', 'rt'): (tmp / f).write_bytes(b'x')
-        a = args(tmp, compile_cache=compile_cache, perf_log=perf_log, boots=boots)
-        seen = []
+        a = args(tmp, compile_cache=compile_cache, perf_log=perf_log, boots=boots, sample_us=sample_us)
+        seen, self.cmds = [], []
 
-        def boot(out, i, cmd, cap):
+        def boot(out, i, cmd, cap, stamper=None):
+            self.cmds.append([str(c) for c in cmd])
             cache = cmd[cmd.index('--compile-cache') + 1]
             seen.append((i, str(cache), '--perf-log' in cmd))
             if cache != 'off':                                   # natemu makes the folder, then writes packs into it
                 pathlib.Path(cache).mkdir(parents=True, exist_ok=True); (pathlib.Path(cache) / f'{i}.pack').write_bytes(b'p')
             text = console(score=1.0 + i) if fill_ok or i else console(done=False)
+            if stamper:                                          # the console as it arrives: a partial line waits
+                k = 'SP-KTEXT ffffffff81000000\n'
+                stamper.feed(k + 'SP-BEGIN cpus=4 iter=5', 1); stamper.feed(k + text, 2); stamper.close()
             return {'text': text, 'seconds': 1.0, 'capped': False, 'exit': 0, 'contended': [], 'command': [str(c) for c in cmd]}
 
         def initrd(inputs, dest, tail):
             dest.write_bytes(b'i'); return {}
         perf = 'vcpu ' + json.dumps({'vcpu': 0, 'cpu_ns': 10, 'resident': {'buckets': {'guest': [10, 1]}}})
         real_boot = boot
-        def boot_perf(out, i, cmd, cap):
+        def boot_perf(out, i, cmd, cap, stamper=None):
             if '--perf-log' in cmd: pathlib.Path(cmd[cmd.index('--perf-log') + 1]).write_text(perf + '\n')
-            return real_boot(out, i, cmd, cap)
+            return real_boot(out, i, cmd, cap, stamper)
         with mock.patch.object(sp.gu, 'boot_local', boot_perf), mock.patch.object(sp.gu, 'make_initrd', initrd), \
                 mock.patch('builtins.print'):
             rc = sp.run(a)
@@ -120,6 +124,18 @@ class CompileCache(unittest.TestCase):
         rc, seen, r, _ = self.run_with('warm', perf_log=True, boots=1)
         self.assertEqual([(i, p) for i, _, p in seen], [(0, False), (1, True)])
         self.assertEqual((rc, len(r['perf']), r['perf'][0]['cpu_ns']), (0, 1, 10))
+
+    def test_a_sampled_boot_gets_the_sampler_its_markers_and_the_elf_image(self):
+        from unittest import mock
+        made = []
+        with mock.patch.object(sp.gu, 'elf_image', lambda src, dest: made.append((src.name, dest.name))):
+            rc, seen, r, out = self.run_with('off', perf_log=True, boots=1, sample_us=250)
+        self.assertEqual((rc, made), (0, [('userland.cpio.zst', 'userland.cpio')]))
+        cmd = self.cmds[0]
+        self.assertEqual(cmd[cmd.index('--profile'):cmd.index('--profile') + 4], ['--profile', str(out / 'sp'), '--profile-us', '250'])
+        self.assertIn('--perf-log', cmd)
+        marks = [l.split('\t')[1] for l in (out / 'sp.markers.tsv').read_text().splitlines()]
+        self.assertEqual(marks, ['NATEMU-BENCH-KTEXT ffffffff81000000', 'NATEMU-BENCH-START', 'NATEMU-BENCH-END'])
 
     def test_a_failed_fill_fails_the_case_and_nothing_is_timed(self):
         rc, seen, r, _ = self.run_with('warm', fill_ok=False)

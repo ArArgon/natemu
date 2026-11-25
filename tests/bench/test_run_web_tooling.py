@@ -34,9 +34,9 @@ class Parse(unittest.TestCase):
 
 
 def vcpu(i, cpu, shadow, abort, halted, resets, cr3, tlb):
-    return 'vcpu ' + json.dumps({'vcpu': i, 'cpu_ns': cpu, 'host': {'translate': [1000 * (i + 1), 2], 'run': [5, 1]},
+    return 'vcpu ' + json.dumps({'vcpu': i, 'cpu_ns': cpu, 'host': {'translate': [100 * (i + 1), 2], 'run': [5, 1], 'log': [10, 1], 'port': [0, 0]},
                                  'parts': {'fexc': 600 * (i + 1), 'admit': 100}, 'sources': [1, i, 1],
-                                 'resident': {'buckets': {'guest': [cpu - shadow - abort - tlb, 10], 'shadow': [shadow, 4],
+                                 'resident': {'buckets': {'guest': [cpu - shadow - abort - tlb - 200, 10], 'host': [200, 2], 'shadow': [shadow, 4],
                                                           'abort': [abort, 3], 'tlb': [tlb, cr3], 'halted': [halted, 1]}},
                                  'k1': {'cr3_loads': cr3, 'global_flushes': 0, 'invlpgs': 7, 'page_faults': 9},
                                  'state': {'evictions': 5, 'shadow_resets': resets}})
@@ -48,20 +48,63 @@ class PerfSummary(unittest.TestCase):
                          vcpu(1, 3000, 750, 690, 1000, 300, 6, 60), 'pool {"published":1}', 'mark destroyed 3']) + '\n'
         s = gu.perf_summary(log)
         self.assertEqual((s['vcpus'], s['cpu_ns'], s['halted_ns']), (2, 4000, 10000))
-        self.assertEqual(list(s['buckets']), ['guest', 'shadow', 'abort', 'tlb'])           # largest first, no halted
+        self.assertEqual(list(s['buckets']), ['guest', 'shadow', 'abort', 'host', 'tlb'])   # largest first, no halted
         self.assertEqual((s['buckets']['shadow']['ns'], s['buckets']['shadow']['share'], s['buckets']['abort']['share']), (1000, 0.25, 0.23))
-        self.assertEqual(s['translate'], {'ns': 3000, 'count': 4, 'parts_ns': {'fexc': 1800, 'admit': 200},
+        self.assertEqual(s['translate'], {'ns': 300, 'count': 4, 'parts_ns': {'fexc': 1800, 'admit': 200},
                                           'answers': {'memory': 2, 'disk': 1, 'fexc': 2}})
         self.assertEqual({k: s['counters'][k] for k in ('state.shadow_resets', 'state.evictions', 'k1.page_faults', 'k1.cr3_loads', 'k1.invlpgs')},
                          {'state.shadow_resets': 400, 'state.evictions': 10, 'k1.page_faults': 18, 'k1.cr3_loads': 10, 'k1.invlpgs': 14})
         self.assertEqual(s['cr3'], {'loads': 10, 'tlb_ns': 80, 'tlb_share': 0.02, 'ns_per_flush': 8})
+        # The host bucket (400 ns over both vCPUs) by what the vCPU thread did on the host: no `run`, no empty part.
+        self.assertEqual(s['host_split'], {'translate': {'ns': 300, 'of_host': 0.75}, 'log': {'ns': 20, 'of_host': 0.05},
+                                           'unaccounted': {'ns': 80, 'of_host': 0.2}})
         text = '\n'.join(gu.perf_lines(s))
         self.assertIn('shadow        25.0%', text)
+        self.assertIn('host bucket 0.00 s: translate 75%, log 5%, unaccounted 20%', text)
         self.assertIn('CR3 loads 10', text)
 
     def test_a_log_without_vcpu_lines_has_no_summary(self):
         self.assertIsNone(gu.perf_summary('mark main 1\nsnap 2 0\n'))
         self.assertIn('no vcpu lines', gu.perf_lines(None)[0])
+
+
+class Sampling(unittest.TestCase):
+    def test_the_stamper_marks_each_pattern_once_and_waits_for_a_whole_line(self):
+        import tempfile
+        f = pathlib.Path(tempfile.mkdtemp()) / 'm.tsv'
+        st = gu.Stamper(f, w.MARKS)
+        st.feed('boot\nWTB-KTEXT ffffffff81000000\nWTB-BEG', 5)
+        st.feed('boot\nWTB-KTEXT ffffffff81000000\nWTB-BEGIN cpus=4\nWTB acorn: 1 runs/s\n', 7)
+        st.feed('boot\nWTB-KTEXT ffffffff81000000\nWTB-BEGIN cpus=4\nWTB acorn: 1 runs/s\nWTB-END uptime=1\nWTB-END uptime=2\n', 9)
+        st.close()
+        self.assertEqual(f.read_text(), '5\tNATEMU-BENCH-KTEXT ffffffff81000000\n7\tNATEMU-BENCH-START\n9\tNATEMU-BENCH-END\n')
+        import sample_report, sample_symbols
+        self.assertEqual(sample_symbols.ktext(f), (0xffffffff81000000, None))
+        self.assertEqual([n for n, *_ in sample_report.marker_windows(sample_report.read_markers(f), 20)], ['boot', 'run1', 'after'])
+
+    def test_natemu_command_samples_only_when_asked(self):
+        import argparse
+        a = argparse.Namespace(natemu='n', runtime='r', fexc='f', kernel='k', vcpus=4, ram=4, natemu_set=[])
+        self.assertNotIn('--profile', gu.natemu_command(a, 'i', 'c', 's'))
+        cmd = gu.natemu_command(a, 'i', 'c', 's', 'p', sample=('o/x', 250))
+        self.assertEqual(cmd[-4:], ['--profile', 'o/x', '--profile-us', '250'])
+
+    def test_the_elf_image_holds_the_userlands_elf_files_only(self):
+        import io, stat, tempfile
+        from compression import zstd
+        from play.mkcpio import entry
+        d = pathlib.Path(tempfile.mkdtemp())
+        raw = io.BytesIO()
+        for ino, (name, data) in enumerate([('usr/bin/node', b'\x7fELF' + b'n' * 60), ('etc/passwd', b'root:x:0:0\n'),
+                                            ('usr/lib/libxul.so', b'\x7fELF' + b'x' * 9)], 1):
+            entry(raw, ino, name, stat.S_IFREG | 0o755, data)
+        entry(raw, 0, 'TRAILER!!!', 0)
+        (d / 'userland.cpio.zst').write_bytes(zstd.compress(raw.getvalue()))
+        got = gu.elf_image(d / 'userland.cpio.zst', d / 'userland.cpio')
+        import sample_symbols
+        files = sample_symbols.cpio_files((d / 'userland.cpio').read_bytes())
+        self.assertEqual((got['files'], sorted(files)), (2, ['usr/bin/node', 'usr/lib/libxul.so']))
+        self.assertEqual(list(d.glob('*.cpio')), [d / 'userland.cpio'])      # the decompressed copy is gone
 
 
 class Tail(unittest.TestCase):

@@ -385,13 +385,38 @@ def test_speedometer_and_the_debug_profiles_get_their_userlands_and_resident():
     assert Requirement('input', 'speedometer-inputs') in reqs and Requirement('artifact', 'qemu-system') in reqs
     debug = suites['debug']
     assert debug.extra['tier'] == 'debug'
-    assert set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile', 'speedometer-profile-warm'}
+    assert set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile', 'speedometer-profile-warm',
+                                         'web-tooling-sample', 'speedometer-sample'}
     reqs = HARNESS.requirements(fam, debug, None)
     assert {Requirement('input', 'web-tooling-inputs'), Requirement('input', 'speedometer-inputs'),
             Requirement('artifact', 'perf-runtime')} <= set(reqs)
-    for spec in debug.extra['cases'].values():
-        assert '{runtime_perf}' in spec['argv'] and '--perf-log' in spec['argv']
+    assert {Requirement('artifact', 'profile-runtime'), Requirement('input', 'kernel-symbols')} <= set(reqs)
+    for name, spec in debug.extra['cases'].items():
+        if name.endswith('-sample'):        # the EL0 sampler, reported by sample_report.py around the runner
+            a = spec['argv']
+            assert a[:2] == ['python3', 'tests/bench/sample_report.py'] and '{runtime_profile}' in a and '{sample_us}' in a, name
+            assert a[a.index('--image') + 1] == '{out}/userland.cpio' and a[a.index('--profile') + 1] == '{out}/' + name, name
+        else:
+            assert '{runtime_perf}' in spec['argv'] and '--perf-log' in spec['argv']
     # Only the -warm cases keep a compile cache; every other case runs with the runner's default, off.
     warm = {c for s in (suites['speedometer'], debug) for c, spec in s.extra['cases'].items()
             if '--compile-cache' in spec['argv'] and spec['argv'][spec['argv'].index('--compile-cache') + 1] == 'warm'}
     assert warm == {'speedometer-natemu-warm', 'speedometer-profile-warm'}
+
+
+def test_a_bench_at_round_runs_the_profiling_residents_of_its_revision(monkeypatch, tmp_path):
+    """TESTKIT_BENCH_AT: {runtime_perf} and {runtime_profile} are the revision's residents (artifacts.runtime_at), as
+    its host and fexc; without it, this checkout's."""
+    from types import SimpleNamespace
+    from testkit.harness import bench
+    from testkit import resources
+    monkeypatch.setattr(artifacts, 'perf_runtime', lambda: tmp_path / 'perf-here')
+    monkeypatch.setattr(artifacts, 'profile_runtime', lambda: tmp_path / 'profile-here')
+    monkeypatch.setattr(artifacts, 'runtime_at', lambda rev, kind: tmp_path / f'{kind}-at-{rev}')
+    monkeypatch.setattr(resources, 'fetch', lambda name: tmp_path / name)
+    n = SimpleNamespace(stub='n', runtime='r', host='h', entry='e')
+    spec = {'argv': ['x', '{runtime_perf}', '{runtime_profile}']}
+    here = bench.HARNESS._values(spec, tmp_path, n, 'f', None)
+    at = bench.HARNESS._values(spec, tmp_path, n, 'f', None, rev='0c962ff4')
+    assert (here['runtime_perf'], here['runtime_profile']) == (tmp_path / 'perf-here', tmp_path / 'profile-here')
+    assert (at['runtime_perf'], at['runtime_profile']) == (tmp_path / 'perf-runtime-at-0c962ff4', tmp_path / 'profile-runtime-at-0c962ff4')

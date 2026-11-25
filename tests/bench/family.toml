@@ -625,6 +625,25 @@ argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "
         "--out", "{out}", "--name", "speedometer-profile-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--perf-log", "--boots", "1", "--compile-cache", "warm"]
 
+# web-tooling-sample, speedometer-sample: where the vCPUs were, from natemu's EL0 sampler, as the guest-*-sample cases:
+# the resident with `perf` and `profile` ({runtime_profile}), natemu --profile every {sample_us} us, the timing log, then
+# tests/bench/sample_report.py (kinds, places, top blocks, word roles, FEX's body, flag words, split checks, dispatch
+# slots, the top symbols: the kernel's from {kernel_symbols}, the user's from the userland's ELF files, which the runner
+# writes as OUT/userland.cpio). One boot each; the phases boot, run1 (the benchmark) and after from the console.
+[suite.cases.web-tooling-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/web-tooling-sample", "--markers", "{out}/web-tooling-sample.markers.tsv",
+        "--perf", "{out}/web-tooling-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{out}/userland.cpio",
+        "--", "python3", "tests/bench/run_web_tooling.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{web_tooling_inputs}",
+        "--out", "{out}", "--name", "web-tooling-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--sample-us", "{sample_us}"]
+
+[suite.cases.speedometer-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/speedometer-sample", "--markers", "{out}/speedometer-sample.markers.tsv",
+        "--perf", "{out}/boot-1.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{out}/userland.cpio",
+        "--", "python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--boots", "1", "--sample-us", "{sample_us}"]
+
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
 # (tests/bench/plugins/indirect.c, artifacts.census_plugin). Counts per guest instruction, not timings: a case claims cores

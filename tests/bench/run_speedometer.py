@@ -4,7 +4,7 @@ reference, KVM on the x86 machine (docs/benchmarks.md, "Web browsing"); speedome
 
     tests/bench/run_speedometer.py run --emu natemu|qemu|kvm --kernel BZIMAGE --inputs SPEEDOMETER_INPUTS --out DIR
         [--boots 3] [--iterations 5] [--vcpus 4] [--ram 4] [--cap 900]
-        [--fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--compile-cache off|warm [--compile-cache-mb 8192]]
+        [--fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--sample-us N] [--compile-cache off|warm [--compile-cache-mb 8192]]
          [--natemu-set KEY=VALUE ...]]                                                                 (natemu)
         [--qemu QEMU_SYSTEM]                                                                           (qemu)
 
@@ -32,6 +32,10 @@ end. With --perf-log (the debug case,
 with the `perf` resident as --runtime) each boot writes its timing log, OUT/boot-I.perf, summarized as the Web Tooling
 profile is (guest_userland.perf_summary: buckets as shares of cpu_ns, host.translate, CR3 loads and the TLB bucket's
 cost, shadow resets, evictions, page faults, INVLPGs): a browser is many processes per vCPU, so CR3 loads matter here.
+--sample-us N (speedometer-sample, one boot, the `perf` and `profile` resident; implies --perf-log): natemu's EL0 sampler
+every N us into OUT/NAME.samples and OUT/NAME.objects, the console's SP-KTEXT, SP-BEGIN and results lines stamped in
+OUT/NAME.markers.tsv (NATEMU-BENCH-KTEXT, -START, -END) and the userland's ELF files as OUT/userland.cpio, for
+tests/bench/sample_report.py, which the case runs around this script, as run_web_tooling.py --sample-us.
 QEMU: the pinned qemu-system-x86_64, TCG thread=multi, the other guest benchmarks' board and CPU model. kvm: the x86
 machine NATEMU_X86_HOST boots the same kernel and initramfs under KVM, the same CPU model (guest_userland.boots_kvm).
 Exit 0 when every boot finished every iteration; 3 when another VM ran during a boot (contended: not comparable); 1
@@ -71,6 +75,7 @@ export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin MOZ_HEADLESS=1 MOZ_CRASHREP
 iter=$($B sed -n 's/.*spiter=\([0-9]*\).*/\1/p' /proc/cmdline)
 $B sed -i 's|<script src="resources/main.mjs" type="module"></script>|<script src="hook.js"></script>&|' /sp/index.html
 $B grep -q '<script src="hook.js"></script><script src="resources/main.mjs"' /sp/index.html || echo "SP-NO-HOOK"
+echo "SP-KTEXT $($B grep ' _text$' /proc/kallsyms | $B cut -d' ' -f1)"
 echo "SP-BEGIN cpus=$(nproc) iter=$iter $(grep MemTotal /proc/meminfo | tr -s ' ')"
 $B mkdir -p /tmp/prof && $B cp /sp-harness/user.js /tmp/prof/user.js
 python3 /sp-harness/serve.py & SRV=$!
@@ -86,6 +91,10 @@ echo "SP-END uptime=$(cut -d' ' -f1 /proc/uptime)"
 $B sed 's/^/SP-FF /' /tmp/ff.log | $B tail -40
 $B kill $FF 2>/dev/null; $B sync; $B poweroff -f
 '''
+
+
+# The console lines a sampled boot's markers stamp (guest_userland.Stamper): the report's phases and the kernel's _text.
+MARKS = [(r'^SP-KTEXT ([0-9a-f]+)', r'NATEMU-BENCH-KTEXT \1'), (r'^SP-BEGIN ', 'NATEMU-BENCH-START'), (r'^SP /done ', 'NATEMU-BENCH-END')]
 
 
 def tail() -> bytes:
@@ -156,15 +165,19 @@ def run(args) -> int:
     cache = args.out / 'compile-cache' if args.compile_cache == 'warm' else 'off'
     if cache != 'off' and cache.exists(): shutil.rmtree(cache)
     first = 0 if cache != 'off' else 1
+    if args.sample_us: gu.elf_image(args.inputs / 'userland.cpio.zst', args.out / 'userland.cpio')
     try:
         remote = gu.boots_kvm(args, initrd, [cmdline] * args.boots, 'speedometer') if args.emu == 'kvm' else None
         for i in range(first, args.boots + 1):
             fill = i == 0
             serial = args.out / f'boot-{i}.serial'
             perf = args.out / f'boot-{i}.perf' if args.perf_log and not fill else None
+            sample = (args.out / args.name, args.sample_us) if args.sample_us and not fill else None
+            stamper = gu.Stamper(args.out / f'{args.name}.markers.tsv', MARKS) if sample else None
             if remote: b = remote[i - 1]
             elif args.emu == 'natemu':
-                b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmdline, serial, perf, cache, args.compile_cache_mb), args.cap)
+                b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmdline, serial, perf, cache, args.compile_cache_mb, sample),
+                                  args.cap, stamper)
             else: b = gu.boot_local(args.out, i, gu.qemu_command(args, initrd, cmdline, serial), args.cap)
             r = parse(b.pop('text'))
             r.update(boot=i, fill=fill, **b)
@@ -224,6 +237,7 @@ def main():
     r.add_argument('--cap', type=float, default=900, help='seconds per boot')
     r.add_argument('--fexc', type=Path); r.add_argument('--natemu', type=Path); r.add_argument('--runtime', type=Path)
     r.add_argument('--perf-log', action='store_true', help="natemu: each boot's timing log, OUT/boot-I.perf, summarized (pass a `perf` resident as --runtime)")
+    r.add_argument('--sample-us', type=int, help="natemu, one boot: the EL0 sampler every N us (pass a `perf,profile` resident as --runtime; implies --perf-log)")
     r.add_argument('--compile-cache', choices=('off', 'warm'), default='off',
                    help="natemu: off (every boot translates from nothing) or warm (an untimed boot fills a persistent cache in OUT that the timed boots reuse)")
     r.add_argument('--compile-cache-mb', type=int, default=8192, help='natemu, warm: the persistent cache\'s cap in MiB')
@@ -234,6 +248,9 @@ def main():
     if args.emu == 'qemu' and not args.qemu: a.error('--emu qemu needs --qemu')
     if args.perf_log and args.emu != 'natemu': a.error('--perf-log is natemu only')
     if args.compile_cache != 'off' and args.emu != 'natemu': a.error('--compile-cache warm is natemu only')
+    if args.sample_us is not None:
+        if args.emu != 'natemu' or args.sample_us < 1 or args.boots != 1: a.error('--sample-us N: natemu only, N at least 1, --boots 1')
+        args.perf_log = True
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     return run(args)
 

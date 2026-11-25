@@ -191,6 +191,43 @@ def natemu_at(rev: str) -> Natemu:
     return n
 
 
+RUNTIME_FEATURES = {'perf-runtime': 'perf', 'profile-runtime': 'perf,profile'}
+
+
+def runtime_at(rev: str, kind: str) -> pathlib.Path:
+    """perf_runtime() or profile_runtime() (`kind` 'perf-runtime' or 'profile-runtime') as committed at `rev`, built as
+    natemu_at() builds its binaries, from `git archive REV` in a scratch folder: a TESTKIT_BENCH_AT round's profile and
+    sampling cases run a resident of the same revision as its host. Keyed by the commit's tree and the features."""
+    features = RUNTIME_FEATURES[kind]
+    r = subprocess.run(['git', '-C', str(paths.repo_root()), 'rev-parse', '--verify', '--quiet', f'{rev}^{{tree}}'],
+                       capture_output=True, text=True)
+    if r.returncode: raise BuildFailure(f'{kind}@{rev}', 'no such revision in this repository')
+    tree = r.stdout.strip()
+    if p := _pinned(f'{kind}-at:{tree}'): return pathlib.Path(p)
+    k = cache.key('natemu-runtime-at-v1', tree, features, *CARGO)
+    root = paths.repo_root()
+    rel = 'aarch64-unknown-none/release/natemu-runtime'
+
+    def build(out: pathlib.Path):
+        scratch = paths.cache_root() / 'build-tmp' / f'{kind}-at-{tree[:12]}-{os.getpid()}'
+        shutil.rmtree(scratch, ignore_errors=True); (scratch / 'src').mkdir(parents=True)
+        try:
+            arc = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar', tree], capture_output=True)
+            if arc.returncode: raise BuildFailure(f'{kind}@{rev}', arc.stderr.decode(errors='replace')[-800:])
+            subprocess.run(['tar', '-x', '-C', str(scratch / 'src')], input=arc.stdout, check=True)
+            env = dict(os.environ, CARGO_TARGET_DIR=str(scratch / 'target'))
+            _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=scratch / 'src', env=env)
+            _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', features], cwd=scratch / 'src', env=env)
+            cache.clone(scratch / 'target' / rel, out / 'natemu-runtime')
+            (out / 'source.txt').write_text(f'git archive of {rev} (tree {tree}), features {features}\n')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    f = cache.get_or_build(f'natemu-{kind}-at', k, build) / 'natemu-runtime'
+    pin_for_run(f'{kind}-at:{tree}', str(f))
+    return f
+
+
 def fexc() -> pathlib.Path:
     """The fexc compiler at the committed FEX pin, built by tools/fexc/build.sh in a scratch folder; only the binary is
     kept."""

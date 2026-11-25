@@ -12,6 +12,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {runtime_perf}      the resident built with its `perf` feature (artifacts.perf_runtime), for profile cases
     {runtime_profile}   the resident built with its `perf` and `profile` features (artifacts.profile_runtime), for
                         sampling cases (the EL0 sampler: `--sample-us`)
+                        (both at the revision of a TESTKIT_BENCH_AT round, as its host and fexc: artifacts.runtime_at)
     {sample_us}         the sampling cases' interval in us: SAMPLE_US, or TESTKIT_SAMPLE_US for one run
     {natemu_entry}      this checkout's natemu build folder, laid out like cargo's target folder (artifacts.natemu)
     {natemu_baseline}   the same for the case's `baseline` revision (artifacts.natemu_at)
@@ -201,13 +202,15 @@ class Bench:
     def _subst(self, s, d):
         return s.format(**d)
 
-    def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False, platform=()) -> dict:
+    def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False, platform=(), rev=None) -> dict:
         vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host, 'vcpus': os.environ.get(VCPUS_ENV, '1'), 'sample_us': os.environ.get(SAMPLE_US_ENV, SAMPLE_US),
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry
-        if _uses(spec, 'runtime_perf'): vals['runtime_perf'] = artifacts.perf_runtime()
-        if _uses(spec, 'runtime_profile'): vals['runtime_profile'] = artifacts.profile_runtime()
+        # A TESTKIT_BENCH_AT round (`rev`) runs the profiling residents of that revision too, beside its host.
+        if _uses(spec, 'runtime_perf'): vals['runtime_perf'] = artifacts.runtime_at(rev, 'perf-runtime') if rev else artifacts.perf_runtime()
+        if _uses(spec, 'runtime_profile'):
+            vals['runtime_profile'] = artifacts.runtime_at(rev, 'profile-runtime') if rev else artifacts.profile_runtime()
         if _uses(spec, 'natemu_baseline'): vals['natemu_baseline'] = artifacts.natemu_at(spec['baseline']).entry
         if _uses(spec, 'qemu_system'): vals['qemu_system'] = artifacts.qemu_system() / 'qemu-system-x86_64'
         if _uses(spec, 'qemu_img'): vals['qemu_img'] = artifacts.qemu_system() / 'qemu-img'
@@ -258,7 +261,7 @@ class Bench:
                 sf.write_text(json.dumps(sess))
             else:
                 fresh = bool(config and config.getoption('fresh'))
-            vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh, platform)
+            vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh, platform, rev)
             where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:

@@ -111,6 +111,39 @@ def test_natemu_at_builds_from_the_archive(tmp_path, monkeypatch):
     assert artifacts.natemu_at(b) == n            # pinned for the run: the same build without rebuilding
 
 
+def test_runtime_at_builds_the_profiling_resident_of_the_revision(tmp_path, monkeypatch):
+    """runtime_at: the `perf` or `perf,profile` resident from `git archive REV` (never the worktree), keyed by the tree and
+    the features (the same tree is one build, another kind another), the scratch folder removed."""
+    repo = tmp_path / 'repo'; repo.mkdir()
+    a, b, c = _repo_with_same_tree_twice(repo)
+    (repo / 'crates' / 'a.rs').write_text('uncommitted\n')
+    monkeypatch.setattr(paths, 'repo_root', lambda: repo)
+    monkeypatch.setattr(paths, 'cache_root', lambda: tmp_path / 'cache')
+    monkeypatch.delenv('TESTKIT_ARTIFACTS', raising=False)
+    monkeypatch.setattr(artifacts, 'pin_for_run', lambda *x: None)
+    calls, built = [], {}
+    def run(cmd, **kw):
+        cmd = [str(x) for x in cmd]; calls.append(cmd)
+        if 'build' in cmd:
+            assert pathlib.Path(kw['cwd'], 'crates/a.rs').read_text() != 'uncommitted\n'      # the commit's, not the worktree's
+            t = pathlib.Path(kw['env']['CARGO_TARGET_DIR']) / 'aarch64-unknown-none/release/natemu-runtime'
+            t.parent.mkdir(parents=True, exist_ok=True); t.write_text(cmd[cmd.index('--features') + 1])
+    def get_or_build(kind, k, build, **kw):
+        if (kind, k) not in built:
+            out = tmp_path / 'entry' / k; out.mkdir(parents=True); build(out); built[(kind, k)] = out
+        return built[(kind, k)]
+    monkeypatch.setattr(artifacts, '_run', run)
+    monkeypatch.setattr(artifacts.cache, 'get_or_build', get_or_build)
+    perf_a, perf_b = artifacts.runtime_at(a, 'perf-runtime'), artifacts.runtime_at(b, 'perf-runtime')
+    prof = artifacts.runtime_at(a, 'profile-runtime')
+    assert perf_a == perf_b and perf_a.read_text() == 'perf' and prof.read_text() == 'perf,profile' and prof != perf_a
+    assert artifacts.runtime_at(c, 'perf-runtime') != perf_a
+    assert len([c for c in calls if 'build' in c]) == 3
+    assert not any((tmp_path / 'cache' / 'build-tmp').glob('*-at-*'))
+    with pytest.raises(artifacts.BuildFailure, match='no such revision'):
+        artifacts.runtime_at('0' * 40, 'perf-runtime')
+
+
 SECRET = 's3cr3t-token-value'
 
 
