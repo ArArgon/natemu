@@ -159,6 +159,10 @@ the floating-point mode, which hardware speed-ups it uses, and where it caches t
 A launch can also be described in a TOML file (`--config FILE`), which adds several disks and
 read-only disks; see [docs/configuration.md](docs/configuration.md).
 
+natemu can also give the guest a simple screen (`[display] device = "bochs"` in that file). There is no window yet: a
+program on the Mac asks natemu for a picture of the screen, as a PNG, through its control socket; see
+[docs/control-api.md](docs/control-api.md).
+
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
 2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error. If the guest's Linux kernel has its pvpanic driver
 (Debian's kernels load it), a kernel panic ends the run at once with status 2; without the driver the panic leaves the

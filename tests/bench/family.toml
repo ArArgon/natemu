@@ -379,3 +379,22 @@ argv = ["python3", "tools/bench/smp/smp.py", "mixed-cost", "--out", "{out}", "--
 [suite.cases.mixed-far-qemu]
 argv = ["python3", "tools/bench/smp/smp.py", "mixed-cost", "--out", "{out}"]
 env = { NATEMU_QEMU_SYSTEM = "{qemu_system}" }
+
+# Bochs display plan Task 4: kms_pattern (tests/devices/kms_pattern.c) copies 1 GiB of full 1024 x 768 frames into the
+# mapped framebuffer and the same into guest RAM (the in-guest reference: the ratio shows the framebuffer runs at RAM
+# speed), then natemu's runner takes 100 PNG snapshots through the control socket (mean time each). The control group:
+# QEMU's bochs-display (TCG) on the same Mac, the same guest and program. tests/devices/run_display.py bench.
+[[suite]]
+name = "display"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 1800 }
+
+[suite.cases.display-fill]
+argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "natemu", "--inputs", "{display_inputs}", "--out", "{out}",
+        "--natemu", "{natemu}", "--runtime", "{runtime}", "--fexc", "{fexc}"]
+
+[suite.cases.display-fill-qemu]
+argv = ["python3", "tests/devices/run_display.py", "bench", "--emu", "qemu", "--inputs", "{display_inputs}", "--out", "{out}",
+        "--qemu", "{qemu_system}"]

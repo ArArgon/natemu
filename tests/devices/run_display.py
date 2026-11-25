@@ -31,15 +31,17 @@ Cases (each ends with `quit`: `stopped: cancelled`, `natemu: Cancelled`, exit st
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse
 import dataclasses
+import json
 import mmap
 import os
 from pathlib import Path
 import re
 import subprocess
+import time
+import types
 
-import png                      # pypng (testkit/requirements.lock)
 from control_client import Control, RpcError
-from io_common import VM_LOCK
+from io_common import VM_LOCK, stop_group
 import run_control
 from run_control import Run
 from run_platform import KVER, stopped
@@ -128,7 +130,19 @@ case_display_off() {
   idle
 }
 
+# display-bench (bench case display-fill): kms_pattern bench BYTES at the EDID's mode, then held for the snapshots.
+case_display_bench() {
+  modprobe bochs || fail modprobe-bochs
+  wait_for /dev/dri/card0
+  bytes=
+  for item in $(cat /proc/cmdline); do case "$item" in bench_bytes=*) bytes=${item#*=};; esac; done
+  /@KMS_PATTERN@ bench "$bytes" || fail "kms_pattern bench exited ($?)"
+  echo BENCH-DONE
+  idle
+}
+
 case "$name" in
+  display-bench) case_display_bench;;
   display) case_display;;
   display-boot-console) case_display_boot_console;;
   display-off) case_display_off;;
@@ -294,6 +308,7 @@ def answer(call):
 
 def snapshot_png(d: Driver, vm: Control, name: str) -> bytes:
     """A snapshot, written to the case's output folder as `name`; its RGB pixels."""
+    import png                  # pypng (testkit/requirements.lock); here, so the bench (system python3) needs none
     width, height, data = vm.snapshot(timeout=60)
     (d.out / name).write_bytes(data)
     w, h, rows, _ = png.Reader(bytes=data).asRGB8()
@@ -365,10 +380,68 @@ def prepare(args):
 
 
 def run(args):
+    import png
     return run_control.run(args, CASES, boot, (png,))
 
 
-# ---------------------------------------------------------------- self-check
+# ---------------------------------------------------------------- bench (tests/bench/family.toml display-fill)
+
+QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip'   # tools/bench/run.py's
+BENCH_SECONDS = 600
+
+
+def bench_line(serial: str) -> dict:
+    m = re.search(r'^BENCH bytes=(\d+) frame=(\d+)x(\d+) vram_ns=(\d+) ram_ns=(\d+)$', serial, re.M)
+    if not m: raise RuntimeError('no BENCH line from kms_pattern')
+    b, w, h, vram, ram = map(int, m.groups())
+    return {'bytes': b, 'frame': [w, h], 'vram_s': vram / 1e9, 'ram_s': ram / 1e9,
+            'vram_gib_s': b / 2**30 / (vram / 1e9), 'ram_gib_s': b / 2**30 / (ram / 1e9), 'vram_over_ram': vram / ram}
+
+
+def bench(args):
+    """kms_pattern bench under natemu (then `snapshots` PNG snapshots through the socket, timed) or QEMU's bochs-display
+    (TCG, the control group); bench.json in --out (the bench harness makes the folder)."""
+    args.out.mkdir(parents=True, exist_ok=True)
+    words = f'display_case=display-bench bench_bytes={args.bytes}'
+    if args.emu == 'natemu':
+        def drive(d: Driver):
+            vm = d.connect()
+            d.until('BENCH-DONE', BENCH_SECONDS)
+            times = []
+            for _ in range(args.snapshots):
+                t = time.monotonic(); width, height, data = vm.snapshot(timeout=60); times.append(time.monotonic() - t)
+            d.control['snapshot'] = {'count': len(times), 'mean_ms': 1000 * sum(times) / len(times), 'size': [width, height],
+                                     'png_bytes': len(data)}
+            d.quit(vm)
+        args.case, args.vcpus = 'display-bench', 1
+        work = args.out / 'natemu'; work.mkdir()
+        r = run_control.boot(args, 'display-bench', work, {'display-bench': types.SimpleNamespace(judge=None, drive=drive, words=(f'bench_bytes={args.bytes}',))}, 'display.cpio',
+                             'display_case', lambda sock, serial, process: Driver(sock, serial, process, args.out))
+        if r.control.get('error'): raise RuntimeError(r.control['error'])
+        result = dict(bench_line(r.serial), snapshot=r.control['snapshot'])
+    else:
+        serial = args.out / 'serial.log'
+        cmd = [str(args.qemu), '-nodefaults', '-machine', 'pc,hpet=off,vmport=off', '-accel', 'tcg,thread=multi', '-cpu', QCPU,
+               '-m', '2048', '-smp', '1', '-kernel', str(args.inputs / 'linux'), '-initrd', str(args.inputs / 'display.cpio'),
+               '-append', f'{CMDLINE} {words}', '-device', 'bochs-display', '-display', 'none', '-monitor', 'none',
+               '-serial', f'file:{serial}', '-no-reboot']
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=(args.out / 'stderr.log').open('wb'),
+                             start_new_session=True)
+        end = time.monotonic() + BENCH_SECONDS
+        try:
+            while p.poll() is None and time.monotonic() < end:
+                if serial.exists() and re.search(r'^(BENCH-DONE|DISPLAY-FAIL)', serial.read_text(errors='replace'), re.M): break
+                time.sleep(0.2)
+        finally:
+            stop_group(p)
+        result = bench_line(serial.read_text(errors='replace').replace('\r', '') if serial.exists() else '')
+    result.update(emu=args.emu, bytes_asked=args.bytes)
+    (args.out / 'bench.json').write_text(json.dumps(result, indent=1) + '\n')
+    print(json.dumps(result), flush=True)
+    return 0
+
+
+
 
 def self_check():
     subprocess.run(['sh', '-n'], input=INIT, text=True, check=True)
@@ -503,7 +576,16 @@ def main():
     runner.add_argument('--set', action='append', default=[], metavar='KEY=VALUE', help="passed to the natemu CLI's --set")
     runner.add_argument('--vcpus', type=int, default=1)
     sub.add_parser('self-check')
+    b = sub.add_parser('bench')
+    b.add_argument('--emu', choices=('natemu', 'qemu'), required=True)
+    for name in ('inputs', 'out'): b.add_argument('--' + name, type=Path, required=True)
+    for name in ('natemu', 'runtime', 'fexc', 'qemu'): b.add_argument('--' + name, type=Path)
+    b.add_argument('--bytes', type=int, default=1 << 30)
+    b.add_argument('--snapshots', type=int, default=100)
+    b.add_argument('--natemu-set', dest='set', action='append', default=['display.device=bochs'], metavar='KEY=VALUE',
+                   help="natemu's --set (the bench harness adds the platform devices off)")
     args = parser.parse_args()
+    if args.command == 'bench': return bench(args)
     if args.command == 'prepare': return prepare(args)
     if args.command == 'self-check': return self_check()
     return run(args)
