@@ -68,8 +68,14 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 - The region set is fixed at launch (which functions have mapped BARs and their sizes); only bases and enables change
   at run time; at most 8 regions, total at most the PCI window's 256 MiB.
 - **No cost on RAM paths:** every audited site tests RAM first and consults the region table only for a page that is
-  not RAM; RAM installs do not read the table; the remap trigger is one load of `seq` per port or device exit without regions (`seq` 0 at the start means none, ever), two with (before the request and once it is answered); split locks run as before. Tasks 2
-  and 3 each end with an A/B (below) that shows no benchmark moves beyond its noise.
+  not RAM; RAM installs do not read the table. What the RAM paths do pay: the interpreter's once-per-instruction load of
+  `seq` at its first check (`Mem::log`); the `shadow_generation` snapshot and compare kept in `split`, `vector_aligned`
+  and `wrapped_load` (a register compare; the `any` over the classes runs only when the generation moved); and
+  `translate`'s non-RAM path, which now runs the APIC and ROM tests and one `seq` load before the device path. The remap
+  trigger is one load of `seq` per port or device exit without regions (`seq` 0 at the start means none, ever), two
+  with (before the request and once it is answered); split locks run as before. The branch ends with one A/B (Step 4b,
+  below): base against tip, judged against the noise the Task 2 and Task 3 experiments measured on the M4, so no
+  benchmark moves beyond its noise.
 - The host never waits for a vCPU inside a device handler (`devices.rs` contract): the remap wait runs in the
   resident, as the split-lock owner's does.
 - Rust unit tests run in the framework as one unit (the `rust/all` item of `tests/unit/family.toml`; the implementer
@@ -253,7 +259,7 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 
 | File | Responsibility |
 | --- | --- |
-| `crates/abi/src/execution.rs`, `crates/abi/src/lib.rs` | `MappedRegions` (global area), `MAPPED_VA` and its assert |
+| `crates/abi/src/execution.rs` | `MappedRegions` (global area), `MAPPED_VA` and its assert |
 | `crates/host/src/pci/memory.rs` (new) | `DeviceMemory` |
 | `crates/host/src/pci/mod.rs` | mapped BAR requests, publishing on effective decode changes |
 | `crates/host/src/linux.rs`, `crates/host/src/vm.rs`, `crates/host/src/memory.rs`, `crates/host/src/execution.rs` | `Prepared` carries regions; `Machine::create` maps them and sizes the IPA; the alias span; report counters |
@@ -269,7 +275,7 @@ Vol. 3A chapter 12 (memory types: the stated deviation below).
 
 ### Task 1: host allocation, VM mapping and the region table
 
-**Files:** create `crates/host/src/pci/memory.rs`; modify `crates/abi/src/execution.rs`, `crates/abi/src/lib.rs`,
+**Files:** create `crates/host/src/pci/memory.rs`; modify `crates/abi/src/execution.rs`,
 `crates/host/src/vm.rs`, `crates/host/src/memory.rs`, `crates/host/src/execution.rs`, `crates/host/src/linux.rs`.
 
 **Interfaces:** `DeviceMemory::new(len: u64) -> Result<Arc<DeviceMemory>>`, `read_words`, `write_words`,

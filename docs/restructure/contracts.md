@@ -540,9 +540,12 @@ with a typed stop where it cannot be, and never reachable at a base it has left.
 - Memory type (stated deviation): a mapped page runs natively whatever its PAT/MTRR type (RAM honours UC/WT/WP by
   stepping); device memory has no side effects, so the results are the same. Enforced by: `mapped-uc` (a UC mapping:
   zero device accesses, `mapped_installs` > 0); `mapped-bar` maps the region UC through `/dev/mem` with `O_SYNC`.
-- The remap rule: the host publishes the table (seqlock, one writer) only from a device handler running in a vCPU's
-  port or device exit (the PCI bus's configuration writes, on each effective decode change of a mapped BAR: memory
-  decoding and the BAR wholly inside the window; a size probe disables it); the resident compares the table's `seq`
+- The remap rule: the host publishes the table (seqlock, one writer) before any vCPU runs (at launch: `Backing::machine`
+  writes every region's disabled entry, and run-program writes its enabled ones) and afterwards only from a device
+  handler running in a vCPU's port or device exit: the PCI bus's configuration writes, on each effective decode change
+  of a mapped BAR (memory decoding and the BAR wholly inside the window; a size probe disables it), and the driver
+  test device's `MOVE` write. A VM without regions never publishes (`seq` stays 0), so its resident makes a single
+  `seq` load per exit, no second one, and sets no flag; the resident compares the table's `seq`
   across every port and device exit and, when it moved, runs `cache::remap_shootdown` (every peer holding shadows resets,
   halted ones before they next run guest code) and resets its own shadows before the guest resumes. Installs set their
   holding flag before reading the table. After the shootdown no vCPU holds a shadow built from the old table: the old
