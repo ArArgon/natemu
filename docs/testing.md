@@ -347,6 +347,14 @@ holding the machine for only its own run, so other work runs in between; all pie
 in the machine's state folder, a rerun measures only what is missing (`--fresh` starts over), and the piece that finds
 nothing left reports the verdict.
 
+The `glmark2` suite is OpenGL rendered by the CPU (`tests/bench/run_glmark2.py`): glmark2 on Mesa's llvmpipe under Xvfb,
+ten 5-second scenes, 4 vCPUs, 5 boots and the median per scene. Its guest userland is the input `glmark2-inputs`
+(`{glmark2_inputs}`), built from `tools/bench/glmark2` in the amd64 builder from a fixed snapshot.debian.org date, its
+package list pinned by the recipe's `packages.txt`. `glmark2-natemu` and `glmark2-qemu` let llvmpipe use AVX2,
+`-sse41` holds it to SSE4.1; `glmark2-kvm` and `glmark2-kvm-sse41` boot the same guest under KVM on the x86 machine and,
+like `io5-solo32-reference`, run only with `TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host` (one at a time there:
+they share a lock file on that machine).
+
 `io5-solo32` is the 32-bit toolchain build (`tests/io/run_io5.py --i386`): in one boot of the Debian cloud image, CPython's
 `./configure` and `make -j4` by the 64-bit userland and then by a Debian i386 userland that `debootstrap` installs in the
 guest, whose python must give the x86 reference machine's answers (a pinned hash). `io5-solo32-qemu` is the same under

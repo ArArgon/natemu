@@ -233,3 +233,8 @@ glmark2 with llvmpipe's AVX2 scores 432 against 191 before (texture 21 -> 952 FP
 jellyfish 3 -> 100, effect2d 7 -> 365); held to SSE4.1, 560 against 543 before (no gathers: unchanged within its noise). A
 profile of the texture and blur scenes with the new compiler moved the resident's `system` bucket from 77.8 s to 1.0 s;
 the rest is translated code. The numbers stay an experiment until a bench case measures them.
+
+**Measured** (bench case `glmark2-natemu`, M4, 5 boots each, November 25, 2026): the glmark2 score 280 at e38ae98c
+(`TESTKIT_BENCH_AT`) against 554 at 79fbd75e, texture 43 -> 1163 FPS, desktop blur 2 -> 73; `glmark2-natemu-sse41` 860
+against 858, within its noise. The per-scene A/B is in the commit message that added the numbers to
+[benchmarks.md](../benchmarks.md#opengl-on-the-cpu-llvmpipe).

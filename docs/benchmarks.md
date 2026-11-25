@@ -9,6 +9,7 @@ natemu compared with QEMU TCG, both running the same x86 Linux guest on the same
 | 64-bit, the 1-vCPU items with the CPython configure and build (4 vCPUs), 14 items | **5.2×** |
 | 32-bit programs, 8 items, 1 vCPU (the CPython build at 4) | **5.1×** (geometric mean; 0.97× to 83×; **4.1×** without the x87 builds) |
 | Context-switch-heavy Debian workload (cloud image), 4 vCPUs, November 14 | **1.7×** |
+| OpenGL on the CPU (glmark2 on llvmpipe), 4 vCPUs, the glmark2 score | **15×** (AVX2); **23×** (SSE4.1) |
 
 32-bit and 64-bit code are summarised separately. A program measured in several builds or kernels (c-ray's builds,
 SciMark's five kernels) counts as one item, the geometric mean of its ratios. At 4 vCPUs the c-ray item is `cray`
@@ -28,7 +29,8 @@ much, is in the commit messages and the pages of the work that moved it.
 - **Host:** Apple M4 (4 performance cores, 16 GiB), macOS 26. Each case ran alone on the machine, with no other VM.
 - **natemu:** each table names its commit: 3b13c1d0 (November 24, 2026) for the 64-bit and 32-bit programs and the
   display, 9f35eb96 (November 22, 2026) for the CPython builds and Paper, 670fab60 (November 23, 2026) for the 32-bit
-  segment cases. At 3b13c1d0 the CPython-build, Paper and segment cases measured within their noise of the numbers shown.
+  segment cases. At 3b13c1d0 the CPython-build, Paper and segment cases measured within their noise of the numbers shown. 79fbd75e
+  (November 25, 2026, branch `gather-fast-path`) for OpenGL on the CPU.
 - **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`, on the same M4. Its CPU model is matched to the
   features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9 of 10 tests we
   compared, so it is not used. Its numbers are older than natemu's; each table says when they were measured.
@@ -277,6 +279,45 @@ run:
 | a 1024 x 768 snapshot | 4.6 ms | |
 
 The pattern's PNG is 27 KB; a busier picture compresses less and takes longer to encode.
+
+## OpenGL on the CPU (llvmpipe)
+
+glmark2 2023.01, a widely used OpenGL benchmark, drawn by Mesa 25.0.7's llvmpipe: OpenGL rendered entirely by the CPU,
+the way a Linux desktop draws when it has no graphics card (a GNOME desktop on natemu's display does). llvmpipe turns
+each shader into x86 vector code with LLVM and spreads the frame over the vCPUs. glmark2 draws off-screen at 800 x 600
+under Xvfb (an X server without a screen), ten of its scenes for 5 seconds each, and reports each scene's frames per
+second and a score, the mean of the scenes' FPS. By default llvmpipe uses AVX2 (256-bit vectors; it fetches texture
+pixels with AVX2's gather instructions); the SSE4.1 columns hold it to SSE4.1 (`GALLIUM_OVERRIDE_CPU_CAPS=sse4.1`,
+128-bit vectors, no gathers). The guest checks llvmpipe's vector width each boot, and the first boot also runs glmark2's
+own check of the pictures (`--validate`), which passes on every scene that has one.
+
+Bench cases `glmark2-natemu` and `glmark2-natemu-sse41` (4 vCPUs, 4 GiB, translation cache off); Apple M4; natemu
+79fbd75e; November 25, 2026. QEMU 11.1.2 on the same M4 (TCG, the CPU model of the other guest benchmarks): cases
+`glmark2-qemu` and `glmark2-qemu-sse41`, the same day. Real x86: cases `glmark2-kvm` and `glmark2-kvm-sse41`, the same
+kernel and initramfs under KVM on the Ryzen with the same CPU model, the same day. FPS, higher is better, the median of
+5 boots:
+
+| Scene | natemu, AVX2 | natemu, SSE4.1 | QEMU, AVX2 | QEMU, SSE4.1 | real x86, AVX2 | real x86, SSE4.1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `build` (geometry, vertex buffers) | 694 | 907 | 54 | 52 | 1311 | 1136 |
+| `texture` (linear filtering) | 1163 | 1970 | 93 | 95 | 2342 | 2055 |
+| `shading` (Phong) | 310 | 525 | 21 | 21 | 687 | 541 |
+| `bump` (normal maps) | 1184 | 1879 | 80 | 77 | 2107 | 1840 |
+| `effect2d` (3 x 3 convolution) | 453 | 791 | 19 | 18 | 1344 | 979 |
+| `pulsar` (blending) | 774 | 1209 | 58 | 53 | 1635 | 1358 |
+| `desktop` (blurred windows) | 73 | 136 | 6 | 7 | 213 | 169 |
+| `jellyfish` | 148 | 254 | 11 | 12 | 342 | 282 |
+| `refract` | 26 | 37 | 2 | 2 | 47 | 42 |
+| `conditionals` (shader branches) | 740 | 919 | 50 | 44 | 1063 | 932 |
+| **score** | **554** | **858** | **38** | **37** | **1109** | **931** |
+
+natemu's 5 scores were 542 to 576 (AVX2) and 855 to 881 (SSE4.1); QEMU's 33 to 42 and 36 to 40; real x86's 1104 to 1117
+and 925 to 947. The first boot is a little faster in the first scene because its validation run has already translated
+glmark2's start-up; the median is not affected.
+
+With SSE4.1 natemu reaches 92% of the real x86 machine's score; with AVX2 50%, and below its own SSE4.1 score, while
+real x86 gains 19% from AVX2. natemu runs each 256-bit AVX2 operation as two 128-bit halves, so AVX2 brings it little
+here, and its gathers, now run inside the translated code, are still a load per element.
 
 ## CPU vulnerability mitigations
 
