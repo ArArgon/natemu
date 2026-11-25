@@ -1,7 +1,7 @@
 # M2: running 32-bit code — design notes
 
 Discussion record of November 19, 2026, between the owner and the main session, with an independent read-only verifier
-checking the code. Nothing here is built.
+checking the code. Status, November 23, 2026: Part 1 is built through checkpoint C ([findings](m2-checkpoint-c-findings.md)); task 6 is deferred; Part 2 is built ([its plan](m2-boot-interpreter-plan.md)). The rest of this page is the design as discussed.
 
 The page has two parts with different standing:
 
@@ -429,7 +429,7 @@ D. **Diagnostics first (owner: yes, better for diagnostics).** Today a Linux boo
    [checkpoint C plan](m2-checkpoint-c-plan.md) defines the order and acceptance cases.
 
    **Checkpoint C, mixed 32/64 in one process:** what the roadmap's far-transfer item asks for, and what Windows' 32-bit
-   layer will need later.
+   layer will need later. Built (November 23, 2026): [findings](m2-checkpoint-c-findings.md).
 6. **Non-flat default 32-bit segments (deferred):** translated code adds the base of a non-flat
    default segment on every access and checks its limit, with the segment shape in the code identity; about 15-23
    agent hours. The trigger to start it is a workload that needs it (Win16 under Wine, DOS emulators). 16-bit code
@@ -454,7 +454,7 @@ waiting for the VM test queue comes on top. "Bugs" rows are the least certain: t
 | Checkpoint A: bugs from real programs (static, dynamic, threads, signals, x87) | 10-25 | **77-148** |
 | 4. Speed (stack check 3-6; cast fix 5-11; SYSENTER fast path 5-8; measuring 3-5) | 16-30 | 93-178 |
 | Checkpoint B: bugs from the toolchain build, the QEMU comparison | 8-20 | **101-198** |
-| 5. Segments done properly | 12-20 | **113-218** (checkpoint C) |
+| 5. Segments done properly: mixed 32/64-bit code and FS/GS limits. **Built** ([findings](m2-checkpoint-c-findings.md)) | 12-20 | **113-218** (checkpoint C) |
 | 6. Non-flat segments (deferred, starts on demand) | 15-23 | 128-241 |
 | Part 2 (not pinned) | 60-90, probably optimistic | |
 

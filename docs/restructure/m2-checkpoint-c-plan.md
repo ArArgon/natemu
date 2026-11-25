@@ -3,6 +3,9 @@
 Implementation plan for checkpoint C of [the M2 design](m2-32bit-design.md). The owner added FS and GS limits to
 checkpoint C. This plan covers 32-bit user code under the existing 64-bit kernel and four-level page tables.
 
+**Built** (November 23, 2026, natemu 670fab60 on `m2-checkpoint-c`). Each part below has an "As built" list; [the
+findings](m2-checkpoint-c-findings.md) say what came out of it, with the tests and the benchmark rounds.
+
 ## Behavior
 
 One process can switch between flat 32-bit and 64-bit code in both directions using far JMP, CALL and RET.
@@ -110,7 +113,7 @@ stop being a correctness premise.
 - A mixed process: each far transfer between the modes switches roots, the cost of a privilege change's switch
   (three `isb` and three register writes), on a path that already goes through the resident. Pages below 4 GiB used
   from both modes take a TLB entry under each ASID. This round-trip cost is known and accepted; it is not measured
-  (no bench case thunks between modes).
+  on its own (bench case `mixed-far-natemu` times the whole far transfer, [the findings](m2-checkpoint-c-findings.md)).
 - Memory: three table pages per vCPU from a pool of 288.
 
 **What folds again** (FEX's lowering as on `main`): a displacement of -16383 to 16383 on a base register, on
@@ -189,8 +192,8 @@ with these notes.
   (shown by inserting a jump there: 24 translations for 23).
 - FXSAVE, XSAVE, FNSAVE and m80 past 4 GiB were already exact: the resident's handlers test the operand's extent
   (`operand_range(..).outside`, `xsave.rs`, `x87.rs`), and `c32` has `fxsave-limit`. Nothing was built.
-- Not measured yet: the A/B against `main` (bench cases `io5-solo`, `io5-solo32`, `guest-hackbench32`,
-  `guest-hackbench32-int80`, `guest-startup32`, `guest-sqlite32`, M4) follows the code review.
+- Measured after the code review: [the findings](m2-checkpoint-c-findings.md#performance) give the A/B rounds against
+  `main`.
 
 ## 2. Enforce FS and GS limits at the point of access
 
@@ -813,10 +816,11 @@ Use that pin when preparing the first slice.
 
 Built on branch `m2-checkpoint-c` (natemu and the FEX fork): section 1, section 3, the resident rule of section 2,
 and [the generic FS/GS operand check](#generated-code-one-generic-check-and-two-identity-bits), which replaced the
-per-opcode checks built first (the inventory below is the record of that state). [The form inventory](m2-checkpoint-c-fs-gs-forms.md) lists every
-previously admitted form and says which are checked and which remain open; checkpoint C needs all of them.
-[The inline A/B note](m2-checkpoint-c-inline-ab.md) is the one measurement so far, an experiment on an M3.
-The checkpoint gate and the benchmark round of "Execution and acceptance" step 4 have not run.
+per-opcode checks built first. [The form inventory](m2-checkpoint-c-fs-gs-forms.md) is the record of that earlier
+state; the generic check covers every form it lists as open.
+[The inline A/B note](m2-checkpoint-c-inline-ab.md) is an experiment on an M3. The benchmark round of "Execution and
+acceptance" step 4 ran on the M4 on November 23, 2026; it and the checkpoint gate are recorded in [the
+findings](m2-checkpoint-c-findings.md).
 
 ## Review
 

@@ -27,6 +27,9 @@ much, is in the commit messages and the pages of the work that moved it.
 
 - **Host:** Apple M4 (4 performance cores, 16 GiB), macOS 26. Each case ran alone on the machine, with no other VM.
 - **natemu:** 9f35eb96, measured November 22, 2026, in every natemu column below unless a table says otherwise.
+  Checkpoint C of the 32-bit work (natemu 670fab60) did not move them: three alternating rounds against 035b243e on the
+  M4 found no difference beyond the noise in `guest-zstd`, `guest-luajit`, `guest-mem`, `guest-7zip`, `guest-hackbench`,
+  `guest-hackbench32` and `guest-paper`.
 - **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`, on the same M4. Its CPU model is matched to the
   features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9 of 10 tests we
   compared, so it is not used. Its numbers are older than natemu's; each table says when they were measured.
@@ -186,6 +189,55 @@ The i386 steps come this close to the 64-bit ones because natemu reuses translat
 addresses, shares it between processes, and walks only current blocks on a page fault ([32-bit
 reuse](restructure/m2-reuse32-findings.md), [sharing](restructure/m2-pic32-findings.md), [page-fault
 chains](restructure/m2-pfchain-findings.md)).
+
+## 32-bit code: FS and GS accesses, and switching modes
+
+Two small timing programs for the parts of 32-bit support that no stock program above exercises. Neither boots Linux:
+the framework's test driver starts a few hundred bytes of x86 code directly in a natemu VM with 1 vCPU, and checks the
+program's final memory before it records a time. Neither runs on natemu builds before checkpoint C of the 32-bit work
+(they fault), so there are no older natemu numbers, and QEMU has not been measured on them.
+
+**FS and GS accesses** (bench case `compat-tls-natemu`). 32-bit programs reach their thread's private data through the
+FS or GS segment register. Linux gives that segment a base address and the full 4 GiB limit; Windows gives its FS
+segment a 4 KiB limit, so every access through it must be checked against the limit. A warmed 32-bit loop reads and
+writes the same eight words through each kind of segment in turn:
+
+- **flat DS:** the ordinary data segment, base 0, nothing to add or check: the baseline.
+- **FS, 4 GiB limit:** the shape Linux uses for thread data. natemu adds the base and compiles no check.
+- **FS or GS, 4 KiB limit:** every instruction's operand is checked against the limit inside the translated code.
+
+The dword loop is a load and a store per word; the mixed loop is five other instruction forms per word (increment and
+add to memory, compare with a constant, a byte load, an SSE load). Each is timed by the guest's clock over 800,000
+accesses (2,000,000 for the mixed loop), the median of 3 samples. The loop's accesses overlap in the processor, so these
+are averages per access, not the time one access takes.
+
+Bench case `compat-tls-natemu`; Apple M4; natemu 670fab60; November 23, 2026. Nanoseconds per access, lower is better:
+
+| Loop | flat DS | FS, 4 GiB limit | FS, 4 KiB limit | GS, 4 KiB limit |
+| --- | ---: | ---: | ---: | ---: |
+| dword load and store | 0.173 | 0.179 | 0.564 | 0.557 |
+| mixed forms | 0.219 | 0.254 | 0.626 | not run |
+
+Checking the limit costs about 0.4 ns per access. Through Linux's 4 GiB FS, which compiles to the same
+code as on main (no check, the base added from the loaded segment), the dword loop is level with flat DS and the mixed
+loop about 15% slower, beyond the samples' spread: that is the base addition, not the limit check. A read-only or expand-down FS or GS segment (no known program uses one) is
+checked by natemu's in-VM runtime on every access instead, which is far slower; [the checkpoint C
+findings](restructure/m2-checkpoint-c-findings.md#performance) say by how much.
+
+**Switching between 32-bit and 64-bit code** (bench case `mixed-far-natemu`). One process loops between 64-bit and
+32-bit code, as Windows' 32-bit layer does to make system calls. Each iteration makes four far transfers (a far CALL
+from 64-bit into 32-bit code, one from there back into 64-bit code, and the two far RETs) and runs a dozen ordinary
+instructions. It is timed on the host as the difference between 1 and 2 million iterations, so start-up and translation
+drop out; the median of 3 such pairs.
+
+Bench case `mixed-far-natemu`; Apple M4; natemu 670fab60; November 23, 2026:
+
+| | Time |
+| --- | ---: |
+| One iteration (4 far transfers) | 1,813 ns |
+| Per far transfer, at most | about 450 ns |
+
+The three pairs read 1,793 to 1,823 ns per iteration.
 
 ## Paper (Minecraft server) start
 

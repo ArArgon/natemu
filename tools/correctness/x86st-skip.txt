@@ -11,5 +11,7 @@
 #   sigreturn_64, sysret_ss_attrs_64, single_step_syscall_64, syscall_arg_fault_64
 #                           entering compatibility mode at CPL 3 is contained (docs/restructure/correctness-nostop.md,
 #                           section 1; runtime segments.rs refuse_compatibility): the transfer takes #GP and the process
-#                           gets SIGSEGV, the machine keeps running. sigreturn_64 and sysret_ss_attrs_64 then fail
-#                           (exit 139) and are `expected`; the other two recover in their signal handlers and pass.
+#                           gets SIGSEGV, the machine keeps running. sigreturn_64 then fails (exit 139, its sigreturn
+#                           into a 16-bit code segment) and is `expected`; sysret_ss_attrs_64 passes since M2
+#                           checkpoint C (far transfers between 32- and 64-bit code); the other two recover in their
+#                           signal handlers and pass.
