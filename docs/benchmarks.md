@@ -371,6 +371,14 @@ real x86). Each suite's time per iteration, in ms (lower is better; the median o
 | `React-Stockcharts-SVG` | 956 | 1275 | 1.3× | 103 |
 | `Perf-Dashboard` | 687 | 1635 | 2.4× | 132 |
 
+**With the translation cache warm** (bench case `speedometer-natemu-warm`, the same M4, commit cc1d42b7 with the same
+natemu, the same day): natemu keeps its translated code on disk across boots, as a desktop keeps it across sessions.
+One untimed boot fills the cache, then 3 timed boots reuse it. The score is **2.13** (2.04 to 2.15), below the cold
+2.33. The debug tier's `speedometer-profile-warm` shows why: about half of the blocks natemu would compile are found
+in the cache, but reading and checking a cached block costs nearly as much as compiling it, and each boot still writes
+about 800 MiB of code it has not seen before to the cache (most likely what Firefox's JavaScript compiler wrote that
+run).
+
 A browser runs JavaScript compiled by its own JIT, in several processes per vCPU, so natemu translates a stream of
 freshly written code and switches address spaces often; its lead over QEMU is far smaller here than on the compiled
 programs above. The debug tier's `speedometer-profile` ([testing](testing.md#the-debug-tier)) shows where natemu's
