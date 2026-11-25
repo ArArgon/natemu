@@ -210,22 +210,21 @@ Bench case `guest-paper`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds,
 The Bochs display (`[display] device = "bochs"`): the guest's `bochs` DRM driver sets the 1024 x 768 mode, and
 `kms_pattern bench` (`tests/devices/kms_pattern.c`) copies 1 GiB of full frames into the framebuffer through the dumb
 buffer's own mapping, then the same amount into a buffer in guest RAM. The framebuffer is mapped device memory, so the
-guest writes it natively: it runs at the speed of RAM. Under natemu the runner then takes 100 PNG snapshots of the
-picture through the control socket (`snapshot`: the copy, the PNG and the base64 JSON line, as a client sees it). The
-control group is QEMU's `bochs-display` on the same Mac (TCG), the same guest and program. 1 vCPU, 2 GiB, one run each
-(`tests/devices/run_display.py bench`).
+guest writes it natively: it runs at the speed of RAM. Then the program holds the pattern on the screen, and under
+natemu the runner takes 100 PNG snapshots of it through the control socket (`snapshot`, timed as a client sees it: the
+copy, the PNG, the base64 JSON line and the client's decoding). The control group is QEMU's `bochs-display` on the same
+Mac (TCG), the same guest and program. 1 vCPU, 2 GiB, one run each (`tests/devices/run_display.py bench`).
 
-Bench cases `display-fill` and `display-fill-qemu`; Apple M4; natemu b3d206bb; November 24, 2026:
+Bench cases `display-fill` and `display-fill-qemu`; Apple M4; natemu 45bdaa88; November 24, 2026:
 
 | | natemu | QEMU |
 | --- | ---: | ---: |
-| 1 GiB into the framebuffer | 0.053 s (18.9 GiB/s) | 0.279 s (3.6 GiB/s) |
-| 1 GiB into guest RAM | 0.053 s (19.0 GiB/s) | 0.276 s (3.6 GiB/s) |
-| framebuffer / RAM | 1.00 | 1.01 |
-| a 1024 x 768 snapshot | 2.4 ms | |
+| 1 GiB into the framebuffer | 0.057 s (17.5 GiB/s) | 0.301 s (3.3 GiB/s) |
+| 1 GiB into guest RAM | 0.053 s (18.7 GiB/s) | 0.289 s (3.5 GiB/s) |
+| framebuffer / RAM | 1.07 | 1.04 |
+| a 1024 x 768 snapshot | 4.6 ms | |
 
-The snapshot's PNG is small (4 KB) because the test pattern is regular; a busier picture compresses less and takes
-longer to encode.
+The pattern's PNG is 27 KB; a busier picture compresses less and takes longer to encode.
 
 ## CPU vulnerability mitigations
 
