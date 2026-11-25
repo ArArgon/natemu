@@ -979,8 +979,9 @@ impl Boot {
 /// A loaded VM, ready to run.
 pub struct Prepared {
     backing: Backing,
-    /// Mapped device memory, in creation order (a mapped BAR's request order): the VM maps each above the backing and
-    /// every window aliases it at `MAPPED_VA` (`vm::mapping_plan`). Empty: none, the default launch.
+    /// Mapped device memory, in the region table's order (the bus's (slot, function, BAR) order, `pci::Mapped::regions`):
+    /// the VM maps each above the backing and every window aliases it at `MAPPED_VA` (`vm::mapping_plan`). Empty: none,
+    /// the default launch.
     mapped: Vec<Arc<crate::pci::DeviceMemory>>,
     /// The bus's publishes of mapped BARs ([`crate::pci::Mapped::publishes`]).
     mapped_publishes: Arc<std::sync::atomic::AtomicU64>,

@@ -375,10 +375,11 @@ le_bytes() {
   while test "$n" -gt 0; do out="$out\\$(printf %03o $((v & 255)))"; v=$((v >> 8)); n=$((n - 1)); done
   printf "$out"
 }
-cfg_write() { le_bytes "$4" "$3" | busybox dd of="$1/config" bs="$3" seek=$(($2 / $3)) count=1 conv=notrunc 2>/dev/null || fail "config write $2"; }
+# The configuration writes run pinned to CPU 0, the probe on the last CPU: at 2 vCPUs the writing vCPU is never the probe's.
+cfg_write() { le_bytes "$4" "$3" | busybox taskset 1 busybox dd of="$1/config" bs="$3" seek=$(($2 / $3)) count=1 conv=notrunc 2>/dev/null || fail "config write $2"; }
 region_digest() { { /@MAPPED_TOOL@ o "$1" @MAPPED_REGION_HEX@ || echo "tool exit $?"; } | busybox sha256sum | while read -r sum _; do echo "$sum"; done; }
 case_mapped_bar() {
-  for applet in devmem hexdump dd printf sha256sum; do
+  for applet in devmem hexdump dd printf sha256sum taskset; do
     busybox --list | grep -x "$applet" >/dev/null || fail "BusyBox has no $applet applet"
   done
   dev=
@@ -526,7 +527,7 @@ def stopped(run: Run, line: str, status: int) -> list:
 # function 0's BAR0 keeps the slot's 64 KiB stride address; the rest of memory goes from E0200000H largest first
 # (function 1's 64 KiB BAR2-3, then its BAR0); I/O from C000H, lowest function first. The judged bits also take
 # IORESOURCE_DISABLED and IORESOURCE_UNSET, expected clear: a BAR the kernel left unassigned or disabled fails.
-PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf', 'sha256sum')
+PCI_APPLETS = ('devmem', 'hexdump', 'dd', 'printf', 'sha256sum', 'taskset')
 PCI_IO, PCI_MEM, PCI_PREFETCH, PCI_MEM_64 = 0x100, 0x200, 0x2000, 0x100000
 PCI_DISABLED, PCI_UNSET = 0x1000_0000, 0x2000_0000
 PCI_TYPE = PCI_IO | PCI_MEM | PCI_PREFETCH | PCI_MEM_64 | PCI_DISABLED | PCI_UNSET

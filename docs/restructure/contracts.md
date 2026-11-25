@@ -517,7 +517,8 @@ with a typed stop where it cannot be, and never reachable at a base it has left.
 ([mapped-device-memory-plan.md](mapped-device-memory-plan.md); added November 24, 2026, numbered after contract 68.)
 - The class: a page that is not RAM, not this vCPU's xAPIC page (which decodes first) and not ROM, inside an enabled
   region of the region table (`cache::MappedRegions`, at most 8 regions, 256 MiB together, fixed at launch: only bases
-  and enables change). Overlapping regions: the lowest-numbered entry wins. The shadow is writable exactly as for RAM
+  and enables change). Overlapping regions: the lowest-numbered entry wins. A region overlapping an emulated BAR (a
+  guest error) is served natively there, whatever the bus window's lowest-function-first rule would pick. The shadow is writable exactly as for RAM
   (guest W and D, the walk's A/D), never code- or table-marked; no guest-physical address resolves to anything but the
   region's own object (contract 21 holds: the alias maps only its allocation, EL1 only). Data accesses of every width
   and form translated code and the resident complete for RAM complete there too, page-crossing stores within one region
