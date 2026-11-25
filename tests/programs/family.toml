@@ -29,6 +29,11 @@ generator = "tools/reference/gen_i10.py"
 args = []
 sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
 
+[input.i2]
+generator = "tools/reference/gen_i2.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
 [input.rex]
 generator = "tools/reference/gen_rex.py"
 args = []
@@ -118,6 +123,18 @@ reference = "qemu"
 matrix = { "engine.max_block" = [0, 1] }
 batch = 64
 smoke = false
+
+[[suite]]
+name = "i2"
+kind = "deterministic"
+harness = "programs"
+input = "i2"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+# String instructions (MOVS/STOS/LODS/SCAS/CMPS, REP/REPE/REPNE, both directions), with overlapping REP MOVS whose bulk
+# copy and element loop both run against QEMU's element-by-element answers (docs/restructure/bulk-rep-plan.md 9.3).
 
 [[suite]]
 name = "rex"

@@ -247,7 +247,7 @@ def test_new_paths_are_components(monkeypatch, tmp_path):
     for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'matrix_inputs', 'platform_inputs', 'console_inputs',
               'control_inputs'):
         monkeypatch.setattr(inputs, n, lambda n=n: stub[n])
-    monkeypatch.setattr(inputs, 'corpus', lambda g: stub['corpus'])
+    monkeypatch.setattr(inputs, 'corpus', lambda g, *a: stub['corpus'])
     monkeypatch.setattr(inputs.artifacts, 'qemu_user', lambda: stub['qemu_user'])
     monkeypatch.setattr(inputs.resources, 'fetch', lambda n: stub['fetch'])
     parts = inputs.components()

@@ -154,14 +154,19 @@ def edges(rng):
                     return m
                 p.string(op, w, rep, 20, src, dst, df)
                 progs.append(finish(p, gpr, 0, rng, same if op == 'cmps' else None))
-    # overlapping movs: destination a few bytes above/below the source, both directions
+    # overlapping movs: destination a few bytes above/below the source, both directions. Deltas around a 16-byte round
+    # (-17..-15, 15, 16, 31, 32) and counts of several rounds (100, 300) reach both natemu's bulk copy and the element
+    # loop it declines to (an overlap of 1..15 bytes: docs/restructure/bulk-rep-plan.md 5.1) against QEMU's answers.
+    # Upward strings start at DATA + 0x800, downward ones longer than 24 elements at DATA + 0x1800, so the longer ones
+    # cross the page at DATA + 0x1000 and every element stays in the two-page region.
     for w in (8, 16, 32, 64):
-        for delta in (-9, -1, 1, 3, 8, 17):
-            for df in (False, True):
-                p, gpr = new(f'overlap-movs{w}-{delta}-{"down" if df else "up"}')
-                src = DATA + 0x800 + rng.randrange(0, 8)
-                p.string('movs', w, 'rep', 24, src, src + delta, df)
-                progs.append(finish(p, gpr, 0, rng))
+        for delta in (-17, -16, -15, -9, -1, 1, 3, 8, 15, 16, 17, 31, 32):
+            for count in (24, 100, 300):
+                for df in (False, True):
+                    p, gpr = new(f'overlap-movs{w}-{delta}-{count}-{"down" if df else "up"}')
+                    src = DATA + (0x1800 if df and count > 24 else 0x800) + rng.randrange(0, 8)
+                    p.string('movs', w, 'rep', count, src, src + delta, df)
+                    progs.append(finish(p, gpr, 0, rng))
     # REPE/REPNE ended by the data: REPE meets `run` equal elements, then a different one; REPNE `run` different ones, then
     # an equal one (0x5a bytes equal, 0xa5 against 0x5a different; scas compares with RAX = 0x5a..5a).
     for op in ('cmps', 'scas'):

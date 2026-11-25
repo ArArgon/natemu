@@ -151,6 +151,26 @@ argv = ["tests/faults/run_slice2_faults.py", "--sizes", "2", "--shard", "2/3", "
 [suite.cases."loopfaults-2@3"]
 argv = ["tests/faults/run_slice2_faults.py", "--sizes", "2", "--shard", "3/3", "--fexc", "{fexc}", "--out", "{out}"]
 
+# I2 string instructions faulting mid-string (gen_i2.py --flow, its overlapping REP MOVS included), at block sizes
+# default and 1 in each shard, against QEMU's signal context (docs/restructure/bulk-rep-plan.md 9.3).
+[suite.cases."loopfaults-i2@1"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "1/6", "--fexc", "{fexc}", "--out", "{out}"]
+
+[suite.cases."loopfaults-i2@2"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "2/6", "--fexc", "{fexc}", "--out", "{out}"]
+
+[suite.cases."loopfaults-i2@3"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "3/6", "--fexc", "{fexc}", "--out", "{out}"]
+
+[suite.cases."loopfaults-i2@4"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "4/6", "--fexc", "{fexc}", "--out", "{out}"]
+
+[suite.cases."loopfaults-i2@5"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "5/6", "--fexc", "{fexc}", "--out", "{out}"]
+
+[suite.cases."loopfaults-i2@6"]
+argv = ["tests/faults/run_slice2_faults.py", "--programs", "{raw}/i2-corpus/flow/programs.json", "--sizes", "default", "1", "--shard", "6/6", "--fexc", "{fexc}", "--out", "{out}"]
+
 [suite.cases."probes@1"]
 argv = ["tests/faults/run_slice2_probes.py", "--shard", "1/2", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

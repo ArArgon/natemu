@@ -230,6 +230,7 @@ generator and the lock together.
 | integer, flags, addressing, branches in general | `tests/programs`: `fix` (fixed forms), `seed` (random) | `gen_slice1.py` |
 | structured control flow | `tests/programs`: `s2d` | `gen_slice2.py` |
 | MOVBE, MMX, AES-NI, PCLMULQDQ, PDEP/PEXT | `tests/programs`: `i9`, `i9-big` | `gen_i9.py` |
+| string instructions (MOVS, STOS, LODS, SCAS, CMPS; REP forms, overlapping REP MOVS) | `tests/programs`: `i2`; their mid-string faults `tests/faults`: `loopfaults-i2` | `gen_i2.py` |
 | the 0x67 address-size prefix, XLAT | `tests/programs`: `i10` | `gen_i10.py` |
 | several REX prefixes | `tests/programs`: `rex` | `gen_rex.py` |
 | FS/GS segment overrides | `tests/programs`: `i7` | `gen_i7.py` |

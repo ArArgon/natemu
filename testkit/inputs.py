@@ -28,6 +28,7 @@ BLOCK_KERNEL_DEB = f'io3-block-20261108-01/prerequisites/{KERNEL_DEB}'
 NETWORK_ROOTFS = 'io-network-tools-20261108-01/rootfs'
 I7_PROGRAMS = 'i7-corpus-20261103-01/programs.json'
 S2D_PROGRAMS = 's2d/corpus/programs.json'
+I2_FLOW_PROGRAMS = 'i2-corpus/flow/programs.json'          # gen_i2.py --flow: loopfaults-i2's mid-string faults
 FIO_PREP = 'io-benchmark-prep-20261108-01'                  # run_io_matrix.py / run_fio_admission.py --fio-prep
 STRESS = 'io-safety-stress-20261108-01'                     # bin/stress-ng, source.tar.xz, provenance.json
 MATRIX = 'io-matrix-inputs-20261118-01'                     # run_io_matrix.py prepare's folder (the serial-stress and soak campaigns)
@@ -36,7 +37,7 @@ CONSOLE = 'devices-console/console'                         # tests/devices/run_
 CONTROL = 'devices-control/control'                         # tests/devices/run_control.py prepare's folder (its run --inputs)
 DISPLAY = 'devices-display/display'                         # tests/devices/run_display.py prepare's folder (its run --inputs)
 PATHS = (NETBOOT_LINUX, NETBOOT_INITRD, QEMU_USER, BLOCK_INPUTS, BLOCK_KERNEL_DEB, NETWORK_ROOTFS, I7_PROGRAMS, S2D_PROGRAMS,
-         FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE, CONTROL, DISPLAY)
+         I2_FLOW_PROGRAMS, FIO_PREP, STRESS, MATRIX, PLATFORM, CONSOLE, CONTROL, DISPLAY)
 E2FSPROGS = pathlib.Path('/opt/homebrew/opt/e2fsprogs')     # Homebrew's: a host tool, checked (version and hashes key the image), not pinned
 
 
@@ -570,12 +571,14 @@ def campaign_image(suite: str) -> pathlib.Path:
 
 
 def _corpus_recipe(out: pathlib.Path, inputs: list) -> None:
-    _runner(f'reference/{inputs[0]}', '-o', out / 'programs.json')
+    _runner(f'reference/{inputs[0]}', '-o', out / 'programs.json', *inputs[3:])
 
 
-def corpus(generator: str) -> pathlib.Path:
-    """programs.json from a tools/reference generator at its default seed (programs only: answers come from locks)."""
-    return resources.derived('corpus', _corpus_recipe, [generator, _tools() / 'reference', _clang()]) / 'programs.json'
+def corpus(generator: str, *args: str) -> pathlib.Path:
+    """programs.json from a tools/reference generator at its default seed, with `args` added (programs only: answers come
+    from locks). A corpus with arguments is its own entry, also under its own run pin."""
+    name = 'corpus' + ''.join('-' + a.lstrip('-') for a in args)
+    return resources.derived(name, _corpus_recipe, [generator, _tools() / 'reference', _clang(), *args]) / 'programs.json'
 
 
 def components() -> dict[str, pathlib.Path]:
@@ -583,6 +586,7 @@ def components() -> dict[str, pathlib.Path]:
     return {NETBOOT_LINUX: resources.fetch('debian-netboot-linux'), NETBOOT_INITRD: resources.fetch('debian-netboot-initrd'),
             QEMU_USER: artifacts.qemu_user(), BLOCK_INPUTS: block_inputs(), BLOCK_KERNEL_DEB: resources.fetch('debian-kernel-deb'),
             NETWORK_ROOTFS: network_rootfs(), I7_PROGRAMS: corpus('gen_i7.py'), S2D_PROGRAMS: corpus('gen_slice2.py'),
+            I2_FLOW_PROGRAMS: corpus('gen_i2.py', '--flow'),
             FIO_PREP: fio_prep(), STRESS: stress_ng(), MATRIX: matrix_inputs(), PLATFORM: platform_inputs(),
             CONSOLE: console_inputs(), CONTROL: control_inputs(), DISPLAY: display_inputs()}
 
