@@ -143,7 +143,7 @@ pub enum Error {
     Capacity,
     /// A table descriptor does not link to one of the shadow table pages.
     Corrupt,
-    /// The target is one of the owner's own table, state or pool pages.
+    /// The target is a page of the owner's window, text block or pool reservation (below [`OWN_END`]).
     Private,
 }
 
@@ -177,15 +177,29 @@ pub struct Space<M> {
 /// The pre-linked lower and upper shadow tables below the roots.
 const LOWER_TABLES: [usize; 3] = [0x11000, 0x15000, LOWER_LEAF];
 const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
-/// Window pages holding the owner's tables and shadow state: never a target.
+/// Window pages holding the owner's tables and shadow state, the compat tables, and (G1) the frame page (the guest-state
+/// page, also reached by its EL0 alias) and the alias's tables: all below [`OWN_END`], so never a target.
 const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
 const COMPAT_TABLES: core::ops::Range<usize> = COMPAT_LOWER_ROOT..COMPAT_L1 + 4096;
-/// G1: the frame page (the guest-state page, also reached by its EL0 alias) and the alias's tables: never a target.
 const GUEST_STATE: [core::ops::Range<usize>; 3] = [
     crate::execution::FRAME_OFFSET..crate::execution::FRAME_OFFSET + 4096,
     crate::execution::GUEST_STATE_TABLES[0]..crate::execution::GUEST_STATE_TABLES[2] + 4096,
     crate::execution::GUEST_STATE_USER_TABLES[0]..crate::execution::GUEST_STATE_USER_TABLES[1] + 4096,
 ];
+/// No shadow targets a page of the owner's block below this offset (relative to its window's IPA): the window (tables,
+/// state, frame, stacks, staging, the pages the pool held before November 25), the resident's text block and the pool's
+/// whole reservation. Targets are guest RAM and device pages, which lie past every vCPU's block, or the all-ones page,
+/// below the backing (so far above any offset here, wrapped).
+pub const OWN_END: usize = POOL_END;
+const _: () = assert!(
+    PRIVATE_TABLES.end <= OWN_END
+        && COMPAT_TABLES.end <= OWN_END
+        && GUEST_STATE[0].end <= OWN_END
+        && GUEST_STATE[1].end <= OWN_END
+        && GUEST_STATE[2].end <= OWN_END
+        && crate::resident::TEXT_END <= OWN_END
+        && crate::ALL_ONES_IPA + crate::ALL_ONES_BYTES <= crate::IPA
+);
 
 impl<M: Maintenance> Space<M> {
     fn slot(&self, table: usize, index: usize) -> *mut u64 {
@@ -243,11 +257,6 @@ impl<M: Maintenance> Space<M> {
                 .into_iter()
                 .take(if upper { 2 } else { 1 })
         })
-    }
-    fn pool(&self, offset: usize, pages: usize) -> bool {
-        offset
-            .checked_sub(POOL_OFFSET)
-            .is_some_and(|o| o / 4096 < pages)
     }
     /// Whether `offset` is an allocated pool table page (either end).
     fn allocated(&self, offset: usize) -> bool {
@@ -317,12 +326,8 @@ impl<M: Maintenance> Space<M> {
         if va & 4095 != 0 || target & !OUTPUT != 0 {
             return Err(Error::Misaligned);
         }
-        let own = target.wrapping_sub(self.ipa) as usize;
-        if PRIVATE_TABLES.contains(&own)
-            || COMPAT_TABLES.contains(&own)
-            || GUEST_STATE.iter().any(|r| r.contains(&own))
-            || self.pool(own, POOL_MAX_PAGES)
-        {
+        // Any page of the owner's window, text block or pool reservation (its tables, state and pool among them).
+        if (target.wrapping_sub(self.ipa) as usize) < OWN_END {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
@@ -803,7 +808,7 @@ mod tests {
             let target = IPA + own as u64;
             assert_eq!(s.map(0x20_0000, target, false), Err(Error::Private));
         }
-        s.map(0x20_0000, IPA + 0x7_0000, true)
+        s.map(0x20_0000, IPA + OWN_END as u64, true)
             .unwrap_or_else(|e| panic!("{e:?}"));
     }
 
@@ -925,22 +930,34 @@ mod tests {
         ((link & OUTPUT) - IPA) as usize / 4096 - POOL_OFFSET / 4096
     }
 
-    /// No shadow of either space ever targets a pool page, from its first to its last ([`POOL_MAX_PAGES`], whatever the
-    /// `pool_pages` a space allocates from), or one of the compat tables, now window pages apart from the pool.
+    /// No shadow of either space ever targets a page of the owner's block below [`OWN_END`]: every page of the window (the
+    /// tables, state, frame, stacks, staging and the pages the pool held before November 25, which nothing refused by name
+    /// any more), the text block and the pool's whole reservation, whatever the `pool_pages` a space allocates from; the
+    /// first page past it, guest RAM's pages and the all-ones page below the backing are targets.
     #[test]
-    fn no_shadow_targets_a_pool_page() {
+    fn no_shadow_targets_the_owners_window_text_or_pool() {
         let mut m = window();
-        for pool_pages in [POOL_MAX_PAGES, 4] {
+        for pool_pages in [POOL_MAX_PAGES, POOL_MIN_PAGES] {
             for user in [false, true] {
                 let mut s = space(&mut m, pool_pages);
                 s.user = user;
-                for page in 0..POOL_MAX_PAGES {
-                    let target = IPA + (POOL_OFFSET + page * 4096) as u64;
-                    assert_eq!(s.map(0x20_0000, target, true), Err(Error::Private), "pool page {page}");
+                for page in 0..OWN_END / 4096 {
+                    let target = IPA + (page * 4096) as u64;
+                    assert_eq!(s.map(0x20_0000, target, true), Err(Error::Private), "page {:#x}", page * 4096);
                     assert_eq!(s.map_global(HIGH_BASE + 0x20_0000, target, false), Err(Error::Private));
                 }
                 assert_eq!(s.descriptor(0x20_0000), 0);
+                for target in [IPA + OWN_END as u64, IPA + (1 << 30), crate::ALL_ONES_IPA] {
+                    s.map(0x20_0000, target, false).unwrap_or_else(|e| panic!("{target:#x}: {e:?}"));
+                    assert_eq!(s.descriptor(0x20_0000), target | LEAF | READ_ONLY);
+                }
+                s.reset();
             }
+        }
+        // The old window pool, named: refused although no table lives there now.
+        let mut s = space(&mut m, POOL_MAX_PAGES);
+        for own in [0xe3000, 0x100000, 0x1ff000] {
+            assert_eq!(s.map(0x20_0000, IPA + own, true), Err(Error::Private));
         }
         // The reservation is its own: below it the text block, above it the lookup area (no window pages, no tables).
         assert!(POOL_OFFSET >= crate::resident::TEXT_END && POOL_END <= crate::execution::cache::LOOKUP_OFFSET);
@@ -993,7 +1010,7 @@ mod tests {
     /// reservation), every other table a bottom page; the two meet exactly at the pool's size; a CR3 load returns the bottom
     /// alone, keeps the top's tables and shadows, and the bottom refills to the same page count, never reaching a kept table.
     #[test]
-    fn kept_half_split_at_full_size() {
+    fn kept_half_split_at_each_pool_size() {
         for pages in SIZES {
             let end = POOL_OFFSET + pages * 4096;
             let mut m = window();

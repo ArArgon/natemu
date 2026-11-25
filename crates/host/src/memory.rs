@@ -246,7 +246,7 @@ const PAGE: u64 = 3 | 1 << 10 | 1 << 11 | 3 << 8;
 const BLOCK: u64 = 1 | 1 << 10 | 1 << 11 | 3 << 8;
 const PRIVATE_LEAF: usize = 0x14000;
 /// Level-2 table of `PRIVATE..PRIVATE + 1 GiB`; its first entry links `PRIVATE_LEAF`.
-const PRIVATE_L2: usize = 0x13000;
+pub(crate) const PRIVATE_L2: usize = 0x13000;
 /// Level-2 table of the private window's GiB `g` (`PRIVATE_L2`, then the guest-RAM alias's, M1).
 fn private_l2(g: usize) -> usize {
     if g == 0 {
@@ -854,11 +854,11 @@ pub(crate) mod tests {
             tlb: Quiet,
         };
         assert_eq!(
-            space.map(shadow::HIGH_BASE, IPA, true),
+            space.map(shadow::HIGH_BASE, IPA + shadow::OWN_END as u64, true),
             Err(shadow::Error::Noncanonical)
         );
         assert_eq!(
-            space.map(0x7f80_0000_0000, IPA, true),
+            space.map(0x7f80_0000_0000, IPA + shadow::OWN_END as u64, true),
             Err(shadow::Error::Capacity)
         );
     }

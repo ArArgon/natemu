@@ -16,8 +16,9 @@ use crate::{
     paging::{self, Control},
 };
 
-/// `Shared::mode` of the execution mode.
-pub const MODE: u64 = 32;
+/// `Shared::mode` of the execution mode. 33 since November 25: the shadow pool's reservation moved the backing's areas (a
+/// resident of another layout stops at its start, as for any other mode, instead of faulting at EL1).
+pub const MODE: u64 = 33;
 /// Resident → host: translate at `cpu.rip` (state record holds the request).
 pub const TRANSLATE_HVC: u64 = 0x4b;
 /// The GIC SGI a resident sends a peer to stop it ([`STOP_WORD`]; `ICC_SGI1R_EL1`). The host's doorbell for vCPU v is

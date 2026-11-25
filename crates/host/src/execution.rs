@@ -7464,7 +7464,7 @@ mod tests {
                 assert_eq!(c.shadow_pool_pages, pages as u64);
                 // The reservation's blocks, whatever the size: the private region's first GiB, one level-2 entry each.
                 for block in (shadow::POOL_OFFSET..shadow::POOL_END).step_by(cache::BLOCK) {
-                    let d = u64::from_le_bytes(b.memory.read::<8>(base + 0x13000 + block / cache::BLOCK * 8));
+                    let d = u64::from_le_bytes(b.memory.read::<8>(base + crate::memory::PRIVATE_L2 + block / cache::BLOCK * 8));
                     assert_eq!(d & 3, 1, "a block descriptor");
                     assert_eq!(d & 0x0000_ffff_ffe0_0000, crate::IPA + (base + block) as u64);
                     assert_eq!((d >> 53 & 3, d >> 6 & 3), (3, 0), "never executable, EL1 read/write, no EL0 access");
@@ -7477,9 +7477,11 @@ mod tests {
                     user: false,
                     tlb: Quiet,
                 };
+                // A page past the vCPU's own window, text block and pool (none of those is ever a target).
+                let target = crate::IPA + (base + shadow::OWN_END) as u64;
                 let mut regions = 0u64;
                 let full = loop {
-                    match space.map((1 << 39) + regions * cache::BLOCK as u64, crate::IPA, true) {
+                    match space.map((1 << 39) + regions * cache::BLOCK as u64, target, true) {
                         Ok(()) => regions += 1,
                         Err(e) => break e,
                     }
