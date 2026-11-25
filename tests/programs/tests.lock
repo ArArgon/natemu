@@ -36,7 +36,7 @@ fingerprint = "f92a60b20086130cb76196c37fd3b99621bec2473a2d6e80c1d54dd4543dddcf"
 output = "a7d9d8878131f209a8630bb33d4c82c8e4fc4235ac99d69886a8dbc89f4debf1"
 
 [input.s2d]
-fingerprint = "ce3ec510bb07871272b7e9480d2e06051cbe8f5e7b7e472743da622c895192c9"
+fingerprint = "a28ce6ee2288cf2e22fdff3a48478c987ffe4e2bd4da52437eecca3a03a1ede2"
 output = "a879740cf01c9d51aa4211a42c5eceba823129482c7ae7edc0e5e17ffb522239"
 
 [input.seed]
@@ -53,7 +53,7 @@ output = "48989ba878ad1e92e27f362feefb688e9e2f7439e7a93786aa2995ce42afc50c"
 
 [suite.adx]
 fex_cases = []
-fingerprint = "8ef0f56b4f05bfa797ab3c3378c7cb8527b8960de6636729d9a4848834c0332d"
+fingerprint = "6ec6238bcd79d01f1b8d16458898122462d65a6948e648be986deb9f03486257"
 input = "8b96017f009a529dc2c49901e5238db9c21dadfe8ee1ca5ecdf5067f873d8556"
 model_cases = []
 reference = "x86"
@@ -179,14 +179,14 @@ adx-model-015 = "e8630488bfbce9998e0414f930f4b151f864484ee11e6b479df6683ddf741f0
 [suite.adx.masks]
 
 [suite.adx.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "x86: x86: ubuntu@192.168.12.10"
 
 [suite.br66]
 fex_cases = []
-fingerprint = "1eee04f1def94a51af0333a9c4aeb968efe9e11774fd9ee2dc070f0cc4159c35"
+fingerprint = "fd9761bbda28652199533fe8c875b1af47dd862f91287957072bdbcca9f359ca"
 input = "1c44db06300500ecac5839e8d62c081939def312a69fa86e79cbb4e939fe2667"
 model_cases = []
 reference = "qemu"
@@ -211,14 +211,14 @@ o16-branches-011 = "f91c150ac2a9fcd37d0b9bbb3c010e6a5fead30cab176d9c5eeb2c9cb37a
 [suite.br66.masks]
 
 [suite.br66.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.fix]
 fex_cases = []
-fingerprint = "791fbc9c97c123d26507105baf0a22a300bf17e8b7407247ee4b0b20d0c5103e"
+fingerprint = "12dcd33f6c6c0576121cf12d23fe01259616ae5022436fe169f569243eb39d62"
 input = "a9cf8a1abeedbe5b5413d9d644985cc8898d9a364a891fef9505bd86b5de4de4"
 model_cases = []
 reference = "qemu"
@@ -295,14 +295,14 @@ random-39 = "0098475963fb82006c6f298ff384a0a64bcaf40a42fd46b14b06b2ea3e0a8ee0"
 [suite.fix.masks]
 
 [suite.fix.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.flow]
 fex_cases = []
-fingerprint = "ec770d5c2f56af1c71266dcb5d2d9324c57cede8af906eb512c874a667aa8884"
+fingerprint = "001ed1be3d6e5096521e79117515785cfc1e3af7d99c97fab3aec382b7deca81"
 input = "a879740cf01c9d51aa4211a42c5eceba823129482c7ae7edc0e5e17ffb522239"
 model_cases = []
 reference = "qemu"
@@ -443,14 +443,14 @@ flow-62-count = "0x440"
 flow-63-loop = "0xcd5"
 
 [suite.flow.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i10]
 fex_cases = []
-fingerprint = "2b760a09862a3684e9ba2d08f5d92a91df698e6136c743d09e1ea75bf08bedc4"
+fingerprint = "b962db708203de3a6a78991aae5c7a0254aa5e6216bd95393f62e375058f456a"
 input = "bb1fb920c46479a76797fcb5be09ec078dc68af807ef1298ce77009ad7eb65e4"
 model_cases = []
 reference = "qemu"
@@ -551,7 +551,7 @@ i10-str-023 = "406943cfb3534fd393140e96824bffdb97efaffe08f1f57cbd2f2e827b704e90"
 [suite.i10.masks]
 
 [suite.i10.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
@@ -607,7 +607,7 @@ fex_cases = [
     "i6b-x87-046",
     "i6b-x87-047",
 ]
-fingerprint = "0feda8feb8837f76b8d8a02dee79b6de02fe3cdd51c19ce3a22fd043f1e7acc5"
+fingerprint = "e1b26cc282aa6135fafc22722d270eb0d894354fff9abbe3876d806bc67d2f1c"
 input = "cf5deb60bc80fe2ae646a3adf8cc8db9f2e0963e94027a9b2d1c15e3de18b1cb"
 model_cases = []
 reference = "qemu"
@@ -732,14 +732,14 @@ i6b-x87-047 = "5d4fcd201bc402e05a2fa151371b1671c7267cf25d904d5bb6d2d55652c8a308"
 [suite.i6b.masks]
 
 [suite.i6b.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
-tool = "qemu: fex: natemu 094f9b992cc4 (FEX reduced-precision x87); qemu: qemu-x86_64-static (apple)"
+tool = "qemu: fex: natemu 53f4ce2eeafd (FEX reduced-precision x87); qemu: qemu-x86_64-static (apple)"
 
 [suite.i7]
 fex_cases = []
-fingerprint = "dc13ace8180401619242a7e41becc11ca05382e036be54c6105e6cb93ccbcfd4"
+fingerprint = "60dda02e3363654daca5fbd41e81d86c33269e4db645eac9e6cda230d9984d81"
 input = "46cb952f54aae6636524f435e43486d50db13681e709d34858e2dd7ad7a36fd4"
 model_cases = []
 reference = "qemu"
@@ -821,14 +821,14 @@ i7-random-59 = "1a260f2371450c4fb12b9f1107d5380629f1ad59a50ad72117b47e2cd8336141
 [suite.i7.masks]
 
 [suite.i7.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i7-cpl0]
 fex_cases = []
-fingerprint = "e8d17e3a391c5892df4938c045bf06a1f2fe48427b64c5d2656447a48e7e35c7"
+fingerprint = "1cbfb2d8d90ddfd04db00535e823693928770e6e58b3d77eb3f23327c082e2d4"
 input = "46cb952f54aae6636524f435e43486d50db13681e709d34858e2dd7ad7a36fd4"
 model_cases = []
 reference = "qemu"
@@ -910,14 +910,14 @@ i7-random-59 = "1a260f2371450c4fb12b9f1107d5380629f1ad59a50ad72117b47e2cd8336141
 [suite.i7-cpl0.masks]
 
 [suite.i7-cpl0.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i9]
 fex_cases = []
-fingerprint = "275f32549a7c66176db06254edd30ff39f58f44aaa2c0c491b9f694529ef8ef7"
+fingerprint = "cd31974fd74a8c1aa29ce69428fbc9ebfc19da812b25757822ae4c0568029695"
 input = "6c7b626fd9ad9a18942bf8a97860e8aa73349456d3d7793ec7c501ba254dadbd"
 model_cases = []
 reference = "qemu"
@@ -1050,14 +1050,14 @@ i9-movbe-015 = "100ad5cd700cfb7852b27527e53e44ab0eb97d1db418b1cd822be450a4d9a8e2
 [suite.i9.masks]
 
 [suite.i9.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i9-big]
 fex_cases = []
-fingerprint = "73d56592727c76a09746ceb5c01ab5ed93e8b38bc0b51abcc6b4a1c15400ce20"
+fingerprint = "8f9d8d5121da1026bbece127ac20eee6317587cac0bb63c7181fb6a63b2e5ddd"
 input = "ada92f4f49c08065e736cdfda3e8af4a7a56b7a8f2085292b4355aeddb6d4d6f"
 model_cases = []
 reference = "qemu"
@@ -1075,14 +1075,14 @@ i9-big-pext64-120 = "797e183d4e7dd5dcf969baa4ae634f81cbd238b6f09bb5ead8d595c7f91
 [suite.i9-big.masks]
 
 [suite.i9-big.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.rex]
 fex_cases = []
-fingerprint = "cb9758f0761664b2741397bcdf410a9696f7ed0790b69924de4a22846152a2c5"
+fingerprint = "05db2500985db9c3a82f53443be33311abc202b7238d8de6e7863d40bd5d8436"
 input = "a7d9d8878131f209a8630bb33d4c82c8e4fc4235ac99d69886a8dbc89f4debf1"
 model_cases = []
 reference = "qemu"
@@ -1132,14 +1132,14 @@ seg-branches-011 = "abf268e65452a7a52f4092cb600339b429c4030b5a946d91b12a63010930
 [suite.rex.masks]
 
 [suite.rex.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.seed]
 fex_cases = []
-fingerprint = "b5cd2f4b7a5d1aa1ccd3af875ddec31c934cce3d126aa3e4a61da0457a4c98b7"
+fingerprint = "f53ad928f3c454b386ce2942261fb37009c3306185549f1652c940048dc8f584"
 input = "bb7833ae832cd4b1d232ff0912ffe0f8dba5116ca58e37778448506807082c9f"
 model_cases = []
 reference = "qemu"
@@ -1196,14 +1196,14 @@ random-19 = "cd8bd09ef20b090854963d21c79fab9e6c5b289aa81f7b8abadff4c729f9b268"
 [suite.seed.masks]
 
 [suite.seed.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.sha]
 fex_cases = []
-fingerprint = "f8c8f2f39f317d13bdaabc913ceeec77ad5a703427b3ed2d045627c713defd90"
+fingerprint = "dcd0f0bfb47a14d7ba0b0e0816cdf7b4136b7e17175a721323e22cacdda0527d"
 input = "a9ee6fdaac82cce8049621bb03977d0376d1e953a82e77afda36ea64e9049bf8"
 model_cases = []
 reference = "x86"
@@ -1337,14 +1337,14 @@ sha-sha256rnds2-003 = "c5a49c66f61f6cd64be3461f724b33d806c302f3364478471e6ebd3b4
 [suite.sha.masks]
 
 [suite.sha.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "x86: x86: ubuntu@192.168.12.10"
 
 [suite.xsave]
 fex_cases = []
-fingerprint = "d1bc225664dddea66c8ddb3eeb09ad95436a509c730b1a0fb2a69653edef1d54"
+fingerprint = "c43fd6e9de0ef5ac3d468142d12a7d17664c6a6432096614692997689d0b0891"
 input = "48989ba878ad1e92e27f362feefb688e9e2f7439e7a93786aa2995ce42afc50c"
 model_cases = []
 reference = "x86"
@@ -1470,7 +1470,7 @@ xs-xsaveopt-011 = "f520ebaf27412b513d1361222dd31900c368bd468a599e2dab88fd3e578d3
 [suite.xsave.masks]
 
 [suite.xsave.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "x86: x86: ubuntu@192.168.12.10"

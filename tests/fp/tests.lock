@@ -9,7 +9,7 @@ output = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 
 [suite.i8]
 fex_cases = []
-fingerprint = "ad2c98f42898e192412f156c6bbac7deeb24fe1be201620b01b46238adfef257"
+fingerprint = "6a6022a8bfeac22020639e67cd7ae9765c6461175252770881670a1d40c70d5c"
 input = "3301ce5d15f97269ab58c470af97be2b9ee9f880fbbc67dcc4d1fe72a24b57f7"
 model_cases = []
 reference = "qemu"
@@ -350,14 +350,14 @@ i8-shifts-29 = "ddd7f1b744d95082f307388daa6b8a83b9cdaae1e947434adde1498c22361b94
 [suite.i8.masks]
 
 [suite.i8.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
 
 [suite.i8b]
 fex_cases = []
-fingerprint = "81efbe3373e50f3af65bb3c702d9ebe837fa8bc2827b4c504c79e6a1117d3971"
+fingerprint = "a9a5246369984bdd3e42b588fa5fa514c2a6d3fc0be8df94a77f2ac64c653123"
 input = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 model_cases = [
     "i8-forms-045",
@@ -845,7 +845,7 @@ i8-shifts-29 = "28a143f356866b735a92afabe602a8bec0dd88d83ffec622de2a8fab74dd710b
 [suite.i8b.masks]
 
 [suite.i8b.seeded]
-date = "2026-11-18"
+date = "2026-11-24"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: model: tools/models/afp_fp (Intel SDM rules); qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
