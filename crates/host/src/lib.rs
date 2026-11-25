@@ -16,6 +16,7 @@ pub mod compile_cache;
 pub mod control;
 pub mod debug_exit;
 pub mod devices;
+pub mod display;
 mod disk;
 pub mod execution;
 mod interp;
