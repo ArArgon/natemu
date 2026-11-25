@@ -84,17 +84,20 @@ def natemu_command(args, initrd: Path, cmdline: str, serial: Path, perf: Path | 
 def elf_image(src: Path, dest: Path) -> dict:
     """dest: a newc cpio of the ELF files of the userland src (userland.cpio.zst), for tests/bench/sample_report.py
     --image, which finds sampled user blocks' guest bytes in an uncompressed cpio's ELF files (sample_symbols.Image)."""
-    import tempfile
-    from sample_symbols import cpio_files, zstd_tool
     import mmap
+    import tempfile
+    from sample_symbols import cpio_files
+    from compression import zstd          # Python 3.14 and later; the zstd program refuses the archive's padding
     with tempfile.NamedTemporaryFile(dir=dest.parent, suffix='.cpio') as raw:
-        exe = zstd_tool()
-        if exe is None:
-            from compression import zstd
-            with zstd.open(src, 'rb') as z:
-                while chunk := z.read(1 << 24): raw.write(chunk)
-        else:
-            subprocess.run([exe, '-dc', str(src)], stdout=raw, check=True)
+        # The recipes zero-pad the archive to 4 bytes (for the kernel), after its one zstd frame: decompress the frame and
+        # accept only zeros after it.
+        dec, rest = zstd.ZstdDecompressor(), b''
+        with open(src, 'rb') as f:
+            while chunk := f.read(1 << 24):
+                if dec.eof: rest += chunk; continue
+                raw.write(dec.decompress(chunk))
+                if dec.eof: rest += dec.unused_data
+        if not dec.eof or rest.strip(b'\0'): raise SystemExit(f'{src}: not one zstd frame and zero padding')
         raw.flush()
         with open(raw.name, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d, open(dest, 'wb') as out:
             n = 0

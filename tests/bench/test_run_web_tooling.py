@@ -99,7 +99,7 @@ class Sampling(unittest.TestCase):
                                             ('usr/lib/libxul.so', b'\x7fELF' + b'x' * 9)], 1):
             entry(raw, ino, name, stat.S_IFREG | 0o755, data)
         entry(raw, 0, 'TRAILER!!!', 0)
-        (d / 'userland.cpio.zst').write_bytes(zstd.compress(raw.getvalue()))
+        (d / 'userland.cpio.zst').write_bytes(zstd.compress(raw.getvalue()) + b'\0\0')      # padded to 4 bytes, as the recipes'
         got = gu.elf_image(d / 'userland.cpio.zst', d / 'userland.cpio')
         import sample_symbols
         files = sample_symbols.cpio_files((d / 'userland.cpio').read_bytes())
