@@ -171,3 +171,5 @@ argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "--durations", 
 
 [suite.cases."fexc-slice1-approx-sdm"]
 argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "--durations", "0", "tools.fexc.test_slice1.ApproxSdm"]
+[suite.cases."fexc-slice1-gather-inline"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "--durations", "0", "tools.fexc.test_slice1.GatherInline"]
