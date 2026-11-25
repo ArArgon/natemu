@@ -447,18 +447,21 @@ mod tests {
 
     #[test]
     fn mode_change_is_atomic_for_readers() {
-        // A writer alternates two geometries register by register, through an unpublished state (ENABLE cleared
+        // A writer alternates two geometries, register by register, through an unpublished state (ENABLE cleared
         // while it changes them), so only the two whole modes are ever published; a reader taking modes meanwhile
-        // must never see a mix (one's width with the other's height or stride).
+        // must never see a mix (one's width with the other's height, stride or offset). Three accesses a geometry
+        // (8-byte writes of four registers each), so publishes come often and a torn read has many chances.
         let d = display(16);
         let a = Mode { offset: 4096 * 4 + 64, ..mode(1024, 768) };
         let b = Mode { offset: 3 * 1600 * 4 + 32, ..mode(1600, 900) };
-        let flips = 20_000;
+        let flips = 50_000;
         let reader = {
             let d = d.clone();
             std::thread::spawn(move || {
                 let (mut seen_a, mut seen_b, mut mixed) = (0u64, 0u64, Vec::new());
                 let mut last = 0;
+                // A deadline, so a writer that stops early fails the test instead of hanging it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 loop {
                     let changes = d.changes();
                     assert!(changes >= last, "the counter never goes back");
@@ -469,20 +472,17 @@ mod tests {
                         Some(m) => mixed.push(m),
                         None => {}
                     }
-                    if changes >= 4 * flips - 1 {
+                    if changes >= 4 * flips - 1 || std::time::Instant::now() > deadline {
                         return (seen_a, seen_b, mixed);
                     }
                 }
             })
         };
-        let geometry = |m: Mode, x_offset: u16, y_offset: u16| {
-            set(&d, ENABLE, 0);
-            set(&d, XRES, m.width as u16);
-            set(&d, YRES, m.height as u16);
-            set(&d, VIRT_WIDTH, m.width as u16);
-            set(&d, X_OFFSET, x_offset);
-            set(&d, Y_OFFSET, y_offset);
-            set(&d, BPP, 32);
+        let geometry = |m: Mode, x_offset: u64, y_offset: u64| {
+            // XRES, YRES, BPP 32 and ENABLE 0; then VIRT_WIDTH 0 (XRES), VIRT_HEIGHT 0 and the offsets; then ENABLE
+            let (w, h) = (u64::from(m.width), u64::from(m.height));
+            write(&d, DISPI + 2 * XRES as u64, 8, w | h << 16 | 32 << 32);
+            write(&d, DISPI + 2 * VIRT_WIDTH as u64, 8, x_offset << 32 | y_offset << 48);
             set(&d, ENABLE, ENABLED);
         };
         for _ in 0..flips {

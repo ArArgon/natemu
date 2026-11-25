@@ -12,8 +12,10 @@
 //!   monitor name "natemu"; descriptors 3 and 4: dummy descriptors;
 //! - no extension blocks, and the checksum.
 //!
-//! Limits: the preferred mode is at most 3935 x 4095 (a detailed timing's 12-bit fields: active plus blanking below
-//! 4096), at least 64 x 64; [`block`] panics outside them (the launch validates the configuration first).
+//! Limits ([`fits`]): width and height from 64 to 4095 (a detailed timing's 12-bit active fields), and a pixel clock
+//! of at most 655.35 MHz (its 16-bit clock field, in 10 kHz). The clock is the tighter bound for large modes: 3840 x
+//! 2400 fits (592.50 MHz), as does 4095 x 2496; 4095 x 2497 does not, nor 2434 x 4095. [`block`] panics on a size
+//! [`fits`] refuses, so the launch checks the configuration with [`fits`] first.
 
 /// Horizontal blanking, front porch and sync width of CVT reduced blanking, in pixels (CVT 1.2, Table 3-2).
 const RB_H_BLANK: u32 = 160;
@@ -54,7 +56,13 @@ pub struct Timing {
 /// One departure: CVT rounds the active width down to its cell of 8 pixels; here it stays as given (1366 stays 1366),
 /// so the timing's active size is the preferred size exactly. The horizontal totals stay what CVT gives for any width
 /// that is a multiple of 8.
-pub fn cvt_rb(width: u32, height: u32) -> Timing {
+///
+/// None when the timing does not fit a detailed timing descriptor: an active size past 4095 or a clock past 655.35 MHz
+/// (the blanking fields, at most 160 pixels and a few hundred lines, always fit).
+pub fn cvt_rb(width: u32, height: u32) -> Option<Timing> {
+    if width > 4095 || height > 4095 {
+        return None;
+    }
     let (w, h) = (u64::from(width), u64::from(height));
     let v_sync = if w * 3 == h * 4 {
         4
@@ -73,8 +81,8 @@ pub fn cvt_rb(width: u32, height: u32) -> Timing {
     let total_h = w + u64::from(RB_H_BLANK);
     // pixels per second / 10^4 is the clock in 10 kHz; round down to the step.
     let clock = REFRESH_HZ * total_v * total_h / (10_000 * CLOCK_STEP_10KHZ) * CLOCK_STEP_10KHZ;
-    Timing {
-        clock_10khz: u16::try_from(clock).expect("pixel clock within a detailed timing's 655.35 MHz"),
+    Some(Timing {
+        clock_10khz: u16::try_from(clock).ok()?,
         h_active: width,
         h_blank: RB_H_BLANK,
         h_front: RB_H_FRONT,
@@ -83,15 +91,18 @@ pub fn cvt_rb(width: u32, height: u32) -> Timing {
         v_blank: vbi as u32,
         v_front: RB_V_FRONT,
         v_sync,
-    }
+    })
+}
+
+/// Whether [`block`] takes `width` x `height` (module documentation, Limits).
+pub fn fits(width: u32, height: u32) -> bool {
+    width >= 64 && height >= 64 && cvt_rb(width, height).is_some()
 }
 
 /// The EDID base block for a monitor whose preferred mode is `width` x `height` (module documentation).
 pub fn block(width: u32, height: u32) -> [u8; 128] {
-    assert!(
-        (64..=4095 - RB_H_BLANK).contains(&width) && (64..=4095).contains(&height),
-        "EDID preferred mode {width} x {height}: from 64 x 64 to 3935 x 4095"
-    );
+    let timing = cvt_rb(width, height).filter(|_| width >= 64 && height >= 64);
+    let timing = timing.unwrap_or_else(|| panic!("EDID preferred mode {width} x {height}: not one `fits` takes"));
     let mut b = [0u8; 128];
     b[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
     // Manufacturer: three letters of 5 bits (A = 1), big-endian, bit 15 clear.
@@ -124,7 +135,7 @@ pub fn block(width: u32, height: u32) -> [u8; 128] {
     // 35-37: no established timings. Standard timings: (width / 8 - 31), aspect 4:3 (01b) and refresh - 60.
     b[38..54].fill(1);
     b[38..42].copy_from_slice(&[(800 / 8 - 31) as u8, 0x40, (640 / 8 - 31) as u8, 0x40]);
-    b[54..72].copy_from_slice(&detailed(cvt_rb(width, height), w_mm, h_mm));
+    b[54..72].copy_from_slice(&detailed(timing, w_mm, h_mm));
     // Display product name: tag FCH, up to 13 bytes, a line feed after the name and spaces after that.
     b[72..77].copy_from_slice(&[0, 0, 0, 0xfc, 0]);
     let mut name = [b' '; 13];
@@ -202,7 +213,7 @@ mod tests {
             assert_eq!((t.h_active, t.v_active), (w, h), "{why}: the preferred size");
             assert_eq!((t.h_blank, t.h_front, t.h_sync), (160, 48, 32), "{why}: CVT-RB horizontal");
             assert_eq!(t.v_front, 3, "{why}: CVT-RB vertical front porch");
-            assert_eq!(t, cvt_rb(w, h), "{why}: the descriptor holds the computed timing");
+            assert_eq!(Some(t), cvt_rb(w, h), "{why}: the descriptor holds the computed timing");
             assert_eq!(b[71] & 0x1e, 0x1a, "{why}: digital separate sync, H+ V-");
             // the monitor name, then the standard timings 800x600@60 and 640x480@60 (4:3)
             assert_eq!(b[72..77], [0, 0, 0, 0xfc, 0], "{why}: name descriptor");
@@ -217,8 +228,41 @@ mod tests {
             ((1920, 1080), 13850, 31, 5),
             ((1280, 800), 7100, 23, 6),
         ] {
-            let t = cvt_rb(w, h);
+            let t = cvt_rb(w, h).unwrap();
             assert_eq!((t.clock_10khz, t.v_blank, t.v_sync), (clock, vblank, vsync), "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn fits_bounds_the_fields_and_the_clock() {
+        // the largest sizes taken, and the first refused past each: the 12-bit active fields, the 16-bit clock
+        for ((w, h), taken) in [
+            ((64, 64), true),
+            ((63, 64), false),
+            ((64, 63), false),
+            ((4095, 64), true),
+            ((4096, 64), false),
+            ((64, 4095), true),
+            ((64, 4096), false),
+            ((3840, 2400), true),
+            ((4095, 2496), true),
+            ((4095, 2497), false),
+            ((2433, 4095), true),
+            ((2434, 4095), false),
+            ((3935, 4095), false),
+        ] {
+            assert_eq!(fits(w, h), taken, "{w}x{h}");
+            if taken {
+                let b = block(w, h);
+                assert_eq!(b.iter().fold(0u8, |s, &x| s.wrapping_add(x)), 0, "{w}x{h}: checksum");
+                let t = first_timing(&b);
+                assert_eq!((t.h_active, t.v_active), (w, h), "{w}x{h}");
+            } else {
+                let refused = std::panic::catch_unwind(|| block(w, h));
+                assert!(refused.is_err(), "{w}x{h}: block refuses it");
+            }
+        }
+        assert_eq!(cvt_rb(4095, 2496).unwrap().clock_10khz, 65525, "655.25 MHz, the last step under the limit");
+        assert_eq!(cvt_rb(3840, 2400).unwrap().clock_10khz, 59250);
     }
 }
