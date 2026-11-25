@@ -8,7 +8,8 @@ The timing log's `vcpu` lines are each vCPU's totals at exit. perf_summary() sum
 vCPU threads' busy time; the resident's buckets other than `halted` add up to it), each resident bucket's time as a
 share of it (`guest`: translated guest code; `shadow`: building shadow page tables; `abort`: stage-2 and shadow aborts;
 `host`: exits to the host; `link`, `system`, `tlb` (CR3 loads and other TLB flushes), ...), the host's translation time
-(`host.translate`: ns and count, on the host's compile threads, so not part of cpu_ns), and the state and K1 counters
+(`host.translate`: ns and count, with its request parts (`fexc`, `admit`, `lookup`, `disk_get`, ...) and the answers by
+source: memory, the persistent compile cache on disk, fexc), and the state and K1 counters
 that show how the shadow tables fare (state.evictions, state.shadow_resets, k1.page_faults, k1.cr3_loads,
 k1.invlpgs and the rest of COUNTERS)."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
@@ -184,11 +185,17 @@ def perf_summary(text: str) -> dict | None:
         for k, (ns, n) in v.get('host', {}).items():
             h = host.setdefault(k, [0, 0]); h[0] += ns; h[1] += n
     counters = {f'{s}.{k}': sum(v.get(s, {}).get(k, 0) for v in vcpus) for s, k in COUNTERS}
+    parts: dict = {}
+    for v in vcpus:
+        for k, ns in v.get('parts', {}).items(): parts[k] = parts.get(k, 0) + ns
+    sources = [sum(v.get('sources', [0, 0, 0])[i] for v in vcpus) for i in range(3)]
     tlb = buckets.get('tlb', [0, 0])
     loads = counters['k1.cr3_loads'] + counters['k1.global_flushes']
     return {'vcpus': len(vcpus), 'cpu_ns': cpu, 'halted_ns': halted[0], 'buckets': shares,
             'host': {k: {'ns': ns, 'count': n} for k, (ns, n) in host.items()},
-            'translate': {'ns': host.get('translate', [0, 0])[0], 'count': host.get('translate', [0, 0])[1]},
+            'translate': {'ns': host.get('translate', [0, 0])[0], 'count': host.get('translate', [0, 0])[1],
+                          'parts_ns': dict(sorted(parts.items(), key=lambda kv: -kv[1])),
+                          'answers': dict(zip(('memory', 'disk', 'fexc'), sources))},
             'counters': counters,
             'cr3': {'loads': counters['k1.cr3_loads'], 'tlb_ns': tlb[0], 'tlb_share': round(tlb[0] / cpu, 4) if cpu else None,
                     'ns_per_flush': round(tlb[0] / loads) if loads else None}}
@@ -203,6 +210,9 @@ def perf_lines(s: dict | None) -> list:
     t = s['translate']
     out.append(f'host.translate {t["ns"] / 1e9:.2f} s, {t["count"]:,} translations' +
                (f', {t["ns"] / t["count"] / 1e3:.1f} us each' if t['count'] else ''))
+    if t.get('parts_ns'):
+        out.append('  parts: ' + ', '.join(f'{k} {ns / 1e9:.2f} s' for k, ns in t['parts_ns'].items() if ns >= 1e7))
+        out.append('  answers: ' + ', '.join(f'{k} {n:,}' for k, n in t['answers'].items()))
     c = s['cr3']
     out.append(f'CR3 loads {c["loads"]:,}: tlb bucket {c["tlb_ns"] / 1e9:.2f} s ({100 * (c["tlb_share"] or 0):.1f}% of cpu_ns)' +
                (f', {c["ns_per_flush"]:,} ns per flush' if c['ns_per_flush'] else ''))

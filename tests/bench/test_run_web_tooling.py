@@ -35,6 +35,7 @@ class Parse(unittest.TestCase):
 
 def vcpu(i, cpu, shadow, abort, halted, resets, cr3, tlb):
     return 'vcpu ' + json.dumps({'vcpu': i, 'cpu_ns': cpu, 'host': {'translate': [1000 * (i + 1), 2], 'run': [5, 1]},
+                                 'parts': {'fexc': 600 * (i + 1), 'admit': 100}, 'sources': [1, i, 1],
                                  'resident': {'buckets': {'guest': [cpu - shadow - abort - tlb, 10], 'shadow': [shadow, 4],
                                                           'abort': [abort, 3], 'tlb': [tlb, cr3], 'halted': [halted, 1]}},
                                  'k1': {'cr3_loads': cr3, 'global_flushes': 0, 'invlpgs': 7, 'page_faults': 9},
@@ -49,7 +50,8 @@ class PerfSummary(unittest.TestCase):
         self.assertEqual((s['vcpus'], s['cpu_ns'], s['halted_ns']), (2, 4000, 10000))
         self.assertEqual(list(s['buckets']), ['guest', 'shadow', 'abort', 'tlb'])           # largest first, no halted
         self.assertEqual((s['buckets']['shadow']['ns'], s['buckets']['shadow']['share'], s['buckets']['abort']['share']), (1000, 0.25, 0.23))
-        self.assertEqual(s['translate'], {'ns': 3000, 'count': 4})
+        self.assertEqual(s['translate'], {'ns': 3000, 'count': 4, 'parts_ns': {'fexc': 1800, 'admit': 200},
+                                          'answers': {'memory': 2, 'disk': 1, 'fexc': 2}})
         self.assertEqual({k: s['counters'][k] for k in ('state.shadow_resets', 'state.evictions', 'k1.page_faults', 'k1.cr3_loads', 'k1.invlpgs')},
                          {'state.shadow_resets': 400, 'state.evictions': 10, 'k1.page_faults': 18, 'k1.cr3_loads': 10, 'k1.invlpgs': 14})
         self.assertEqual(s['cr3'], {'loads': 10, 'tlb_ns': 80, 'tlb_share': 0.02, 'ns_per_flush': 8})
