@@ -484,9 +484,9 @@ Return prediction was taken out of natemu on November 24 at the owner's request,
 a return address that ends several blocks (a loop header, a fall-through entry, a block placed from inside another) has
 one call pair per block, the return-table entry names one pad, and when the block that made the call is another one the
 `ret x1` mispredicts on every return. The code of cc06f0f2, 115f0b34, 7a51e342, 0264a2b9 and da574812 is gone: the call
-pairs and pads, the hint table, the push stub and `s.ras`, the admission forms `FORM_RETURN` and `FORM_PADS` and the
+pairs and pads, the return table and its hints, the push stub and `s.ras`, the admission forms `FORM_RETURN` and `FORM_PADS` and the
 `NATEMU_RETURN_PREDICT` switch, the audits in the host's `check_links` and the resident's `check_tails`, the counters
-40-47, and the cases `ret-pairs`, `ret-pairs-lc`, `ret-stop`, `ret-death`, `compat32-resident-limits-ret` (`ret32`),
+40-51, and the cases `ret-pairs`, `ret-pairs-lc`, `ret-stop`, `ret-death`, `compat32-resident-limits-ret` (`ret32`),
 `micro-callchain` and the `guest-*-predict` bench cases. Return paths are as at 161176fb: returns leave through the slot's
 shared `br`, calls are plain links, and a block with no slot keeps its computed exit's `b` to the miss. What indirect
 step 1 laid down before this plan stays: the slot's `SLOT_RETURN` form (`ret x1`, now unreached), the pad word after an
