@@ -852,8 +852,8 @@ fn large_snapshot_is_answered() {
 }
 
 /// While a large answer is being written, notifications still reach the client: the guest changes its mode while the
-/// client has not yet read a snapshot's answer (longer than OUTPUT_CAP, so its write is in flight), and the client gets
-/// the answer, then the display_changed lines, and stays connected.
+/// client has read only the first bytes of a snapshot's answer (longer than OUTPUT_CAP, its write blocked), and the
+/// client gets the answer, then the display_changed lines, and stays connected.
 #[test]
 fn notifications_during_a_large_answer() {
     let d = display(16);
@@ -871,15 +871,17 @@ fn notifications_during_a_large_answer() {
     let r = rig_full(true, false, Some(d.clone()));
     let mut c = r.client();
     c.send(r#"{"jsonrpc":"2.0","id":1,"method":"snapshot"}"#);
-    // not reading: once the answer is queued its write blocks on the full socket buffer; meanwhile the mode changes
-    // ten times, two windows apart (about a second, longer than the snapshot takes), so display_changed lines are
-    // queued before and behind the answer
-    for k in 0..10u16 {
+    // the answer's first bytes arrive: its write is in flight, and with nothing more read it blocks on the socket's
+    // buffer (the answer is about 1.2 MB); meanwhile the mode changes four times, two windows apart (about 400 ms, well
+    // within SEND_TIMEOUT, after which a client that does not read is dropped), so display_changed lines are queued
+    // behind it
+    assert_eq!(c.lines.fill_buf().unwrap().first(), Some(&b'{'));
+    for k in 0..4u16 {
         modeset(&d, (640 + k, 480), 1024, (0, 0));
         std::thread::sleep(Duration::from_millis(2 * DISPLAY_CHANGED_EVERY.as_millis() as u64));
     }
     let (mut answer, mut changes) = (None, 0);
-    while answer.is_none() || changes == 0 {
+    while changes == 0 || answer.as_ref().is_none() {
         let mut line = String::new();
         assert!(c.lines.read_line(&mut line).unwrap() > 0, "disconnected after {changes} display_changed");
         let v: Value = serde_json::from_str(&line).unwrap();
@@ -888,9 +890,8 @@ fn notifications_during_a_large_answer() {
             answer = Some(v);
         } else {
             assert_eq!(v["method"], "display_changed", "{v}");
-            if v["params"]["width"] == 649 {
-                changes += 1;
-            }
+            changes += 1;
+            assert!(answer.is_some(), "display_changed before the answer");
         }
     }
     assert_eq!(c.status(2)["state"], "running", "still connected");
