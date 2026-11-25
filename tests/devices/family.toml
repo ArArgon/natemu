@@ -134,8 +134,8 @@ argv = ["tests/devices/run_platform.py", "run", "--natemu", "{natemu_stub}", "--
 
 # display-probe (Bochs display plan Task 2): `[display] device = "bochs"`, the display (QEMU's bochs-display,
 # 1234:1111) at slot 1 with its EDID's preferred mode 1024 x 768. The stock bochs DRM driver (a module, with
-# drm_kms_helper and the rest of DRM it depends on) binds it with its BARs where the launch placed them (BAR0 16 MiB at
-# E1000000H, BAR2 at E2000000H); /sys/class/drm/card0 and /dev/dri/card0 exist; card0-Virtual-1/modes lists 1024x768
+# drm_kms_helper and the rest of DRM it depends on) binds it with its BARs where the launch placed them (BAR0 32 MiB at
+# E2000000H, BAR2 at E4000000H); /sys/class/drm/card0 and /dev/dri/card0 exist; card0-Virtual-1/modes lists 1024x768
 # first and 800x600 and 640x480; dmesg names bochs-drm with `Found bochs VGA, ID 0xb0c5.` and `Found EDID data blob.`;
 # the host's `natemu: mapped` line shows the framebuffer as one region decoding at BAR0. S5 ends the run.
 [suite.cases."display-probe"]

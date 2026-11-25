@@ -53,9 +53,10 @@ pub struct Spec {
     pub height: u32,
 }
 impl Default for Spec {
-    /// 16 MiB (QEMU's `bochs-display` default) and 1024 x 768.
+    /// 32 MiB and 1024 x 768. QEMU's `bochs-display` has 16; a compositor (Weston) at 1920 x 1080 needs room for
+    /// fbcon's buffer and its own two, which 16 MiB lacks.
     fn default() -> Self {
-        Spec { vram_mib: 16, width: 1024, height: 768 }
+        Spec { vram_mib: 32, width: 1024, height: 768 }
     }
 }
 impl Spec {
@@ -668,7 +669,7 @@ mod tests {
     #[test]
     fn spec_check() {
         let spec = |vram_mib, width, height| Spec { vram_mib, width, height };
-        assert_eq!(Spec::default(), spec(16, 1024, 768));
+        assert_eq!(Spec::default(), spec(32, 1024, 768));
         let fine = [spec(16, 1024, 768), spec(4, 640, 480), spec(64, 2560, 1600), spec(32, 2560, 1600), spec(4, 64, 64)];
         for ok in [&fine[..], &[spec(64, 4095, 2048)]].concat() {
             assert_eq!(ok.check(), Ok(()), "{ok:?}");

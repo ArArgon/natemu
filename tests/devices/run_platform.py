@@ -293,12 +293,12 @@ file_end:
 '''
 # display-probe ([display] device = "bochs", crates/host/src/display): the function's identity, the driver that binds
 # it, where natemu's launch places its BARs (crates/host/src/pci/place.rs: the only function, at slot 1; memory BARs from
-# E0200000H largest first, naturally aligned: BAR0's 16 MiB at E1000000H, BAR2's 4 KiB after it), the modes the EDID
+# E0200000H largest first, naturally aligned: BAR0's 32 MiB (the default vram_mib) at E2000000H, BAR2's 4 KiB after it), the modes the EDID
 # gives (the preferred 1024 x 768 first, then the standard timings) and the driver's dmesg lines.
 DISPLAY_ID = '0x1234 0x1111'
 DISPLAY_DRIVER = 'bochs-drm'
-DISPLAY_VRAM = 16 << 20
-DISPLAY_BAR0, DISPLAY_BAR2 = 0xE100_0000, 0xE200_0000
+DISPLAY_VRAM = 32 << 20
+DISPLAY_BAR0, DISPLAY_BAR2 = 0xE200_0000, 0xE400_0000
 DISPLAY_MODES = ('1024x768', '800x600', '640x480')
 DISPLAY_DMESG = ('Found bochs VGA, ID 0xb0c5.', 'Found EDID data blob.')
 VM_SECONDS = 120
@@ -836,7 +836,7 @@ def self_check_display_probe():
              'PLATFORM-DISPLAY-PATH /sys/class/drm/card0 present', 'PLATFORM-DISPLAY-PATH /dev/dri/card0 present',
              'PLATFORM-DISPLAY-MODE 1024x768', 'PLATFORM-DISPLAY-MODE 800x600', 'PLATFORM-DISPLAY-MODE 640x480',
              'PLATFORM-DISPLAY-DMESG [    1.000000] [drm] Found bochs VGA, ID 0xb0c5.',
-             'PLATFORM-DISPLAY-DMESG [    1.000001] [drm] Framebuffer size 16384 kB @ 0xe1000000, mmio @ 0xe2000000.',
+             'PLATFORM-DISPLAY-DMESG [    1.000001] [drm] Framebuffer size 32768 kB @ 0xe2000000, mmio @ 0xe4000000.',
              'PLATFORM-DISPLAY-DMESG [    1.000002] [drm] Found EDID data blob.',
              f'PLATFORM-DISPLAY-DMESG [    1.000003] [drm] Initialized {DISPLAY_DRIVER} 1.0.0 for 0000:00:01.0 on minor 0',
              'PLATFORM-PASS']

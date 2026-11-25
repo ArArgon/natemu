@@ -92,7 +92,7 @@ pub struct Config {
     pub control_socket: Option<PathBuf>,
     /// The display (`[display] device = "bochs"`, default `"none"`): QEMU's `bochs-display` on the PCI bus.
     pub display_on: bool,
-    /// `[display] vram_mib`, `width`, `height` (16, 1024, 768); checked by `natemu::display::Spec::check`.
+    /// `[display] vram_mib`, `width`, `height` (32, 1024, 768); checked by `natemu::display::Spec::check`.
     pub display: natemu::display::Spec,
 }
 

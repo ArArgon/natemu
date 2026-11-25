@@ -1455,7 +1455,7 @@ fn control_socket_key() {
 fn display_keys() {
     let _env = lock();
     let boot = |c: &Config| to_boot(c, "RT".into(), vec![7], None).unwrap();
-    let default = natemu::display::Spec { vram_mib: 16, width: 1024, height: 768 };
+    let default = natemu::display::Spec { vram_mib: 32, width: 1024, height: 768 };
     let c = load_old(&[]).unwrap();
     assert!(!c.display_on && c.display == default && boot(&c).display.is_none(), "no display by default");
     let (_, c) = load_file(MIN, &[]);

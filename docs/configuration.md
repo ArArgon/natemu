@@ -112,7 +112,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `socket` | none | A Unix socket natemu listens on: a program that connects talks to the guest's console (see below) |
 | `[control]` | `socket` | none | A Unix socket natemu listens on for programs that drive the VM: keyboard and mouse input, quit, status ([the control API](control-api.md)) |
 | `[display]` | `device` | `"none"` | `"bochs"` gives the guest a display (see below) |
-| | `vram_mib` | `16` | The display's video memory in MiB: 4, 8, 16, 32 or 64 |
+| | `vram_mib` | `32` | The display's video memory in MiB: 4, 8, 16, 32 or 64 |
 | | `width`, `height` | `1024`, `768` | The picture size the display tells the guest it prefers |
 | `[debug]` | `pool` | `true` | Shared template pool |
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
@@ -210,9 +210,12 @@ every PCI device's memory in one 256 MiB range, largest first, and a 128 MiB one
 it lands in. `width` and `height` are the picture size the display reports as its preferred one (in its EDID, the
 description a monitor gives its computer), with 800 x 600 and 640 x 480 as the other sizes it offers. Each must be
 at least 64 and at most 4095, and very large sizes are refused (at 60 pictures a second they would need a faster
-signal than an EDID can describe; 4095 x 2048 is accepted). The video memory must hold two pictures of the preferred
-size (`vram_mib` MiB at least 2 x width x height x 4 bytes), because Linux offers only sizes that fit twice: 1920 x
-1080 needs 16, 2560 x 1600 needs 32. These limits are checked when natemu starts, even with `device = "none"`. A
+signal than an EDID can describe; 4095 x 2048 is accepted). natemu refuses video memory that cannot hold two pictures
+of the preferred size (`vram_mib` MiB at least 2 x width x height x 4 bytes), because Linux offers only sizes that fit
+twice. A graphical desktop needs more: a compositor (Weston, for example) keeps two buffers of its own besides the text
+console's, each a little taller than the picture, so give it 32 for 1920 x 1080 and 64 for 2560 x 1600 (with 16 at
+1920 x 1080 it fails to allocate its second buffer and the screen stays black). The default, 32, covers 1920 x 1080.
+These limits are checked when natemu starts, even with `device = "none"`. A
 firmware boot has no PCI bus, so it refuses the display.
 
 ```toml

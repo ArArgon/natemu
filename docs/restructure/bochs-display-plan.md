@@ -49,7 +49,7 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
   height at least 64, and `offset + stride x height` within the framebuffer. A geometry that fails it (including the
   intermediate states the driver passes through while it pans) unpublishes the mode until a later write makes it valid
   again; ENABLE is never cleared by the device.
-- The framebuffer size is fixed at launch (`vram_mib`, a power of two from 4 to 64, default 16), and must hold two
+- The framebuffer size is fixed at launch (`vram_mib`, a power of two from 4 to 64, default 32: a compositor at 1920 x 1080 needs fbcon's buffer and two of its own, which 16 lacks), and must hold two
   frames of the preferred mode (`vram_mib` MiB at least 2 x width x height x 4: Linux's `drm_vram_helper_mode_valid`
   filters out a mode larger than half of VRAM); the mapped-memory limits apply. 64 is what launch-time BAR placement
   (`pci/place.rs`) admits: memory BARs go from E0200000H upward, largest first, naturally aligned, so a 128 MiB BAR0
@@ -133,7 +133,7 @@ specification); VESA E-EDID 1.4 (the 128-byte base block). Behaviour references 
   the mode, present only with a display (a VM without one answers exactly as before).
 - A snapshot response may exceed 1 MiB: the request-line limit is on requests only, and the output cap admits a line
   larger than the cap when nothing else is queued for the client (`docs/control-api.md`, Limits).
-- `crates/cli`: `[display] device = "bochs"` (default `"none"`), `vram_mib` (16), `width`, `height` (1024, 768: the
+- `crates/cli`: `[display] device = "bochs"` (default `"none"`), `vram_mib` (32), `width`, `height` (1024, 768: the
   EDID's preferred mode); refused at configuration time, naming the key, when `vram_mib` is not a power of two from 4
   to 64, when `edid::fits` refuses the preferred mode, or when `vram_mib` cannot hold two preferred frames
   (`display::Spec::check`, which the launch also applies, so the library never panics in `edid::block`).
