@@ -205,6 +205,28 @@ Bench case `guest-paper`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds,
 | first | 23.86 | 24.20, 23.86, 23.82 | 21.37 | 21.62, 21.37, 21.34 |
 | second | 23.77 | 23.77, 23.67, 24.22 | 21.76 | 21.76, 21.60, 22.12 |
 
+## Display
+
+The Bochs display (`[display] device = "bochs"`): the guest's `bochs` DRM driver sets the 1024 x 768 mode, and
+`kms_pattern bench` (`tests/devices/kms_pattern.c`) copies 1 GiB of full frames into the framebuffer through the dumb
+buffer's own mapping, then the same amount into a buffer in guest RAM. The framebuffer is mapped device memory, so the
+guest writes it natively: it runs at the speed of RAM. Under natemu the runner then takes 100 PNG snapshots of the
+picture through the control socket (`snapshot`: the copy, the PNG and the base64 JSON line, as a client sees it). The
+control group is QEMU's `bochs-display` on the same Mac (TCG), the same guest and program. 1 vCPU, 2 GiB, one run each
+(`tests/devices/run_display.py bench`).
+
+Bench cases `display-fill` and `display-fill-qemu`; Apple M4; natemu b3d206bb; November 24, 2026:
+
+| | natemu | QEMU |
+| --- | ---: | ---: |
+| 1 GiB into the framebuffer | 0.053 s (18.9 GiB/s) | 0.279 s (3.6 GiB/s) |
+| 1 GiB into guest RAM | 0.053 s (19.0 GiB/s) | 0.276 s (3.6 GiB/s) |
+| framebuffer / RAM | 1.00 | 1.01 |
+| a 1024 x 768 snapshot | 2.4 ms | |
+
+The snapshot's PNG is small (4 KB) because the test pattern is regular; a busier picture compresses less and takes
+longer to encode.
+
 ## CPU vulnerability mitigations
 
 The numbers above use `mitigations=off`, except the Paper start, which keeps the default kernel command line and turns
