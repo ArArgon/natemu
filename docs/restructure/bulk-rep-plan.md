@@ -349,6 +349,19 @@ the SDM's MOVS:
   corpus (QEMU's signal context gives RCX/RSI/RDI and memory at the faulting element), at block sizes default and 1.
 - The 32-bit real-x86 cases (compat programs with overlap, wrap and mid-string faults added to `run_compat_kvm.py`'s
   `SELECTED`, tests/smp/run_compat_kvm.py:21, locked by the AMD KVM box) come with the 32-bit work, not the first cut.
+- **Built (November 24).** `[input.i2]` and the `i2` suite (tests/programs/family.toml, `reference = "qemu"`,
+  `engine.max_block` 0 and 1): gen_i2's overlap programs now take deltas -17, -16, -15, -9, -1, 1, 3, 8, 15, 16, 17, 31, 32
+  at counts 24, 100 and 300, both directions and all four widths (312 programs; the longer downward ones start at
+  DATA + 0x1800, and the longer ones cross the page at DATA + 0x1000), 748 programs in all, 1,496 cases, every one with
+  QEMU's answer (`natemu-test lock tests/programs i2`). `loopfaults-i2@1..6` (tests/faults/family.toml): run_slice2_faults.py
+  `--programs` on gen_i2's `--flow` corpus (input root `i2-corpus/flow/programs.json`, `testkit.inputs.corpus('gen_i2.py',
+  '--flow')`), 6,732 program x mutation cases (each page of the data and stack regions absent or read-only, and none) at
+  block sizes default and 1 per shard, 13,470 results; seeded twice (`TESTKIT_SEED_ANSWERS=1`) and locked from both runs
+  (16,136 answers, none differing between the seeds). On the M2 Max at a6c85008 plus these changes: `i2` 1,496 passed,
+  `loopfaults-i2` 13,470 passed against the lock (1 min 23 s; QEMU faulted in 1,844 of the 6,732 cases); no case disagrees
+  with QEMU. Mutation (9.4's first row, a scratch build of the shim and the admission template, reverted): the overlap
+  skip removed turns 24 `i2` cases red, `overlap-movs8-{1,3,8,15}-{24,100,300}-up` at both block sizes; MOVSQ stays green
+  there, its overlapping copies being declined by the alignment test (sources at DATA + 0x800 plus 0-7 bytes).
 - Unchanged families that must stay green: `faults` (slice 1, I7, I10 string forms), `m2`, `compat32`, `k2-repbulk`'s STOS
   cases, the gate.
 
@@ -414,8 +427,8 @@ Share x (1 - 1/speedup), with chunk 26's 4 KiB speedups (`movsq` 1.2-2.2x, `movs
 
 ## 13. The first cut, built (November 24)
 
-At b0be221c (task 0) and a23206f2 (tasks 1-7; FEX fork 39eb0db on 13a1bfc). Task 8 (the independent review) and the
-QEMU cases of 9.3 are not done; see the end of this section.
+At b0be221c (task 0) and a23206f2 (tasks 1-7; FEX fork 39eb0db on 13a1bfc). Task 8 (the independent review) is not
+done; see the end of this section. The QEMU cases of 9.3 were built afterwards (9.3, "Built").
 
 **Task 0: eligibility** (census cases, QEMU 11.1.2 with the plugin, the M2 Max; bytes are each instance's first RCX times
 the width; "moved in bulk" simulates every pass of 4.3 from the first iteration's registers, with the plan's [1, 16]
@@ -513,7 +526,7 @@ remove them is not in this design: a bounded element loop inside the page for wh
 misaligned and overlapping copies), so declined copies stop re-entering the setup per element. Owner decision:
 drop the first cut, keep it with the rule relaxed for these rows, or add that loop.
 
-**Not done** (first cut): 9.3's QEMU corpus (`i2` input and suite, gen_i2's new deltas, `loopfaults-i2`); 9.2's
+**Not done** (first cut): 9.3's QEMU corpus (built since: 9.3); 9.2's
 `movs-cpl3-us`, `movs-noncanonical`, `movs-into-noncanonical`, `movs-frame-alias`, `movs-watch-src/dst`, `movs-ac`,
 `movs-wt-wp` as a destination, `movs-smc-*`, `movs-tso` and the M2 device cases; the independent review (task 8).
 `fexc-replay` fails by design (64-bit output changes for every REP MOVSB/MOVSQ compiled with `--bulk`).
@@ -610,8 +623,7 @@ intent (`movs-first`, `movs-unassigned-src`); bulk in steps (`movs-tf`, `movs-uc
 the element loop's store before its load (37 cases). RSI's room dropped stayed green there; that was a test gap, not an
 equivalence (review B2: see the review fixes below).
 
-**Not done:** 9.3's QEMU corpus (an `i2` input and suite seeded against QEMU, gen_i2's deltas, `loopfaults-i2`): over an
-hour with the seeding; the system cases judge against an element-by-element model instead.
+**Not done in that round:** 9.3's QEMU corpus, built since (9.3, "Built").
 
 **Review fixes** (independent review of 84ddcdef; FEX fork 934032e on 7e03132: the dispatcher's comment only).
 - B1: the branch-free min is signed, valid only below 2^63, and the second cut had dropped the first cut's shift of RCX:
@@ -629,5 +641,3 @@ hour with the seeding; the system cases judge against an element-by-element mode
   (55,186 requests, 0 differences, 137 explained) and `boot-smoke` pass.
 - Minor: the TSO cases (`tso`, `movs-tso`) run the writer until the observer has scanned 20 times (no fixed round count to
   race at block size 1); `movs-uc-dst`, `movs-wt-wp-dst` and `movs-src-into-noncanonical` added.
-- Owed before the pooled gate: 9.3's QEMU corpus (`i2` input and suite, gen_i2's deltas, `loopfaults-i2`: mid-string fault
-  state against QEMU's), not done in this round.
