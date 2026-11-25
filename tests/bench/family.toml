@@ -20,8 +20,8 @@ argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{o
 
 # The return plan's in-VM kill-test (docs/restructure/return-prediction-plan.md section 6): call chains of depth 4, 16 and
 # 32 with four callers per level in a long-period order, one caller per level, trips at the bottom of depth 16 (CPUID: the
-# resident; IN: the host), and the `call` body; ns per iteration in results.json (`ns_per_iter`). Base and fix through
-# TESTKIT_BENCH_AT.
+# resident; IN: the host), and the `call` body; ns per iteration in results.json (`ns_per_iter`). Return prediction is off
+# by default: the case turns it on (NATEMU_RETURN_PREDICT=1); `micro-callchain-base` is the indirect plan's step 1 (ad452224).
 [suite.cases.micro-callchain]
 argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3",
         "--bench", "call,chain4-d4,chain4-d16,chain4-d32,chain1-d16,chain4-d16-cpuid,chain4-d16-port"]
@@ -247,18 +247,18 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/build-sam
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--compile-cache", "off", "--sample-us", "{sample_us}"]
 
-# The return plan's slowdown fix (return-prediction-plan.md section 15): repmicro and hackbench at 65a3d1eb (return prediction
-# on for every block), natemu through its build folder, this checkout's fexc and image: the base side of that kill-test.
-[suite.cases.guest-repmicro-base]
-baseline = "65a3d1eb"
+# Return prediction's switch (return-prediction-plan.md section 15): repmicro and hackbench with NATEMU_RETURN_PREDICT=1, an A/B
+# of the switch on one commit and one binary against `guest-repmicro` and `guest-hackbench` (off, the default).
+[suite.cases.guest-repmicro-predict]
 argv = ["python3", "tests/bench/repmicro_report.py", "run", "--out", "{out}", "--kernel", "{kernel}", "--initrd", "{bench_image}",
-        "--fexc", "{fexc}", "--natemu", "{natemu_baseline}/release/natemu", "--runtime", "{natemu_baseline}/aarch64-unknown-none/release/natemu-runtime"]
+        "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}"]
+env = { NATEMU_RETURN_PREDICT = "1" }
 
-[suite.cases.guest-hackbench-base]
-baseline = "65a3d1eb"
+[suite.cases.guest-hackbench-predict]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "{vcpus}", "--bench", "hackbench",
-        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu_baseline}/release/natemu",
-        "--runtime", "{natemu_baseline}/aarch64-unknown-none/release/natemu-runtime", "--compile-cache", "off"]
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases.guest-hackbench-sample]
 argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/hackbench-sample", "--markers", "{out}/hackbench-sample.markers.tsv", "--perf", "{out}/hackbench-sample.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{bench_image}",

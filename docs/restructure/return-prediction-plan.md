@@ -427,7 +427,8 @@ Narrow runs at the final code (161176fb plus this work and the review fixes), al
 
 **For the owner.** (1) The kill-test at depth 4 saves 0.82 ns per return, under the 1.5 ns bar; depths 16 and 32 pass three
 times over. The build went on (the plan's decision case is the deep chain); whether the bar is per depth is the owner's call.
-(2) An HVF exit clears the return stack: no gain across host exits. 
+(2) An HVF exit clears the return stack: no gain across host exits.
+
 ## 15. The slowdown, and return prediction off by default (November 24, 2026)
 
 The bisect on the M2 Max (bench cases `guest-repmicro` and `guest-hackbench`, 161176fb against 115f0b34) showed return
@@ -458,16 +459,20 @@ shared by every block ending there, with link records for the stub's users and t
 and the return form, and a block has no pads (`FORM_PADS`, set only with it on): calls are plain links, returns leave
 through the slot's shared `br`, indirect calls keep step 1's `blr` (pushes no return pops: harmless). That is the code at
 161176fb but for the stubs, slot forms and audits, which stay. The plan's cases (`ret-pairs`, `ret-pairs-lc`, `ret-stop`,
-`compat32-resident-limits`, `micro-callchain`) turn it on; the K1 counter checks and `ret32`'s apply only with it on.
+`compat32-resident-limits-ret`, `micro-callchain`, the `-predict` bench cases) turn it on.
 
-Kill-test (bench cases `guest-repmicro-base`, `guest-hackbench-base` at 65a3d1eb, and `guest-repmicro`, `guest-hackbench` at
-the fix, M2 Max, three alternating rounds a side):
+Kill-test: the switch on one commit and one binary (bench cases `guest-repmicro` and `guest-hackbench`, off, against
+`guest-repmicro-predict` and `guest-hackbench-predict`, `NATEMU_RETURN_PREDICT=1`; M2 Max, 503ed92e, three alternating rounds a
+side):
 
-| Case | 65a3d1eb | fix |
+| Case | off (default) | on |
 | --- | --- | --- |
-| repmicro movsb-1, ns per copy | 11.44, 10.88, 11.07 | 3.67, 3.69, 3.71 |
-| repmicro movsd-4 (32-bit) | 12.81, 12.72, 12.50 | 6.01, 5.88, 5.76 |
-| repmicro movsq-4096 | 107.82, 104.15, 105.41 | 99.93, 97.47, 99.04 |
-| hackbench wall, s (run 1 / run 2) | 16.93/16.92, 16.28/16.71, 17.01/17.30 | 14.72/14.54, 13.44/13.70, 14.78/14.41 |
+| repmicro movsb-1, ns per copy | 3.55, 3.55, 3.54 | 10.47, 11.13, 10.59 |
+| repmicro movsd-4 (32-bit) | 5.62, 5.62, 5.75 | 12.05, 12.51, 12.51 |
+| repmicro movsq-4096 | 95.31, 93.04, 95.01 | 101.03, 103.35, 101.85 |
+| hackbench wall, s (run 1 / run 2) | 13.17/13.18, 13.18/13.01, 14.05/13.85 | 15.81/16.11, 16.28/16.38, 16.23/16.40 |
 
-movsb-1 is back at 161176fb's 3.66 and hackbench at its 14.47 s, within the rounds' spread.
+Off, movsb-1 is at 161176fb's level (3.66 in the bisect) and hackbench below its 14.47 s; on, the slowdown the bisect found.
+With the switch unset, the K1 programs `ret-pairs` and `ret-death` (in `k1-c1` and every K1 run) require the return plan's
+counters 40-47 to be zero (red with the switch forced on); `compat32-resident-limits` runs off and
+`compat32-resident-limits-ret` on.

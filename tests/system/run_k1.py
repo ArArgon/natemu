@@ -2347,6 +2347,11 @@ def main():
                             problems.append(f'cpu{v} pic counter {k} = {pic[k]}, want {least}..{most}')
                     if name == 'pic-flush' and c['stats']['flushes'] < 2:
                         problems.append(f"cpu{v} flushes {c['stats']['flushes']}, want the driver's and the program's")
+                # Return plan: off (the default), no call pair, pad, call form or stub continuation at all (counters 40-47 zero).
+                for v, c in enumerate(out['cpus'] if out and name in RET_COUNT and os.environ.get('NATEMU_RETURN_PREDICT') != '1' else []):
+                    pic = c['stats']['k1']['pic']
+                    if any(pic[40:48]):
+                        problems.append(f'cpu{v} return prediction off, yet pic counters 40-47 = {pic[40:48]}')
                 # Return plan: the resident counters of the call pairs, pads and stubs (natemu_abi::pic::count, least per CPU).
                 # (Not under a PIC test mode, which changes how blocks are entered: run_pic.py checks its own counters.)
                 for v, c in enumerate(out['cpus'] if out and name in RET_COUNT and not os.environ.get('NATEMU_PIC_TEST') and os.environ.get('NATEMU_RETURN_PREDICT') == '1' else []):

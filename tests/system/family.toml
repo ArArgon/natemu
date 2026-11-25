@@ -432,6 +432,12 @@ smoke = true
 [suite.cases."compat32-resident-limits"]
 argv = ["tests/smp/run_slice3_vm.py", "compat-limits", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
+
+# The same with return prediction on (return-prediction-plan.md section 15): `ret32`'s counters (pairs linked, pads hinted,
+# push-stub entries) apply.
+[suite.cases."compat32-resident-limits-ret"]
+argv = ["tests/smp/run_slice3_vm.py", "compat-limits", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
 env = { NATEMU_RETURN_PREDICT = "1" }
 
 [suite.cases."mixed-far"]
