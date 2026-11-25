@@ -90,20 +90,7 @@ pub mod count {
     pub const MISS_CURRENT: usize = 29;
     pub const MISS_REVALIDATE: usize = 30;
     pub const MISS_NEW: usize = 31;
-    /// Indirect plan step 1 (every build): computed exits given their own appended words, as a jump (`br x1`) and as a
-    /// call (`blr x1`); link points of shared code given theirs; checked links made through a link point's words (the
-    /// others go to the slot); stops taken at once at an appended word, and of them in a dead block.
-    pub const TAILS: usize = 32;
-    pub const TAIL_CALLS: usize = 33;
-    pub const TAIL_POINTS: usize = 34;
-    pub const TAIL_LINKS: usize = 35;
-    pub const TAIL_STOPS: usize = 36;
-    pub const TAIL_DEAD_STOPS: usize = 37;
-    /// Stops taken at once inside a slot's lookup form; stops at an armed computed exit's hot trampoline of a block with
-    /// appended words (the tests `PIC_TEST_LOOKUP`, `PIC_TEST_TRAMPOLINE`).
-    pub const LOOKUP_STOPS: usize = 38;
-    pub const TRAMPOLINE_STOPS: usize = 39;
-    pub const COUNTS: usize = 40;
+    pub const COUNTS: usize = 32;
 }
 
 /// The class of a link (source, target): both position-independent and the target starting on the source's start

@@ -161,8 +161,8 @@ abort). Removing one trip saves 50 to 500 times what the sure gate cuts take off
 
 - **Misses, links, aborts.** Their count reductions are other, larger projects, mostly root cause A of the architecture
   review (currency per address space: configure's misses, aborts and remade links follow its CR3 loads), or are already
-  pooled with this fix (indirect step 1 and return prediction take computed exits off the dispatcher; bulk REP strings
-  take string iterations off the resident). Not this plan's.
+  pooled with this fix (bulk REP strings take string iterations off the resident; indirect step 1 and return prediction,
+  which took computed exits off the dispatcher, were removed on November 24). Not this plan's.
 - **Helpers: this plan owns them, and they are its largest item.** Configure's 14.1 M helper trips cost about
   14.1 M x (132 + 58 + 33) ns = **3.1 s**, more than everything steps 1-3 can save (section 10). No other plan owns
   them: `svc #X87` is the x87 transcendental, remainder, scale and extract instructions, `svc #STRING` the PCMPxSTRx

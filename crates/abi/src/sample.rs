@@ -186,14 +186,6 @@ pub const STEP: u8 = 4;
 pub const HEAD: u8 = 5;
 pub const NO_BLOCK: u8 = 6;
 pub const OUTSIDE: u8 = 7;
-/// Indirect plan step 1: in the words the resident appended after a block's code for one exit (`cache::Block::tail`): `rip`
-/// the target (x0), `context` and `frame` the block's (its first source frame), `at` the word's role ([`TAIL_WORD`] bits:
-/// 0 the `bl` to the lookup form, 1 the `br`/`blr`, 2 the pad; [`TAIL_CALL`]: the exit is a call; [`TAIL_POINT`]: a
-/// link point's, a checked link of shared code, not the computed exit's), [`DEAD`] in `flags` for a dead block's.
-pub const TAIL: u8 = 8;
-pub const TAIL_WORD: u16 = 3;
-pub const TAIL_CALL: u16 = 4;
-pub const TAIL_POINT: u16 = 8;
 
 /// `flags` of a sample in a block ([`BLOCK`], [`PROBE`], [`STEP`]): the PC was in the block's hot copy; the block was dead
 /// (its code still ran); its native offset did not fit `at` (saturated).
@@ -430,8 +422,6 @@ pub struct BlockView {
 pub trait Places {
     /// The block whose code holds `pc` (the step slot's block included), dead ones too.
     fn block(&self, pc: u64) -> Option<BlockView>;
-    /// The block whose appended words hold `pc` (dead ones too; `offset` unused) and the word's role ([`TAIL`]'s `at`).
-    fn tail(&self, pc: u64) -> Option<(BlockView, u16)>;
     /// Dispatcher slot `k`'s code context (`Control::slot_contexts`; `cache::NO_CONTEXT`: none).
     fn slot_context(&self, k: usize) -> u64;
     /// The first source page of the block current for (`rip`, `context`), found with no walk (`cache::current_at`).
@@ -536,11 +526,6 @@ pub fn record(rung: u64, st: &Stretches, t0: u64, flushes: u64, elr: u64, x0: u6
             None => CALL_UNKNOWN,
         };
         s.flags = call << CALL_SHIFT;
-        return s;
-    }
-    if let Some((b, role)) = p.tail(elr) {
-        (s.place, s.rip, s.context, s.frame, s.at) = (TAIL, x0, b.context, (b.frame >> 12) as u32, role);
-        s.flags = if b.dead { DEAD } else { 0 };
         return s;
     }
     let probe = crate::execution::probe::at(elr).is_some();
@@ -732,7 +717,6 @@ mod tests {
     }
     const BLOCK_PC: u64 = CODE_VA + HEAD_BYTES as u64 + 0x1000;
     const STEP_PC: u64 = CODE_VA + 0x40;
-    const TAIL_PC: u64 = BLOCK_PC + 0x100;
     const TARGET: u64 = 0x40_1123;
     impl Places for Fake {
         fn block(&self, pc: u64) -> Option<BlockView> {
@@ -744,10 +728,6 @@ mod tests {
                 p if p == STEP_PC => Some(BlockView { rip: 0x7000, step: true, dead: true, ..view }),
                 _ => None,
             }
-        }
-        fn tail(&self, pc: u64) -> Option<(BlockView, u16)> {
-            let view = BlockView { rip: 0x40_0000, context: 0x6, frame: 0x45_6000, dead: true, ..BlockView::default() };
-            (TAIL_PC..TAIL_PC + 12).contains(&pc).then(|| (view, ((pc - TAIL_PC) / 4) as u16 | TAIL_CALL))
         }
         fn slot_context(&self, k: usize) -> u64 {
             if k == 2 { 0x9 } else { NO_CONTEXT }
@@ -807,9 +787,6 @@ mod tests {
         let s = at(STEP_PC, 0, 0);
         assert_eq!((s.place, s.rip, s.flags), (STEP, 0x7000, DEAD));
         assert_eq!(at(CODE_VA + probe::offset(0) + 4, 0, 0).place, HEAD, "an empty probe slot of the head");
-        // Indirect plan step 1: a block's appended words, the target in x0, the word's role in `at`.
-        let t = at(TAIL_PC + 4, TARGET, 0);
-        assert_eq!((t.place, t.rip, t.context, t.frame, t.at, t.flags), (TAIL, TARGET, 6, 0x456, 1 | TAIL_CALL, DEAD));
         let none = at(BLOCK_PC + 0x1000, 0, 0);
         assert_eq!((none.place, none.frame), (NO_BLOCK, (BLOCK_PC + 0x1000 - CODE_VA) as u32));
         assert_eq!(at(CODE_VA - 4, 0, 0).place, OUTSIDE);

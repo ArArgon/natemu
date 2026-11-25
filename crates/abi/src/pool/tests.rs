@@ -128,7 +128,6 @@ impl Owned {
             links: self.links,
             dispatch_exit: self.dispatch_exit,
             rep_exits: self.rep_exits,
-            exit_forms: 0,
             code: &self.code,
             sites: &self.sites,
             relocs: &self.relocs,

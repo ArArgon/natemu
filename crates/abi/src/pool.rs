@@ -185,8 +185,6 @@ pub struct Parts<'a> {
     pub links: [LinkPoint; MAX_LINK_POINTS],
     pub dispatch_exit: u32,
     pub rep_exits: u32,
-    /// Indirect plan step 1: the host's hint ([`crate::execution::cache::Block::exit_forms`]).
-    pub exit_forms: u32,
     pub code: &'a [u8],
     pub sites: &'a [u8],
     pub relocs: &'a [u32],
@@ -236,7 +234,6 @@ impl Parts<'_> {
         );
         put32(out, 52, self.dispatch_exit);
         put32(out, 56, self.rep_exits);
-        put32(out, 60, self.exit_forms);
         for (i, l) in self.links.iter().enumerate() {
             put32(out, 64 + 16 * i, l.offset);
             put32(out, 68 + 16 * i, l.word);
@@ -267,7 +264,6 @@ pub struct Entry<'a> {
     pub links: [LinkPoint; MAX_LINK_POINTS],
     pub dispatch_exit: u32,
     pub rep_exits: u32,
-    pub exit_forms: u32,
     pub code: &'a [u8],
     sites: &'a [u8],
     relocs: &'a [u8],
@@ -316,7 +312,7 @@ pub fn decode(bytes: &[u8]) -> Result<Entry<'_>, Refusal> {
     let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     let (len, code, guest_bytes, prefix) = (u32_at(24), u32_at(28), u32_at(32), u32_at(36));
     let (sites, relocs, flags) = (u32_at(40), u32_at(44), u32_at(48));
-    let (dispatch_exit, rep_exits, exit_forms) = (u32_at(52), u32_at(56), u32_at(60));
+    let (dispatch_exit, rep_exits) = (u32_at(52), u32_at(56));
     if len as usize != bytes.len() {
         return Err(Refusal::Length);
     }
@@ -361,9 +357,6 @@ pub fn decode(bytes: &[u8]) -> Result<Entry<'_>, Refusal> {
     {
         return Err(bad("REP exits"));
     }
-    if exit_forms & !crate::execution::cache::FORMS != 0 {
-        return Err(bad("exit forms"));
-    }
     let mut last = None;
     for i in 0..relocs as usize {
         let r = u32::from_le_bytes(bytes[relocs_at + 4 * i..][..4].try_into().unwrap());
@@ -381,7 +374,6 @@ pub fn decode(bytes: &[u8]) -> Result<Entry<'_>, Refusal> {
         links,
         dispatch_exit,
         rep_exits,
-        exit_forms,
         code: &bytes[code_at..sites_at],
         sites: &bytes[sites_at..relocs_at],
         relocs: &bytes[relocs_at..prefix_at],

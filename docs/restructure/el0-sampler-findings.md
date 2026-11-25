@@ -262,7 +262,8 @@ configure steps be read. The FEX-body row needs a tighter skid model before `bui
 
 - Build every fix whose row reads "Build": indirect step 1, return prediction, the resident's trip cost (return path
   and footprint), bulk REP string operations, flag words, and page-crossing checks. Correctness first. (Return prediction was built and then removed on November 24, at the owner's
-  request: it made returns slower, [return plan](return-prediction-plan.md) section 15.)
+  request: it made returns slower, [return plan](return-prediction-plan.md) section 15. Indirect step 1 was built and then
+  reverted the same day: it made `guest-luajit-interp` 7-12% slower, [indirect plan](indirect-cache-plan.md) section 14.)
 - Pool them: no A/B per fix; one combined A/B against this page's commit and one profile round over all of them at the
   end, with the gate. Each fix keeps its own kill-test and correctness tests.
 - No FEX code-quality track for now.

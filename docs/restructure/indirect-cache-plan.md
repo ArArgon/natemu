@@ -1,12 +1,10 @@
 # Indirect jumps and calls: a branch per site, then a one-entry inline cache (plan)
 
-Status: step 1 built (section 13: the kill-test, what was built, the tests), November 23, 2026, on a branch from
-`m2-sampler` 810bd50b; its A/B is the owner's pooled round over all fixes. Revision 2, after an independent design review
-(section 12): step 1 accepted with fixes, taken in; step 2 deferred, and dropped by the kill-test. This plan goes first: it builds
-what the [return prediction plan](return-prediction-plan.md) then uses (the slot's forms, the words appended to a block, `blr`
-at indirect calls). Two plans, not one, because each has its own sampler number, benchmarks and A/B. The return plan was
-removed on November 24 (its section 16); what this step built for it (the slot's return form, the pad after `blr x1`) stays,
-unreached.
+Status: **step 1 reverted** (November 24, 2026, section 14): built November 23 (section 13), it made the threaded
+interpreter `guest-luajit-interp` 7-12% slower, and the detour into the appended words is the cause, not the prediction.
+Computed exits and checked links leave through the slot's shared `br` again, as before step 1. Step 2 was deferred and
+dropped by the kill-test. The [return prediction plan](return-prediction-plan.md), which built on step 1, was removed the same
+day (its section 16). Sections 1-13 are the record of what was planned and built.
 
 ## 1. Why
 
@@ -323,3 +321,54 @@ checks (`indirect-*`, `frame-randomization*`, `k1-c1`, `k1-c2@*`, `pic-*`, `comp
 The A/B and the profile are left to the owner's pooled round over all fixes: section 7's cases, with flush counts, since the
 code area now holds 12 bytes more per indirect exit, and more per link point of shared code. The in-VM check
 (`guest-luajit-interp`, `guest-luajit`) belongs to that round.
+
+## 14. Results and removal (November 24, 2026)
+
+**The slowdown.** The in-VM check of section 5 (`guest-luajit-interp`, M2 Max, wall seconds of run 2) was first run in the
+owner's pooled round. Earlier commits were built through `TESTKIT_BENCH_AT`. Results: a7cd8e82 (before step 1) 4.54 and
+4.64; deef6f63 (step 1) 5.17; 161176fb (step 1 and bulk REP) 4.91; 0264a2b9 (every fix, return prediction off) 4.96 and 4.96.
+That is +7-12% with a noise of about 2%. `guest-luajit` read +4-6%, near its noise, and 7zip was within noise.
+
+**Diagnosis.** Two builds of da574812 (0264a2b9 plus test and switch fixes) changed only where the words lead, on the same
+case and machine, one run each:
+
+| Build | A computed exit | Run 2 (s) | Run |
+| --- | --- | ---: | --- |
+| da574812 as built (0264a2b9's figure) | `b` to its words: `bl` the lookup form, `ret`, the site's own `br x1` | 4.96 | (pooled round) |
+| D2 | `b` to its words, whose first word is `b` to the slot's ordinary form: the shared `br x1` | 4.875 | 20261124-163031-5a77 |
+| D1 | `b` to the slot directly, as before step 1 (checked links still through their words, as in D2) | 4.564 | 20261124-163348-640e |
+
+D1 against D2 is the detour alone. Each dispatch takes one more taken branch, into a line at the end of the block's code
+(not its hot copy). That costs 0.31 s (about 7%), and D1 is back at a7cd8e82's level. D2 against step 1 is a branch per site
+against the shared one, with the detour in both: 0.085 s in the shared branch's favour, within noise. The host kill-test's
+gain (section 13) came from patterns the shared branch predicts badly. The interpreter's real bytecode streams are
+regular, and the shared branch with its history already predicts them, so a branch per site gains nothing. The extra
+taken branch, and the cache line it lands on, are not paid back. The two costs were not separated (that would need the
+words in the hot copy). The lookup's `ret` was predicted: step 1 is within noise of D2, which has no `bl`/`ret`.
+
+**Removed** (the owner's call; the code of ab033f6b, deef6f63 and bd97a67d reverted, and merged by hand over the later
+commits):
+- the words appended to a block (`Block::tail`, `tail_words`, `append`, a checked link's rewrite through them);
+- the slot's lookup and return forms (slots back to 128 bytes, the area to 16 KiB);
+- admission's `exit_forms` hint;
+- the tail stop rule;
+- the sampler's `TAIL` place and its slot-form classes;
+- pic counters 32-39;
+- the host's and the `link-check` resident's audits of the appended words;
+- the cases `indirect-sites-lc` and `indirect-stop`, run_k1's `--link-check`, and `host-dispatch-micro` (fc09a6a9; this
+  section's kill-test numbers are reproducible at 810bd50b).
+
+**Kept:**
+- `indirect-sites` (the K1 program) and `compat32-resident-limits`' `indirect32`, as tests of indirect jumps and calls
+  through absolute and shared code. Their values are unchanged, and only the counter checks of appended words are gone:
+  `indirect32` keeps its least instances and checked links.
+- Page-crossing step A, the trip-cost steps, bulk REP and the sampler are as they were.
+
+**After the revert** (`guest-luajit-interp`, M2 Max, run 2, alternating with a7cd8e82 built through `TESTKIT_BENCH_AT`, two
+rounds): reverted 4.57 and 4.58 s, a7cd8e82 4.53 and 4.59 s. Step 1's slowdown is gone. Two earlier single runs of the reverted
+tree (4.76, 4.78) came while other sessions' work held the machine between windows and did not repeat in the alternating
+rounds.
+
+A per-site branch would have to cost nothing on the predicted path before it is worth retrying. That means words in the
+hot copy, no `bl`/`ret`, and a benchmark whose shared branch mispredicts. The census's `build` and `sqlite` would be such
+benchmarks, which no in-VM case of this plan measured.

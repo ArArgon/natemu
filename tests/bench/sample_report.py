@@ -63,25 +63,9 @@ VERSIONS = (1, 2)           # 1: before EL0_UNKNOWN (its samples were counted re
 RECORD_BYTES = 32
 OBJECT_HEADER_BYTES = 56
 FILE, EL0, RESIDENT, HALTED, MARK, CLOCK, VCPU, COUNT, TOGGLE, PASS, EL0_UNKNOWN = range(11)
-BLOCK, PROBE, DISPATCH, STEP, HEAD, NO_BLOCK, OUTSIDE, TAIL = range(1, 9)
+BLOCK, PROBE, DISPATCH, STEP, HEAD, NO_BLOCK, OUTSIDE = range(1, 8)
 PLACES = {BLOCK: 'block', PROBE: 'probe', DISPATCH: 'dispatch', STEP: 'step', HEAD: 'head', NO_BLOCK: 'no_block',
-          OUTSIDE: 'outside', TAIL: 'tail'}
-# Indirect plan step 1: a dispatch sample's slot form (its offset in the 256-byte slot: `cache::SLOT_LOOKUP`, `SLOT_RETURN`),
-# and a tail sample's role (`sample::TAIL_WORD`, `TAIL_CALL`, `TAIL_POINT` in `at`).
-SLOT_BYTES, SLOT_LOOKUP, SLOT_RETURN = 256, 64, 128
-FORMS = ('ordinary', 'lookup', 'return')
-TAIL_WORDS = ('bl', 'branch', 'pad', 'word3')
-TAIL_CALL, TAIL_POINT = 4, 8
-
-
-def slot_form(at):
-    o = at % SLOT_BYTES
-    return FORMS[0] if o < SLOT_LOOKUP else FORMS[1] if o < SLOT_RETURN else FORMS[2]
-
-
-def tail_role(at):
-    """'jump-bl', 'call-branch', 'link-call-pad', ...: the exit (computed, or a shared link point's `link-`), jump or call, the word."""
-    return f"{'link-' if at & TAIL_POINT else ''}{'call' if at & TAIL_CALL else 'jump'}-{TAIL_WORDS[at & 3]}"
+          OUTSIDE: 'outside'}
 HOT, DEAD, FAR = 1, 2, 4
 OLD = 1                     # a resident sample's flags: rung before every stretch the resident kept (version 2)
 AT_BIAS = 4                 # a block sample's `at` is its native offset + 4 (a PIC block's full entry word, -4, is 0)
@@ -490,11 +474,11 @@ def buckets_between(snap_lines, t0, t1, names):
 # --- the samples file ------------------------------------------------------------------------------------------------
 class Tally:
     """Counts of one (vCPU or all, phase)."""
-    __slots__ = ('kinds', 'places', 'privilege', 'modes', 'calls', 'flags', 'since', 'blocks', 'words', 'forms', 'tails', 'back')
+    __slots__ = ('kinds', 'places', 'privilege', 'modes', 'calls', 'flags', 'since', 'blocks', 'words', 'back')
 
     def __init__(self, blocks=False):
         self.kinds, self.places, self.privilege, self.modes = (collections.Counter() for _ in range(4))
-        self.forms, self.tails, self.back = collections.Counter(), collections.Counter(), collections.Counter()
+        self.back = collections.Counter()
         self.calls, self.flags, self.since = collections.Counter(), collections.Counter(), collections.Counter()
         self.blocks = collections.Counter() if blocks else None
         self.words = collections.Counter() if blocks else None
@@ -595,15 +579,12 @@ class Profile:
                 if rip >> (RIP_BITS - 1): rip |= ~((1 << RIP_BITS) - 1) & (2 ** 64 - 1)
                 pname = PLACES.get(place, f'place{place}')
                 inblock = place in (BLOCK, PROBE, STEP)
-                if inblock or place in (DISPATCH, TAIL):
+                if inblock or place == DISPATCH:
                     has_ctx = inblock or context != 0     # a dispatcher sample has its slot's context, or 0 for none
                     priv = privilege(context, rip, has_ctx)
                     md = mode(context) if has_ctx else None
                 else: priv, md = 'unknown', None
                 call = CALLS.get(flags >> CALL_SHIFT & 3) if place == DISPATCH else None
-                at_ = w[2] >> 40 & 0xffff
-                form = slot_form(at_) if place == DISPATCH else None
-                role = tail_role(at_) if place == TAIL else None
                 sb = since_bucket(w[3] >> 32, freq)
                 key = (rip, w[3] & 0xffff_ffff, context) if inblock else None
                 for p in ps:
@@ -611,8 +592,6 @@ class Profile:
                         t_.kinds['el0'] += 1; t_.places[pname] += 1; t_.privilege[priv] += 1; t_.since[sb] += 1
                         if md: t_.modes[md] += 1
                         if call: t_.calls[call] += 1
-                        if form: t_.forms[form] += 1
-                        if role: t_.tails[role] += 1
                         if inblock:
                             if flags & HOT: t_.flags['hot'] += 1
                             if flags & DEAD: t_.flags['dead'] += 1
@@ -678,7 +657,6 @@ class Profile:
             privilege=dict(t.privilege), privilege_pct={k: pct(n, el0) for k, n in t.privilege.items()},
             modes=dict(t.modes), dispatch_calls={k: t.calls[k] for k in ('return', 'not_call', 'unknown')},
             dispatch_call_pct={k: pct(t.calls[k], t.places['dispatch']) for k in ('return', 'not_call', 'unknown')},
-            dispatch_forms={k: t.forms[k] for k in FORMS}, tail_roles=dict(sorted(t.tails.items())),
             hot=t.flags['hot'], dead=t.flags['dead'], far=t.flags['far'],
             since_log2_us={str(k): n for k, n in sorted(t.since.items())})
 
@@ -780,22 +758,19 @@ def markdown(rep):
            f'{rep["vcpus"]} vCPU(s), every {rep["interval_us"]} us requested ({rep["requested_per_s"]}/s per vCPU), '
            f'{rep["duration_s"]} s, sampling on {rep["on_s"]} s; {rep["objects"]} objects. A profile, not a timing.', '',
            '## By phase (all vCPUs)', '',
-           '| phase | s | samples | EL0 all % | EL0 % | EL0 no place % | resident % | halted % | block | probe | dispatch | tail | step | head | no block | outside | user % | kernel % | ret % | not call % | unknown % |',
-           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+           '| phase | s | samples | EL0 all % | EL0 % | EL0 no place % | resident % | halted % | block | probe | dispatch | step | head | no block | outside | user % | kernel % | ret % | not call % | unknown % |',
+           '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for ph in rep['phases']:
         s = ph['summed']; e = s['el0_place_pct']; c = s['dispatch_call_pct']; k = s['kind_pct']; pr = s['privilege_pct']
         out.append(f'| {ph["name"]} | {ph["end_s"] - ph["start_s"]:.1f} | {s["samples"]} | {p(s["el0_all_pct"])} | {p(k["el0"])} | '
                    f'{p(k["el0_unknown"])} | {p(k["resident"])} | '
-                   f'{p(k["halted"])} | {p(e["block"])} | {p(e["probe"])} | {p(e["dispatch"])} | {p(e["tail"])} | {p(e["step"])} | {p(e["head"])} | '
+                   f'{p(k["halted"])} | {p(e["block"])} | {p(e["probe"])} | {p(e["dispatch"])} | {p(e["step"])} | {p(e["head"])} | '
                    f'{p(e["no_block"])} | {p(e["outside"])} | {p(pr.get("user"))} | {p(pr.get("kernel"))} | {p(c["return"])} | '
                    f'{p(c["not_call"])} | {p(c["unknown"])} |')
     out += ['', 'EL0 all: EL0 samples with a place and without (rung in generated code, taken after the next trip out began: its PC',
             'is a later stretch\'s), the share to set beside the guest bucket. Everything below is of EL0 samples with a place.',
             f'Resident samples rung before every stretch the resident kept (counted resident): {rep["phases"][0]["summed"]["resident_old"]}.',
-            'EL0 places are % of EL0 samples; the call test (return, not a call, unknown) is % of dispatch samples; tail: the words',
-            'appended to a block for an indirect jump or call or a shared block\'s checked link (indirect plan step 1).', '']
-    whole_s = rep['phases'][0]['summed']
-    out += [f"Dispatch samples by slot form: {whole_s['dispatch_forms']}; tail samples by role: {whole_s['tail_roles'] or 'none'}.", '',
+            'EL0 places are % of EL0 samples; the call test (return, not a call, unknown) is % of dispatch samples.', '',
             '## Per vCPU (whole run)', '', '| vCPU | samples | per s | EL0 all % | EL0 % | EL0 no place % | resident % | halted % | rings | bells | in wait | merged | lost | written | drained |',
             '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     whole = rep['phases'][0]

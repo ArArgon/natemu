@@ -1027,7 +1027,7 @@ pub struct K1 {
     dispatch_misses: u64,
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
-    pic: Vec<u64>,
+    pic: [u64; natemu_abi::pic::count::COUNTS],
     pic_transitions: [u64; 5],
     /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
     #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
@@ -1321,7 +1321,7 @@ impl K1 {
                     .zip(c.sys_fast_declined)
                     .collect(),
             },
-            pic: c.pic_counts.to_vec(),
+            pic: c.pic_counts,
             pic_transitions: [0; 5],
             page_study: K1PageStudy::new(&c.page_study),
             pcid_study: c.pcid_study,
@@ -1542,47 +1542,6 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     // PIC study stage 3: an instance's link points are its translation's (which holds the words); the dispatcher slots.
     let slots = (cache::DISPATCH + cache::DISPATCH_SLOT_BYTES) as u64
         ..(cache::DISPATCH + cache::DISPATCH_BYTES) as u64;
-    // Indirect plan step 1: an appended entry's first word at `at`, `w`, of a block of `context`: `bl` to the lookup form of
-    // the slot serving that context (Some(true)), or `b` to the miss (Some(false)).
-    let lookup_call = |at: u64, w: u32, context: u64| {
-        let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
-        let serves = |to: u64| {
-            let k = (to - cache::DISPATCH as u64) as usize / cache::DISPATCH_SLOT_BYTES;
-            control.slot_contexts.get(k) == Some(&context)
-        };
-        match w >> 26 {
-            0x25 if slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == cache::SLOT_LOOKUP as u64 && serves(to) => Some(true),
-            0x05 if to == cache::DISPATCH_MISS as u64 => Some(false),
-            _ => None,
-        }
-    };
-    // Every block's appended words: each entry `bl` to its context's lookup form (or `b` to the miss, with no slot), then
-    // `blr x1` for a call and `br x1` otherwise (its hint, `exit_forms`), then `b` to the miss; a computed exit with them
-    // branches to them, or to the miss with none bound.
-    for b in blocks.iter().filter(|b| b.tail_entries() != 0) {
-        for point in [None].into_iter().chain((0..exec::MAX_LINK_POINTS).map(Some)) {
-            let Some(at) = b.tail(point) else { continue };
-            let bound = lookup_call(at, word(at), b.context);
-            let second = if b.tail_calls(point) { 0xd63f_0020 } else { 0xd61f_0020 };
-            let pad = 0x1400_0000 | ((cache::DISPATCH_MISS as u64).wrapping_sub(at + 8) >> 2) as u32 & 0x03ff_ffff;
-            if bound.is_none() || word(at + 4) != second || word(at + 8) != pad {
-                return Err(format!(
-                    "appended words of the block at {:#x} ({point:?}): {:#010x} {:#010x} {:#010x}",
-                    b.rip,
-                    word(at),
-                    word(at + 4),
-                    word(at + 8)
-                ));
-            }
-            if point.is_none() {
-                let exit = u64::from(b.code) + u64::from(b.dispatch_exit);
-                let to = if bound == Some(true) { at } else { cache::DISPATCH_MISS as u64 };
-                if word(exit) != 0x1400_0000 | (to.wrapping_sub(exit) >> 2) as u32 & 0x03ff_ffff {
-                    return Err(format!("computed exit of the block at {:#x}: word {:#010x}", b.rip, word(exit)));
-                }
-            }
-        }
-    }
     for b in blocks
         .iter()
         .filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM) == 0)
@@ -1624,14 +1583,11 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 if w == natemu_abi::pic::SVC_LINK {
                     continue;
                 }
-                // A checked link: `b` to a dispatcher slot, or (indirect plan step 1, shared code) to its point's appended
-                // words, whose words the loop below checks.
+                // A checked link: `b` to a dispatcher slot.
                 let slot =
                     |to: u64| slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == 0;
-                let k = b.links.iter().position(|q| q.offset == p.offset);
-                let own = |to: u64| k.and_then(|k| b.tail(Some(k))) == Some(to) && lookup_call(to, word(to), b.context).is_some();
-                if !branch(svc, w).is_some_and(|to| slot(to) || own(to)) {
-                    return Err(format!("{}, its `svc` word {w:#010x}", bad()));
+                if !branch(svc, w).is_some_and(slot) {
+                    return Err(bad());
                 }
                 linked.insert((b.number, (svc - u64::from(b.code)) as u32), cache::CHECKED);
                 continue;
@@ -4320,14 +4276,9 @@ pub fn run(
         Ok("forge-noncanonical") => cache::PIC_TEST_FORGE_NONCANONICAL,
         Ok("forge-half") => cache::PIC_TEST_FORGE_HALF,
         Ok("nolocal") => cache::PIC_TEST_NOLOCAL,
-        Ok("tail0") => cache::PIC_TEST_TAIL,
-        Ok("tail1") => cache::PIC_TEST_TAIL + 1,
-        Ok("tail2") => cache::PIC_TEST_TAIL + 2,
-        Ok("lookup") => cache::PIC_TEST_LOOKUP,
-        Ok("trampoline") => cache::PIC_TEST_TRAMPOLINE,
         Ok(other) => {
             return Err(format!(
-                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical, forge-half, nolocal or tail0-tail2"
+                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical or forge-half"
             ));
         }
     };
@@ -4984,7 +4935,6 @@ fn translation(
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
     state.rep_exits = rep_exit_mask(&block);
-    state.exit_forms = u64::from(block.exit_forms);
     state.sti_first = u64::from(block.sti_first);
     compiler.charge(crate::perf::STAGE, t);
     // The template pool (cross-vCPU reuse plan, chunk 2): a template is published after its admission, once per answer; the

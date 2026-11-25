@@ -1508,15 +1508,14 @@ def mixed_user_shld_6g():
 
 
 def indirect32():
-    """Indirect plan step 1 in 32-bit code (natemu only): U's frame holds a library at U + 0x400 and a function at U + 0xf00,
+    """Indirect jumps and calls in 32-bit code (natemu only; built for indirect plan step 1, kept for its values): U's frame holds a library at U + 0x400 and a function at U + 0xf00,
     and is also mapped at A1 and A2 (two more 32-bit user pages); a trampoline frame T is also mapped at T2. The library, a
     get-PC thunk and a loop of 64 rounds through three jump sites (`jmp eax`) of 1, 4 and 64 targets and three call sites
     (`call eax`) of as many (position-independent tables), each target counting its runs in memory (jumps: `jmp edi` back),
     ends with `jmp ebp`. U calls it at U, three times at A1 (a shared translation), three times through T (`jmp` A1's) and
     three through T2 (the same bytes: `jmp` A2's, a checked link out of shared code), then T + 0x300 and T2 + 0x300 three
     times each (`call` the function at A1, A2: a checked link that is a call), storing what the function returns (its
-    alias + 5). Every count, both returns, the end at INT 0x80, and (`pic_min`) appended words for 32-bit jumps, calls and
-    shared link points, with checked links through them."""
+    alias + 5). Every count, both returns, the end at INT 0x80, and (`pic_min`) the least shared instances and checked links."""
     a1, a2, t, t2 = 0x2a0000, 0x2a1000, 0x2a8000, 0x2a9000
     jc, cc, res = C.W + 0x400, C.W + 0x500, C.W + 0x600
     lib = C.U + 0x400
@@ -1543,7 +1542,7 @@ def indirect32():
     memory = [P_zero(jc, 0x210), {'addr': f'0x{t:x}', 'data': bytes(tramp).hex(), 'capture': False},
               leaf(a1, C.U), leaf(a2, C.U), leaf(t2, t)]
     prog = C.program('indirect32', C.ENTER() + C.handlers('    jmp .fin\n'), text, memory)
-    prog['pic_min'] = [(26, 1), (28, 2), (32, 3), (33, 3), (34, 1), (35, 2)]
+    prog['pic_min'] = [(26, 1), (28, 2)]
     runs = lambda k: 10 * (64 * (k == 0) + 16 * (k < 4) + 1)
     counts = b''.join(struct.pack('<I', runs(k)) for k in range(64))
     end = C.U + len(C.user32(main))

@@ -119,11 +119,11 @@ class Base(unittest.TestCase):
 class Format(unittest.TestCase):
     def test_constants_are_the_abi_s(self):
         text = (ROOT / 'crates/abi/src/sample.rs').read_text()
-        const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u16|u32|u64|i64|usize) = ([^;]+);', text)}
+        const = {m[1]: m[2] for m in re.finditer(r'pub const (\w+): (?:u8|u32|u64|i64|usize) = ([^;]+);', text)}
         num = lambda n: int(const[n].replace('_', ''), 0)
         for n in ('FILE', 'EL0', 'RESIDENT', 'EL0_UNKNOWN', 'OLD', 'HALTED', 'MARK', 'CLOCK', 'VCPU', 'COUNT', 'TOGGLE', 'PASS', 'BLOCK', 'PROBE',
                   'DISPATCH', 'STEP', 'HEAD', 'NO_BLOCK', 'OUTSIDE', 'HOT', 'DEAD', 'CALL_SHIFT', 'CALL_YES', 'CALL_NO',
-                  'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS', 'FAR', 'AT_BIAS', 'TAIL', 'TAIL_CALL', 'TAIL_POINT'):
+                  'CALL_UNKNOWN', 'RECORD_BYTES', 'VERSION', 'CONTEXT_BITS', 'FAR', 'AT_BIAS'):
             self.assertEqual(getattr(sr, n), num(n), n)
         self.assertEqual(sr.COUNTERS, re.findall(r'"(\w+)"', re.search(r'pub const COUNTERS: \[&str; \d+\] = \[(.*?)\];', text, re.S)[1]))
         for n in sr.COUNTERS: self.assertEqual(sr.COUNTERS.index(n), num('C_' + n.upper()), n)
@@ -150,15 +150,6 @@ class Format(unittest.TestCase):
         h = sr.host(hostrec(sr.MARK, 9, 255, (1 << 56) - 1, 3, 0xffff_ffff))
         self.assertEqual(h, dict(kind=sr.MARK, time=9, value1=255, value2=(1 << 56) - 1, value3=3, value4=0xffff_ffff))
 
-    def test_slot_forms_and_tail_roles_come_from_at(self):
-        # (Indirect plan step 1: a slot's three forms at 0, 64 and 128 of its 256 bytes; a tail word's role in `at`.)
-        execution = (ROOT / 'crates/abi/src/execution.rs').read_text()
-        for n, v in (('DISPATCH_SLOT_BYTES', sr.SLOT_BYTES), ('SLOT_LOOKUP', sr.SLOT_LOOKUP), ('SLOT_RETURN', sr.SLOT_RETURN)):
-            self.assertIn(f'pub const {n}: usize = {v};', execution)
-        self.assertEqual([sr.slot_form(a) for a in (4, 2 * 256 + 60, 256 + 64, 3 * 256 + 200)], ['ordinary', 'ordinary', 'lookup', 'return'])
-        self.assertEqual([sr.tail_role(a) for a in (0, 1 | sr.TAIL_CALL, 2 | sr.TAIL_CALL | sr.TAIL_POINT, 1 | sr.TAIL_POINT)],
-                         ['jump-bl', 'call-branch', 'link-call-pad', 'link-jump-branch'])
-
     def test_privilege_and_mode_come_from_the_context(self):
         self.assertEqual(sr.privilege(USER64, 0, True), 'user')
         self.assertEqual(sr.privilege(KERNEL64, 0x40_0000, True), 'kernel')
@@ -176,8 +167,7 @@ class Report(Base):
         self.assertEqual(whole['name'], 'all')
         s = whole['summed']
         self.assertEqual(s['kinds'], dict(el0=12, el0_unknown=0, resident=1, halted=2))
-        self.assertEqual(s['el0_places'], dict(block=6, probe=1, dispatch=3, step=1, head=1, no_block=0, outside=0, tail=0))
-        self.assertEqual((s['dispatch_forms'], s['tail_roles']), (dict(ordinary=3, lookup=0, ** {'return': 0}), {}))
+        self.assertEqual(s['el0_places'], dict(block=6, probe=1, dispatch=3, step=1, head=1, no_block=0, outside=0))
         self.assertEqual(s['dispatch_calls'], {'return': 1, 'not_call': 1, 'unknown': 1})
         # Blocks and the dispatcher with a context by it; the context-less dispatcher sample by its RIP; the head sample unknown.
         self.assertEqual(s['privilege'], dict(user=8, kernel=3, unknown=1))
@@ -243,7 +233,7 @@ class Report(Base):
         self.assertEqual((ph['run1']['start_s'], ph['run1']['end_s']), (2.0, 5.0))
         self.assertEqual(ph['run1']['summed']['kinds'], dict(el0=9, el0_unknown=0, resident=1, halted=1))
         self.assertEqual(ph['run1/one']['summed']['el0_places']['block'], 3)        # 2.1, 2.2, 2.3 s
-        self.assertEqual(ph['run2']['summed']['el0_places'], dict(block=2, probe=0, dispatch=0, step=1, head=0, no_block=0, outside=0, tail=0))
+        self.assertEqual(ph['run2']['summed']['el0_places'], dict(block=2, probe=0, dispatch=0, step=1, head=0, no_block=0, outside=0))
         self.assertEqual(ph['boot']['summed']['samples'], 0)
         self.assertEqual(ph['mark/7']['summed']['el0_places']['block'], 1)          # 3.5 s, until mark 8 at 4 s
         self.assertEqual(ph['mark/8']['end_s'], 8.0)

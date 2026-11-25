@@ -589,7 +589,7 @@ JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
 PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
        'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross', 'pic-now',
        'l1-pic', 'miss-pic', 'indirect-sites')
-# Indirect plan step 1 (`indirect-sites`): a library page IL (RL's frame) at RV1, RV3 and RV5 of table A and RV2 of table B,
+# Indirect sites (`indirect-sites`; it was indirect plan step 1's test, kept for its values): a library page IL (RL's frame) at RV1, RV3 and RV5 of table A and RV2 of table B,
 # the trampoline page RT at RVT and RVT2. IL: a loop of 256 rounds through three jump sites (`jmp rax`) of 1, 4 and 64
 # targets and three call sites (`call rax`) of as many, a position-independent table each (`movsxd; add`); each target adds
 # its number + 1 to a sum and sets its bit (jumps: `jmp r11` back), then rbx = the jump sum | the call sum << 32, rdi = the
@@ -630,10 +630,7 @@ PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1),
            'l1-pic': (1, 0, 1), 'miss-pic': (1, 0, 1), 'indirect-sites': (2, 2, 1)}
 # Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
 # `pic-user` shares nothing (SHARES).
-PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)],
-             # Indirect plan step 1: computed exits given their own words as jumps and as calls (TAILS, TAIL_CALLS), shared
-             # link points given theirs (TAIL_POINTS), checked links made through them (TAIL_LINKS: the trampoline's jump and call).
-             'indirect-sites': [(32, 3, None), (33, 3, None), (34, 2, None), (35, 2, None)]}
+PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
 # The resident's NATEMU_PIC per program (else the program driver's `all`).
 PIC_ENV = {'link-full': 'off', 'pic-user': 'user', 'probe-copy': 'off'}
 # Split-check plan step A (module docstring): PB at offset 0 of RL; the bytes it stores (8 at d + PB_8, 16 at d + PB_16).
@@ -1874,15 +1871,6 @@ def adv_program(name, n):
 COUNT_CHECKS = ('l1-pair', 'l1-triple', 'l1-triple-d', 'l1-global', 'l1-dup', 'l1-pic')
 
 
-def feature_runtime(feature):
-    """The resident built with `feature` into its own target directory (`target/FEATURE`), as [`perf_runtime`] builds its own."""
-    target = ROOT / 'target' / feature
-    out = target / 'aarch64-unknown-none/release/natemu-runtime'
-    subprocess.run(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
-                    '--features', feature], cwd=ROOT, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
-    return out
-
-
 def perf_runtime(a):
     """The resident with its `perf` feature (the dispatcher-miss count), built into its own target directory."""
     if a.perf_runtime:
@@ -2167,15 +2155,11 @@ def main():
     ap.add_argument('--page-currency', default='on', choices=('on', 'off', 'check', 'check-halt'), help='the page record mode of every run (local-gpa and the check programs keep their own)')
     ap.add_argument('--hooks-host', type=pathlib.Path, help='an io-test-hooks host for the hold cases (default: built into target/hooks)')
     ap.add_argument('--hooks-runtime', type=pathlib.Path, help='its resident')
-    ap.add_argument('--link-check', action='store_true', help='run on a resident built with `--features link-check` (into target/link-check here)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
-    # (`--link-check`: every program on the `link-check` resident, whose scans halt `link_check` at a TLB flush when the link
-    # records, the L1 lists, the linear chains or the appended words disagree with the code.)
-    if a.link_check: a.runtime = feature_runtime('link-check')
     import k1_expected   # (the expected states: written from the programs, tests/system/k1_expected.py)
     report, failures = [], []
     listed = [x for x in bodies(a.k) if x not in L1_VARIANTS]

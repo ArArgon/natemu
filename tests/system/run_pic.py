@@ -22,14 +22,6 @@ of a shared translation's instance from the resident:
   at L3 with the driver's hook at L3 + A (its `nop` switches to CPL 3): B at L3 must not reach A through the local link;
   the hook is taken (the MOV from CR0 after the calls is #GP(0) at CPL 3), and L2 is still shared.
 
-- `tail0`, `tail1`, `tail2` (indirect plan step 1): entered at word 0, 1 or 2 of the words the resident appended to another
-  block of the context for an exit (`bl` to the lookup form, `br`/`blr x1`, the pad; a dead block's when one has them), x0
-  the entered block's RIP, with the vCPU's own doorbell rung: the stop there must take that RIP, before the dead-block
-  filter (every program's values as without the test; TAIL_STOPS in every run that appended words, TAIL_DEAD_STOPS in some).
-- `lookup`, `trampoline`: entered at a word of the context's slot's lookup form (every word in turn), or at the hot
-  trampoline of a live split block's computed exit that has appended words, with the doorbell rung: the stop takes the
-  entered block's RIP (LOOKUP_STOPS, TRAMPOLINE_STOPS in some run; the values as without the test).
-
 - `user` (and under each mode above): CPL-3 ports of K1 programs in two user address spaces switched by CR3 at CPL 0
   (the driver's `switch` hooks): `user-two`, `user-cow`, `user-twoframe`, `user-pfault` (a #PF at the alias's own RIP
   and CR2 in shared code reached by a local link), each with its exact values; under the stop modes each must stop at
@@ -51,8 +43,7 @@ sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT
 import ref, run_k1 as K, run_k2, run_slice1_vm as vm, programs as P  # noqa: E402
 # `natemu_abi::pic::count`.
 SAME, ABS_TO_SHARED, UNPROVED, ENTRY_STOPS, SVC_STOPS, SHARES, INSTANCES, CHECKED = 10, 13, 19, 21, 24, 25, 26, 28
-TAILS, TAIL_CALLS, TAIL_POINTS, TAIL_STOPS, TAIL_DEAD_STOPS, LOOKUP_STOPS, TRAMPOLINE_STOPS = 32, 33, 34, 36, 37, 38, 39
-MODES = 'and,str,body,svc,forge,forge-noncanonical,forge-half,tail0,tail1,tail2,lookup,trampoline,ac,fence,user'
+MODES = 'and,str,body,svc,forge,forge-noncanonical,forge-half,ac,fence,user'
 SVC_PROGRAMS = ('pic-two', 'pic-ctx', 'pic-xm', 'pic-twosrc')
 
 
@@ -261,7 +252,7 @@ def main():
                             env=env, stdout=open(a.out / f'{mode}.log', 'w'), stderr=subprocess.STDOUT).returncode
         report = json.loads((out / 'k1.json').read_text())['report']
         stats = [s['k1']['pic'] for r in report for s in r.get('stats') or [] if 'k1' in s]
-        total = [sum(p[i] for p in stats) for i in range(len(stats[0]) if stats else 40)]
+        total = [sum(p[i] for p in stats) for i in range(len(stats[0]) if stats else 33)]
         problems = [p for r in report for p in r['problems']]
         bad = []
         bad += user_bad
@@ -269,22 +260,6 @@ def main():
             bad += [p for p in problems if any(h in p for h in HALTS)]
             # (Forged only in a run's first entries: `pic-again`'s second run must give its exact values.)
             bad += [f"{r['name']}: {p}" for r in report if r['name'].startswith('k1-pic-again') for p in r['problems']]
-        elif mode in ('lookup', 'trampoline'):
-            if rc != 0 or problems:
-                bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
-            want = LOOKUP_STOPS if mode == 'lookup' else TRAMPOLINE_STOPS
-            if total[want] == 0:
-                bad.append(f'no stop at the tested word (counter {want})')
-        elif mode.startswith('tail'):
-            if rc != 0 or problems:
-                bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
-            # Every run that appended words stops at them; some of those stops are in a dead block's.
-            missed = [f"{r['name']}{'/1' if r['max_block'] else ''}" for r in report for s in r.get('stats') or []
-                      if sum(s['k1']['pic'][TAILS:TAIL_POINTS + 1]) and not s['k1']['pic'][TAIL_STOPS]]
-            if missed or total[TAIL_STOPS] == 0:
-                bad.append(f'no stop at an appended word (counter {TAIL_STOPS}) in {missed or "any run"}')
-            if total[TAIL_DEAD_STOPS] == 0:
-                bad.append(f'no stop at an appended word of a dead block (counter {TAIL_DEAD_STOPS})')
         else:
             if rc != 0 or problems:
                 bad.append(f'run_k1 exit {rc}, {len(problems)} problems (first: {problems[:2]})')
@@ -302,8 +277,7 @@ def main():
         if total[UNPROVED]:
             bad.append(f'{total[UNPROVED]} rewrites unproved')
         print(f"{mode}: {'FAIL ' + '; '.join(bad) if bad else 'ok'} (entry stops {total[ENTRY_STOPS:ENTRY_STOPS + 3]}, svc stops "
-              f"{total[SVC_STOPS]}, tail stops {total[TAIL_STOPS]} (dead {total[TAIL_DEAD_STOPS]}), lookup/trampoline stops "
-              f"{total[LOOKUP_STOPS]}/{total[TRAMPOLINE_STOPS]}, links local/checked/abs->shared "
+              f"{total[SVC_STOPS]}, links local/checked/abs->shared "
               f"{total[SAME]}/{total[CHECKED]}/{total[ABS_TO_SHARED]})", flush=True)
         failed += [mode] * bool(bad)
         results.append((mode, bad))
