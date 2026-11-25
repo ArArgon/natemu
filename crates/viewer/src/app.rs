@@ -5,7 +5,7 @@ use picture::{Framebuffer, Mode};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,10 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 const FRAME: Duration = Duration::from_micros(16_667);
+/// How often the picture is checked once nothing changed and no input went out for [`QUIET_AFTER`]: looking costs a read
+/// of the whole picture (the Bochs display does not say when the guest drew), so a still screen is looked at less.
+const QUIET_FRAME: Duration = Duration::from_millis(50);
+const QUIET_AFTER: Duration = Duration::from_secs(1);
 /// The size of one `pointer_motion` or `scroll` field (docs/control-api.md: at most 65535 in magnitude).
 const MAX_STEP: i64 = 65535;
 /// Trackpad scrolling: logical pixels per wheel step.
@@ -40,20 +44,32 @@ enum Note {
     MouseUnread,
 }
 
+/// natemu-viewer: a window on a running natemu's display, with its keyboard and mouse.
+///
+/// Click in the window to capture the mouse; Control-Option, pressed and let go on its own, releases it. Closing the
+/// window leaves the VM running. See docs/viewer.md.
+#[derive(clap::Parser)]
+#[command(name = "natemu-viewer")]
+struct Args {
+    /// natemu's control socket (its `control.socket`)
+    socket: PathBuf,
+    /// Window size per guest pixel, in the Mac's points (0.25 to 4): 1 shows a 1920 x 1080 picture in a 1920 x 1080
+    /// point window, 0.5 in 960 x 540 (on a Retina screen, one guest pixel per screen pixel). Resizing the window
+    /// rescales the picture
+    #[arg(long, default_value_t = 1.0, value_parser = scale)]
+    scale: f64,
+}
+
+fn scale(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (0.25..=4.0).contains(&v) => Ok(v),
+        _ => Err(format!("{s}: a number from 0.25 to 4")),
+    }
+}
+
 pub fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let socket = match (args.next(), args.next()) {
-        (Some(a), None) if a != "-h" && a != "--help" => PathBuf::from(a),
-        _ => {
-            eprintln!(
-                "usage: natemu-viewer SOCKET\n\nShows the display of the natemu that listens on SOCKET (its \
-                 `control.socket`) and passes on keyboard and mouse input. Click to capture the mouse; \
-                 Control-Option releases it."
-            );
-            std::process::exit(2);
-        }
-    };
-    match run(&socket) {
+    let args = <Args as clap::Parser>::parse();
+    match run(&args) {
         Ok(Some(stopped)) => eprintln!("natemu-viewer: {stopped}"),
         Ok(None) => {}
         Err(e) => {
@@ -64,7 +80,8 @@ pub fn main() {
 }
 
 /// `Ok(Some(why))` when the VM stopped, `Ok(None)` when the window was closed, `Err` when the viewer could not go on.
-fn run(socket: &Path) -> Result<Option<String>, String> {
+fn run(args: &Args) -> Result<Option<String>, String> {
+    let socket = &args.socket;
     let what = |e: std::io::Error| format!("control socket {}: {e}", socket.display());
     let display = Connection::open(socket).map_err(what)?;
     let input = Connection::open(socket).map_err(what)?;
@@ -87,7 +104,7 @@ fn run(socket: &Path) -> Result<Option<String>, String> {
         }
     });
 
-    let mut app = App::new(picture, tx);
+    let mut app = App::new(picture, tx, args.scale);
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     app.gone.transpose()
 }
@@ -283,11 +300,19 @@ struct App {
     motion: (f64, f64),
     scroll: f64,
     next_frame: Instant,
+    /// Window points per guest pixel (`--scale`).
+    scale: f64,
+    /// The picture copied for this frame, and the one last presented with its mode and window size.
+    copy: Vec<u32>,
+    last: Vec<u32>,
+    drawn: Option<(Option<Mode>, NonZeroU32, NonZeroU32)>,
+    /// When the picture last changed or input last went out (the window then checks at full rate).
+    active: Instant,
     gone: Option<Result<String, String>>,
 }
 
 impl App {
-    fn new(picture: Arc<Mutex<Picture>>, input: Sender<Value>) -> App {
+    fn new(picture: Arc<Mutex<Picture>>, input: Sender<Value>, scale: f64) -> App {
         App {
             picture,
             input,
@@ -301,11 +326,19 @@ impl App {
             motion: (0.0, 0.0),
             scroll: 0.0,
             next_frame: Instant::now(),
+            scale,
+            copy: Vec::new(),
+            last: Vec::new(),
+            drawn: None,
+            active: Instant::now(),
             gone: None,
         }
     }
 
-    fn send(&self, event: Value) {
+    fn send(&mut self, event: Value) {
+        self.active = Instant::now();
+        // Back to full rate at once, so the guest's answer (a typed character's echo) shows within a frame.
+        self.next_frame = self.next_frame.min(self.active + FRAME);
         let _ = self.input.send(event);
     }
 
@@ -377,21 +410,37 @@ impl App {
         }
     }
 
+    /// Copies the guest's picture and, when it, its mode or the window's size changed since the last frame, draws and
+    /// presents it. Presenting is most of the cost (Core Animation copies the whole image), so an unchanged picture
+    /// costs only the copy and a comparison.
     fn redraw(&mut self) {
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else { return };
         let size = window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        let p = self.picture.lock().unwrap();
+        let mode = p.mode.filter(|_| p.framebuffer.is_some());
+        let frame = (mode, w, h);
+        if self.drawn == Some(frame) && p.framebuffer.as_ref().zip(mode).is_none_or(|(fb, m)| fb.same(&m, &self.last)) {
+            return;
+        }
+        match (&p.framebuffer, &mode) {
+            (Some(fb), Some(mode)) => fb.copy(mode, &mut self.copy),
+            _ => self.copy.clear(),
+        }
+        drop(p);
         if surface.resize(w, h).is_err() {
             return;
         }
         let Ok(mut buffer) = surface.buffer_mut() else { return };
-        let p = self.picture.lock().unwrap();
-        match (&p.framebuffer, &p.mode) {
-            (Some(fb), Some(mode)) => picture::draw(fb, mode, &mut buffer, w.get(), h.get()),
-            _ => buffer.fill(0),
+        match &mode {
+            Some(mode) => picture::draw(&self.copy, mode, &mut buffer, w.get(), h.get()),
+            None => buffer.fill(0),
         }
-        drop(p);
-        let _ = buffer.present();
+        if buffer.present().is_ok() {
+            self.active = Instant::now();
+            self.drawn = Some(frame);
+            std::mem::swap(&mut self.copy, &mut self.last);
+        }
     }
 }
 
@@ -400,7 +449,7 @@ impl ApplicationHandler<Note> for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title(self.title()).with_inner_size(LogicalSize::new(1024.0, 768.0));
+        let attrs = Window::default_attributes().with_title(self.title()).with_inner_size(LogicalSize::new(1024.0 * self.scale, 768.0 * self.scale));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -426,7 +475,7 @@ impl ApplicationHandler<Note> for App {
                 if shown != self.shown {
                     self.shown = shown;
                     if let (Some(w), Some((mw, mh))) = (&self.window, shown) {
-                        let _ = w.request_inner_size(LogicalSize::new(mw as f64, mh as f64));
+                        let _ = w.request_inner_size(LogicalSize::new(mw as f64 * self.scale, mh as f64 * self.scale));
                     }
                     if let Some(w) = &self.window {
                         w.set_title(&self.title());
@@ -510,7 +559,7 @@ impl ApplicationHandler<Note> for App {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-            self.next_frame = now + FRAME;
+            self.next_frame = now + if now.duration_since(self.active) > QUIET_AFTER { QUIET_FRAME } else { FRAME };
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }

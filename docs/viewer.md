@@ -21,6 +21,9 @@ target/release/natemu-viewer vm.sock
 
 The window opens at the size of the guest's screen and follows it when the guest changes resolution; resizing the
 window scales the picture, keeping its shape. Until the guest's display driver loads, the window is black.
+`--scale FACTOR` (0.25 to 4, default 1) sizes the window per guest pixel in the Mac's points: `--scale 0.5` shows a
+1920 x 1080 guest in a 960 x 540 window, which on a Retina screen is one guest pixel per screen pixel, sharp and
+cheaper to draw. `natemu-viewer --help` lists the options.
 
 - **Keyboard:** while the window has focus, keys go to the guest, named by their place on a US keyboard (the Command
   keys are the guest's Windows/Meta keys). The guest's keyboard layout decides what a key types. Command-Q still quits
@@ -38,8 +41,12 @@ window scales the picture, keeping its shape. Until the guest's display driver l
 ## How it works
 
 The viewer opens two connections to the socket. On the first it asks for `framebuffer`, which hands it the
-framebuffer's shared memory; it maps that read-only and redraws the window from it about 60 times a second (the Bochs
-display does not say which parts changed, and copying a 1920 x 1080 picture costs well under a millisecond). It follows
+framebuffer's shared memory and maps it read-only. The Bochs display does not say when or where the guest drew, so the
+viewer looks about 60 times a second, compares the picture with the one it last showed, and draws only when something
+changed (or the window's size or the mode did). After a second with no change and no input it looks 20 times a second
+instead, and goes back to 60 at the next change or key. Comparing costs little; drawing does, because the whole window's image
+goes to Core Animation even when only the cursor blinked, so a guest that changes its picture often (scrolling text, a
+blinking cursor) costs some CPU, less at a smaller `--scale`. It follows
 `display_changed` for the mode and closes on `stopped`. On the second connection it sends `send_input`, one request at
 a time; input that arrives meanwhile waits in the viewer, where consecutive mouse movements merge into one. Both
 connections are read all the time, since natemu disconnects a client that leaves its notifications unread. When a
@@ -59,5 +66,6 @@ It is built on [winit](https://github.com/rust-windowing/winit) (the window and 
 - Absolute pointing (a tablet device in the guest), which would let the Mac pointer move straight into the guest
   without capture.
 - Clipboard, audio, a menu (snapshot, reset, quit the VM).
-- virtio-gpu: with its 2D path the same viewer can redraw only what the guest says changed; with 3D the picture is a
+- virtio-gpu: with its 2D path the guest says what it changed and when, so the viewer neither looks nor redraws more
+  than that; with 3D the picture is a
   GPU surface shared through Metal, which the viewer would add beside today's shared-memory path.
