@@ -52,6 +52,8 @@ pub struct Config {
     pub smbios: bool,
     /// The 8042 with a PS/2 keyboard and mouse (`machine.ps2`, default on); off, port 64H only resets.
     pub ps2: bool,
+    /// Each vCPU's shadow-table pool in pages (`machine.shadow_pool_pages`); `None`: the whole reservation.
+    pub shadow_pool_pages: Option<usize>,
     pub serial_output: Option<PathBuf>, // None = standard output
     pub serial_stdin: bool,
     pub fexc: Option<PathBuf>,
@@ -120,6 +122,7 @@ impl Config {
             pvpanic: true,
             smbios: true,
             ps2: true,
+            shadow_pool_pages: None,
             serial_output: None,
             serial_stdin: false,
             fexc: None,
@@ -201,6 +204,7 @@ struct FMachine {
     pvpanic: Option<bool>,
     smbios: Option<bool>,
     ps2: Option<bool>,
+    shadow_pool_pages: Option<toml::Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,6 +357,14 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         cfg.pvpanic = m.pvpanic.unwrap_or(cfg.pvpanic);
         cfg.smbios = m.smbios.unwrap_or(cfg.smbios);
         cfg.ps2 = m.ps2.unwrap_or(cfg.ps2);
+        if let Some(v) = m.shadow_pool_pages {
+            let text = match v {
+                toml::Value::Integer(n) => n.to_string(),
+                _ => return Err(format!("{who}: machine.shadow_pool_pages: expected an integer count of pages")),
+            };
+            cfg.shadow_pool_pages =
+                Some(natemu::execution::parse_shadow_pool_pages(&text).map_err(|e| format!("{who}: machine.shadow_pool_pages: {e}"))?);
+        }
         if let Some(t) = m.transport {
             let one = |v: Option<String>, key: &str, slot: &mut Transport| -> Res<()> {
                 if let Some(v) = v {
@@ -719,7 +731,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 42] = [
+const KEYS: [&str; 43] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -730,6 +742,7 @@ const KEYS: [&str; 42] = [
     "machine.pvpanic",
     "machine.smbios",
     "machine.ps2",
+    "machine.shadow_pool_pages",
     "serial.output",
     "serial.stdin",
     "engine.fexc",
@@ -890,6 +903,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
         "machine.pvpanic" => cfg.pvpanic = boolish(text).map_err(err)?,
         "machine.smbios" => cfg.smbios = boolish(text).map_err(err)?,
         "machine.ps2" => cfg.ps2 = boolish(text).map_err(err)?,
+        "machine.shadow_pool_pages" => cfg.shadow_pool_pages = Some(natemu::execution::parse_shadow_pool_pages(text).map_err(err)?),
         "serial.output" => cfg.serial_output = (text != "stdout").then(path),
         "serial.stdin" => cfg.serial_stdin = boolish(text).map_err(err)?,
         "engine.fexc" => cfg.fexc = Some(path()),
@@ -1206,6 +1220,9 @@ pub fn to_boot(
     boot.pvpanic = cfg.pvpanic;
     boot.smbios = cfg.smbios;
     boot.ps2 = cfg.ps2;
+    if let Some(pages) = cfg.shadow_pool_pages {
+        boot.shadow_pool_pages = pages;
+    }
     boot.initrd = initrd;
     boot.cmdline = cfg.cmdline.clone();
     boot.ram = cfg.ram.unwrap_or(boot.ram);

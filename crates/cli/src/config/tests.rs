@@ -1278,6 +1278,36 @@ fn ps2_key_parses_and_set_turns_it_off() {
     assert!(err(load_old(&["--set", "machine.ps2=maybe"])).contains("--set machine.ps2: bad boolean"));
 }
 
+/// `machine.shadow_pool_pages`: unset, the launch takes the whole reservation; the file or `--set` lowers it (from 285 to
+/// 16384), `--set` winning; anything else is refused naming the key.
+#[test]
+fn shadow_pool_pages_key_caps_the_pool_within_its_bounds() {
+    let _env = lock();
+    let boot = |c: &Config| to_boot(c, "r".into(), Vec::new(), None).unwrap().shadow_pool_pages;
+    let c = load_old(&[]).unwrap();
+    assert_eq!((c.shadow_pool_pages, boot(&c)), (None, 16384));
+    for pages in ["285", "1000", "16384"] {
+        let c = load_old(&["--set", &format!("machine.shadow_pool_pages={pages}")]).unwrap();
+        assert_eq!(boot(&c), pages.parse::<usize>().unwrap());
+    }
+    let (_, c) = load_file(&format!("[machine]\nshadow_pool_pages = 285\n{MIN}"), &[]);
+    assert_eq!(boot(&c.unwrap()), 285);
+    let (_, c) = load_file(
+        &format!("[machine]\nshadow_pool_pages = 285\n{MIN}"),
+        &["--set", "machine.shadow_pool_pages=4096"],
+    );
+    assert_eq!(boot(&c.unwrap()), 4096, "--set wins over the file");
+    for bad in ["284", "16385", "0"] {
+        let e = err(load_old(&["--set", &format!("machine.shadow_pool_pages={bad}")]));
+        assert!(e.contains(&format!("--set machine.shadow_pool_pages: {bad}: from 285 to 16384 pages")), "{e}");
+        let e = err(load_file(&format!("[machine]\nshadow_pool_pages = {bad}\n{MIN}"), &[]).1);
+        assert!(e.contains(&format!("machine.shadow_pool_pages: {bad}: from 285 to 16384 pages")), "{e}");
+    }
+    assert!(err(load_old(&["--set", "machine.shadow_pool_pages=many"])).contains("bad count"));
+    let e = err(load_file(&format!("[machine]\nshadow_pool_pages = \"4096\"\n{MIN}"), &[]).1);
+    assert!(e.contains("machine.shadow_pool_pages: expected an integer"), "{e}");
+}
+
 #[test]
 fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
     let _env = lock();

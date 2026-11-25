@@ -181,6 +181,7 @@ pub unsafe fn start() -> ! {
     fp::reset();
     let mut s = unsafe { load() };
     let broken = !guest_state_alias_valid(cache::control().guest_state_va)
+        || !shadow::pool_pages_valid(cache::control().shadow_pool_pages)
         || s.request != NONE
         || s.vcpu >= s.vcpus
         || s.vcpus as usize > cache::MAX_VCPUS;

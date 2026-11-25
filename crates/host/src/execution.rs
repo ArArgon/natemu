@@ -352,13 +352,15 @@ pub fn prepare_with_pool(
     ram_bytes: usize,
     pool: bool,
 ) -> Result<Backing> {
-    prepare_with_firmware(resident, code_bytes, n, ram_bytes, pool, &[])
+    prepare_with_firmware(resident, code_bytes, n, ram_bytes, pool, &[], shadow::POOL_MAX_PAGES)
 }
 /// [`prepare_with_pool`] with a firmware image (M2 Part 2, docs/restructure/firmware-mode.md; empty: none, as
 /// [`prepare_with_pool`]): `image` (whole pages, at most `exec::MAX_FIRMWARE_BYTES`) at guest-physical
 /// `[4 GiB - its size, 4 GiB)`, read and fetched as RAM, its stores dropped. The backing's RAM span then reaches 4 GiB (address
 /// space only: the untouched part is never backed), so the image's backing offset is its guest-physical address's as RAM's
-/// is; the resident's alias maps its 2 MiB blocks read-only (`Control::firmware_bytes` tells it the image's size).
+/// is; the resident's alias maps its 2 MiB blocks read-only (`Control::firmware_bytes` tells it the image's size). Each
+/// vCPU's shadow tables come from the first `shadow_pool_pages` pages of its pool's reservation (`shadow::POOL_MAX_PAGES`,
+/// the default, is all of it; at least `shadow::POOL_MIN_PAGES`): the launch's `machine.shadow_pool_pages`.
 pub fn prepare_with_firmware(
     resident: &str,
     code_bytes: usize,
@@ -366,6 +368,7 @@ pub fn prepare_with_firmware(
     ram_bytes: usize,
     pool: bool,
     image: &[u8],
+    shadow_pool_pages: usize,
 ) -> Result<Backing> {
     unsafe extern "C" {
         fn getentropy(buf: *mut u8, len: usize) -> i32;
@@ -374,7 +377,20 @@ pub fn prepare_with_firmware(
         // SAFETY: the buffer is writable and 8 bytes, below getentropy's 256-byte limit.
         unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) }
     })?;
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image, shadow_pool_pages)
+}
+
+/// The refusal of a pool size outside [`shadow::pool_pages_valid`]'s range (`machine.shadow_pool_pages`).
+fn shadow_pool_error(pages: usize) -> String {
+    format!("{pages}: from {} to {} pages", shadow::POOL_MIN_PAGES, shadow::POOL_MAX_PAGES)
+}
+/// A launch's shadow-pool size (`machine.shadow_pool_pages`, decimal pages), checked as [`prepare_with_firmware`] checks it.
+pub fn parse_shadow_pool_pages(text: &str) -> Result<usize> {
+    let pages: usize = text.parse().map_err(|_| format!("bad count {text:?}"))?;
+    match shadow::pool_pages_valid(pages as u64) {
+        true => Ok(pages),
+        false => Err(shadow_pool_error(pages)),
+    }
 }
 
 fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
@@ -400,10 +416,12 @@ pub fn prepare_with_guest_state_alias(
     va: u64,
     pool: bool,
     image: &[u8],
+    shadow_pool_pages: usize,
 ) -> Result<Backing> {
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool, image, shadow_pool_pages)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_at_alias(
     resident: &str,
     code_bytes: usize,
@@ -412,7 +430,11 @@ fn prepare_at_alias(
     va: u64,
     pool: bool,
     image: &[u8],
+    shadow_pool_pages: usize,
 ) -> Result<Backing> {
+    if !shadow::pool_pages_valid(shadow_pool_pages as u64) {
+        return Err(shadow_pool_error(shadow_pool_pages));
+    }
     if !exec::guest_state_alias_valid(va) {
         return Err(format!(
             "guest-state alias {va:#x}: an aligned page inside the reserved slot is required"
@@ -547,6 +569,7 @@ fn prepare_at_alias(
         control.ram_bytes = ram_bytes as u64;
         control.firmware_bytes = firmware;
         control.guest_state_va = va;
+        control.shadow_pool_pages = shadow_pool_pages as u64;
         memory.write_record(base + cache::LOOKUP_OFFSET + cache::CONTROL, control);
         // SAFETY: Shared is plain integers; all-zero is its empty value.
         let mut shared: Shared = unsafe { std::mem::zeroed() };
@@ -5017,7 +5040,7 @@ mod tests {
             exec::GUEST_STATE_SLOT.end,
         ] {
             assert!(
-                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false, &[])
+                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false, &[], shadow::POOL_MAX_PAGES)
                     .err()
                     .unwrap()
                     .starts_with("guest-state alias")
@@ -7405,6 +7428,81 @@ mod tests {
         }
     }
 
+    /// The shadow pool's launch size, host and resident in agreement: every vCPU's control record holds the size the launch
+    /// set (the whole reservation by default), the host maps the whole reservation (EL1 read/write blocks of the vCPU's own
+    /// block of the backing), and a space made as the resident makes it (`tables::space`: `shadow::pool_pages` of that
+    /// field, the window at the vCPU's block) fills exactly that many pages, all inside the reservation's first ones; sizes
+    /// outside `POOL_MIN_PAGES..=POOL_MAX_PAGES` are refused before anything is allocated.
+    #[test]
+    fn the_launch_sets_the_shadow_pool_and_the_host_maps_the_reservation() {
+        struct Quiet;
+        impl shadow::Maintenance for Quiet {
+            fn publish(&mut self) {}
+            fn invalidate(&mut self, _: u64) {}
+            fn invalidate_all(&mut self) {}
+        }
+        let path = std::env::temp_dir().join(format!("natemu-shadow-pool-{}.elf", std::process::id()));
+        std::fs::write(&path, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let resident = path.to_str().unwrap();
+        for bad in [0, shadow::POOL_MIN_PAGES - 1, shadow::POOL_MAX_PAGES + 1] {
+            let e = prepare_with_firmware(resident, cache::CODE_BYTES, 1, 4 << 20, false, &[], bad).err().unwrap();
+            assert!(e.contains(&format!("{bad}: from 285 to 16384 pages")), "{e}");
+        }
+        assert_eq!(parse_shadow_pool_pages("285"), Ok(285));
+        for bad in ["284", "16385", "x", "-1", ""] {
+            assert!(parse_shadow_pool_pages(bad).is_err(), "{bad}");
+        }
+        let default = prepare(resident, cache::CODE_BYTES, 1, 4 << 20).unwrap();
+        let c: cache::Control = default.vcpu(0).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+        assert_eq!(c.shadow_pool_pages, shadow::POOL_MAX_PAGES as u64);
+        drop(default);
+        for (n, pages) in [(1, shadow::POOL_MAX_PAGES), (2, shadow::POOL_MIN_PAGES), (2, 1000)] {
+            let b = prepare_with_firmware(resident, cache::CODE_BYTES, n, 4 << 20, false, &[], pages).unwrap();
+            for v in 0..n {
+                let base = v * b.stride;
+                let c: cache::Control = b.vcpu(v).read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+                assert_eq!(c.shadow_pool_pages, pages as u64);
+                // The reservation's blocks, whatever the size: the private region's first GiB, one level-2 entry each.
+                for block in (shadow::POOL_OFFSET..shadow::POOL_END).step_by(cache::BLOCK) {
+                    let d = u64::from_le_bytes(b.memory.read::<8>(base + 0x13000 + block / cache::BLOCK * 8));
+                    assert_eq!(d & 3, 1, "a block descriptor");
+                    assert_eq!(d & 0x0000_ffff_ffe0_0000, crate::IPA + (base + block) as u64);
+                    assert_eq!((d >> 53 & 3, d >> 6 & 3), (3, 0), "never executable, EL1 read/write, no EL0 access");
+                }
+                let mut space = shadow::Space {
+                    window: unsafe { b.memory.0.add(base) },
+                    ipa: crate::IPA + base as u64,
+                    pool_pages: shadow::pool_pages(c.shadow_pool_pages),
+                    upper: true,
+                    user: false,
+                    tlb: Quiet,
+                };
+                let mut regions = 0u64;
+                let full = loop {
+                    match space.map((1 << 39) + regions * cache::BLOCK as u64, crate::IPA, true) {
+                        Ok(()) => regions += 1,
+                        Err(e) => break e,
+                    }
+                };
+                assert_eq!((full, space.used()), (shadow::Error::Capacity, pages));
+                // Every table the fill linked: a level-0 entry, its level-1 table's entries, their level-2 tables' entries.
+                let word = |offset: usize| u64::from_le_bytes(b.memory.read::<8>(base + offset));
+                let table = |d: u64| (d & 0x0000_ffff_ffff_f000) as usize - crate::IPA as usize - base;
+                let l1 = table(word(shadow::LOWER_ROOT + 8));
+                let mut tables = vec![l1];
+                for i in (0..512).filter(|&i| word(l1 + i * 8) & 1 != 0) {
+                    let l2 = table(word(l1 + i * 8));
+                    tables.push(l2);
+                    tables.extend((0..512).filter(|&j| word(l2 + j * 8) & 1 != 0).map(|j| table(word(l2 + j * 8))));
+                }
+                assert_eq!(tables.len(), pages);
+                let end = shadow::POOL_OFFSET + pages * 4096;
+                assert!(tables.iter().all(|&t| (shadow::POOL_OFFSET..end).contains(&t)), "vCPU {v}: a table past the pool");
+            }
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// The template pool's backing (cross-vCPU reuse plan, N7): its span follows the last vCPU's block and precedes guest RAM
     /// (RAM stays the backing's last bytes, shifted by exactly the span), every vCPU maps it at `cache::POOL_VA` read-only and
     /// never executable, and the pool starts empty and on. Without a pool nothing changes: RAM follows the last block and
@@ -8010,7 +8108,7 @@ mod tests {
         std::fs::write(&path, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
         let ram = exec::LOW_RAM_END as usize + cache::BLOCK;
         let image = vec![0xcc; exec::MAX_FIRMWARE_BYTES as usize];
-        let b = prepare_with_firmware(path.to_str().unwrap(), cache::CODE_BYTES, 2, ram, false, &image).unwrap();
+        let b = prepare_with_firmware(path.to_str().unwrap(), cache::CODE_BYTES, 2, ram, false, &image, shadow::POOL_MAX_PAGES).unwrap();
         std::fs::remove_file(path).unwrap();
         let plan = crate::vm::mapping_plan(IPA + b.memory.1 as u64, &[exec::MAX_MAPPED_BYTES / 8; 8]);
         let tables = exec::RAM_TABLES_OFFSET..exec::RAM_TABLES_OFFSET + (exec::PRIVATE_GIBS - 1) * 4096;
@@ -8091,7 +8189,7 @@ mod tests {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.write_legacy_rom(gpa, &vec![1; len])));
             assert!(r.is_err(), "{gpa:#x}+{len:#x}");
         }
-        let fw = prepare_with_firmware(resident, cache::CODE_BYTES, 1, 4 << 20, false, &[0xcc; 4096]).unwrap();
+        let fw = prepare_with_firmware(resident, cache::CODE_BYTES, 1, 4 << 20, false, &[0xcc; 4096], shadow::POOL_MAX_PAGES).unwrap();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fw.write_legacy_rom(0xf_0000, &entry))).is_err());
         std::fs::remove_file(path).unwrap();
     }

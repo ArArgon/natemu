@@ -2,9 +2,10 @@
 //! translation tables (4 KiB granule, 48-bit VA, separate from guest
 //! translation). TTBR0 maps the guest lower canonical half (below 2^47) beside
 //! the resident's private region at L0 index 256; TTBR1 maps the upper half.
-//! The x86 non-canonical gap is never mapped. Tables live in the owner's 2 MiB
-//! window: the host pre-links the lower and upper 2 MiB windows at fixed pages,
-//! and further intermediate tables come from a bounded pool.
+//! The x86 non-canonical gap is never mapped. Roots, the host's pre-linked
+//! tables and the shadow state live in the owner's 2 MiB window at fixed pages;
+//! further intermediate and leaf tables come from a bounded pool of the owner's,
+//! outside the window ([`POOL_OFFSET`]).
 //!
 //! Each owner has two shadow spaces, one per x86 privilege class: supervisor
 //! (CPL 0-2; roots [`LOWER_ROOT`]/[`UPPER_ROOT`], the host's pre-linked windows)
@@ -50,11 +51,37 @@ const LIST: usize = 4;
 /// only them (what the load must drop); past this many it resets everything, as before.
 const LIST_MAX: usize = 64;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
-/// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
-/// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
-pub const POOL_OFFSET: usize = COMPAT_L1 + 4096;
-pub const POOL_PAGES: usize = 285;
-/// M2 checkpoint C: the roots 32-bit user code runs under (three pages before the pool, never pool pages), with an ASID
+/// `evictions`). M1 put 288 pages (285 after checkpoint C's compat tables) at the end of the window's 2 MiB: a leaf table
+/// per 2 MiB of linear addresses spans ~560 MiB when the working set is dense, but node's V8 (and SpiderMonkey) place
+/// 256 KiB heap pages at random addresses, so its layout needs about 2,140 table pages (one sample: 1,283 distinct 2 MiB,
+/// 728 distinct 1 GiB, 131 distinct 512 GiB regions), and a Web Tooling Benchmark run reset every shadow about 946 k
+/// times. Since November 25 the pool has a reservation of its own: [`POOL_MAX_PAGES`] pages (64 MiB) in the vCPU's own
+/// block of the backing right after the resident's text block, at the same offset of the private region as of the block
+/// ([`POOL_OFFSET`] is both), mapped whole by the host as 2 MiB blocks, EL1 read/write, no EL0 access, never executable
+/// (host `memory::private_space`). A vCPU allocates from its first `execution::cache::Control::shadow_pool_pages` pages
+/// (the host's launch setting: the whole reservation unless `machine.shadow_pool_pages` caps it, [`pool_pages`]). Pages
+/// are backed as allocated (each is zeroed when taken), so the reservation costs address space; the worst case, a guest
+/// filling every vCPU's pool, is 64 MiB of host memory per vCPU.
+pub const POOL_OFFSET: usize = crate::resident::TEXT_END;
+/// The reservation (64 MiB). The private region has room up to the code area (`execution::cache::CODE_VA`, 256 MiB), the
+/// backing at any size (it is address space until touched).
+pub const POOL_MAX_PAGES: usize = 16384;
+/// The least pool a launch may set (`machine.shadow_pool_pages`): the window's pool before November 25, so tests can still
+/// fill a pool of that size.
+pub const POOL_MIN_PAGES: usize = 285;
+/// The end of the reservation: the window, the text block and the pool precede the cache's areas in a vCPU's block
+/// (`execution::cache::LOOKUP_OFFSET`).
+pub const POOL_END: usize = POOL_OFFSET + POOL_MAX_PAGES * 4096;
+/// Whether a launch's pool size (`Control::shadow_pool_pages`) is one the host maps and the resident accepts.
+pub const fn pool_pages_valid(pages: u64) -> bool {
+    pages >= POOL_MIN_PAGES as u64 && pages <= POOL_MAX_PAGES as u64
+}
+/// The pages a space allocates from, from the launch's `Control::shadow_pool_pages`: never past the reservation (the
+/// resident refuses to start with an invalid value; this bound holds whatever the field says).
+pub const fn pool_pages(field: u64) -> usize {
+    if field > POOL_MAX_PAGES as u64 { POOL_MAX_PAGES } else { field as usize }
+}
+/// M2 checkpoint C: the roots 32-bit user code runs under (three window pages, never pool pages), with an ASID
 /// of their own. They map the first 4 GiB and nothing else of the guest: [`COMPAT_LOWER_ROOT`]'s entry 0 links
 /// [`COMPAT_L1`] and its entry 256 the resident's private region (the host writes both); [`COMPAT_UPPER_ROOT`] holds
 /// only the guest-state alias's entry. `COMPAT_L1`'s entries 0 to 3 are copies of the user space's level-1 entries of
@@ -94,8 +121,14 @@ pub const NOT_GLOBAL: u64 = 1 << 11;
 pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
-const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= 2 * crate::RAM_SIZE);
-const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= crate::resident::TEXT_OFFSET);
+// The pool follows the resident's text block and precedes the cache's areas in the vCPU's block; in the private region it
+// lies below the code area, the lowest of the areas above it (nothing else is mapped between). The host maps it in 2 MiB
+// blocks: its start and size are 2 MiB multiples.
+const _: () = assert!(POOL_OFFSET >= crate::resident::TEXT_END && POOL_END <= crate::execution::cache::LOOKUP_OFFSET);
+const _: () = assert!(POOL_END as u64 <= crate::execution::cache::CODE_VA - crate::PRIVATE);
+const _: () = assert!(POOL_OFFSET % crate::execution::cache::BLOCK == 0 && POOL_END % crate::execution::cache::BLOCK == 0);
+// The compat tables are window pages.
+const _: () = assert!(COMPAT_TABLES.end <= crate::resident::TEXT_OFFSET);
 const _: () =
     assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
 
@@ -146,7 +179,7 @@ const LOWER_TABLES: [usize; 3] = [0x11000, 0x15000, LOWER_LEAF];
 const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
 /// Window pages holding the owner's tables and shadow state: never a target.
 const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
-const COMPAT_TABLES: core::ops::Range<usize> = COMPAT_LOWER_ROOT..POOL_OFFSET;
+const COMPAT_TABLES: core::ops::Range<usize> = COMPAT_LOWER_ROOT..COMPAT_L1 + 4096;
 /// G1: the frame page (the guest-state page, also reached by its EL0 alias) and the alias's tables: never a target.
 const GUEST_STATE: [core::ops::Range<usize>; 3] = [
     crate::execution::FRAME_OFFSET..crate::execution::FRAME_OFFSET + 4096,
@@ -288,7 +321,7 @@ impl<M: Maintenance> Space<M> {
         if PRIVATE_TABLES.contains(&own)
             || COMPAT_TABLES.contains(&own)
             || GUEST_STATE.iter().any(|r| r.contains(&own))
-            || self.pool(own, POOL_PAGES)
+            || self.pool(own, POOL_MAX_PAGES)
         {
             return Err(Error::Private);
         }
@@ -446,8 +479,9 @@ mod tests {
             tlb: Log::default(),
         }
     }
+    /// The owner's window, text block and pool (the pool's pages are backed only as touched).
     fn window() -> Vec<u64> {
-        vec![0; 2 * crate::RAM_SIZE / 8]
+        vec![0; POOL_END / 8]
     }
     fn word(memory: &[u64], offset: usize) -> u64 {
         memory[offset / 8]
@@ -473,9 +507,9 @@ mod tests {
         let copies = |m: &[u64]| [0, 1, 2, 3, 4].map(|i| word(m, COMPAT_L1 + i * 8));
         let user_l1 = |m: &[u64], i: usize| word(m, (word(m, USER_LOWER_ROOT) & OUTPUT) as usize - IPA as usize + i * 8);
         // A supervisor shadow below 4 GiB links nothing under the compat root.
-        space(&mut m, POOL_PAGES).map(0x1000, target, true).unwrap();
+        space(&mut m, POOL_MAX_PAGES).map(0x1000, target, true).unwrap();
         assert_eq!(copies(&m), [0; 5]);
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.user = true;
         for va in [0x1000, 0xffff_f000, 1 << 32, 0x7fff_ffff_f000, u64::MAX & !4095] {
             s.map(va, target, true).unwrap();
@@ -484,25 +518,25 @@ mod tests {
         assert_eq!(got, [user_l1(&m, 0), 0, 0, user_l1(&m, 3), 0]);
         assert!(got[0] & 3 == TABLE && got[3] & 3 == TABLE && got[0] != got[3]);
         for full in [true, false] {
-            let mut s = space(&mut m, POOL_PAGES);
+            let mut s = space(&mut m, POOL_MAX_PAGES);
             s.user = true;
             s.map(0x4000_0000, target, false).unwrap();
             assert_ne!(copies(&m)[1], 0);
             assert!(if full { s.reset(); true } else { !s.reset_cr3() });
             assert_eq!(copies(&m), [0; 5]);
         }
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.user = true;
         for table in [COMPAT_LOWER_ROOT, COMPAT_UPPER_ROOT, COMPAT_L1] {
             assert_eq!(s.map(0x1000, IPA + table as u64, true), Err(Error::Private));
         }
-        assert_eq!(COMPAT_L1 + 4096, POOL_OFFSET);
+        assert!(COMPAT_TABLES.end <= crate::resident::TEXT_OFFSET && COMPAT_TABLES.end <= POOL_OFFSET);
     }
 
     #[test]
     fn unmap_large_clears_one_region() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         for va in [0x20_0000, 0x20_3000, 0x3f_f000, 0x40_0000] {
             s.map(va, 0x4007_0000, false).unwrap();
         }
@@ -521,7 +555,7 @@ mod tests {
     #[test]
     fn halves_allocate_tables_from_the_pool_and_gap_is_refused() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.map(0x10_0000, 0x4007_0000, false).unwrap();
         assert_eq!(s.used(), 3);
         s.map(HIGH_BASE + 0x10_0000, 0x4007_0000, true).unwrap();
@@ -547,10 +581,10 @@ mod tests {
         drop(s);
         // Lower: root[0] -> pool 0 -> pool 1 -> pool 2; upper (the kept half): root[256] -> the pool's last three pages.
         let table = |page: usize| (IPA + (POOL_OFFSET + page * 4096) as u64) | 3;
-        assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(POOL_PAGES - 1));
+        assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(POOL_MAX_PAGES - 1));
         assert_eq!(
-            word(&m, POOL_OFFSET + (POOL_PAGES - 1) * 4096),
-            table(POOL_PAGES - 2)
+            word(&m, POOL_OFFSET + (POOL_MAX_PAGES - 1) * 4096),
+            table(POOL_MAX_PAGES - 2)
         );
         assert_eq!(word(&m, LOWER_ROOT), table(0));
         assert_eq!(word(&m, POOL_OFFSET), table(1));
@@ -607,7 +641,7 @@ mod tests {
     #[test]
     fn upgrade_breaks_before_make_and_unmap_invalidates() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         let va = HIGH_BASE + 0x10_0000;
         s.map(va, 0x4007_0000, false).unwrap();
         // First map of an invalid entry needs no invalidation.
@@ -640,7 +674,7 @@ mod tests {
     #[test]
     fn user_and_supervisor_spaces_are_separate_and_reset_together() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.map(0x10_0000, 0x4007_0000, true).unwrap();
         s.user = true;
         // Nothing of the supervisor space shows in the user space, and the reverse.
@@ -681,7 +715,7 @@ mod tests {
         for [_, upper] in ROOTS {
             m[upper / 8 + alias] = 9;
         }
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.reset();
         drop(s);
         for [lower, upper] in ROOTS {
@@ -696,7 +730,7 @@ mod tests {
         );
         // The host's pre-linked tables belong to the supervisor space: a user root linking one is corrupt.
         m[USER_LOWER_ROOT / 8] = (IPA + 0x11000) | 3;
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.user = true;
         assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
     }
@@ -705,11 +739,11 @@ mod tests {
     fn foreign_descriptor_is_corrupt_not_followed() {
         let mut m = window();
         m[LOWER_ROOT / 8] = 0x4000_0000 | 1; // block, as the boot identity alias
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
         drop(s);
         m[LOWER_ROOT / 8] = (IPA + crate::RAM_SIZE as u64) | 3; // outside the window
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
         assert_eq!(s.descriptor(0x1000), 0);
     }
@@ -719,7 +753,7 @@ mod tests {
         let mut m = window();
         // An unmapped upper root would fault natively; poison it here instead.
         m[UPPER_ROOT / 8..(UPPER_LEAF + 4096) / 8].fill(u64::MAX);
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.upper = false;
         for va in [HIGH_BASE, u64::MAX & !4095] {
             assert_eq!(s.map(va, 0x4000_0000, true), Err(Error::Noncanonical));
@@ -736,7 +770,7 @@ mod tests {
         );
         // Without the upper half, its pre-linked pages are not tables either.
         m[LOWER_ROOT / 8] = (IPA + UPPER_L1 as u64) | 3;
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.upper = false;
         assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
     }
@@ -744,16 +778,16 @@ mod tests {
     #[test]
     fn links_reach_only_shadow_tables_and_targets_exclude_own_tables() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         s.map(0, 0x4000_0000, true).unwrap();
         drop(s);
         // A link into the private leaf, an unallocated pool page or a root.
         for to in [0x14000, POOL_OFFSET + 5 * 4096, UPPER_ROOT] {
             m[(POOL_OFFSET + 4096) / 8] = (IPA + to as u64) | 3;
-            let mut s = space(&mut m, POOL_PAGES);
+            let mut s = space(&mut m, POOL_MAX_PAGES);
             assert_eq!(s.map(0, 0x4000_0000, true), Err(Error::Corrupt));
         }
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         // G1: also the frame page and the guest-state alias's tables.
         let [l1, _, leaf] = crate::execution::GUEST_STATE_TABLES;
         for own in [
@@ -778,7 +812,7 @@ mod tests {
     #[test]
     fn cr3_reset_keeps_global_upper_shadows_only() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         let kernel = HIGH_BASE + 0x10_0000;
         s.map_global(kernel, 0x4007_0000, true).unwrap();
         s.map_global(0x10_0000, 0x4008_0000, true).unwrap(); // global, but the lower half: not kept
@@ -851,7 +885,7 @@ mod tests {
     #[test]
     fn cr3_reset_removes_listed_non_global_shadows() {
         let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
+        let mut s = space(&mut m, POOL_MAX_PAGES);
         let (kernel, va) = (HIGH_BASE + 0x10_0000, HIGH_BASE + 0x20_0000);
         s.map_global(kernel, 0x4007_0000, true).unwrap();
         s.map_global(va, 0x4008_0000, true).unwrap();
@@ -873,6 +907,143 @@ mod tests {
         assert!(!s.reset_cr3()); // a full reset empties the list too
         assert_eq!(s.descriptor(kernel), 0);
     }
+    /// Maps one 2 MiB region after another from `base` in the space `s` selects (globally, so the supervisor upper half's
+    /// tables come from the top of the pool) until the pool is full: the regions mapped, the error that ended them.
+    fn fill(s: &mut Space<Log>, base: u64, global: bool) -> (u64, Error) {
+        let mut regions = 0;
+        loop {
+            let va = base + regions * 0x20_0000;
+            match if global { s.map_global(va, 0x4000_0000, true) } else { s.map(va, 0x4000_0000, true) } {
+                Ok(()) => regions += 1,
+                Err(e) => return (regions, e),
+            }
+        }
+    }
+    /// The pool page `link` links to (a table descriptor's output, as a pool page number).
+    fn pool_page(link: u64) -> usize {
+        assert_eq!(link & 3, TABLE);
+        ((link & OUTPUT) - IPA) as usize / 4096 - POOL_OFFSET / 4096
+    }
+
+    /// No shadow of either space ever targets a pool page, from its first to its last ([`POOL_MAX_PAGES`], whatever the
+    /// `pool_pages` a space allocates from), or one of the compat tables, now window pages apart from the pool.
+    #[test]
+    fn no_shadow_targets_a_pool_page() {
+        let mut m = window();
+        for pool_pages in [POOL_MAX_PAGES, 4] {
+            for user in [false, true] {
+                let mut s = space(&mut m, pool_pages);
+                s.user = user;
+                for page in 0..POOL_MAX_PAGES {
+                    let target = IPA + (POOL_OFFSET + page * 4096) as u64;
+                    assert_eq!(s.map(0x20_0000, target, true), Err(Error::Private), "pool page {page}");
+                    assert_eq!(s.map_global(HIGH_BASE + 0x20_0000, target, false), Err(Error::Private));
+                }
+                assert_eq!(s.descriptor(0x20_0000), 0);
+            }
+        }
+        // The reservation is its own: below it the text block, above it the lookup area (no window pages, no tables).
+        assert!(POOL_OFFSET >= crate::resident::TEXT_END && POOL_END <= crate::execution::cache::LOOKUP_OFFSET);
+    }
+
+    /// The pool sizes a launch can set: the whole reservation (the default), the least, and one between.
+    const SIZES: [usize; 3] = [POOL_MAX_PAGES, POOL_MIN_PAGES, 1000];
+
+    /// A reset returns every page of the pool, both ends, at each size: filled to its last page (the kept half's tables
+    /// from the top, the rest from the bottom), emptied, it fills again to its last page from the bottom alone, over the
+    /// pages the top held; a link to a page the reset returned is corrupt until the page is taken again.
+    #[test]
+    fn reset_returns_the_whole_pool() {
+        for pages in SIZES {
+            let end = POOL_OFFSET + pages * 4096;
+            let mut m = window();
+            let mut s = space(&mut m, pages);
+            let (kept, e) = fill(&mut s, HIGH_BASE + (1 << 39), true);
+            assert_eq!((e, s.used()), (Error::Capacity, pages));
+            assert!(kept as usize > pages - pages / 256 - 3, "{kept} regions: the kept half alone fills the pool");
+            s.reset();
+            assert_eq!((s.used(), s.descriptor(HIGH_BASE + (1 << 39))), (0, 0));
+            drop(s);
+            // The kept half's first level-1 table was the pool's last page: returned, so a link to it is corrupt.
+            m[LOWER_ROOT / 8] = (IPA + (end - 4096) as u64) | TABLE;
+            let mut s = space(&mut m, pages);
+            assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
+            s.reset();
+            // About half from each end, then everything from the bottom.
+            for r in 0..pages as u64 / 2 {
+                s.map_global(HIGH_BASE + (1 << 39) + r * 0x20_0000, 0x4000_0000, true).unwrap();
+            }
+            assert_eq!((fill(&mut s, 1 << 39, false).1, s.used()), (Error::Capacity, pages));
+            s.reset();
+            assert_eq!(s.used(), 0);
+            let (regions, e) = fill(&mut s, 1 << 39, false);
+            assert_eq!((e, s.used()), (Error::Capacity, pages));
+            drop(s);
+            // The bottom's first table is the pool's first page, its last tables its last pages (the top's before).
+            assert_eq!(pool_page(word(&m, LOWER_ROOT + 8)), 0);
+            let mut s = space(&mut m, pages);
+            assert!((0..regions).all(|r| s.descriptor((1 << 39) + r * 0x20_0000) == 0x4000_0000 | LEAF));
+            let last = (1u64 << 39) + (regions - 1) * 0x20_0000;
+            let (table, _) = s.leaf(last, false).unwrap().unwrap();
+            assert!(table >= end - 2 * 4096 && table < end, "{table:#x}");
+        }
+    }
+
+    /// Perf chunk 14 at each pool size: the kept half's tables are the top pages of the pool the launch set (not of the
+    /// reservation), every other table a bottom page; the two meet exactly at the pool's size; a CR3 load returns the bottom
+    /// alone, keeps the top's tables and shadows, and the bottom refills to the same page count, never reaching a kept table.
+    #[test]
+    fn kept_half_split_at_full_size() {
+        for pages in SIZES {
+            let end = POOL_OFFSET + pages * 4096;
+            let mut m = window();
+            let mut s = space(&mut m, pages);
+            let kernel = HIGH_BASE + (1 << 39);
+            // A quarter of the pool's kept regions: a level-1 table, a level-2 table per GiB, a leaf table each.
+            let kept = pages as u64 / 4;
+            for r in 0..kept {
+                s.map_global(kernel + r * 0x20_0000, 0x4007_0000, true).unwrap();
+            }
+            let top = s.used();
+            assert_eq!(top as u64, kept + 1 + kept.div_ceil(512));
+            let (bottom, e) = fill(&mut s, 1 << 39, false);
+            assert_eq!((e, s.used()), (Error::Capacity, pages));
+            assert!(!s.reset_cr3());
+            assert_eq!(s.used(), top);
+            assert!((0..kept).all(|r| s.descriptor(kernel + r * 0x20_0000) == 0x4007_0000 | LEAF));
+            let (again, e) = fill(&mut s, 1 << 39, false);
+            assert_eq!((e, s.used(), again), (Error::Capacity, pages, bottom));
+            assert!((0..kept).all(|r| s.descriptor(kernel + r * 0x20_0000) == 0x4007_0000 | LEAF));
+            drop(s);
+            // The kept half's level-1 table is the pool's last page, the lower half's its first.
+            assert_eq!(pool_page(word(&m, UPPER_ROOT + 257 * 8)), pages - 1);
+            assert_eq!(pool_page(word(&m, LOWER_ROOT + 8)), 0);
+            // Every kept table is a top page, every lower one a bottom page; none lies past the pool.
+            let mut s = space(&mut m, pages);
+            for r in 0..kept {
+                let (table, _) = s.leaf(kernel + r * 0x20_0000, false).unwrap().unwrap();
+                assert!(table >= end - top * 4096 && table < end, "kept leaf {r} at {table:#x}");
+            }
+            for r in 0..bottom {
+                let (table, _) = s.leaf((1 << 39) + r * 0x20_0000, false).unwrap().unwrap();
+                assert!(table >= POOL_OFFSET && table < end - top * 4096, "lower leaf {r} at {table:#x}");
+            }
+        }
+    }
+
+    /// A launch's pool size: valid from [`POOL_MIN_PAGES`] to the reservation; a space never allocates past the
+    /// reservation, whatever the field says.
+    #[test]
+    fn launch_pool_sizes_are_bounded_by_the_reservation() {
+        let valid = [POOL_MIN_PAGES as u64, 1000, POOL_MAX_PAGES as u64];
+        assert!(valid.iter().all(|&n| pool_pages_valid(n) && pool_pages(n) == n as usize));
+        for n in [0, POOL_MIN_PAGES as u64 - 1, POOL_MAX_PAGES as u64 + 1, u64::MAX] {
+            assert!(!pool_pages_valid(n), "{n}");
+            assert!(pool_pages(n) <= POOL_MAX_PAGES, "{n}");
+        }
+        assert_eq!((POOL_MAX_PAGES * 4096, POOL_END), (64 << 20, crate::resident::TEXT_END + (64 << 20)));
+    }
+
     /// Perf chunk 14: the two ends of the pool share its capacity, and a link into the gap between them is corrupt.
     #[test]
     fn pool_ends_share_capacity() {

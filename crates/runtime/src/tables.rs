@@ -5,7 +5,7 @@
 //! M2 checkpoint C: user code that is not 64-bit code runs under a third pair of roots with a third ASID, which reach the
 //! user space's shadows below 4 GiB and no other guest address (`shadow::COMPAT_LOWER_ROOT`).
 use super::*;
-use natemu_abi::shadow::{CLASS_ROOTS, Error, Maintenance, POOL_PAGES, Space, asids};
+use natemu_abi::shadow::{CLASS_ROOTS, Error, Maintenance, Space, asids, pool_pages};
 
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 
@@ -44,7 +44,8 @@ impl Maintenance for Tlb {
 /// The owner's `user` (CPL 3) or supervisor space; the window's IPA and the ASIDs come from its TTBR0 (whichever
 /// root it holds: `shadow::asids`), and the upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks. Every
 /// owner has ASIDs of its own (never 0) and tags each space's shadows with that space's. The compat root has no space
-/// of its own: its shadows are the user space's below 4 GiB.
+/// of its own: its shadows are the user space's below 4 GiB. Its tables come from the first `Control::shadow_pool_pages`
+/// pages of the owner's pool reservation (`shadow::POOL_OFFSET`, after the resident's text block).
 pub fn space(user: bool) -> Space<Tlb> {
     let (root, tcr): (u64, u64);
     unsafe { asm!("mrs {0}, ttbr0_el1", "mrs {1}, tcr_el1", out(reg) root, out(reg) tcr) };
@@ -53,7 +54,8 @@ pub fn space(user: bool) -> Space<Tlb> {
     Space {
         window: PRIVATE as *mut u8,
         ipa: (root & OUTPUT) - CLASS_ROOTS[class][0] as u64,
-        pool_pages: POOL_PAGES,
+        // The launch's pool size (checked at start), bounded by the reservation whatever the field holds.
+        pool_pages: pool_pages(crate::cache::control().shadow_pool_pages),
         upper: tcr & 1 << 23 == 0,
         user,
         tlb: Tlb { asid: all[user as usize], all },

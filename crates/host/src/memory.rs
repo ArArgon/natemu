@@ -24,10 +24,10 @@ unsafe impl Sync for Memory {}
 // SAFETY: the mapping is not tied to the thread that made it; any thread may unmap it.
 unsafe impl Send for Memory {}
 impl Memory {
-    /// One window and its text block.
+    /// One window, its text block and its shadow pool.
     #[cfg(test)]
     pub(crate) fn new() -> Result<Self> {
-        Self::with_size(resident::TEXT_END)
+        Self::with_size(shadow::POOL_END)
     }
     pub fn with_size(size: usize) -> Result<Self> {
         let p = unsafe { mmap(ptr::null_mut(), size, 3, 0x1002, -1, 0) };
@@ -260,11 +260,14 @@ const PRIVATE_GIBS: usize = (natemu_abi::execution::PRIVATE_BYTES >> 30) as usiz
 
 /// Private tables of the owner whose window starts at backing offset `window`:
 /// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
-/// region `PRIVATE..PRIVATE + 2 MiB` with exactly `spans`, and the lower guest
+/// region (`PRIVATE..PRIVATE + execution::PRIVATE_BYTES`) with exactly `spans`, and the lower guest
 /// shadow window; with `upper`, TTBR1 (`shadow::UPPER_ROOT`) pre-links the
 /// upper window. The user (CPL 3) shadow space's roots start empty but for the
-/// private region, linked as in TTBR0. The runtime's table pages, shadow state
-/// and shadow pool are always mapped.
+/// private region, linked as in TTBR0. The runtime's table pages and shadow state
+/// (window pages) and the shadow pool's whole reservation (`shadow::POOL_OFFSET..POOL_END` of the private region, 64 MiB,
+/// 2 MiB blocks of the owner's block of the backing at the same offset, after the text block; the launch's
+/// `Control::shadow_pool_pages` says how much of it the resident allocates from) are always mapped, EL1 read/write, no
+/// EL0 access, never executable.
 pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], upper: bool) {
     let word = |at: usize, value| memory.word(window + at, value);
     let table = |offset: usize| IPA + (window + offset) as u64 + 3;
@@ -313,7 +316,8 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
                 shadow::USER_LOWER_ROOT,
                 shadow::USER_UPPER_ROOT + 4096 - shadow::USER_LOWER_ROOT,
             ),
-            own(shadow::COMPAT_LOWER_ROOT, shadow::POOL_OFFSET - shadow::COMPAT_LOWER_ROOT + shadow::POOL_PAGES * 4096),
+            own(shadow::COMPAT_LOWER_ROOT, shadow::COMPAT_L1 + 4096 - shadow::COMPAT_LOWER_ROOT),
+            own(shadow::POOL_OFFSET, shadow::POOL_END - shadow::POOL_OFFSET),
         ],
     );
 }
@@ -499,11 +503,11 @@ pub(crate) mod tests {
     }
 
     /// The window's 4 KiB pages: only the boot page is executable; the text block is one EL1-executable, read-only level-2
-    /// block of the window's own backing; nothing else in the window's first 4 MiB is executable.
+    /// block of the window's own backing; nothing else in the window, the text block and the shadow pool is executable.
     #[test]
     fn private_resident_mapping_has_no_executable_gap() {
         for window in [0, 6 << 20] {
-            let memory = Memory::with_size(window + resident::TEXT_END).unwrap();
+            let memory = Memory::with_size(window + shadow::POOL_END).unwrap();
             let mut spans = resident_text(window);
             spans.push(Span::data(SHARED_OFFSET, 0x8000, window + SHARED_OFFSET));
             private_space(&memory, window, &spans, false);
@@ -523,7 +527,38 @@ pub(crate) mod tests {
             for offset in (resident::TEXT_OFFSET..resident::TEXT_END).step_by(2 * RAM_SIZE) {
                 assert_eq!(block(offset), (IPA + (window + offset) as u64) | BLOCK | READ_ONLY | UXN);
             }
-            assert_eq!(block(resident::TEXT_END), 0);
+            for offset in (shadow::POOL_OFFSET..shadow::POOL_END).step_by(2 * RAM_SIZE) {
+                assert_eq!(block(offset), (IPA + (window + offset) as u64) | BLOCK | PXN | UXN);
+            }
+            assert_eq!(block(shadow::POOL_END), 0);
+        }
+    }
+
+    /// The shadow pool: every page the runtime can take (the reservation, [`shadow::POOL_MAX_PAGES`] from
+    /// [`shadow::POOL_OFFSET`]) is mapped, by one 2 MiB level-2 block per 2 MiB, at its own offset of the owner's block of
+    /// the backing (the resident's view and the IPA the walker reads agree); EL1 read/write, no EL0 access, never
+    /// executable; the blocks around it are not the pool's, and the window pages it held before (0xe3000 up to the text
+    /// block) are unmapped.
+    #[test]
+    fn shadow_pool_is_el1_data_at_its_own_offset() {
+        for window in [0, shadow::POOL_END.next_multiple_of(1 << 30), 3 * shadow::POOL_END] {
+            let memory = Memory::with_size(window + shadow::POOL_END).unwrap();
+            private_space(&memory, window, &resident_text(window), true);
+            let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
+            let block = |offset: usize| word(PRIVATE_L2 + offset / (2 * RAM_SIZE) * 8);
+            for page in 0..shadow::POOL_MAX_PAGES {
+                let offset = shadow::POOL_OFFSET + page * 4096;
+                let pte = block(offset);
+                // The block's output address plus the page's offset in it: the page's own backing offset.
+                let at = (pte & 0x0000_ffff_ffe0_0000) as usize + offset % (2 * RAM_SIZE) - IPA as usize;
+                assert_eq!((pte & 3, at), (1, window + offset), "pool page {page}");
+                assert_eq!(pte & (READ_ONLY | EL0_DATA | PXN | UXN), PXN | UXN, "pool page {page}");
+            }
+            assert_eq!(block(shadow::POOL_OFFSET - 2 * RAM_SIZE) & (PXN | READ_ONLY), READ_ONLY, "the text block");
+            assert_eq!(block(shadow::POOL_END), 0);
+            for offset in (0xe3000..resident::TEXT_OFFSET).step_by(4096) {
+                assert_eq!(word(PRIVATE_LEAF + offset / 4096 * 8), 0, "{offset:#x}");
+            }
         }
     }
 
@@ -565,9 +600,9 @@ pub(crate) mod tests {
             (1 << 39) - 4096,
         ] {
             let va = GUEST_STATE_SLOT.start + offset;
-            let memory = Memory::with_size(MAX_VCPUS * resident::TEXT_END).unwrap();
+            let memory = Memory::with_size(MAX_VCPUS * shadow::POOL_END).unwrap();
             for v in 0..MAX_VCPUS {
-                let window = v * resident::TEXT_END;
+                let window = v * shadow::POOL_END;
                 let mut spans = resident_text(window);
                 spans.push(Span::data(FRAME_OFFSET, 4096, window + FRAME_OFFSET));
                 private_space(&memory, window, &spans, true);
@@ -610,7 +645,7 @@ pub(crate) mod tests {
     #[test]
     fn dispatcher_tables_each_space_maps_only_its_own() {
         use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_SLOT, cache::BLOCK as MIB2};
-        let dl1 = 4 * RAM_SIZE;
+        let dl1 = shadow::POOL_END;
         for offset in [0, 4096, (1 << 30) - 4096, 300 << 30] {
             let va = GUEST_STATE_SLOT.start + offset;
             let memory = Memory::with_size(dl1 + 2 * MIB2).unwrap();
@@ -731,13 +766,17 @@ pub(crate) mod tests {
             fn invalidate(&mut self, _: u64) {}
             fn invalidate_all(&mut self) {}
         }
-        let window = resident::TEXT_END;
-        let memory = Memory::with_size(2 * window).unwrap();
+        // A second owner's block: its window, text block and pool end the backing.
+        let window = shadow::POOL_END;
+        let memory = Memory::with_size(window + shadow::POOL_END).unwrap();
         private_space(&memory, window, &resident_text(window), true);
-        let leaf = |offset: usize| {
-            u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))
+        // The descriptor mapping private offset `offset`: a leaf page in the window's 2 MiB, a level-2 block above.
+        let mapping = |offset: usize| {
+            let (table, granule) = if offset < 2 * RAM_SIZE { (PRIVATE_LEAF, 4096) } else { (PRIVATE_L2, 2 * RAM_SIZE) };
+            let pte = u64::from_le_bytes(memory.read::<8>(window + table + offset / granule * 8));
+            (pte & 3, (pte & 0x0000_ffff_ffff_f000 & !(granule as u64 - 1)) + (offset % granule) as u64, pte & (3 << 6 | PXN | UXN))
         };
-        // The runtime reaches its tables, state and pool through own-window RW aliases.
+        // The runtime reaches its tables, state and every pool page through own-block EL1 read/write aliases.
         for offset in [
             shadow::LOWER_ROOT,
             shadow::UPPER_LEAF,
@@ -749,12 +788,10 @@ pub(crate) mod tests {
             shadow::COMPAT_L1,
         ]
         .into_iter()
-        .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
+        .chain((0..shadow::POOL_MAX_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
         {
-            assert_eq!(
-                leaf(offset),
-                (IPA + (window + offset) as u64) | PAGE | PXN | UXN
-            );
+            let kind = if offset < 2 * RAM_SIZE { 3 } else { 1 };
+            assert_eq!(mapping(offset), (kind, IPA + (window + offset) as u64, PXN | UXN), "{offset:#x}");
         }
         // Both spaces' TTBR0 roots reach the private region through the same table.
         for root in [shadow::LOWER_ROOT, shadow::USER_LOWER_ROOT, shadow::COMPAT_LOWER_ROOT] {
@@ -769,7 +806,7 @@ pub(crate) mod tests {
         let mut space = shadow::Space {
             window: unsafe { memory.0.add(window) },
             ipa: IPA + window as u64,
-            pool_pages: shadow::POOL_PAGES,
+            pool_pages: shadow::POOL_MAX_PAGES,
             upper: true,
             user: false,
             tlb: Quiet,
@@ -789,6 +826,21 @@ pub(crate) mod tests {
         );
         space.map(0x7fff_0000_0000, IPA, false).unwrap();
         assert_eq!(space.used(), 3);
+        // The whole pool, to its last page (the backing's last page here, so a table past it would fault): a leaf table
+        // per 2 MiB region, from a level-0 entry nothing else uses.
+        let base = 1 << 39;
+        let mut regions = 0;
+        let full = loop {
+            match space.map(base + regions * 2 * RAM_SIZE as u64, IPA, true) {
+                Ok(()) => regions += 1,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!((full, space.used()), (shadow::Error::Capacity, shadow::POOL_MAX_PAGES));
+        let leaf = IPA | shadow::PAGE | shadow::NOT_GLOBAL;
+        assert!((0..regions).all(|r| space.descriptor(base + r * 2 * RAM_SIZE as u64) == leaf));
+        space.reset();
+        assert_eq!((space.used(), space.descriptor(base)), (0, 0));
         // Without `upper` (TCR.EPD1 set) the upper half is refused; the lower
         // half grows from the pool.
         let memory = Memory::new().unwrap();

@@ -430,9 +430,10 @@ pub mod cache {
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
-    /// Backing offsets in a vCPU's block (2 MiB aligned), after its window's 2 MiB and the resident's text block
-    /// ([`crate::resident::TEXT_OFFSET`], backed at its own private offset).
-    pub const LOOKUP_OFFSET: usize = crate::resident::TEXT_END;
+    /// Backing offsets in a vCPU's block (2 MiB aligned), after its window's 2 MiB, the resident's text block
+    /// ([`crate::resident::TEXT_OFFSET`]) and the shadow-table pool's reservation ([`crate::shadow::POOL_OFFSET`], 64 MiB),
+    /// the last two backed at their own private offsets.
+    pub const LOOKUP_OFFSET: usize = crate::shadow::POOL_END;
     pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
@@ -1070,6 +1071,11 @@ pub mod cache {
         /// is linked already: the exit ran in the block's cold code (a linked hot copy never reaches the `svc`), the trip a
         /// return into the cold code costs. A plain counter in every build. Appended.
         pub cold_exits: u64,
+        /// The shadow-table pool's size, in pages, that this vCPU's spaces allocate from (`crate::shadow::pool_pages`),
+        /// set by the host at prepare: the whole reservation ([`crate::shadow::POOL_MAX_PAGES`]) unless the launch's
+        /// `machine.shadow_pool_pages` caps it, never below [`crate::shadow::POOL_MIN_PAGES`]
+        /// ([`crate::shadow::pool_pages_valid`]; the resident does not start with another value). Appended.
+        pub shadow_pool_pages: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1679,10 +1685,11 @@ pub mod cache {
         pub const VECTOR: u64 = 0xff << VECTOR_SHIFT;
     }
 
-    // The window's 2 MiB (its pages and the shadow pool) and the text block precede the areas in a vCPU's block.
+    // The window's 2 MiB, the text block and the shadow pool precede the areas in a vCPU's block, in that order.
     const _: () = assert!(
-        crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= crate::resident::TEXT_OFFSET
-            && crate::resident::TEXT_END <= LOOKUP_OFFSET
+        2 * crate::RAM_SIZE <= crate::resident::TEXT_OFFSET
+            && crate::resident::TEXT_END <= crate::shadow::POOL_OFFSET
+            && crate::shadow::POOL_END <= LOOKUP_OFFSET
             && LOOKUP_OFFSET % BLOCK == 0
     );
     // Every per-vCPU area lies in PRIVATE..PRIVATE + 1 GiB; the shared global area and pool above it. All are 2 MiB
@@ -1769,7 +1776,8 @@ pub mod cache {
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
 }
 
-/// Bytes of a vCPU's block of the backing before its code area: its window and the cache's fixed areas.
+/// Bytes of a vCPU's block of the backing before its code area: its window, the text block, the shadow pool and the
+/// cache's fixed areas.
 pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 // Every vCPU's window starts below IPA + 1 GiB: `_start` runs with the MMU just enabled through the host's temporary
 // identity alias, one 1 GiB block at [IPA, IPA + 1 GiB) (host `memory::private_space`). Perf chunk 6: a 256 MiB arena put

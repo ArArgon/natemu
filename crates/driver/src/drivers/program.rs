@@ -1447,6 +1447,10 @@ pub(crate) struct Args {
     /// Deterministic frame-alias VA for isolation/deviation probes (test driver only; default OS-random per VM)
     #[arg(long, value_name = "VA", value_parser = number)]
     guest_state_alias: Option<u64>,
+    /// Each vCPU's shadow-table pool, in pages (default the whole reservation, `shadow::POOL_MAX_PAGES`; at least
+    /// `shadow::POOL_MIN_PAGES`): a small pool fills, for tests of the eviction path
+    #[arg(long, value_name = "PAGES", default_value_t = natemu_abi::shadow::POOL_MAX_PAGES)]
+    shadow_pool_pages: usize,
     #[arg(long)]
     code_shape: bool,
     #[arg(long)]
@@ -2034,8 +2038,17 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             va,
             pool,
             firmware,
+            args.shadow_pool_pages,
         )?,
-        None => execution::prepare_with_firmware(resident, code_bytes, n, ram_bytes as usize, pool, firmware)?,
+        None => execution::prepare_with_firmware(
+            resident,
+            code_bytes,
+            n,
+            ram_bytes as usize,
+            pool,
+            firmware,
+            args.shadow_pool_pages,
+        )?,
     };
     if let Some((gpa, bytes)) = &d.spaces[0].legacy_rom {
         backing.write_legacy_rom(*gpa, bytes);

@@ -473,6 +473,9 @@ pub struct Boot {
     pub rsdp: u64,
     /// Each vCPU's code cache (default the largest, `CODE_BYTES_MAX` less its head).
     pub code_bytes: usize,
+    /// Each vCPU's shadow-table pool, in pages (`machine.shadow_pool_pages`; default the whole reservation,
+    /// `shadow::POOL_MAX_PAGES`; at least `shadow::POOL_MIN_PAGES`).
+    pub shadow_pool_pages: usize,
     /// Where COM1's output goes as it is sent (default none: the UART keeps it; [`Prepared::serial_bytes`] counts it either
     /// way, [`Prepared::serial_error`] reports a failed write).
     pub serial: Option<Box<dyn Write + Send>>,
@@ -585,6 +588,7 @@ impl Boot {
             vcpus: 1,
             rsdp: boot::ACPI_NVS.0,
             code_bytes: exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES,
+            shadow_pool_pages: natemu_abi::shadow::POOL_MAX_PAGES,
             serial: None,
             strict_unassigned: false,
             lost_ticks: clock::LostTicks::DEFAULT,
@@ -682,12 +686,14 @@ impl Boot {
         let placed = self.placed()?;
         layout_of(&placed, self.ram)?; // before require_vcpus and before allocating the RAM
         require_vcpus(self.vcpus)?;
-        let backing = execution::prepare_with_pool(
+        let backing = execution::prepare_with_firmware(
             &self.runtime.to_string_lossy(),
             self.code_bytes,
             self.vcpus,
             self.ram as usize,
             self.pool,
+            &[],
+            self.shadow_pool_pages,
         )?;
         let plan = plan_tables_with(
             self.vcpus,
@@ -931,6 +937,7 @@ impl Boot {
             self.ram as usize,
             self.pool,
             &firmware.image,
+            self.shadow_pool_pages,
         )?;
         let loaded = boot::firmware::loaded(&firmware);
         let lost = self.lost_ticks;

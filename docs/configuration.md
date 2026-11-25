@@ -87,6 +87,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `pvpanic` | `true` | The pvpanic device (ACPI `QEMU0001`, port 505H): a guest kernel panic ends the run (`natemu: Power(4)`, exit status 2) |
 | | `smbios` | `true` | SMBIOS 3.0 tables naming the machine `natemu` (what `dmidecode` and `/sys/class/dmi/id` show), the entry point at F0000H; a firmware boot or a Multiboot kernel ignores it |
 | | `ps2` | `true` | An 8042 controller with a PS/2 keyboard and mouse (no host input reaches them yet); `false` leaves port 64H a reset-only register |
+| | `shadow_pool_pages` | `16384` | The most 4 KiB page-table pages each processor may use to map the guest's memory ([below](#page-tables-for-guest-memory)) |
 | `[serial]` | `output` | standard output | A file path, or the word `stdout` |
 | | `stdin` | `false` | Feed standard input to COM1 |
 | `[engine]` | `fexc` | none (required) | The fexc compiler |
@@ -169,6 +170,18 @@ interpreter, which does not yet run every instruction such code uses
 
 Virtio devices attach over PCI when a `--config` file is given and over MMIO when there is none
 (the old command lines). `machine.transport` or `--virtio-transport` overrides either.
+
+### Page tables for guest memory
+
+natemu runs the guest's memory accesses through page tables of its own, one set per processor, built as the guest
+touches its memory. Each processor may use up to 16,384 of these 4 KiB table pages (64 MiB). A page is taken only when
+the guest touches memory that needs one, so most guests use a small part of that. The worst case is a guest that fills
+every processor's tables: 64 MiB of host memory per processor, 256 MiB with four. When a processor's tables are full,
+natemu empties all of them and builds them again as the guest goes on; that costs time, and the run's statistics count
+it as `evictions`.
+
+`shadow_pool_pages` lowers the limit, to any number of pages from 285 to 16384: to bound the host memory a guest can
+take this way, or for tests that need the tables to fill (`--set machine.shadow_pool_pages=285`).
 
 ### A second console
 
@@ -303,6 +316,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
 | `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
 | `--set machine.ram: set twice on the command line` | A key given twice |
+| `c.toml: machine.shadow_pool_pages: 100: from 285 to 16384 pages` | The pool limit is outside its range |
 | `--set machine.ps2: bad boolean "maybe": 1/0, yes/no, on/off or true/false` | A switch (`machine.pvpanic`, `machine.smbios`, `machine.ps2`, ...) given something else |
 | `--disk: the config file lists [[disk]] devices; use --set disk.ID.path=... or edit the file` | Flag and file disagree on who owns the devices |
 | `c.toml: disk "a" is its own backing file` | `backing` and `path` are one file |
