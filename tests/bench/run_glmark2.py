@@ -200,8 +200,9 @@ def boot_local(args, i: int, initrd: Path, cmdline: str) -> dict:
 
 
 def boots_kvm(args, initrd: Path, cmdlines: list[str]) -> list[dict]:
-    """Every boot on the x86 machine, in one container run (Debian's QEMU installed once): the kernel and initramfs are
-    copied to a run folder there, each boot's console comes back as OUT/boot-I.serial, and the folder is removed."""
+    """Every boot on the x86 machine, in one container run (Debian's QEMU installed once), under a lock file there so no
+    other reference boot runs beside it: the kernel and initramfs are copied to a run folder there, each boot's console
+    comes back as OUT/boot-I.serial, and the folder is removed."""
     host = os.environ.get('NATEMU_X86_HOST')
     if not host: raise SystemExit('--emu kvm needs NATEMU_X86_HOST=user@host (an x86-64 Linux machine with Docker and /dev/kvm)')
     ssh = ['ssh', '-o', 'BatchMode=yes', host]
@@ -223,7 +224,9 @@ def boots_kvm(args, initrd: Path, cmdlines: list[str]) -> list[dict]:
                  + loop)
         log = args.out / 'kvm.log'
         with open(log, 'wb') as f:
-            subprocess.run([*ssh, f'docker run --rm --name {name} --device /dev/kvm -v $HOME/{run}:/b {KVM_IMAGE} sh -c {shlex.quote(guest)}'],
+            # One reference boot at a time on that machine (the -kvm cases take one core here, so they could run at once):
+            # its lock file, held for the whole container run.
+            subprocess.run([*ssh, f'flock $HOME/{KVM_DIR}/.lock docker run --rm --name {name} --device /dev/kvm -v $HOME/{run}:/b {KVM_IMAGE} sh -c {shlex.quote(guest)}'],
                            stdout=f, stderr=subprocess.STDOUT, timeout=args.cap * len(cmdlines) + 900)
         out = []
         host_lines = log.read_text(errors='replace')
