@@ -1,6 +1,6 @@
 """natemu-test: run, submit and inspect test runs, lock answers, prepare and clean the cache.
 
-    tools/natemu-test run [--tier smoke|affected|gate|campaign|bench] [--gate] [pytest args]
+    tools/natemu-test run [--tier smoke|affected|gate|campaign|bench|debug] [--gate] [pytest args]
     tools/natemu-test submit [same as run]     start a detached run, print its id
     tools/natemu-test status [RUN]             the machine's queue, or one run
     tools/natemu-test wait RUN                 wait for a run, exit with its status

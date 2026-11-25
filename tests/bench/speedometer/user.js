@@ -1,0 +1,32 @@
+// Firefox profile of the Speedometer cases (tests/bench/run_speedometer.py): no network services, no first-run or
+// update UI, no slow-script dialogs (headless Firefox would hang on one). A fresh copy for every boot.
+user_pref("app.update.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("startup.homepage_welcome_url.additional", "");
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.unified", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);
+user_pref("browser.safebrowsing.downloads.enabled", false);
+user_pref("network.captive-portal-service.enabled", false);
+user_pref("network.connectivity-service.enabled", false);
+user_pref("extensions.update.enabled", false);
+user_pref("extensions.getAddons.cache.enabled", false);
+user_pref("extensions.systemAddon.update.enabled", false);
+user_pref("browser.newtabpage.enabled", false);
+user_pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+user_pref("browser.region.network.url", "");
+user_pref("browser.search.geoip.url", "");
+user_pref("services.settings.server", "");
+user_pref("dom.max_script_run_time", 0);
+user_pref("dom.max_chrome_script_run_time", 0);
+user_pref("dom.ipc.reportProcessHangs", false);
+user_pref("browser.tabs.remote.autostart", true);

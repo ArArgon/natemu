@@ -438,6 +438,35 @@ def glmark2_inputs() -> pathlib.Path:
     return resources.derived('bench-glmark2', _glmark2_recipe, [recipe, artifacts.build_env()])
 
 
+def _userland_recipe(out: pathlib.Path, inputs: list) -> None:
+    """A guest userland recipe of tools/bench (inputs[0], built under its folder's name): its container.sh in the amd64
+    builder, a userland.cpio.zst padded to 4 bytes, its packages.txt and versions.txt, and provenance.json as
+    glmark2_inputs' (the archive's sha256, recorded, never required, and the machine that built it)."""
+    recipe = pathlib.Path(inputs[0])
+    _in_container(recipe.name, recipe, out, memory='8g')
+    f = out / 'userland.cpio.zst'
+    if not f.is_file() or f.stat().st_size % 4: raise BuildFailure(recipe.name, f'no 4-byte-padded {f.name} produced')
+    sha = hashlib.sha256(f.read_bytes()).hexdigest()
+    (out / 'provenance.json').write_text(json.dumps({
+        'userland_sha256': sha, 'recipe_sha256': recipe_sha256(recipe), 'builder': artifacts.build_env_described()}, indent=1) + '\n')
+
+
+def web_tooling_inputs() -> pathlib.Path:
+    """tests/bench/run_web_tooling.py's guest userland (tools/bench/web-tooling): Debian's Node.js and BusyBox from a
+    fixed snapshot.debian.org date and the Web Tooling Benchmark v0.5.3 (v8/web-tooling-benchmark at a fixed commit, its
+    npm dependencies from its package-lock.json) built to /wtb/cli.js; the installed package list pinned by the recipe's
+    packages.txt. userland.cpio.zst, packages.txt, versions.txt and provenance.json."""
+    return resources.derived('bench-web-tooling', _userland_recipe, [_tools() / 'bench' / 'web-tooling', artifacts.build_env()])
+
+
+def speedometer_inputs() -> pathlib.Path:
+    """tests/bench/run_speedometer.py's guest userland (tools/bench/speedometer): Debian's firefox-esr, Python 3, the
+    DejaVu fonts and BusyBox from a fixed snapshot.debian.org date and Speedometer 3.1 (WebKit/Speedometer at a fixed
+    commit of release/3.1) at /sp; the installed package list pinned by the recipe's packages.txt. userland.cpio.zst,
+    packages.txt, versions.txt and provenance.json."""
+    return resources.derived('bench-speedometer', _userland_recipe, [_tools() / 'bench' / 'speedometer', artifacts.build_env()])
+
+
 def recipe_sha256(recipe: pathlib.Path) -> str:
     """sha256 of the recipe folder's `sha256sum` listing (every file, sorted relative paths)."""
     files = sorted(p for p in recipe.rglob('*') if p.is_file() and '__pycache__' not in p.parts)

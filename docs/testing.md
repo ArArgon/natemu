@@ -11,6 +11,7 @@ checkouts; later runs reuse it. Nothing has to be copied from another machine. T
 tools/natemu-test run                     # the tests your change concerns (the "affected" tier)
 tools/natemu-test run --tier smoke        # one small case of everything, plus all unit tests
 tools/natemu-test run --gate              # everything: what must pass before a merge that needs it (below)
+tools/natemu-test run --tier debug        # profiling workloads: where natemu's time goes (below), never in the gate
 tools/natemu-test run tests/fp            # one family; any pytest selection works (-k, node ids)
 ```
 
@@ -355,6 +356,16 @@ package list pinned by the recipe's `packages.txt`. `glmark2-natemu` and `glmark
 like `io5-solo32-reference`, run only with `TESTKIT_SEED_ANSWERS=1 NATEMU_X86_HOST=user@host` (one at a time there:
 they share a lock file on that machine).
 
+The `speedometer` suite is web browsing (`tests/bench/run_speedometer.py`): WebKit's Speedometer 3.1 in headless Firefox
+ESR 140, 4 vCPUs, 4 GiB, 3 boots of 5 iterations each, the median of the boots' scores and each suite's median of the
+boots' mean times. Its guest userland is the input `speedometer-inputs` (`{speedometer_inputs}`), built from
+`tools/bench/speedometer` in the amd64 builder (Debian's packages from the fixed snapshot.debian.org date, pinned by
+the recipe's `packages.txt`, and Speedometer at a fixed commit of its release/3.1 branch); the runner appends its init
+and the files of `tests/bench/speedometer` (the results hook, the guest's web server, Firefox's profile and policies).
+Speedometer is served from inside the guest, which has only its loopback network. `speedometer-natemu` and
+`speedometer-qemu` are natemu and the control group; `speedometer-kvm` boots the same guest under KVM on the x86 machine
+and, like `glmark2-kvm`, runs only when seeding (one at a time there, under its own lock file).
+
 `io5-solo32` is the 32-bit toolchain build (`tests/io/run_io5.py --i386`): in one boot of the Debian cloud image, CPython's
 `./configure` and `make -j4` by the 64-bit userland and then by a Debian i386 userland that `debootstrap` installs in the
 guest, whose python must give the x86 reference machine's answers (a pinned hash). `io5-solo32-qemu` is the same under
@@ -383,6 +394,38 @@ every word must get its idiom's role: a change in fexc's output shape fails ther
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not
 in the framework yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.
+
+## The debug tier
+
+```sh
+tools/natemu-test run --tier debug                          # every profile, each alone on the machine
+tools/natemu-test run --tier debug -k web-tooling-profile   # one
+```
+
+The debug tier holds profiling workloads: larger real programs run on natemu to show where its time goes, not to
+score it. Like `campaign` and `bench` it runs only when named (`--tier debug`), never in smoke, affected or the gate,
+and its cases need the machine to themselves as benchmarks do. Their numbers are never the benchmarks page's: they come
+from natemu's `perf` resident (`{runtime_perf}`, the build the `-profile` bench cases use), which counts and times what
+the resident does at some cost of its own. Each case writes natemu's timing log (`--perf-log`) and sums its `vcpu`
+lines over the vCPUs (`tests/bench/guest_userland.py`): each resident bucket as a share of the vCPUs' busy time
+(`cpu_ns`: `guest` is translated guest code, `shadow` building shadow page tables, `abort` stage-2 and shadow aborts,
+`host` exits to the host, `tlb` CR3 loads and other TLB flushes, and the rest), the host's translation time
+(`host.translate`), and the counters that show how the shadow tables fare (`state.shadow_resets`, `state.evictions`,
+`k1.page_faults`, `k1.cr3_loads`, `k1.invlpgs` and others). The case folder's `result.json` holds it all and
+`report.md` says it as text; the timing log stays beside them for a closer look.
+
+Its suite `debug` (`tests/bench/family.toml`), 4 vCPUs, 4 GiB, the translation cache off, one boot each:
+
+- `web-tooling-profile`: the V8 team's Web Tooling Benchmark v0.5.3 (`tests/bench/run_web_tooling.py`): 18 JavaScript
+  tools (Babel, TypeScript, Prettier, terser and others) on Debian's Node.js 20, each tool's runs per second and their
+  geometric mean as the benchmark prints them, about 7.5 minutes on natemu. Its input `web-tooling-inputs`
+  (`{web_tooling_inputs}`) is built from `tools/bench/web-tooling`: the benchmark at a fixed commit, its npm
+  dependencies from its own `package-lock.json`, bundled into one file by its build. The bundle is built for the
+  browser, so the benchmark's `--only` flag does nothing: every run runs all 18 tools. V8 places its heap pages at
+  random addresses, more than natemu's pool of shadow tables holds: about a million full shadow resets per run, with
+  `shadow` and `abort` each about a quarter of `cpu_ns`.
+- `speedometer-profile`: Speedometer 3.1 as the `speedometer` bench cases boot it (the same input), one boot of 5
+  iterations, with its score: a browser runs many processes on each vCPU, so CR3 loads and the `tlb` bucket show here.
 
 ## Runner families
 

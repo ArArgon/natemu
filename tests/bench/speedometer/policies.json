@@ -1,0 +1,3 @@
+{"policies": {"DisableAppUpdate": true, "DisableTelemetry": true, "DisableFirefoxStudies": true, "DontCheckDefaultBrowser": true,
+  "OverrideFirstRunPage": "", "OverridePostUpdatePage": "", "DisablePocket": true, "CaptivePortal": false,
+  "ExtensionUpdate": false, "NetworkPrediction": false}}

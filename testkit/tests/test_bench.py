@@ -250,11 +250,11 @@ def test_a_failing_piece_count_is_loud(monkeypatch, tmp_path):
 
 def test_only_a_remote_case_is_not_exclusive():
     """Every benchmark takes the machine alone, except a case marked `remote` (its VM runs on another machine and nothing
-    is timed here): io5-solo32-reference and the glmark2 KVM references, and only they."""
+    is timed here): io5-solo32-reference and the glmark2 and Speedometer KVM references, and only they."""
     from testkit.harness.bench import HARNESS
     fam, suites = _bench_family()
     shared = {c for s in suites.values() for c in s.extra['cases'] if not HARNESS.case_needs(fam, s, c).exclusive}
-    assert shared == {'io5-solo32-reference', 'glmark2-kvm', 'glmark2-kvm-sse41'}
+    assert shared == {'io5-solo32-reference', 'glmark2-kvm', 'glmark2-kvm-sse41', 'speedometer-kvm'}
     assert HARNESS.case_needs(fam, suites['io5'], 'io5-solo32-reference').cores == 1
     assert HARNESS.case_needs(fam, suites['glmark2'], 'glmark2-kvm').cores == 1
 
@@ -373,3 +373,20 @@ def test_glmark2_cases_get_their_userland_and_the_pinned_qemu():
     fam, suites = _bench_family()
     reqs = HARNESS.requirements(fam, suites['glmark2'], None)
     assert Requirement('input', 'glmark2-inputs') in reqs and Requirement('artifact', 'qemu-system') in reqs
+
+
+def test_speedometer_and_the_debug_profiles_get_their_userlands_and_resident():
+    """The speedometer suite's cases name {speedometer_inputs} and its QEMU case the pinned qemu-system; the debug suite
+    (tier debug) runs the Web Tooling and Speedometer profiles with the `perf` resident and the timing log."""
+    from testkit.harness import Requirement
+    from testkit.harness.bench import HARNESS
+    fam, suites = _bench_family()
+    reqs = HARNESS.requirements(fam, suites['speedometer'], None)
+    assert Requirement('input', 'speedometer-inputs') in reqs and Requirement('artifact', 'qemu-system') in reqs
+    debug = suites['debug']
+    assert debug.extra['tier'] == 'debug' and set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile'}
+    reqs = HARNESS.requirements(fam, debug, None)
+    assert {Requirement('input', 'web-tooling-inputs'), Requirement('input', 'speedometer-inputs'),
+            Requirement('artifact', 'perf-runtime')} <= set(reqs)
+    for spec in debug.extra['cases'].values():
+        assert '{runtime_perf}' in spec['argv'] and '--perf-log' in spec['argv']

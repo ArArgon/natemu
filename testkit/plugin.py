@@ -11,7 +11,7 @@ from testkit import report
 
 def pytest_addoption(parser):
     g = parser.getgroup('testkit')
-    g.addoption('--tier', default=None, choices=['smoke', 'affected', 'gate', 'campaign', 'bench'])
+    g.addoption('--tier', default=None, choices=['smoke', 'affected', 'gate', 'campaign', 'bench', 'debug'])
     g.addoption('--gate', action='store_true', help='the merge gate: every category in report.GATE_FAILS fails the run')
     g.addoption('--accept-not-runnable', action='store_true',
                 help='a person decided to pass this gate without the tests this machine cannot run (risk: high)')

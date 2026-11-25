@@ -555,6 +555,61 @@ remote = true
 argv = ["python3", "tests/bench/run_glmark2.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{glmark2_inputs}",
         "--out", "{out}", "--caps", "sse4.1"]
 
+# Web browsing (docs/benchmarks.md; tests/bench/run_speedometer.py): WebKit's Speedometer 3.1 (release/3.1) in headless
+# Firefox ESR 140, served from inside the guest, 4 vCPUs, 4 GiB, 3 boots of 5 iterations (the median of the boots'
+# scores; each suite's median of the boots' means). The guest userland is the input speedometer-inputs
+# (tools/bench/speedometer, testkit/inputs.py:speedometer_inputs). natemu runs with its translation cache off, as the
+# other guest benchmarks. The control group: QEMU (the pinned 11.1.2, TCG, the guest benchmarks' CPU model) on the same
+# Mac, and real x86: speedometer-kvm boots the same kernel and initramfs under KVM on the x86 machine (NATEMU_X86_HOST,
+# the same CPU model), so it runs only when seeding (TESTKIT_SEED_ANSWERS=1), like glmark2-kvm.
+[[suite]]
+name = "speedometer"
+kind = "bench"
+harness = "bench"
+tier = "bench"
+params = { timeout = 1800 }
+
+[suite.cases.speedometer-natemu]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-natemu", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}"]
+
+[suite.cases.speedometer-qemu]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "qemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-qemu", "--qemu", "{qemu_system}"]
+
+[suite.cases.speedometer-kvm]
+remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-kvm"]
+
+# The debug tier (docs/testing.md, "The debug tier"): profiles whose output is where natemu's time goes, not a score for
+# the benchmarks page; run only with `--tier debug`. natemu with the `perf` resident ({runtime_perf}) and its timing log
+# (--perf-log), 4 vCPUs, 4 GiB, translation cache off, one boot; the runner sums the log's vcpu lines
+# (tests/bench/guest_userland.py: buckets as shares of cpu_ns, host.translate, shadow resets, evictions, page faults,
+# CR3 loads, INVLPGs) into OUT/result.json and OUT/report.md.
+# web-tooling-profile: the V8 team's Web Tooling Benchmark v0.5.3 (18 JavaScript tools on Node.js 20; input
+# web-tooling-inputs, tools/bench/web-tooling), all 18 tools (the bundle ignores --only), about 7.5 minutes; its known
+# shape: V8's randomly placed heap pages overflow the shadow-table pool (about a million full shadow resets per run;
+# `shadow` and `abort` each about a quarter of cpu_ns).
+# speedometer-profile: Speedometer 3.1 as the speedometer suite's cases boot it, one boot of 5 iterations: a browser is
+# many processes per vCPU, so CR3 loads and the TLB bucket's cost show here.
+[[suite]]
+name = "debug"
+kind = "bench"
+harness = "bench"
+tier = "debug"
+params = { timeout = 2400 }
+
+[suite.cases.web-tooling-profile]
+argv = ["python3", "tests/bench/run_web_tooling.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{web_tooling_inputs}",
+        "--out", "{out}", "--name", "web-tooling-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--perf-log"]
+
+[suite.cases.speedometer-profile]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--perf-log", "--boots", "1"]
+
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
 # (tests/bench/plugins/indirect.c, artifacts.census_plugin). Counts per guest instruction, not timings: a case claims cores

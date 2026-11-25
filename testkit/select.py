@@ -2,8 +2,9 @@
 
     smoke     unit suites, plus every family's smoke cases
     affected  smoke, plus every family whose `covers` rules match a changed file (the default of `natemu-test run`)
-    gate      everything except campaign and bench suites
-    campaign, bench   only suites declaring that tier (`tier = "campaign"`)
+    gate      everything except campaign, bench and debug suites
+    campaign, bench, debug   only suites declaring that tier (`tier = "campaign"`); debug: profiling workloads, whose
+              output is where the time goes, not a score (docs/testing.md, "The debug tier")
 
 Unit suites run in every tier (R6.3a). A changed file matching a `shared` rule of tests/selection.toml selects every
 family's smoke cases. A changed file no rule claims is listed, never guessed at.
@@ -65,10 +66,13 @@ def affected(families, changed: list[str], shared=None) -> tuple[set, list[str],
     return sel, unmapped, any_shared
 
 
+OPT_IN = ('campaign', 'bench', 'debug')     # tiers a suite runs in only when named: never in smoke, affected or the gate
+
+
 def keep(item: CaseItem, tier: str, chosen: set) -> bool:
     t = item.suite.extra.get('tier')
-    if tier in ('campaign', 'bench'): return t == tier
-    if t in ('campaign', 'bench'): return False
+    if tier in OPT_IN: return t == tier
+    if t in OPT_IN: return False
     if item.suite.kind == 'units' or tier == 'gate': return True
     if item.get_closest_marker('smoke'): return True
     return tier == 'affected' and item.fam.name in chosen

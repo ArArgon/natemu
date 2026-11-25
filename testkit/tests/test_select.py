@@ -32,6 +32,21 @@ def test_folder_rule_covers_contents():
     assert not select.matches('third_party/FEXX', ['third_party/FEX'])
 
 
+def test_opt_in_tiers_run_only_their_own_suites():
+    """campaign, bench and debug suites run only in their own tier: never in smoke, affected or the gate, and a debug
+    run selects nothing else."""
+    from types import SimpleNamespace
+    def item(tier, kind='runner', smoke=False):
+        return SimpleNamespace(suite=SimpleNamespace(extra={'tier': tier} if tier else {}, kind=kind), fam=SimpleNamespace(name='bench'),
+                               get_closest_marker=lambda m: smoke)
+    for t in ('campaign', 'bench', 'debug'):
+        for tier in ('smoke', 'affected', 'gate'):
+            assert not select.keep(item(t, smoke=True), tier, {'bench'}), (t, tier)
+        assert select.keep(item(t), t, set())
+        assert not select.keep(item(None), t, set()) and not select.keep(item(None, kind='units'), t, set())
+    assert not select.keep(item('bench'), 'debug', set()) and not select.keep(item('debug'), 'bench', set())
+
+
 def test_empty_selection_exit_5_and_gate_fails(pytester, family_dir, monkeypatch, tmp_path):
     monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=1')
     monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
