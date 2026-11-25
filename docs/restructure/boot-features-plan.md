@@ -1638,7 +1638,9 @@ what was marked, not R (without them the 2 GiB scans took a cross-modifying-code
 | 1 GiB - 1 GiB + R (<= 4 GiB) | R | guest-RAM alias (was PRIVATE + 2 MiB) | RW | none |
 
 Backing per vCPU block: window (2 MiB, pool included), lookup, global (block 0 only), metadata, code; guest RAM after the
-last block. Stage 2: `hv_vm_map` of the whole backing at IPA 1 GiB; the default IPA size is 36 bits (maximum 40) and the
+last block. (Later changes, not M1's: the resident's text became a 2 MiB block after the window in M2 Part 2, and on
+November 25 the shadow pool left the window for a reservation of 16,384 pages (64 MiB) after the text block, at private
+and backing offset 4 MiB of the vCPU's block, the lookup and later areas 64 MiB further up: `natemu_abi::shadow::POOL_OFFSET`.) Stage 2: `hv_vm_map` of the whole backing at IPA 1 GiB; the default IPA size is 36 bits (maximum 40) and the
 largest backing ends near 4.6 GiB; `Machine::create` checks the fit and would raise the size. The instruction-cache
 flush covers only the windows' resident text. Device ranges (`devices::Devices::new(R)`) lie above R; [R, 4 GiB) is the
 map's reserved range and not RAM. The resident's atomics are single LSE instructions

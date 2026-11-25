@@ -244,7 +244,9 @@ As [PCID plan](pcid-plan.md) 3.2-3.3 and 3.6, with slots for PCIDs:
   maps unassigned physical pages with `map`, never global, `tables.rs:116-117`, so a kernel probe of an unassigned page
   marks the kept half) and either fixes it or builds PCID plan 3.6's per-top-entry split (chunk 5, now required for the
   data half).
-- Pool: today 288 pages in the 2 MiB window, bump-allocated from two ends, freed only whole (`shadow.rs:43-48`). It moves
+- Pool: today 288 pages in the 2 MiB window, bump-allocated from two ends, freed only whole (`shadow.rs:43-48`). (November
+  25: it left the window for a reservation of 16,384 pages, 64 MiB, after the resident's text block, still bump-allocated
+  from two ends and freed only whole: `natemu_abi::shadow::POOL_OFFSET`. The slots and the free list below are not built.) It moves
   to a per-vCPU private region of 2,048 pages (8 MiB; estimate: about 100 table pages per slot x 8, the kept half and
   headroom) with a free list; each slot owns a page list. Resetting a slot: unlink its roots, `TLBI ASIDE1` of its two
   ASIDs, then free its pages. Capacity: reset the least recently used non-current slot, then everything.
