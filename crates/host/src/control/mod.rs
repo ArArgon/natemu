@@ -20,8 +20,10 @@
 //! thread (`control-display`) follows the display's change counter and sends every client `display_changed`, at most
 //! once per [`DISPLAY_CHANGED_EVERY`]: a change within that time after one sent is sent at its end, with the state
 //! then (so the last state is always sent, and a guest flipping its mode quickly costs a client one line per window).
-//! A snapshot's answer can exceed [`OUTPUT_CAP`]: a line is queued over the cap when nothing else waits for the client
-//! (a client that does not read is still dropped by the next line, or by the send timeout).
+//! A snapshot's answer can exceed [`OUTPUT_CAP`]: the cap bounds the lines that wait behind the one being written, the
+//! lines up to [`OUTPUT_CAP`] long (notifications, ordinary answers) together, and a longer one alone (at most one
+//! waits). So a large answer being written never costs the client a `display_changed` sent meanwhile; a client that does
+//! not read is still dropped once its waiting lines pass the cap, or by the send timeout.
 pub mod protocol;
 pub mod ps2;
 
@@ -372,8 +374,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Out {
     /// Lines (with their newline) not yet written, each with the descriptors sent with its first bytes.
     queue: VecDeque<(Vec<u8>, Vec<OwnedFd>)>,
-    /// Their bytes, and the line being written.
+    /// Their bytes, and the line being written's ([`Client::flushed`] waits for 0).
     bytes: usize,
+    /// The waiting (queued, not being written) lines' bytes, of those up to [`OUTPUT_CAP`] long ([`Client::push`]).
+    small: usize,
+    /// How many waiting lines are longer than [`OUTPUT_CAP`] (a snapshot's answer): at most one.
+    large: usize,
     /// Close once the queue is written (an over-long line's -32700).
     closing: bool,
     /// Disconnected: nothing more is written.
@@ -500,17 +506,25 @@ impl Client {
         }
     }
 
-    /// Queues `line` for the writer, `fds` to go with its first bytes; over the output cap the client is disconnected
-    /// instead, unless nothing else waits for it (one long answer, a snapshot's, is queued alone).
+    /// Queues `line` for the writer, `fds` to go with its first bytes. The client is disconnected instead when the
+    /// waiting lines up to [`OUTPUT_CAP`] long would pass it together, or a second longer line would wait (the module
+    /// documentation): the line being written does not count.
     fn push(&self, line: String, fds: Vec<OwnedFd>) {
         let mut out = lock(&self.out);
         if out.dead || out.closing {
             return;
         }
-        if out.bytes > 0 && out.bytes + line.len() + 1 > OUTPUT_CAP {
+        let len = line.len() + 1;
+        let refused = if len > OUTPUT_CAP { out.large > 0 } else { out.small + len > OUTPUT_CAP };
+        if refused {
             drop(out);
             self.kill();
             return;
+        }
+        if len > OUTPUT_CAP {
+            out.large += 1;
+        } else {
+            out.small += len;
         }
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
@@ -533,7 +547,7 @@ impl Client {
         let mut out = lock(&self.out);
         out.dead = true;
         out.queue.clear();
-        out.bytes = 0;
+        (out.bytes, out.small, out.large) = (0, 0, 0);
         drop(out);
         let _ = self.stream.shutdown(Shutdown::Both);
         self.changed.notify_all();
@@ -565,6 +579,11 @@ impl Client {
                         return;
                     }
                     if let Some(line) = out.queue.pop_front() {
+                        if line.0.len() > OUTPUT_CAP {
+                            out.large -= 1;
+                        } else {
+                            out.small -= line.0.len();
+                        }
                         break line;
                     }
                     if out.closing {

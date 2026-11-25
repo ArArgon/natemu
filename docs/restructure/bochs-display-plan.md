@@ -246,17 +246,21 @@ emulation draws into a shadow in guest RAM and copies it to VRAM about every 50 
 
 ### Task 4: cost, documentation, gate
 
-**Files:** the guest bench family, `docs/benchmarks.md`, `README.md`, `docs/configuration.md`.
+**Files:** `tests/bench/family.toml` (suite `display`), `tests/devices/run_display.py` (`bench`), `testkit/harness/bench.py`
+(the `{display_inputs}` slot, registered as `{paper_inputs}` is), `docs/benchmarks.md`, `README.md`.
 
 - [ ] **Step 1: bench case `display-fill`**: `kms_pattern bench` copies 1 GiB of full 1024 x 768 frames into the mapped
   dumb buffer and reports the elapsed time, with the same program writing the same amount into a guest-RAM buffer as
   the in-guest reference (the ratio shows the framebuffer runs at RAM speed: the claim this plan makes); the
-  control-socket snapshot cost in the same case (100 snapshots, mean time per PNG). The control group: QEMU's
-  `bochs-display` on the same Mac running the same guest program (`-device bochs-display`), as AGENTS.md's benchmark
-  rules ask. Recorded on the M4 in `docs/benchmarks.md` with case, machine, commit and date.
+  control-socket snapshot cost in the same case (100 snapshots of the held 1024 x 768 pattern, mean round trip per
+  snapshot as a client sees it: the copy, the PNG, the base64 line and the client's decoding). The control group: QEMU's
+  `bochs-display` on the same Mac running the same guest program (`-device bochs-display`, case `display-fill-qemu`),
+  as AGENTS.md's benchmark rules ask; one run per side (owner, November 24). Recorded on the M4 in `docs/benchmarks.md`
+  with case, machine, commit and date, in a docs-only commit after the code's.
 - [ ] **Step 2:** README: one plain sentence that natemu can show a simple screen to programs that ask for pictures
   through the control socket (no window yet), linking `docs/control-api.md`.
-- [ ] **Step 3: run** `tools/natemu-test run` then `--gate`; PASS. **Commit** `display: bench case and documentation`.
+- [ ] **Step 3:** commit `display: bench case display-fill and the README sentence`; the numbers in a docs-only commit;
+  then `--gate` (a mosaic across machines at one commit); PASS.
 
 ## Cost
 

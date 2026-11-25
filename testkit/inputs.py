@@ -165,8 +165,8 @@ def display_inputs() -> pathlib.Path:
     t, lib, dev = _tools(), _lib(), paths.repo_root() / 'tests' / 'devices'
     srcs = [str(kms_pattern())] + [str(resources.fetch(n)) for n in ('debian-netboot-linux', 'debian-kernel-deb', 'busybox-static-deb')]
     return resources.derived('devices-display-inputs', _display_recipe,
-                             srcs + [dev / 'run_display.py', dev / 'run_platform.py', lib / 'io_common.py',
-                                     t / 'raw_root.py', t / 'play/mkcpio.py']) / 'display'
+                             srcs + [dev / 'run_display.py', dev / 'run_control.py', dev / 'run_platform.py',
+                                     lib / 'io_common.py', t / 'raw_root.py', t / 'play/mkcpio.py']) / 'display'
 
 
 

@@ -4,7 +4,7 @@
  *   kms_pattern            draw the pattern and scan it out, print READY, then hold the mode until killed
  *   kms_pattern bench N    a BENCH_W x BENCH_H buffer and mode (the EDID's preferred), then copy full frames into
  *                          the mapped buffer until N bytes went, and the same into a buffer in guest RAM; print both
- *                          times (BENCH ...), and exit
+ *                          times (BENCH ...), then READY, and hold the mode (the pattern) as above
  *
  * The buffer (pattern mode): a dumb buffer BUF_W x BUF_H (32 bpp, pitch BUF_W x 4 = 3200 bytes), mapped through the card
  * (DRM_IOCTL_MODE_MAP_DUMB: the buffer's own mapping, the BAR the guest writes natively, not fbdev's shadow); a
@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
     res.connector_id_ptr = (uintptr_t)connectors;
     res.count_fbs = res.count_encoders = 0;
     if (ioc(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) die("GETRESOURCES (ids)");
-    struct drm_mode_modeinfo modes[64], mode = {0};
+    struct drm_mode_modeinfo modes[256], mode = {0};
     struct drm_mode_get_connector conn;
     int found = 0;
     for (uint32_t i = 0; i < res.count_connectors && !found; i++) {
@@ -104,10 +104,13 @@ int main(int argc, char **argv) {
         conn.connector_id = connectors[i];
         if (ioc(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) die("GETCONNECTOR");
         if (conn.connection != 1 || conn.count_modes == 0) continue;     /* DRM_MODE_CONNECTED */
-        if (conn.count_modes > 64) conn.count_modes = 64;
+        /* the kernel copies the modes only when they all fit, and then reports how many there are */
+        if (conn.count_modes > 256) { errno = E2BIG; die("modes"); }
+        uint32_t room = conn.count_modes;
         conn.modes_ptr = (uintptr_t)modes;
         conn.count_props = conn.count_encoders = 0;
         if (ioc(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) die("GETCONNECTOR (modes)");
+        if (conn.count_modes > room) { errno = EAGAIN; die("modes changed"); }
         for (uint32_t m = 0; m < conn.count_modes; m++)
             if (modes[m].hdisplay == w && modes[m].vdisplay == h) { mode = modes[m]; found = 1; break; }
     }
@@ -149,7 +152,7 @@ int main(int argc, char **argv) {
         uint64_t ram_ns = copy_frames(ram, create.pitch, fb.offsets[0], src, w, h, bench);
         printf("BENCH bytes=%llu frame=%ux%u vram_ns=%llu ram_ns=%llu\n", (unsigned long long)bench, w, h,
                (unsigned long long)vram_ns, (unsigned long long)ram_ns);
-        return 0;
+        /* the framebuffer now holds the last frame copied, the pattern: held below for the runner's snapshots */
     }
     printf("READY\n");
     for (;;) pause();          /* hold the mode: fbdev restores its own when the program exits */

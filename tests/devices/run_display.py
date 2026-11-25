@@ -40,11 +40,11 @@ import subprocess
 import time
 import types
 
-from control_client import Control, RpcError
+from control_client import Control
 from io_common import VM_LOCK, stop_group
 import run_control
-from run_control import Run
-from run_platform import KVER, stopped
+from run_control import Run, answer, cancelled
+from run_platform import KVER
 
 MODULES = ('bochs', 'drm_kms_helper')
 APPLETS = ('sh', 'mount', 'nproc', 'uname', 'modprobe', 'cat', 'ls', 'readlink', 'basename', 'dmesg', 'sync', 'poweroff',
@@ -130,15 +130,14 @@ case_display_off() {
   idle
 }
 
-# display-bench (bench case display-fill): kms_pattern bench BYTES at the EDID's mode, then held for the snapshots.
+# display-bench (bench case display-fill): kms_pattern bench BYTES at the EDID's mode; it prints BENCH, then READY,
+# and holds the pattern for the runner's snapshots.
 case_display_bench() {
   modprobe bochs || fail modprobe-bochs
   wait_for /dev/dri/card0
   bytes=
   for item in $(cat /proc/cmdline); do case "$item" in bench_bytes=*) bytes=${item#*=};; esac; done
   /@KMS_PATTERN@ bench "$bytes" || fail "kms_pattern bench exited ($?)"
-  echo BENCH-DONE
-  idle
 }
 
 case "$name" in
@@ -221,12 +220,6 @@ def common(run: Run) -> list:
     return errors
 
 
-def cancelled(run: Run) -> list:
-    errors = [] if run.control.get('quit') == {} else [f'quit answered {run.control.get("quit")!r}, expected {{}}']
-    if run.control.get('stopped') != 'cancelled': errors.append(f'stopped reason {run.control.get("stopped")!r}, expected cancelled')
-    return errors + stopped(run, 'natemu: Cancelled', 2)
-
-
 def judge_display(run: Run) -> list:
     errors = common(run)
     if len(re.findall(r'^READY$', run.serial, re.M)) != 1: errors.append('kms_pattern never reported READY')
@@ -295,15 +288,11 @@ class Driver(run_control.Driver):
     def until(self, marker: str, seconds: float = READY_SECONDS):
         super().until(lambda t: re.search(rf'^{marker}$', t, re.M), seconds, marker)
 
-    def quit(self, vm: Control):
+    def quit_with(self, vm: Control):
         self.control['quit'] = vm.call('quit')
         self.control['stopped'] = vm.wait_stopped()
         vm.close()
 
-
-def answer(call):
-    try: return call()
-    except RpcError as e: return {'code': e.code, 'data': e.data}
 
 
 def snapshot_png(d: Driver, vm: Control, name: str) -> bytes:
@@ -333,7 +322,7 @@ def drive_display(d: Driver):
     status = vm.call('query_status', timeout=30)
     d.control['status_display'] = status['devices'].get('display')
     d.control['display_changed'] = vm.display_changes()
-    d.quit(vm)
+    d.quit_with(vm)
 
 
 def drive_boot_console(d: Driver):
@@ -342,7 +331,7 @@ def drive_boot_console(d: Driver):
     colours, share = text_share(snapshot_png(d, vm, 'boot-console.png'))
     d.control['colours'], d.control['text_share'] = colours, share
     d.control['status_display'] = vm.call('query_status', timeout=30)['devices'].get('display')
-    d.quit(vm)
+    d.quit_with(vm)
 
 
 def drive_off(d: Driver):
@@ -351,7 +340,7 @@ def drive_off(d: Driver):
     d.control['snapshot'] = answer(lambda: vm.call('snapshot', {'format': 'png'}, timeout=30))
     d.control['framebuffer'] = answer(lambda: vm.call('framebuffer', None, timeout=30))
     d.control['devices'] = vm.call('query_status', timeout=30)['devices']
-    d.quit(vm)
+    d.quit_with(vm)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -386,7 +375,7 @@ def run(args):
 
 # ---------------------------------------------------------------- bench (tests/bench/family.toml display-fill)
 
-QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip'   # tools/bench/run.py's
+QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip'   # = tools/bench/run.py QCPU (self-checked)
 BENCH_SECONDS = 600
 
 
@@ -406,13 +395,13 @@ def bench(args):
     if args.emu == 'natemu':
         def drive(d: Driver):
             vm = d.connect()
-            d.until('BENCH-DONE', BENCH_SECONDS)
+            d.until('READY', BENCH_SECONDS)
             times = []
             for _ in range(args.snapshots):
                 t = time.monotonic(); width, height, data = vm.snapshot(timeout=60); times.append(time.monotonic() - t)
             d.control['snapshot'] = {'count': len(times), 'mean_ms': 1000 * sum(times) / len(times), 'size': [width, height],
                                      'png_bytes': len(data)}
-            d.quit(vm)
+            d.quit_with(vm)
         args.case, args.vcpus = 'display-bench', 1
         work = args.out / 'natemu'; work.mkdir()
         r = run_control.boot(args, 'display-bench', work, {'display-bench': types.SimpleNamespace(judge=None, drive=drive, words=(f'bench_bytes={args.bytes}',))}, 'display.cpio',
@@ -430,7 +419,7 @@ def bench(args):
         end = time.monotonic() + BENCH_SECONDS
         try:
             while p.poll() is None and time.monotonic() < end:
-                if serial.exists() and re.search(r'^(BENCH-DONE|DISPLAY-FAIL)', serial.read_text(errors='replace'), re.M): break
+                if serial.exists() and re.search(r'^(READY|DISPLAY-FAIL)', serial.read_text(errors='replace'), re.M): break
                 time.sleep(0.2)
         finally:
             stop_group(p)
@@ -445,6 +434,7 @@ def bench(args):
 
 def self_check():
     subprocess.run(['sh', '-n'], input=INIT, text=True, check=True)
+    assert f"QCPU = '{QCPU}'" in (Path(__file__).resolve().parents[2] / 'tools/bench/run.py').read_text(), 'QCPU differs from tools/bench/run.py'
     assert '@' not in INIT, 'a placeholder left in INIT'
     for name in CASES:
         assert f'\n  {name}) case_{name.replace("-", "_")};;\n' in INIT, f'{name}: no dispatch line in INIT'

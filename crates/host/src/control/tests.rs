@@ -851,6 +851,51 @@ fn large_snapshot_is_answered() {
     assert_eq!(c.status(2)["state"], "running");
 }
 
+/// While a large answer is being written, notifications still reach the client: the guest changes its mode while the
+/// client has not yet read a snapshot's answer (longer than OUTPUT_CAP, so its write is in flight), and the client gets
+/// the answer, then the display_changed lines, and stays connected.
+#[test]
+fn notifications_during_a_large_answer() {
+    let d = display(16);
+    let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+    let noise: Vec<u64> = (0..(1024 * 768 / 2))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        })
+        .collect();
+    d.vram().write_words(0, &noise);
+    modeset(&d, (1024, 768), 1024, (0, 0));
+    let r = rig_full(true, false, Some(d.clone()));
+    let mut c = r.client();
+    c.send(r#"{"jsonrpc":"2.0","id":1,"method":"snapshot"}"#);
+    // not reading: once the answer is queued its write blocks on the full socket buffer; meanwhile the mode changes
+    // ten times, two windows apart (about a second, longer than the snapshot takes), so display_changed lines are
+    // queued before and behind the answer
+    for k in 0..10u16 {
+        modeset(&d, (640 + k, 480), 1024, (0, 0));
+        std::thread::sleep(Duration::from_millis(2 * DISPLAY_CHANGED_EVERY.as_millis() as u64));
+    }
+    let (mut answer, mut changes) = (None, 0);
+    while answer.is_none() || changes == 0 {
+        let mut line = String::new();
+        assert!(c.lines.read_line(&mut line).unwrap() > 0, "disconnected after {changes} display_changed");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v["id"] == 1 {
+            assert!(line.len() > OUTPUT_CAP, "{} bytes", line.len());
+            answer = Some(v);
+        } else {
+            assert_eq!(v["method"], "display_changed", "{v}");
+            if v["params"]["width"] == 649 {
+                changes += 1;
+            }
+        }
+    }
+    assert_eq!(c.status(2)["state"], "running", "still connected");
+}
+
 /// `display_changed` follows the published mode: once per change when changes are rare, and at most one per
 /// DISPLAY_CHANGED_EVERY while the guest changes the mode quickly, the last always the state after the last change.
 #[test]
