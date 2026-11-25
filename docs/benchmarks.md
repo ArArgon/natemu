@@ -26,10 +26,9 @@ much, is in the commit messages and the pages of the work that moved it.
 ## Setup
 
 - **Host:** Apple M4 (4 performance cores, 16 GiB), macOS 26. Each case ran alone on the machine, with no other VM.
-- **natemu:** 9f35eb96, measured November 22, 2026, in every natemu column below unless a table says otherwise.
-  Checkpoint C of the 32-bit work (natemu 670fab60) did not move them: three alternating rounds against 035b243e on the
-  M4 found no difference beyond the noise in `guest-zstd`, `guest-luajit`, `guest-mem`, `guest-7zip`, `guest-hackbench`,
-  `guest-hackbench32` and `guest-paper`.
+- **natemu:** each table names its commit: 3b13c1d0 (November 24, 2026) for the 64-bit and 32-bit programs and the
+  display, 9f35eb96 (November 22, 2026) for the CPython builds and Paper, 670fab60 (November 23, 2026) for the 32-bit
+  segment cases. At 3b13c1d0 the CPython-build, Paper and segment cases measured within their noise of the numbers shown.
 - **QEMU:** 11.1.2, `qemu-system-x86_64 -accel tcg,thread=multi`, on the same M4. Its CPU model is matched to the
   features natemu offers, so both guests run the same code paths. QEMU's `-cpu max` was slower on 9 of 10 tests we
   compared, so it is not used. Its numbers are older than natemu's; each table says when they were measured.
@@ -63,25 +62,25 @@ to 13% at 4 vCPUs, and 20% and 40% faster for `build`.
 | `avx` | x264 0.164 encoding 300 CIF frames on its AVX2 paths |
 | `scimark` | SciMark 2.0's five kernels (FFT, SOR, Monte Carlo, sparse matrix multiply, LU), each for at least 2 s, in Mflops |
 
-Bench cases `guest-build` to `guest-scimark` (at 4 vCPUs with `TESTKIT_BENCH_VCPUS=4`); Apple M4; natemu 9f35eb96;
-November 22, 2026. QEMU 11.1.2 on the same M4: November 14, 2026, the median of 3 boots' first runs
+Bench cases `guest-build` to `guest-scimark` (at 4 vCPUs with `TESTKIT_BENCH_VCPUS=4`); Apple M4; natemu 3b13c1d0;
+November 24, 2026, the median of 3 boots' first runs. QEMU 11.1.2 on the same M4: November 14, 2026, the median of 3 boots' first runs
 (`tools/bench/run.py`, the script the bench cases run, before they existed); `cray-strict` and SciMark November 21-22,
 2026, one boot's first run (cases `guest-cray-strict-qemu` and `guest-scimark-qemu`, 1 vCPU). Seconds, lower is better:
 
 | Program | natemu, 1 vCPU | QEMU, 1 vCPU | speed-up | natemu, 4 vCPUs | QEMU, 4 vCPUs | speed-up |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `build` | 7.325 | 29.34 | 4.0× | 3.769 | 12.35 | 3.3× |
-| `zstd` | 2.617 | 29.78 | 11.4× | 1.287 | 11.09 | 8.6× |
-| `hackbench` | 10.910 | 16.34 | 1.5× | 3.201 | 5.39 | 1.7× |
-| `locks` | 3.359 | 11.08 | 3.3× | 5.812 | 27.55 | 4.7× |
-| `luajit` | 2.957 | 18.38 | 6.2× | 1.087 | 5.32 | 4.9× |
-| `luajit-interp` | 3.400 | 30.34 | 8.9× | 1.030 | 9.05 | 8.8× |
-| `mem` | 7.316 | 16.64 | 2.3× | 2.432 | 4.99 | 2.1× |
-| `cray` | 3.072 | 130.35 | 42.4× | 1.035 | 42.14 | 40.7× |
-| `cray-strict` | 3.276 | 132.40 | 40.4× | 1.141 | not run | |
-| `7zip` | 3.502 | 20.80 | 5.9× | 1.564 | 6.44 | 4.1× |
-| `sqlite` | 5.972 | 22.82 | 3.8× | 6.036 | 22.76 | 3.8× |
-| `avx` | 7.973 | 45.12 | 5.7× | 3.244 | 16.56 | 5.1× |
+| `build` | 7.252 | 29.34 | 4.0× | 3.732 | 12.35 | 3.3× |
+| `zstd` | 2.635 | 29.78 | 11.3× | 1.321 | 11.09 | 8.4× |
+| `hackbench` | 11.099 | 16.34 | 1.5× | 3.267 | 5.39 | 1.6× |
+| `locks` | 3.357 | 11.08 | 3.3× | 5.732 | 27.55 | 4.8× |
+| `luajit` | 2.983 | 18.38 | 6.2× | 1.083 | 5.32 | 4.9× |
+| `luajit-interp` | 3.429 | 30.34 | 8.8× | 1.036 | 9.05 | 8.7× |
+| `mem` | 7.417 | 16.64 | 2.2× | 2.487 | 4.99 | 2.0× |
+| `cray` | 3.077 | 130.35 | 42.4× | 1.035 | 42.14 | 40.7× |
+| `cray-strict` | 3.274 | 132.40 | 40.4× | 1.053 | not run | |
+| `7zip` | 3.595 | 20.80 | 5.8× | 1.612 | 6.44 | 4.0× |
+| `sqlite` | 5.465 | 22.82 | 4.2× | 5.564 | 22.76 | 4.1× |
+| `avx` | 8.004 | 45.12 | 5.6× | 3.245 | 16.56 | 5.1× |
 
 SciMark (`guest-scimark`, 1 vCPU) times its own kernels, each for at least 2 s, so its result is the Mflops it prints,
 not its run time: higher is better, per kernel the median of the 3 boots' first runs. QEMU's is one boot's first run;
@@ -89,13 +88,13 @@ real x86's is the same binary on the Ryzen (November 20-21, 2026):
 
 | SciMark, 64-bit | FFT | SOR | Monte Carlo | sparse | LU |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| natemu | 1228 | 4136 | 846 | 3089 | 3671 |
+| natemu | 3163 | 4294 | 863 | 3290 | 6775 |
 | QEMU | 167 | 293 | 80 | 322 | 458 |
-| speed-up | 7.4× | 14.1× | 10.6× | 9.6× | 8.0× |
+| speed-up | 18.9× | 14.7× | 10.8× | 10.2× | 14.8× |
 | real x86 | 4213 | 2877 | 983 | 5499 | 11639 |
 
-FFT varies from run to run: its first runs read 1083, 1432 and 1228 Mflops in the three boots, and its second runs up
-to 3073.
+FFT varies from run to run: its first runs read 3163, 3198 and 1777 Mflops in the three boots, and its second runs
+1716 to 3105.
 
 The gap is largest for floating-point and vector code (`cray`, `zstd`, `luajit-interp`), which
 natemu runs as native ARM64 instructions. It is smallest where the guest kernel does most of the
@@ -118,22 +117,22 @@ unless the case says SSE2, run by the same 64-bit kernel at 1 vCPU:
 | `cray32`, `cray32-strict`, `cray32-sse2` | c-ray built as `cray` and as `cray-strict` (x87), and for SSE2; `-small`: the scene at 320×240, 1/16 of the pixels |
 | `scimark32`, `scimark32-sse2` | SciMark, the x87 and the SSE2 build |
 
-Bench cases `guest-hackbench32` to `guest-scimark32-sse2`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds, the
+Bench cases `guest-hackbench32` to `guest-scimark32-sse2`; Apple M4; natemu 3b13c1d0; November 24, 2026; seconds, the
 median of 3 boots' first runs. QEMU 11.1.2 on the same M4 (the cases with `-qemu`): November 21-22, 2026, one boot's
 first run, the small c-ray scenes only. Real x86: the same binary on the Ryzen, November 20-21, 2026, where measured:
 
 | Program | natemu | QEMU | speed-up | real x86 |
 | --- | ---: | ---: | ---: | ---: |
-| `hackbench32` | 10.733 | 17.79 | 1.7× | |
-| `hackbench32-int80` | 25.278 | 24.48 | 0.97× | |
-| `sqlite32` | 7.887 | 33.70 | 4.3× | |
-| `startup32` | 7.140 | 29.15 | 4.1× | |
-| `cray32-small` | 0.657 | 80.92 | 123× | 0.58 |
-| `cray32-strict-small` | 0.644 | 86.50 | 134× | 0.61 |
-| `cray32-sse2-small` | 0.302 | 10.27 | 34.0× | 0.25 |
-| `cray32` | 9.249 | not run | | 9.19 |
-| `cray32-strict` | 8.795 | not run | | 9.63 |
-| `cray32-sse2` | 3.912 | not run | | 3.91 |
+| `hackbench32` | 11.006 | 17.79 | 1.6× | |
+| `hackbench32-int80` | 25.671 | 24.48 | 0.95× | |
+| `sqlite32` | 7.264 | 33.70 | 4.6× | |
+| `startup32` | 6.617 | 29.15 | 4.4× | |
+| `cray32-small` | 0.643 | 80.92 | 126× | 0.58 |
+| `cray32-strict-small` | 0.600 | 86.50 | 144× | 0.61 |
+| `cray32-sse2-small` | 0.308 | 10.27 | 33.3× | 0.25 |
+| `cray32` | 9.230 | not run | | 9.19 |
+| `cray32-strict` | 8.791 | not run | | 9.63 |
+| `cray32-sse2` | 3.915 | not run | | 3.91 |
 
 QEMU runs x87 code in software, which is why the x87 rows are so large; they say more about QEMU than about natemu.
 `hackbench32-int80` is level with QEMU: natemu has no fast path yet for system calls made by INT 0x80.
@@ -143,13 +142,13 @@ boot's first run; real x86 the same binaries on the Ryzen, November 20-21, 2026)
 
 | SciMark, 32-bit | FFT | SOR | Monte Carlo | sparse | LU |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| x87: natemu | 1037 | 1653 | 292 | 1187 | 1939 |
+| x87: natemu | 1298 | 1643 | 292 | 1186 | 1938 |
 | x87: QEMU | 10.9 | 30.6 | 15.9 | 26.2 | 21.6 |
-| x87: speed-up | 95× | 54× | 18× | 45× | 90× |
+| x87: speed-up | 119× | 54× | 18× | 45× | 90× |
 | x87: real x86 | 1869 | 1226 | 852 | 4378 | 4571 |
-| SSE2: natemu | 2624 | 3897 | 256 | 2875 | 4241 |
+| SSE2: natemu | 2649 | 3887 | 257 | 2911 | 6693 |
 | SSE2: QEMU | 149 | 312 | 33 | 297 | 434 |
-| SSE2: speed-up | 18× | 12× | 7.8× | 9.7× | 9.8× |
+| SSE2: speed-up | 18× | 12× | 7.8× | 9.8× | 15× |
 | SSE2: real x86 | 4098 | 2887 | 796 | 5541 | 10276 |
 
 ## Context-switch-heavy Debian workload
@@ -267,13 +266,14 @@ natemu the runner takes 100 PNG snapshots of it through the control socket (`sna
 copy, the PNG, the base64 JSON line and the client's decoding). The control group is QEMU's `bochs-display` on the same
 Mac (TCG), the same guest and program. 1 vCPU, 2 GiB, one run each (`tests/devices/run_display.py bench`).
 
-Bench cases `display-fill` and `display-fill-qemu`; Apple M4; natemu 45bdaa88; November 24, 2026:
+Bench cases `display-fill` and `display-fill-qemu`; Apple M4; November 24, 2026; natemu 3b13c1d0, QEMU with natemu 45bdaa88's
+run:
 
 | | natemu | QEMU |
 | --- | ---: | ---: |
-| 1 GiB into the framebuffer | 0.057 s (17.5 GiB/s) | 0.301 s (3.3 GiB/s) |
-| 1 GiB into guest RAM | 0.053 s (18.7 GiB/s) | 0.289 s (3.5 GiB/s) |
-| framebuffer / RAM | 1.07 | 1.04 |
+| 1 GiB into the framebuffer | 0.026 s (38.3 GiB/s) | 0.301 s (3.3 GiB/s) |
+| 1 GiB into guest RAM | 0.027 s (37.6 GiB/s) | 0.289 s (3.5 GiB/s) |
+| framebuffer / RAM | 0.98 | 1.04 |
 | a 1024 x 768 snapshot | 4.6 ms | |
 
 The pattern's PNG is 27 KB; a busier picture compresses less and takes longer to encode.
