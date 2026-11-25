@@ -115,6 +115,10 @@ pub(crate) struct Args {
     /// The code cache [default: the largest]
     #[arg(long = "code-cache", value_name = "BYTES", value_parser = number)]
     code_bytes: Option<u64>,
+    /// Each vCPU's shadow-table pool in pages (`machine.shadow_pool_pages`) [default: the whole reservation, 16384; at
+    /// least 285: a small pool fills, for tests of the full reset]
+    #[arg(long, value_name = "PAGES", value_parser = natemu::execution::parse_shadow_pool_pages)]
+    shadow_pool_pages: Option<usize>,
     /// Load into host memory and run nothing (RUNTIME and FEXC are not opened)
     #[arg(long)]
     load_only: bool,
@@ -223,6 +227,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         rsdp,
         vcpus,
         code_bytes,
+        shadow_pool_pages,
         load_only,
         dump,
         stop_at,
@@ -350,6 +355,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         vcpus,
         rsdp,
         code_bytes,
+        shadow_pool_pages: shadow_pool_pages.unwrap_or(natemu_abi::shadow::POOL_MAX_PAGES),
         strict_unassigned: strict,
         lost_ticks: lost,
         watchdog: std::time::Duration::from_millis(watchdog_ms),
@@ -496,6 +502,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
                 ),
                 shootdowns: s.shootdowns,
+                evictions: s.evictions,
                 fault: format!("{:x?}", s.fault),
                 native: s.native.map(Hex),
                 state: CpuReport::new(&s.cpu),
@@ -738,6 +745,8 @@ struct VcpuReport {
     interrupts: u64,
     mailbox: (Hex, u64, u64, u64),
     shootdowns: u64,
+    /// Its shadow pool's full resets (`State::evictions`; the top-level `stats` holds vCPU 0's).
+    evictions: u64,
     fault: String,
     /// The resident's detail of its stop (`State::native`: e.g. a reuse mismatch's RIP, code offset and failed checks).
     native: [Hex; 3],
@@ -904,7 +913,7 @@ mod tests {
         let acked = v.mailbox.2;
         let compiles = v.compiles;
         format!(
-            "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"native\":[{},{},{}],\"state\":{}}}",
+            "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"evictions\":{},\"fault\":\"{:x?}\",\"native\":[{},{},{}],\"state\":{}}}",
             stop.replace('"', "'"),
             hex(v.rip.0),
             v.blocks,
@@ -918,6 +927,7 @@ mod tests {
             v.mailbox.1,
             v.mailbox.3,
             v.shootdowns,
+            v.evictions,
             fault,
             hex(v.native[0].0),
             hex(v.native[1].0),
@@ -939,6 +949,7 @@ mod tests {
             interrupts: 17,
             mailbox: (Hex(0xfee0_0000), 18, 19, 20),
             shootdowns: 21,
+            evictions: 22,
             fault: format!("{fault:x?}"),
             native: [Hex(1), Hex(0x22), Hex(0x333)],
             state: CpuReport::new(c),

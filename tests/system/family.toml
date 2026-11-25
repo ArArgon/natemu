@@ -282,6 +282,13 @@ argv = ["tests/system/run_m1.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 smoke = true
 
+# The shadow pool's full reset (`run-program --shadow-pool-pages 285`): pages in 300 regions 1 GiB apart fill the least
+# pool a launch may set; the default pool never fills (tests/system/run_shadow_pool.py).
+[suite.cases."shadow-pool"]
+argv = ["tests/system/run_shadow_pool.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+smoke = true
+
 [suite.cases."l3"]
 argv = ["tests/system/run_l3.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

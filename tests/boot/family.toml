@@ -50,6 +50,14 @@ argv = ["tests/boot/run_boot_smoke.py", "--only", "startup", "--host", "{natemu_
         "--fexc", "{fexc}", "--out", "{out}"]
 needs = { cores = 4, perf = true }
 
+# The shadow pool's full reset on an SMP Linux boot: the `startup` boots with a pool of 285 pages (the least a launch may
+# set; the default 16,384 never fills), with tests/boot/sparse_static.asm run by the script to fill it: each boot also needs
+# its read-back right and evictions on some vCPU.
+[suite.cases."boot-startup-small-pool"]
+argv = ["tests/boot/run_boot_smoke.py", "--only", "startup", "--vcpus", "2", "--shadow-pool-pages", "285", "--host", "{natemu_host}",
+        "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { cores = 2, perf = true }
+
 # The M2 exit test's firmware (tests/boot/exit_fw.asm) and its AP part as a 64-bit program (exit_prog.asm), both built
 # here with nasm, on the references at 1, 2, 4 and 8 CPUs (tests/boot/run_exit_fw.py;
 # docs/restructure/m2-exit-firmware.md): -qemu the pinned QEMU 11.1.2 under TCG, -kvm real hardware (the x86 reference

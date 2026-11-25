@@ -35,10 +35,17 @@ the reboot vector, then `stop_this_cpu`'s HLT loop with IF = 0; 6.12 parks no CP
 Each boot's run time (the driver's `stats.seconds`, VM start to S5), the guest's uptime and the CMOS ports' (70H, 71H)
 access counts are reported: 71H's writes grow by two for each warm-reset setup and its restore (0AH, then 0, into 0FH;
 natemu's CMOS keeps 0FH as a plain byte, as QEMU's does, and 467H is guest RAM).
+`--shadow-pool-pages N` (with `startup`): each vCPU's shadow-table pool is N pages (boot-linux's option; the default, the
+whole 16,384-page reservation, never fills), and the script also runs tests/boot/sparse_static.asm (built here with
+nasm, appended to the initrd as /natemu-sparse): one page in each of 300 regions 1 GiB apart, stored and read back three
+times, which needs about 600 shadow table pages a pass. Each boot must then also show `natemu-sparse-rc=42` and
+evictions on some vCPU (the driver's per-vCPU `evictions`): the full-pool reset runs on a real SMP boot
+(`boot-startup-small-pool`, N = 285, the least a launch may set; busybox alone never fills it).
 
     tests/boot/run_boot_smoke.py --fexc FEXC --out DIR [--vcpus 1 4] [--kernel BZIMAGE] [--initrd FILE]
         [--timeout SECONDS] [--only i386]
     tests/boot/run_boot_smoke.py --only startup --host HOST --runtime RUNTIME --fexc FEXC --out DIR [--vcpus 2 4]
+        [--shadow-pool-pages N]
 
 The compile cache is off unless NATEMU_COMPILE_CACHE is set (hermetic). Writes DIR/smoke-N.serial, DIR/smoke.json;
 exit 1 on a failure."""
@@ -235,10 +242,22 @@ def startup_judge(n, mailbox, rep, fields):
 
 def startup(a, n, mailbox):
     """One `startup` boot: the driver's report, the script's fields, the judge's differences, the run's time."""
-    name = f"startup-{'mailbox' if mailbox else 'no-mailbox'}-n{n}"
+    pool = a.shadow_pool_pages
+    name = f"startup-{'mailbox' if mailbox else 'no-mailbox'}-n{n}{f'-pool{pool}' if pool else ''}"
     serial = a.out / f'{name}.serial'
-    cmd = [a.host, a.runtime, 'boot-linux', a.fexc, a.kernel, '--initrd', a.initrd, '--cmdline', STARTUP_CMDLINE,
-           '--vcpus', str(n), '--serial', serial, *([] if mailbox else ['--no-mailbox'])]
+    initrd, cmdline = a.initrd, STARTUP_CMDLINE
+    if pool:
+        # The sparse program (tests/boot/sparse_static.asm) in the initrd, run by the script before its end.
+        prog = a.out / 'natemu-sparse'
+        subprocess.run(['nasm', '-f', 'bin', '-o', prog, ROOT / 'tests/boot/sparse_static.asm'], check=True)
+        initrd = a.out / 'initrd-sparse'
+        base = pathlib.Path(a.initrd).read_bytes()
+        initrd.write_bytes(base + bytes(-len(base) % 4) + newc([('natemu-sparse', 0o100755, prog.read_bytes())]))
+        cmdline = STARTUP_CMDLINE.replace('echo natemu-script=done;', '/natemu-sparse; echo natemu-sparse-rc=$?; echo natemu-script=done;')
+        assert cmdline != STARTUP_CMDLINE
+    cmd = [a.host, a.runtime, 'boot-linux', a.fexc, a.kernel, '--initrd', initrd, '--cmdline', cmdline,
+           '--vcpus', str(n), '--serial', serial, *([] if mailbox else ['--no-mailbox']),
+           *(['--shadow-pool-pages', str(pool)] if pool else [])]
     t0 = time.monotonic()
     try:
         r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=a.timeout)
@@ -256,8 +275,16 @@ def startup(a, n, mailbox):
     text = serial.read_text(errors='replace') if serial.exists() else ''
     fields = startup_fields(text)
     diffs = startup_judge(n, mailbox, rep, fields)
+    # A small pool (`--shadow-pool-pages`): the sparse program read back every page, and its vCPU filled the pool (the
+    # full reset ran) while the boot still passed.
+    evictions = [c.get('evictions') for c in rep.get('vcpus', [])]
+    if pool:
+        if fields.get('sparse-rc') != '42':
+            diffs.append(f"sparse-rc: {fields.get('sparse-rc')!r}, want '42' (tests/boot/sparse_static.asm)")
+        if not sum(e or 0 for e in evictions):
+            diffs.append(f'evictions {evictions!r} with a pool of {pool} pages, want some (the full-pool reset untested)')
     cmos = {x['port']: [x['reads'], x['writes']] for x in rep.get('ports', []) if x['port'] in ('0x70', '0x71')}
-    return dict(case=name, vcpus=n, mailbox=mailbox, ok=not diffs, diffs=diffs, wall_s=wall,
+    return dict(case=name, vcpus=n, mailbox=mailbox, ok=not diffs, diffs=diffs, wall_s=wall, evictions=evictions,
                 run_s=rep.get('stats', {}).get('seconds'), uptime_s=fields.get('uptime'),
                 waiting=[c.get('waiting') for c in rep.get('vcpus', [])], cmos_ports=cmos, fields=fields,
                 last=[line for line in text.splitlines() if line.strip()][-5:] if diffs else [])
@@ -274,6 +301,8 @@ def main():
     ap.add_argument('--only', choices=['i386', 'startup'])
     ap.add_argument('--host', help='startup: the program driver (natemu-host)')
     ap.add_argument('--runtime', help='startup: the resident')
+    ap.add_argument('--shadow-pool-pages', type=int, help="startup: each vCPU's shadow pool in pages (boot-linux's); each "
+                    'boot must then also have filled it at least once (vCPU 0\'s evictions)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault('NATEMU_COMPILE_CACHE', 'off')
