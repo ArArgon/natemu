@@ -331,3 +331,16 @@ All bench cases run on the Mac mini M4, each side from its own commit (`TESTKIT_
   guardable: absolute to absolute, user, non-global, with a one-page target (a counter step 1a adds). If it is built, it
   is kept if those buckets drop and `guest-luajit-interp` slows by no more than twice its noise; otherwise the
   fallbacks of section 5 are measured the same way.
+
+### 7.1 The A/B (Mac mini M4, `~/de-profile`)
+
+- **Base:** e86dbab6, the desktop-profile tip with the host's `snapc` lines, through `TESTKIT_BENCH_AT`. The base runs
+  are shared with the fault-around work, so the base is measured once:
+  - `desktop-kde-profile`: run 20261126-024119-6d48.
+  - `desktop-kde-browser-profile` (the desktop Chromium Speedometer, which is the one that counts; base 2.42): run
+    20261126-021552-6362.
+  - Run for this plan: `guest-build`, `guest-luajit-interp` and `speedometer-natemu` (run 20261126-025647-314e), and
+    `guest-hackbench` at 4 vCPUs, twice (about 14% noise: runs 20261126-025647-479f and -da80).
+- **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip b645b4f5). It is measured on the
+  same cases, one run each, and hackbench twice.
+
