@@ -19,18 +19,29 @@
 //! the index of every pack of its own identity at start; a writer thread hashes its new entries (each key once, off the
 //! compile path) into one pending pack, written when it reaches [`PACK_BYTES`], when its oldest entry is [`PACK_AGE`] old (a
 //! run killed by a signal loses at most that), and when the cache is dropped. Cap: at start, once the total exceeds 3/4 of
-//! the cap, other builds' packs go (they can never hit), then the oldest of this build's, until it is at most 3/4 of the
-//! cap, so every run has a quarter of the cap to write into; during a run, nothing more is written once the total reaches
-//! the cap.
+//! the cap, other builds' packs go (they can never hit), then this build's least recently used, until it is at most 3/4
+//! of the cap, so every run has a quarter of the cap to write into; during a run, nothing more is written once the total
+//! reaches the cap. A pack's modification time is when it was last used: written, or hit by a process (the writer thread
+//! sets it to the time of the process's first hit in that pack, once per pack and process, off the compile path), so
+//! the packs a desktop's sessions keep hitting outlive newer ones nothing hit again.
+//!
+//! In memory, the index keys an entry by the first 8 bytes of its key and keeps the first 8 bytes of its sum (33 bytes a
+//! table slot, against 89 for the whole key and sum; sized once for every pack's entries at open): a hit checks the sum,
+//! computed with the lookup's whole key, so a key sharing only those 8 bytes, or a damaged payload, is a miss but for a
+//! chance of 2^-64.
+//!
 //! Configuration: [`Config`], by [`Config::new`] from the entries' `--compile-cache DIR|off` (default
-//! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap, default 512), whose fallbacks are the environment's
-//! `NATEMU_COMPILE_CACHE` and `NATEMU_COMPILE_CACHE_MB`. Only the boot entry opens it
-//! ([`shared`]: `natemu`, `natemu-host boot-linux`); the test drivers never do.
+//! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap; default [`default_cap`], a tenth of the cache
+//! volume's free space within 1 to 4 GiB), whose fallbacks are the environment's `NATEMU_COMPILE_CACHE` and
+//! `NATEMU_COMPILE_CACHE_MB`. Only the boot entry opens it ([`shared`]: `natemu`, `natemu-host boot-linux`); the test
+//! drivers never do. Why these numbers: `docs/restructure/disk-cache-cap-plan.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const HEAD: &[u8; 8] = b"NFXPACK1";
@@ -163,12 +174,34 @@ fn sha256_with(parts: &[&[u8]], compress: fn(&mut [u32; 8], &[u8])) -> [u8; 32] 
     out
 }
 
+/// An entry in the in-memory index: the first 8 bytes of its sum, and where its payload is.
 struct Slot {
-    pack: usize,
-    offset: u64,
+    sum: u64,
+    pack: u32,
+    offset: u32,
     len: u32,
-    sum: [u8; 32],
 }
+/// The index's key: the first 8 bytes of an entry's key.
+fn prefix(bytes: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+/// Hashes the index's keys as they are: they are bytes of SHA-256, already uniform.
+#[derive(Default)]
+struct Uniform(u64);
+impl Hasher for Uniform {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+type Index = HashMap<u64, Slot, BuildHasherDefault<Uniform>>;
 /// The pending pack.
 #[derive(Default)]
 struct Pack {
@@ -176,11 +209,13 @@ struct Pack {
     index: Vec<([u8; 32], u64, u32, [u8; 32])>,
     since: Option<std::time::Instant>,
 }
-/// The writer thread's state: new entries go to disk off the compile path.
+/// The writer thread's state: new entries go to disk off the compile path, and hits to the packs' times.
 struct Writer {
     dir: PathBuf,
     identity: [u8; 32],
     cap: u64,
+    /// The packs read at start (the hits' stamps).
+    packs: Arc<Vec<File>>,
     pack: Pack,
     /// Keys stored by this process (vCPUs compile the same blocks).
     stored: HashSet<[u8; 32]>,
@@ -188,8 +223,11 @@ struct Writer {
     bytes: u64,
     written: u32,
 }
-/// A new entry: what it is stored under, payload.
-type Entry = (Stored, Vec<u8>);
+/// What the writer thread is sent: a new entry (what it is stored under, payload), or the first hit in a pack read at start.
+enum Msg {
+    Put(Stored, Vec<u8>),
+    Hit(u32),
+}
 /// What a new entry is stored under: the key the lookup that missed computed ([`DiskCache::key`]), or the request body when no
 /// lookup was made (a cold cache: the writer thread hashes it).
 pub(crate) enum Stored {
@@ -199,9 +237,11 @@ pub(crate) enum Stored {
 
 pub struct DiskCache {
     identity: [u8; 32],
-    packs: Vec<File>,
-    index: HashMap<[u8; 32], Slot>,
-    writer: Mutex<Option<std::sync::mpsc::Sender<Entry>>>,
+    packs: Arc<Vec<File>>,
+    /// Per pack, whether this process has hit it (its time is set once).
+    hit: Vec<AtomicBool>,
+    index: Index,
+    writer: Mutex<Option<std::sync::mpsc::Sender<Msg>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Bytes of the packs kept at start (after eviction), and their entries.
     #[allow(dead_code)] // read only by the tests (eviction and entry counts) since the open line went
@@ -253,65 +293,78 @@ impl DiskCache {
                 }
             }
         }
-        // Other builds' packs, then this build's, each oldest first: the eviction order.
+        // Other builds' packs, then this build's, each least recently used first (a pack's time is its last write or
+        // hit): the eviction order.
         packs.sort();
         let mut total: u64 = packs.iter().map(|p| p.2).sum();
         // Down to 3/4 of the cap as soon as the total is above it, not only above the cap: a cache left just under the cap
         // would let nothing more be written (see `Writer::put`) and never be evicted.
-        // ponytail: oldest-written first (no access times); an LRU needs a write per hit.
         while total > cap / 4 * 3 && !packs.is_empty() {
             let (_, _, size, path) = packs.remove(0);
             let _ = fs::remove_file(path);
             total -= size;
         }
-        let (mut files, mut index, mut bytes) = (vec![], HashMap::new(), 0);
+        let mut bytes = 0;
+        // Each kept pack of this build, open, with its entry count: the index is sized for all of them at once.
+        let mut opened = vec![];
         for (own, _, size, path) in packs {
-            if !own {
-                bytes += size; // on disk and counted, but its keys are another build's: not read
-                continue;
-            }
-            match File::open(&path)
-                .ok()
-                .and_then(|f| read_index(&f, size).map(|i| (f, i)))
-            {
-                Some((file, records)) => {
-                    let pack = files.len();
-                    files.push(file);
-                    bytes += size;
-                    for (key, offset, len, sum) in records {
-                        index.insert(
-                            key,
-                            Slot {
-                                pack,
-                                offset,
-                                len,
-                                sum,
-                            },
-                        );
-                    }
-                }
-                None => {
-                    let _ = fs::remove_file(path); // complete by construction, so damaged
-                }
+            bytes += size; // on disk and counted, read or not
+            // Another build's pack is not read (its keys are another build's), nor is one that cannot be opened (out of
+            // descriptors, say): it is left alone.
+            if let Some(file) = own.then(|| File::open(&path).ok()).flatten() {
+                opened.push((file, size, path));
             }
         }
+        let mut index = Index::with_capacity_and_hasher(
+            opened.iter().map(|(f, size, _)| count(f, *size).unwrap_or(0) as usize).sum(),
+            Default::default(),
+        );
+        let mut files = Vec::with_capacity(opened.len());
+        for (file, size, path) in opened {
+            let Some(records) = read_index(&file, size) else {
+                let _ = fs::remove_file(path); // complete by construction, so damaged
+                bytes -= size;
+                continue;
+            };
+            let pack = files.len() as u32;
+            files.push(file);
+            for (key, offset, len, sum) in records {
+                index.insert(
+                    prefix(&key),
+                    Slot {
+                        sum: prefix(&sum),
+                        pack,
+                        offset,
+                        len,
+                    },
+                );
+            }
+        }
+        let files = Arc::new(files);
         let mut w = Writer {
             dir: dir.into(),
             identity,
             cap,
+            packs: files.clone(),
             pack: Pack::default(),
             stored: HashSet::new(),
             bytes,
             written: 0,
         };
-        let (tx, rx) = std::sync::mpsc::channel::<Entry>();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         let thread = std::thread::Builder::new()
             .name("compile-cache".into())
             .spawn(move || {
                 loop {
                     match rx.recv_timeout(PACK_AGE) {
-                        Ok((Stored::Key(k), payload)) => w.put(k, &payload),
-                        Ok((Stored::Body(body), payload)) => w.put(key(&w.identity, &body), &payload),
+                        Ok(Msg::Put(Stored::Key(k), payload)) => w.put(k, &payload),
+                        Ok(Msg::Put(Stored::Body(body), payload)) => {
+                            w.put(key(&w.identity, &body), &payload)
+                        }
+                        // The pack's last use, for the eviction order (a failure only costs it its place).
+                        Ok(Msg::Hit(pack)) => {
+                            let _ = w.packs[pack as usize].set_modified(std::time::SystemTime::now());
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return w.write(),
                     }
@@ -324,6 +377,7 @@ impl DiskCache {
         let entries = index.len();
         Ok(Self {
             identity,
+            hit: (0..files.len()).map(|_| AtomicBool::new(false)).collect(),
             packs: files,
             index,
             writer: Mutex::new(Some(tx)),
@@ -342,25 +396,35 @@ impl DiskCache {
         self.index.is_empty()
     }
 
-    /// The payload stored under `key`, if any and intact.
+    /// The payload stored under `key`, if any and intact. The first hit in a pack has the writer thread stamp it.
     pub(crate) fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
-        let slot = self.index.get(key)?;
+        let slot = self.index.get(&prefix(key))?;
         let mut payload = vec![0; slot.len as usize];
-        self.packs[slot.pack]
-            .read_exact_at(&mut payload, slot.offset)
+        self.packs[slot.pack as usize]
+            .read_exact_at(&mut payload, u64::from(slot.offset))
             .ok()?;
-        (sha256(&[key, &payload]) == slot.sum).then_some(payload)
+        if prefix(&sha256(&[key, &payload])) != slot.sum {
+            return None;
+        }
+        if !self.hit[slot.pack as usize].swap(true, Ordering::Relaxed) {
+            self.send(Msg::Hit(slot.pack));
+        }
+        Some(payload)
     }
 
     /// Stores `payload` for a request (once per process), on the writer thread.
     pub(crate) fn put(&self, at: Stored, payload: Vec<u8>) {
+        self.send(Msg::Put(at, payload));
+    }
+
+    fn send(&self, msg: Msg) {
         if let Some(tx) = self
             .writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            let _ = tx.send((at, payload));
+            let _ = tx.send(msg);
         }
     }
 }
@@ -444,8 +508,16 @@ impl Drop for DiskCache {
     }
 }
 
-/// A pack's index, if its framing is intact.
-fn read_index(f: &File, size: u64) -> Option<Vec<([u8; 32], u64, u32, [u8; 32])>> {
+/// A pack's entry count as its tail says (a bound for sizing: [`read_index`] checks it).
+fn count(f: &File, size: u64) -> Option<u64> {
+    let mut end = [0; 16];
+    f.read_exact_at(&mut end, size.checked_sub(16)?).ok()?;
+    let count = u64::from_le_bytes(end[..8].try_into().unwrap());
+    (&end[8..] == TAIL && count <= size / RECORD as u64).then_some(count)
+}
+
+/// A pack's index, if its framing is intact (offsets within 4 GiB, as every pack's are: packs are written at 4 MiB).
+fn read_index(f: &File, size: u64) -> Option<Vec<([u8; 32], u32, u32, [u8; 32])>> {
     let mut end = [0; 16];
     f.read_exact_at(&mut end, size.checked_sub(16)?).ok()?;
     let count = u64::from_le_bytes(end[..8].try_into().unwrap());
@@ -464,8 +536,9 @@ fn read_index(f: &File, size: u64) -> Option<Vec<([u8; 32], u64, u32, [u8; 32])>
                 u64::from_le_bytes(r[32..40].try_into().unwrap()),
                 u32::from_le_bytes(r[40..44].try_into().unwrap()),
             );
-            (offset >= HEAD.len() as u64
-                && offset
+            let offset = u32::try_from(offset).ok()?;
+            (offset >= HEAD.len() as u32
+                && u64::from(offset)
                     .checked_add(u64::from(len))
                     .is_some_and(|end| end <= start))
             .then(|| {
@@ -496,7 +569,7 @@ pub struct Config {
 impl Config {
     pub const OFF: Self = Self { dir: None, cap: 0 };
     /// The configuration callers opt into: `dir` a directory or `off` (default `~/Library/Caches/natemu/fexc`), `mb` the
-    /// cap in MiB (default 512).
+    /// cap in MiB (default [`default_cap`] of the free space of the volume `dir` is on).
     pub fn new(dir: Option<&std::ffi::OsStr>, mb: Option<u64>) -> Result<Self, String> {
         let dir = match dir {
             Some(v) if v == "off" => None,
@@ -504,12 +577,35 @@ impl Config {
             None => std::env::var_os("HOME")
                 .map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
         };
-        let cap = mb
-            .unwrap_or(512)
-            .checked_mul(1 << 20)
-            .ok_or_else(|| format!("compile cache cap {} MiB: too large", mb.unwrap_or(0)))?;
+        let cap = match (mb, &dir) {
+            (Some(mb), _) => mb
+                .checked_mul(1 << 20)
+                .ok_or_else(|| format!("compile cache cap {mb} MiB: too large"))?,
+            (None, Some(dir)) => default_cap(free_bytes(dir)),
+            (None, None) => 0,
+        };
         Ok(Self { dir, cap })
     }
+}
+
+/// The default cap's bounds. The ceiling holds a desktop's sessions and apps (a KDE session alone writes 592 MiB before
+/// any app starts); the floor keeps that session across opens (3/4 of it, 768 MiB, is kept at each).
+pub const CAP_FLOOR: u64 = 1 << 30;
+pub const CAP_CEILING: u64 = 4 << 30;
+/// The default cap for a cache volume with `free` bytes free (`None`: unknown): a tenth of it within [`CAP_FLOOR`] and
+/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 40 GiB free, and moves in steps).
+pub fn default_cap(free: Option<u64>) -> u64 {
+    let step = 256 << 20;
+    free.map_or(CAP_CEILING, |f| (f / 10).clamp(CAP_FLOOR, CAP_CEILING)) / step * step
+}
+
+/// The bytes free to an unprivileged writer on the volume `dir` is on (or would be on: its nearest existing ancestor's).
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let dir = dir.ancestors().find(|d| d.exists())?;
+    let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str())).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statfs(path.as_ptr(), &mut st) } == 0)
+        .then(|| u64::from(st.f_bavail).saturating_mul(u64::from(st.f_bsize)))
 }
 
 /// The process's cache for answers of `fexc` (one, shared by every vCPU's compiler; written out when the last drops), or
@@ -695,12 +791,25 @@ mod tests {
 
     /// A small pack: `put`s of `n` payloads of 1000 bytes by build `fexc`, each batch its own open.
     fn fill(store: &Path, fexc: &Path, n: u8) {
+        fill_keys(store, fexc, 0..n);
+    }
+    /// The same for requests `keys` (request `[i]`, payload 1000 bytes of `i`).
+    fn fill_keys(store: &Path, fexc: &Path, keys: std::ops::Range<u8>) {
         let c = DiskCache::open(store, fexc, 1 << 30).unwrap();
-        for i in 0..n {
+        for i in keys {
             c.put(Stored::Body(vec![i]), vec![i; 1000]);
         }
         drop(c);
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fn scratch(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("natemu-cc-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fexc = dir.join("fexc");
+        fs::write(&fexc, b"build 1").unwrap();
+        let store = dir.join("store");
+        (dir, fexc, store)
     }
     fn dir_bytes(store: &Path) -> u64 {
         fs::read_dir(store)
@@ -748,6 +857,90 @@ mod tests {
         assert_eq!(c.entries, 2);
         assert_eq!(fs::read_dir(&store).unwrap().count(), 1);
         assert!(c.get(&c.key(&[0])).is_some() && c.get(&c.key(&[1])).is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pack hit since it was written outlives a newer one nothing hit: eviction is by last use, not by write time.
+    #[test]
+    fn hit_packs_outlive_newer_untouched_ones() {
+        let (dir, fexc, store) = scratch("lru");
+        fill_keys(&store, &fexc, 0..2); // older
+        fill_keys(&store, &fexc, 10..12); // newer
+        {
+            let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
+            assert_eq!(c.get(&c.key(&[0])), Some(vec![0; 1000])); // the older pack's first hit: stamped
+            assert_eq!(c.get(&c.key(&[1])), Some(vec![1; 1000])); // its second: not again
+        } // the writer thread has stamped it before the drop returns
+        let cap = dir_bytes(&store) * 2 / 3 + 64; // 3/4 of it is just over one pack: one goes
+        let c = DiskCache::open(&store, &fexc, cap).unwrap();
+        assert_eq!(
+            [0u8, 1, 10, 11].map(|i| c.get(&c.key(&[i])).is_some()),
+            [true, true, false, false]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pack of this build that cannot be opened is kept on disk (and counted), not taken for a damaged one.
+    #[test]
+    fn unopenable_pack_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, fexc, store) = scratch("unopenable");
+        fill(&store, &fexc, 2);
+        let pack = fs::read_dir(&store).unwrap().flatten().next().unwrap().path();
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0)).unwrap();
+        let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
+        assert_eq!((c.entries, c.bytes), (0, fs::metadata(&pack).unwrap().len()));
+        drop(c);
+        assert!(pack.exists());
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(DiskCache::open(&store, &fexc, 1 << 30).unwrap().entries, 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The index keys entries by their keys' first 8 bytes: a lookup whose key shares only those is a miss (the sum is
+    /// computed with the whole key).
+    #[test]
+    fn a_key_sharing_the_index_prefix_misses() {
+        let (dir, fexc, store) = scratch("prefix");
+        fill(&store, &fexc, 1);
+        let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
+        let mut k = c.key(&[0]);
+        assert!(c.get(&k).is_some());
+        k[31] ^= 1;
+        assert_eq!(c.get(&k), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The default cap: a tenth of the free space, within 1 to 4 GiB, in 256 MiB steps; the ceiling when unknown.
+    #[test]
+    fn default_cap_bounds() {
+        const G: u64 = 1 << 30;
+        assert_eq!(default_cap(None), 4 * G);
+        assert_eq!(default_cap(Some(0)), G);
+        assert_eq!(default_cap(Some(5 * G)), G); // the floor
+        assert_eq!(default_cap(Some(20 * G)), 2 * G);
+        assert_eq!(default_cap(Some(13 * G)), 5 * G / 4); // 1.3 GiB, down to a step
+        assert_eq!(default_cap(Some(40 * G)), 4 * G);
+        assert_eq!(default_cap(Some(2000 * G)), 4 * G); // the ceiling
+        assert_eq!(default_cap(Some(u64::MAX)), 4 * G);
+    }
+
+    /// `--compile-cache-mb` wins over the default; without it the cap is the default of the cache volume's free space, also
+    /// for a folder not made yet; `off` has no cap.
+    #[test]
+    fn config_cap() {
+        let (dir, _, store) = scratch("config");
+        let os = |p: &Path| p.as_os_str().to_owned();
+        let c = Config::new(Some(&os(&store)), Some(64)).unwrap();
+        assert_eq!((c.dir.as_deref(), c.cap), (Some(store.as_path()), 64 << 20));
+        let free = free_bytes(&store.join("not/made")).unwrap();
+        assert!(free > 0 && free < 1 << 50, "{free}");
+        let c = Config::new(Some(&os(&store)), None).unwrap();
+        assert!(c.cap >= CAP_FLOOR && c.cap <= CAP_CEILING, "{}", c.cap);
+        assert_eq!(c.cap, default_cap(Some(free)));
+        let off = Config::new(Some(std::ffi::OsStr::new("off")), None).unwrap();
+        assert_eq!((off.dir, off.cap), (None, 0));
+        assert!(Config::new(None, Some(u64::MAX)).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
