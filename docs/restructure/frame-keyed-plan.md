@@ -108,6 +108,19 @@ What instances did, and how each is done without them:
 | Linker and fault RIP | `running_rip` already reads the slot. The linker gets the target's RIP from `find` instead of `target.rip` (`link(source, target, at, to)`). |
 | `REUSE_CHECK` | The comparison with the host's answer runs at each frame-keyed entry in check mode. |
 
+What the tests found instances also gave (k1 at 2-4 CPUs), kept without them:
+
+- **The reuse check compares each (translation, RIP) once,** as each instance was compared once when it was filed. A
+  direct-mapped table of the pairs already compared (`area::CHECKED_AT`, 4096 entries, under the check only) holds them;
+  the fast paths enter only a pair compared already.
+- **`remapped` still counts** a RIP whose page maps other frames than its last shared entry (or a global leaf, or none),
+  as the stale instance's revalidation counted it. It comes from a direct-mapped table of the frames each RIP was entered
+  from (`area::ENTERED_AT`, 4096 entries, counting only). The k1 oracle exempts such runs from "host requests equal
+  distinct RIPs".
+- **A translation's L1 way is the one whose tag is the RIP,** so two of its RIPs in one set hold both ways, as two
+  instances did (code review note 7).
+- **A lost race does not discard the translation** (`entered_shared`); it serves every RIP of its frames.
+
 L1 is still emptied at every CR3 load in step 1. Sharing stays lazy: code is rewritten the first time a second address
 needs it.
 
@@ -346,7 +359,8 @@ checkpoint.
   - `guest-luajit-interp`, run for this plan: run 20261126-030949-67a2.
 - **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip eded8385, which carries the race
   fix 2d7ec278), on the same three cases: `guest-luajit-interp` in run 20261126-032144-aa00, the two desktop cases in run
-  20261126-032146-6203.
+  20261126-032146-6203. The branch's later commits change, outside the check and the counters, only which L1 way a
+  translation's second RIP in one set takes; they are not measured separately.
 - **What is read:**
   - `desktop-kde-profile`: the warm and cold Konsole and Dolphin starts (`app-*-1:start`, `app-*-2:start`), their buckets,
     and the k1 counters `fkeys.lost`, `fkeys.full`, `fkeys.suspended_guardable`, the `tl1_*` scans, and `relink.suspended`.
