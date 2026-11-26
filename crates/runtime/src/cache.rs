@@ -1586,16 +1586,27 @@ pub fn virtual_instance(t: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) 
 /// Frame-keyed plan step 1b, under the reuse check: whether translation `t`'s entry at `rip` was compared already
 /// ([`area::CHECKED_AT`]).
 pub fn entry_checked(t: &Block, rip: u64) -> bool {
-    control().checked_any != 0 && unsafe { checked_slot(t, rip).read() } == [rip, u64::from(t.number) + 1]
+    let want = [rip, u64::from(t.number) + 1];
+    control().checked_any != 0 && (0..area::CHECKED_WAYS).any(|w| unsafe { checked_set(t, rip).add(w).read() } == want)
 }
-/// Frame-keyed plan step 1b: translation `t`'s entry at `rip` compared (under the reuse check).
+/// Frame-keyed plan step 1b: translation `t`'s entry at `rip` compared (under the reuse check): in its set's first empty way,
+/// else in place of its way 0, the others moving down (the oldest goes).
 pub fn note_checked(t: &Block, rip: u64) {
-    unsafe { checked_slot(t, rip).write([rip, u64::from(t.number) + 1]) };
+    let set = checked_set(t, rip);
+    let way = (0..area::CHECKED_WAYS).find(|&w| unsafe { set.add(w).read() }[1] == 0).unwrap_or_else(|| {
+        for w in 0..area::CHECKED_WAYS - 1 {
+            unsafe { set.add(w).write(set.add(w + 1).read()) };
+        }
+        area::CHECKED_WAYS - 1
+    });
+    unsafe { set.add(way).write([rip, u64::from(t.number) + 1]) };
     control().checked_any = 1;
 }
-fn checked_slot(t: &Block, rip: u64) -> *mut [u64; 2] {
+/// The first way of the set of (`t`, `rip`) in [`area::CHECKED_AT`].
+fn checked_set(t: &Block, rip: u64) -> *mut [u64; 2] {
+    let sets = area::CHECKED_ENTRIES / area::CHECKED_WAYS;
     let h = (rip ^ u64::from(t.number).rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    lookup_area::<[u64; 2]>(area::CHECKED_AT).wrapping_add((h >> (64 - area::CHECKED_ENTRIES.trailing_zeros())) as usize)
+    lookup_area::<[u64; 2]>(area::CHECKED_AT).wrapping_add((h >> (64 - sets.trailing_zeros())) as usize * area::CHECKED_WAYS)
 }
 /// Frame-keyed plan step 1b: the L1 entries a shared translation was entered through (none has a record) whose bytes touch
 /// linear page `page`, or (`region`) the 2 MiB region of a large leaf, leave L1: INVLPG and #PF (SDM Vol.3 4.10.4.1). Only

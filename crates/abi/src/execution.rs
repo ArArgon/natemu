@@ -396,11 +396,12 @@ pub mod cache {
     pub const ENTERED_AT: usize = (CHECKED_AT + 16 * CHECKED_ENTRIES).next_multiple_of(4096);
     pub const ENTERED_ENTRIES: usize = 4096;
     /// Frame-keyed plan step 1b, under the reuse check only: the (RIP, shared translation number + 1) pairs whose entry was
-    /// compared with the host's answer, direct-mapped by a hash of both ([`CHECKED_ENTRIES`] of {RIP, number + 1}): each such
-    /// entry is compared once, as stage 3 compared each instance it filed once (a pair a collision evicted is compared again).
-    /// Emptied by a reset. Untouched, so unbacked, without the check.
+    /// compared with the host's answer, in sets of [`CHECKED_WAYS`] by a hash of both ([`CHECKED_ENTRIES`] of {RIP, number +
+    /// 1}): each such entry is compared once, as stage 3 compared each instance it filed once (a pair a full set evicted is
+    /// compared again). Emptied by a reset. Untouched, so unbacked, without the check.
     pub const CHECKED_AT: usize = (TL1_PAGES + TL1_BITS / 8).next_multiple_of(4096);
-    pub const CHECKED_ENTRIES: usize = 4096;
+    pub const CHECKED_ENTRIES: usize = 1 << 14;
+    pub const CHECKED_WAYS: usize = 4;
     /// Frame-keyed plan step 1a (docs/restructure/frame-keyed-plan.md): the exact table of templates and shared translations by
     /// (frame, page offset, half, context), open-addressed, [`FKEY_ENTRIES`] of {32-bit tag, block number + 1} (0: empty). A
     /// key names at most one block and a block has at most one entry; at most [`FKEY_MAX`] are live (the lookup area's room
