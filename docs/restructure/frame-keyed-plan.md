@@ -790,7 +790,45 @@ step 2 and step 1d). Guards on is the default; guards off is `NATEMU_GUARDS=off`
 - **The reference for `guest-build`:** checkpoint 2's plain-form numbers (second run 5.56-5.59 s; base 5.79-5.99 s;
   change 67a776e2 5.98-6.22 s).
 
-**If the guards recover `guest-build` only in part,** the policies to try (both cheap, both behind the existing keys):
+**The results** (read November 26; one build, so on and off differ only in `NATEMU_GUARDS`):
+
+- **`guest-build`, wall seconds (first run / second run):**
+
+  | | run 1 | run 2 |
+  |---|---|---|
+  | guards on | 7.17 / 5.455 | 7.211 / 5.451 |
+  | guards off | 7.97 / 6.15 | 7.96 / 6.391 |
+
+  The guards take 11-15% off the second run. They also put it below checkpoint 2's plain form (5.56-5.59 s) and its
+  base (5.79-5.99 s): they recover step 1c's cost in full and then some. Run 1038's numbers are complete
+  (`bench.jsonl`), but its run folder has no `result.json`.
+- **`desktop-kde-profile`** (one boot a side, wall s / busy vCPU-s):
+
+  | window | guards on | guards off |
+  |---|---|---|
+  | session start to idle desktop (`session:idle-ready`) | 24.69 / 69.38 | 31.06 / 78.41 |
+  | the four app `:start` windows, summed | 5.43 / 7.29 | 5.53 / 7.58 |
+  | `ui-window-grow` frames/s | 10.82 | 10.46 |
+  | `ui-window-move` frames/s | 9.50 | 9.52 |
+
+  - The session start is 6.4 s (21%) shorter with guards and takes 9.0 busy vCPU-s less, beyond the 71-78 s spread of
+    the earlier boots of 7.3.
+  - App starts: Konsole is a little slower with guards (1.52/1.20 s against 1.42/1.02 s), Dolphin a little faster
+    (1.51/1.20 against 1.78/1.31). In sum they are equal, within single windows' noise (7.3).
+  - Frame rates do not move.
+  - **Counters, guards on, over the boot (four vCPUs):** 2.60 M guard misses (0.45-1.12 M a vCPU) and 54.8 k code-TLB
+    conflicts. Guards off: both 0.
+- **`desktop-kde-browser-profile`:**
+  - Speedometer 3.18 ± 0.62 with guards, 2.97 ± 0.64 without: within its ±20% spread.
+  - Chromium cold start 8.16 s with guards, 7.50 s without (busy 18.8 / 16.2 vCPU-s); warm start 4.25 / 3.97 s.
+  - Firefox's first start is 9.66 / 9.61 s.
+  - These are single windows, with no second run.
+
+**Decision: step 2 stays on by default.** It is a clear gain on `guest-build` and on the desktop's session start, and
+neutral elsewhere within noise. The two policies below are not needed for `guest-build`. A Chromium cold start
+0.6 s slower is the one reading against it: repeat it at the next checkpoint before acting on it.
+
+**If the guards had recovered `guest-build` only in part,** the policies to try (both cheap, both behind the existing keys):
 - **Plain links for blocks of a low CR3 rate:** count each address space's CR3 loads, and link plainly into blocks whose
   space is switched to rarely. They are suspended and relinked at most a few times.
 - **Direct links only where the code TLB earns them:** keep a link checked until its target page has been filled in the
