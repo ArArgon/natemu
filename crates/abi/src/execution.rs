@@ -401,9 +401,11 @@ pub mod cache {
     /// page whose bit is clear has no such entry to empty.
     pub const TL1_PAGES: usize = FKEYS + 8 * FKEY_ENTRIES;
     pub const TL1_BITS: usize = 1 << 15;
-    /// At most this many live entries (half the table): a template placed beyond it is not entered (counted, `Control::fkey_full`),
-    /// so probes stay short and always end at an empty slot.
+    /// At most this many live entries of templates (half the table): a template placed beyond it is not entered (counted,
+    /// `Control::fkey_full`); a shared translation is entered up to [`FKEY_MAX_TRANSLATIONS`] (code review, finding 1: one left
+    /// out could only be found through local links), so the load stays below three quarters and probes end at an empty slot.
     pub const FKEY_MAX: usize = FKEY_ENTRIES / 2;
+    pub const FKEY_MAX_TRANSLATIONS: usize = FKEY_ENTRIES / 4 * 3;
     pub const PCID_STUDY_BYTES: usize = 18 * MIB;
     /// EL0 sampler (`profile` resident builds): the study part holds the sample ring ([`crate::sample`]).
     /// [`Control::pcid_study`]'s counters: CR3 loads to a space still modelled, to a new one and of the current value, and

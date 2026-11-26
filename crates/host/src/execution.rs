@@ -1145,10 +1145,16 @@ struct K1Fkeys {
     lost: u64,
     full: u64,
     suspended_guardable: u64,
+    /// Step 1b: INVLPG and #PF scans of the L1 fill lists for shared translations' entries, the list slots looked at, the
+    /// entries emptied.
+    tl1_scans: u64,
+    tl1_scanned: u64,
+    tl1_emptied: u64,
 }
 impl K1Fkeys {
     fn is_empty(&self) -> bool {
-        self.entries | self.found | self.lost | self.full | self.suspended_guardable == 0
+        self.entries | self.found | self.lost | self.full | self.suspended_guardable | self.tl1_scans | self.tl1_scanned | self.tl1_emptied
+            == 0
     }
 }
 impl K1Relink {
@@ -1419,6 +1425,9 @@ impl K1 {
                 lost: c.fkey_lost,
                 full: c.fkey_full,
                 suspended_guardable: c.suspended_guardable,
+                tl1_scans: c.tl1_scans,
+                tl1_scanned: c.tl1_scanned,
+                tl1_emptied: c.tl1_emptied,
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,

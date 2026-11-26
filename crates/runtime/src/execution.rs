@@ -357,12 +357,12 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                     }
                     // (Frame-keyed plan step 1b: a shared translation entered with no record is checked as the instance stage 3
                     // filed at RIP, at every such entry.)
-                    let virtual_instance = (copy.flags & cache::TRANSLATION != 0)
-                        .then(|| cache::virtual_instance(copy, s.cpu.rip, s.source_gpa, walked(s)));
-                    if cache::control().reuse == cache::REUSE_CHECK
-                        && !unsafe { checked(s, virtual_instance.as_ref().unwrap_or(copy)) }
-                    {
-                        return None;
+                    if cache::control().reuse == cache::REUSE_CHECK {
+                        let virtual_instance = (copy.flags & cache::TRANSLATION != 0)
+                            .then(|| cache::virtual_instance(copy, s.cpu.rip, s.source_gpa, walked(s)));
+                        if !unsafe { checked(s, virtual_instance.as_ref().unwrap_or(copy)) } {
+                            return None;
+                        }
                     }
                     copy
                 }
@@ -1113,6 +1113,16 @@ fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut 
     if c.reuse != natemu_abi::execution::cache::REUSE_ON || !cache::shares(context) {
         return None;
     }
+    // (Code review, finding 3: before any walk, what needs no translation: a fence or the stop RIP on RIP's page or the next,
+    // and a RIP no shared translation is entered at, non-canonical or, in 32-bit code, at or above 4 GiB.)
+    let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
+    if c.reuse_fences.iter().any(|&f| page_fenced(f))
+        || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)])
+        || !natemu_abi::execution::canonical(rip)
+        || cache::bits32(context) && rip >> 32 != 0
+    {
+        return None;
+    }
     let answer = |s: &mut State, va: u64| {
         if walk {
             page_translation(s, va, natemu_abi::page_study::REVAL).ok()
@@ -1137,11 +1147,7 @@ fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut 
     } else {
         cache::GLOBAL
     };
-    let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
-    if c.reuse_fences.iter().any(|&f| page_fenced(f))
-        || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)])
-        || t.flags & cache::DEAD != 0
-    {
+    if t.flags & cache::DEAD != 0 {
         return None;
     }
     cache::shared_at(t, rip, leaves(s, [first, second])).ok()

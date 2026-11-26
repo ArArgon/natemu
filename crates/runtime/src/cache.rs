@@ -1738,7 +1738,9 @@ fn fkey_enter(n: usize) {
     let b = *block(n);
     let c = control();
     let same = |m: u32| fkey_fits(block(m as usize - 1), b.source_gpa[0], b.rip, b.context);
-    match fkeys::enter(fkey_table(), fkey_of(&b), n as u32 + 1, b.flags & TRANSLATION != 0, same, c.fkey_entries as usize, area::FKEY_MAX) {
+    let translation = b.flags & TRANSLATION != 0;
+    let max = if translation { area::FKEY_MAX_TRANSLATIONS } else { area::FKEY_MAX };
+    match fkeys::enter(fkey_table(), fkey_of(&b), n as u32 + 1, translation, same, c.fkey_entries as usize, max) {
         fkeys::Entered::New => c.fkey_entries += 1,
         fkeys::Entered::Full => c.fkey_full += 1,
         fkeys::Entered::Replaced | fkeys::Entered::Kept => {}
@@ -3483,11 +3485,14 @@ fn suspend(scope: usize) -> Option<u64> {
         let r = unsafe { record(i as usize).read() };
         // (A suspended record is named by no outbound slot: its source's point may be linked to another block meanwhile.)
         out_del(i as usize);
-        // (Frame-keyed plan, step 2's evidence: a target an absolute-block guard could serve: user, not global, not shared, on one
-        // linear page.)
-        let t = block(r.target as usize);
-        let [p0, p1] = lpages(t);
-        c.suspended_guardable += u64::from(user(t.context) && p0 == p1 && t.flags & (GLOBAL | PIC | INSTANCE) == 0);
+        // (Frame-keyed plan, step 2's evidence, `perf` builds (the profiles'): a target an absolute-block guard could serve:
+        // user, not global, not shared, on one linear page.)
+        #[cfg(feature = "perf")]
+        {
+            let t = block(r.target as usize);
+            let [p0, p1] = lpages(t);
+            c.suspended_guardable += u64::from(user(t.context) && p0 == p1 && t.flags & (GLOBAL | PIC | INSTANCE) == 0);
+        }
         // (`link-check`: the epoch moved, so no target of the scanned segments is current: the premise of suspending without looking.)
         #[cfg(feature = "link-check")]
         if current(block(r.target as usize)) {
