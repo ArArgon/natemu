@@ -248,14 +248,15 @@ fn record<T: Copy>(bytes: &[u8], offset: usize) -> T {
     assert!(offset + size_of::<T>() <= bytes.len());
     unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast()) }
 }
-/// `count` records of `T` at `offset`, aligned and inside `[from, to)`.
+/// `count` records of `T` at `offset`, aligned and inside `[from, to)`, into `out` (emptied first).
 fn table<T: Copy>(
+    out: &mut Vec<T>,
     bytes: &[u8],
     offset: u32,
     count: u32,
     from: usize,
     to: usize,
-) -> Result<Vec<T>, String> {
+) -> Result<(), String> {
     let (offset, count) = (offset as usize, count as usize);
     let end = count
         .checked_mul(size_of::<T>())
@@ -263,9 +264,9 @@ fn table<T: Copy>(
     if offset < from || end.is_none_or(|end| end > to) || offset % align_of::<T>() != 0 {
         return Err(format!("table at {offset:#x} x{count} outside the object"));
     }
-    Ok((0..count)
-        .map(|i| record(bytes, offset + i * size_of::<T>()))
-        .collect())
+    out.clear();
+    out.extend((0..count).map(|i| record::<T>(bytes, offset + i * size_of::<T>())));
+    Ok(())
 }
 
 /// Feature bit of FlagM (the contract requires it: FEX emits CFINV/RMIF).
@@ -414,31 +415,89 @@ pub(crate) fn admit_user(
     bits32: bool,
     user: User32,
 ) -> Result<Admitted, String> {
-    let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0, bits32)?;
-    let h = &parts.header;
-    let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
-    // (admit_records' own split of the sites: FMA checks apart, then the access sites and the check stubs.)
-    let (fma, (accesses, stubs)) = (&parts.fma, parts.rest.split_at(parts.split));
-    let c = structure::Code {
-        code,
-        literals: &parts.literals,
-        accesses,
-        stubs,
-        fma,
-        pcs: &parts.pcs,
-        relocs: &parts.relocs,
-        source,
-        rip,
-        guest_bytes: h.guest_bytes,
-        targets: &parts.targets,
-        shape,
-        cpl0,
-        bits32,
-        cpl3: user.cpl3,
-        limited: user.limited,
+    SCRATCH.with(|s| match s.try_borrow_mut() {
+        Ok(mut s) => admit_in(&mut s, bytes, rip, source, supported, shape, cpl0, bits32, user),
+        // (Never: admission admits nothing inside itself. A fresh set of buffers would do as well.)
+        Err(_) => admit_in(&mut Scratch::default(), bytes, rip, source, supported, shape, cpl0, bits32, user),
+    })
+}
+
+/// Buffers admission reuses from one object to the next on its thread (each vCPU thread admits its own requests): their
+/// allocation and release were about a quarter of an admission's time (the November 25 profile, an experiment). Each is
+/// emptied before it is filled, so nothing of one object is read while admitting another; a refusal may drop some (they
+/// are allocated again).
+#[derive(Default)]
+struct Scratch {
+    sites: Vec<Site>,
+    maps: Vec<Site>,
+    unmapped: Vec<Site>,
+    fma: Vec<Site>,
+    rest: Vec<Site>,
+    pcs: Vec<PcEntry>,
+    relocs: Vec<Reloc>,
+    literals: Vec<std::ops::Range<usize>>,
+    starts: Vec<u32>,
+    targets: Vec<u64>,
+    code: structure::Scratch,
+}
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = Default::default();
+}
+impl Scratch {
+    /// `parts`' tables, back for the next object.
+    fn keep(&mut self, parts: Parts) {
+        let Parts { header: _, fma, rest, split: _, pcs, relocs, literals, targets } = parts;
+        (self.fma, self.rest, self.pcs, self.relocs, self.literals, self.targets) = (fma, rest, pcs, relocs, literals, targets);
+    }
+}
+/// A buffer of `s`, emptied.
+fn emptied<T>(v: &mut Vec<T>) -> Vec<T> {
+    let mut v = std::mem::take(v);
+    v.clear();
+    v
+}
+
+/// [`admit_user`] with the thread's buffers.
+#[allow(clippy::too_many_arguments)]
+fn admit_in(
+    s: &mut Scratch,
+    bytes: &[u8],
+    rip: u64,
+    source: &[u8],
+    supported: u64,
+    shape: bool,
+    cpl0: bool,
+    bits32: bool,
+    user: User32,
+) -> Result<Admitted, String> {
+    let (mut admitted, parts) = admit_records(s, bytes, rip, source, supported, cpl0, bits32)?;
+    let checked = {
+        let h = &parts.header;
+        let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
+        // (admit_records' own split of the sites: FMA checks apart, then the access sites and the check stubs.)
+        let (fma, (accesses, stubs)) = (&parts.fma, parts.rest.split_at(parts.split));
+        let c = structure::Code {
+            code,
+            literals: &parts.literals,
+            accesses,
+            stubs,
+            fma,
+            pcs: &parts.pcs,
+            relocs: &parts.relocs,
+            source,
+            rip,
+            guest_bytes: h.guest_bytes,
+            targets: &parts.targets,
+            shape,
+            cpl0,
+            bits32,
+            cpl3: user.cpl3,
+            limited: user.limited,
+        };
+        structure::check(&c, &mut s.code)
     };
-    let (links, dispatch_exit, bulk) =
-        structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    s.keep(parts);
+    let (links, dispatch_exit, bulk) = checked.map_err(|e| format!("object refused: {e}"))?;
     if links.len() > MAX_LINK_POINTS {
         return Err(format!(
             "object refused: {} literal exits, at most {MAX_LINK_POINTS}",
@@ -595,6 +654,7 @@ pub(super) fn pc_entry(pcs: &[PcEntry], native: u32, guest: u32) -> bool {
 
 /// Everything but the code: header, tables, site records, relocations.
 fn admit_records(
+    s: &mut Scratch,
     bytes: &[u8],
     rip: u64,
     source: &[u8],
@@ -663,9 +723,11 @@ fn admit_records(
     if h.sra_gpr.get(..h.sra_count as usize) != Some(if bits32 { &SRA32[..] } else { &SRA[..] }) {
         return fail("static register map");
     }
-    let sites: Vec<Site> = table(bytes, h.sites_offset, h.sites_count, code_end, bytes.len())?;
-    let pcs: Vec<PcEntry> = table(bytes, h.pcs_offset, h.pcs_count, code_end, bytes.len())?;
-    let relocs: Vec<Reloc> = table(
+    let (mut sites, mut pcs, mut relocs) = (emptied(&mut s.sites), emptied(&mut s.pcs), emptied(&mut s.relocs));
+    table(&mut sites, bytes, h.sites_offset, h.sites_count, code_end, bytes.len())?;
+    table(&mut pcs, bytes, h.pcs_offset, h.pcs_count, code_end, bytes.len())?;
+    table(
+        &mut relocs,
         bytes,
         h.relocs_offset,
         h.relocs_count,
@@ -695,7 +757,12 @@ fn admit_records(
     // check stubs placed after the body.
     // M2 task 4: the x87 maps are no access and no stub: apart, each a well-formed record at an instruction's start (a PC-table
     // entry of its guest offset). A wrong map could only give the guest a wrong x87 state of its own.
-    let (maps, sites): (Vec<Site>, Vec<Site>) = sites.iter().partition(|s| s.kind == object::kind::X87MAP);
+    let (mut maps, mut unmapped) = (emptied(&mut s.maps), emptied(&mut s.unmapped));
+    for x in &sites {
+        if x.kind == object::kind::X87MAP { maps.push(*x) } else { unmapped.push(*x) }
+    }
+    s.sites = sites;
+    let sites = unmapped;
     for s in &maps {
         if object::x87_map(s).is_none()
             || s.guest_offset >= h.guest_bytes
@@ -704,7 +771,11 @@ fn admit_records(
             return fail(&format!("x87 map at native offset {:#x}", s.native_offset));
         }
     }
-    let (fma, rest): (Vec<Site>, Vec<Site>) = sites.iter().partition(|s| s.kind == object::kind::FMA);
+    let (mut fma, mut rest) = (emptied(&mut s.fma), emptied(&mut s.rest));
+    for x in &sites {
+        if x.kind == object::kind::FMA { fma.push(*x) } else { rest.push(*x) }
+    }
+    (s.maps, s.unmapped) = (maps, sites);
     for s in &fma {
         if !site_fields_valid(s, &h, region) || !fma_site_ok(s) {
             return fail(&format!("FMA check site at native offset {:#x}", s.native_offset));
@@ -816,7 +887,7 @@ fn admit_records(
         (v == rip || v == end || Some(v) == target) && (structure::canonical(v) || v == end)
     };
     let mut out = bytes.to_vec();
-    let mut literals = Vec::new();
+    let mut literals = emptied(&mut s.literals);
     for r in &relocs {
         let at = r.offset as usize;
         match r.kind {
@@ -863,11 +934,8 @@ fn admit_records(
         rep_self: own.filter(|_| rep_string(tail)),
         ..admitted
     };
-    let mut starts: Vec<u32> = pcs
-        .iter()
-        .map(|p| p.guest_offset)
-        .filter(|&g| g < h.guest_bytes)
-        .collect();
+    let mut starts = emptied(&mut s.starts);
+    starts.extend(pcs.iter().map(|p| p.guest_offset).filter(|&g| g < h.guest_bytes));
     starts.dedup();
     let sti = interrupt_flag(source, &starts, h.guest_bytes, rip, cpl0)?;
     let admitted = Admitted {
@@ -882,12 +950,9 @@ fn admit_records(
         branch_target(&source[g as usize..next as usize], rip.wrapping_add(u64::from(next)))
             .map(|t| wrap(t, bits32))
     });
-    let targets = [Some(end), target, own]
-        .into_iter()
-        .flatten()
-        .chain(sti)
-        .chain(inner)
-        .collect();
+    let mut targets = emptied(&mut s.targets);
+    targets.extend([Some(end), target, own].into_iter().flatten().chain(sti).chain(inner));
+    s.starts = starts;
     Ok((
         admitted,
         Parts {
@@ -1087,7 +1152,7 @@ mod tests {
 
     /// The record checks only: the synthetic object's code is no real block (`structure` tests use fexc output).
     fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
-        admit_records(bytes, rip, source, supported, false, false).map(|(a, _)| a)
+        admit_records(&mut Scratch::default(), bytes, rip, source, supported, false, false).map(|(a, _)| a)
     }
 
     const RIP: u64 = 0x10_0000;

@@ -822,40 +822,70 @@ struct Verifier<'a> {
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
 /// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26), a bulk REP MOVS sequence or an inline
 /// gather's element load (gather plan): whether only a `--bulk` request may have it.
-pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
+/// `s`: the thread's buffers ([`Scratch`]).
+pub(super) fn check(c: &Code, s: &mut Scratch) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
     let operands = segment_operands(c)?;
     // A block with an operand check relies on the exact memory-word, stub and control-flow rules of the code shape, also in
     // production: no native access of it is unrecorded.
     let checked = Code { shape: c.shape || operands.iter().any(|o| o.limited), ..*c };
     let c = &checked;
-    let mut v = Verifier::new(c)?;
-    v.segment_checks(&operands)?;
-    v.segment_bases(&operands)?;
-    v.words()?;
-    v.exits()?;
-    // Gather plan (2.5): an inline gather's element loads exist only in 64-bit `--bulk` code; such an object is a bulk one,
-    // which a request without `--bulk` (a step) refuses, so a step never holds one (the resident's STEP guard is the other half).
-    let gather = c.accesses.iter().any(object::gather_element);
-    if gather && c.bits32 {
-        return Err("a gather element site in a 32-bit object".into());
-    }
-    if c.shape {
-        v.gathers()?;
-        v.stub_checks()?;
-        v.aligned_before = v.aligned();
-        v.sites()?;
-        v.branch_target()?;
-        v.divisions()?;
-        v.fp_checks()?;
-        v.fma_checks()?;
-        if let Some(i) = v.claimed.iter().position(|&ok| !ok) {
-            return Err(format!(
-                "stub at {:#x} is reached by no check of its kind",
-                c.stubs[i].native_offset
-            ));
+    let mut v = Verifier::new(c, s)?;
+    let verdict = v.run(&operands);
+    (s.insns, s.branches, s.claimed, s.moves) = (
+        std::mem::take(&mut v.insns),
+        std::mem::take(&mut v.branches),
+        std::mem::take(&mut v.claimed),
+        std::mem::take(&mut v.moves),
+    );
+    verdict.map(|gather| (v.links, v.dispatch, !v.bulk.is_empty() || gather))
+}
+
+/// Buffers [`check`] reuses from one object to the next (`admission::Scratch`): each is emptied before it is filled.
+#[derive(Default)]
+pub(super) struct Scratch {
+    insns: Vec<Option<Insn>>,
+    branches: Vec<(u32, u32)>,
+    claimed: Vec<bool>,
+    moves: Vec<(Range<u32>, u8, u64)>,
+    all: Vec<(u32, i64)>,
+    back: Vec<(u32, u32)>,
+    returns: Vec<(u32, u32)>,
+    loops: Vec<(u32, u32)>,
+}
+
+impl Verifier<'_> {
+    /// Every rule on the code, in order ([`check`]); whether it holds an inline gather's element load.
+    fn run(&mut self, operands: &[SegmentOperand]) -> Result<bool, String> {
+        let c = self.c;
+        let v = self;
+        v.segment_checks(operands)?;
+        v.segment_bases(operands)?;
+        v.words()?;
+        v.exits()?;
+        // Gather plan (2.5): an inline gather's element loads exist only in 64-bit `--bulk` code; such an object is a bulk one,
+        // which a request without `--bulk` (a step) refuses, so a step never holds one (the resident's STEP guard is the other half).
+        let gather = c.accesses.iter().any(object::gather_element);
+        if gather && c.bits32 {
+            return Err("a gather element site in a 32-bit object".into());
         }
+        if c.shape {
+            v.gathers()?;
+            v.stub_checks()?;
+            v.aligned_before = v.aligned();
+            v.sites()?;
+            v.branch_target()?;
+            v.divisions()?;
+            v.fp_checks()?;
+            v.fma_checks()?;
+            if let Some(i) = v.claimed.iter().position(|&ok| !ok) {
+                return Err(format!(
+                    "stub at {:#x} is reached by no check of its kind",
+                    c.stubs[i].native_offset
+                ));
+            }
+        }
+        Ok(gather)
     }
-    Ok((v.links, v.dispatch, !v.bulk.is_empty() || gather))
 }
 
 /// M2 checkpoint C: an instruction's memory operand through a limited FS or GS, from an independent decode of the source.
@@ -1092,9 +1122,11 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn new(c: &'a Code<'a>) -> Result<Self, String> {
+    fn new(c: &'a Code<'a>, s: &mut Scratch) -> Result<Self, String> {
         let words = c.code.len() / 4;
-        let mut insns = vec![None; words];
+        let mut insns = std::mem::take(&mut s.insns);
+        insns.clear();
+        insns.resize(words, None);
         for (i, slot) in insns.iter_mut().enumerate().skip(ENTRY_OFFSET as usize / 4) {
             if c.literals.iter().any(|l| l.contains(&(i * 4))) {
                 continue;
@@ -1144,15 +1176,16 @@ impl<'a> Verifier<'a> {
             }
             insns[at / 4] = Some(Insn::ProbeBranch);
         }
-        let all: Vec<(u32, i64)> = (insns.iter().enumerate())
-            .filter_map(|(i, x)| match x {
-                Some(Insn::B(t) | Insn::Cond(t)) => Some((i as u32 * 4, *t)),
-                _ => None,
-            })
-            .collect();
-        let mut branches = Vec::new();
-        let mut back = Vec::new();
-        for (at, t) in all {
+        let mut all = std::mem::take(&mut s.all);
+        all.clear();
+        all.extend((insns.iter().enumerate()).filter_map(|(i, x)| match x {
+            Some(Insn::B(t) | Insn::Cond(t)) => Some((i as u32 * 4, *t)),
+            _ => None,
+        }));
+        let (mut branches, mut back) = (std::mem::take(&mut s.branches), std::mem::take(&mut s.back));
+        branches.clear();
+        back.clear();
+        for &(at, t) in &all {
             match u32::try_from(t) {
                 Ok(t) if t > at && insns.get(t as usize / 4).is_some_and(|x| x.is_some()) => {
                     branches.push((at, t))
@@ -1166,14 +1199,19 @@ impl<'a> Verifier<'a> {
                 }
             }
         }
+        s.all = all;
         branches.sort_by_key(|&(_, t)| t);
+        let (mut claimed, mut moves) = (std::mem::take(&mut s.claimed), std::mem::take(&mut s.moves));
+        claimed.clear();
+        moves.clear();
+        claimed.resize(c.stubs.len(), false);
         let mut v = Verifier {
             c,
             insns,
             branches,
-            moves: Vec::new(),
+            moves,
             checks: Vec::new(),
-            claimed: vec![false; c.stubs.len()],
+            claimed,
             links: Vec::new(),
             dispatch,
             bulk: Vec::new(),
@@ -1182,7 +1220,13 @@ impl<'a> Verifier<'a> {
         };
         // A probing split stub's branch back to its store, and the branch back from the run's end of a top x87 run test:
         // branches like the others for every rule on targets.
-        let (mut returns, back): (Vec<_>, Vec<_>) = back.into_iter().partition(|&(at, t)| v.run_end_return(at, t));
+        let (mut returns, mut loops) = (std::mem::take(&mut s.returns), std::mem::take(&mut s.loops));
+        returns.clear();
+        loops.clear();
+        for &(at, t) in &back {
+            if v.run_end_return(at, t) { returns.push((at, t)) } else { loops.push((at, t)) }
+        }
+        s.back = back;
         // A probing split stub's way back from its shared probe: from the stub's `b` to its `adr`'s target.
         for (i, st) in c.stubs.iter().enumerate() {
             let at = st.native_offset + 4;
@@ -1196,17 +1240,19 @@ impl<'a> Verifier<'a> {
         }
         // (No other backward branch into the run's end: its return is reached from the test alone.)
         if let Some(e) = v.run_test()
-            && returns.iter().chain(&back).any(|&(at, t)| at != e + 36 && t >= e && t <= e + 36)
+            && returns.iter().chain(&loops).any(|&(at, t)| at != e + 36 && t >= e && t <= e + 36)
         {
             return Err(format!("backward branch into the x87 run's end at {e:#x}"));
         }
-        v.branches.extend(returns);
-        for (at, t) in back {
+        v.branches.extend_from_slice(&returns);
+        s.returns = returns;
+        for &(at, t) in &loops {
             let words = v.bulk_loop(at, t).or_else(|| v.bulk_movs_loop(at, t)).ok_or_else(|| format!(
                 "branch at {at:#x} to {t:#x}: not forward to an instruction of the code region"
             ))?;
             v.bulk.push(words);
         }
+        s.loops = loops;
         v.branches.sort_by_key(|&(_, t)| t);
         for r in c
             .relocs
