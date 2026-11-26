@@ -388,7 +388,19 @@ pub mod cache {
     const _: () = assert!(DL1_BYTES == 2 * BLOCK && L1_SPACE_TABLES * L1_ENTRIES * 16 == BLOCK && DL1 % BLOCK == 0);
     /// PCID gain study (`pcid-study` resident builds; the EL0 sampler's ring in `profile` builds; untouched, so unbacked,
     /// otherwise): the modelled sets, after the page record.
-    pub const PCID_STUDY: usize = (TL1_PAGES + TL1_BITS / 8).next_multiple_of(4096);
+    pub const PCID_STUDY: usize = (ENTERED_AT + 32 * ENTERED_ENTRIES).next_multiple_of(4096);
+    /// Frame-keyed plan step 1b: the frames each RIP a shared translation was last entered at was fetched from, direct-mapped by
+    /// the RIP ([`ENTERED_ENTRIES`] of {RIP, first frame, second frame or `u64::MAX`, 0}): a later fetch of that RIP from other
+    /// frames (or none, or through a global leaf) is a remap ([`Control::remapped`]), as a stale instance's revalidation counted
+    /// it. Counting only; a collision forgets a RIP.
+    pub const ENTERED_AT: usize = (CHECKED_AT + 16 * CHECKED_ENTRIES).next_multiple_of(4096);
+    pub const ENTERED_ENTRIES: usize = 4096;
+    /// Frame-keyed plan step 1b, under the reuse check only: the (RIP, shared translation number + 1) pairs whose entry was
+    /// compared with the host's answer, direct-mapped by a hash of both ([`CHECKED_ENTRIES`] of {RIP, number + 1}): each such
+    /// entry is compared once, as stage 3 compared each instance it filed once (a pair a collision evicted is compared again).
+    /// Emptied by a reset. Untouched, so unbacked, without the check.
+    pub const CHECKED_AT: usize = (TL1_PAGES + TL1_BITS / 8).next_multiple_of(4096);
+    pub const CHECKED_ENTRIES: usize = 4096;
     /// Frame-keyed plan step 1a (docs/restructure/frame-keyed-plan.md): the exact table of templates and shared translations by
     /// (frame, page offset, half, context), open-addressed, [`FKEY_ENTRIES`] of {32-bit tag, block number + 1} (0: empty). A
     /// key names at most one block and a block has at most one entry; at most [`FKEY_MAX`] are live (the lookup area's room
@@ -1116,6 +1128,10 @@ pub mod cache {
         pub tl1_scans: u64,
         pub tl1_scanned: u64,
         pub tl1_emptied: u64,
+        /// Whether [`CHECKED_AT`] holds a pair (it is emptied at a reset only then). Appended.
+        pub checked_any: u64,
+        /// Whether [`ENTERED_AT`] holds a RIP. Appended.
+        pub entered_any: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1787,7 +1803,9 @@ pub mod cache {
             && PAGE_STAMPS + crate::page_study::BYTES <= FKEYS
             && FKEYS % 4096 == 0
             && FKEYS + 8 * FKEY_ENTRIES <= TL1_PAGES
-            && TL1_PAGES + TL1_BITS / 8 <= PCID_STUDY
+            && TL1_PAGES + TL1_BITS / 8 <= CHECKED_AT
+            && CHECKED_AT + 16 * CHECKED_ENTRIES <= ENTERED_AT
+            && ENTERED_AT + 32 * ENTERED_ENTRIES <= PCID_STUDY
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate.
     const _: () = assert!(

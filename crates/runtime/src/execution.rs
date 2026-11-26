@@ -364,11 +364,18 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                     }
                     // (Frame-keyed plan step 1b: a shared translation entered with no record is checked as the instance stage 3
                     // filed at RIP, at every such entry.)
+                    // (Once per translation and RIP, as each filed instance was compared once.)
                     if cache::control().reuse == cache::REUSE_CHECK {
-                        let virtual_instance = (copy.flags & cache::TRANSLATION != 0)
-                            .then(|| cache::virtual_instance(copy, s.cpu.rip, s.source_gpa, walked(s)));
-                        if !unsafe { checked(s, virtual_instance.as_ref().unwrap_or(copy)) } {
-                            return None;
+                        let shared = copy.flags & cache::TRANSLATION != 0;
+                        if !(shared && cache::entry_checked(copy, s.cpu.rip)) {
+                            let virtual_instance =
+                                shared.then(|| cache::virtual_instance(copy, s.cpu.rip, s.source_gpa, walked(s)));
+                            if !unsafe { checked(s, virtual_instance.as_ref().unwrap_or(copy)) } {
+                                return None;
+                            }
+                            if shared {
+                                cache::note_checked(copy, s.cpu.rip);
+                            }
                         }
                     }
                     copy
@@ -1120,13 +1127,14 @@ unsafe fn miss_fast(frame: &NativeFrame) {
 /// Frame-keyed plan step 1b, [`miss_fast`]: the shared translation of the frame RIP's page is fetched from (the page record's
 /// answer, as a revalidation there reads it), entered at RIP with no record ([`cache::shared_at`]'s refusals, the second page's
 /// frame the translation's), unless a fence or the stop RIP lies on RIP's page or the next (as [`reused`] refuses). `unknown`:
-/// the record lacks a page (the full path walks it). Not under the reuse check, which compares every such entry ([`find`]).
+/// the record lacks a page (the full path walks it). Under the reuse check, only an entry the full path compared already.
 /// With `walk` ([`sys_fast`], which may walk as its lookup's revalidation does): the fetch translation of each page (the record's
 /// answer or a walk, which may set an A bit and kill blocks: the translation must still be live after it); a faulting walk is
 /// no answer (the full path delivers the fault).
 fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut bool) -> Option<&'static Block> {
     let c = cache::control();
-    if c.reuse != natemu_abi::execution::cache::REUSE_ON || !cache::shares(context) {
+    let check = c.reuse == natemu_abi::execution::cache::REUSE_CHECK;
+    if !(c.reuse == natemu_abi::execution::cache::REUSE_ON || check) || !cache::shares(context) {
         return None;
     }
     // (Code review, finding 3: before any walk, what needs no translation: a fence or the stop RIP on RIP's page or the next,
@@ -1150,8 +1158,14 @@ fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut 
         *unknown = true;
         return None;
     };
+    // (A RIP last entered from another frame: the full path counts the remap, as a stale instance's revalidation did.)
+    if cache::entered_moved(rip, page, None, false, false) {
+        *unknown = true;
+        return None;
+    }
     let t = cache::template(rip, page, context).filter(|t| t.flags & cache::TRANSLATION != 0)?;
-    let second = if (rip & 4095) + u64::from(t.guest_bytes) > 4096 {
+    let crosses = (rip & 4095) + u64::from(t.guest_bytes) > 4096;
+    let second = if crosses {
         let Some((next, flags)) = answer(s, (rip & !4095).wrapping_add(4096)) else {
             *unknown = true;
             return None;
@@ -1163,10 +1177,16 @@ fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut 
     } else {
         cache::GLOBAL
     };
-    if t.flags & cache::DEAD != 0 {
+    // (Under the reuse check, only an entry compared already: the full path compares the first, [`find`].)
+    if t.flags & cache::DEAD != 0 || check && !cache::entry_checked(t, rip) {
         return None;
     }
-    cache::shared_at(t, rip, leaves(s, [first, second])).ok()
+    let entered = cache::shared_at(t, rip, leaves(s, [first, second])).ok();
+    // (The page record's answers this entry used, as a revalidation from it counts them; a walk counted itself.)
+    if entered.is_some() && !walk {
+        c.page_hits += 1 + u64::from(crosses);
+    }
+    entered
 }
 /// One more decline of [`miss_fast`] for `reason` (`fast_decline`): a plain increment.
 #[inline(always)]
@@ -1351,6 +1371,12 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
     fetch_first(s, true);
     let rip = s.cpu.rip;
     let c = cache::control();
+    // (Frame-keyed plan step 1b: a RIP a shared translation was last entered at, fetched from another frame now or not at all:
+    // the remap a stale instance's revalidation counted.)
+    let global = leaves(s, [c.fetched as u32 & 0xff, cache::GLOBAL]) & cache::GLOBAL != 0;
+    if cache::entered_moved(rip, s.fetch[0], None, s.fetch[0] != u64::MAX && global, true) {
+        c.remapped += 1;
+    }
     let template =
         (c.reuse != cache::REUSE_OFF && s.fetch[0] != u64::MAX && s.cpu.dr[5] & DR7_ENABLES == 0)
             .then(|| cache::template(rip, s.fetch[0], context))
@@ -1374,6 +1400,10 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             take_invalidations(s);
         }
         let template = cache::template(rip, s.fetch[0], context).filter(|t| core::ptr::eq(*t, b));
+        // (The next page's frame known now: a RIP last entered with another one there is the remap a stale instance counted.)
+        if crosses && cache::entered_moved(rip, s.fetch[0], Some(s.fetch[1]), false, true) {
+            c.remapped += 1;
+        }
         refused |= s.generation != generation
             || template.is_none()
             || (crosses && s.fetch[1] != b.source_gpa[1]);

@@ -444,6 +444,14 @@ pub fn reset() {
     }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     tl1_clear();
+    if c.checked_any != 0 {
+        unsafe { ptr::write_bytes(lookup_area::<u8>(area::CHECKED_AT), 0, area::CHECKED_ENTRIES * 16) };
+        c.checked_any = 0;
+    }
+    if c.entered_any != 0 {
+        unsafe { ptr::write_bytes(lookup_area::<u8>(area::ENTERED_AT), 0, area::ENTERED_ENTRIES * 32) };
+        c.entered_any = 0;
+    }
     // (Frame-keyed plan step 1a: only when it holds entries, so a vCPU that never placed a template backs none of it.)
     if c.fkey_entries != 0 {
         unsafe { ptr::write_bytes(lookup_area::<u8>(area::FKEYS), 0, area::FKEY_ENTRIES * 8) };
@@ -865,8 +873,19 @@ pub fn fill_l1(rip: u64, block: &Block) {
     let (o0, o1) = unsafe { (l1_owner(t, w0).read(), l1_owner(t, w1).read()) };
     let want = block.number + 1;
     // The way: one holding the block already (so it is never in both), else an empty one, else the victim by the set's
-    // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever.
-    let f = area::l1_fill_set(t, w1, o0, o1, want);
+    // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever. (Frame-keyed plan
+    // step 1b: a shared translation is entered at several RIPs, which may share a set, as its instances did: its way is the one
+    // whose tag is this RIP, so two of its RIPs hold both ways; `cut_one` empties every way it owns.)
+    let f = if block.flags & TRANSLATION != 0 {
+        let tags = unsafe { [dl1(t, w0).read()[0], dl1(t, w1).read()[0]] };
+        match tags.iter().position(|&tag| tag == rip) {
+            Some(way) if !(way == 1 && area::segment_slot(t, w1)) => area::L1Fill { way, there: true, victim: false },
+            // (No block has this number: the fill order picks an empty way or the victim.)
+            _ => area::l1_fill_set(t, w1, o0, o1, area::L1_NEXT - 1),
+        }
+    } else {
+        area::l1_fill_set(t, w1, o0, o1, want)
+    };
     let i = [w0, w1][f.way];
     #[cfg(feature = "dispatch-study")]
     if f.victim {
@@ -1510,7 +1529,30 @@ pub fn shared_at(t: &'static Block, rip: u64, walked: u32) -> Result<&'static Bl
     }
     counted(count::INSTANCES);
     control().tl1_walked = u64::from(walked);
+    unsafe { entered_slot(rip).write([rip, t.source_gpa[0], t.source_gpa[1], 0]) };
+    control().entered_any = 1;
     Ok(t)
+}
+/// Frame-keyed plan step 1b: whether a shared translation was last entered at `rip` from other frames than `frame` (`u64::MAX`:
+/// the fetch faults now) and, when known, `second` (the next page's frame), or `global` holds now (shared code is for
+/// non-global mappings only), which forgets it (`forget`; the fast paths only look, leaving the count to the full path): the
+/// remap a stale instance's revalidation found ([`Control::remapped`]).
+pub fn entered_moved(rip: u64, frame: u64, second: Option<u64>, global: bool, forget: bool) -> bool {
+    if control().entered_any == 0 {
+        return false;
+    }
+    let at = entered_slot(rip);
+    let [r, f0, f1, _] = unsafe { at.read() };
+    let moved = r == rip
+        && (f0 != frame & !0xfff || global || second.is_some_and(|g| f1 != u64::MAX && f1 != g & !0xfff));
+    if moved && forget {
+        unsafe { at.write([0; 4]) };
+    }
+    moved
+}
+fn entered_slot(rip: u64) -> *mut [u64; 4] {
+    let h = rip.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    lookup_area::<[u64; 4]>(area::ENTERED_AT).wrapping_add((h >> (64 - area::ENTERED_ENTRIES.trailing_zeros())) as usize)
 }
 /// Frame-keyed plan step 1b: the record stage 3 filed as `t`'s instance at `rip` (`source_gpa` its frames there, `walked` as
 /// for [`place`]), made only for the reuse check's comparison ([`REUSE_CHECK`]): `t`'s link-point targets moved to `rip`.
@@ -1540,6 +1582,20 @@ pub fn virtual_instance(t: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) 
         patch: [0; MAX_LINK_POINTS],
         ..*t
     }
+}
+/// Frame-keyed plan step 1b, under the reuse check: whether translation `t`'s entry at `rip` was compared already
+/// ([`area::CHECKED_AT`]).
+pub fn entry_checked(t: &Block, rip: u64) -> bool {
+    control().checked_any != 0 && unsafe { checked_slot(t, rip).read() } == [rip, u64::from(t.number) + 1]
+}
+/// Frame-keyed plan step 1b: translation `t`'s entry at `rip` compared (under the reuse check).
+pub fn note_checked(t: &Block, rip: u64) {
+    unsafe { checked_slot(t, rip).write([rip, u64::from(t.number) + 1]) };
+    control().checked_any = 1;
+}
+fn checked_slot(t: &Block, rip: u64) -> *mut [u64; 2] {
+    let h = (rip ^ u64::from(t.number).rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    lookup_area::<[u64; 2]>(area::CHECKED_AT).wrapping_add((h >> (64 - area::CHECKED_ENTRIES.trailing_zeros())) as usize)
 }
 /// Frame-keyed plan step 1b: the L1 entries a shared translation was entered through (none has a record) whose bytes touch
 /// linear page `page`, or (`region`) the 2 MiB region of a large leaf, leave L1: INVLPG and #PF (SDM Vol.3 4.10.4.1). Only
