@@ -386,7 +386,7 @@ def test_speedometer_and_the_debug_profiles_get_their_userlands_and_resident():
     debug = suites['debug']
     assert debug.extra['tier'] == 'debug'
     assert set(debug.extra['cases']) == {'web-tooling-profile', 'speedometer-profile', 'speedometer-profile-warm',
-                                         'web-tooling-sample', 'speedometer-sample'}
+                                         'speedometer-desktop-profile', 'web-tooling-sample', 'speedometer-sample'}
     reqs = HARNESS.requirements(fam, debug, None)
     assert {Requirement('input', 'web-tooling-inputs'), Requirement('input', 'speedometer-inputs'),
             Requirement('artifact', 'perf-runtime')} <= set(reqs)
@@ -402,6 +402,11 @@ def test_speedometer_and_the_debug_profiles_get_their_userlands_and_resident():
     warm = {c for s in (suites['speedometer'], debug) for c, spec in s.extra['cases'].items()
             if '--compile-cache' in spec['argv'] and spec['argv'][spec['argv'].index('--compile-cache') + 1] == 'warm'}
     assert warm == {'speedometer-natemu-warm', 'speedometer-profile-warm'}
+    # Only the desktop profile boots the guest with its mitigations on, and with natemu's speculation barriers.
+    def opt(spec, flag): a = spec['argv']; return a[a.index(flag) + 1] if flag in a else None
+    on = {c for s in (suites['speedometer'], debug) for c, spec in s.extra['cases'].items() if opt(spec, '--mitigations') not in (None, 'off')}
+    assert on == {'speedometer-desktop-profile'}
+    assert opt(debug.extra['cases']['speedometer-desktop-profile'], '--natemu-set') == 'engine.speculation_barriers=true'
 
 
 def test_a_bench_at_round_runs_the_profiling_residents_of_its_revision(monkeypatch, tmp_path):

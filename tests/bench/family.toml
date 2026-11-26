@@ -603,6 +603,10 @@ argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "kvm", "--k
 # many processes per vCPU, so CR3 loads and the TLB bucket's cost show here.
 # speedometer-profile-warm: the same with the persistent compile cache warm (as speedometer-natemu-warm: one untimed
 # boot fills it, the profiled boot reuses it), so translation of Firefox's own code drops out of the profile.
+# speedometer-desktop-profile: speedometer-profile as the owner's desktop boots its guest: the kernel's own speculation
+# mitigations at their defaults (run_speedometer.py --mitigations on: no mitigations=off, nokaslr kept) and natemu's
+# speculation barriers on (engine.speculation_barriers, so RDCL_NO on a FEAT_CSV3 host and the guest leaves PTI off);
+# its result.json holds what the guest's /sys/devices/system/cpu/vulnerabilities says.
 [[suite]]
 name = "debug"
 kind = "bench"
@@ -624,6 +628,11 @@ argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "
 argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
         "--out", "{out}", "--name", "speedometer-profile-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
         "--perf-log", "--boots", "1", "--compile-cache", "warm"]
+
+[suite.cases.speedometer-desktop-profile]
+argv = ["python3", "tests/bench/run_speedometer.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{speedometer_inputs}",
+        "--out", "{out}", "--name", "speedometer-desktop-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--perf-log", "--boots", "1", "--mitigations", "on", "--natemu-set", "engine.speculation_barriers=true"]
 
 # web-tooling-sample, speedometer-sample: where the vCPUs were, from natemu's EL0 sampler, as the guest-*-sample cases:
 # the resident with `perf` and `profile` ({runtime_profile}), natemu --profile every {sample_us} us, the timing log, then

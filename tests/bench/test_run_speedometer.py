@@ -7,8 +7,13 @@ import run_speedometer as sp
 UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'
 
 
+VULN = ['SP-VULN meltdown: Not affected', 'SP-VULN mds: Mitigation: Clear CPU buffers; SMT disabled',
+        'SP-VULN spectre_v2: Mitigation: Retpolines; IBPB: conditional; STIBP: disabled; RSB filling; PBRSB-eIBRS: Not affected',
+        'SP-BUGS bugs\t\t: spectre_v1 spectre_v2 spec_store_bypass mds swapgs']
+
+
 def console(score=2.28, iters=5, suites=sp.SUITES, done=True, error=None, cpus=4, hook=True, exited=False, end=True, asked=5):
-    lines = ([] if hook else ['SP-NO-HOOK']) + [f'SP-BEGIN cpus={cpus} iter={asked} MemTotal: 4000212 kB', 'SP /log {"loaded":906}',
+    lines = ([] if hook else ['SP-NO-HOOK']) + VULN + [f'SP-BEGIN cpus={cpus} iter={asked} MemTotal: 4000212 kB', 'SP /log {"loaded":906}',
                                                  'SP /log {"suite":"TodoMVC-JavaScript-ES5","step":0,"of":290,"t":4176}',
                                                  'SP /log {"error":"x is undefined","at":"a.js:1"}']
     if exited: lines.append('SP-FF-EXITED')
@@ -29,6 +34,13 @@ class Parse(unittest.TestCase):
         self.assertEqual((r['suites']['TodoMVC-JavaScript-ES5'], r['suites']['Perf-Dashboard']), (100.0, 119.0))
         self.assertEqual(r['page_errors'], [{'error': 'x is undefined', 'at': 'a.js:1'}])
         self.assertEqual(sp.problems(r, 5, 4), [])
+
+    def test_the_guests_vulnerabilities_and_bugs(self):
+        r = sp.parse(console())
+        self.assertEqual(r['vulnerabilities'], {'meltdown': 'Not affected', 'mds': 'Mitigation: Clear CPU buffers; SMT disabled',
+                                                'spectre_v2': VULN[2].split(': ', 1)[1]})
+        self.assertEqual(r['bugs'], ['spectre_v1', 'spectre_v2', 'spec_store_bypass', 'mds', 'swapgs'])
+        self.assertEqual((sp.parse('SP-BEGIN cpus=4 iter=5\n')['vulnerabilities'], sp.parse('')['bugs']), ({}, None))
 
     def test_a_boot_without_results_or_with_other_ones_does_not_count(self):
         self.assertEqual(sp.problems(sp.parse(console(done=False, exited=True)), 5, 4), ['Firefox exited before the results', 'no results (no /done)'])
@@ -55,7 +67,7 @@ def args(out, **kw):
     import argparse
     a = dict(emu='natemu', name='sp', kernel=out / 'k', inputs=out / 'in', out=out / 'o', boots=3, iterations=5, vcpus=4, ram=4,
              cap=900, fexc=out / 'fexc', natemu=out / 'natemu', runtime=out / 'rt', perf_log=False, compile_cache='off',
-             compile_cache_mb=8192, natemu_set=[], qemu=None, sample_us=None)
+             compile_cache_mb=8192, natemu_set=[], qemu=None, sample_us=None, mitigations='off')
     a.update(kw)
     return argparse.Namespace(**a)
 
@@ -71,13 +83,13 @@ class CompileCache(unittest.TestCase):
         self.assertEqual(on[on.index('--compile-cache') + 1:on.index('--compile-cache') + 4], ['/x/cache', '--compile-cache-mb', '8192'])
         self.assertEqual(on[on.index('--perf-log') + 1], pathlib.Path('/x/cc'))
 
-    def run_with(self, compile_cache, perf_log=False, fill_ok=True, boots=3, sample_us=None):
+    def run_with(self, compile_cache, perf_log=False, fill_ok=True, boots=3, sample_us=None, **kw):
         """run() with the boots faked: each writes a pack into the cache folder it was given and a console with a score."""
         import tempfile
         from unittest import mock
         tmp = pathlib.Path(tempfile.mkdtemp())
         for f in ('k', 'natemu', 'rt'): (tmp / f).write_bytes(b'x')
-        a = args(tmp, compile_cache=compile_cache, perf_log=perf_log, boots=boots, sample_us=sample_us)
+        a = args(tmp, compile_cache=compile_cache, perf_log=perf_log, boots=boots, sample_us=sample_us, **kw)
         seen, self.cmds = [], []
 
         def boot(out, i, cmd, cap, stamper=None):
@@ -136,6 +148,21 @@ class CompileCache(unittest.TestCase):
         self.assertIn('--perf-log', cmd)
         marks = [l.split('\t')[1] for l in (out / 'sp.markers.tsv').read_text().splitlines()]
         self.assertEqual(marks, ['NATEMU-BENCH-KTEXT ffffffff81000000', 'NATEMU-BENCH-START', 'NATEMU-BENCH-END'])
+
+    def test_the_mitigations_off_by_default_or_at_the_kernels_defaults_and_the_barriers_through_natemu_set(self):
+        self.assertEqual(sp.cmdline('off', 5), 'console=ttyS0 mitigations=off nokaslr rdinit=/sp-init spiter=5')
+        self.assertEqual(sp.cmdline('on', 3), 'console=ttyS0 nokaslr rdinit=/sp-init spiter=3')
+        rc, _, r, _ = self.run_with('off', boots=1)
+        cmd = self.cmds[0]
+        self.assertIn('mitigations=off', cmd[cmd.index('--cmdline') + 1])
+        self.assertEqual((rc, r['mitigations'], r['vulnerabilities']['meltdown']), (0, 'off', 'Not affected'))
+        rc, _, r, _ = self.run_with('off', boots=1, mitigations='on', natemu_set=['engine.speculation_barriers=true'])
+        cmd = self.cmds[0]
+        self.assertEqual(cmd[cmd.index('--cmdline') + 1], 'console=ttyS0 nokaslr rdinit=/sp-init spiter=5')
+        self.assertEqual(cmd[cmd.index('--set') + 1], 'engine.speculation_barriers=true')
+        self.assertEqual((rc, r['mitigations'], r['cmdline'], r['natemu_set']),
+                         (0, 'on', 'console=ttyS0 nokaslr rdinit=/sp-init spiter=5', ['engine.speculation_barriers=true']))
+        self.assertIn(b'/sys/devices/system/cpu/vulnerabilities/*', sp.tail())
 
     def test_a_failed_fill_fails_the_case_and_nothing_is_timed(self):
         rc, seen, r, _ = self.run_with('warm', fill_ok=False)

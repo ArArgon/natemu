@@ -3,7 +3,7 @@
 reference, KVM on the x86 machine (docs/benchmarks.md, "Web browsing"); speedometer-profile, its debug-tier profile.
 
     tests/bench/run_speedometer.py run --emu natemu|qemu|kvm --kernel BZIMAGE --inputs SPEEDOMETER_INPUTS --out DIR
-        [--boots 3] [--iterations 5] [--vcpus 4] [--ram 4] [--cap 900]
+        [--boots 3] [--iterations 5] [--vcpus 4] [--ram 4] [--cap 900] [--mitigations off|on]
         [--fexc FEXC --natemu NATEMU --runtime RUNTIME [--perf-log] [--sample-us N] [--compile-cache off|warm [--compile-cache-mb 8192]]
          [--natemu-set KEY=VALUE ...]]                                                                 (natemu)
         [--qemu QEMU_SYSTEM]                                                                           (qemu)
@@ -36,6 +36,11 @@ cost, shadow resets, evictions, page faults, INVLPGs): a browser is many process
 every N us into OUT/NAME.samples and OUT/NAME.objects, the console's SP-KTEXT, SP-BEGIN and results lines stamped in
 OUT/NAME.markers.tsv (NATEMU-BENCH-KTEXT, -START, -END) and the userland's ELF files as OUT/userland.cpio, for
 tests/bench/sample_report.py, which the case runs around this script, as run_web_tooling.py --sample-us.
+--mitigations: the guest kernel's own speculation mitigations, off (the default, `mitigations=off` on its command line, as
+every benchmark boots it) or on (the kernel's defaults, as a desktop boots: speedometer-desktop-profile, which also turns
+on natemu's speculation barriers with --natemu-set engine.speculation_barriers=true, so natemu advertises RDCL_NO on a
+host with FEAT_CSV3 and the guest leaves PTI off). Either way the init prints the guest's
+/sys/devices/system/cpu/vulnerabilities/* (SP-VULN lines) and /proc/cpuinfo's bugs before SP-BEGIN; result.json holds them.
 QEMU: the pinned qemu-system-x86_64, TCG thread=multi, the other guest benchmarks' board and CPU model. kvm: the x86
 machine NATEMU_X86_HOST boots the same kernel and initramfs under KVM, the same CPU model (guest_userland.boots_kvm).
 Exit 0 when every boot finished every iteration; 3 when another VM ran during a boot (contended: not comparable); 1
@@ -64,7 +69,13 @@ SUITES = ['TodoMVC-JavaScript-ES5', 'TodoMVC-JavaScript-ES6-Webpack-Complex-DOM'
           'Charts-observable-plot', 'Charts-chartjs', 'React-Stockcharts-SVG', 'Perf-Dashboard']
 HARNESS = HERE / 'speedometer'           # hook.js, serve.py, user.js, policies.json
 INIT = 'sp-init'
-CMDLINE = f'console=ttyS0 mitigations=off nokaslr rdinit=/{INIT}'
+
+
+def cmdline(mitigations: str, iterations: int) -> str:
+    """The guest kernel's command line: its mitigations off (`mitigations=off`, the benchmarks') or at its defaults ('on')."""
+    return f'console=ttyS0 {"mitigations=off " if mitigations == "off" else ""}nokaslr rdinit=/{INIT} spiter={iterations}'
+
+
 GUEST = r'''#!/bin/sh
 # sp-init: Speedometer in headless Firefox, its results printed by serve.py, then power off. Markers "SP..." on the console.
 B=/bin/busybox
@@ -75,6 +86,8 @@ export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin MOZ_HEADLESS=1 MOZ_CRASHREP
 iter=$($B sed -n 's/.*spiter=\([0-9]*\).*/\1/p' /proc/cmdline)
 $B sed -i 's|<script src="resources/main.mjs" type="module"></script>|<script src="hook.js"></script>&|' /sp/index.html
 $B grep -q '<script src="hook.js"></script><script src="resources/main.mjs"' /sp/index.html || echo "SP-NO-HOOK"
+for f in /sys/devices/system/cpu/vulnerabilities/*; do echo "SP-VULN ${f##*/}: $($B cat $f)"; done
+echo "SP-BUGS $($B grep -m1 '^bugs' /proc/cpuinfo)"
 echo "SP-KTEXT $($B grep ' _text$' /proc/kallsyms | $B cut -d' ' -f1)"
 echo "SP-BEGIN cpus=$(nproc) iter=$iter $(grep MemTotal /proc/meminfo | tr -s ' ')"
 $B mkdir -p /tmp/prof && $B cp /sp-harness/user.js /tmp/prof/user.js
@@ -117,6 +130,8 @@ def parse(serial: str) -> dict:
         try: d = json.loads(m.group(1))
         except ValueError: continue
         if 'error' in d: errors.append(d)
+    vulns = {m.group(1): m.group(2).strip() for m in re.finditer(r'^SP-VULN ([\w.-]+): (.*)$', serial, re.M)}
+    bugs = re.search(r'^SP-BUGS (?:bugs\s*:\s*)?(.*)$', serial, re.M)
     begin = re.search(r'^SP-BEGIN cpus=(\d+) iter=(\d*)', serial, re.M)
     suites = (res or {}).get('suites') or {}
     return {'score': (res or {}).get('score'), 'score_text': (res or {}).get('scoreText'),
@@ -126,7 +141,8 @@ def parse(serial: str) -> dict:
             'ua': (res or {}).get('ua'), 'page_errors': errors, 'hook': 'SP-NO-HOOK' not in serial,
             'firefox_exited': 'SP-FF-EXITED' in serial, 'cpus': int(begin.group(1)) if begin else None,
             'iterations': int(begin.group(2)) if begin and begin.group(2) else None,
-            'ended': re.search(r'^SP-END ', serial, re.M) is not None}
+            'ended': re.search(r'^SP-END ', serial, re.M) is not None, 'vulnerabilities': vulns,
+            'bugs': bugs.group(1).split() if bugs else None}
 
 
 def problems(r: dict, iterations: int, vcpus: int) -> list:
@@ -159,7 +175,7 @@ def run(args) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     initrd = args.out / 'initrd.img'
     made = gu.make_initrd(args.inputs, initrd, tail())
-    cmdline = f'{CMDLINE} spiter={args.iterations}'
+    cmd = cmdline(args.mitigations, args.iterations)
     (args.out / 'bench.jsonl').unlink(missing_ok=True)
     boots, filled = [], None
     cache = args.out / 'compile-cache' if args.compile_cache == 'warm' else 'off'
@@ -167,7 +183,7 @@ def run(args) -> int:
     first = 0 if cache != 'off' else 1
     if args.sample_us: gu.elf_image(args.inputs / 'userland.cpio.zst', args.out / 'userland.cpio')
     try:
-        remote = gu.boots_kvm(args, initrd, [cmdline] * args.boots, 'speedometer') if args.emu == 'kvm' else None
+        remote = gu.boots_kvm(args, initrd, [cmd] * args.boots, 'speedometer') if args.emu == 'kvm' else None
         for i in range(first, args.boots + 1):
             fill = i == 0
             serial = args.out / f'boot-{i}.serial'
@@ -176,9 +192,9 @@ def run(args) -> int:
             stamper = gu.Stamper(args.out / f'{args.name}.markers.tsv', MARKS) if sample else None
             if remote: b = remote[i - 1]
             elif args.emu == 'natemu':
-                b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmdline, serial, perf, cache, args.compile_cache_mb, sample),
+                b = gu.boot_local(args.out, i, gu.natemu_command(args, initrd, cmd, serial, perf, cache, args.compile_cache_mb, sample),
                                   args.cap, stamper)
-            else: b = gu.boot_local(args.out, i, gu.qemu_command(args, initrd, cmdline, serial), args.cap)
+            else: b = gu.boot_local(args.out, i, gu.qemu_command(args, initrd, cmd, serial), args.cap)
             r = parse(b.pop('text'))
             r.update(boot=i, fill=fill, **b)
             if cache != 'off': r['compile_cache'] = gu.cache_size(cache)
@@ -195,6 +211,8 @@ def run(args) -> int:
                   (f'; page errors: {r["page_errors"][:3]}' if r['page_errors'] else '') +
                   (f'; contended by {r["contended"]}' if r['contended'] else ''), flush=True)
             for line in gu.perf_lines(r['perf']) if perf else []: print('  ' + line)
+            if not fill and len(boots) == 1:
+                for k, v in r['vulnerabilities'].items(): print(f'  vulnerabilities/{k}: {v}')
             if r['problems']: break
     finally:
         initrd.unlink(missing_ok=True)
@@ -202,7 +220,9 @@ def run(args) -> int:
     ok = len(boots) == args.boots and not any(b['problems'] for b in boots) and not (filled and filled['problems'])
     result = {'name': args.name, 'emu': args.emu, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'boots': len(boots),
               'iterations': args.iterations, 'inputs': made, 'kernel': digest(args.kernel), 'pass': ok,
-              'ua': boots[0]['ua'] if boots else None, 'perf_log': args.perf_log, 'compile_cache': args.compile_cache}
+              'ua': boots[0]['ua'] if boots else None, 'perf_log': args.perf_log, 'compile_cache': args.compile_cache,
+              'mitigations': args.mitigations, 'cmdline': cmd, 'natemu_set': args.natemu_set,
+              'vulnerabilities': boots[0]['vulnerabilities'] if boots else None, 'bugs': boots[0]['bugs'] if boots else None}
     if filled: result['fill'] = {k: filled[k] for k in ('score', 'score_text', 'seconds', 'compile_cache', 'problems')}
     if args.emu == 'natemu': result.update(natemu=digest(args.natemu), runtime=digest(args.runtime))
     if args.emu == 'qemu': result['qemu'] = subprocess.run([str(args.qemu), '--version'], capture_output=True, text=True).stdout.splitlines()[0]
@@ -242,6 +262,8 @@ def main():
                    help="natemu: off (every boot translates from nothing) or warm (an untimed boot fills a persistent cache in OUT that the timed boots reuse)")
     r.add_argument('--compile-cache-mb', type=int, default=8192, help='natemu, warm: the persistent cache\'s cap in MiB')
     r.add_argument('--natemu-set', action='append', default=[], metavar='KEY=VALUE', help='natemu: passed on as --set KEY=VALUE (the bench harness turns the platform devices off with it)')
+    r.add_argument('--mitigations', choices=('off', 'on'), default='off',
+                   help="the guest kernel's speculation mitigations: off (mitigations=off, the benchmarks') or on (its defaults, a desktop's)")
     r.add_argument('--qemu', type=Path)
     args = a.parse_args()
     if args.emu == 'natemu' and not (args.fexc and args.natemu and args.runtime): a.error('--emu natemu needs --fexc, --natemu and --runtime')
