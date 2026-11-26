@@ -1233,7 +1233,18 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 # `jmp rbx`); EXIT (user) ends in the nop to CPL 0 and is followed by BACK (supervisor: `jmp r12`); S is a supervisor code page. A
 # CPL-3 call sets r12 = the return label, rbx = the target and r13 = EXIT's nop (the code ends `jmp r13`).
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
-STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro')
+STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3', 'guard-invlpg', 'guard-flags')
+# Frame-keyed plan 8.2, guarded blocks (natemu only: CPL 3). GS (CPU i's page d + GS, mapped at its own address) holds CPL-3 code
+# that jumps straight to V + PY, a link from another page into an absolute user block: its guard stub. Table A maps V -> F1,
+# table B V -> F2 (each frame's code at PY: `mov eax, 0x11|0x12; jmp r13`, or for `guard-flags` RFLAGS' OF|SF|ZF|CF).
+# - `guard-cr3`: twice under A (the link made, then a guard hit); twice under B with no INVLPG (the CR3 load emptied the code TLB:
+#   the stub misses, F2's block runs; then F2's entry is in the slot and F1's stub still misses); twice under A again (F1).
+# - `guard-invlpg`: under A, V remapped to F2 with INVLPG and back: the slot goes with the INVLPG, each frame's code runs.
+# - `guard-flags`: `cmp ecx, edx` in GS before the jump, the flags read at the target: through the linker, a guard hit, a guard
+#   miss after a CR3 load (B), and a hit with other flags: the stub keeps NZCV (guest flags) on both paths.
+GUARD = ('guard-cr3', 'guard-invlpg', 'guard-flags')
+GS = 0x8000
+GUARD_FLAGS = b'\x9c\x58\x25\xc1\x08\x00\x00\x41\xff\xe5'   # pushfq; pop rax; and eax, 0x8c1; jmp r13
 # `fa-ro` (fault-around plan chunk 1, natemu only: QEMU cannot switch CPL): at CPL 3 (the user code on FAUC) a page NRW (R/W = 1, D = 1) read and
 # written (the read installs it writable: no upgrade abort), then NRO (R/W = 0, A = 1, D = 1) read and written: #PF error 7 (present, write,
 # user) at CR2 = NRO, the run's stop. A rule that ignored R/W would install NRO writable at the read and the write would succeed.
@@ -1333,6 +1344,12 @@ def chunk_bodies(k, i, n):
         # K blocks on V in a fresh epoch, 0x20 apart: one walk and K - 1 record hits (run at K and 2K rounds: the counts' difference).
         'page-counts': (cr3('tb') + f'    xor r8d, r8d\n    xor ecx, ecx\n.l:\n    mov rax, {d:#x}\n    mov rdx, rcx\n    shl rdx, 5\n    add rax, rdx\n'
                         f'    lea r13, [rel .cl]\n    jmp rax\n.cl:\n    add r8, rax\n    inc ecx\n    cmp ecx, {k}\n    jb .l\n' + cr3('ta')),
+        'guard-cr3': (c3('a0', d + GS) + save('r8') + c3('a1', d + GS) + save('r9') + cr3('tb') + c3('a2', d + GS) + save('r10')
+                      + c3('a3', d + GS) + save('r14') + cr3('ta') + c3('a4', d + GS) + save('r15') + c3('a5', d + GS) + save('rsi')),
+        'guard-invlpg': (c3('b0', d + GS) + save('r8') + c3('b1', d + GS) + save('r9') + put(d + F2) + inv(d) + c3('b2', d + GS)
+                         + save('r10') + c3('b3', d + GS) + save('r14') + put(d + F1) + inv(d) + c3('b4', d + GS) + save('r15')),
+        'guard-flags': ('    mov ecx, 1\n    mov edx, 2\n' + c3('f0', d + GS) + save('r8') + c3('f1', d + GS) + save('r9') + cr3('tb')
+                        + c3('f2', d + GS) + save('r10') + '    mov ecx, 2\n' + c3('f3', d + GS) + save('r14') + cr3('ta')),
         # The fast miss path: K rounds of A, B, C (one L1 set of three RIPs: each call misses into a current block).
         'miss-counts': f'    mov ecx, {k}\n.r:\n' + add('a', A, 'r8') + add('b', B, 'r9') + add('c', C, 'r10') + '    dec ecx\n    jnz .r\n',
         # A CPUID decode (kept, never in L1) reached by a computed jump each round: always a miss, always declined (`system`).
@@ -1396,6 +1413,11 @@ def chunk_memory(name, i, n):
         out += [mem(t + 0x6000, b''.join(((LF1 + (o << 12)) | P.LEAF).to_bytes(8, 'little') for o in range(512)), capture=False)]
     if name == 'page-counts':
         out += [mem(d + F2 + 0x20 * j, P.asm(f'mov eax, {j}\njmp r13'), capture=False) for j in range(PCN)]
+    if name in GUARD:
+        jump = P.asm(f'org {d + GS:#x}\n' + ('cmp ecx, edx\n' if name == 'guard-flags' else '') + f'jmp {d + PY:#x}')
+        out += [mem(d + GS, jump, capture=False)]
+        out += ([mem(d + f + PY, GUARD_FLAGS, capture=False) for f in (F1, F2)] if name == 'guard-flags'
+                else [code(d + F1 + PY, 0x11), code(d + F2 + PY, 0x12)])
     if name in STUB_PROGRAMS:
         out += [mem(d + STUB['enter'], b'\x90', capture=False), mem(d + STUB['user'], b'\xff\xe3', capture=False), mem(d + STUB['exit'], b'\x90', capture=False),
                 mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
@@ -1439,6 +1461,9 @@ CHUNK_VALUES = {
     'page-global': {'r8': {1}, 'r9': {0x11}, 'r10': {0x12}, 'r12': {0x21}, 'r14': {0x22}},
     'page-user': lambda i, k: {'r8': {1}, 'r9': {P.SYS_D(i) + PY}, 'r10': {0x21}, 'r14': {0x11}},   # (r9: the faulted call leaves its target in rax)
     'page-user-invlpg': {'r8': {1}, 'r9': {0x12}, 'r10': {0x21}, 'rdi': {1}},
+    'guard-cr3': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}, 'rsi': {0x11}},
+    'guard-invlpg': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}},
+    'guard-flags': {'r8': {0x81}, 'r9': {0x81}, 'r10': {0x81}, 'r14': {0x40}},
     'page-mark': {'r8': {1}, 'r9': {0x11}, 'r10': {0x41}},
     'page-size-check': {'r8': {1}, 'r9': {0x11}},
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
@@ -2454,7 +2479,8 @@ def main():
             prog = program(name, n, a.k)
             want = None if name in EITHER else k1_expected.expected(name, n, a.k, prog)
             # (The pool's programs also without the reuse check: production's, where a pool copy is not asked of the host.)
-            for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL else []):
+            # (Frame-keyed plan 8.2: the guard programs too: guarded blocks are placed only without the reuse check.)
+            for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL or name in GUARD else []):
                 out, problems = run(a, prog, extra, check=check)
                 if name in ('pic-ctx', 'pic-xm'):  # (as `contexts`: once per context)
                     problems = [p for p in problems if 'host requests' not in p]
@@ -2476,6 +2502,11 @@ def main():
                 for v, c in enumerate(out['cpus'] if out and name == 'probe-share' else []):
                     if c['stats']['k1']['pic'][26] < 1:
                         problems.append(f"cpu{v} pic instances {c['stats']['k1']['pic'][26]}, want at least 1")
+                # Frame-keyed plan 8.2: the guard programs made a guarded link and filled the code TLB (not vacuous).
+                for v, c in enumerate(out['cpus'] if out and name in GUARD and not check and not os.environ.get('NATEMU_PIC_TEST') else []):
+                    f = c['stats']['k1'].get('fkeys', {})
+                    if f.get('links_guarded', 0) < 1 or f.get('ctlb_fills', 0) < 2:
+                        problems.append(f"cpu{v} guarded links {f.get('links_guarded', 0)}, code-TLB fills {f.get('ctlb_fills', 0)}: want at least 1 and 2")
                 # A block's death undoes its links out by its outbound list: no pass over the records (the pass's records count as scanned).
                 for v, c in enumerate(out['cpus'] if out and name in NO_SWEEP else []):
                     if c['stats']['k1']['scanned']:

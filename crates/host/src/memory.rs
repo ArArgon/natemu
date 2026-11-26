@@ -387,6 +387,13 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
             let ipa = IPA + (dl1 + k * cache::BLOCK) as u64;
             assert_eq!(ipa % cache::BLOCK as u64, 0);
             word(l2 + at * 8, ipa | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
+            // Frame-keyed plan 8.2: the code TLB, after the data tables in the lookup area, in the user space only (user code's
+            // guards read it; supervisor code has none).
+            if k == 1 {
+                let ctlb = IPA + (dl1 + cache::CTLB - cache::DL1) as u64;
+                assert_eq!(ctlb % cache::BLOCK as u64, 0);
+                word(l2 + cache::ctlb_block(va) * 8, ctlb | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
+            }
         }
     }
     word(

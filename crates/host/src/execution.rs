@@ -1165,6 +1165,12 @@ struct K1Fkeys {
     suspended_dropped: u64,
     /// Step 1c: link points linked in the checked form only because their link is not local.
     links_checked_cross: u64,
+    /// Plan 8.2: link points linked to a guarded block's stub; the code TLB's fills, conflicts, whole clears, page clears.
+    links_guarded: u64,
+    ctlb_fills: u64,
+    ctlb_conflicts: u64,
+    ctlb_clears: u64,
+    ctlb_invalidated: u64,
 }
 impl K1Fkeys {
     fn is_empty(&self) -> bool {
@@ -1179,6 +1185,11 @@ impl K1Fkeys {
             | self.reclaimed_suspended
             | self.suspended_dropped
             | self.links_checked_cross
+            | self.links_guarded
+            | self.ctlb_fills
+            | self.ctlb_conflicts
+            | self.ctlb_clears
+            | self.ctlb_invalidated
             == 0
     }
 }
@@ -1456,6 +1467,11 @@ impl K1 {
                 reclaimed_suspended: c.reclaimed_suspended,
                 suspended_dropped: c.suspended_dropped,
                 links_checked_cross: c.links_checked_cross,
+                links_guarded: c.links_guarded,
+                ctlb_fills: c.ctlb_fills,
+                ctlb_conflicts: c.ctlb_conflicts,
+                ctlb_clears: c.ctlb_clears,
+                ctlb_invalidated: c.ctlb_invalidated,
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,
@@ -1648,6 +1664,10 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let mut entries = HashMap::new();
     for (i, t) in blocks.iter().enumerate().filter(|(_, t)| t.flags & (cache::SYSTEM | cache::INSTANCE) == 0) {
         entries.entry(t.entry() - cache::CODE_VA).or_insert(i);
+        // (Frame-keyed plan 8.2: a link from another page into a guarded block enters its guard stub.)
+        if t.flags & cache::GUARDED != 0 {
+            entries.entry(t.guard_entry() - cache::CODE_VA).or_insert(i);
+        }
     }
     let mut linked = HashMap::new();
     let mut points = 0;
@@ -4858,6 +4878,11 @@ pub fn run(
     area.write_record(
         control + std::mem::offset_of!(cache::Control, miss_fast_off),
         u64::from(std::env::var("NATEMU_MISS_FAST").as_deref() == Ok("off")),
+    );
+    // Frame-keyed plan 8.2 (A/B and fallback): NATEMU_GUARDS=off places no guarded block (every link and L1 entry plain).
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, guards_off),
+        u64::from(std::env::var("NATEMU_GUARDS").as_deref() == Ok("off")),
     );
     // Tests only (M2 Part 2): NATEMU_INTERPRETER=off stops a vCPU at the boot-time interpreter's entry, as before it ran.
     area.write_record(

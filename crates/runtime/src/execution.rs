@@ -2788,7 +2788,9 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         };
         cache::control().pic_counts[natemu_abi::pic::count::ENTRY_STOPS + word] += 1;
     }
-    if (elr == b.entry() || (b.flags & cache::PIC != 0 && elr < b.entry() && elr >= b.full_entry()))
+    // (Frame-keyed plan 8.2: a guarded block's stub is before its first word: nothing of it ran, the RIP is its own.)
+    let in_guard = b.flags & cache::GUARDED != 0 && elr >= b.guard_entry() && elr < b.code_va();
+    if (elr == b.entry() || in_guard || (b.flags & cache::PIC != 0 && elr < b.entry() && elr >= b.full_entry()))
         && (b.flags & cache::STEP != 0 || (!b.starts_with_rep() && s.shadow_entry != elr))
     {
         let mut s = at_once(s, entered);

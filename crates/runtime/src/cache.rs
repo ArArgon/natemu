@@ -17,7 +17,7 @@ use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
-    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_BYTES, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL,
+    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_BYTES, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, GUARDED, GUARD_LEAD,
     INBOUND, INSTANCE, LARGE, LEAF_DIRTY, LOCAL_INBOUND, MAX_VCPUS, OFF0, OFF1, PAGES, PIC, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
     PIC_TEST_STR, PIC_TEST_SVC, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, DROPS, DROP_SLOTS,
@@ -444,6 +444,7 @@ pub fn reset() {
     }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     tl1_clear();
+    ctlb_clear();
     if c.checked_any != 0 {
         unsafe { ptr::write_bytes(lookup_area::<u8>(area::CHECKED_AT), 0, area::CHECKED_ENTRIES * 16) };
         c.checked_any = 0;
@@ -605,6 +606,11 @@ fn check_chains() {
         }
         if current(b) {
             halt(2 << 32 | n as u64, u64::from(b.flags))
+        }
+        // (Frame-keyed plan 8.2: a guarded block's L1 entries and links outlive its currency, by design: its stub checks the code
+        // TLB, whose slot of its page went with the event that made it not current.)
+        if b.flags & GUARDED != 0 {
+            continue;
         }
         // (Only tables with a context: a global flush or a reset leaves the others' entries, unreachable, until a context takes one
         // and `select_l1` clears it.)
@@ -859,6 +865,8 @@ pub fn select_l1(context: u64) {
 /// Enters `block` for `rip` in the dispatcher's L1 table if the block's context is the table's ([`select_l1`] ran for
 /// it before the lookup that found it); otherwise nothing is entered (the block is still entered from the resident).
 pub fn fill_l1(rip: u64, block: &Block) {
+    // Frame-keyed plan 8.2: every resident entry into a guarded block that is current fills its page's code-TLB slot.
+    ctlb_fill(block);
     let t = control().l1_table as usize;
     // (PIC study test [`PIC_TEST_SVC`]: none, so every computed exit and checked link enters the resident, which then
     // enters blocks armed after their links are made.)
@@ -876,7 +884,7 @@ pub fn fill_l1(rip: u64, block: &Block) {
     // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever. (Frame-keyed plan
     // step 1b: a shared translation is entered at several RIPs, which may share a set, as its instances did: its way is the one
     // whose tag is this RIP, so two of its RIPs hold both ways; `cut_one` empties every way it owns.)
-    let f = if block.flags & TRANSLATION != 0 {
+    let f = if block.flags & (TRANSLATION | GUARDED) != 0 {
         let tags = unsafe { [dl1(t, w0).read()[0], dl1(t, w1).read()[0]] };
         match tags.iter().position(|&tag| tag == rip) {
             Some(way) if !(way == 1 && area::segment_slot(t, w1)) => area::L1Fill { way, there: true, victim: false },
@@ -899,7 +907,8 @@ pub fn fill_l1(rip: u64, block: &Block) {
     }
     let flip = if f.victim { area::L1_NEXT } else { 0 };
     let mut listed = [o0, o1][f.way] & area::L1_LISTED;
-    if listed == 0 && block.flags & GLOBAL == 0 {
+    // (Frame-keyed plan 8.2: a guarded block's entry outlives CR3 loads, so it is not listed for them.)
+    if listed == 0 && block.flags & (GLOBAL | GUARDED) == 0 {
         let c = control();
         unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
         (c.l1_listed[t], listed) = (c.l1_listed[t] + 1, area::L1_LISTED);
@@ -1123,8 +1132,10 @@ pub fn tlb(global: bool) -> Option<u64> {
             c.l1_listed[t] = kept as u64;
         }
     }
-    // Frame-keyed plan step 1b: every L1 entry of a shared translation (never current) is gone.
+    // Frame-keyed plan step 1b: every L1 entry of a shared translation (never current) is gone. Plan 8.2: and the code TLB
+    // (a TLB event: every fetch translation of the old epoch).
     tl1_clear();
+    ctlb_clear();
     #[cfg(feature = "link-check")]
     check_l1_lists();
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
@@ -1259,7 +1270,10 @@ pub fn place(
     let (h_at, want) = split_point(staged, &links, dispatch_exit as u32, size, |o| {
         staged_sites.iter().any(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind) && u64::from(s.native_offset) == o)
     });
-    let (code, hot) = reserve(u64::from(size), want)?;
+    // Frame-keyed plan 8.2: a guarded block's stub before its code.
+    let lead = guard_lead(h.guest_rip, h.guest_bytes, context, source_gpa, walked);
+    let (start, hot) = reserve(u64::from(size + lead), want)?;
+    let code = start + u64::from(lead);
     let code_end = code + u64::from(size);
     let mut record = Block {
         rip: h.guest_rip,
@@ -1279,7 +1293,8 @@ pub fn place(
             } else {
                 0
             }
-            | if sti_first { STI_FIRST } else { 0 },
+            | if sti_first { STI_FIRST } else { 0 }
+            | if lead != 0 { GUARDED } else { 0 },
         dispatch_exit: dispatch_exit as u32,
         rep_exits: rep_exits as u32,
         links,
@@ -1306,6 +1321,7 @@ pub fn place(
                 (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
             }
         }
+        write_guard(&record);
         let placed = file(
             record,
             object.add(h.sites_offset as usize),
@@ -1328,7 +1344,7 @@ pub fn place(
             placed,
             core::slice::from_raw_parts(object.add(h.code_offset as usize), size as usize),
         );
-        synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, size as usize);
+        synchronize_code(area::CODE_WRITE_VA + start, area::CODE_VA + start, (size + lead) as usize);
         c.code_used = code_end;
         if placed.hot_size != 0 {
             c.seg.hot_used = placed.hot_body() + u64::from(placed.hot_size);
@@ -1581,6 +1597,142 @@ pub fn virtual_instance(t: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) 
         hot_body: 0,
         patch: [0; MAX_LINK_POINTS],
         ..*t
+    }
+}
+/// Frame-keyed plan 8.2: guarded blocks are placed (the host did not turn them off, and no check or study mode compares or
+/// counts what plain links would do: the reuse check, a page-record check mode, the PIC tests and `pic-count`).
+pub fn guards_on() -> bool {
+    let c = control();
+    c.guards_off == 0
+        && c.reuse != REUSE_CHECK
+        && c.pages == natemu_abi::execution::cache::PAGES_ON
+        && c.pic_test == 0
+        && !cfg!(feature = "pic-count")
+}
+fn ctlb_table() -> *mut u64 {
+    lookup_area::<u64>(area::CTLB)
+}
+fn ctlb_list() -> *mut u32 {
+    lookup_area::<u32>(area::CTLB_LIST)
+}
+/// Frame-keyed plan 8.2: the code TLB gets guarded block `b`'s page, a fetch translation of this epoch ([`current`]: a walk
+/// found `b`'s page at its frame since the last CR3 load, global flush, INVLPG or #PF of it). The slot is listed the first
+/// time it is filled since the table was last emptied; a large leaf's region is noted for INVLPG.
+pub fn ctlb_fill(b: &Block) {
+    if b.flags & GUARDED == 0 || b.flags & DEAD != 0 || !current(b) || !guards_on() {
+        return;
+    }
+    let c = control();
+    let slot = area::ctlb_slot(b.rip);
+    let entry = area::ctlb_entry(b.rip, b.source_gpa[0]);
+    let at = ctlb_table().wrapping_add(slot);
+    let old = unsafe { at.read() };
+    if old == entry {
+        return;
+    }
+    if old == 0 {
+        if (c.ctlb_listed as usize) < area::CTLB_LIST_ENTRIES {
+            unsafe { ctlb_list().add(c.ctlb_listed as usize).write(slot as u32) };
+        }
+        c.ctlb_listed += 1;
+    } else {
+        c.ctlb_conflicts += 1;
+    }
+    if b.flags & LARGE != 0 {
+        let (w, bit) = region(b.rip >> 21);
+        c.ctlb_regions[w] |= bit;
+    }
+    unsafe { at.write(entry) };
+    c.ctlb_fills += 1;
+}
+/// Frame-keyed plan 8.2: the code TLB emptied (a CR3 load, a global flush, a reset): the listed slots, or the whole table when
+/// the list overflowed.
+fn ctlb_clear() {
+    let c = control();
+    if c.ctlb_listed == 0 {
+        return;
+    }
+    if c.ctlb_listed as usize > area::CTLB_LIST_ENTRIES {
+        unsafe { ptr::write_bytes(ctlb_table(), 0, area::CTLB_ENTRIES) };
+    } else {
+        for k in 0..c.ctlb_listed as usize {
+            unsafe { ctlb_table().add(ctlb_list().add(k).read() as usize).write(0) };
+        }
+    }
+    (c.ctlb_listed, c.ctlb_regions) = (0, [0; 16]);
+    c.ctlb_clears += 1;
+}
+/// Frame-keyed plan 8.2: INVLPG or #PF at `address` (SDM Vol.3 4.10.4.1): the slot of its page, whatever page it holds (a
+/// slot may hold another page's entry: emptying it is only conservative), and every slot of its 2 MiB region when a large
+/// leaf filled one there. Unconditional: a guarded block not current is reachable through the table alone.
+fn ctlb_invalidate(address: u64) {
+    let c = control();
+    if c.ctlb_listed == 0 {
+        return;
+    }
+    unsafe { ctlb_table().add(area::ctlb_slot(address)).write(0) };
+    let (w, bit) = region(address >> 21);
+    if c.ctlb_regions[w] & bit != 0 {
+        let base = address & !((2 << 20) - 1);
+        for page in 0..512u64 {
+            unsafe { ctlb_table().add(area::ctlb_slot(base + (page << 12))).write(0) };
+        }
+    }
+    c.ctlb_invalidated += 1;
+}
+/// Frame-keyed plan 8.2: the guard stub's bytes for a block placed now for `rip` (`guest_bytes` long, from `source_gpa`,
+/// `walked` its fetch translation's flags) under `context`: [`GUARD_LEAD`] for an absolute block of a user context on one
+/// linear page through a non-global leaf whose frame and address an entry can say ([`area::ctlb_frame_ok`]); else 0.
+fn guard_lead(rip: u64, guest_bytes: u32, context: u64, source_gpa: [u64; 2], walked: u32) -> u32 {
+    let one_page = rip >> 12 == rip.wrapping_add(u64::from(guest_bytes).max(1) - 1) >> 12;
+    let fits = guards_on()
+        && user(context)
+        && walked & GLOBAL == 0
+        && one_page
+        && source_gpa[1] == u64::MAX
+        && area::ctlb_frame_ok(rip, source_gpa[0]);
+    if fits { GUARD_LEAD } else { 0 }
+}
+/// Frame-keyed plan 8.2: writes guarded block `b`'s stub (its record as it is filed: `code`, its entry) in the [`GUARD_LEAD`]
+/// bytes before its code. It loads the code-TLB slot of `b`'s page (x28 + the table's distance, [`area::ctlb_delta`]) and
+/// enters `b` only if it holds the entry of `b`'s page and frame; otherwise it exits to the dispatcher's miss with x0 = `b`'s
+/// RIP. No word writes NZCV (guest flags live there across every exit); x1 and x2 are dead at every exit, as the dispatcher
+/// slots' use shows.
+///
+/// ```text
+/// add/sub x1, x28, #pages, lsl #12;  ldr x1, [x1, #off]
+/// movz x2, #e0;  movk x2, #e1, lsl #16;  movk x2, #e2, lsl #32;  eor x1, x1, x2;  cbnz x1, miss;  b entry
+/// miss: movz x0, #r0;  movk x0, #r1, lsl #16;  movk x0, #r2, lsl #32;  b DISPATCH_MISS
+/// ```
+fn write_guard(b: &Block) {
+    if b.flags & GUARDED == 0 {
+        return;
+    }
+    let at = u64::from(b.code) - u64::from(GUARD_LEAD);
+    let a = area::ctlb_delta(control().guest_state_va) + 8 * area::ctlb_slot(b.rip) as i64;
+    let off = a.rem_euclid(4096) as u32;
+    let pages = if a >= 0 { 0x9140_0000u32 | ((a >> 12) as u32) << 10 } else { 0xd140_0000 | (((i64::from(off) - a) >> 12) as u32) << 10 };
+    let base = pages | 28 << 5 | 1;
+    let e = area::ctlb_entry(b.rip, b.source_gpa[0]);
+    let mov = |keep: bool, hw: u32, v: u64, rd: u32| {
+        (if keep { 0xf280_0000u32 } else { 0xd280_0000 }) | hw << 21 | ((v >> (16 * hw)) as u32 & 0xffff) << 5 | rd
+    };
+    let words = [
+        base,
+        0xf940_0000 | (off >> 3) << 10 | 1 << 5 | 1,
+        mov(false, 0, e, 2),
+        mov(true, 1, e, 2),
+        mov(true, 2, e, 2),
+        0xca02_0021,
+        0xb500_0001 | 2 << 5,
+        branch(at + 28, b.entry() - area::CODE_VA),
+        mov(false, 0, b.rip, 0),
+        mov(true, 1, b.rip, 0),
+        mov(true, 2, b.rip, 0),
+        branch(at + 44, area::DISPATCH_MISS as u64),
+    ];
+    for (k, w) in words.into_iter().enumerate() {
+        unsafe { ((area::CODE_WRITE_VA + at + 4 * k as u64) as *mut u32).write(w) };
     }
 }
 /// Frame-keyed plan step 1b, under the reuse check: whether translation `t`'s entry at `rip` was compared already
@@ -1859,9 +2011,11 @@ pub fn copy(
     let (h_at, want) = split_point(|o| word(u64::from(b.code) + o), &b.links, b.dispatch_exit, b.code_size, |o| {
         sites(b).iter().any(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind) && u64::from(s.native_offset) == o)
     });
-    let Some((code, hot)) = reserve(u64::from(b.code_size), want) else {
+    let lead = guard_lead(rip, b.guest_bytes, b.context, source_gpa, walked);
+    let Some((start, hot)) = reserve(u64::from(b.code_size + lead), want) else {
         return Ok(None);
     };
+    let code = start + u64::from(lead);
     let code_end = code + u64::from(b.code_size);
     let mut links = b.links;
     unsafe {
@@ -1909,7 +2063,8 @@ pub fn copy(
         code: code as u32,
         number: 0,
         flags: walked & (GLOBAL | LARGE)
-            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | UNSHAREABLE),
+            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | UNSHAREABLE)
+            | if lead != 0 { GUARDED } else { 0 },
         links,
         inbound: 0,
         out: [0; MAX_LINK_POINTS],
@@ -1924,6 +2079,10 @@ pub fn copy(
         if !split(&mut record, sites(b).iter().copied()) {
             (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
         }
+    }
+    if lead != 0 {
+        write_guard(&record);
+        synchronize_code(area::CODE_WRITE_VA + start, area::CODE_VA + start, lead as usize);
     }
     let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
     let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
@@ -1976,9 +2135,11 @@ pub fn copy_pooled(
         len as u32,
         |o| (0..e.sites_count()).any(|i| natemu_abi::code_object::kind::is_stub_kind(e.site(i).kind) && u64::from(e.site(i).native_offset) == o),
     );
-    let Some((code, hot)) = reserve(code_size, want) else {
+    let lead = guard_lead(rip, e.guest_bytes, context, source_gpa, walked);
+    let Some((start, hot)) = reserve(code_size + u64::from(lead), want) else {
         return Ok(None);
     };
+    let code = start + u64::from(lead);
     let code_end = code + code_size;
     let count = e.relocs_count();
     // (decode bounds the count by `MAX_RELOCS`.)
@@ -2022,7 +2183,8 @@ pub fn copy_pooled(
         flags: walked & (GLOBAL | LARGE)
             | RELOCATABLE
             | (count as u32) << RELOCS_SHIFT
-            | if e.sti_first { STI_FIRST } else { 0 },
+            | if e.sti_first { STI_FIRST } else { 0 }
+            | if lead != 0 { GUARDED } else { 0 },
         dispatch_exit: e.dispatch_exit,
         rep_exits: e.rep_exits,
         links,
@@ -2039,6 +2201,10 @@ pub fn copy_pooled(
         if !split(&mut record, (0..e.sites_count()).map(|i| e.site(i))) {
             (record.hot, record.hot_size, record.hot_body, record.patch) = (0, 0, 0, [0; MAX_LINK_POINTS]);
         }
+    }
+    if lead != 0 {
+        write_guard(&record);
+        synchronize_code(area::CODE_WRITE_VA + start, area::CODE_VA + start, lead as usize);
     }
     let tables = e.tables();
     let placed = unsafe { file(record, tables.as_ptr(), tables.len(), 0) };
@@ -2599,7 +2765,16 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     // Frame-keyed plan step 1c (shared-code plan chunk 4's A/B): every link that is not local is checked too, unless the
     // host's debug key asks for plain ones (`Control::link_form_plain`): it probes L1 at the RIP the exit built, so no TLB
     // event undoes it (an L1 entry is emptied instead) and none is patched again.
+    // Frame-keyed plan 8.2: from absolute code into a guarded block on another page, the link enters the target's guard stub, a
+    // direct branch that outlives CR3 loads and global flushes as a local link does (the stub checks the code TLB): it takes
+    // the place of step 1c's checked form there.
+    let guarded = !local_shared
+        && !shared
+        && target.flags & (INSTANCE | TRANSLATION) == 0
+        && code.flags & GUARDED != 0
+        && !local(target, source);
     let checked = !local_shared
+        && !guarded
         && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (c.link_form_plain == 0 && !local(target, source)));
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
@@ -2611,6 +2786,8 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
             d if d == area::DISPATCH_MISS as u64 => return Link::Linked(0), // (no slot: no link)
             d => d,
         }
+    } else if guarded {
+        code.guard_entry() - area::CODE_VA
     } else {
         link_entry(source, code)
     };
@@ -2660,7 +2837,7 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     }
     let (segment, inbound) = if checked {
         (CHECKED, 0)
-    } else if local_shared || local(target, source) {
+    } else if local_shared || local(target, source) || guarded {
         (LOCAL, LOCAL_INBOUND)
     } else if target.flags & GLOBAL != 0 {
         (TLB, INBOUND)
@@ -2708,6 +2885,9 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     let pic_checked = checked && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
     if linked != 0 && checked && !pic_checked {
         c.links_checked_cross += linked;
+    }
+    if guarded {
+        c.links_guarded += linked;
     }
     if linked != 0 && pic_checked {
         counted(count::CHECKED_LINKS);
@@ -3294,8 +3474,10 @@ pub fn invlpg(address: u64) -> Option<u64> {
     if held(&c.regions) {
         on_linear_page(address >> 12, &mut cut);
     }
-    // Frame-keyed plan step 1b: the L1 entries of shared translations entered at the page or region.
+    // Frame-keyed plan step 1b: the L1 entries of shared translations entered at the page or region. Plan 8.2: the code
+    // TLB's entries of the page or region.
     tl1_invalidate(address);
+    ctlb_invalidate(address);
     if large_held(c, r) {
         for page in r << 9..(r + 1) << 9 {
             on_linear_page(page, |n| {
@@ -3440,6 +3622,9 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
     // Frame-keyed plan step 1b: a shared translation, entered at any address of its page offset, in every such set (RIP bits
     // 12 up to the set index's top vary).
     let sets = if b.flags & TRANSLATION != 0 { 1 << (area::L1_SET_BITS - 12) } else { 1 };
+    // (Frame-keyed plan 8.2: a guarded block's L1 entries outlive its currency: the code-TLB slot of its page goes at the same
+    // event, so they miss. Only its death takes them.)
+    let sets = if !dead && b.flags & GUARDED != 0 { 0 } else { sets };
     for k in 0..sets {
         let (w0, w1) = area::l1_slots_of(b.rip ^ (k << 12));
         for t in 0..area::L1_TABLES {

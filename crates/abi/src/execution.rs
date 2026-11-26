@@ -368,7 +368,49 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (DL1 + DL1_BYTES).next_multiple_of(BLOCK);
+    pub const LOOKUP_BYTES: usize = (CTLB + CTLB_BYTES).next_multiple_of(BLOCK);
+    /// Frame-keyed plan 8.2: the code TLB, user-class fetch translations as an ITLB holds them, one 2 MiB block after the
+    /// data tables, mapped EL0 read-only in the user space's level 2 beside the guest-state alias ([`ctlb_block`]): a guarded
+    /// block's stub loads its slot ([`ctlb_slot`]) and compares it with the entry its page and frame make ([`ctlb_entry`]).
+    /// [`CTLB_ENTRIES`] u64 (0: empty), then the list of the slots filled since the table was last emptied
+    /// ([`CTLB_LIST_ENTRIES`] u32; `Control::ctlb_listed` of them; past that the whole table is emptied).
+    pub const CTLB: usize = DL1 + DL1_BYTES;
+    pub const CTLB_BYTES: usize = BLOCK;
+    pub const CTLB_ENTRIES: usize = 1 << 15;
+    pub const CTLB_LIST: usize = CTLB + 8 * CTLB_ENTRIES;
+    pub const CTLB_LIST_ENTRIES: usize = 4096;
+    const _: () = assert!(CTLB % BLOCK == 0 && CTLB_LIST + 4 * CTLB_LIST_ENTRIES <= CTLB + CTLB_BYTES);
+    /// The level-2 index (in the alias's 1 GiB) of the code TLB's block in the user space: beside the data tables' block,
+    /// on the same side of the alias when it fits ([`dl1_after`]: the alias's block `i`, the tables at `i + 1` or `i - 1`).
+    pub const fn ctlb_block(guest_state_va: u64) -> usize {
+        let i = (guest_state_va >> 21 & 511) as usize;
+        if dl1_after(guest_state_va) {
+            if i + 2 <= 511 { i + 2 } else { i - 1 }
+        } else {
+            i - 2
+        }
+    }
+    /// The code TLB's first byte less the guest-state alias's (x28 of generated code), a whole number of pages.
+    pub const fn ctlb_delta(guest_state_va: u64) -> i64 {
+        let block = (guest_state_va & !(BLOCK as u64 - 1)) as i64;
+        let i = (guest_state_va >> 21 & 511) as i64;
+        block + (ctlb_block(guest_state_va) as i64 - i) * BLOCK as i64 - guest_state_va as i64
+    }
+    /// The slot of linear address `va`'s page: its page number's low 15 bits.
+    pub const fn ctlb_slot(va: u64) -> usize {
+        (va >> 12) as usize & (CTLB_ENTRIES - 1)
+    }
+    /// The entry that says `va`'s page is fetched from the 4 KiB frame at `gpa`: the frame's page number (below 2^28,
+    /// [`ctlb_frame_ok`]) and the page number's bits above the slot's (below 2^20 for a user address below 2^47), packed to
+    /// 48 bits, plus one (0 is empty): three move words build it.
+    pub const fn ctlb_entry(va: u64, gpa: u64) -> u64 {
+        ((gpa >> 12) | (va >> 27) << 28) + 1
+    }
+    /// A block of a user page at `va` from the frame at `gpa` can have a code-TLB entry: the frame's page number fits 28
+    /// bits and the address is a user one below 2^47.
+    pub const fn ctlb_frame_ok(va: u64, gpa: u64) -> bool {
+        gpa >> 12 < 1 << 28 && va >> 47 == 0
+    }
     /// The dispatcher's data tables: table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves
     /// ([`DL1_EMPTY`]: none) and the address to branch to. Filling or emptying one is two stores: no code is written,
     /// nothing is synchronized. Each shadow space's upper root maps its own class's block of [`L1_SPACE_TABLES`] tables
@@ -1150,6 +1192,19 @@ pub mod cache {
         pub checked_any: u64,
         /// Whether [`ENTERED_AT`] holds a RIP. Appended.
         pub entered_any: u64,
+        /// Frame-keyed plan 8.2: guarded blocks off (the host's `NATEMU_GUARDS=off`, an A/B and fallback switch); the code
+        /// TLB's listed slots ([`CTLB_LIST`]), the 2 MiB regions a large leaf filled a slot in (bit `r % 1024`, as
+        /// [`Control::regions`]), and counters: slots filled, fills that replaced another page's entry (conflicts), whole
+        /// clears, INVLPG/#PF slot clears. Appended.
+        pub guards_off: u64,
+        pub ctlb_listed: u64,
+        pub ctlb_regions: [u64; 16],
+        pub ctlb_fills: u64,
+        pub ctlb_conflicts: u64,
+        pub ctlb_clears: u64,
+        pub ctlb_invalidated: u64,
+        /// Link points linked to a guarded block's stub. Appended.
+        pub links_guarded: u64,
         /// Frame-keyed plan 8.1: of [`Self::reclaimed`], the suspended records dropped (no code written); and the suspended
         /// records dropped at a TLB event for [`MAX_SUSPENDED`]. Appended.
         pub reclaimed_suspended: u64,
@@ -1557,6 +1612,13 @@ pub mod cache {
     /// INVLPG walk cuts it and drops it from them ([`OFF0`], [`OFF1`]) for good, as nothing revalidates it; harmless, as
     /// nothing reads its currency.
     pub const INTERPRETED: u32 = 32768;
+    /// Frame-keyed plan 8.2: an absolute block of a user context on one linear page, placed with a guard stub in the
+    /// [`GUARD_LEAD`] bytes before its code ([`Block::guard_entry`]): links from other pages and L1 entries enter there, and
+    /// it enters the block only if the code TLB holds the block's page and frame ([`ctlb_entry`]), so they outlive CR3 loads.
+    /// (Bits 16-23 hold the relocations' count, [`RELOCS_SHIFT`].)
+    pub const GUARDED: u32 = 1 << 24;
+    /// The guard stub's bytes (12 words), before a [`GUARDED`] block's code, keeping it 16-byte aligned.
+    pub const GUARD_LEAD: u32 = 48;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
     /// design's 16-byte shift of FEX's body.
@@ -1582,9 +1644,16 @@ pub mod cache {
         pub fn full_entry(&self) -> u64 {
             if self.flags & PIC != 0 {
                 self.code_va() - 4
+            } else if self.flags & GUARDED != 0 {
+                self.guard_entry()
             } else {
                 self.entry()
             }
+        }
+        /// Frame-keyed plan 8.2: a [`GUARDED`] block's guard stub, the [`GUARD_LEAD`] bytes before its code: where links
+        /// from other pages and its L1 entries enter it.
+        pub fn guard_entry(&self) -> u64 {
+            self.code_va() - u64::from(GUARD_LEAD)
         }
         /// Hot/cold: its exit words ([`super::exit_offsets`]); `hot_size` is its body's end ([`super::body_end`]).
         pub fn exits(&self) -> ([u32; super::MAX_LINK_POINTS + 1], usize) {
@@ -1649,7 +1718,14 @@ pub mod cache {
         }
         /// The code-area offset of its first word ([`Block::full_entry`]'s, for a [`PIC`] block).
         pub fn start(&self) -> u32 {
-            self.code - if self.flags & PIC != 0 { 4 } else { 0 }
+            self.code
+                - if self.flags & PIC != 0 {
+                    4
+                } else if self.flags & GUARDED != 0 {
+                    GUARD_LEAD
+                } else {
+                    0
+                }
         }
         /// Link point `offset` (a native offset in the block, 0 = none) is the self-exit of the REP string instruction
         /// that ends the block (X2, [`Block::rep_exits`]).
@@ -5030,6 +5106,30 @@ mod tests {
     }
     /// The record area's capacity is [`cache::MAX_LINKS`] unless a value in range is set; a full area is found at the cap
     /// (not before a block's links stop fitting), and what remains after the local links are undone is judged against it.
+    #[test]
+    fn ctlb_entry_packs_frame_and_page_and_is_never_empty() {
+        use super::cache::{CTLB_ENTRIES, ctlb_entry, ctlb_frame_ok, ctlb_slot};
+        let (va, gpa) = (0x7fff_1234_5000u64, 0xff_ffff_f000u64);
+        assert!(ctlb_frame_ok(va, gpa) && !ctlb_frame_ok(1 << 47, gpa) && !ctlb_frame_ok(va, 1 << 40));
+        assert_eq!(ctlb_entry(0, 0), 1, "0 is empty");
+        assert!(ctlb_entry(va, gpa) < 1 << 48, "three move words");
+        // Two pages of one slot, or two frames, give two entries.
+        let other = va + (CTLB_ENTRIES as u64) * 4096;
+        assert_eq!(ctlb_slot(va), ctlb_slot(other));
+        assert_ne!(ctlb_entry(va, gpa), ctlb_entry(other, gpa));
+        assert_ne!(ctlb_entry(va, gpa), ctlb_entry(va, gpa - 4096));
+    }
+    #[test]
+    fn ctlb_block_sits_beside_the_data_tables() {
+        use super::cache::{BLOCK, ctlb_block, ctlb_delta, dl1_after};
+        for i in [0u64, 1, 2, 300, 509, 510, 511] {
+            let va = 0xffff_8f00_0000_0000u64 | i << 21 | 0x5000;
+            let dl1 = if dl1_after(va) { i + 1 } else { i - 1 };
+            let c = ctlb_block(va) as u64;
+            assert!(c != i && c != dl1 && c <= 511, "{i}");
+            assert_eq!(ctlb_delta(va), ((c as i64 - i as i64) * BLOCK as i64) - 0x5000, "{i}");
+        }
+    }
     #[test]
     fn link_records_hold_every_live_link_point() {
         // (Frame-keyed plan 8.1: every live record holds one outbound slot of a live block, so the area fills only with suspended
