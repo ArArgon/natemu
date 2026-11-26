@@ -553,3 +553,66 @@ PIC form of the guard (2.4's sequence, x0-indexed), not 8.2's constant-index stu
 Order: step 2 builds the absolute stub and the code TLB, and the PIC guard after it. P2 then turns its checked links into
 guarded ones. The link records' segments (`GUARDED`) and `cache::link`'s forms are this plan's; P2's chunk 2 does not
 touch them.
+
+### 8.4 Review of section 8 (Fable, independent, November 26) and the response
+
+The reviewer found 8.1 sound with corrections, and 8.2's ITLB argument sound in every listed case (an absolute block
+reached by a plain link, from L1, after a CR3 load, after INVLPG or #PF, with large leaves, in 32-bit code, alive but not
+current, killed by a write). Two defects in the stub as drawn were blocking.
+
+**Blocking, adopted:**
+
+1. **The stub must not write NZCV**, which holds guest flags across every exit. It compares with `eor x1, x1, x2; cbnz
+   x1, miss`, as the dispatcher does. A k1 case enters a guarded block with each NZCV bit set, on a hit and on a miss.
+2. **The code area is EL0 execute-only,** so the stub cannot load a literal. The expected entry is built with
+   `movz`/`movk`. It is packed to 48 bits: `(frame | (vpn >> 15) << 28) + 1` (the slot index gives vpn's low 15 bits;
+   0 is empty), so three move words. The hit path is `add, ldr, movz, movk, movk, eor, cbnz, b`: 8 instructions, one
+   load, one taken branch.
+
+**Should, adopted:**
+
+3. Fill the code TLB at every resident entry into a block that is `current`, global leaf or not. The entry is a TLB entry
+   of this epoch either way.
+4. A guard is suppressed by the plain-link rule (`at_breakpoint` of its RIP), not by "DR7 armed": data watchpoints keep
+   translations. Under a mode-wide suppression (the reuse check, a page-record check mode, `pic-count`), blocks get the
+   plain entry and plain CR3-segment links. A frame of 2^28 or more is decided at placement: no stub.
+5. **Conflicts:** each guarded block has two candidate slots (two hashes of its vpn). On a conflict miss (B current, its
+   slot holding another valid page) the resident re-points B's two index words to the other slot. Fills write B's
+   current slot; INVLPG and #PF clear both candidates of the page. Conflicts are counted.
+6. The reclaim continues past `drop_suspended` only while `links_full` still holds (and an unset cap is the full area).
+   `MAX_LINKS = MAX_BLOCKS × MAX_LINK_POINTS + MAX_LINK_POINTS`, asserted.
+7. Suspended records are bounded on their own: they are dropped (no code written) when they reach 1 Mi. Reclaims are
+   counted split into suspended records dropped and live links undone.
+8. **P2's kill:** P2's shared area has no inbound records, so a guarded cross-page link into a dead block would still hit
+   (the code TLB says only that the page still maps the frame). A kill therefore poisons the dead block's guard: one word
+   to `b miss`, a form Arm allows to change under a running core. In this plan's private cache, death also unlinks the
+   inbound records and empties L1, as today. 8.3 records it, and that the shared area will have no `GUARDED` records.
+   8.2's constant-index stub serves P2's absolute user blocks unchanged; only PIC translations need 2.4's form.
+9. **Code the plan did not list, adopted:**
+   - The records: `host/execution.rs`'s `link_record` and the program driver's writers (`program.rs` 1030, 1094).
+   - `check_links`: a first word may branch to a guard stub.
+   - The segment checks (`host/execution.rs` 1755, 1818, 1868).
+   - `unlink_word`/`links_to`, and `check_no_dead_links`'s rule for `GUARDED`.
+   - `GUARDED` sits between `TLB` and `LOCAL`, so INVLPG's `unlink_inbound(n, false)` leaves it and `resume`'s swaps stay
+     valid.
+   - `cut_one(n, false)` leaves a guarded block's L1 ways.
+10. The fill list appends a slot only when the slot did not hold the entry already.
+11. Layout asserts: the shadow pool ends below `LINKS_VA`, and `LINKS_VA + LINKS_BYTES <= CODE_WRITE_VA` (P2:
+    `<= META_VA`).
+
+**Notes, adopted:**
+
+12. The INVLPG/#PF clear of the code TLB is unconditional: a guarded block that is not current is reachable through the
+    table alone.
+13. The stub enters at `entry()`: a guarded link loses the x87 run-test skip, so the test runs once more. This is
+    correct.
+14. The stub lies inside B's code span (after its body, before its tail), so `block_at` finds B with no new search. A
+    stop at a stub word is "not entered, RIP = r", as the `pic-count` stub's precedent does.
+15. **The table's mapping:** one 2 MiB block, EL0 read-only, in the user space's level 2 on the alias's free side (as DL1
+    is), not 64 leaf pages. Supervisor code cannot read it, and `guest_state_alias_valid` needs no room check. The
+    guard's `add x1, x28, #hi, lsl #12` reaches it.
+16. With 12 MiB freed in the lookup area, `FKEYS` gets one slot per block (2^21 entries).
+
+**Not adopted for now:** the lead form, a guard before the hot entry that falls through on a hit. It saves the taken
+branch but needs room in the hot zone before each split block's hot copy, so it waits for the measurement. The baseline
+to beat is P2 chunk 4's A/B of checked cross-page links in the private cache.
