@@ -824,9 +824,24 @@ step 2 and step 1d). Guards on is the default; guards off is `NATEMU_GUARDS=off`
   - Firefox's first start is 9.66 / 9.61 s.
   - These are single windows, with no second run.
 
-**Decision: step 2 stays on by default.** It is a clear gain on `guest-build` and on the desktop's session start, and
-neutral elsewhere within noise. The two policies below are not needed for `guest-build`. A Chromium cold start
-0.6 s slower is the one reading against it: repeat it at the next checkpoint before acting on it.
+**Chromium, run again** (`desktop-kde-browser-profile` alone, same build; guards on 20261126-150702-908f, off
+20261126-151244-7d4d):
+
+| | guards on (b24b, 908f) | guards off (b913, 7d4d) |
+|---|---|---|
+| Chromium cold start, s | 8.16, 8.02 | 7.50, 7.44 |
+| Chromium cold start, busy vCPU-s | 18.8, 18.8 | 16.2, 16.5 |
+| Chromium warm start, s | 4.25, 3.83 | 3.97, 3.56 |
+| Firefox cold start, s | 9.66, 9.17 | 9.61, 9.51 |
+| Speedometer | 3.18, 3.20 | 2.97, 3.11 |
+
+The Chromium cost repeats: with guards a cold start is about 0.6 s (8%) longer and takes 14% more busy vCPU time, and a warm
+start about 0.27 s longer. 908f's first vCPU alone counts 6.25 M guard misses. Firefox and Speedometer do not move.
+
+**Decision: step 2 stays on by default.** It is a clear gain on `guest-build` and on the desktop's session start. But
+Chromium's start, one of the KDE target's readings, is a repeated loss, so the cost of a guard miss in a many-process
+start is the next thing to find (the counters by window, then the policies below or the two-candidate slots of 8.4
+item 5).
 
 **If the guards had recovered `guest-build` only in part,** the policies to try (both cheap, both behind the existing keys):
 - **Plain links for blocks of a low CR3 rate:** count each address space's CR3 loads, and link plainly into blocks whose
