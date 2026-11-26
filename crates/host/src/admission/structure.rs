@@ -851,6 +851,7 @@ pub(super) struct Scratch {
     back: Vec<(u32, u32)>,
     returns: Vec<(u32, u32)>,
     loops: Vec<(u32, u32)>,
+    literal: Vec<bool>,
 }
 
 impl Verifier<'_> {
@@ -1127,8 +1128,18 @@ impl<'a> Verifier<'a> {
         let mut insns = std::mem::take(&mut s.insns);
         insns.clear();
         insns.resize(words, None);
+        // The words a literal slot holds (data: never decoded), marked once (each word tested every slot): word i when its
+        // offset i * 4 is in the slot's bytes.
+        let mut literal = std::mem::take(&mut s.literal);
+        literal.clear();
+        literal.resize(words, false);
+        for l in c.literals {
+            for i in l.start.div_ceil(4)..l.end.div_ceil(4).min(words) {
+                literal[i] = true;
+            }
+        }
         for (i, slot) in insns.iter_mut().enumerate().skip(ENTRY_OFFSET as usize / 4) {
-            if c.literals.iter().any(|l| l.contains(&(i * 4))) {
+            if literal[i] {
                 continue;
             }
             let w = u32::from_le_bytes(c.code[i * 4..i * 4 + 4].try_into().unwrap());
@@ -1147,6 +1158,7 @@ impl<'a> Verifier<'a> {
                 }
             });
         }
+        s.literal = literal;
         // The computed exit's branch placeholder, relocated by the resident (at most one: a block ends at one branch).
         let mut dispatch = None;
         for r in c
