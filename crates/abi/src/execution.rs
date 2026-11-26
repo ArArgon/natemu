@@ -408,7 +408,7 @@ pub mod cache {
     /// holds 8 MiB of it, not one slot per block). A tag match is a candidate, checked against the block's record. Backed as
     /// touched; emptied by a reset.
     pub const FKEYS: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
-    pub const FKEY_ENTRIES: usize = 1 << 20;
+    pub const FKEY_ENTRIES: usize = 1 << 21;
     /// Frame-keyed plan step 1b: a filter of linear pages (bit `page % TL1_BITS`) holding a byte of a shared translation that
     /// an L1 entry enters at that address since the filter was last cleared ([`Control::tl1_any`]): an INVLPG or #PF of a
     /// page whose bit is clear has no such entry to empty.
@@ -467,7 +467,8 @@ pub mod cache {
     pub const LOOKUP_OFFSET: usize = crate::shadow::POOL_END;
     pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
-    pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
+    pub const LINKS_OFFSET: usize = META_OFFSET + META_BYTES;
+    pub const CODE_OFFSET: usize = LINKS_OFFSET + LINKS_BYTES;
 
     /// Lookup area layout: [`Control`], L1's owners, L2, block index (L1's entries are at [`DL1`]).
     pub const CONTROL: usize = 0;
@@ -531,9 +532,25 @@ pub mod cache {
     /// one per block of the index (64 Ki before): the `build` benchmark's metadata arena fills (about 238 Ki blocks) before
     /// it does, while 64 Ki filled with links into current kernel blocks. Perf chunk 23: kept at 256 Ki when the index
     /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above). Chunk 1b: 512 Ki (a CPython `make -j4`
-    /// reclaimed about 100 times per vCPU, undoing 71 M links, at 256 Ki).
-    pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
-    pub const MAX_LINKS: usize = 512 * 1024;
+    /// reclaimed about 100 times per vCPU, undoing 71 M links, at 256 Ki). Frame-keyed plan 8.1: no longer in the lookup area
+    /// but in a span of their own at [`LINKS_VA`] ([`LINKS_OFFSET`] in the backing), as many as the live blocks' link points
+    /// can name (every live record holds one [`Block::out`] slot) and one block's more, so only the suspended records (on top,
+    /// bounded by [`MAX_SUSPENDED`]) can fill it: at 512 Ki a desktop's fewer capacity flushes left it full 1-2 times per vCPU,
+    /// each reclaim undoing 0.3-0.8 M links.
+    pub const MAX_LINKS: usize = MAX_BLOCKS * super::MAX_LINK_POINTS + super::MAX_LINK_POINTS;
+    /// Frame-keyed plan 8.1: suspended records beyond this many are dropped at the next TLB event (their words are restored:
+    /// no code is written; their targets' revalidations then relink nothing).
+    pub const MAX_SUSPENDED: usize = 1 << 20;
+    /// The link records' span: in the window's room between the code area and its write alias (and, in P2's layout, below the
+    /// metadata arena), EL1 read/write, never executable, backed as touched.
+    pub const LINKS_VA: u64 = PRIVATE + 0x1800_0000;
+    pub const LINKS_BYTES: usize = (MAX_LINKS * core::mem::size_of::<LinkRecord>()).next_multiple_of(BLOCK);
+    const _: () = assert!(
+        LINKS_VA % BLOCK as u64 == 0
+            && CODE_VA + CODE_BYTES_MAX as u64 <= LINKS_VA
+            && LINKS_VA + LINKS_BYTES as u64 <= CODE_WRITE_VA
+            && crate::shadow::POOL_END as u64 <= LINKS_VA - PRIVATE
+    );
     /// Least test-only link capacity ([`Control::link_cap`]): a full area must free at least a quarter of itself again.
     pub const MIN_LINK_CAP: usize = 4096;
     /// The record area's effective capacity: [`Control::link_cap`] if set (by the host's `NATEMU_LINK_CAP`, K1's `link-full`
@@ -554,7 +571,7 @@ pub mod cache {
         cap - cap / 4
     }
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
-    pub const STEP_RECORD: usize = LINKS + core::mem::size_of::<LinkRecord>() * MAX_LINKS;
+    pub const STEP_RECORD: usize = INDEX + 4 * MAX_BLOCKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
     /// M1: this vCPU's summaries of the code-page and writable mask words it set bits in (bit i % 64 of u64 i / 64: word
     /// i of the mask may hold its bits), so clearing its bits visits only those words, not all of guest RAM's (only the
@@ -1133,6 +1150,10 @@ pub mod cache {
         pub checked_any: u64,
         /// Whether [`ENTERED_AT`] holds a RIP. Appended.
         pub entered_any: u64,
+        /// Frame-keyed plan 8.1: of [`Self::reclaimed`], the suspended records dropped (no code written); and the suspended
+        /// records dropped at a TLB event for [`MAX_SUSPENDED`]. Appended.
+        pub reclaimed_suspended: u64,
+        pub suspended_dropped: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1817,8 +1838,7 @@ pub mod cache {
     );
     const _: () =
         assert!(HEAD_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
-    const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
-    const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
+    const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= STEP_RECORD);
     const _: () = assert!(
         STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY
             && STEP_RECORD % core::mem::align_of::<Block>() == 0
@@ -4994,6 +5014,14 @@ mod tests {
     }
     /// The record area's capacity is [`cache::MAX_LINKS`] unless a value in range is set; a full area is found at the cap
     /// (not before a block's links stop fitting), and what remains after the local links are undone is judged against it.
+    #[test]
+    fn link_records_hold_every_live_link_point() {
+        // (Frame-keyed plan 8.1: every live record holds one outbound slot of a live block, so the area fills only with suspended
+        // records, which a reclaim drops with no code written.)
+        use super::cache::{MAX_BLOCKS, MAX_LINKS, MAX_SUSPENDED, links_full};
+        assert!(!links_full(MAX_BLOCKS * super::MAX_LINK_POINTS, MAX_LINKS));
+        assert!(MAX_SUSPENDED < MAX_LINKS);
+    }
     #[test]
     fn link_cap_defaults_to_max_and_bounds_the_overflow() {
         use super::cache::{MAX_LINKS, MIN_LINK_CAP, link_cap, links_full, reclaim_floor};

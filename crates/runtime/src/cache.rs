@@ -302,7 +302,7 @@ fn step_block() -> &'static Block {
     unsafe { &*lookup_area::<Block>(area::STEP_RECORD) }
 }
 fn record(i: usize) -> *mut LinkRecord {
-    lookup_area::<LinkRecord>(area::LINKS).wrapping_add(i)
+    (area::LINKS_VA as *mut LinkRecord).wrapping_add(i)
 }
 fn global<T>(offset: usize) -> *mut T {
     (area::GLOBAL_VA + offset as u64) as *mut T
@@ -2632,8 +2632,15 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
         // per link (before, a pass that freed nothing was repeated at every linker entry).
         c.reclaims += 1;
         // Suspended records first (relink plan): their words are restored already, so dropping them writes no code.
-        let mut n = drop_suspended();
-        if control().links as usize > area::reclaim_floor(cap) {
+        let dropped = drop_suspended();
+        control().reclaimed_suspended += dropped;
+        let mut n = dropped;
+        // (Frame-keyed plan 8.1: the full area holds every live block's link points, so with no test cap only suspended
+        // records fill it and dropping them is the whole reclaim; a test cap goes on to the live links as before.)
+        let capped = control().link_cap != 0 && cap < area::MAX_LINKS;
+        if (capped || area::links_full(control().links as usize, cap))
+            && control().links as usize > area::reclaim_floor(cap)
+        {
             let Some(local) = prune(LOCAL, true) else {
                 return Link::Bad;
             };
@@ -3545,6 +3552,11 @@ fn fill_gap(old: [u64; 5], scope: usize, w: u64, new: &mut [u64; 5]) {
 /// block is current), and no record names a dead block or source (their deaths dropped them). Returns the links undone.
 #[cfg(not(feature = "pic-count"))]
 fn suspend(scope: usize) -> Option<u64> {
+    // (Frame-keyed plan 8.1: suspended records have their own bound, as the area holds every live link: past it they are
+    // dropped, their words restored already, so no code is written.)
+    if control().links_susp as usize >= area::MAX_SUSPENDED {
+        control().suspended_dropped += drop_suspended();
+    }
     let c = control();
     let ctr = c.ctr_el0;
     let (from, to) = (c.links_susp, *ends(c)[scope]);

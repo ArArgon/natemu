@@ -1091,7 +1091,7 @@ fn corrupt(area: Area, kind: Corrupt) -> bool {
                 original: r.original ^ 1 << 5,
                 ..r
             };
-            area.write_record(cache::LOOKUP_OFFSET + cache::LINKS, record); // another immediate
+            area.write_record(cache::LINKS_OFFSET, record); // another immediate
         }
     }
     true

@@ -161,7 +161,8 @@ own and asks the pool; counts are per CPU, a peer may serve a first request too,
   fences share the own-template path's code, `reuse_fenced`, which no program here arms).
 Perf chunk 11 (natemu only):
 - `link-full`: more links than the record area holds. By default a test capacity of 16 Ki records (NATEMU_LINK_CAP: a
-  chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the production 512 Ki (a chain of 688,128 link
+  chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the old production 512 Ki's chain, which the
+  production area (4 Mi records, frame-keyed plan 8.1) holds with no reclaim (a chain of 688,128 link
   points through 168 pages above 4 GiB), about 30 of the K1 run's 35 minutes. Three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
   reload; back with INVLPG: every pass counts exactly, the area filled without a flush, and each fill cost at most two
   passes over it (`reclaims` at most 1 + 4 links / capacity).
@@ -953,7 +954,7 @@ def page_study_problems(name, ps, block1=False):
 # 0x400 and 0x404) with a CR3 reload; (r12) back to FC with INVLPG. Each pass runs every link point through links kept,
 # dropped and remade; the record area fills in every pass, and each fill costs at most two passes over it (`reclaims`
 # bounded by the links made).
-MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
+MAX_LINKS = 512 * 1024                    # the record area's size before frame-keyed plan 8.1 (the chain's geometry is sized for it)
 # `link-full` overflows a test-only capacity by default (the host's NATEMU_LINK_CAP -> `cache::Control::link_cap`): the
 # same linker paths (full area, local prune, unlink-all, reclaim bookkeeping), at a chain 28 times shorter. `--full-links`
 # runs the production size (cap MAX_LINKS, no env). Each of the FM pages holds 4096 link points. At MAX_LINKS FM = cap/4096
@@ -2218,10 +2219,15 @@ def main():
                         problems.append(f"cpu{v} flushes {c['stats']['flushes']}, want the driver's and the program's")
                 # Perf chunk 11: the record area filled (more links made than it holds, no flush but the driver's first)
                 # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
+                # Frame-keyed plan 8.1: at the production size (`--full-links`, no NATEMU_LINK_CAP) the area holds every live
+                # block's link points, so the same chain of more than the old 512 Ki links fills it never.
                 for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):
                     count, flushes = c['stats']['k1']['reclaims'][0], c['stats']['flushes']
                     links = c['stats']['links'] + c['stats']['k1'].get('relink', {}).get('relinked', 0)   # (a relink makes a link too)
-                    if not (links > CAP and count >= 1 and count <= 1 + 4 * links // CAP and flushes == 1):
+                    if CAP == MAX_LINKS:
+                        if not (links > CAP and count == 0 and flushes == 1):
+                            problems.append(f'cpu{v} links {links}, full {count} times (want none: the production area holds more than {CAP}), flushes {flushes}')
+                    elif not (links > CAP and count >= 1 and count <= 1 + 4 * links // CAP and flushes == 1):
                         problems.append(f'cpu{v} links {links}, full {count} times (at most {1 + 4 * links // CAP}; capacity {CAP}), flushes {flushes}')
                 seen = {}
                 if out and name in EITHER:

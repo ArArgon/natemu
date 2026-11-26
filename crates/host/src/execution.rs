@@ -545,6 +545,12 @@ fn prepare_at_alias(
                 cache::META_BYTES,
                 base + cache::META_OFFSET,
             ),
+            // Frame-keyed plan 8.1: the link records, a span of their own.
+            Span::data(
+                (cache::LINKS_VA - PRIVATE) as usize,
+                cache::LINKS_BYTES,
+                base + cache::LINKS_OFFSET,
+            ),
             Span::data(
                 (cache::LOOKUP_VA - PRIVATE) as usize,
                 cache::LOOKUP_BYTES,
@@ -1589,7 +1595,7 @@ pub fn placed_blocks(area: Area) -> Vec<cache::Block> {
 }
 /// The link record `i` (written by the resident's linker).
 pub fn link_record(area: Area, i: usize) -> cache::LinkRecord {
-    area.read_record(cache::LOOKUP_OFFSET + cache::LINKS + i * size_of::<cache::LinkRecord>())
+    area.read_record(cache::LINKS_OFFSET + i * size_of::<cache::LinkRecord>())
 }
 
 /// Self-check of the vCPU's cache after a run (the contract's rule (d), independent of the resident): every link point of
@@ -5449,7 +5455,8 @@ mod tests {
             link_cap_from(Some(&cache::MAX_LINKS.to_string())),
             Ok(cache::MAX_LINKS as u64)
         );
-        for bad in ["", "0", "-1", "x", "4095", "524289", "99999999999999999999"] {
+        let over = (cache::MAX_LINKS + 1).to_string();
+        for bad in ["", "0", "-1", "x", "4095", &over, "99999999999999999999"] {
             assert!(link_cap_from(Some(bad)).is_err(), "{bad}");
         }
     }
