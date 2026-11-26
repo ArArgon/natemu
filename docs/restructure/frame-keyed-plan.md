@@ -332,15 +332,33 @@ All bench cases run on the Mac mini M4, each side from its own commit (`TESTKIT_
   is kept if those buckets drop and `guest-luajit-interp` slows by no more than twice its noise; otherwise the
   fallbacks of section 5 are measured the same way.
 
-### 7.1 The A/B (Mac mini M4, `~/de-profile`)
+### 7.1 Checkpoint 1: the A/B (Mac mini M4, `~/de-profile`)
 
-- **Base:** e86dbab6, the desktop-profile tip with the host's `snapc` lines, through `TESTKIT_BENCH_AT`. The base runs
-  are shared with the fault-around work, so the base is measured once:
+The owner's policy: serious measurements happen only at checkpoints. Step 1 is checkpoint 1. It runs the decision set only,
+one run per side; the full set (`guest-build`, `guest-hackbench`, headless `speedometer-natemu`) runs once, at the final
+checkpoint.
+
+- **Base:** e86dbab6, the desktop-profile tip with the host's `snapc` lines, through `TESTKIT_BENCH_AT`. Its runs are
+  shared with the fault-around work:
   - `desktop-kde-profile`: run 20261126-024119-6d48.
   - `desktop-kde-browser-profile` (the desktop Chromium Speedometer, which is the one that counts; base 2.42): run
     20261126-021552-6362.
-  - Run for this plan: `guest-build`, `guest-luajit-interp` and `speedometer-natemu` (run 20261126-025647-314e), and
-    `guest-hackbench` at 4 vCPUs, twice (about 14% noise: runs 20261126-025647-479f and -da80).
-- **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip b645b4f5). It is measured on the
-  same cases, one run each, and hackbench twice.
+  - `guest-luajit-interp`, run for this plan: run 20261126-030949-67a2.
+- **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip b645b4f5), on the same three
+  cases.
+- **What is read:**
+  - `desktop-kde-profile`: the warm and cold Konsole and Dolphin starts (`app-*-1:start`, `app-*-2:start`), their buckets,
+    and the k1 counters `fkeys.lost`, `fkeys.full`, `fkeys.suspended_guardable`, the `tl1_*` scans, and `relink.suspended`.
+  - `desktop-kde-browser-profile`: Chromium's starts and its Speedometer score.
+  - `guest-luajit-interp`: the hot path's regression check.
 
+### 7.2 Step 2's decision
+
+Step 2 stays held until checkpoint 1 is read. It is built only if both hold:
+
+- In `desktop-kde-profile`'s warm starts, the switch buckets (`link`, `relink`, `patch`, `tlb`, and the misses after CR3
+  loads) are still at least 15% of busy vCPU time.
+- Most suspended links are guardable (`fkeys.suspended_guardable` / `relink.suspended` above one half).
+
+Otherwise P2 (the store shared by the vCPUs, which the counting boot gives 59-71% of pool and host time) comes before it.
+The decision and its numbers are recorded here when checkpoint 1 is read.
