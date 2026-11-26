@@ -2521,6 +2521,11 @@ def main():
                     f = c['stats']['k1'].get('fkeys', {})
                     if f.get('links_guarded', 0) < 1 or f.get('ctlb_fills', 0) < 1:
                         problems.append(f"cpu{v} guarded links {f.get('links_guarded', 0)}, code-TLB fills {f.get('ctlb_fills', 0)}: want at least 1 each")
+                    # (The stub's own miss exit: after each CR3 load the code TLB is empty, so `guard-cr3` misses at a2 and a4 at
+                    # least; `guard-hits`' K calls miss at most a few times.)
+                    gm = f.get('guard_misses', 0)
+                    if name == 'guard-cr3' and gm < 2 or name == 'guard-hits' and gm > 4:
+                        problems.append(f'cpu{v} guard misses {gm}')
                 # (`guard-hits`: the dispatcher misses against the same run with no guarded block, whose cross-page link is checked
                 # and hits L1: a guard that missed would add one a call.)
                 if out and name == 'guard-hits' and not check and not os.environ.get('NATEMU_PIC_TEST'):

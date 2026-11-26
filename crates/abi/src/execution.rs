@@ -314,6 +314,9 @@ pub mod cache {
     pub const DISPATCH_BYTES: usize = 0x4000;
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
+    /// Frame-keyed plan 8.2: a second `svc #MISS`, in slot 0's unused words, where a guard stub's miss exits (x0 = the RIP),
+    /// so the resident counts guard misses apart from the dispatcher's (`Control::guard_misses`) and then serves both alike.
+    pub const GUARD_MISS: usize = DISPATCH + 64;
     pub const DISPATCH_SLOT_BYTES: usize = 128;
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
     /// L1: [`L1_TABLES`] tables of two-way sets, kept as data ([`DL1`]). A set is [`L1_WAYS`] entries, indexed by
@@ -439,7 +442,7 @@ pub mod cache {
             mov(false, 0, rip, 0),
             mov(true, 1, rip, 0),
             mov(true, 2, rip, 0),
-            b(at + 44, DISPATCH_MISS as u64),
+            b(at + 44, GUARD_MISS as u64),
         ]
     }
     /// A block of a user page at `va` from the frame at `gpa` can have a code-TLB entry: the frame's page number fits 28
@@ -1240,8 +1243,9 @@ pub mod cache {
         pub ctlb_conflicts: u64,
         pub ctlb_clears: u64,
         pub ctlb_invalidated: u64,
-        /// Link points linked to a guarded block's stub. Appended.
+        /// Link points linked to a guarded block's stub; guard stubs that missed (their exit at [`GUARD_MISS`]). Appended.
         pub links_guarded: u64,
+        pub guard_misses: u64,
         /// Frame-keyed plan 8.1: of [`Self::reclaimed`], the suspended records dropped (no code written); and the suspended
         /// records dropped at a TLB event for [`MAX_SUSPENDED`]. Appended.
         pub reclaimed_suspended: u64,
@@ -5162,7 +5166,7 @@ mod tests {
     fn guard_words_reach_the_slot_and_compare_the_entry() {
         // Decoded as the CPU runs them: x1 = x28 +/- pages * 4096, then [x1 + off] must be the slot's address; x2 = the entry;
         // the branches go to the miss word, the entry and the dispatcher's miss; nothing writes NZCV (no `subs`/`cmp`).
-        use super::cache::{BLOCK, CTLB_ENTRIES, DISPATCH_MISS, ctlb_delta, ctlb_entry, ctlb_slot, guard_words};
+        use super::cache::{BLOCK, CTLB_ENTRIES, GUARD_MISS, ctlb_delta, ctlb_entry, ctlb_slot, guard_words};
         let branch = |w: u32, from: u64| from.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
         for block in [0u64, 1, 300, 509, 510, 511] {
             let gsv = 0xffff_8f00_0000_0000u64 | block << 21 | 0x7000;
@@ -5183,7 +5187,7 @@ mod tests {
                 assert_eq!(branch(w[7], at + 28), entry);
                 let r = (8..11).fold(0u64, |v, k| v | u64::from(w[k] >> 5 & 0xffff) << (16 * (k - 8)));
                 assert_eq!(r, rip);
-                assert_eq!(branch(w[11], at + 44), DISPATCH_MISS as u64);
+                assert_eq!(branch(w[11], at + 44), GUARD_MISS as u64);
                 assert!(ctlb_delta(gsv).unsigned_abs() < 4 * BLOCK as u64);
             }
         }

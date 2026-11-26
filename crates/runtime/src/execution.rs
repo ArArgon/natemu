@@ -1119,7 +1119,9 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     unsafe {
         resume_exception(
             frame,
-            cache::code_of(target).full_entry(),
+            // (Frame-keyed plan 8.2: a guarded block at its body: the resident found it current, so its stub's check is not
+            // needed, and the entry depends on no fill having worked.)
+            if target.flags & cache::GUARDED != 0 { target.entry() } else { cache::code_of(target).full_entry() },
             BLOCK_SPSR | frame.nzcv,
             alignment_check(&s.cpu),
         )
@@ -2486,7 +2488,10 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u6
             (3, ..) => crate::perf::IRQ,
             (_, 0x3c, imm) if imm == STOP_IMM as u16 => crate::perf::STOP,
             (_, 0x15, svc::LINK) => crate::perf::LINK,
-            (_, 0x15, svc::MISS) if elr == cache::CODE_VA + cache::DISPATCH_MISS as u64 + 4 => {
+            (_, 0x15, svc::MISS)
+                if elr == cache::CODE_VA + cache::DISPATCH_MISS as u64 + 4
+                    || elr == cache::CODE_VA + natemu_abi::execution::cache::GUARD_MISS as u64 + 4 =>
+            {
                 crate::perf::MISS
             }
             (_, 0x15, svc::DIV_U | svc::DIV_S) => crate::perf::DIVISION,
@@ -2532,6 +2537,12 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u6
                 linker(frame, elr)
             }
             svc::MISS if elr == miss => {
+                miss_fast(frame);
+                missed(frame)
+            }
+            // (Frame-keyed plan 8.2: a guard stub's miss, x0 = the RIP as at the dispatcher's.)
+            svc::MISS if elr == cache::CODE_VA + natemu_abi::execution::cache::GUARD_MISS as u64 + 4 => {
+                cache::control().guard_misses += 1;
                 miss_fast(frame);
                 missed(frame)
             }

@@ -724,6 +724,10 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
         c.slot_contexts[k] = area::NO_CONTEXT;
     }
     (c.slot_contexts[0], c.l1_slots) = (area::NO_CONTEXT, [0; area::L1_TABLES]);
+    // (Frame-keyed plan 8.2: the guard stubs' miss, the dispatcher's own `svc` word copied to slot 0's unused words.)
+    unsafe {
+        ((area::CODE_WRITE_VA + area::GUARD_MISS as u64) as *mut u32).write(word(area::DISPATCH_MISS as u64))
+    };
     for t in 0..area::L1_TABLES {
         for i in 0..area::L1_ENTRIES {
             let tag = if area::segment_slot(t, i) { 0 } else { area::DL1_EMPTY };

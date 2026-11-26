@@ -1167,6 +1167,7 @@ struct K1Fkeys {
     links_checked_cross: u64,
     /// Plan 8.2: link points linked to a guarded block's stub; the code TLB's fills, conflicts, whole clears, page clears.
     links_guarded: u64,
+    guard_misses: u64,
     ctlb_fills: u64,
     ctlb_conflicts: u64,
     ctlb_clears: u64,
@@ -1186,6 +1187,7 @@ impl K1Fkeys {
             | self.suspended_dropped
             | self.links_checked_cross
             | self.links_guarded
+            | self.guard_misses
             | self.ctlb_fills
             | self.ctlb_conflicts
             | self.ctlb_clears
@@ -1468,6 +1470,7 @@ impl K1 {
                 suspended_dropped: c.suspended_dropped,
                 links_checked_cross: c.links_checked_cross,
                 links_guarded: c.links_guarded,
+                guard_misses: c.guard_misses,
                 ctlb_fills: c.ctlb_fills,
                 ctlb_conflicts: c.ctlb_conflicts,
                 ctlb_clears: c.ctlb_clears,
