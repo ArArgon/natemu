@@ -30,7 +30,7 @@ stdin = false                # true: the terminal is the console (Ctrl-A x quits
 fexc = "../build/fexc"
 fp = "fast"                  # or "accurate"
 compile_cache = "off"        # a folder or "off"; left out, the user cache folder
-compile_cache_mb = 512
+compile_cache_mb = 2048
 speculation_barriers = false
 
 [boot.kernel]

@@ -54,8 +54,9 @@ about 2.6% of its hits: an experiment, a replay of one boot's trace. A quarter o
   sixteenth of the host's memory.
 - `NATEMU_ANSWER_CACHE_MB` still sets the cap exactly. The cap is now on the performance log's `answers` line
   (`cap_bytes`).
-- The 3 GiB reserve is for macOS and the rest of natemu: four code caches of 128 MiB, the shadow pool, the fexc
-  servers, the compile cache's index.
+- The 3 GiB reserve is for macOS and the rest of natemu: four code caches of 128 MiB, the shadow pool, each vCPU's
+  link record span (about 96 MiB, frame-keyed plan 8) and the 16 MiB frame-keyed table, the fexc servers, the compile
+  cache's index.
 
 **How it got here.**
 - A first draft took a quarter of the host's memory. The design review blocked it, because it ignored the guest's RAM.

@@ -2672,7 +2672,8 @@ pub(crate) fn answer_cap(host: u64, guest: Option<u64>) -> usize {
 /// experiment, a replay of one boot's trace), so a quarter, 1 GiB there, holds what is found again.
 const ANSWERS_PER_GUEST_RAM: u64 = 4;
 /// What the host's memory keeps beside the guest and the cache: macOS and the rest of natemu (code caches, the shadow
-/// pool, the fexc servers, the compile cache's index).
+/// pool, each vCPU's link record span of about 96 MiB and the 16 MiB frame-keyed table, the fexc servers, the compile
+/// cache's index).
 const ANSWER_RESERVE: u64 = 3 << 30;
 
 /// What an answer's bookkeeping costs beside the bytes [`Entry`] holds (the memory cache counts it, [`Entry::size`]): its
