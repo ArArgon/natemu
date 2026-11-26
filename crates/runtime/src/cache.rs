@@ -33,6 +33,7 @@ use natemu_abi::execution::{
 };
 use natemu_abi::interp::Insn;
 use natemu_abi::pic::{self, count};
+use natemu_abi::fkeys;
 
 /// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
 fn vcpu() -> usize {
@@ -1643,24 +1644,11 @@ pub fn frame_met(b: &Block) {
 /// system record), from that frame at that offset and half, in that context. A key names at most one block (a translation
 /// before its template, [`fkey_enter`]), so every such block this vCPU holds is found while it is entered.
 pub fn template(rip: u64, gpa: u64, context: u64) -> Option<&'static Block> {
-    let h = fkey_hash(gpa, rip, context);
-    let mut i = fkey_home(h);
-    loop {
-        let [tag, number] = unsafe { fkey_slot(i).read() };
-        if number == 0 {
-            return None;
-        }
-        if tag == h as u32 {
-            let b = block(number as usize - 1);
-            if fkey_fits(b, gpa, rip, context) {
-                return Some(b);
-            }
-        }
-        i = (i + 1) & (area::FKEY_ENTRIES - 1);
-    }
+    let n = fkeys::find(fkey_table(), fkeys::hash(gpa, rip, context), |m| fkey_fits(block(m as usize - 1), gpa, rip, context))?;
+    Some(block(n as usize - 1))
 }
-/// Frame-keyed plan step 1a: what the old hint table would have given for the same key (`template` found `found`): whether its
-/// entry still names a block that fits. Counting only ([`Control::fkey_lost`]).
+/// Frame-keyed plan step 1a: what the old hint table would have given for the same key: whether its entry still names a block
+/// that fits. Counting only ([`Control::fkey_lost`]).
 pub fn hinted(rip: u64, gpa: u64, context: u64) -> bool {
     let Some(n) = unsafe { hint(gpa, rip, context).read() }.checked_sub(1) else {
         return false;
@@ -1674,83 +1662,37 @@ fn fkey_fits(b: &Block, gpa: u64, rip: u64, context: u64) -> bool {
         && b.context == context
         && (b.rip ^ rip) & (1 << 63 | 0xfff) == 0
 }
-/// The 64-bit hash of a frame key: its slot is the top bits ([`fkey_home`]), its tag the low 32.
-fn fkey_hash(gpa: u64, rip: u64, context: u64) -> u64 {
-    let key = (gpa & !0xfff | rip & 0xfff) ^ (rip >> 63) << 62 ^ context.rotate_left(29);
-    (key ^ key >> 31).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-fn fkey_home(h: u64) -> usize {
-    (h >> (64 - area::FKEY_ENTRIES.trailing_zeros())) as usize
-}
-/// Slot `i` of the frame-keyed table: {tag, block number + 1}.
-fn fkey_slot(i: usize) -> *mut [u32; 2] {
-    lookup_area::<[u32; 2]>(area::FKEYS).wrapping_add(i)
+/// The frame-keyed table ([`area::FKEYS`]).
+fn fkey_table() -> &'static mut [fkeys::Slot] {
+    // SAFETY: the table is this vCPU's, in its lookup area; only this vCPU's resident reads or writes it.
+    unsafe { core::slice::from_raw_parts_mut(lookup_area::<fkeys::Slot>(area::FKEYS), area::FKEY_ENTRIES) }
 }
 fn fkey_of(b: &Block) -> u64 {
-    fkey_hash(b.source_gpa[0], b.rip, b.context)
+    fkeys::hash(b.source_gpa[0], b.rip, b.context)
 }
 /// Frame-keyed plan step 1a: enters the [`RELOCATABLE`] block `n` (just filed) under its key: in a free slot, or in place of the
 /// key's block when `n` is a shared translation (its template stays valid at its own RIP, found there by L2); a copy of a
 /// template already entered is not entered (the key names one block). Not when the table holds [`area::FKEY_MAX`] entries.
 fn fkey_enter(n: usize) {
     let b = *block(n);
-    let h = fkey_of(&b);
-    let mut i = fkey_home(h);
-    loop {
-        let [tag, number] = unsafe { fkey_slot(i).read() };
-        if number == 0 {
-            let c = control();
-            if c.fkey_entries as usize >= area::FKEY_MAX {
-                c.fkey_full += 1;
-                return;
-            }
-            unsafe { fkey_slot(i).write([h as u32, n as u32 + 1]) };
-            c.fkey_entries += 1;
-            return;
-        }
-        if tag == h as u32 && fkey_fits(block(number as usize - 1), b.source_gpa[0], b.rip, b.context) {
-            if b.flags & TRANSLATION != 0 {
-                unsafe { fkey_slot(i).write([tag, n as u32 + 1]) };
-            }
-            return;
-        }
-        i = (i + 1) & (area::FKEY_ENTRIES - 1);
+    let c = control();
+    let same = |m: u32| fkey_fits(block(m as usize - 1), b.source_gpa[0], b.rip, b.context);
+    match fkeys::enter(fkey_table(), fkey_of(&b), n as u32 + 1, b.flags & TRANSLATION != 0, same, c.fkey_entries as usize, area::FKEY_MAX) {
+        fkeys::Entered::New => c.fkey_entries += 1,
+        fkeys::Entered::Full => c.fkey_full += 1,
+        fkeys::Entered::Replaced | fkeys::Entered::Kept => {}
     }
 }
-/// Frame-keyed plan step 1a: takes block `n` (dying) out of the frame-keyed table if a slot names it (backward-shift deletion, as
-/// [`l2_remove`]); a block whose key names another (a copy, a template a translation replaced) has no slot.
+/// Frame-keyed plan step 1a: takes block `n` (dying) out of the frame-keyed table if a slot names it; a block whose key names
+/// another (a copy, a template a translation replaced) has no slot.
 fn fkey_remove(n: usize) {
     let b = *block(n);
     if b.flags & RELOCATABLE == 0 {
         return;
     }
-    let mask = area::FKEY_ENTRIES - 1;
-    let mut i = fkey_home(fkey_of(&b));
-    loop {
-        let [_, number] = unsafe { fkey_slot(i).read() };
-        if number == 0 {
-            return;
-        }
-        if number as usize == n + 1 {
-            break;
-        }
-        i = (i + 1) & mask;
-    }
-    control().fkey_entries -= 1;
-    let mut j = i;
-    loop {
-        j = (j + 1) & mask;
-        let [tag, number] = unsafe { fkey_slot(j).read() };
-        if number == 0 {
-            unsafe { fkey_slot(i).write([0, 0]) };
-            return;
-        }
-        // The entry at j moves into the hole at i unless its home lies cyclically in (i, j].
-        let home = fkey_home(fkey_of(block(number as usize - 1)));
-        if (j.wrapping_sub(home) & mask) >= (j.wrapping_sub(i) & mask) {
-            unsafe { fkey_slot(i).write([tag, number]) };
-            i = j;
-        }
+    let home = |m: u32| fkeys::home(fkey_of(block(m as usize - 1)), area::FKEY_ENTRIES);
+    if fkeys::remove(fkey_table(), fkey_of(&b), n as u32 + 1, home) {
+        control().fkey_entries -= 1;
     }
 }
 /// The old hint table's entry for (`gpa`'s frame, `rip`'s half and page offset, `context`), kept for [`hinted`].
