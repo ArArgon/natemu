@@ -344,8 +344,9 @@ checkpoint.
   - `desktop-kde-browser-profile` (the desktop Chromium Speedometer, which is the one that counts; base 2.42): run
     20261126-021552-6362.
   - `guest-luajit-interp`, run for this plan: run 20261126-030949-67a2.
-- **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip b645b4f5), on the same three
-  cases.
+- **Change:** `frame-keyed-measure`, which is e86dbab6 plus this branch's commits (tip eded8385, which carries the race
+  fix 2d7ec278), on the same three cases: `guest-luajit-interp` in run 20261126-032144-aa00, the two desktop cases in run
+  20261126-032146-6203.
 - **What is read:**
   - `desktop-kde-profile`: the warm and cold Konsole and Dolphin starts (`app-*-1:start`, `app-*-2:start`), their buckets,
     and the k1 counters `fkeys.lost`, `fkeys.full`, `fkeys.suspended_guardable`, the `tl1_*` scans, and `relink.suspended`.
