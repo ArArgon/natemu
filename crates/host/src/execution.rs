@@ -3356,13 +3356,36 @@ impl Compiler {
                 return Err(format!("an answer for 32-bit code at {rip:#x} was compiled at {from:#x}").into());
             }
             let disk_hit = self.disk_hits > disk_hits;
-            let t = self.stamp();
+            let mut t = self.stamp();
             let (whole, end) = (
                 reply.extent as usize >= bytes.len(),
                 bytes.len().min(reply.extent as usize),
             );
             let (read, prefix) = (self.keyed_read(reply.read)?, bytes[..end].to_vec());
             let at = at[usize::from(read >> GATING != 0)];
+            let (mut answer, mut from) = (Answer::new(reply, from)?, from);
+            // A disk answer compiled at another RIP (an earlier run's: another load address) is kept as fexc's answer at this
+            // RIP, relocated once here (relocation's contract: it is fexc's answer there). Its first use is then an admission
+            // at its own RIP, which keeps the admitted form (option (d)), so its later hits skip relocation and admission as a
+            // fresh compile's do; kept at the RIP it was compiled at, every hit was relocated and admitted again.
+            if disk_hit && from != rip {
+                self.charge(crate::perf::KEEP, t);
+                let r = self.stamp();
+                let moved = answer.at(from, rip);
+                self.charge(crate::perf::RELOCATE, r);
+                t = self.stamp();
+                let Some(moved) = moved else {
+                    // Not fexc's answer here: compiled instead, as `reuse` would.
+                    self.relocation_refused += 1;
+                    disk = false;
+                    continue;
+                };
+                if self.check_reuse {
+                    self.check(&moved, (read, whole, end), bytes, rip, limit, from, hook)?;
+                }
+                self.relocated += 1;
+                (answer, from) = (moved, rip);
+            }
             let entry = Arc::new(Entry {
                 rip: from,
                 tag: at ^ rip,
@@ -3371,7 +3394,7 @@ impl Compiler {
                 gating,
                 prefix,
                 whole,
-                answer: Answer::new(reply, from)?,
+                answer,
                 kept: Default::default(),
                 published: AtomicU64::new(0),
             });
@@ -3410,7 +3433,8 @@ impl Compiler {
                     }
                     return Ok(code);
                 }
-                None => disk = false, // a disk answer for another RIP that is not fexc's here
+                // (An answer for another RIP that is not fexc's here; a disk answer is at `rip` by now, moved above.)
+                None => disk = false,
             }
         }
     }
@@ -3941,8 +3965,12 @@ impl Compiler {
         }
         let t = self.stamp();
         if let Some(disk) = &cache {
+            // Under the key the lookup made, if it made one (the writer then hashes nothing).
             disk.put(
-                self.disk_body(bytes, rip, limit),
+                key.map_or_else(
+                    || crate::compile_cache::Stored::Body(self.disk_body(bytes, rip, limit)),
+                    crate::compile_cache::Stored::Key,
+                ),
                 [&rip.to_le_bytes()[..], &reply.payload()].concat(),
             );
         }
@@ -7031,6 +7059,17 @@ mod tests {
             (moved.compiles, moved.disk_hits, moved.relocated),
             (0, 1, 1)
         );
+        // Moved once, when read: kept at 0x9000, the answer's second use there is a memory hit that reuses the form its first
+        // use's admission kept (no relocation, no admission).
+        assert!(
+            matches!(moved.compile(&code, 0x9000, false, &mut ()), Ok(Code::Block(b)) if b.object[24..32] == 0x9000u64.to_le_bytes())
+        );
+        let n = |w: usize| moved.admissions[w].get();
+        assert_eq!(
+            (moved.compiles, moved.disk_hits, moved.relocated, moved.hits),
+            (0, 1, 1, 1)
+        );
+        assert_eq!((n(why::DISK), n(why::SKIPPED), n(why::NO_KEPT)), (1, 1, 0));
         // M2 reuse: 32-bit code's answers too, under their own key (the request's `--bitness 32`, null segments and guess):
         // stored, then served at another EIP, relocated; never to a 64-bit request for the same bytes, nor under a null DS.
         let call = [0x40, 0xe8, 0x00, 0x00, 0x00, 0x00]; // inc eax; call $+5 (64-bit code: a REX call)
@@ -7069,7 +7108,7 @@ mod tests {
         let at = word(&reply.object, 40) + word(&reply.object, 48);
         reply.object[at..at + 4].copy_from_slice(&0xd61f_0380u32.to_le_bytes()); // br x28
         let forged = open("forged").unwrap();
-        forged.put(body.clone(), [&stored[..8], &reply.payload()[..]].concat());
+        forged.put(crate::compile_cache::Stored::Body(body.clone()), [&stored[..8], &reply.payload()[..]].concat());
         drop(forged);
         let mut c = new(open("forged"));
         let e = block(&mut c).unwrap_err();

@@ -188,8 +188,14 @@ struct Writer {
     bytes: u64,
     written: u32,
 }
-/// A new entry: request body, payload.
-type Entry = (Vec<u8>, Vec<u8>);
+/// A new entry: what it is stored under, payload.
+type Entry = (Stored, Vec<u8>);
+/// What a new entry is stored under: the key the lookup that missed computed ([`DiskCache::key`]), or the request body when no
+/// lookup was made (a cold cache: the writer thread hashes it).
+pub(crate) enum Stored {
+    Key([u8; 32]),
+    Body(Vec<u8>),
+}
 
 pub struct DiskCache {
     identity: [u8; 32],
@@ -304,7 +310,8 @@ impl DiskCache {
             .spawn(move || {
                 loop {
                     match rx.recv_timeout(PACK_AGE) {
-                        Ok((body, payload)) => w.put(key(&w.identity, &body), &payload),
+                        Ok((Stored::Key(k), payload)) => w.put(k, &payload),
+                        Ok((Stored::Body(body), payload)) => w.put(key(&w.identity, &body), &payload),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return w.write(),
                     }
@@ -345,15 +352,15 @@ impl DiskCache {
         (sha256(&[key, &payload]) == slot.sum).then_some(payload)
     }
 
-    /// Stores `payload` for request `body` (once per process), on the writer thread.
-    pub(crate) fn put(&self, body: Vec<u8>, payload: Vec<u8>) {
+    /// Stores `payload` for a request (once per process), on the writer thread.
+    pub(crate) fn put(&self, at: Stored, payload: Vec<u8>) {
         if let Some(tx) = self
             .writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            let _ = tx.send((body, payload));
+            let _ = tx.send((at, payload));
         }
     }
 }
@@ -614,13 +621,13 @@ mod tests {
         {
             let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
             assert!(c.is_empty());
-            c.put(b"request 1".to_vec(), b"answer 1".to_vec());
-            c.put(b"request 1".to_vec(), b"answer 1 again".to_vec()); // a second vCPU's copy: not stored
+            c.put(Stored::Body(b"request 1".to_vec()), b"answer 1".to_vec());
+            c.put(Stored::Body(b"request 1".to_vec()), b"answer 1 again".to_vec()); // a second vCPU's copy: not stored
             assert_eq!(c.get(&c.key(b"request 1")), None); // pending until written
         }
         {
             let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
-            c.put(b"request 2".to_vec(), b"answer 2".to_vec());
+            c.put(Stored::Key(c.key(b"request 2")), b"answer 2".to_vec()); // under the key a lookup made
         }
         assert_eq!(packs(), 2);
         let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
@@ -673,7 +680,7 @@ mod tests {
         {
             let c = DiskCache::open(&store, &fexc, cap).unwrap();
             for i in 0..4u8 {
-                c.put(vec![i], vec![i; PACK_BYTES]);
+                c.put(Stored::Body(vec![i]), vec![i; PACK_BYTES]);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -690,7 +697,7 @@ mod tests {
     fn fill(store: &Path, fexc: &Path, n: u8) {
         let c = DiskCache::open(store, fexc, 1 << 30).unwrap();
         for i in 0..n {
-            c.put(vec![i], vec![i; 1000]);
+            c.put(Stored::Body(vec![i]), vec![i; 1000]);
         }
         drop(c);
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -717,7 +724,7 @@ mod tests {
         {
             let c = DiskCache::open(&store, &fexc, cap).unwrap();
             assert!(c.bytes <= cap / 4 * 3, "{} of {cap}", c.bytes);
-            c.put(b"new request".to_vec(), vec![9; 1000]);
+            c.put(Stored::Body(b"new request".to_vec()), vec![9; 1000]);
         }
         let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
         assert_eq!(c.get(&c.key(b"new request")), Some(vec![9; 1000]));
