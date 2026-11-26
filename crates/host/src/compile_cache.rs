@@ -34,8 +34,8 @@
 //! chance of 2^-96.
 //!
 //! Configuration: [`Config`], by [`Config::new`] from the entries' `--compile-cache DIR|off` (default
-//! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap; default [`default_cap`], a tenth of the cache
-//! volume's free space within 1 to 16 GiB), whose fallbacks are the environment's `NATEMU_COMPILE_CACHE` and
+//! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap; default [`default_cap`], the guest's RAM, at most
+//! a tenth of the cache volume's free space, at least 1 GiB), whose fallbacks are the environment's `NATEMU_COMPILE_CACHE` and
 //! `NATEMU_COMPILE_CACHE_MB`. Only the boot entry opens it ([`shared`]: `natemu`, `natemu-host boot-linux`); the test
 //! drivers never do. Why these numbers: `docs/restructure/disk-cache-cap-plan.md`.
 
@@ -624,8 +624,8 @@ pub struct Config {
 impl Config {
     pub const OFF: Self = Self { dir: None, cap: 0 };
     /// The configuration callers opt into: `dir` a directory or `off` (default `~/Library/Caches/natemu/fexc`), `mb` the
-    /// cap in MiB (default [`default_cap`] of the free space of the volume `dir` is on).
-    pub fn new(dir: Option<&std::ffi::OsStr>, mb: Option<u64>) -> Result<Self, String> {
+    /// cap in MiB (default [`default_cap`] of the free space of the volume `dir` is on and the guest's `guest_ram` bytes).
+    pub fn new(dir: Option<&std::ffi::OsStr>, mb: Option<u64>, guest_ram: u64) -> Result<Self, String> {
         let dir = match dir {
             Some(v) if v == "off" => None,
             Some(v) => Some(PathBuf::from(v)),
@@ -636,22 +636,26 @@ impl Config {
             (Some(mb), _) => mb
                 .checked_mul(1 << 20)
                 .ok_or_else(|| format!("compile cache cap {mb} MiB: too large"))?,
-            (None, Some(dir)) => default_cap(free_bytes(dir)),
+            (None, Some(dir)) => default_cap(free_bytes(dir), guest_ram),
             (None, None) => 0,
         };
         Ok(Self { dir, cap })
     }
 }
 
-/// The default cap's bounds: the ceiling holds a desktop's sessions and apps, the floor at least one KDE session across
-/// opens (3/4 of it, 768 MiB, is kept at each). The measurements: `docs/restructure/disk-cache-cap-plan.md`.
+/// The default cap per byte of the guest's RAM. Provisional: the index a process builds at open grows with the cache (about
+/// 33 bytes an entry of about 750), so the cache is sized with the VM; an 8 GiB guest's 8 GiB cap is the size at which a
+/// KDE desktop's second session hit 98-99% (docs/restructure/disk-cache-cap-plan.md). The final factor comes from
+/// measurement (warm sessions' hit rate against the cap).
+pub const CAP_PER_GUEST_RAM: u64 = 1;
+/// The default cap's floor: one KDE session across opens (3/4 of it, 768 MiB, is kept at each).
 pub const CAP_FLOOR: u64 = 1 << 30;
-pub const CAP_CEILING: u64 = 16 << 30;
-/// The default cap for a cache volume with `free` bytes free (`None`: unknown): a tenth of it within [`CAP_FLOOR`] and
-/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 160 GiB free).
-pub fn default_cap(free: Option<u64>) -> u64 {
+/// The default cap for a guest of `guest_ram` bytes on a cache volume with `free` bytes free (`None`: unknown):
+/// [`CAP_PER_GUEST_RAM`] times its RAM, at most a tenth of the free space, at least [`CAP_FLOOR`], rounded down to 256 MiB.
+pub fn default_cap(free: Option<u64>, guest_ram: u64) -> u64 {
     let step = 256 << 20;
-    free.map_or(CAP_CEILING, |f| (f / 10).clamp(CAP_FLOOR, CAP_CEILING)) / step * step
+    let want = guest_ram.saturating_mul(CAP_PER_GUEST_RAM);
+    free.map_or(want, |f| want.min(f / 10)).max(CAP_FLOOR) / step * step
 }
 
 /// The bytes free to an unprivileged writer on the volume `dir` is on (or would be on: its nearest existing ancestor's).
@@ -994,42 +998,47 @@ mod tests {
     #[test]
     fn default_cap_bounds() {
         const G: u64 = 1 << 30;
-        assert_eq!(default_cap(None), 16 * G);
-        assert_eq!(default_cap(Some(0)), G);
-        assert_eq!(default_cap(Some(5 * G)), G); // the floor
-        assert_eq!(default_cap(Some(20 * G)), 2 * G);
-        assert_eq!(default_cap(Some(13 * G)), 5 * G / 4); // 1.3 GiB, down to a step
-        assert_eq!(default_cap(Some(40 * G)), 4 * G);
-        assert_eq!(default_cap(Some(160 * G)), 16 * G);
-        assert_eq!(default_cap(Some(2000 * G)), 16 * G); // the ceiling
-        assert_eq!(default_cap(Some(u64::MAX)), 16 * G);
+        // The Mac mini M4's desktop guest (8 GiB) with room on disk, and with too little.
+        assert_eq!(default_cap(Some(200 * G), 8 * G), 8 * G);
+        assert_eq!(default_cap(Some(41 * G), 8 * G), 4 * G); // 4.1 GiB, down to a step
+        // The M3's usual guest (4 GiB), with its 16 GiB free and with room.
+        assert_eq!(default_cap(Some(16 * G), 4 * G), 3 * G / 2); // 1.6 GiB, down to a step
+        assert_eq!(default_cap(Some(200 * G), 4 * G), 4 * G);
+        // The floor: a small guest, a full disk.
+        assert_eq!(default_cap(Some(200 * G), G / 2), G);
+        assert_eq!(default_cap(Some(0), 8 * G), G);
+        assert_eq!(default_cap(Some(5 * G), 8 * G), G);
+        // Unknown free space: the guest's RAM; a guest's RAM not a step's multiple: down to one.
+        assert_eq!(default_cap(None, 8 * G), 8 * G);
+        assert_eq!(default_cap(Some(u64::MAX), 3 * G + 100), 3 * G);
     }
 
-    /// `--compile-cache-mb` wins over the default; without it the cap is the default of the cache volume's free space, also
-    /// for a folder not made yet; `off` has no cap.
+    /// `--compile-cache-mb` wins over the default; without it the cap is the default of the cache volume's free space and
+    /// the guest's RAM, also for a folder not made yet; `off` has no cap.
     #[test]
     fn config_cap() {
         let (dir, _, store) = scratch("config");
         let os = |p: &Path| p.as_os_str().to_owned();
-        let c = Config::new(Some(&os(&store)), Some(64)).unwrap();
+        const RAM: u64 = 4 << 30;
+        let c = Config::new(Some(&os(&store)), Some(64), RAM).unwrap();
         assert_eq!((c.dir.as_deref(), c.cap), (Some(store.as_path()), 64 << 20));
         let free = || free_bytes(&store.join("not/made")).unwrap();
         let before = free();
         assert!(before > 0 && before < 1 << 50, "{before}");
-        let c = Config::new(Some(&os(&store)), None).unwrap();
-        assert!(c.cap >= CAP_FLOOR && c.cap <= CAP_CEILING, "{}", c.cap);
+        let c = Config::new(Some(&os(&store)), None, RAM).unwrap();
+        assert!(c.cap >= CAP_FLOOR && c.cap <= RAM, "{}", c.cap);
         // Other tests write meanwhile: the free space may cross a step's edge between the calls.
         let after = free();
         assert!(
-            [before, after].map(|f| default_cap(Some(f))).contains(&c.cap),
+            [before, after].map(|f| default_cap(Some(f), RAM)).contains(&c.cap),
             "{} for {before} to {after} free",
             c.cap
         );
         // A relative folder not made yet: its volume is the working directory's.
         assert!(free_bytes(Path::new("not/made/yet")).is_some());
-        let off = Config::new(Some(std::ffi::OsStr::new("off")), None).unwrap();
+        let off = Config::new(Some(std::ffi::OsStr::new("off")), None, RAM).unwrap();
         assert_eq!((off.dir, off.cap), (None, 0));
-        assert!(Config::new(None, Some(u64::MAX)).is_err());
+        assert!(Config::new(None, Some(u64::MAX), RAM).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

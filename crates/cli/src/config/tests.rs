@@ -126,6 +126,7 @@ fn legacy(cli: &Cli) -> Fields {
     boot.compile_cache = natemu::compile_cache::Config::new(
         cli.compile_cache.as_deref().map(|p| p.as_os_str()),
         cli.compile_cache_mb,
+        cli.ram.unwrap_or(boot.ram),
     )
     .unwrap();
     boot.speculation_barriers = cli.speculation_barriers;

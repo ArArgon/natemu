@@ -22,30 +22,47 @@ so the cache holds only code that comes from files.
 
 ## Design
 
-**Default cap.** Without `--compile-cache-mb` or `engine.compile_cache_mb`, the cap is a tenth of the free space on the
-cache folder's volume, at least 1 GiB and at most 16 GiB, rounded down to 256 MiB steps (`default_cap`). If statfs
-fails, the cap is 16 GiB.
-- *Floor, 1 GiB.* Each open keeps 3/4 of the cap, 768 MiB here, which holds a KDE session's 592 MiB with 176 MiB to
-  spare for its apps: the floor keeps the session, not a desktop's apps.
-- *Ceiling, 16 GiB.* The reviewed design had 4 GiB. The owner raised it because disk is plentiful (November 26,
-  2026: "memory is not tight", and disk neither).
-  - At 4 GiB, each open keeps 3 GiB, five times a session, which leaves room for its apps and a browser, and each run
-    has 1 GiB to write into, more than a cold session's 592 MiB.
-  - At 16 GiB, each open keeps 12 GiB and each run has 4 GiB to write into, so a machine's sessions, browsers and
-    other guests rarely evict each other.
-  - The cache reaches the ceiling only as it fills. What a full cache costs grows with it: the index built at open,
-    about 33 bytes an entry, is about 0.75 GiB of host memory at 16 GiB (about 23 M entries, at the 750 bytes an
-    entry measured locally). Its build would take about 0.75 s, extrapolated from the experiment below, and the cache
-    holds about 5,000 packs, one descriptor each within the budget below.
-  - The Mac mini measurement reads `disk_open` and the pack count, to check this before the cache is ever full.
-  - A browser's own working set has not been measured yet (see the measurement below).
-- *A tenth of the free space.* This keeps a Mac with a small or nearly full disk from losing a large cap to the cache.
-  Any volume with 160 GiB free gets the ceiling. Below that, the 256 MiB steps
-  make it unlikely that two calls made moments apart disagree; it is not impossible. A process computes the cap once.
-- The free space does not count what the cache itself already holds. So on a volume with less than 160 GiB free, the
-  cap is a little smaller than a tenth of "free plus cache". On a nearly full disk the floor still gives 1 GiB; the
-  writer survives the full disk that follows (the entries are lost, not the run).
+**Default cap.** Without `--compile-cache-mb` or `engine.compile_cache_mb`, the cap is the guest's RAM
+(`CAP_PER_GUEST_RAM` = 1), at most a tenth of the free space on the cache folder's volume, at least 1 GiB, rounded down
+to 256 MiB steps (`default_cap`). If statfs fails, the cap is the guest's RAM.
+
+| Machine | Guest RAM | Free disk | Cap |
+| --- | --- | --- | --- |
+| Mac mini M4 | 8 GiB (the desktop cases) | 41 GiB or more | 4 GiB at 41 GiB, 8 GiB from 80 GiB |
+| M3 | 4 GiB (its usual guest) | 16 GiB | 1.5 GiB (a tenth of the free space) |
+| M3 | 4 GiB | 40 GiB or more | 4 GiB |
+| any | 512 MiB | any | 1 GiB (the floor) |
+
+**This size is provisional.** The final factor gets set later from measurement: warm-session runs, comparing hit rate
+against cap. Changing it is one constant.
+
+**Why the guest's RAM.** The bytes live on disk, which is plentiful, but every process builds the cache's index in
+memory at open: about 33 bytes for each entry of about 750 bytes, about 4.4% of the cache. Sizing the cache with the
+guest keeps that index a fixed share of the VM, about 0.35 GiB for an 8 GiB guest's 8 GiB cache.
+- 1× rather than 2×: the only measurement is that an 8 GiB cap (1× the desktop's 8 GiB guest) made a KDE desktop's
+  second session hit 98–99%. Each open keeps 3/4 of the cap (6 GiB there), about ten times a session's 592 MiB, and
+  each run has 2 GiB to write into.
+- The owner judged 2× too much.
+
+**The floor, 1 GiB.** Each open keeps 3/4 of the cap, 768 MiB here, which holds a KDE session's 592 MiB with 176 MiB
+to spare. The floor keeps the session, not a desktop's apps.
+
+**A tenth of the free space.** This keeps a Mac with a small or nearly full disk from losing a large cap to the cache.
+- Steps of 256 MiB make it unlikely that two calls made moments apart disagree; it is not impossible. A process
+  computes the cap once.
+- The free space does not count what the cache itself already holds. So where the tenth binds, the cap is a little
+  smaller than a tenth of "free plus cache".
+- On a nearly full disk the floor still gives 1 GiB; the writer survives the full disk that follows (the entries are
+  lost, not the run).
 - A relative cache folder that does not exist yet is measured on the working directory's volume.
+
+**One folder, several guests.** The folder is shared by every VM, and each process evicts down to its own cap at open.
+A small guest's boot therefore trims a large guest's cache to the small guest's size. A guest that needs more sets
+`--compile-cache-mb` or a folder of its own.
+
+**How it got here.**
+- The reviewed design took a tenth of the free space within 1 to 4 GiB. That ceiling was raised to 16 GiB.
+- The owner then asked for a size proportional to the VM, because the index costs memory: about 0.75 GiB at 16 GiB.
 
 The knobs are unchanged: `--compile-cache-mb N`, `engine.compile_cache_mb` and `NATEMU_COMPILE_CACHE_MB` set the cap
 exactly. The startup line `natemu: code cache: pool on, disk N MiB at DIR` shows the cap that was computed.
@@ -96,7 +113,7 @@ payload, and compares the first 12 bytes with the stored sum.
   rates. Both reviewers agreed.
 
 **Descriptors.** Each pack a process reads holds one open descriptor for the whole run. At 4 GiB that is up to about
-1,300 descriptors, and at the 16 GiB ceiling about 5,000 (packs average 3.2 MiB locally, because a pack is written every 2 s as well as at 4 MiB); at the old
+1,300 descriptors, and at an 8 GiB guest's 8 GiB about 2,600 (packs average 3.2 MiB locally, because a pack is written every 2 s as well as at 4 MiB); at the old
 default it was about 120. natemu does not raise its own limit, and macOS's default soft limit is 256.
 - Before this change, a pack of this build that failed `File::open` was deleted as damaged, so running out of
   descriptors deleted good packs. Without a bound, a large cache would also take every descriptor the rest of the boot
@@ -152,23 +169,20 @@ The unit tests are in `compile_cache.rs`: `default_cap_bounds`, `config_cap`, `h
 against a mutant of the code it checks. The framework selection is `tools/natemu-test run tests/unit` (suite `rust`), and
 `tools/natemu-test run` for the affected tier.
 
-## Measurement for the Mac mini M4 (to schedule)
+## Measurement
 
-Run it on the KDE desktop, as the measurements above were, with the default cap (no `--compile-cache-mb`) and a fresh
-cache folder:
-1. Session 1: KDE, then first starts of Konsole and Firefox. Record the startup line's cap, and the cache's bytes and
-   pack count at the end.
-2. Session 2: the same. Record disk hits against fexc compiles for each first app start, the start times against the
-   8 GiB runs, and the time from the perf log's `disk_open` mark (the open's index build) with the host's peak RSS.
-   Also record the pack count against the process's descriptor limit, and `disk_open` once with a cold page cache
-   (after a reboot): a full cache reads about a tenth of its bytes as index.
-3. Eviction, which at the default cap three sessions do not reach (they stay under the 3 GiB kept): with
-   `--compile-cache-mb 1024` (the floor) on every session, session 1 as above, then a session 2' that starts other
-   apps, then session 3 as session 1. Konsole and Firefox should still hit in session 3; run the same with main's
-   build at the same cap for the comparison (oldest written first).
+There is no separate measurement for this change; the owner keeps serious measurements to checkpoints. It goes into a
+pooled checkpoint run with P1 step 1 and fault-around, and the counters are read from that run:
+- `disk_open` (the open's index build) and the pack count against the process's descriptor limit;
+- disk hits against fexc compiles for the warm sessions' first app starts;
+- `dropped_disk_hits` (the in-memory map's drops that came back from disk).
 
-The framework's `speedometer-natemu-warm` case records the compile cache's bytes after its fill boot. That gives
-Firefox's own working set (it sets an 8 GiB cap of its own, so this change does not move it).
+Warm-session runs that compare the hit rate against the cap will set the final factor (`CAP_PER_GUEST_RAM`). Eviction
+by last use is checked at an explicit small cap, `--compile-cache-mb 1024`:
+- session 1;
+- a session that starts other apps;
+- session 1's apps again, which should still hit;
+- the same three sessions with main's build at the same cap, for the comparison.
 
 ## Review
 
@@ -188,3 +202,6 @@ Two independent reviews of the design (Fable) and the code (Opus) found one bloc
 - **Known, unchanged:** two calls of `Config::new` in the CLI's `old_command_lines_build_the_same_boot` test can in
   principle get caps a step apart, on a volume with 10 to 40 GiB free whose free space crosses a 2.56 GiB edge
   between them.
+
+The default cap was then redone at the owner's request, as the guest's RAM, provisional (above). That change was
+reviewed briefly as well (Opus).

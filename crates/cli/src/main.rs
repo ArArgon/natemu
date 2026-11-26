@@ -185,7 +185,7 @@ struct Cli {
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
-    /// The compile cache's cap in MiB [default: a tenth of its volume's free space, 1 to 16 GiB]
+    /// The compile cache's cap in MiB [default: the guest's RAM, at most a tenth of its volume's free space, at least 1 GiB]
     #[arg(long, value_name = "N", env = "NATEMU_COMPILE_CACHE_MB")]
     compile_cache_mb: Option<u64>,
     /// Write the timing log (natemu::perf) to FILE

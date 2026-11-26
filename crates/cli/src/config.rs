@@ -1190,6 +1190,7 @@ pub fn to_boot(
     boot.compile_cache = natemu::compile_cache::Config::new(
         cfg.compile_cache.as_deref().map(|p| p.as_os_str()),
         cfg.compile_cache_mb,
+        cfg.ram.unwrap_or(boot.ram),
     )?;
     boot.speculation_barriers = cfg.speculation_barriers;
     boot.accurate_fp = cfg.fp;

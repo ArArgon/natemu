@@ -23,35 +23,41 @@ copies moved to other page offsets.
 
 ## Design
 
-**The cap takes the guest's RAM into account.** It is half of what the host's memory leaves after the guest's RAM and
-3 GiB (`answer_cap`), between the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 8 GiB.
-The reviewed design had a 4 GiB ceiling; the owner raised it to 8 GiB because memory is not tight (November 26, 2026).
-The guest-aware part is unchanged, so a 16 GB host running an 8 GiB guest still gets 2.5 GiB.
+**The cap is proportional to the guest's RAM.** For a boot it is a quarter of the guest's RAM, at most what the host's
+memory leaves after the guest's RAM and a 3 GiB reserve, at least 256 MiB (`answer_cap`). There is no other ceiling.
 
 | Host | Guest RAM | Cap |
 | --- | --- | --- |
-| 16 GB | 8 GiB (the desktop cases' `--ram 8`) | 2.5 GiB |
-| 16 GB | 4 GiB | 4.5 GiB |
-| 32 GB | 8 GiB | 8 GiB (the ceiling) |
-| 16 GB | 12 GiB | 1 GiB (the old bound) |
-| 8 GB | 2 GiB | 1.5 GiB |
-| 8 GB | 4 GiB | 512 MiB (the old bound) |
+| Mac mini M4, 16 GB | 8 GiB (the desktop cases' `--ram 8`) | 2 GiB (a quarter) |
+| Mac mini M4, 16 GB | 4 GiB | 1 GiB |
+| M3, 8 GB | 4 GiB (its usual guest) | 1 GiB (a quarter; also all the host leaves) |
+| M3, 8 GB | 2 GiB | 512 MiB |
+| 8 GB | 5 GiB | 256 MiB (the floor: the host leaves nothing) |
+| 16 GB | 12 GiB | 1 GiB (what the host leaves) |
 
+**Why a quarter.** Speedometer 3.1 in a 4 GiB guest needed about 1.9 GB of answers in a map that never sweeps. Only
+about a third of those are ever found again. The sweeping map kept about 0.87 GB under its 1 GiB cap, recompiling
+about 2.6% of its hits: an experiment, a replay of one boot's trace. A quarter of a 4 GiB guest is that 1 GiB.
+- The KDE desktop with Chromium in an 8 GiB guest compiled 1.37 M answers again at 1 GiB. A quarter of its RAM doubles
+  that cap to 2 GiB.
+- A map sized with the guest's RAM stays a fixed share of what the VM was given, about a quarter beside it.
+- The answers kept are a function of the guest's code, not of its RAM. The guest's RAM is the size the owner chose for
+  the workload, and a larger workload usually gets a larger guest.
+
+**Details.**
 - The boot passes its guest's RAM to the first vCPU's compiler, which makes the run's map with that cap
-  (`Compiler::share_for`).
-- A compiler outside a boot (tests, the program driver) keeps the old bound.
+  (`Compiler::share_for`). A compiler outside a boot (tests, the program driver) keeps the old bound: 1 GiB, or a
+  sixteenth of the host's memory.
 - `NATEMU_ANSWER_CACHE_MB` still sets the cap exactly. The cap is now on the performance log's `answers` line
   (`cap_bytes`).
 - The 3 GiB reserve is for macOS and the rest of natemu: four code caches of 128 MiB, the shadow pool, the fexc
   servers, the compile cache's index.
-- A first draft took a quarter of the host's memory, at most 4 GiB. The design review blocked it: on the 16 GB Mac mini
-  with an 8 GiB guest, it would give 8 + 4 + about 1 + about 3 GiB, the whole machine with no slack once the guest's
-  page cache has touched its RAM.
 
-**What this does and does not hold.** At 2.5 GiB, about 1.8 M answers are kept after a sweep, at about 1.45 KB each
-(1.2 KB counted on Speedometer, plus the bookkeeping now counted). That is most of the measured boot, not all of it.
-The keep-the-found policy (below) decides what goes, and the measurement decides whether a larger share of the host
-pays.
+**How it got here.**
+- A first draft took a quarter of the host's memory. The design review blocked it, because it ignored the guest's RAM.
+- The reviewed version took half of what the host leaves, within 1 to 4 GiB. That ceiling was raised to 8 GiB.
+- The owner then asked for a cap proportional to the VM: 4 GiB of map for an 8 GiB guest is half of what the VM was
+  given.
 
 **Counting the bookkeeping.** An answer used to count only its `Entry`, its prefix, its object, its kept form and room
 for the most link points. The bookkeeping around it is now counted too, so the cap bounds resident memory rather than
@@ -78,8 +84,7 @@ dereferences an answer while it holds the shard's lock.
 - An experiment by the reviewer on the M2 Max, at 210 k answers in a shard with resident answers, measured about 16 ms
   a sweep: the rank pass 6 ms (3 ms without the answer reads), the sort 4 ms, the retain 6 ms. At 55 k it measured
   about 4 ms.
-- At the 8 GiB ceiling (a 32 GB host), a shard holds about 370 k answers: by the same experiment, about 30 ms a
-  sweep, as rarely again.
+- At 2 GiB (the 8 GiB desktop guest), a shard holds about 90 k answers: by the same experiment, about 7 ms a sweep.
 - Each sweep's time is now on the performance log's `answers` line, as `sweeps`: [sweeps, answers dropped, ns in all,
   longest ns]. If the stalls show in a desktop's frame gaps, the next step is more shards (64 restores today's shard
   size).
@@ -87,11 +92,9 @@ dereferences an answer while it holds the shard's lock.
 **The dropped answers' fingerprints** are now hashed before their lock is taken, the lock every vCPU's fresh compile
 takes (`Answers::recompiled`).
 
-**The answer bound (`CAP_ANSWERS`) doubles to 2^23,** about 8.4 M answers, of which a sweep keeps about 6.3 M. With
-the bookkeeping counted, every answer counts at least about 500 bytes. At the 8 GiB ceiling, answers of a typical
-1.45 KB meet the byte bound first, at about 5.9 M answers; at 2^22 the count would have bound first and kept only
-3.1 M. The count bound still limits a flood of small answers, below about 1 KB each. A `NATEMU_ANSWER_CACHE_MB` above
-about 12 GiB meets it first.
+**The answer bound (`CAP_ANSWERS`) is 2^23,** about 8.4 M answers, of which a sweep keeps about 6.3 M. With the
+bookkeeping counted, every answer counts at least about 500 bytes. Below a cap of about 12 GiB (a 48 GiB guest), answers
+of a typical 1.45 KB meet the byte bound first. The count bound limits a flood of small answers.
 
 **The keep-the-found policy is unchanged.** An answer's rank is the shard's insert count when it was kept or last found,
 plus half the shard's answer count if it has been found since it was kept. So an answer found again outlives the many
@@ -126,25 +129,18 @@ The unit tests are in `execution.rs`:
 
 Each new check was shown to fail against a mutant of the code it checks.
 
-## Measurement for the Mac mini M4 (to schedule)
+## Measurement
 
-`desktop-kde-browser-profile` is on the `desktop-profile` and `desktop-counting` branches, not on main or this branch.
-Run it on this branch rebased onto the case, and on that base, with the case's configuration (4 vCPUs, 8 GiB guest):
-- the warm Chromium start's time;
-- the boot's fexc compiles and `recompiled` admissions (the performance log's `state.admissions`), and the `answers`
-  line: `kept_answers`, `cap_bytes` and `sweeps`. `kept_bytes` now counts the bookkeeping, so compare answers, not
-  bytes, across the two sides;
-- host time against busy vCPU time;
-- the frame gaps (maximum and tail), as the evidence for sweep stalls;
-- memory pressure. The process's `phys_footprint`, and the system's compressions, swap-outs and swap use over the run,
-  not its peak resident memory, which compressed pages leave. Any swap-out rejects the cap.
-
-Run it both ways:
-- **cache off** (the case as it is): the recompile count (`recompiled`) and host time;
-- **cache on at the new default cap** (the `-warm` variant, or the case with the compile cache on): the disk hits that
-  map drops caused (`dropped_disk_hits`), and the recompiles left, which are kernel answers (they are never on disk). Optionally run two caps of this branch on the 16/8
-configuration, 2.5 GiB (the default) and 4.5 GiB (`NATEMU_ANSWER_CACHE_MB=4608`), labelled as an experiment, to settle
-whether a larger share of the host pays.
+There is no separate measurement for this change; the owner keeps serious measurements to checkpoints. It goes into a
+pooled checkpoint run with P1 step 1 and fault-around, and the counters are read from that run:
+- with the compile cache off (as `desktop-kde-browser-profile` runs), the fexc compiles and `recompiled` admissions
+  (the performance log's `state.admissions`) and host time against busy vCPU time;
+- with the compile cache on at its default cap, `dropped_disk_hits` (the disk hits that map drops caused) and the
+  recompiles left, which are kernel answers (never on disk);
+- the `answers` line's `kept_answers`, `cap_bytes` and `sweeps`. `kept_bytes` now counts the bookkeeping, so compare
+  answers, not bytes, with an earlier run;
+- the frame gaps, for sweep stalls, and memory pressure (the process's `phys_footprint`; the system's compressions,
+  swap-outs and swap use).
 
 ## Review
 
@@ -175,3 +171,6 @@ The code was reviewed independently (Opus) and nothing was blocking. Adopted fro
 
 Not adopted: a test of a short-prefix answer swept from the lens map (the code is right; a coverage gap noted here),
 and building `Compiler::answers` lazily (one map thrown away per boot).
+
+The sizing was then redone at the owner's request, proportional to the guest's RAM (above). That change was reviewed
+briefly as well (Opus).
