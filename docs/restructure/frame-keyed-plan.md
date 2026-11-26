@@ -660,3 +660,23 @@ L1 probe on every cross-page transfer (about 9 ns against a direct branch), and 
 switch. Step 2's guards turn hot cross-page links back into direct branches into a guard stub: 8 instructions and one load,
 with no switch cost. They are measured against step 1c at the pooled checkpoint 2, not against the plain form.
 
+**Review of step 1c (Fable, independent, November 26).** No blocking finding: the checked form is sound for every pair it
+now covers (kernel and global targets, 32-bit code, split blocks' cold exits, precise stops, REP and `STI_FIRST`
+self-links). Adopted:
+
+- **S1.** The PIC counters (`CHECKED_LINKS`, the absolute-into-shared class) count what they counted before 1c, so the
+  PIC tests' floors can still fail. A link checked only because it crosses pages is counted on its own
+  (`links_checked_cross`, in the k1 stats' `fkeys` block).
+- **S2.** The default-form `relink-many` run also checks its registers (every site reached the right V after each CR3
+  load) and that at least one checked cross-page link per site was made, so it cannot pass vacuously.
+
+Noted, not changed:
+
+- A context with no dispatcher slot (more than 127 contexts since a flush) gets no cross-page link now, where it used to
+  get plain ones.
+- A context whose L1 table was given away misses on every cross-page link until it takes a table again.
+- Every cross-page exit of a split block runs through its cold code.
+- Three hot targets with the same low 15 RIP bits thrash through the resident.
+
+The last two are part of what step 2's direct guarded links remove.
+
