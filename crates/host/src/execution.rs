@@ -2628,9 +2628,10 @@ impl std::hash::Hasher for Words {
 }
 /// The memory cache's bound in answers, over all its shards ([`Shard::sweep`]): far above any run's (a CPython `make -j4` asks
 /// for about 660 k distinct blocks, Speedometer about 1.55 M, a KDE desktop with Chromium about 2.35 M); the bytes are the
-/// bound that matters ([`cap_bytes`]: every answer counts at least its bookkeeping, so at 4 GiB they bound it to about 8 M),
-/// and this one a flood of small answers. A `NATEMU_ANSWER_CACHE_MB` above about 6 GiB meets it first.
-const CAP_ANSWERS: usize = 1 << 22;
+/// bound that matters ([`cap_bytes`]: every answer counts at least its bookkeeping, about 500 bytes), and this one a flood of
+/// small answers: at the 8 GiB ceiling, answers of a typical 1.45 KB meet the bytes first (about 5.9 M), answers under
+/// about 1 KB this. A `NATEMU_ANSWER_CACHE_MB` above about 12 GiB meets it first.
+const CAP_ANSWERS: usize = 1 << 23;
 /// The memory cache's bound in bytes, over all its shards ([`answer_cap`] of the host's memory and, for a boot, the guest's;
 /// `NATEMU_ANSWER_CACHE_MB` overrides it).
 fn cap_bytes(guest: Option<u64>) -> usize {
@@ -2648,8 +2649,9 @@ fn cap_bytes(guest: Option<u64>) -> usize {
 /// The bytes the memory cache may keep on a host of `host` bytes of memory running a guest of `guest` bytes of RAM
 /// (`None`: unknown, a compiler outside a boot). The answers kept are a function of the guest's code, not of its RAM, but
 /// the guest's RAM, the rest of natemu and macOS need the host's memory first: half of what is left after the guest and
-/// 3 GiB, within the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 4 GiB. 16 GB with an
-/// 8 GiB guest gives 2.5 GiB, with a 4 GiB guest 4 GiB; 8 GB with a 2 GiB guest 1.5 GiB, with 4 GiB the old 512 MiB.
+/// 3 GiB, within the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 8 GiB. 16 GB with an
+/// 8 GiB guest gives 2.5 GiB, with a 4 GiB guest 4.5 GiB; 32 GB with an 8 GiB guest 8 GiB; 8 GB with a 2 GiB guest
+/// 1.5 GiB, with 4 GiB the old 512 MiB.
 /// (The guest's display memory is not counted with its RAM: the reserve covers today's sizes. A vCPU whose features
 /// differ from the first's keeps a map of its own at the old bound, beside the run's.)
 /// Why: a KDE desktop with Chromium on the Mac mini M4 (16 GB, the old 1 GiB) compiled 1.37 M of its 3.72 M answers again
@@ -2660,7 +2662,7 @@ pub(crate) fn answer_cap(host: u64, guest: Option<u64>) -> usize {
     let floor = (1u64 << 30).min(host / 16);
     let cap = match guest {
         None => floor,
-        Some(guest) => (host.saturating_sub(guest).saturating_sub(3 << 30) / 2).clamp(floor, 4 << 30),
+        Some(guest) => (host.saturating_sub(guest).saturating_sub(3 << 30) / 2).clamp(floor, 8 << 30),
     };
     usize::try_from(cap).unwrap_or(usize::MAX)
 }
@@ -6448,7 +6450,7 @@ mod tests {
         assert_eq!(across.size(), own + BOOKKEEPING);
     }
 
-    /// The cap: half of what the guest and 3 GiB leave of the host's memory, within the old bound and 4 GiB; the old bound
+    /// The cap: half of what the guest and 3 GiB leave of the host's memory, within the old bound and 8 GiB; the old bound
     /// outside a boot.
     #[test]
     fn answer_cap_from_host_and_guest_memory() {
@@ -6456,11 +6458,12 @@ mod tests {
         const M: usize = 1 << 20;
         let cases = [
             (16 * G, Some(8 * G), 2560 * M),
-            (16 * G, Some(4 * G), 4096 * M),
+            (16 * G, Some(4 * G), 4608 * M),
             (16 * G, Some(12 * G), 1024 * M), // the old 1 GiB
             (8 * G, Some(2 * G), 1536 * M),
             (8 * G, Some(4 * G), 512 * M), // the old sixteenth
-            (64 * G, Some(8 * G), 4096 * M),
+            (32 * G, Some(8 * G), 8192 * M), // the ceiling
+            (64 * G, Some(8 * G), 8192 * M),
             (4 * G, Some(8 * G), 256 * M),
             (16 * G, None, 1024 * M),
             (8 * G, None, 512 * M),

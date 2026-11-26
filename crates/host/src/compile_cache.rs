@@ -35,7 +35,7 @@
 //!
 //! Configuration: [`Config`], by [`Config::new`] from the entries' `--compile-cache DIR|off` (default
 //! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap; default [`default_cap`], a tenth of the cache
-//! volume's free space within 1 to 4 GiB), whose fallbacks are the environment's `NATEMU_COMPILE_CACHE` and
+//! volume's free space within 1 to 16 GiB), whose fallbacks are the environment's `NATEMU_COMPILE_CACHE` and
 //! `NATEMU_COMPILE_CACHE_MB`. Only the boot entry opens it ([`shared`]: `natemu`, `natemu-host boot-linux`); the test
 //! drivers never do. Why these numbers: `docs/restructure/disk-cache-cap-plan.md`.
 
@@ -646,9 +646,9 @@ impl Config {
 /// The default cap's bounds: the ceiling holds a desktop's sessions and apps, the floor at least one KDE session across
 /// opens (3/4 of it, 768 MiB, is kept at each). The measurements: `docs/restructure/disk-cache-cap-plan.md`.
 pub const CAP_FLOOR: u64 = 1 << 30;
-pub const CAP_CEILING: u64 = 4 << 30;
+pub const CAP_CEILING: u64 = 16 << 30;
 /// The default cap for a cache volume with `free` bytes free (`None`: unknown): a tenth of it within [`CAP_FLOOR`] and
-/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 40 GiB free).
+/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 160 GiB free).
 pub fn default_cap(free: Option<u64>) -> u64 {
     let step = 256 << 20;
     free.map_or(CAP_CEILING, |f| (f / 10).clamp(CAP_FLOOR, CAP_CEILING)) / step * step
@@ -990,18 +990,19 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The default cap: a tenth of the free space, within 1 to 4 GiB, in 256 MiB steps; the ceiling when unknown.
+    /// The default cap: a tenth of the free space, within 1 to 16 GiB, in 256 MiB steps; the ceiling when unknown.
     #[test]
     fn default_cap_bounds() {
         const G: u64 = 1 << 30;
-        assert_eq!(default_cap(None), 4 * G);
+        assert_eq!(default_cap(None), 16 * G);
         assert_eq!(default_cap(Some(0)), G);
         assert_eq!(default_cap(Some(5 * G)), G); // the floor
         assert_eq!(default_cap(Some(20 * G)), 2 * G);
         assert_eq!(default_cap(Some(13 * G)), 5 * G / 4); // 1.3 GiB, down to a step
         assert_eq!(default_cap(Some(40 * G)), 4 * G);
-        assert_eq!(default_cap(Some(2000 * G)), 4 * G); // the ceiling
-        assert_eq!(default_cap(Some(u64::MAX)), 4 * G);
+        assert_eq!(default_cap(Some(160 * G)), 16 * G);
+        assert_eq!(default_cap(Some(2000 * G)), 16 * G); // the ceiling
+        assert_eq!(default_cap(Some(u64::MAX)), 16 * G);
     }
 
     /// `--compile-cache-mb` wins over the default; without it the cap is the default of the cache volume's free space, also

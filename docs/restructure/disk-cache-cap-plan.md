@@ -23,18 +23,26 @@ so the cache holds only code that comes from files.
 ## Design
 
 **Default cap.** Without `--compile-cache-mb` or `engine.compile_cache_mb`, the cap is a tenth of the free space on the
-cache folder's volume, at least 1 GiB and at most 4 GiB, rounded down to 256 MiB steps (`default_cap`). If statfs
-fails, the cap is 4 GiB.
+cache folder's volume, at least 1 GiB and at most 16 GiB, rounded down to 256 MiB steps (`default_cap`). If statfs
+fails, the cap is 16 GiB.
 - *Floor, 1 GiB.* Each open keeps 3/4 of the cap, 768 MiB here, which holds a KDE session's 592 MiB with 176 MiB to
   spare for its apps: the floor keeps the session, not a desktop's apps.
-- *Ceiling, 4 GiB.* Each open keeps 3 GiB, five times a session, which leaves room for its apps and a browser. Each run
-  also has 1 GiB to write into, more than a cold session's 592 MiB. Half of the measured 8 GiB setting is enough
-  because hits come from the code that sessions share. A browser's own working set has not been measured yet (see the
-  measurement below).
-- *A tenth of the free space.* This keeps a Mac with a small or nearly full disk from losing 4 GiB to the cache. Any
-  volume with 40 GiB free gets the ceiling, which is a fixed value on most machines. Below that, the 256 MiB steps
+- *Ceiling, 16 GiB.* The reviewed design had 4 GiB. The owner raised it because disk is plentiful (November 26,
+  2026: "memory is not tight", and disk neither).
+  - At 4 GiB, each open keeps 3 GiB, five times a session, which leaves room for its apps and a browser, and each run
+    has 1 GiB to write into, more than a cold session's 592 MiB.
+  - At 16 GiB, each open keeps 12 GiB and each run has 4 GiB to write into, so a machine's sessions, browsers and
+    other guests rarely evict each other.
+  - The cache reaches the ceiling only as it fills. What a full cache costs grows with it: the index built at open,
+    about 33 bytes an entry, is about 0.75 GiB of host memory at 16 GiB (about 23 M entries, at the 750 bytes an
+    entry measured locally). Its build would take about 0.75 s, extrapolated from the experiment below, and the cache
+    holds about 5,000 packs, one descriptor each within the budget below.
+  - The Mac mini measurement reads `disk_open` and the pack count, to check this before the cache is ever full.
+  - A browser's own working set has not been measured yet (see the measurement below).
+- *A tenth of the free space.* This keeps a Mac with a small or nearly full disk from losing a large cap to the cache.
+  Any volume with 160 GiB free gets the ceiling. Below that, the 256 MiB steps
   make it unlikely that two calls made moments apart disagree; it is not impossible. A process computes the cap once.
-- The free space does not count what the cache itself already holds. So on a volume with less than 40 GiB free, the
+- The free space does not count what the cache itself already holds. So on a volume with less than 160 GiB free, the
   cap is a little smaller than a tenth of "free plus cache". On a nearly full disk the floor still gives 1 GiB; the
   writer survives the full disk that follows (the entries are lost, not the run).
 - A relative cache folder that does not exist yet is measured on the working directory's volume.
@@ -88,7 +96,7 @@ payload, and compares the first 12 bytes with the stored sum.
   rates. Both reviewers agreed.
 
 **Descriptors.** Each pack a process reads holds one open descriptor for the whole run. At 4 GiB that is up to about
-1,300 descriptors (packs average 3.2 MiB locally, because a pack is written every 2 s as well as at 4 MiB); at the old
+1,300 descriptors, and at the 16 GiB ceiling about 5,000 (packs average 3.2 MiB locally, because a pack is written every 2 s as well as at 4 MiB); at the old
 default it was about 120. natemu does not raise its own limit, and macOS's default soft limit is 256.
 - Before this change, a pack of this build that failed `File::open` was deleted as damaged, so running out of
   descriptors deleted good packs. Without a bound, a large cache would also take every descriptor the rest of the boot

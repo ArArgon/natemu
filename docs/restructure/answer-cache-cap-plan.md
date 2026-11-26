@@ -24,12 +24,15 @@ copies moved to other page offsets.
 ## Design
 
 **The cap takes the guest's RAM into account.** It is half of what the host's memory leaves after the guest's RAM and
-3 GiB (`answer_cap`), between the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 4 GiB.
+3 GiB (`answer_cap`), between the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 8 GiB.
+The reviewed design had a 4 GiB ceiling; the owner raised it to 8 GiB because memory is not tight (November 26, 2026).
+The guest-aware part is unchanged, so a 16 GB host running an 8 GiB guest still gets 2.5 GiB.
 
 | Host | Guest RAM | Cap |
 | --- | --- | --- |
 | 16 GB | 8 GiB (the desktop cases' `--ram 8`) | 2.5 GiB |
-| 16 GB | 4 GiB | 4 GiB |
+| 16 GB | 4 GiB | 4.5 GiB |
+| 32 GB | 8 GiB | 8 GiB (the ceiling) |
 | 16 GB | 12 GiB | 1 GiB (the old bound) |
 | 8 GB | 2 GiB | 1.5 GiB |
 | 8 GB | 4 GiB | 512 MiB (the old bound) |
@@ -75,6 +78,8 @@ dereferences an answer while it holds the shard's lock.
 - An experiment by the reviewer on the M2 Max, at 210 k answers in a shard with resident answers, measured about 16 ms
   a sweep: the rank pass 6 ms (3 ms without the answer reads), the sort 4 ms, the retain 6 ms. At 55 k it measured
   about 4 ms.
+- At the 8 GiB ceiling (a 32 GB host), a shard holds about 370 k answers: by the same experiment, about 30 ms a
+  sweep, as rarely again.
 - Each sweep's time is now on the performance log's `answers` line, as `sweeps`: [sweeps, answers dropped, ns in all,
   longest ns]. If the stalls show in a desktop's frame gaps, the next step is more shards (64 restores today's shard
   size).
@@ -82,10 +87,11 @@ dereferences an answer while it holds the shard's lock.
 **The dropped answers' fingerprints** are now hashed before their lock is taken, the lock every vCPU's fresh compile
 takes (`Answers::recompiled`).
 
-**The answer bound (`CAP_ANSWERS`, 2^22) stays.** With the bookkeeping counted, every answer counts at least about
-500 bytes, so below a cap of about 2 GiB the byte cap always binds first. Above it, the count bound (about 3.1 M kept
-after a sweep) limits a flood of small answers. For typical answers of about 1.45 KB, it binds first only when
-`NATEMU_ANSWER_CACHE_MB` sets more than about 6 GiB.
+**The answer bound (`CAP_ANSWERS`) doubles to 2^23,** about 8.4 M answers, of which a sweep keeps about 6.3 M. With
+the bookkeeping counted, every answer counts at least about 500 bytes. At the 8 GiB ceiling, answers of a typical
+1.45 KB meet the byte bound first, at about 5.9 M answers; at 2^22 the count would have bound first and kept only
+3.1 M. The count bound still limits a flood of small answers, below about 1 KB each. A `NATEMU_ANSWER_CACHE_MB` above
+about 12 GiB meets it first.
 
 **The keep-the-found policy is unchanged.** An answer's rank is the shard's insert count when it was kept or last found,
 plus half the shard's answer count if it has been found since it was kept. So an answer found again outlives the many
@@ -137,7 +143,7 @@ Run it both ways:
 - **cache off** (the case as it is): the recompile count (`recompiled`) and host time;
 - **cache on at the new default cap** (the `-warm` variant, or the case with the compile cache on): the disk hits that
   map drops caused (`dropped_disk_hits`), and the recompiles left, which are kernel answers (they are never on disk). Optionally run two caps of this branch on the 16/8
-configuration, 2.5 GiB (the default) and 4 GiB (`NATEMU_ANSWER_CACHE_MB=4096`), labelled as an experiment, to settle
+configuration, 2.5 GiB (the default) and 4.5 GiB (`NATEMU_ANSWER_CACHE_MB=4608`), labelled as an experiment, to settle
 whether a larger share of the host pays.
 
 ## Review
