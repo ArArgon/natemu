@@ -132,12 +132,13 @@ def transition_judge(got, n, alias=None):
 
 # The dispatcher's data tables beside the alias: each shadow space maps only its own class's 2 MiB block (supervisor
 # tables at CPL 0, user tables at CPL 3) in the 2 MiB after the alias's, or before it when the alias is in its GiB's
-# last 2 MiB. Aliases: (selected, the tables' block, addresses that must #GP at both CPLs: the rest of that GiB's blocks
-# where the tables and a removed study's block used to be, and the neighbouring GiB).
-# (tag, alias, the data tables' block, the code TLB's block, holes). The code TLB (frame-keyed plan 8.2, `cache::ctlb_block`:
-# two blocks after the alias's, or two before when the tables are before it) is mapped EL0 read-only in the user space only.
+# last 2 MiB. The code TLB (frame-keyed plan 8.2, `cache::ctlb_block`) is one more 2 MiB block, EL0 read-only in the user
+# space only: two after the alias's, or one before when that runs past the GiB (alias in block 510), or two before when
+# the tables are before it. Aliases: (tag, alias, the tables' block, the code TLB's block, addresses that must #GP at
+# both CPLs: other blocks of that GiB, where the tables and a removed study's block used to be, and the next GiB).
 TABLE_ALIASES = [('after', strict.FRAME, 0xffff400000200000, 0xffff400000400000, [0xffff400000600000, 0xffff400000a00000]),
-                 ('before', 0xffff40003fe01000, 0xffff40003fc00000, 0xffff40003fa00000, [0xffff400040000000])]
+                 ('before', 0xffff40003fe01000, 0xffff40003fc00000, 0xffff40003fa00000, [0xffff400040000000]),
+                 ('last-after', 0xffff40003fc01000, 0xffff40003fe00000, 0xffff40003fa00000, [0xffff40003f800000])]
 
 
 def table_program(block):

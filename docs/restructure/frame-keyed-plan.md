@@ -143,7 +143,8 @@ bits for a user address below 2^47), `VALID` is bit 35, and the frame is a 4 KiB
 
   These are exactly the page record's events (`page_record::invalidated`, epoch). So the code TLB is a projection of
   the page record, and its correctness argument reduces to the page record's (page-currency plan).
-- **Mapped** EL0 read-only in the guest-state alias's leaf table, in the 8 pages after the guest-state page, at x28 +
+- **Mapped** (as first designed; as built it is one 2 MiB block beside the data tables, 32 Ki entries: 8.4 item 15 and
+  section 10) EL0 read-only in the guest-state alias's leaf table, in the 8 pages after the guest-state page, at x28 +
   4096. The table is backed in the lookup area and written by the resident at EL1. The leaf table is shared by both
   shadow spaces, so supervisor code can read it too; it never reads it. What user code can read is the frame numbers of
   its own address space's user code pages. This is a documented deviation of the same class as the readable L1 tables
