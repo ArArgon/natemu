@@ -1,5 +1,6 @@
 // natemu export hook: the only interface between the patched FEXCore and the fexc driver.
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -119,7 +120,35 @@ inline std::vector<FexcX87MapInfo> fexc_x87_maps;
 inline uint8_t fexc_x87_slots[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};   // the FexcX87Slot ops since the last FexcX87Map
 inline uint32_t fexc_x87_slots_guest = ~0u;    // the guest instruction those slots were recorded in (a map takes its own instruction's only)
 inline std::vector<FexcInsnInfo> fexc_insns;
-inline FexcMapT<uint64_t, bool> fexc_cf_inverted; // guest offset -> CF inversion at that instruction's start (dispatcher state)
+// guest offset -> CF inversion at that instruction's start (dispatcher state): the dispatcher sets one per instruction in
+// order (`[off] = v`), the JIT asks for them in about the same order (get: the last value set, true when none), so a vector
+// with a cursor answers instead of a map; an order that is not increasing is sorted once, the last value of a key kept.
+struct FexcCfTable {
+  std::vector<std::pair<uint64_t, bool>> v;
+  size_t cur = 0;
+  bool sorted = true;
+  struct Ref { FexcCfTable& t; uint64_t k; void operator=(bool b) { t.set(k, b); } };
+  Ref operator[](uint64_t k) { return {*this, k}; }
+  void set(uint64_t k, bool b) {
+    if (!v.empty() && k <= v.back().first) sorted = false;
+    v.push_back({k, b});
+  }
+  bool get(uint64_t k) {
+    if (!sorted) {
+      std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      size_t o = 0;   // keep the last of each key (the map's overwrite)
+      for (size_t i = 0; i < v.size(); ++i) { if (o && v[o - 1].first == v[i].first) v[o - 1] = v[i]; else v[o++] = v[i]; }
+      v.resize(o); sorted = true; cur = 0;
+    }
+    if (cur < v.size() && v[cur].first == k) return v[cur++].second;
+    const auto it = std::lower_bound(v.begin(), v.end(), k, [](const auto& e, uint64_t x) { return e.first < x; });
+    if (it == v.end() || it->first != k) return true;
+    cur = size_t(it - v.begin()) + 1;
+    return it->second;
+  }
+  void clear() { v.clear(); cur = 0; sorted = true; }
+};
+inline FexcCfTable fexc_cf_inverted;
 inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue subtracts from sp (ResetStack restores them)
 
 // ---------------------------------------------------------------------------------------------

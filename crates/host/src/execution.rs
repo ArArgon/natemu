@@ -1963,9 +1963,11 @@ impl Channel {
     /// The layout's magic (and version), "CHN1": the host writes it at 8 when it makes the mapping, the server checks it and
     /// writes it at 72 before it answers; the host checks that with every reply (fexc.cpp's kChanMagic).
     const MAGIC: u32 = 0x314e_4843;
-    /// How long the host spins for a reply before it sleeps: 99.6% of chunk 21's round trips took at most 30 us. (The server
-    /// spins 20 us for the next request; with only one side spinning the other's wake-up costs what the pipe did.)
-    const SPIN: Duration = Duration::from_micros(30);
+    /// How long the host spins for a reply before it sleeps. 30 us (99.6% of chunk 21's round trips) left 18% of a
+    /// Speedometer boot's compiles to a sleep and a wake-up (experiment, M3, fexc profile); the spinning thread is the vCPU
+    /// waiting for the answer anyway. (The server spins 100 us for the next request; with only one side spinning the other's
+    /// wake-up costs what the pipe did.)
+    const SPIN: Duration = Duration::from_micros(100);
     /// A sleep's longest stretch: then the host checks whether the server died (and its deadline).
     const SLICE_NS: u64 = 5_000_000;
     /// A new mapping (close-on-exec: `shm_open` takes no O_CLOEXEC; its name is unlinked at once).

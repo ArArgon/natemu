@@ -121,6 +121,12 @@ smoke = true
 argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools/fexc/test_fexc.py"]
 smoke = true
 
+# The CF table (fexc_cf_inverted, shim/fexc_hook.h) against the std::map it replaced, on random sets and lookups: no fexc
+# binary, the check built here with clang++ (tools/fexc/cf_table_check.cpp).
+[suite.cases."fexc-cf-table"]
+argv = ["python3", "-B", "-m", "unittest", "tools/fexc/test_cf_table.py"]
+smoke = true
+
 # test_slice1.py, one case per test class: the classes are independent (each process builds its own native helper and
 # keeps its own compile cache), and as one case its 92 tests ran 8 to 9 minutes on one core. testkit/tests/test_layout.py
 # checks that the cases name every class of the file.

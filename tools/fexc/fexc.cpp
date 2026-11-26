@@ -665,9 +665,13 @@ static bool Redo(Core::InternalThreadState* thread, IR::IRListView& View, int& b
 // fexc_ext_abandon (asked by GenerateIR before the passes, while an Attempt arms it): no pass makes or removes an exit, so the
 // count on the dispatcher's IR is the final one; Attempt checks the final IR as well.
 static Core::InternalThreadState* AbandonThread = nullptr;
-static bool AbandonArmed = false;
+static bool AbandonArmed = false, AbandonAsked = false;
 static int AbandonBlocks = 0, AbandonLinks = 0;
-static bool ExtAbandon(IR::IRListView& View) { return AbandonArmed && Redo(AbandonThread, View, AbandonBlocks, AbandonLinks); }
+static bool ExtAbandon(IR::IRListView& View) {
+  if (!AbandonArmed) return false;
+  AbandonAsked = true;
+  return Redo(AbandonThread, View, AbandonBlocks, AbandonLinks);
+}
 
 // One compile attempt: FEX's ContextImpl::CompileCode as fexc runs it (no source map: GDB symbols are off; no lookup-cache race
 // check: fexc never enters a block into the cache), except that with `retry` set an attempt the extended-block loop would throw
@@ -678,7 +682,7 @@ static bool ExtAbandon(IR::IRListView& View) { return AbandonArmed && Redo(Aband
 // depend on them, the retry being decided before code generation).
 static bool Attempt(Context::ContextImpl* impl, Core::InternalThreadState* thread, uint64_t rip, uint64_t max, bool retry,
                     int& blocks, int& links) {
-  AbandonThread = thread; AbandonArmed = retry; fexc_ext_abandoned = false;
+  AbandonThread = thread; AbandonArmed = retry; AbandonAsked = false; fexc_ext_abandoned = false;
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
     impl->GenerateIR(thread, rip, impl->Config.GDBSymbols() || fexc_dense_pc_table, max);
   (void)NeedsAddGuestCodeRanges;
@@ -691,8 +695,9 @@ static bool Attempt(Context::ContextImpl* impl, Core::InternalThreadState* threa
     blocks = AbandonBlocks; links = AbandonLinks;
     return false;
   }
-  if (retry) {
-    if (Redo(thread, *IRView, blocks, links)) {   // (not after ExtAbandon said no: kept as the check on the final IR)
+  // (After ExtAbandon said no, the final IR's answer is the same: no pass makes or removes an exit, so its walk is not repeated.)
+  if (retry && !AbandonAsked) {
+    if (Redo(thread, *IRView, blocks, links)) {
       thread->OpDispatcher->DelayedDisownBuffer();
       thread->FrontendDecoder->ValidateDisownedOrFree();
       thread->OpDispatcher->ValidateDisownedOrFree();
@@ -846,7 +851,10 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
 
   JoinSites(rip);
   std::string end_reason_str;   // guest.end.reason, also recorded in the binary object
-  std::stable_sort(Cap.sites.begin(), Cap.sites.end(), [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; });
+  {
+    const auto by_native = [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; };
+    if (!std::is_sorted(Cap.sites.begin(), Cap.sites.end(), by_native)) std::stable_sort(Cap.sites.begin(), Cap.sites.end(), by_native);
+  }
   const auto& c = Cap.code;
   uint32_t tail_off = 0; std::memcpy(&tail_off, c.data(), 4);
   CPU::CPUBackend::JITCodeTail tail {};
@@ -855,7 +863,8 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
 
   // Relocation slots hold process-specific host pointers (dispatcher entry) or guest RIPs.
   // The code is exported with literal slots zeroed; the emitted values are listed per relocation.
-  std::vector<uint8_t> code = c;
+  static std::vector<uint8_t> code;   // (kept: no allocation per request once it has held the largest)
+  code.assign(c.begin(), c.end());
   for (auto& r : Cap.relocs) {
     using T = CPU::RelocationTypes;
     const uint64_t off = r.Header.Offset;
@@ -1138,7 +1147,8 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     // The site table: the access sites and stubs, and each x87 map as a record of kind X87MAP at its instruction's native
     // offset + 1 (no word is there: found by that key alone): TOP and the tag byte in guest_offset2, the eight host registers
     // in imm (registers 0..3) and base_reg, index_reg, extend, shift (4..7).
-    std::vector<FexcSiteInfo> rows = Cap.sites;
+    static std::vector<FexcSiteInfo> rows;   // (kept, as `code`)
+    rows.assign(Cap.sites.begin(), Cap.sites.end());
     for (auto& m : Cap.x87_maps) {
       FexcSiteInfo s {};
       s.native_offset = m.insn_native_offset | 1; s.guest_offset = m.guest_offset; s.guest_offset2 = uint32_t(m.top) | uint32_t(m.tags) << 8;
@@ -1148,20 +1158,32 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       s.access_native_offset = FEXC_NONE32; s.ir_op = "x87map";
       rows.push_back(s);
     }
-    std::stable_sort(rows.begin(), rows.end(), [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; });
+    if (!Cap.x87_maps.empty())   // (Cap.sites is sorted already: only the maps can be out of order)
+      std::stable_sort(rows.begin(), rows.end(), [](const FexcSiteInfo& a, const FexcSiteInfo& b) { return a.native_offset < b.native_offset; });
     put(64, f.size(), 4); put(68, rows.size(), 4);
+    // Fixed-size records written in place (a push_back per byte was most of the writer's time).
+    const auto put32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+    size_t at = f.size();
+    f.resize(at + rows.size() * 40);
     for (auto& s : rows) {
+      uint8_t* p = f.data() + at; at += 40;
       const bool stub = s.kind == FEXC_SITE_SEGMENT || s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN || s.kind == FEXC_SITE_STACK;   // a stub's guest_offset2 is its access site
-      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.kind != FEXC_SITE_X87MAP && MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
-      for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
-                        uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
-                        s.flags_written_before, s.ordering, s.completed_effects, s.located}) f.push_back(b);
+      const uint32_t mmio = stub || s.kind == FEXC_SITE_X87MAP ? 0 : MmioRecord(s, rip);
+      put32(p, s.native_offset); put32(p + 4, s.guest_offset); put32(p + 8, stub ? s.access_native_offset : mmio ? mmio : s.guest_offset2);
+      put32(p + 12, s.insn_native_offset); put32(p + 16, uint32_t(s.imm));
+      const uint8_t b[20] = {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
+                             uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
+                             s.flags_written_before, s.ordering, s.completed_effects, s.located};
+      std::memcpy(p + 20, b, 20);
     }
     pad(8);
     put(72, f.size(), 4); put(76, Cap.pcs.size(), 4);
-    for (auto& p : Cap.pcs) {
-      int cf = CfInverted(p.first, p.second);
-      push(p.second, 4); push(p.first, 4); push(cf < 0 ? 2 : cf, 1); push(0, 3);
+    at = f.size();
+    f.resize(at + Cap.pcs.size() * 12);
+    for (auto& pc : Cap.pcs) {
+      const int cf = CfInverted(pc.first, pc.second);
+      uint8_t* p = f.data() + at; at += 12;
+      put32(p, uint32_t(pc.second)); put32(p + 4, uint32_t(pc.first)); put32(p + 8, uint32_t(cf < 0 ? 2 : cf));
     }
     pad(8);
     put(80, f.size(), 4); put(84, Cap.relocs.size() + Cap.dispatch_exits.size() + Cap.probe_branches.size(), 4);
@@ -1217,9 +1239,11 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
 // --channel-reply-cap N (tests only, test_channel.py): a smaller reply cap, to reach that error reply.
 static constexpr uint32_t kChanMagic = 0x314e4843;   // "CHN1"; the host's Channel::MAGIC
 static constexpr size_t kChanBytes = 16u << 20, kReqAt = 4096, kReqCap = 1u << 20, kRepAt = kReqAt + kReqCap, kRepCap = kChanBytes - kRepAt;
-// The host's next compile request follows a reply within 20 us in about 95% of cases (perf chunk 21). Both sides spin: with
-// either one asleep the woken side's wake-up costs about as much as the pipe did, the gain is the wake-ups avoided.
-static constexpr uint64_t kServerSpinNs = 20000;
+// Both sides spin: with either one asleep the woken side's wake-up costs about as much as the pipe did, the gain is the
+// wake-ups avoided. 100 us: in a Speedometer boot (4 vCPUs) 57% of the host's next requests came within 20 us of a reply,
+// 89% within 100 us, and a request that found the server asleep took about 10 us longer (experiment, M3, fexc profile);
+// the price is at most 100 us of a core after each reply.
+static constexpr uint64_t kServerSpinNs = 100000;
 static uint8_t* Chan = nullptr;
 static size_t ChanRepCap = kRepCap;
 static uint32_t* ChanWord(size_t at) { return reinterpret_cast<uint32_t*>(Chan + at); }
@@ -1307,12 +1331,20 @@ static void Compile(const char* a, size_t alen, const uint8_t* bytes, size_t siz
     if (e - i == 5 && !memcmp(a + i, "--rip", 5) && e + 1 < alen) { vo = e + 1; ve = vo + strlen(a + vo); guess = int(t + 1); break; }
     i = e + 1;
   }
-  static std::string key;
-  if (vo != SIZE_MAX) { key.assign(a, vo); key.append(a + ve, alen - ve); key.append(reinterpret_cast<const char*>(&vo), sizeof vo); }
+  // The kept setup of the last request that had one, compared with these arguments in place: most requests repeat the
+  // last one's arguments but for the RIP, and then the key is neither built nor hashed.
+  static std::string key, last_key;
+  static Setup* last = nullptr;
+  const bool same = last && vo != SIZE_MAX && last_key.size() == vo + (alen - ve) + sizeof vo &&
+                    !memcmp(last_key.data() + last_key.size() - sizeof vo, &vo, sizeof vo) && !memcmp(last_key.data(), a, vo) &&
+                    !memcmp(last_key.data() + vo, a + ve, alen - ve);
+  if (vo != SIZE_MAX && !same) { key.assign(a, vo); key.append(a + ve, alen - ve); key.append(reinterpret_cast<const char*>(&vo), sizeof vo); }
   Setup* s = nullptr;
   uint64_t rip = 0;
-  if (auto it = vo == SIZE_MAX ? Setups.end() : Setups.find(key); it != Setups.end()) {
-    s = &it->second;
+  Setup* kept = same ? last : nullptr;
+  if (!kept && vo != SIZE_MAX) if (auto it = Setups.find(key); it != Setups.end()) { kept = last = &it->second; last_key = key; }
+  if (kept) {
+    s = kept;
     rip = strtoull(a + vo, nullptr, 0);
     if ((r.code = CheckWindow(rip, s->bitness, size))) return;
     Prepare(*s, rip, bytes, size);
@@ -1324,7 +1356,7 @@ static void Compile(const char* a, size_t alen, const uint8_t* bytes, size_t siz
     Prepare(fresh, fresh.rip, bytes, size);
     if ((r.code = Configure(fresh))) return;
     rip = fresh.rip;
-    if (vo != SIZE_MAX && fresh.rip_arg == guess) s = &Setups.emplace(key, std::move(fresh)).first->second;
+    if (vo != SIZE_MAX && fresh.rip_arg == guess) { s = last = &Setups.emplace(key, std::move(fresh)).first->second; last_key = key; }
     else { static Setup once; once = std::move(fresh); s = &once; }
   }
   r.code = CompileRequest(*s, rip, bytes, size, &r);

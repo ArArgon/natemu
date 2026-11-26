@@ -1289,8 +1289,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     FexcInsnNative = Begin;
     FexcNzcvWritten = FexcNzcvSaved = FexcStoreSeen = false;
     FexcLoadSite = -1;
-    const auto it = fexc_cf_inverted.find(Op->GuestEntryOffset);
-    FexcCf = it == fexc_cf_inverted.end() ? true : it->second;
+    FexcCf = fexc_cf_inverted.get(Op->GuestEntryOffset);
     for (auto i : FexcPendingFused) fexc_sites[i].guest_offset2 = FexcGuest;
     FexcPendingFused.clear();
     fexc_insns.push_back({FexcGuest, Begin, FexcCf});
