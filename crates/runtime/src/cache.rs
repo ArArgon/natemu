@@ -2757,9 +2757,17 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
         && target.flags & (INSTANCE | TRANSLATION) == 0
         && code.flags & GUARDED != 0
         && !local(target, source);
+    // (Step 1d: a link into a global block stays plain by default: no CR3 load undoes it (it is in the TLB segment, which only a
+    // global flush suspends), so checking it would buy nothing and cost the kernel's cross-page transfers an L1 probe each;
+    // `link_form_plain` 2, `NATEMU_LINK_FORM=checked`, checks those too, as step 1c did.)
+    let cross_checked = match c.link_form_plain {
+        0 => target.flags & GLOBAL == 0,
+        2 => true,
+        _ => false,
+    };
     let checked = !local_shared
         && !guarded
-        && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (c.link_form_plain == 0 && !local(target, source)));
+        && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (cross_checked && !local(target, source)));
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
     if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {

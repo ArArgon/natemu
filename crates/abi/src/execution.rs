@@ -1254,7 +1254,8 @@ pub mod cache {
         /// ([`crate::execution::cache`]'s linker, `local`) is made in the checked form (its `svc` word becomes `b` to its
         /// context's dispatcher slot, which probes L1 at the RIP the exit built), so no TLB event undoes it; nonzero (the
         /// host's `NATEMU_LINK_FORM=plain`, a debug key): such links are plain, undone at TLB events and patched again
-        /// (the relink plan). Appended.
+        /// (the relink plan). Step 1d: at 0 a link into a global block stays plain (no CR3 load undoes it); 2
+        /// (`NATEMU_LINK_FORM=checked`) checks those too, as step 1c did. Appended.
         pub link_form_plain: u64,
         /// Frame-keyed plan step 1c: link points linked in the checked form only because their link is not local (neither end
         /// shared code). Appended.

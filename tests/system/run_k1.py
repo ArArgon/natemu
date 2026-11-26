@@ -2074,6 +2074,25 @@ def relink_counts(a, n, name, report):
                     failures.append(f'{name}@{n} checked cpu{v}: {reg} = {got:#x}, allowed {[hex(x) for x in sorted(ok)]}')
         if not out:
             failures.append(f'{name}@{n} checked: no output')
+    # Step 1d: in the default form a link into a global block stays plain (a CR3 load never undoes it): V's RM sites are plain,
+    # suspended at each round's global flushes and relinked; only Z's two (not global) are checked.
+    if name == 'relink-global-many':
+        prog = program(name, n, k)
+        prog['link_form'] = None
+        out, problems = run(a, prog, [], None, None, '-default')
+        failures += [f'{name}@{n} default: {p}' for p in problems]
+        for v, c in enumerate(out['cpus'] if out else []):
+            r = c['stats']['k1'].get('relink', {})
+            cross = c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0)
+            if cross >= RM or r.get('relinked', 0) < RM:
+                failures.append(f"{name}@{n} default cpu{v}: {cross} cross-page links checked, {r.get('relinked', 0)} relinked: want V's plain (fewer than {RM} checked, at least {RM} relinked)")
+            allowed = EITHER[name](v, k) if callable(EITHER[name]) else EITHER[name]
+            for reg, ok in allowed.items():
+                got = smp.num(c['gpr'][P.REGS.index(reg)])
+                if got not in ok:
+                    failures.append(f'{name}@{n} default cpu{v}: {reg} = {got:#x}, allowed {[hex(x) for x in sorted(ok)]}')
+        if not out:
+            failures.append(f'{name}@{n} default: no output')
     report.append({'name': f'k1-{name}@{n}-relink-counts', 'max_block': None, 'stats': got, 'problems': failures})
     print(json.dumps(report[-1]), flush=True)
     return failures

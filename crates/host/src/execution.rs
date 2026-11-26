@@ -4977,15 +4977,18 @@ pub fn run(
     area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
     // Frame-keyed plan step 1c: every link that is not local is checked by default; `NATEMU_LINK_FORM=plain` (a debug key)
     // makes them plain again, undone at TLB events and relinked.
+    // Step 1d: by default only links into non-global blocks are checked; `NATEMU_LINK_FORM=checked` checks every link that
+    // is not local (step 1c's form), `plain` none.
     let plain = match std::env::var("NATEMU_LINK_FORM").as_deref() {
         Ok("plain") => 1u64,
-        Ok("checked") | Ok("") | Err(std::env::VarError::NotPresent) => 0,
-        Ok(other) => return Err(format!("NATEMU_LINK_FORM={other}: checked (the default) or plain")),
+        Ok("checked") => 2,
+        Ok("") | Err(std::env::VarError::NotPresent) => 0,
+        Ok(other) => return Err(format!("NATEMU_LINK_FORM={other}: checked or plain (unset: links into global blocks plain, the rest checked)")),
         Err(e) => return Err(format!("NATEMU_LINK_FORM: {e}")),
     };
     if plain != 0 {
         static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_FORM=plain: links between pages are plain (debug key)"));
+        SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_FORM set: link forms changed (debug key)"));
     }
     area.write_record(control + std::mem::offset_of!(cache::Control, link_form_plain), plain);
     // The template pool (chunk 3): the resident looks in it (mapped read-only at `cache::POOL_VA` by `prepare_with_pool`) unless
