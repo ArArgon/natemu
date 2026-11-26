@@ -22,12 +22,30 @@ use natemu_abi::execution::{
 /// - a move needs another number of words for its new value (FEX's `LoadConstant` picks the form by the value);
 /// - a relocation of any other kind, or a malformed object (admission's to refuse; not relocated).
 pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
-    let h: Header = read(o, 0)?;
-    let d = to.wrapping_sub(from);
     // Only between RIPs of the same half and page offset (the cache keys promise it; a forged disk entry's RIP is only
     // checksum-protected).
-    if !same_place(from, to)
-        || h.guest_rip != from
+    if !same_place(from, to) {
+        return None;
+    }
+    moved(o, from, to)
+}
+
+/// [`object`] between RIPs of the same half at any page offsets, for 64-bit code whose guest bytes lie in one page at both
+/// RIPs (so its page crossing, and the bytes fexc was given before the page's end, are alike): the same relocation, by the
+/// same records. The reuse check (`Compiler::check_reuse`) compares its result with fexc's own answer at the new RIP.
+pub(crate) fn object_moved(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
+    let h: Header = read(o, 0)?;
+    let in_page = |r: u64| (r & 0xfff) + u64::from(h.guest_bytes) <= 4096;
+    if (from ^ to) >> 63 != 0 || h.guest_bitness != 64 || !in_page(from) || !in_page(to) {
+        return None;
+    }
+    moved(o, from, to)
+}
+
+fn moved(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
+    let h: Header = read(o, 0)?;
+    let d = to.wrapping_sub(from);
+    if h.guest_rip != from
         || h.end_reason == object::end_reason::UNSUPPORTED_FORM
     {
         return None;
@@ -218,6 +236,20 @@ mod tests {
         // Truncated.
         assert_eq!(object(&USER_A.0[..200], USER_A.1, USER_B.1), None);
         assert!(no_code_reusable("system_instruction") && !no_code_reusable("unsupported_form"));
+    }
+
+    /// Moved to another page offset only within the half and with the bytes in one page at both RIPs; at the same
+    /// page offset it is [`object`]'s relocation.
+    #[test]
+    fn moved_relocation_refusals() {
+        let h: Header = read(USER_A.0, 0).unwrap();
+        assert_eq!(h.guest_bytes, 26);
+        assert_eq!(object_moved(USER_A.0, USER_A.1, 0xffff_ffff_8123_4340), None);
+        // 26 bytes from page offset 0xff0 cross the page; from 0xfe6 they end at its end.
+        assert_eq!(object_moved(USER_A.0, USER_A.1, 0x7f12_3456_8ff0), None);
+        assert!(object_moved(USER_A.0, USER_A.1, 0x7f12_3456_8fe6).is_some());
+        assert_eq!(object_moved(USER_A.0, USER_A.1, USER_B.1), object(USER_A.0, USER_A.1, USER_B.1));
+        assert_eq!(object_moved(USER_A.0, USER_B.1, 0x7f12_3456_8340), None);
     }
 
     /// Perf chunk 10: a placed block's code as the resident holds it (the admitted object's code, its link points linked:

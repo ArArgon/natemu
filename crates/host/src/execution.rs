@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{
-    AtomicBool, AtomicU64,
+    AtomicBool, AtomicU32, AtomicU64,
     Ordering::{Relaxed, SeqCst},
 };
 use std::sync::{Arc, Mutex};
@@ -2493,7 +2493,7 @@ fn key(limit: Option<u32>, at: u64, lead: &[u8]) -> Key {
 /// The memory cache's hash (perf chunk 7; SipHash's was about 25 ns a probe): Thorup's strongly universal multiply-shift for
 /// vectors of words ("High Speed Hashing for Integers and Strings", 2015, 3.4) under random keys per map. The guest chooses
 /// the keys (its bytes, RIPs) but never sees a hash, so they collide no more than by chance: no quadratic buckets.
-type Cache = HashMap<Key, Vec<Arc<Entry>>, Universal>;
+type Cache = HashMap<Key, Vec<Slot>, Universal>;
 #[derive(Clone)]
 struct Universal([u128; 4]);
 impl Default for Universal {
@@ -2537,13 +2537,27 @@ impl std::hash::Hasher for Words {
         ((self.sum >> 64) as u64).reverse_bits()
     }
 }
-/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards. Sized for a parallel build's working
-/// set (IO5, November 13: a CPython `make -j4` asks for about 660 k distinct blocks; with 2 x 256 k the generations cycled and
-/// fexc compiled 1.8 M answers again for other vCPUs); the installer boot keeps about 130 k.
-const GENERATION: usize = 1 << 20;
-/// And bytes per generation (answers average about 650 bytes: the build's set is about 450 MB).
-const GENERATION_BYTES: usize = 512 << 20;
-/// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the generation bounds.
+/// The memory cache's bound in answers, over all its shards ([`Shard::sweep`]): far above any run's (a CPython `make -j4` asks
+/// for about 660 k distinct blocks, Speedometer about 1.55 M); the bytes are the bound that matters ([`cap_bytes`]).
+const CAP_ANSWERS: usize = 1 << 22;
+/// The memory cache's bound in bytes, over all its shards: 1 GiB, or a sixteenth of the host's memory when that is less
+/// (`NATEMU_ANSWER_CACHE_MB` overrides it). The answers kept are a function of the guest's code, not of its RAM. Speedometer 3.1
+/// (4 vCPUs) makes 1.55 M answers, 1.9 GB, of which a third are ever found again: under 1 GiB the sweep compiles about 2.6%
+/// of the hits again (experiment: a replay of one boot's trace; a two-generation flip at that size about 40%).
+fn cap_bytes() -> usize {
+    if let Some(mb) = std::env::var("NATEMU_ANSWER_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return mb << 20;
+    }
+    let mut mem: u64 = 0;
+    let mut len = size_of::<u64>();
+    // SAFETY: `hw.memsize` is a u64; `len` its size.
+    let ok = unsafe {
+        libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut mem).cast(), &mut len, std::ptr::null_mut(), 0)
+    } == 0;
+    let host = if ok { mem as usize } else { 8 << 30 };
+    (1usize << 30).min(host / 16)
+}
+/// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the caps.
 const SHARDS: usize = 16;
 /// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
 /// bytes before the compile's extent (`whole`: the extent reached their end, so their length matters too); `owner`: the vCPU
@@ -2586,7 +2600,9 @@ pub(crate) mod why {
     pub const MOVE_REFUSED: usize = 9;
     /// An object the host translates again with fewer instructions ([`crate::admission::retry`]): never admitted.
     pub const RETRY: usize = 10;
-    pub const NAMES: [&str; 11] = [
+    /// The first use of an answer moved from another page offset ([`Answers::find_moved`]).
+    pub const MOVED: usize = 11;
+    pub const NAMES: [&str; 12] = [
         "skipped",
         "fresh",
         "disk",
@@ -2598,6 +2614,7 @@ pub(crate) mod why {
         "short_prefix",
         "move_refused",
         "retry",
+        "moved",
     ];
 }
 /// An answer's admitted form (its record without the object, which [`crate::relocation::resolved`] gives back) and the
@@ -2648,92 +2665,159 @@ impl Entry {
             }
     }
 }
-/// One shard of the kept answers in two generations ([`Shard::insert`]): `cache` the newer (`cached` entries), `old` the older.
+/// A kept answer in its shard ([`Shard`]): `used`, the shard's insert count when it was kept or last found; `hit`, found
+/// since it was kept.
+struct Slot {
+    entry: Arc<Entry>,
+    used: u64,
+    hit: bool,
+    /// The prefix's length and its bytes after the lead ([`tail`]), so a lookup passes over an answer for other bytes without
+    /// reading the answer.
+    len: u32,
+    tail: u64,
+}
+/// The (up to) 8 bytes after the lead [`LEAD`] of `bytes`, cut to `len`, as a little-endian word.
+fn tail(bytes: &[u8], len: usize) -> u64 {
+    let end = len.min(bytes.len()).min(LEAD + 8);
+    let mut w = [0u8; 8];
+    if end > LEAD {
+        w[..end - LEAD].copy_from_slice(&bytes[LEAD..end]);
+    }
+    u64::from_le_bytes(w)
+}
+/// One shard of the kept answers, bounded by a sweep ([`Shard::sweep`]): when its answers or their bytes pass the shard's
+/// share of the cap, the lowest-ranked go until a quarter of the cap is free. Rank: `used`, plus a bonus of half the
+/// answers kept for one found since it was kept, so an answer used again outlives the many never used again (on
+/// Speedometer two thirds of the answers are never found again: a two-generation flip dropped the reused third with them).
 #[derive(Default)]
 struct Shard {
     cache: Cache,
-    old: Cache,
-    cached: usize,
-    cached_bytes: usize,
+    /// Per (limit word, RIP word) of a key, the answers kept under each lead length, so a lookup probes the map only for
+    /// lengths some answer has there (a small map that stays in cache; a miss usually costs no map probe).
+    lens: HashMap<(u64, u64), [u32; LEAD + 1], Universal>,
+    count: usize,
+    bytes: usize,
+    clock: u64,
+    /// Sweeps made and the answers they dropped (the tests look at them).
+    #[cfg_attr(not(test), allow(dead_code))]
+    sweeps: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    swept: u64,
 }
 impl Shard {
-    /// The kept answer matching `bytes` at `at` (generation, key, index), from either generation: one kept for that RIP
-    /// itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
-    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once. (`at`: tagged for 32-bit code; a bucket's
-    /// entries have its key's tag.)
+    /// The kept answer matching `bytes` at `at` (key, index): one kept for that RIP itself in any bucket first, then one for
+    /// another RIP. Keys hold the leading bytes the answer read (at most [`LEAD`]), so each length is tried; one pass, each
+    /// bucket looked up once. (`at`: tagged for 32-bit code; a bucket's entries have its key's tag.)
     fn find(
         &self,
         bytes: &[u8],
         at: u64,
         limit: Option<u32>,
         gating: &[u64; GATING],
-    ) -> Option<(bool, Key, usize)> {
+    ) -> Option<(Key, usize)> {
         let mut other = None;
         let rip = untagged(at);
+        let k0 = key(limit, at, &[]);
+        let lens = self.lens.get(&(k0.0, k0.1))?;
         for n in (0..=LEAD.min(bytes.len())).rev() {
+            if lens[n] == 0 {
+                continue;
+            }
             let key = key(limit, at, &bytes[..n]);
-            for newer in [true, false] {
-                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else {
-                    continue;
-                };
-                let mut matching = v
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.matches(bytes, gating));
-                let Some((first, _)) = matching.next() else {
-                    continue;
-                };
-                let own = if v[first].rip == rip {
-                    Some(first)
-                } else {
-                    matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i)
-                };
-                match own {
-                    Some(i) => return Some((newer, key, i)),
-                    None => other = other.or(Some((newer, key, first))),
-                }
+            let Some(v) = self.cache.get(&key) else {
+                continue;
+            };
+            let all = tail(bytes, bytes.len());
+            let mut matching = v.iter().enumerate().filter(|(_, s)| {
+                let len = s.len as usize;
+                let n = len.min(LEAD + 8).saturating_sub(LEAD);
+                let mask = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+                len <= bytes.len() && all & mask == s.tail && s.entry.matches(bytes, gating)
+            });
+            let Some((first, _)) = matching.next() else {
+                continue;
+            };
+            let own = if v[first].entry.rip == rip {
+                Some(first)
+            } else {
+                matching.find(|(_, s)| s.entry.rip == rip).map(|(i, _)| i)
+            };
+            match own {
+                Some(i) => return Some((key, i)),
+                None => other = other.or(Some((key, first))),
             }
         }
         other
     }
-    fn at(&self, (newer, key, i): (bool, Key, usize)) -> &Arc<Entry> {
-        &(if newer { &self.cache } else { &self.old })[&key][i]
+    fn at(&self, (key, i): (Key, usize)) -> &Arc<Entry> {
+        &self.cache[&key][i].entry
     }
-    /// The entry [`Shard::find`] gave; one in the older generation moves to the newer (with the generation it may drop,
-    /// [`Shard::insert`]).
-    fn take(
-        &mut self,
-        (newer, key, i): (bool, Key, usize),
-        limit: Option<u32>,
-    ) -> (Arc<Entry>, Option<Cache>) {
-        if newer {
-            return (self.cache[&key][i].clone(), None);
-        }
-        let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
-        let dropped = self.insert(limit, entry.clone());
-        (entry, dropped)
+    /// The entry [`Shard::find`] gave, marked found now.
+    fn take(&mut self, (key, i): (Key, usize)) -> Arc<Entry> {
+        let clock = self.clock;
+        let s = &mut self.cache.get_mut(&key).unwrap()[i];
+        (s.used, s.hit) = (clock, true);
+        s.entry.clone()
     }
-    /// Keeps `entry` in the newer generation; when that holds a [`SHARDS`]th of [`GENERATION`] answers or of
-    /// [`GENERATION_BYTES`] it becomes the older one (the older is dropped): every answer used or made in the shard's last
-    /// generation is kept, at most twice the bound (2 x 512 MiB over the shards). Returns the dropped generation, for the
-    /// caller to free after unlocking the shard (up to 16 k answers).
-    fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>) -> Option<Cache> {
-        let mut dropped = None;
-        if self.cached >= GENERATION / SHARDS || self.cached_bytes >= GENERATION_BYTES / SHARDS {
-            dropped = Some(std::mem::replace(
-                &mut self.old,
-                std::mem::take(&mut self.cache),
-            ));
-            (self.cached, self.cached_bytes) = (0, 0);
-        }
+    /// Keeps `entry`; past `cap` (the shard's bytes and answers) sweeps. Returns the answers dropped with their limits, for the
+    /// caller to free after unlocking the shard.
+    fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>, cap: (usize, usize)) -> Vec<(Option<u32>, Arc<Entry>)> {
         let key = key(
             limit,
             entry.rip | entry.tag,
             &entry.prefix[..LEAD.min(entry.prefix.len())],
         );
-        self.cached_bytes += entry.size();
-        self.cache.entry(key).or_default().push(entry);
-        self.cached += 1;
+        self.clock += 1;
+        self.bytes += entry.size();
+        self.count += 1;
+        self.lens.entry((key.0, key.1)).or_default()[LEAD.min(entry.prefix.len())] += 1;
+        let (len, tail) = (entry.prefix.len() as u32, tail(&entry.prefix, entry.prefix.len()));
+        self.cache.entry(key).or_default().push(Slot { entry, used: self.clock, hit: false, len, tail });
+        if self.bytes > cap.0 || self.count > cap.1 {
+            self.sweep(cap)
+        } else {
+            Vec::new()
+        }
+    }
+    /// Drops the lowest-ranked answers until at most three quarters of `cap` (bytes, answers) are kept.
+    fn sweep(&mut self, cap: (usize, usize)) -> Vec<(Option<u32>, Arc<Entry>)> {
+        let bonus = self.count as u64 / 2;
+        let rank = |s: &Slot| s.used + if s.hit { bonus } else { 0 };
+        let mut ranks: Vec<(u64, usize)> = self.cache.values().flatten().map(|s| (rank(s), s.entry.size())).collect();
+        ranks.sort_unstable();
+        let (want_bytes, want_count) = (cap.0 / 4 * 3, cap.1 / 4 * 3);
+        let (mut bytes, mut count, mut below) = (self.bytes, self.count, 0);
+        for &(r, size) in &ranks {
+            if bytes <= want_bytes && count <= want_count {
+                break;
+            }
+            (bytes, count, below) = (bytes - size, count - 1, r + 1);
+        }
+        let mut dropped = Vec::new();
+        self.cache.retain(|k, v| {
+            let limit = (k.0 != 1 << 32).then_some(k.0 as u32);
+            let mut i = 0;
+            while i < v.len() {
+                if rank(&v[i]) < below {
+                    dropped.push((limit, v.swap_remove(i).entry));
+                } else {
+                    i += 1;
+                }
+            }
+            !v.is_empty()
+        });
+        for (limit, e) in &dropped {
+            self.bytes -= e.size();
+            let k = key(*limit, e.rip | e.tag, &[]);
+            let lens = self.lens.get_mut(&(k.0, k.1)).unwrap();
+            lens[LEAD.min(e.prefix.len())] -= 1;
+            if lens.iter().all(|&n| n == 0) {
+                self.lens.remove(&(k.0, k.1));
+            }
+        }
+        self.count -= dropped.len();
+        self.sweeps += 1;
+        self.swept += dropped.len() as u64;
         dropped
     }
 }
@@ -2750,16 +2834,156 @@ pub struct Answers {
     /// PIC study: the fingerprints ([`Entry::fingerprint`]) of the answers dropped with a generation, with their owners, until
     /// compiled again ([`Answers::recompiled`]).
     dropped: Mutex<HashMap<u64, u8>>,
+    /// The caps over all shards: bytes and answers ([`cap_bytes`], [`CAP_ANSWERS`]).
+    cap: (usize, usize),
+    /// The moved index: the answers [`movable`] to another page offset, by limit, half and up to [`MOVED_LEAD`] lead bytes
+    /// ([`moved_key`]), in shards by that key ([`Answers::find_moved`]). An answer is in it while its shard keeps it.
+    moved: [Mutex<HashMap<MovedKey, Vec<MovedSlot>, Universal>>; SHARDS],
+    /// The lead lengths kept, as masks with no lock: lengths 4 to 16 by a hash of (limit, half, first four bytes) in
+    /// [`MOVED_MASKS`] words, lengths 1 to 3 by one of (limit, half, first byte) in [`MOVED_SHORT`] (bits are never
+    /// cleared; a stale or shared one costs a probe).
+    moved_masks: Box<[AtomicU32]>,
+    moved_short: Box<[AtomicU32]>,
+}
+/// A moved index entry: the answer, and its prefix's length and hash ([`fnv`]), compared before the answer is read.
+struct MovedSlot {
+    len: u32,
+    hash: u64,
+    entry: Arc<Entry>,
+}
+/// FNV-1a over `bytes`, from `h` (the offset basis for a fresh hash): a lookup extends it a byte at a time.
+fn fnv(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+thread_local! {
+    /// FNV-1a of each prefix of a lookup's bytes (index n: the first n bytes), extended as needed.
+    static PREFIX_HASHES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+const MOVED_MASKS: usize = 1 << 20;
+const MOVED_SHORT: usize = 1 << 12;
+/// The moved masks' slot of `lead` (its first four bytes, or the first one) under `limit` and `half`, among `n` slots.
+fn moved_slot(limit: Option<u32>, half: u64, lead: &[u8], n: usize) -> usize {
+    let mut w = [0u8; 4];
+    w[..lead.len()].copy_from_slice(lead);
+    let x = (limit.map_or(1 << 32, u64::from) | half << 33 | (lead.len() as u64) << 40) ^ u64::from(u32::from_le_bytes(w)) << 20;
+    (x.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - n.trailing_zeros())) as usize
+}
+/// The lead bytes of the moved index's keys.
+const MOVED_LEAD: usize = 16;
+type MovedKey = (u64, u64, u64);
+fn moved_key(limit: Option<u32>, half: u64, lead: &[u8]) -> MovedKey {
+    let mut w = [0u8; MOVED_LEAD];
+    w[..lead.len()].copy_from_slice(lead);
+    (
+        limit.map_or(1 << 32, u64::from) | half << 33 | (lead.len() as u64) << 40,
+        u64::from_le_bytes(w[..8].try_into().unwrap()),
+        u64::from_le_bytes(w[8..].try_into().unwrap()),
+    )
+}
+/// An answer that may serve another page offset ([`crate::relocation::object_moved`]): 64-bit code's object, not cut by the
+/// end of the bytes it was given (`whole`), whose prefix lies in its page.
+fn movable(e: &Entry) -> bool {
+    e.tag == 0
+        && !e.whole
+        && !e.prefix.is_empty()
+        && matches!(e.answer, Answer::Object(_))
+        && (e.rip & 0xfff) as usize + e.prefix.len() <= 4096
 }
 impl Answers {
     pub(crate) fn new(supported: u64) -> Arc<Self> {
+        Self::with_cap(supported, cap_bytes(), CAP_ANSWERS)
+    }
+    /// With the caps `bytes` and `answers` over all shards.
+    pub(crate) fn with_cap(supported: u64, bytes: usize, answers: usize) -> Arc<Self> {
         Arc::new(Self {
             supported,
             pick: Universal::default(),
             shards: std::array::from_fn(|_| Mutex::default()),
             waits: Default::default(),
             dropped: Mutex::default(),
+            cap: (bytes, answers),
+            moved: std::array::from_fn(|_| Mutex::default()),
+            moved_masks: (0..MOVED_MASKS).map(|_| AtomicU32::new(0)).collect(),
+            moved_short: (0..MOVED_SHORT).map(|_| AtomicU32::new(0)).collect(),
         })
+    }
+    fn moved_shard(&self, k: &MovedKey) -> usize {
+        std::hash::BuildHasher::hash_one(&self.pick, k) as usize % SHARDS
+    }
+    /// An answer kept at another page offset whose bytes are `bytes`' (and gating values `gating`'s), for `rip`: one whose
+    /// prefix fits in `rip`'s page, under the same limit and half.
+    fn find_moved(&self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<Arc<Entry>> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let half = rip >> 63;
+        let long = if bytes.len() >= 4 {
+            self.moved_masks[moved_slot(limit, half, &bytes[..4], MOVED_MASKS)].load(Relaxed)
+        } else {
+            0
+        };
+        let short = |n: usize| self.moved_short[moved_slot(limit, half, &bytes[..n.min(2)], MOVED_SHORT)].load(Relaxed);
+        let masks = long & !0xf | short(1) & 0x2 | if bytes.len() >= 2 { short(2) & 0xc } else { 0 };
+        let room = 4096 - (rip & 0xfff) as usize;
+        let most = room.min(bytes.len());
+        PREFIX_HASHES.with(|hs| {
+            let mut hs = hs.borrow_mut();
+            hs.clear();
+            hs.push(FNV_BASIS);
+            for n in (1..=MOVED_LEAD.min(bytes.len())).rev() {
+                if masks & 1 << n == 0 {
+                    continue;
+                }
+                let k = moved_key(limit, half, &bytes[..n]);
+                let m = self.moved[self.moved_shard(&k)].lock().unwrap_or_else(|e| e.into_inner());
+                let Some(v) = m.get(&k) else { continue };
+                for s in v {
+                    let len = s.len as usize;
+                    if len > most || (n < MOVED_LEAD && len != n) {
+                        continue;
+                    }
+                    while hs.len() <= len {
+                        let (i, h) = (hs.len(), *hs.last().unwrap());
+                        hs.push(fnv(h, &bytes[i - 1..i]));
+                    }
+                    if hs[len] != s.hash {
+                        continue;
+                    }
+                    if s.entry.matches(bytes, gating) {
+                        return Some(s.entry.clone());
+                    }
+                }
+            }
+            None
+        })
+    }
+    fn moved_add(&self, limit: Option<u32>, e: &Arc<Entry>) {
+        let n = MOVED_LEAD.min(e.prefix.len());
+        let (half, lead) = (e.rip >> 63, &e.prefix[..n]);
+        if n >= 4 {
+            self.moved_masks[moved_slot(limit, half, &lead[..4], MOVED_MASKS)].fetch_or(1 << n, Relaxed);
+        } else {
+            self.moved_short[moved_slot(limit, half, &lead[..n.min(2)], MOVED_SHORT)].fetch_or(1 << n, Relaxed);
+        }
+        let k = moved_key(limit, half, lead);
+        let slot = MovedSlot { len: e.prefix.len() as u32, hash: fnv(FNV_BASIS, &e.prefix), entry: e.clone() };
+        self.moved[self.moved_shard(&k)].lock().unwrap_or_else(|e| e.into_inner()).entry(k).or_default().push(slot);
+    }
+    fn moved_remove(&self, limit: Option<u32>, e: &Arc<Entry>) {
+        let n = MOVED_LEAD.min(e.prefix.len());
+        let k = moved_key(limit, e.rip >> 63, &e.prefix[..n]);
+        let mut m = self.moved[self.moved_shard(&k)].lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = m.get_mut(&k) {
+            v.retain(|x| !Arc::ptr_eq(&x.entry, e));
+            if v.is_empty() {
+                m.remove(&k);
+            }
+        }
+    }
+    /// Each shard's share of the caps.
+    fn shard_cap(&self) -> (usize, usize) {
+        (self.cap.0 / SHARDS, self.cap.1 / SHARDS)
     }
     /// The shard of `limit` and `rip`, locked, and the nanoseconds waited for it.
     fn lock(&self, limit: Option<u32>, rip: u64) -> (std::sync::MutexGuard<'_, Shard>, u64) {
@@ -2791,9 +3015,7 @@ impl Answers {
         let Some(f) = shard.find(bytes, rip, limit, gating) else {
             return (None, waited);
         };
-        let (entry, dropped) = shard.take(f, limit);
-        drop(shard);
-        self.forget(dropped); // freed unlocked
+        let entry = shard.take(f);
         (Some(entry), waited)
     }
     /// Keeps `entry`, made for `bytes` at `rip`; returns the owner of a matching answer the map held already (perf chunk 13:
@@ -2805,25 +3027,54 @@ impl Answers {
         bytes: &[u8],
         rip: u64,
     ) -> (Option<u8>, u64) {
+        self.insert_with(limit, entry, bytes, rip, true)
+    }
+    /// [`Answers::insert`]; `index`: also in the moved index when [`movable`] (not for a moved answer's copy, whose
+    /// original is there).
+    fn insert_with(
+        &self,
+        limit: Option<u32>,
+        entry: Arc<Entry>,
+        bytes: &[u8],
+        rip: u64,
+        index: bool,
+    ) -> (Option<u8>, u64) {
+        // Indexed before its shard keeps it: a sweep (of another thread's insert) can then never drop it unindexed, which
+        // would leave it in the index for good. (Found there first, it is an answer as any: only kept a moment sooner.)
+        if index && movable(&entry) {
+            self.moved_add(limit, &entry);
+        }
         let (mut shard, waited) = self.lock(limit, rip);
         let held = shard
             .find(bytes, rip, limit, &entry.gating)
             .map(|f| shard.at(f).owner);
-        let dropped = shard.insert(limit, entry);
+        let dropped = shard.insert(limit, entry, self.shard_cap());
         drop(shard);
         self.forget(dropped); // freed unlocked
         (held, waited)
     }
-    /// Notes the fingerprints of a dropped generation's answers, then frees them.
-    fn forget(&self, dropped: Option<Cache>) {
-        let Some(d) = dropped else { return };
-        let mut set = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
-        for (k, v) in &d {
-            let limit = (k.0 != 1 << 32).then_some(k.0 as u32);
-            for e in v {
-                set.insert(e.fingerprint(limit), e.owner);
+    /// Notes the fingerprints of a sweep's dropped answers, then frees them.
+    fn forget(&self, dropped: Vec<(Option<u32>, Arc<Entry>)>) {
+        if dropped.is_empty() {
+            return;
+        }
+        for (limit, e) in &dropped {
+            if movable(e) {
+                self.moved_remove(*limit, e);
             }
         }
+        let mut set = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        for (limit, e) in &dropped {
+            set.insert(e.fingerprint(*limit), e.owner);
+        }
+    }
+    /// Sweeps and the answers they dropped, over the shards (the tests').
+    #[cfg(test)]
+    fn sweeps(&self) -> (u64, u64) {
+        self.shards.iter().fold((0, 0), |(n, d), s| {
+            let s = s.lock().unwrap_or_else(|e| e.into_inner());
+            (n + s.sweeps, d + s.swept)
+        })
     }
     /// PIC study: `entry`, just compiled, is an answer the map dropped: the owner of the dropped one.
     fn recompiled(&self, limit: Option<u32>, entry: &Entry) -> Option<u8> {
@@ -2837,9 +3088,9 @@ impl Answers {
     fn kept(&self) -> (usize, usize) {
         self.shards.iter().fold((0, 0), |(b, n), s| {
             let s = s.lock().unwrap_or_else(|e| e.into_inner());
-            let all = || s.cache.values().chain(s.old.values()).flatten();
+            let all = || s.cache.values().flatten();
             (
-                b + all().map(|e| e.size()).sum::<usize>(),
+                b + all().map(|e| e.entry.size()).sum::<usize>(),
                 n + all().count(),
             )
         })
@@ -3349,6 +3600,18 @@ impl Compiler {
                 return Ok(code);
             }
         }
+        // Nothing kept at this half and page offset (64-bit code): an answer for the same bytes at another page offset,
+        // moved here.
+        if found.is_none() && !self.bits32 {
+            let t = self.stamp();
+            let moved = self.answers.find_moved(bytes, rip, limit, &gating);
+            self.charge(crate::perf::LOOKUP, t);
+            if let Some(e) = moved {
+                if let Some(code) = self.moved_hit(&e, bytes, rip, limit, hook)? {
+                    return Ok(code);
+                }
+            }
+        }
         // Nothing kept, or an answer kept for another RIP that is not fexc's here: the persistent cache only in the first
         // case (it is keyed as memory is, so it would hold the same answer).
         let mut disk = found.is_none();
@@ -3441,6 +3704,65 @@ impl Compiler {
                 None => disk = false,
             }
         }
+    }
+    /// `e`, kept at another page offset, as fexc's answer at `rip` ([`crate::relocation::object_moved`]): admitted at `rip`
+    /// and kept as its own answer there, so later hits there skip admission. `None`: the move or admission refused it
+    /// (logged): compile. Under the reuse check (`check_reuse`) the moved answer must equal fexc's own at `rip`, and a
+    /// refusal is an error.
+    fn moved_hit(
+        &mut self,
+        e: &Arc<Entry>,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        hook: &mut impl Hook,
+    ) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
+        let Answer::Object(o) = &e.answer else { return Ok(None) };
+        let t = self.stamp();
+        let Some(object) = crate::relocation::object_moved(o, e.rip, rip) else {
+            return Ok(None);
+        };
+        self.charge(crate::perf::RELOCATE, t);
+        let answer = Answer::Object(object);
+        if self.check_reuse {
+            self.check(&answer, (e.read, e.whole, e.prefix.len()), bytes, rip, limit, e.rip, hook)?;
+        }
+        let entry = Arc::new(Entry {
+            rip,
+            tag: 0,
+            owner: self.vcpu,
+            read: e.read,
+            gating: self.gating(),
+            prefix: e.prefix.clone(),
+            whole: e.whole,
+            answer,
+            kept: Default::default(),
+            published: AtomicU64::new(0),
+        });
+        let t = self.stamp();
+        let code = match self.answered(&entry.answer, bytes, rip, hook, Some(&entry), Some(why::MOVED)) {
+            Ok(code) => code,
+            Err(err) if self.check_reuse => return Err(err),
+            Err(err) => {
+                eprintln!("natemu: the answer moved from {:#x} to {rip:#x} was refused ({err}); compiled at {rip:#x}", e.rip);
+                return Ok(None);
+            }
+        };
+        self.charge(crate::perf::ADMIT, t);
+        let (_, waited) = self.answers.insert_with(limit, entry.clone(), bytes, rip, false);
+        self.waited(waited);
+        self.hits += 1;
+        self.hits_by_source[usize::from(e.owner)] += 1;
+        self.read = entry.prefix.len();
+        self.guess_read = false;
+        if let Some(r) = &mut self.perf {
+            r.sources[0] += 1;
+            r.read = (hash(&entry.prefix), entry.prefix.len() as u32);
+        }
+        if self.pool.is_some() {
+            self.last = Some(entry);
+        }
+        Ok(Some(code))
     }
     fn waited(&mut self, ns: u64) {
         if ns > 0 {
@@ -5373,10 +5695,14 @@ mod tests {
 
     /// Changes every answer `c` keeps (no other reference is held between compiles).
     fn edit(c: &mut Compiler, f: impl Fn(&mut Entry)) {
+        // (The moved index's references go: the answers are changed in place.)
+        for m in &c.answers.moved {
+            m.lock().unwrap().clear();
+        }
         for s in &c.answers.shards {
             let s = &mut *s.lock().unwrap();
-            for e in s.cache.values_mut().chain(s.old.values_mut()).flatten() {
-                f(Arc::get_mut(e).unwrap());
+            for e in s.cache.values_mut().flatten() {
+                f(Arc::get_mut(&mut e.entry).unwrap());
             }
         }
     }
@@ -5577,7 +5903,7 @@ mod tests {
             let retry = Entry { answer: Answer::Object(spill), ..kept_entry(USER.len()) };
             run(&c, &retry, &retry.answer, A.1, None);
             let counts: Vec<u64> = c.admissions.iter().map(|n| n.get()).collect();
-            assert_eq!(counts, [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "{:?}", why::NAMES);
+            assert_eq!(counts, [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0], "{:?}", why::NAMES);
             assert_eq!(counts.iter().sum::<u64>(), calls);
         }
 
@@ -5722,11 +6048,12 @@ mod tests {
         assert_eq!(owner(&[1, 2, 3, 4, 5], 0x5100, None, &g), Some((0, 0x1100)));
     }
 
-    /// Perf chunk 13: an answer dropped from the map by later inserts (two generation flips of its shard) between a lookup
-    /// and its use stays whole for the holder; the map no longer finds it.
+    /// Perf chunk 13: an answer dropped from the map by later inserts (sweeps of its shard) between a lookup and its use stays
+    /// whole for the holder; the map no longer finds it.
     #[test]
     fn an_answer_evicted_between_lookup_and_use_stays_whole() {
-        let a = Answers::new(u64::MAX);
+        const CAP: usize = 64;
+        let a = Answers::with_cap(u64::MAX, usize::MAX, SHARDS * CAP);
         let g = [0; GATING];
         a.insert(
             None,
@@ -5736,7 +6063,7 @@ mod tests {
         );
         let held = hit(&a, &[0xaa; 32], 0x1100, None, &g).unwrap();
         // Same limit and page offset: the same shard; distinct bytes.
-        for i in 0..2 * GENERATION / SHARDS + 1 {
+        for i in 0..8 * CAP {
             let b = (i as u64).to_le_bytes();
             a.insert(
                 None,
@@ -5758,9 +6085,9 @@ mod tests {
     /// a reference held across the flips stays whole, and the shard stays within its bound.
     #[test]
     fn shared_answers_under_concurrent_insert_lookup_and_eviction() {
-        let a = Answers::new(u64::MAX);
+        let bound = 1024;
+        let a = Answers::with_cap(u64::MAX, usize::MAX, SHARDS * bound);
         let g = [0; GATING];
-        let bound = GENERATION / SHARDS;
         // The lead bytes are the count's, so the keys differ (no long bucket); the thread's number follows.
         let bytes = |t: u64, i: u64| [i.to_le_bytes(), t.to_le_bytes()].concat();
         let rip = |t: u64, i: u64| 0x7f00_0000_0100 + (t << 32) + (i << 12);
@@ -5797,22 +6124,174 @@ mod tests {
             }
         });
         let (_, kept) = a.kept();
-        // 4n = 12 bounds inserted into one shard: it flipped at least four times and keeps at most two generations.
+        // 4n = 12 bounds inserted into one shard: it swept many times and never kept more than its bound.
         assert!(
-            cross.load(Relaxed) > 0 && kept <= 2 * bound && kept < 4 * n as usize,
+            cross.load(Relaxed) > 0 && kept <= bound && kept < 4 * n as usize,
             "{} {kept}",
             cross.load(Relaxed)
         );
         let k = key(None, rip(0, 0), &[]);
         let one = std::hash::BuildHasher::hash_one(&a.pick, (k.0, k.1)) as usize % SHARDS;
         let s = a.shards[one].lock().unwrap();
-        // Since its last flip the shard holds at least a generation's answers (hits only move them to the newer one).
+        // Each sweep leaves three quarters of the bound; the shard holds at least that since its last one.
         assert!(
-            !s.old.is_empty() && s.cached <= bound && kept >= bound,
+            s.sweeps >= 8 && s.count <= bound && s.count >= bound / 4 * 3 && s.count == kept,
             "{} {}",
-            s.old.len(),
-            s.cached
+            s.sweeps,
+            s.count
         );
+    }
+
+    /// The sweep drops the answers never found before one found since it was kept, though that one is older.
+    #[test]
+    fn a_found_answer_outlives_answers_never_found() {
+        const CAP: usize = 64;
+        let a = Answers::with_cap(u64::MAX, usize::MAX, SHARDS * CAP);
+        let g = [0; GATING];
+        // Same limit and page offset: one shard.
+        let put = |i: u64| {
+            let b = [i.to_le_bytes(), [0x5a; 8]].concat();
+            a.insert(None, entry(0x1100 + (i << 12), 0, &b, 0, g), &b, 0x1100);
+            b
+        };
+        let found = put(0);
+        assert!(hit(&a, &found, 0x1100, None, &g).is_some());
+        let never = put(1);
+        for i in 2..=CAP as u64 {
+            put(i);
+        }
+        // CAP + 1 kept: the sweep keeps three quarters.
+        let s = a.sweeps();
+        assert_eq!(s, (1, (CAP + 1 - CAP / 4 * 3) as u64));
+        assert!(hit(&a, &found, 0x1100, None, &g).is_some(), "the answer found was dropped");
+        assert!(hit(&a, &never, 0x1100, None, &g).is_none(), "an older answer never found was kept");
+    }
+
+    /// The bytes kept stay within the byte cap, sweeping to three quarters of it.
+    #[test]
+    fn the_byte_cap_bounds_the_kept_bytes() {
+        let g = [0; GATING];
+        let size = entry(0x1100, 0, &[0; 16], 0, g).size();
+        let cap = SHARDS * 20 * size;
+        let a = Answers::with_cap(u64::MAX, cap, usize::MAX);
+        for i in 0..200u64 {
+            let b = [i.to_le_bytes(), [7; 8]].concat();
+            a.insert(None, entry(0x1100 + (i << 12), 0, &b, 0, g), &b, 0x1100);
+            let (bytes, _) = a.kept();
+            assert!(bytes <= cap / SHARDS, "{bytes} kept, cap {}", cap / SHARDS);
+        }
+        let (bytes, n) = a.kept();
+        assert!(a.sweeps().0 >= 5 && bytes >= cap / SHARDS / 4 * 3 - size && n >= 14, "{bytes} {n}");
+        // The default: at most 1 GiB, and at least a sixteenth of an 8 GiB host's memory.
+        if std::env::var_os("NATEMU_ANSWER_CACHE_MB").is_none() {
+            assert!(cap_bytes() <= 1 << 30 && cap_bytes() >= 512 << 20, "{}", cap_bytes());
+        }
+    }
+
+    /// The moved index finds an answer's bytes at another page offset when they lie in the page there, under the
+    /// same limit and half; never an answer cut by the end of its bytes or of 32-bit code; a sweep's dropped answer leaves it.
+    #[test]
+    fn the_moved_index_finds_bytes_at_another_page_offset_within_the_page() {
+        let a = Answers::with_cap(u64::MAX, usize::MAX, SHARDS * 64);
+        let g = [0; GATING];
+        let b: Vec<u8> = (1..=20).collect();
+        a.insert(None, entry(0x7f00_0000_1100, 0, &b, 0, g), &b, 0x7f00_0000_1100);
+        let at = |bytes: &[u8], rip, limit| a.find_moved(bytes, rip, limit, &g).map(|e| (e.owner, e.rip));
+        assert_eq!(at(&b, 0x7f00_0005_2340, None), Some((0, 0x7f00_0000_1100)));
+        assert_eq!(at(&b, 0x7f00_0005_2ff0, None), None, "20 bytes from 0xff0 cross the page");
+        assert!(at(&[&b[..], &[9, 9]].concat(), 0x7f00_0005_2340, None).is_some());
+        let mut other = b.clone();
+        other[17] ^= 1;
+        assert_eq!(at(&other, 0x7f00_0005_2340, None), None);
+        assert_eq!(at(&b, 0xffff_8000_0000_2340, None), None);
+        assert_eq!(at(&b, 0x7f00_0005_2340, Some(3)), None);
+        a.insert(None, entry(0x7f00_0000_3200, 1, &[0xc3], 0, g), &[0xc3], 0x7f00_0000_3200);
+        assert_eq!(at(&[0xc3, 0, 0], 0x7f00_0005_4567, None), Some((1, 0x7f00_0000_3200)));
+        let whole = Entry { whole: true, ..Arc::into_inner(entry(0x7f00_0000_5100, 2, &[7; 8], 0, g)).unwrap() };
+        a.insert(None, Arc::new(whole), &[7; 8], 0x7f00_0000_5100);
+        assert_eq!(at(&[7; 8], 0x7f00_0005_6200, None), None);
+        let tag = tag32([false; 4], [false; 2], 0).unwrap();
+        let e32 = Entry { tag, ..Arc::into_inner(entry(0x40_7100, 2, &[6; 8], 0, g)).unwrap() };
+        a.insert(None, Arc::new(e32), &[6; 8], 0x40_7100 | tag);
+        assert_eq!(at(&[6; 8], 0x7f00_0005_6200, None), None);
+        for i in 0..4 * 64u64 {
+            let x = [i.to_le_bytes(), [1; 8]].concat();
+            a.insert(None, entry(0x7f00_0000_1100 + ((i + 1) << 12), 3, &x, 0, g), &x, 0x7f00_0000_1100);
+        }
+        assert!(hit(&a, &b, 0x7f00_0000_1100, None, &g).is_none(), "still kept");
+        assert_eq!(at(&b, 0x7f00_0005_2340, None), None, "the index kept a dropped answer");
+    }
+
+    /// The lookup filters: the lookup finds answers of every lead length at one key, and among answers with the same lead the one
+    /// whose later bytes are the request's (the inline tail), before and after sweeps.
+    #[test]
+    fn the_lookup_finds_every_lead_length_and_tells_later_bytes_apart() {
+        let a = Answers::with_cap(u64::MAX, usize::MAX, SHARDS * 64);
+        let g = [0; GATING];
+        let put = |owner: u8, prefix: &[u8], rip: u64| a.insert(None, entry(rip, owner, prefix, 0, g), prefix, rip);
+        for n in 1..=4u8 {
+            put(n, &(1..=n).collect::<Vec<u8>>(), 0x1100 + (u64::from(n) << 12));
+        }
+        // Same lead (5, 6, 7, 8), differing at byte 9 (in the tail word) and at byte 13 (past it).
+        put(20, &[5, 6, 7, 8, 9, 9, 9, 9, 9, 1, 0, 0, 0, 0], 0x9100);
+        put(21, &[5, 6, 7, 8, 9, 9, 9, 9, 9, 2, 0, 0, 0, 0], 0xa100);
+        put(22, &[5, 6, 7, 8, 9, 9, 9, 9, 9, 2, 0, 0, 0, 7], 0xb100);
+        let owner = |bytes: &[u8]| hit(&a, bytes, 0x1100, None, &g).map(|e| e.owner);
+        for round in 0..2 {
+            assert_eq!(owner(&[1]), Some(1));
+            assert_eq!(owner(&[1, 2, 0xff]), Some(2));
+            assert_eq!(owner(&[1, 2, 3, 0xff]), Some(3));
+            assert_eq!(owner(&[1, 2, 3, 4, 5, 6, 7]), Some(4));
+            assert_eq!(owner(&[5, 6, 7, 8, 9, 9, 9, 9, 9, 1, 0, 0, 0, 0, 5]), Some(20));
+            assert_eq!(owner(&[5, 6, 7, 8, 9, 9, 9, 9, 9, 2, 0, 0, 0, 7]), Some(22));
+            assert_eq!(owner(&[5, 6, 7, 8, 9, 9, 9, 9, 9, 3, 0, 0, 0, 0]), None);
+            assert_eq!(owner(&[2, 2]), None);
+            if round == 0 {
+                // Past the shard's cap with answers never found: one sweep, and the ones found above stay.
+                for i in 0..60u64 {
+                    let x = [[0xee; 4], (i as u32).to_le_bytes()].concat();
+                    put(30, &x, 0x1100 + ((i + 20) << 12));
+                }
+                assert_eq!(a.sweeps().0, 1);
+            }
+        }
+    }
+
+    /// With `FEXC` set: an answer kept at one page offset serves another, moved, admitted there and kept, under the reuse
+    /// check (fexc's own compile there must equal it); one whose bytes would cross the page there is compiled.
+    #[test]
+    fn answers_move_to_another_page_offset() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let answers = std::sync::OnceLock::new();
+        // The block (it ends at its call) and bytes after it, as a page's rest: its answer did not read to the end of its bytes.
+        let user = [&include_bytes!("../tests/relocation/user.src")[..], &[0xcc; 16]].concat();
+        let run = |v: u8, rip: u64| {
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            (c.vcpu, c.check_reuse) = (v, true);
+            c.share(&answers);
+            let Code::Block(b) = c.compile(&user, rip, false, &mut ()).unwrap() else {
+                panic!("no block")
+            };
+            let n: Vec<u64> = c.admissions.iter().map(|n| n.get()).collect();
+            (b, c.compiles, c.hits, c.reuse_checks, n)
+        };
+        let (a, ..) = std::thread::scope(|s| s.spawn(|| run(0, 0x7f12_3456_7100)).join().unwrap());
+        let (b, compiles, hits, checks, n) =
+            std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8340)).join().unwrap());
+        assert_eq!(
+            (b.guest_insns, compiles, hits, checks, n[why::MOVED]),
+            (a.guest_insns, 0, 1, 1, 1)
+        );
+        assert_ne!(a.object, b.object);
+        // Kept at its new RIP: found there again, its kept form reused (no admission).
+        let (_, compiles, hits, _, n) =
+            std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8340)).join().unwrap());
+        assert_eq!((compiles, hits, n[why::MOVED], n[why::SKIPPED]), (0, 1, 0, 1));
+        let (_, compiles, _, _, n) =
+            std::thread::scope(|s| s.spawn(|| run(2, 0x7f12_3456_9ff0)).join().unwrap());
+        assert_eq!((compiles, n[why::MOVED]), (1, 0));
     }
 
     /// With `FEXC` set (perf chunk 13): two compilers sharing one map on two threads: the second's request at another RIP is
