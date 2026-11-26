@@ -404,8 +404,23 @@ to first window:
 
 - **Konsole warm, by bucket:** `pool` 0.353 → 0.100 s, `host` 0.177 → 0.094 s, `miss` 0.114 → 0.036 s, `link` 0.152 →
   0.095 s.
-- **Dolphin warm:** 21,622 → 73,036 translation requests. It is outside its earlier range (1.04-1.23 s), so it is run
-  again (run 20261126-034139-bb8f) before any reading of it.
+- **Dolphin warm, run again** (20261126-034139-bb8f): 1.778 s, 114,603 requests. So it repeats, but the cause is
+  where the capacity flushes land, not a dearer warm start:
+  - In bb8f, three of the four vCPUs each make 30-40 k requests inside the 1.8 s window (base: 2-9.5 k each). That is
+    the pattern of the metadata arena filling (`full[1]`) and its flush dropping each vCPU's code at about the same
+    point.
+  - With no instance records the arena fills more slowly (2/2/2/1 flushes per vCPU against 4/3/3/3). The change's
+    second flush falls near the warm Dolphin start, while the base's fell elsewhere (its warm Konsole start has 26 k
+    requests on vCPU 0).
+  - The code area is at its 128 MiB maximum, so the flushes cannot be moved off the case. Single windows are confounded
+    both ways; the whole run is the fair reading.
+  - bb8f's other windows: Konsole cold 1.544 s, warm 1.044 s (base 1.801, 1.176); Dolphin cold 1.342 s (base 1.698).
+- **Whole run** (base, change 6203, change bb8f):
+  - vCPU CPU time: 147.2, 137.1 and 140.2 s (−5 to −7%).
+  - The session's start to ready: 78.3, 71.3 and 73.9 busy vCPU-s.
+  - The four app windows: 19.99, 18.48 and 18.74 busy vCPU-s (−7%).
+  - The UI windows: 24.10, 22.83 and 22.70 busy vCPU-s (−5%).
+  - Translation requests outside the session's start: 1,028,918, 931,834 and 941,015.
 - **Counters per vCPU:**
   - `fkeys.lost` is 0.40-0.45 M of 1.10-1.21 M templates found: the old hint table lost about 35% of them.
   - `fkeys.full` is 0.
