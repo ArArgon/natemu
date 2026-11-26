@@ -502,3 +502,50 @@ CPython build (notes item 34: hit rates 39-53% on sparse windows) need not carry
 | The 16:1 ratio does not mean 16-page groups: a 4 KiB anonymous or shmem write fault maps one page, so at most about 2 installs follow it (the direct-map clear and the user access), about 12% of the 1.26 M. The rest is most likely refills: after CR3 loads (an munmap of more than 33 pages reloads CR3 on every CPU running the mm), per vCPU, after INVLPG region drops and resets, and shmem read fault-around (16 young PTEs). Estimate: W = 16 removes about 55-75% if user space holds most installs, under 20% if direct-map writes dominate (low confidence) | The A/B decides: `--fault-around off` (NATEMU_FAULT_AROUND=off) against the default, judged by retries removed per neighbour installed, `abort` + `shadow`, frames/s. The fill's counters (`k1.fault_around`) give the split by space and leaf kind |
 | Alternatives: (a) 2 MiB shadow blocks for the direct map (legal: one A, one D) need 512 RAM frames untranslated, of one type, none split-held, gpa/IPA congruent modulo 2 MiB, region-granular writable bits and drops: large, pays only if direct-map writes dominate; (b) a sequential ramp (a miss on the first index after a filled window doubles W: 16, 64, 512) for linear buffer sweeps; (c) one shadow walk per abort instead of three `tables::descriptor` walks plus `install`'s, perhaps 10-15% of an abort; (e) batch `unmap_large`'s TLBIs; PCID only removes CR3-load refills entirely | Ranked: chunk 2 as above with `unmap_large` batched (one `dsb ishst`, the region's `tlbi`s, one `dsb ish; isb`); the ramp if retries stay window-bound; (c) as its own item; (a) and lifting 3.6 only if the counters show direct-map writes large; PCID only if refills and `tlb` still dominate after chunk 2 |
 | Nits on the work in progress: the abi module was not declared; `Translation::table == 0` as the 2 MiB discriminator is fragile; `pte`'s CPL 0 grant matches `walk_once` only because the walker refuses CPL 1 and 2 | Fixed: declared; the fill keys on `leaf_bytes`; the CPL note is in `pte`'s comment |
+
+## 10. Chunk 2 as built: the A/B on the M4 (an experiment, November 26, 2026)
+
+Built as section 3 with review 9.1's B1 and B2 (commit `5dc215bb`; the same code on the desktop deploy commit `e86dbab6` is
+`a8c2c924`). The window is 16 pages by default; `--fault-around off` or `NATEMU_FAULT_AROUND=off` turns it off. One run per
+side on the Mac mini M4, both natemu builds through `TESTKIT_BENCH_AT` from the desktop checkout: base `e86dbab6`, change
+`a8c2c924`.
+
+**Desktop** (debug case `desktop-kde-profile`, runs `20261126-024119-6d48` base and `20261126-024151-4352` change):
+
+| window | frames/s | abort ms/frame | shadow ms/frame | abort + shadow vCPU-s | busy vCPU-s |
+| --- | --- | --- | --- | --- | --- |
+| window grow | 9.89 → 10.54 | 10.6 → 6.2 | 8.2 → 10.0 | 0.693 → 0.534 | 5.10 → 4.58 |
+| window move | 9.11 → 9.14 | 7.8 → 4.2 | 5.8 → 6.4 | 0.488 → 0.380 | 2.96 → 2.83 |
+| session start to idle desktop | | | | 8.02 → 5.69 | 78.3 → 80.9 |
+
+- The fill halves the time spent in `abort` in every window and adds about a tenth to `shadow`.
+- The frame rates do not move beyond one run's noise: guest time is half the busy time of a resize frame.
+- The app starts (Konsole and Dolphin, first and second, the `:start` windows) are unchanged within noise. Before and after,
+  in seconds: 1.80 / 1.79, 1.18 / 1.11, 1.70 / 1.68 and 1.04 / 1.12.
+
+Over the whole boot (four vCPUs summed), retries fell from 24.8 M to 10.7 M.
+
+- 6.7 M fills installed 46.4 M neighbours:
+  - 45.5 M in the user space and 0.9 M in the supervisor space;
+  - 9.0 M from 2 MiB leaves;
+  - 28.2 M writable.
+- That is about 3.3 neighbours installed per retry saved.
+- Skipped neighbours:
+  - not present: 17.7 M;
+  - A = 0: 4.9 M;
+  - supervisor neighbours that would have been writable (B2): 7.0 M;
+  - already shadowed: 7.1 M.
+- Upgrades rose from 1.6 k to 15.5 k.
+
+**CPython build** (bench case `io5-solo32`; base `20261126-025007-a3ff`; change `20261126-025007-0dc0`, and
+`20261126-030820-3ab4`, run again because its difference was within the noise). Seconds:
+
+| | 64-bit configure | 64-bit make | i386 configure | i386 make |
+| --- | ---: | ---: | ---: | ---: |
+| base | 52.9 | 85.7 | 57.2 | 104.2 |
+| fault-around, two runs | 50.8, 53.2 | 84.4, 85.0 | 57.4, 56.8 | 107.9, 104.1 |
+
+No step moved beyond the spread of the change's own two runs. Section 5's 1.5-3.5 s on configure is not shown. This
+agrees with chunk 0's count: its windows were sparse there.
+
+Speedometer was not run: the owner moved measurements to the pooled checkpoint branch.
