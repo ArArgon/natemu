@@ -680,3 +680,62 @@ Noted, not changed:
 
 The last two are part of what step 2's direct guarded links remove.
 
+## 10. Step 2 built: the code TLB and guarded absolute user blocks
+
+**What is built, and where it departs from 8.2:**
+
+- **The code TLB:** a 2 MiB block after the data tables (`cache::CTLB`), 32 Ki 8-byte entries, page and frame packed
+  to 48 bits (`ctlb_entry`), and a fill list.
+  - It is mapped EL0 read-only in the user space only, at `ctlb_block` beside the data tables. x28 reaches it at
+    `ctlb_delta`.
+  - It is filled at every `fill_l1` of a current guarded block.
+  - It is emptied at every `tlb` (CR3 load, global flush, `tables_written`) and reset. At INVLPG and #PF the page's
+    slot is emptied, and every slot of the 2 MiB region of a large leaf.
+- **The stub sits before the code** (48 bytes, `GUARD_LEAD`, `Block::guard_entry`), not after the body as 8.4 note 14
+  said. `start()` and `block_at` cover it.
+  - The stub's words come from `natemu_abi::cache::guard_words`.
+  - A unit test decodes them: the add/sub reach on both sides of the alias, the slot, the entry, and the branches.
+  - The host's end-of-run check recomputes every guarded block's stub.
+- **Guarded links live in the LOCAL segment, not a segment of their own.** Their lifecycle is the local links': never
+  undone by a TLB event, undone by either end's death, dropped first by a strict reclaim. The target gets
+  `LOCAL_INBOUND`. They take the place of step 1c's checked form for links from absolute code on another page into a
+  guarded block.
+- **L1 entries:** a guarded block's are not listed for CR3 loads, survive INVLPG (`cut_one`), and go at death, at a
+  table's change of context, or at a global flush. An L1 fill now replaces the way whose tag is the RIP, for every block.
+- **Not placed** under `NATEMU_GUARDS=off`, the reuse check, a page-record check mode or the PIC tests.
+
+**Review (Fable, independent): two blocking defects, both of which halt the vCPU.** Neither runs wrong code.
+
+- **B1:** undoing a guarded link (a death, a flush, a reclaim) halted `BAD_LINK`. Fixed: `unlink_word` accepts the
+  stub branch.
+- **B2:** an interrupt at stub words 0-10 found no block. Fixed: `block_at` looks `GUARD_LEAD` ahead.
+
+The review's SHOULD findings, all fixed:
+
+- **S1:** the host check now takes stub entries with no x87 run-test skip.
+- **S2:** the host mapping test expects the code TLB's block.
+- **S3:** frames stay below 2^28 - 1, so no entry builds as 0.
+- **S4:** the words builder is pure, with its decode test and the host recheck.
+- **S7:** the tag rule applies to every block.
+- **S5 and S6, the tests:**
+  - `guard-flags` gained an OF case;
+  - `guard-hits` bounds the dispatcher misses over K calls against the same run with no guards;
+  - `guard-kill` rewrites the target's frame and flushes, with the guarded link live.
+
+**Tests:**
+
+- The k1 programs, natemu only, CPL 3, without the reuse check: `guard-cr3`, `guard-invlpg`, `guard-flags`,
+  `guard-hits` and `guard-kill`. Each asserts a guarded link and code-TLB fills.
+- Shown to fail when broken (branches `fk-broken-5` to `fk-broken-8`, never merged):
+  - a guard that always hits fails `guard-cr3` and `guard-invlpg`;
+  - a stub that writes NZCV fails `guard-flags`;
+  - no INVLPG clear fails `guard-invlpg`;
+  - a guard that always misses fails `guard-hits`;
+  - B1 reverted fails `guard-kill`.
+
+**Still open:**
+
+- A k1 case that stops at every stub word. It needs a kick source; the rented M4's kicker is throttled.
+- The two-candidate slots (8.4 item 5): conflicts are only counted (`ctlb_conflicts`).
+- A large-leaf INVLPG case, and running the link and kill programs once more with guards on.
+
