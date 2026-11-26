@@ -1160,6 +1160,8 @@ struct K1Fkeys {
     /// event for their own bound.
     reclaimed_suspended: u64,
     suspended_dropped: u64,
+    /// Step 1c: link points linked in the checked form only because their link is not local.
+    links_checked_cross: u64,
 }
 impl K1Fkeys {
     fn is_empty(&self) -> bool {
@@ -1173,6 +1175,7 @@ impl K1Fkeys {
             | self.tl1_emptied
             | self.reclaimed_suspended
             | self.suspended_dropped
+            | self.links_checked_cross
             == 0
     }
 }
@@ -1449,6 +1452,7 @@ impl K1 {
                 tl1_emptied: c.tl1_emptied,
                 reclaimed_suspended: c.reclaimed_suspended,
                 suspended_dropped: c.suspended_dropped,
+                links_checked_cross: c.links_checked_cross,
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,

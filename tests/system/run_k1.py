@@ -2019,6 +2019,16 @@ def relink_counts(a, n, name, report):
             r = c['stats']['k1'].get('relink', {})
             if r.get('suspended', 0) or r.get('relinked', 0):
                 failures.append(f"{name}@{n} checked cpu{v}: suspended {r.get('suspended', 0)}, relinked {r.get('relinked', 0)}, want none")
+            # (Review S2: not vacuous: the cross-page links were made, checked, and every site reached the right V after each
+            # CR3 load.)
+            cross = c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0)
+            if cross < RM:   # (one per site: checked links stay across the CR3 loads)
+                failures.append(f'{name}@{n} checked cpu{v}: {cross} links checked for being cross-page, want at least {RM}')
+            allowed = EITHER[name](v, k) if callable(EITHER[name]) else EITHER[name]
+            for reg, ok in allowed.items():
+                got = smp.num(c['gpr'][P.REGS.index(reg)])
+                if got not in ok:
+                    failures.append(f'{name}@{n} checked cpu{v}: {reg} = {got:#x}, allowed {[hex(x) for x in sorted(ok)]}')
         if not out:
             failures.append(f'{name}@{n} checked: no output')
     report.append({'name': f'k1-{name}@{n}-relink-counts', 'max_block': None, 'stats': got, 'problems': failures})

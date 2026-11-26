@@ -2703,12 +2703,18 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
         }
         linked += 1;
     }
-    if linked != 0 && checked {
+    // (Frame-keyed plan step 1c, review S1: the PIC counters count what they counted before 1c, links out of or into shared
+    // code; a link checked only because it is not local is counted on its own, `Control::links_checked_cross`.)
+    let pic_checked = checked && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
+    if linked != 0 && checked && !pic_checked {
+        c.links_checked_cross += linked;
+    }
+    if linked != 0 && pic_checked {
         counted(count::CHECKED_LINKS);
     }
     // (Every build: the forms' counts the tests need, local and absolute into shared.)
     #[cfg(not(feature = "pic-count"))]
-    if linked != 0 && (local_shared || checked && !shared) {
+    if linked != 0 && (local_shared || pic_checked && !shared) {
         counted(
             count::LINKS
                 + if local_shared {

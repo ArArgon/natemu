@@ -1160,6 +1160,9 @@ pub mod cache {
         /// host's `NATEMU_LINK_FORM=plain`, a debug key): such links are plain, undone at TLB events and patched again
         /// (the relink plan). Appended.
         pub link_form_plain: u64,
+        /// Frame-keyed plan step 1c: link points linked in the checked form only because their link is not local (neither end
+        /// shared code). Appended.
+        pub links_checked_cross: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
