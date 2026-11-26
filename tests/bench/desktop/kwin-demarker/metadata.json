@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "demarker",
+        "Name": "demarker",
+        "Description": "natemu's desktop profile (tests/bench/run_desktop.py): prints window events and steps windows on request",
+        "EnabledByDefault": true,
+        "License": "MIT"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

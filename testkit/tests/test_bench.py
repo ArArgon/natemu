@@ -250,11 +250,11 @@ def test_a_failing_piece_count_is_loud(monkeypatch, tmp_path):
 
 def test_only_a_remote_case_is_not_exclusive():
     """Every benchmark takes the machine alone, except a case marked `remote` (its VM runs on another machine and nothing
-    is timed here): io5-solo32-reference and the glmark2 and Speedometer KVM references, and only they."""
+    is timed here): io5-solo32-reference and the glmark2, Speedometer and desktop KVM references, and only they."""
     from testkit.harness.bench import HARNESS
     fam, suites = _bench_family()
     shared = {c for s in suites.values() for c in s.extra['cases'] if not HARNESS.case_needs(fam, s, c).exclusive}
-    assert shared == {'io5-solo32-reference', 'glmark2-kvm', 'glmark2-kvm-sse41', 'speedometer-kvm'}
+    assert shared == {'io5-solo32-reference', 'glmark2-kvm', 'glmark2-kvm-sse41', 'speedometer-kvm', 'desktop-kde-kvm'}
     assert HARNESS.case_needs(fam, suites['io5'], 'io5-solo32-reference').cores == 1
     assert HARNESS.case_needs(fam, suites['glmark2'], 'glmark2-kvm').cores == 1
 

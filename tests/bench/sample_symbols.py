@@ -205,11 +205,13 @@ def cpio_files(data):
 
 
 class Elf:
-    """An ELF file's executable segments [(vaddr, file bytes)] and its function symbols (sized: .symtab, else .dynsym)."""
+    """An ELF file's executable segments [(vaddr, file bytes)], its GNU build ID and its function symbols (sized: .symtab,
+    else .dynsym; Image replaces a file's .dynsym by the .symtab of its separate debug file when the image has one)."""
 
     def __init__(self, name, e):
         self.name = name
         self.segments, self.symbols = [], []
+        self.symtab, self.debug, self.build_id = False, None, None
         self.c64 = c64 = e[4] == 2
         if c64:
             phoff, shoff = struct.unpack_from('<QQ', e, 0x20)
@@ -221,6 +223,7 @@ class Elf:
             if c64: typ, flags, off, vaddr, _, filesz, _, _ = struct.unpack_from('<IIQQQQQQ', e, phoff + i * phentsize)
             else: typ, off, vaddr, _, filesz, _, flags, _ = struct.unpack_from('<8I', e, phoff + i * phentsize)
             if typ == 1 and flags & 1 and off + filesz <= len(e): self.segments.append((vaddr, off, filesz))
+            if typ == 4 and self.build_id is None and off + filesz <= len(e): self.build_id = note_build_id(e, off, filesz)
         secs = []
         for i in range(shnum if shoff and shoff + shnum * shentsize <= len(e) else 0):
             if c64:
@@ -252,19 +255,48 @@ class Elf:
         return None
 
 
+def note_build_id(e, off, size):
+    """The NT_GNU_BUILD_ID (type 3, owner "GNU") of a PT_NOTE segment, as hex, or None."""
+    end = off + size
+    while off + 12 <= end:
+        namesz, descsz, typ = struct.unpack_from('<III', e, off)
+        name_at = off + 12; desc_at = name_at + (namesz + 3) // 4 * 4
+        if typ == 3 and bytes(e[name_at:name_at + namesz]) == b'GNU\0': return bytes(e[desc_at:desc_at + descsz]).hex()
+        off = desc_at + (descsz + 3) // 4 * 4
+    return None
+
+
+DEBUG_DIR = 'usr/lib/debug/'
+
+
 class Image:
-    """The bench image's ELF files: `match(queries)` finds blocks' guest bytes in their executable segments."""
+    """The bench image's ELF files: `match(queries)` finds blocks' guest bytes in their executable segments. Files under
+    usr/lib/debug (the dbgsym packages' separate debug files: symbols, no code) are not searched; a searched file without
+    a .symtab takes the .symtab of the debug file its build ID names (usr/lib/debug/.build-id/XX/REST.debug)."""
 
     def __init__(self, cpio):
         f = open(cpio, 'rb')
         self.data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         f.close()
-        self.files = []
+        self.files, debug = [], {}
         for name, (off, size) in sorted(cpio_files(self.data).items()):
             if self.data[off:off + 4] == b'\x7fELF':
+                if name.startswith(DEBUG_DIR) or name.startswith('./' + DEBUG_DIR):
+                    m = re.search(r'\.build-id/([0-9a-f]{2})/([0-9a-f]+)\.debug$', name)
+                    if m: debug[m[1] + m[2]] = (off, size)
+                    continue
                 e = self.data[off:off + size]
                 try: self.files.append((Elf(name, e), off))
                 except struct.error: continue
+        self.debug_files = 0
+        for elf, _ in self.files:
+            if elf.symtab or not elf.build_id or elf.build_id not in debug: continue
+            off, size = debug[elf.build_id]
+            try: d = Elf(elf.name + '.debug', self.data[off:off + size])
+            except struct.error: continue
+            if d.symtab and d.symbols:
+                elf.symbols, elf.starts, elf.symtab, elf.debug = d.symbols, d.starts, True, elf.build_id
+                self.debug_files += 1
 
     def match(self, queries, key=MATCH_BYTES):
         """{query id: [(Elf, vaddr), ...]} for queries {id: (page offset, guest bytes, 64-bit)}: every place an ELF file of

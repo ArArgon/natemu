@@ -23,6 +23,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {glmark2_inputs}    inputs.glmark2_inputs(), read-only: the glmark2 cases' guest userland (glmark2, llvmpipe, Xvfb)
     {web_tooling_inputs}  inputs.web_tooling_inputs(), read-only: the Web Tooling case's guest userland (Node.js, the bundle)
     {speedometer_inputs}  inputs.speedometer_inputs(), read-only: the Speedometer cases' guest userland (Firefox, Speedometer)
+    {desktop_inputs}    inputs.desktop_inputs(), read-only: the desktop profile's disk, initramfs and ELF files (KDE Plasma)
     {kernel_symbols}    inputs.kernel_symbols(), read-only: the booted kernel's text symbols (the EL0 sampler's report)
     {qemu_system}       the pinned qemu-system-x86_64 binary
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
@@ -49,12 +50,13 @@ from testkit.harness import CaseResult, Requirement, runner
 INPUTS = {'fio_prep': 'fio-prep', 'block_inputs': 'block-inputs', 'io5_inputs': 'io5-inputs',   # placeholder -> input name
           'paper_inputs': 'paper-inputs', 'display_inputs': 'display-inputs',
           'kernel_symbols': 'kernel-symbols', 'glmark2_inputs': 'glmark2-inputs',
-          'web_tooling_inputs': 'web-tooling-inputs', 'speedometer_inputs': 'speedometer-inputs'}
+          'web_tooling_inputs': 'web-tooling-inputs', 'speedometer_inputs': 'speedometer-inputs',
+          'desktop_inputs': 'desktop-inputs'}
 INPUT_FNS = {'fio-prep': lambda: inputs.fio_prep(), 'block-inputs': lambda: inputs.block_inputs(),
              'io5-inputs': lambda: inputs.io5_inputs(), 'paper-inputs': lambda: inputs.paper_inputs(),
              'display-inputs': lambda: inputs.display_inputs(), 'kernel-symbols': lambda: inputs.kernel_symbols(),
              'glmark2-inputs': lambda: inputs.glmark2_inputs(), 'web-tooling-inputs': lambda: inputs.web_tooling_inputs(),
-             'speedometer-inputs': lambda: inputs.speedometer_inputs()}
+             'speedometer-inputs': lambda: inputs.speedometer_inputs(), 'desktop-inputs': lambda: inputs.desktop_inputs()}
 # Given as writable clones: run_io_matrix.py prepare writes into the folders it copies from fio_prep and block_inputs;
 # run_io5.py run clones disk.raw (keeping its mode) and grows the clone to 16 GiB.
 WRITABLE = {'fio_prep', 'block_inputs', 'io5_inputs'}

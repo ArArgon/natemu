@@ -467,6 +467,32 @@ def speedometer_inputs() -> pathlib.Path:
     return resources.derived('bench-speedometer', _userland_recipe, [_tools() / 'bench' / 'speedometer', artifacts.build_env()])
 
 
+def _desktop_recipe(out: pathlib.Path, inputs: list) -> None:
+    recipe = pathlib.Path(inputs[0])
+    _in_container('desktop', recipe, out, memory='8g', timeout=3 * 3600)
+    for n in ('disk.raw.zst', 'initrd.img', 'elves.cpio.zst'):
+        if not (out / n).is_file(): raise BuildFailure('desktop', f'no {n} produced')
+    exe = shutil.which('zstd') or next((p for p in ('/opt/homebrew/bin/zstd', '/usr/local/bin/zstd') if os.path.isfile(p)), None)
+    if not exe: raise BuildFailure('desktop', "unpacking the disk needs Homebrew's zstd (brew install zstd; the README's prerequisites)")
+    r = subprocess.run([exe, '-q', '-d', '--sparse', str(out / 'disk.raw.zst'), '-o', str(out / 'disk.raw')], capture_output=True, text=True)
+    if r.returncode: raise BuildFailure('desktop', f'unpacking disk.raw.zst: {r.stderr[-800:]}')
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    (out / 'provenance.json').write_text(json.dumps({
+        'disk_raw_zst_sha256': sha(out / 'disk.raw.zst'), 'initrd_sha256': sha(out / 'initrd.img'),
+        'elves_sha256': sha(out / 'elves.cpio.zst'), 'disk_raw_bytes': (out / 'disk.raw').stat().st_size,
+        'recipe_sha256': recipe_sha256(recipe), 'builder': artifacts.build_env_described()}, indent=1) + '\n')
+
+
+def desktop_inputs() -> pathlib.Path:
+    """tests/bench/run_desktop.py's guest (tools/bench/desktop): Debian 13's KDE Plasma 6 Wayland session, Konsole,
+    Dolphin, Chromium, Firefox ESR, llvmpipe, systemd, perf and dbgsym symbol tables from a fixed snapshot.debian.org date
+    (the installed package list pinned by the recipe's packages.txt) and Speedometer 3.1, built in the amd64 Debian
+    builder: disk.raw (ext4, the whole disk; sparse, unpacked here from disk.raw.zst, which the KVM reference sends),
+    initrd.img (initramfs-tools' for the benchmarks' kernel), elves.cpio.zst (the ELF and symbol files, for the sampler's
+    report), packages.txt, versions.txt and provenance.json (sha256s recorded, never required, and the builder)."""
+    return resources.derived('bench-desktop', _desktop_recipe, [_tools() / 'bench' / 'desktop', artifacts.build_env()])
+
+
 def recipe_sha256(recipe: pathlib.Path) -> str:
     """sha256 of the recipe folder's `sha256sum` listing (every file, sorted relative paths)."""
     files = sorted(p for p in recipe.rglob('*') if p.is_file() and '__pycache__' not in p.parts)

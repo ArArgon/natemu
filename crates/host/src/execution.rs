@@ -243,7 +243,28 @@ impl Blocks {
         }
         text
     }
+    /// The performance log's `snapc` line, beside each `snap` (desktop profile, tests/bench/run_desktop.py: CR3 loads and
+    /// link suspensions per window): `snapc NS` and, per vCPU, the counters [`SNAP_COUNTERS`] names (`cache::Control`'s
+    /// plain counters, every build) then the resident's entries per bucket (`perf::BUCKETS` values; zero without a `perf`
+    /// resident).
+    pub(crate) fn snap_counts(&self) -> String {
+        use exec::perf as rp;
+        let mut text = format!("snapc {}", crate::perf::now());
+        for v in 0..self.n {
+            let c: cache::Control = self.memory.read_record(v * self.stride + cache::LOOKUP_OFFSET + cache::CONTROL);
+            for x in [c.cr3_loads, c.global_flushes, c.invlpgs, c.page_faults, c.suspended, c.relinked] {
+                text += &format!(" {x}");
+            }
+            let p: rp::Perf = self.memory.read_record(v * self.stride + rp::OFFSET);
+            for x in p.count {
+                text += &format!(" {}", if p.magic == rp::MAGIC { x } else { 0 });
+            }
+        }
+        text
+    }
 }
+/// The counters of a `snapc` line, per vCPU, before the bucket entries ([`Blocks::snap_counts`]).
+pub const SNAP_COUNTERS: [&str; 6] = ["cr3_loads", "global_flushes", "invlpgs", "page_faults", "suspended", "relinked"];
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
 #[derive(Clone, Copy)]
 pub struct Area<'a> {

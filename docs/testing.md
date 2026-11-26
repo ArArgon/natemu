@@ -440,6 +440,37 @@ Its suite `debug` (`tests/bench/family.toml`), 4 vCPUs, 4 GiB, the translation c
   console lines the runner stamps as they arrive. JavaScript the engines compiled at run time is in no file, so its
   blocks stay at block level.
 
+Its suite `desktop` (same file), the desktop profile (`tests/bench/run_desktop.py`): a KDE Plasma 6 Wayland session on
+the Bochs display at 1920 x 1080, 4 vCPUs, 8 GiB, one boot each. Its input `desktop-inputs` (`{desktop_inputs}`) is built
+from `tools/bench/desktop`: Debian 13's Plasma (KWin, plasma-workspace, plasma-desktop, no recommends), Konsole, Dolphin,
+Chromium, Firefox ESR, Mesa's llvmpipe, systemd, perf, the dbgsym symbol tables of llvmpipe, KWin, Qt, Plasma and the
+browsers, and Speedometer 3.1, as an ext4 disk with initramfs-tools' initramfs for the benchmarks' kernel. The runner
+appends the guest's harness to the initramfs (`tests/bench/desktop`: the driver, the user's settings, a KWin script that
+reports each window's arrival), so the workload changes without rebuilding the image. getty logs user `de` in on tty1 and
+the login starts the session; the driver waits for the shell and the desktop to go quiet, then runs the case's phases:
+20 s idle, the launcher, the Overview and the virtual desktops, Konsole's and Dolphin's first and second starts and
+window moves, resizes and switches (`idle,ui,apps`), or the browsers' starts and Speedometer in Chromium
+(`idle,browsers,speedometer`). The runner stays on the control socket, timing every page flip KWin presents, and saves a
+PNG at each of the driver's snapshot points. Its analysis (`result.json`, `report.md`) splits each window (the session's
+start, idle, each interaction, each app start up to its first window and on until the CPUs are quiet) by the resident's
+buckets (the timing log's 5 ms `snap` lines), the translation requests begun in it (count, host time and parts, answers
+from memory, the disk cache or fexc, and first-seen code: guest bytes the boot had not asked for before), the guest's own
+page faults, disk reads and I/O time, the frames presented, and each guest process's CPU time. `desktop-kde-sample` adds
+natemu's EL0 sampler (reported by `sample_report.py`, its phases the windows) and the guest's own perf, whose reports by
+process and object say which process the time went to (a sample record has no address space); `desktop-kde-profile` is
+the timing log with the compile cache off; `-warm` keeps the compile cache at natemu's default cap (512 MiB) across an
+untimed boot of the same workload and the measured one, as a desktop's next session would; `-warm-8g` the same at a cap
+nothing reaches; `-norandmaps` is an experiment, the guest's address-space randomization off. `desktop-kde-click-*` start
+Konsole and Dolphin as a user does, through natemu's PS/2 keyboard (the launcher, the name, Enter: Plasma's launcher, KIO
+and a systemd app unit), timed from the key through the launcher's D-Bus call to systemd and the process's creation to its
+first window. `desktop-kde-browser-*` are the browsers' starts and Speedometer's (the sampled one without Speedometer:
+V8's code makes the sampler's objects file outgrow a 16 GB Mac's free disk). Each window also gets its CR3 loads per
+second, the switch-related buckets (`tlb`, `relink`, `link`, `abort`, `shadow`, `revalidate`) and link suspensions and
+relinks (the timing log's `snapc` lines), and the split of its 5 ms intervals by how many vCPUs were busy (about one: the
+serial stretches a hand-off between processes makes). `desktop-kde-kvm` boots the same guest
+under KVM on the x86 machine, real x86's times, and runs only when seeding (`TESTKIT_SEED_ANSWERS=1
+NATEMU_X86_HOST=user@host`), as the other KVM references.
+
 The profile and sampling cases also summarize the resident's `host` bucket by what the vCPU thread did on the host
 (serving translation requests, writing the timing log, ports and the rest). `TESTKIT_BENCH_AT=REV` runs them with the
 profiling residents of REV too, beside REV's host and compiler.

@@ -1373,7 +1373,8 @@ impl Prepared {
             Ok((stop?, compiler.compiles))
         };
         // Perf chunk 14: with the log on, every 5 ms each vCPU's resident time so far by bucket (the current one counted to
-        // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
+        // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU; then `snapc NS`, its CR3
+        // loads, flushes, faults, link suspensions and relinks and entries per bucket (`Blocks::snap_counts`).
         let sampling = AtomicBool::new(crate::perf::on());
         // EL0 sampler: its ringing and drain threads end once every vCPU has.
         let sampler_done = AtomicBool::new(false);
@@ -1428,6 +1429,7 @@ impl Prepared {
                 scope.spawn(move || {
                     while sampling.load(SeqCst) {
                         crate::perf::line(&blocks.snap());
+                        crate::perf::line(&blocks.snap_counts());
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 });

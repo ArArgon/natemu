@@ -181,5 +181,53 @@ class Image(unittest.TestCase):
         self.assertNotIn('x', self.image.match({'x': (0x080, other, True)}))
 
 
+def elf64_stripped(text_vaddr, text, build_id):
+    """An ELF64 with one executable PT_LOAD and a PT_NOTE holding its GNU build ID, no sections (a stripped library)."""
+    po = text_vaddr % 4096
+    body = bytearray(0x1000 + po) + text
+    body += bytes(-len(body) % 4)
+    desc = bytes.fromhex(build_id)
+    note = struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc + bytes(-len(desc) % 4)
+    noteoff = len(body); body += note
+    hdr = bytearray(64)
+    hdr[:7] = b'\x7fELF\x02\x01\x01'
+    struct.pack_into('<QQ', hdr, 0x20, 64, 0)
+    struct.pack_into('<HHHH', hdr, 0x36, 56, 2, 64, 0)
+    body[:64] = hdr
+    body[64:64 + 56] = struct.pack('<IIQQQQQQ', 1, 5, 0x1000, text_vaddr - po, 0, po + len(text), po + len(text), 4096)
+    body[120:120 + 56] = struct.pack('<IIQQQQQQ', 4, 4, noteoff, 0, 0, len(note), len(note), 4)
+    return bytes(body)
+
+
+class DebugFiles(unittest.TestCase):
+    """A stripped file takes the .symtab of the separate debug file its build ID names; debug files are not searched."""
+    BLOCK = Image.BLOCK
+    ID = 'ab' + '12' * 19
+
+    def setUp(self):
+        d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
+        text = b'\xcc' * 0x80 + self.BLOCK + b'\xc3' * 16
+        lib = elf64_stripped(0x1000, text, self.ID)
+        other = elf64_stripped(0x1000, b'\x90' * 0x100 + self.BLOCK, 'cd' * 20)        # no debug file for this one
+        dbg = elf64(0x1000, b'', [(0x1000, 0x80, 'before'), (0x1080, 0x20, 'work')])
+        (d / 'i.cpio').write_bytes(cpio([('usr/lib/libx.so', lib, 0o100644), ('usr/lib/liby.so', other, 0o100644),
+                                         (f'usr/lib/debug/.build-id/{self.ID[:2]}/{self.ID[2:]}.debug', dbg, 0o100644)]))
+        self.image = S.Image(d / 'i.cpio')
+
+    def test_the_build_id_is_read_from_the_note(self):
+        self.assertEqual({e.name: e.build_id for e, _ in self.image.files}, {'usr/lib/libx.so': self.ID, 'usr/lib/liby.so': 'cd' * 20})
+
+    def test_the_debug_file_names_the_stripped_files_function_and_is_not_searched(self):
+        hits = self.image.match({'a': (0x080, self.BLOCK, True)})
+        (elf, va), = hits['a']
+        self.assertEqual((elf.name, va, elf.lookup(va + 4), elf.symtab, elf.debug), ('usr/lib/libx.so', 0x1080, 'work', True, self.ID))
+        self.assertEqual(self.image.debug_files, 1)
+
+    def test_a_file_without_its_debug_file_stays_unnamed(self):
+        hits = self.image.match({'b': (0x100, self.BLOCK, True)})
+        (elf, va), = hits['b']
+        self.assertEqual((elf.name, elf.lookup(va), elf.symtab), ('usr/lib/liby.so', None, False))
+
+
 if __name__ == '__main__':
     unittest.main()

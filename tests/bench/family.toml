@@ -653,6 +653,91 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/speedomet
         "--out", "{out}", "--name", "speedometer-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--boots", "1", "--sample-us", "{sample_us}"]
 
+# The desktop profile (tests/bench/run_desktop.py; tier debug, docs/testing.md "The debug tier"): a KDE Plasma 6
+# Wayland session on the Bochs display (input desktop-inputs, tools/bench/desktop: Debian 13's Plasma, Konsole, Dolphin,
+# Chromium, Firefox ESR, llvmpipe, on an ext4 disk), 4 vCPUs, 8 GiB, the kernel's mitigations at their defaults with
+# natemu's speculation barriers (as speedometer-desktop-profile). One boot each: the session's start, 20 s idle, the
+# shell's interactions and Konsole's and Dolphin's first and second starts (phases idle,ui,apps), each window split by
+# the resident's buckets, translation requests (first-seen code), the guest's faults and disk I/O and the frames KWin
+# presented. desktop-kde-sample: natemu's EL0 sampler and the guest's own perf (by process and object), reported by
+# sample_report.py. desktop-kde-profile: the timing log, compile cache off. -warm: the compile cache at natemu's default
+# cap (512 MiB), filled by an untimed boot of the same workload, then the measured boot; -warm-8g: the same at 8 GiB, a cap
+# nothing reaches. desktop-kde-browser-*: the browsers' starts (Chromium, Firefox ESR) and Speedometer 3.1 in Chromium
+# (the sampled case without Speedometer: V8's code made its NAME.objects outgrow a 16 GB Mac's free disk).
+# desktop-kde-click-*: Konsole and Dolphin started as a user does, through the launcher with natemu's PS/2 keyboard
+# (Meta, the name, Enter), timed from the Enter key through the launcher's D-Bus call to systemd, the app unit's start
+# and the process's creation to its first window. desktop-kde-kvm: the same guest under KVM on the x86 machine (remote,
+# seeding runs only), real x86's times.
+[[suite]]
+name = "desktop"
+kind = "bench"
+harness = "bench"
+tier = "debug"
+params = { timeout = 7200 }
+
+[suite.cases.desktop-kde-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/desktop-kde-sample", "--markers", "{out}/desktop-kde-sample.markers.tsv",
+        "--perf", "{out}/boot-1.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{out}/userland.cpio",
+        "--", "python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--phases", "idle,ui,apps", "--sample-us", "{sample_us}", "--guest-perf"]
+
+[suite.cases.desktop-kde-profile]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,ui,apps", "--perf-log"]
+
+[suite.cases.desktop-kde-profile-warm]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-profile-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,ui,apps", "--perf-log", "--compile-cache", "warm"]
+
+[suite.cases.desktop-kde-profile-warm-8g]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-profile-warm-8g", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,ui,apps", "--perf-log", "--compile-cache", "warm", "--compile-cache-mb", "8192"]
+
+[suite.cases.desktop-kde-click-profile]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-click-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,click", "--perf-log"]
+
+[suite.cases.desktop-kde-click-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/desktop-kde-click-sample", "--markers", "{out}/desktop-kde-click-sample.markers.tsv",
+        "--perf", "{out}/boot-1.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{out}/userland.cpio",
+        "--", "python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-click-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--phases", "idle,click", "--sample-us", "{sample_us}", "--guest-perf"]
+
+# desktop-kde-profile-norandmaps: an experiment beside desktop-kde-profile, the guest kernel's `norandmaps` (every process
+# maps its libraries at the same addresses): how much of a second app start is its blocks placed again at new addresses.
+[suite.cases.desktop-kde-profile-norandmaps]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-profile-norandmaps", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,ui,apps", "--perf-log", "--norandmaps"]
+
+[suite.cases.desktop-kde-browser-sample]
+argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/desktop-kde-browser-sample", "--markers", "{out}/desktop-kde-browser-sample.markers.tsv",
+        "--perf", "{out}/boot-1.perf", "--kernel-symbols", "{kernel_symbols}", "--boots", "{kernel}", "--image", "{out}/userland.cpio",
+        "--", "python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-browser-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
+        "--phases", "idle,browsers", "--sample-us", "{sample_us}", "--guest-perf"]
+
+[suite.cases.desktop-kde-browser-profile]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-browser-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,browsers,speedometer", "--perf-log"]
+
+[suite.cases.desktop-kde-browser-profile-warm]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-browser-profile-warm", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--phases", "idle,browsers", "--perf-log", "--compile-cache", "warm"]
+
+[suite.cases.desktop-kde-kvm]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "kvm", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-kvm", "--phases", "idle,ui,apps,click,browsers,speedometer"]
+remote = true                   # nothing runs or is timed on this Mac: not an exclusive window
+
 # The computed-exit census (docs/restructure/el0-sampler-plan.md, chunk 2; tests/bench/run_census.py): QEMU 11.1.2 built with
 # plugins (artifacts.qemu_plugins, its own cache key: the control group's qemu-system is not this build) and the census plugin
 # (tests/bench/plugins/indirect.c, artifacts.census_plugin). Counts per guest instruction, not timings: a case claims cores
