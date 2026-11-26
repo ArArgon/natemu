@@ -497,6 +497,8 @@ pub struct Boot {
     pub page_currency: u64,
     /// Fault-around plan chunk 1: `Compiler::writable_on_read` (default on; `--writable-on-read` / `NATEMU_WRITABLE_ON_READ`).
     pub writable_on_read: bool,
+    /// Fault-around plan chunk 2: `Compiler::fault_around` (default 16 pages; `--fault-around` / `NATEMU_FAULT_AROUND`).
+    pub fault_around: u64,
     /// Gather plan: `Compiler::inline_gather` (default on; the CLI's `[debug] inline_gather` or `--set debug.inline_gather`; `NATEMU_INLINE_GATHER` overrides it in `execution::run`).
     pub inline_gather: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
@@ -599,6 +601,7 @@ impl Boot {
             check_reuse: false,
             page_currency: exec::cache::PAGES_ON,
             writable_on_read: true,
+            fault_around: natemu_abi::fault_around::DEFAULT_WINDOW,
             inline_gather: true,
             code_shape: false,
             speculation_barriers: false,
@@ -882,6 +885,7 @@ impl Boot {
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
             writable_on_read: self.writable_on_read,
+            fault_around: self.fault_around,
             inline_gather: self.inline_gather,
             code_shape: self.code_shape,
             accurate_fp: self.accurate_fp,
@@ -1010,6 +1014,7 @@ impl Boot {
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
             writable_on_read: self.writable_on_read,
+            fault_around: self.fault_around,
             inline_gather: self.inline_gather,
             code_shape: self.code_shape,
             accurate_fp: self.accurate_fp,
@@ -1077,6 +1082,7 @@ pub struct Prepared {
     check_reuse: bool,
     page_currency: u64,
     writable_on_read: bool,
+    fault_around: u64,
     inline_gather: bool,
     code_shape: bool,
     accurate_fp: bool,
@@ -1279,6 +1285,7 @@ impl Prepared {
             compiler.check_reuse = self.check_reuse;
             compiler.page_currency = self.page_currency;
             compiler.writable_on_read = self.writable_on_read;
+            compiler.fault_around = self.fault_around;
             compiler.inline_gather = self.inline_gather;
             compiler.shape = self.code_shape;
             compiler.accurate_fp = self.accurate_fp;

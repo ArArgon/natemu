@@ -1163,6 +1163,13 @@ pub mod cache {
         /// Frame-keyed plan step 1c: link points linked in the checked form only because their link is not local (neither end
         /// shared code). Appended.
         pub links_checked_cross: u64,
+        /// Fault-around plan chunk 2 (docs/restructure/fault-around-plan.md), set by the host before the vCPU runs
+        /// (`--fault-around`, `NATEMU_FAULT_AROUND`): the window W in pages ([`crate::fault_around::WINDOWS`]; 0: off). At a
+        /// demand shadow install the resident also installs the shadows of the window's other pages that the guest's leaf
+        /// already justifies (present, A = 1; writable only with D = 1). Appended.
+        pub fault_around: u64,
+        /// Its counters ([`crate::fault_around::count`]; plain increments in every build). Appended.
+        pub fault_around_counts: [u64; crate::fault_around::count::COUNT],
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32

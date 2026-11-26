@@ -5,7 +5,7 @@
 //! M2 checkpoint C: user code that is not 64-bit code runs under a third pair of roots with a third ASID, which reach the
 //! user space's shadows below 4 GiB and no other guest address (`shadow::COMPAT_LOWER_ROOT`).
 use super::*;
-use natemu_abi::shadow::{CLASS_ROOTS, Error, Maintenance, Space, asids, pool_pages};
+use natemu_abi::shadow::{CLASS_ROOTS, Error, Fill, Maintenance, Space, asids, pool_pages};
 
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 
@@ -29,6 +29,25 @@ impl Maintenance for Tlb {
         unsafe { asm!("dsb ishst", "tlbi vae1, {0}", in(reg) page | self.asid) };
         if self.asid == self.all[1] && va >> 32 == 0 {
             unsafe { asm!("tlbi vae1, {0}", in(reg) page | self.all[2]) };
+        }
+        unsafe { asm!("dsb ish", "isb") }
+    }
+    fn invalidate_many(&mut self, base: u64, pages: &[u64; 8]) {
+        // One `dsb ishst` for the batch's stores, a TLBI VAE1 per page (and its compat alias, as `invalidate`), one
+        // `dsb ish; isb` (fault-around plan chunk 2).
+        let compat = self.asid == self.all[1] && base >> 32 == 0;
+        unsafe { asm!("dsb ishst") };
+        for (w, &bits) in pages.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let i = (w * 64) as u64 + u64::from(bits.trailing_zeros());
+                bits &= bits - 1;
+                let page = ((base + 4096 * i) >> 12) & ((1 << 44) - 1);
+                unsafe { asm!("tlbi vae1, {0}", in(reg) page | self.asid) };
+                if compat {
+                    unsafe { asm!("tlbi vae1, {0}", in(reg) page | self.all[2]) };
+                }
+            }
         }
         unsafe { asm!("dsb ish", "isb") }
     }
@@ -119,6 +138,21 @@ pub fn install(
         true => space.map_global(va & !4095, ipa, writable),
         false => space.map(va & !4095, ipa, writable),
     }
+}
+/// The IPA of guest-physical page `gpa` of `ram` (its resident alias's, through the resident's own mapping), `None` outside it.
+pub fn ipa(ram: &GuestRam, gpa: u64) -> Option<u64> {
+    native(ram.range(gpa & !4095, 4096)? as u64)
+}
+/// Fault-around plan 3.4: installs the neighbour shadows `entries` (targets from [`ipa`]) in the leaf table of `va`'s 2 MiB
+/// region in the space of `cpl`, which the demand install of `va` has just made ([`Space::fill`]: empty slots only, no
+/// allocation, one publish).
+pub fn fill(cpl: u64, va: u64, entries: &mut [Fill]) -> Result<usize, Error> {
+    space(user(cpl)).fill(va, entries)
+}
+/// Fault-around plan 3.2: the valid slots of `range` in `va`'s 2 MiB region's leaf table in the space of `cpl`
+/// ([`Space::valid_slots`]).
+pub fn valid_slots(cpl: u64, va: u64, range: core::ops::Range<usize>) -> Result<Option<[u64; 8]>, Error> {
+    space(user(cpl)).valid_slots(va, range)
 }
 /// L3 (amendment): shadow guest linear page `va`, which maps an unassigned guest-physical page, read-only onto the shared
 /// all-ones page (`natemu_abi::ALL_ONES_IPA`, read-only at stage 2 too; never executable: `PAGE` has PXN/UXN).

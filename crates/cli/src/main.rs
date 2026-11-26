@@ -4,7 +4,7 @@
 //!   natemu [--config FILE] [--set KEY=VALUE]... [--fexc FILE] [--kernel FILE | --firmware FILE] [--runtime FILE] [--initrd FILE] [--cmdline TEXT]
 //!       [--ram SIZE] [--vcpus N] [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]]
 //!       [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE] [--page-currency on|off|check]
-//!       [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
+//!       [--writable-on-read on|off] [--fault-around off|8|16|32|64|512] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
 //!       [--net-host-loopback] [--virtio-transport SPEC] [--profile NAME [--profile-us N] [--profile-start run|guest] [--profile-objects=BOOL]]
 //!
 //! Named arguments (clap; `natemu --help`); the configuration file is described in docs/configuration.md.
@@ -46,7 +46,7 @@
 //! SIGTERM cancels the run: `Cancelled`; a second one exits 130 at once), 1 on a host error (a failed serial write and a
 //! refused command line included; `--help` exits 0). `--perf-log FILE` turns on the library's timing log (`natemu::perf`).
 //! `--serial-stdin` (off by default) feeds standard input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode,
-//! Ctrl-C to the guest, Ctrl-A x cancels the run. `--page-currency` and `--writable-on-read` are debug and measurement switches (see their
+//! Ctrl-C to the guest, Ctrl-A x cancels the run. `--page-currency`, `--writable-on-read` and `--fault-around` are debug and measurement switches (see their
 //! help). `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` turns it off) is the shared template pool.
 //! `--profile NAME` (a measurement; a resident built with its `profile` feature) rings each vCPU's sample bell every
 //! `--profile-us` microseconds (250) and writes `NAME.samples` and `NAME.objects` (`natemu::sampler`); `--profile-start
@@ -140,6 +140,11 @@ struct Cli {
     /// default), or read-only (off); for A/B measurement
     #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_writable_on_read)]
     writable_on_read: bool,
+    /// Debug: at a shadow miss, also map the neighbouring pages of the same 2 MiB region that the guest's page table already
+    /// maps as accessed (a window of this many pages, 16 by default), or none (off); for A/B measurement (NATEMU_FAULT_AROUND, read by the
+    /// library, overrides it)
+    #[arg(long, value_name = "off|8|16|32|64|512", default_value = "16", value_parser = natemu::execution::parse_fault_around)]
+    fault_around: u64,
     /// Expose the virtio entropy device
     #[arg(long)]
     rng: bool,

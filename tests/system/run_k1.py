@@ -214,6 +214,13 @@ Fault-around plan chunk 1 (writable on a read when D = 1, docs/restructure/fault
 (D = 1: no upgrade abort), `fa-ro-wp` (R/W = 0 at CPL 0 with WP 1 and 0), `fa-wt` (a WT page is read-only at a read), all QEMU-compared at CPL 0 with
 natemu's counters asserted (`STAT_EXACT`, `UC_STEPS`); `fa-ro` (natemu only, CPL 3: R/W = 0 read then written: #PF 7). With
 NATEMU_WRITABLE_ON_READ=off the exact counts are skipped and the switch itself is checked (an upgrade abort must appear).
+Fault-around chunk 2 (the fill, docs/restructure/fault-around-plan.md section 7 and review 9.1; `fa_fill_setup`, 1 vCPU, each at the default
+window and with NATEMU_FAULT_AROUND=off, the registers and faults the architecture fixes asserted in both): `fa-fill-ad` (A = 0 neighbours are
+never installed; D = 0 ones read-only, their first write sets D), `fa-fill-rw` (R/W = 0 at CPL 3: #PF 7; D = 1 and R/W: writable, no
+upgrade), `fa-fill-user` (U/S at CPL 3 and the space a CPL 0 fill goes to: #PF 5), `fa-fill-smc` (the writable bit, the reverse map and
+`translated`: the SMC result), `fa-fill-wt` (WT read-only, UC never: `uncached_steps`), `fa-fill-mmio` (a device page beside RAM),
+`fa-fill-none` (P = 0, reserved: #PF 0 and 9), `fa-fill-invlpg` (INVLPG and CR3 drop prefetched shadows; a stale one may serve),
+`fa-fill-kept` (the kept half: global neighbours only), `fa-fill-large` (2 MiB leaves: D = 0 read-only, D = 1 writable), `fa-fill-counts` (the window sizes, by `retries`; also at 512).
 Writes DIR/k1.json; exit status 1 on any failure."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, fcntl, hashlib, json, os, pathlib, subprocess, sys
@@ -2168,6 +2175,252 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
     return out, problems
 
 
+
+# ---- Fault-around chunk 2: the fill (docs/restructure/fault-around-plan.md section 7, review 9.1; natemu only, 1 vCPU) ----------
+# Each program runs twice: at the default window (16 pages) and with NATEMU_FAULT_AROUND=off. The fill writes no guest-visible
+# bit, so both runs must end in exactly the registers (and the fault) the architecture fixes, written below; the counters show the
+# fill ran (`k1.fault_around`, absent when off) and what it skipped. Windows are aligned runs of 16 pages whose PTEs the program
+# writes itself (PT0 and PT1 entries no other K1 program uses): page j of window W is W + 0x1000 j, identity-mapped unless noted.
+# CPL 3 code runs through the stub pages (`c3`: the user function at FA_UC + offset, ending `jmp r13`); a fault at CPL 3 ends the
+# run (`guest_fault`), its vector, CR2 and error code checked. The mutations each program catches are in
+# tests/system/run_fault_around_mutations.py.
+FA_UC = 0xe000                     # the user code page (offset from d): one function per 0x200
+FA_W = dict(ad=0x240000, rw=0x250000, user=0x260000, smc=0x270000, smc2=0x3f0000, wt=0x1c0000, mmio=0x1d0000, none=0x1e0000,
+          inv=0x1f0000, counts=0x120000)
+FA_LARGE = (0x400000, 0x600000)    # `fa-fill-large`: two user 2 MiB leaves (PD entries 2 and 3) onto LF1, D = 0 and D = 1
+FA_LARGE_AT = (0x1c0000, 0x1d0000)  # the windows used inside them (frames LF1 + these: free)
+RWB, USB, AB, DB, PWT, PCD = P.RW, P.US, P.A, P.D, 0x8, 0x10
+PRES = P.P
+
+
+def fa_c3(d, tag, va):
+    return (f'    lea r12, [rel .k{tag}]\n    mov rbx, {va:#x}\n    mov r13, {d + STUB["exit"]:#x}\n'
+            f'    mov rax, {d + STUB["enter"]:#x}\n    jmp rax\n.k{tag}:\n')
+
+
+def fa_pte(va):
+    return P.sys_leaf(0, 0, va)
+
+
+def fa_fill_setup():
+    """name -> (CPL 0 body, user functions [text], {window base: {j: PTE}}, extra memory, expected {register: value} or None,
+    expected fault (vector, CR2, error) or None)."""
+    d = P.SYS_D(0)
+    uf = lambda k: d + FA_UC + 0x200 * k
+    pg = lambda w, j: FA_W[w] + 0x1000 * j
+    ident = lambda w, j, bits: pg(w, j) | bits
+    zero = lambda at, size=0x1000: dict(P.zero(at, size), capture=False)
+    probe = lambda tag, insn: f'    lea r13, [rel .t{tag}]\n    {insn}\n.t{tag}:\n'
+    sentinel = '    mov r14, -1\n    mov r15, -1\n'
+    out = {}
+    # fa-fill-ad (M1, M2): X (j 0) read at CPL 3 fills j 1-7 (A = 1, D = 0: read-only) and never j 8-15 (A = 0; odd ones D = 1).
+    # The demand reads of j 8, 9 and 11 then set their A (a fill that ignored A would have prefetched them: A stays 0); the writes to
+    # j 2 and 3 abort on their read-only shadows and set D once (a fill writable with D = 0 leaves D clear). PTEs read back.
+    w = 'ad'
+    ptes = {0: ident(w, 0, PRES | RWB | USB | AB | DB)}
+    ptes.update({j: ident(w, j, PRES | RWB | USB | AB) for j in range(1, 8)})
+    ptes.update({j: ident(w, j, PRES | RWB | USB | (DB if j % 2 else 0)) for j in range(8, 16)})
+    fn = (f'mov rax, [{pg(w, 0):#x}]\nmov rax, [{pg(w, 9):#x}]\nmov rax, [{pg(w, 11):#x}]\nmov rax, [{pg(w, 8):#x}]\n'
+          f'mov qword [{pg(w, 2):#x}], 0x22\nmov qword [{pg(w, 3):#x}], 0x33\n'
+          f'mov r8, [{fa_pte(pg(w, 2)):#x}]\nmov r9, [{fa_pte(pg(w, 3)):#x}]\nmov r10, [{fa_pte(pg(w, 8)):#x}]\n'
+          f'mov r14, [{fa_pte(pg(w, 9)):#x}]\nmov r15, [{fa_pte(pg(w, 11)):#x}]\nmov rsi, [{fa_pte(pg(w, 1)):#x}]\nmov rdi, [{fa_pte(pg(w, 10)):#x}]\njmp r13')
+    out['fa-fill-ad'] = (fa_c3(d, 0, uf(0)), [fn], {FA_W[w]: ptes}, [zero(FA_W[w], 0x10000)],
+                         {'r8': ptes[2] | DB, 'r9': ptes[3] | DB, 'r10': ptes[8] | AB, 'r14': ptes[9] | AB, 'r15': ptes[11] | AB,
+                          'rsi': ptes[1], 'rdi': ptes[10]}, None)
+    # fa-fill-rw (M8; writable needs D, and D = 1 gives it): at CPL 3 X read fills j 2 (R/W, D = 1) writable, so its store takes no
+    # abort (`upgrades` 0), and j 1 (R/W = 0, A = D = 1) read-only: its store is #PF 7 at CR2 = j 1 (a fill ignoring R/W lets it through).
+    w = 'rw'
+    ptes = {0: ident(w, 0, PRES | RWB | USB | AB | DB), 1: ident(w, 1, PRES | USB | AB | DB), 2: ident(w, 2, PRES | RWB | USB | AB | DB)}
+    fn = f'mov rax, [{pg(w, 0):#x}]\nmov qword [{pg(w, 2):#x}], 0x77\nmov r8, [{pg(w, 2):#x}]\nmov qword [{pg(w, 1):#x}], 0x55\njmp r13'
+    out['fa-fill-rw'] = (fa_c3(d, 0, uf(0)), [fn], {FA_W[w]: ptes}, [zero(FA_W[w], 0x3000)], {'r8': 0x77}, (14, pg(w, 1), 7))
+    # fa-fill-user (M7, M15): S (j 1) a supervisor page (U/S = 0, A = 1, D = 0). CPL 3 reads X first (the user space's leaf table
+    # made; S not filled there: `supervisor_page`); CPL 0 reads X: S filled read-only in the supervisor space, T (j 2, supervisor, R/W,
+    # D = 1) not at all (review 9.1 B2: `supervisor_read_only`). CPL 3 reads S: #PF 5 at CR2 = S (a fill ignoring U/S, or one that also
+    # writes the user space's table, lets it through).
+    w = 'user'
+    ptes = {0: ident(w, 0, PRES | RWB | USB | AB | DB), 1: ident(w, 1, PRES | RWB | AB), 2: ident(w, 2, PRES | RWB | AB | DB)}
+    fns = [f'mov rax, [{pg(w, 0):#x}]\njmp r13', f'mov r8, 1\nmov rax, [{pg(w, 1):#x}]\nmov r8, 2\njmp r13']
+    out['fa-fill-user'] = (fa_c3(d, 0, uf(0)) + f'    mov rax, [{pg(w, 0):#x}]\n    mov qword [{pg(w, 2):#x}], 9\n' + fa_c3(d, 1, uf(1)), fns,
+                           {FA_W[w]: ptes}, [zero(FA_W[w], 0x3000)], {'r8': 1}, (14, pg(w, 1), 5))
+    # fa-fill-smc (M5, M6, B1): N holds `mov eax, 1; jmp r13`, user, R/W, A = D = 1. (a) X read at CPL 3 fills N writable (its writable
+    # bit and reverse-map entry); N called at CPL 3 (the mark drops this vCPU's writable shadow of N); a store makes the code `mov eax, 2`
+    # (it aborts: the code-write path kills the block); N called: 2. A fill that set no bit, or left no reverse-map entry, keeps the
+    # writable shadow: the store goes unseen and the stale block returns 1. (b) The other order: N2 called first (marked), X2 read (N2
+    # filled read-only: `translated`), the store aborts, N2 called: 2 (a fill skipping `translated` lets the store through: 1).
+    ptes = {0: ident('smc', 0, PRES | RWB | USB | AB | DB), 1: ident('smc', 1, PRES | RWB | USB | AB | DB)}
+    ptes2 = {0: ident('smc2', 0, PRES | RWB | USB | AB | DB), 1: ident('smc2', 1, PRES | RWB | USB | AB | DB)}
+    n1, n2 = pg('smc', 1), pg('smc2', 1)
+    fns = [f'mov rax, [{pg("smc", 0):#x}]\njmp r13', f'mov byte [{n1 + 1:#x}], 2\njmp r13',
+           f'mov rax, [{pg("smc2", 0):#x}]\njmp r13', f'mov byte [{n2 + 1:#x}], 2\njmp r13']
+    body = (fa_c3(d, 0, uf(0)) + fa_c3(d, 1, n1) + '    mov r8, rax\n' + fa_c3(d, 2, uf(1)) + fa_c3(d, 3, n1) + '    mov r9, rax\n'
+            + fa_c3(d, 4, n2) + '    mov r10, rax\n' + fa_c3(d, 5, uf(2)) + fa_c3(d, 6, uf(3)) + fa_c3(d, 7, n2) + '    mov r14, rax\n')
+    out['fa-fill-smc'] = (body, fns, {FA_W['smc']: ptes, FA_W['smc2']: ptes2},
+                          [zero(FA_W['smc'], 0x2000), zero(FA_W['smc2'], 0x2000), {'addr': f'0x{n1:x}', 'data': CODE(1).hex(), 'capture': False},
+                           {'addr': f'0x{n2:x}', 'data': CODE(1).hex(), 'capture': False}],
+                          {'r8': 1, 'r9': 2, 'r10': 1, 'r14': 2}, None)
+    # fa-fill-wt (M2's memory type, UC): N (j 1) PWT (PAT entry 1: WT), R/W, D = 1: X read at CPL 3 fills it read-only
+    # (`not_writable_type`), its store runs alone; Q (j 2) PCD | PWT (PAT entry 3: UC): never filled (`uncached`), its read runs
+    # alone. `uncached_steps` 2 (a fill ignoring the memory type lets either run natively).
+    w = 'wt'
+    ptes = {0: ident(w, 0, PRES | RWB | USB | AB | DB), 1: ident(w, 1, PRES | RWB | USB | AB | DB | PWT), 2: ident(w, 2, PRES | RWB | USB | AB | DB | PWT | PCD)}
+    fn = f'mov rax, [{pg(w, 0):#x}]\nmov qword [{pg(w, 1) + 8:#x}], 0x1234\nmov r8, [{pg(w, 1) + 8:#x}]\nmov r9, [{pg(w, 2):#x}]\njmp r13'
+    out['fa-fill-wt'] = (fa_c3(d, 0, uf(0)), [fn], {FA_W[w]: ptes}, [zero(FA_W[w], 0x1000), zero(pg(w, 1)), {'addr': f'0x{pg(w, 2):x}', 'data': (0x5a5a).to_bytes(8, 'little').hex(), 'capture': False}],
+                         {'r8': 0x1234, 'r9': 0x5a5a}, None)
+    # fa-fill-mmio (M4): j 1 maps the LAPIC page (0xfee00000), read-only so a CPL 0 fill would take it: X read at CPL 0, then the
+    # LAPIC version register through j 1 (the device's answer, as with the fill off: `not_ram`).
+    w = 'mmio'
+    ptes = {0: ident(w, 0, PRES | RWB | AB | DB), 1: 0xfee00000 | PRES | AB}
+    out['fa-fill-mmio'] = (f'    mov rax, [{pg(w, 0):#x}]\n    mov r8d, [{pg(w, 1) + 0x30:#x}]\n', [], {FA_W[w]: ptes}, [zero(FA_W[w])], None, None)
+    # fa-fill-none (M14): at CPL 0, beside X: N (j 1) P = 0 with A, D and a frame (a PROT_NONE or NUMA-hint shape), R (j 2) present,
+    # A = 1, reserved bit 51 set; both R/W = 0 (a CPL 0 fill would take them read-only). Their reads fault: #PF 0 at N, #PF 9 at R
+    # (the handler records the error code and CR2; a fill ignoring P or the reserved bits lets the read through: the sentinels stay).
+    w = 'none'
+    ptes = {0: ident(w, 0, PRES | RWB | AB | DB), 1: ident(w, 1, AB | DB), 2: ident(w, 2, PRES | AB | DB) | 1 << 51}
+    body = (adv_idt(d) + f'    mov rax, [{pg(w, 0):#x}]\n' + sentinel + probe(0, f'mov rax, [{pg(w, 1):#x}]') + '    mov r8, r14\n    mov r9, r15\n'
+            + sentinel + probe(1, f'mov rax, [{pg(w, 2):#x}]') + '    mov r10, r14\n    mov rsi, r15\n    jmp .end\n' + TO_R13 + '.end:\n')
+    out['fa-fill-none'] = (body, [], {FA_W[w]: ptes}, [zero(FA_W[w], 0x3000), zero(d + IDT)], {'r8': 0, 'r9': pg(w, 1), 'r10': 9, 'rsi': pg(w, 2)}, None)
+    # fa-fill-invlpg (the TLB rule; QEMU's answers): N (j 1, R/W = 0, A = 1) onto F1 (j 14) is prefetched by X's read at CPL 0 and read
+    # through (r8: F1's word, the translation now in the Arm TLB too). N -> F2 (j 15) and INVLPG N: F2's (r9; an INVLPG that left the
+    # entry or its TLB entry, F1's). N -> F1, a CR3 reload, X read (N prefetched again): F1's (r10). N -> F2 with no invalidation:
+    # either (rsi); INVLPG N: F2's (rdi).
+    w = 'inv'
+    f1, f2 = pg(w, 14), pg(w, 15)
+    ptes = {0: ident(w, 0, PRES | RWB | AB | DB), 1: f1 | PRES | AB}
+    put = lambda frame: f'    mov rax, {frame | PRES | AB:#x}\n    mov [{fa_pte(pg(w, 1)):#x}], rax\n'
+    inv = f'    mov rax, {pg(w, 1):#x}\n    invlpg [rax]\n'
+    body = (f'    mov rax, [{pg(w, 0):#x}]\n    mov r8, [{pg(w, 1):#x}]\n' + put(f2) + inv + f'    mov r9, [{pg(w, 1):#x}]\n' + put(f1)
+            + '    mov rax, cr3\n    mov cr3, rax\n' + f'    mov rax, [{pg(w, 0):#x}]\n    mov r10, [{pg(w, 1):#x}]\n' + put(f2)
+            + f'    mov rsi, [{pg(w, 1):#x}]\n' + inv + f'    mov rdi, [{pg(w, 1):#x}]\n')
+    out['fa-fill-invlpg'] = (body, [], {FA_W[w]: ptes}, [zero(FA_W[w]), {'addr': f'0x{f1:x}', 'data': (0x1111).to_bytes(8, 'little').hex(), 'capture': False},
+                                                       {'addr': f'0x{f2:x}', 'data': (0x2222).to_bytes(8, 'little').hex(), 'capture': False}],
+                             {'r8': 0x1111, 'r9': 0x2222, 'r10': 0x1111, 'rdi': 0x2222}, None)
+    # fa-fill-kept (M3): the kept half (supervisor, upper half: KV = 0xffff800000000000, tables of its own in A and B), CR4.PGE on.
+    # X (global) read under A: G2 (global, read-only) is filled, N (non-global, read-only, F1 in A, F2 in B) is not (`kept`: a CR3
+    # load keeps the kept half's shadows when it holds global ones only). CR3 B: N reads F2's word (a fill that put N in the kept
+    # half leaves F1's there), G2 its own; the CR3 load kept the half (`kept_resets`).
+    kv, kx, kf1, kf2 = 0xffff_8000_0000_0000, 0x3a0000, 0x3a1000, 0x3a2000
+    kmem = []
+    for t, nf in ((0, kf1), (1, kf2)):
+        base = P.SYS_T(0, t)
+        link = lambda to: (to | PRES | RWB | USB | AB).to_bytes(8, 'little').hex()
+        kmem += [{'addr': f'0x{base + 256 * 8:x}', 'data': link(base + 0x5000), 'capture': False},
+                 {'addr': f'0x{base + 0x5000:x}', 'data': link(base + 0x6000), 'capture': False},
+                 {'addr': f'0x{base + 0x6000:x}', 'data': link(base + 0x7000), 'capture': False},
+                 {'addr': f'0x{base + 0x7000:x}', 'data': b''.join(v.to_bytes(8, 'little') for v in (
+                     kx | PRES | RWB | AB | DB | G, nf | PRES | AB, kx + 0x3000 | PRES | AB | G)).hex(), 'capture': False}]
+    kmem += [zero(kx, 0x4000), {'addr': f'0x{kf1:x}', 'data': (0x1111).to_bytes(8, 'little').hex(), 'capture': False},
+             {'addr': f'0x{kf2:x}', 'data': (0x2222).to_bytes(8, 'little').hex(), 'capture': False},
+             {'addr': f'0x{kx + 0x3000:x}', 'data': (0x3333).to_bytes(8, 'little').hex(), 'capture': False}]
+    body = ('    mov rax, cr4\n    bts rax, 7\n    mov cr4, rax\n' + f'    mov rax, {kv:#x}\n    mov rax, [rax]\n' + '    mov rax, {tb:#x}\n    mov cr3, rax\n'
+            + f'    mov rax, {kv + 0x1000:#x}\n    mov r8, [rax]\n    mov rax, {kv + 0x2000:#x}\n    mov r9, [rax]\n')
+    out['fa-fill-kept'] = (body, [], {}, kmem, {'r8': 0x2222, 'r9': 0x3333}, None)
+    # fa-fill-large: two user 2 MiB leaves onto LF1. The first with D = 0: a read at CPL 3 fills its window read-only; a write to
+    # another page aborts and sets the PDE's D once (r8: a fill writable with D = 0 leaves it clear). The second with D = 1: the
+    # read fills writable; the write takes no abort and the PDE is unchanged (r9). One upgrade in all.
+    (l0, l1), (a0, a1) = FA_LARGE, FA_LARGE_AT
+    pd = P.SYS_T(0, 0) + 0x2000
+    pde0, pde1 = LF1 | 0x80 | PRES | RWB | USB | AB, LF1 | 0x80 | PRES | RWB | USB | AB | DB
+    fn = (f'mov rax, [{l0 + a0:#x}]\nmov qword [{l0 + a0 + 0x1000:#x}], 0x11\nmov r8, [{pd + 16:#x}]\n'
+          f'mov rax, [{l1 + a1:#x}]\nmov qword [{l1 + a1 + 0x1000:#x}], 0x22\nmov r9, [{pd + 24:#x}]\nmov r10, [{l0 + a0 + 0x1000:#x}]\njmp r13')
+    out['fa-fill-large'] = (fa_c3(d, 0, uf(0)), [fn], {}, [zero(LF1 + a0, 0x2000), zero(LF1 + a1, 0x2000),
+                            {'addr': f'0x{pd + 16:x}', 'data': b''.join(v.to_bytes(8, 'little') for v in (pde0, pde1)).hex(), 'capture': False}],
+                            {'r8': pde0 | DB, 'r9': pde1, 'r10': 0x11}, None)
+    # fa-fill-counts (M9): 32 present, A = 1 user pages (two windows) read in order at CPL 3, against `-1`, which reads page 0 only:
+    # the difference in `retries` is the windows the reads opened less one (W = 16: 1; W = 512: 0; off: 31).
+    w = 'counts'
+    ptes = {j: ident(w, j, PRES | RWB | USB | AB) for j in range(16)}
+    ptes2 = {j: (FA_W[w] + 0x10000 + 0x1000 * j) | PRES | RWB | USB | AB for j in range(16)}
+    loop = lambda pages: (f'mov rsi, {FA_W[w]:#x}\nmov ecx, {pages}\n.l:\nmov rax, [rsi]\nadd rsi, 0x1000\ndec ecx\njnz .l\njmp r13')
+    for name, pages in (('fa-fill-counts', 32), ('fa-fill-counts-1', 1)):
+        out[name] = (fa_c3(d, 0, uf(0)), [loop(pages)], {FA_W[w]: ptes, FA_W[w] + 0x10000: ptes2}, [zero(FA_W[w], 0x20000)], None, None)
+    return out
+
+
+FILL_COUNTS = {   # least `k1.fault_around` counters a program shows at the default window
+    'fa-fill-ad': {'user': 7, 'not_accessed': 8}, 'fa-fill-rw': {'writable': 1}, 'fa-fill-user': {'supervisor': 1, 'supervisor_page': 1, 'supervisor_read_only': 1},
+    'fa-fill-smc': {'writable': 1, 'translated': 1}, 'fa-fill-wt': {'not_writable_type': 1, 'uncached': 1}, 'fa-fill-mmio': {'not_ram': 1},
+    'fa-fill-kept': {'kept': 1, 'supervisor': 1},
+    'fa-fill-none': {'not_present': 1, 'reserved': 1}, 'fa-fill-invlpg': {'supervisor': 2}, 'fa-fill-large': {'large': 30, 'writable': 15},
+}
+FILL_STATS = {'fa-fill-rw': {'upgrades': 0}, 'fa-fill-large': {'upgrades': 1}}            # exact, at the default window
+FILL_UC_STEPS = {'fa-fill-wt': 2}
+FILL_EITHER = {'fa-fill-invlpg': {'rsi': {0x1111, 0x2222}}}
+FILL_COUNT_DIFF = {'16': 1, '512': 0, 'off': 31}                                           # `fa-fill-counts` - `-1` retries
+
+
+def fill_program(name):
+    i, n, d = 0, 1, P.SYS_D(0)
+    text, fns, windows, extra, _, _ = fa_fill_setup()[name]
+    a = {d + x: ((d + x) | P.LEAF) & ~US for x in (0x9000, STUB['back'], STUB['S'])}
+    mem = lambda at, data: {'addr': f'0x{at:x}', 'data': data.hex(), 'capture': False}
+    out = {'format': 'natemu-smp-v1', 'name': f'k1-{name}@{n}', 'ncpu': n, 'system': True, 'params': {},
+           'bodies': [P.body(P.SYS_CODE(i), P.sys_text(i, text))],
+           'cpus': [dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, switches=[(d + STUB['enter'], 3), (d + STUB['exit'], 0)])]}
+    out['memory'] = P.sys_tables(i, 0, n, a) + P.sys_tables(i, 1, n, {}) + [dict(P.zero(d + P.SAVE, 8), capture=False)] + extra + [
+        mem(d + STUB['enter'], b'\x90'), mem(d + STUB['user'], b'\xff\xe3'), mem(d + STUB['exit'], b'\x90'), mem(d + STUB['back'], b'\x41\xff\xe4')]
+    out['memory'] += [mem(d + FA_UC + 0x200 * k, P.asm(f)) for k, f in enumerate(fns)]
+    for base, ptes in windows.items():
+        out['memory'].append(mem(fa_pte(base), b''.join(ptes.get(j, 0).to_bytes(8, 'little') for j in range(16))))
+    return out
+
+
+def fill_runs(a, report):
+    """Every fill program at the default window and off (and `fa-fill-counts` at 512): the module's section above."""
+    failures, retries = [], {}
+    setup = fa_fill_setup()
+    for name in [x for x in setup if not a.programs or 'fa-fill' in a.programs or x in a.programs or x.rsplit('-', 1)[0] in a.programs]:
+        _, _, _, _, regs, fault = setup[name]
+        prog = fill_program(name)
+        for mode in ('16', 'off') + (('512',) if name.startswith('fa-fill-counts') else ()):
+            saved = os.environ.get('NATEMU_FAULT_AROUND')
+            os.environ['NATEMU_FAULT_AROUND'] = mode
+            EXPECT_STOP.pop(name, None)
+            if fault:
+                EXPECT_STOP[name] = ('guest_fault', '')
+            try:
+                out, problems = run(a, prog, [], tag=f'-fa{mode}')
+            finally:
+                os.environ.pop('NATEMU_FAULT_AROUND') if saved is None else os.environ.__setitem__('NATEMU_FAULT_AROUND', saved)
+            c = out['cpus'][0] if out else None
+            if c:
+                got = lambda r: smp.num(c['gpr'][P.REGS.index(r)])
+                want = dict(regs or {})
+                if name == 'fa-fill-mmio':
+                    retries.setdefault(name, got('r8'))
+                    want = {'r8': retries[name]}
+                problems += [f'{r} = {got(r):#x}, want {v:#x}' for r, v in want.items() if got(r) != v]
+                problems += [f'{r} = {got(r):#x}, allowed {sorted(hex(x) for x in ok)}' for r, ok in FILL_EITHER.get(name, {}).items() if got(r) not in ok]
+                if fault and c['stop'] == 'guest_fault':
+                    f = tuple(smp.num(x) for x in c['fault'][:3])
+                    if f != fault:
+                        problems.append(f'fault (vector, CR2, error) {tuple(hex(x) for x in f)}, want {tuple(hex(x) for x in fault)}')
+                fa = c['stats']['k1'].get('fault_around', {})
+                if mode == 'off' and fa.get('fills'):
+                    problems.append(f'fault-around off, yet fills {fa}')
+                if mode == '16':
+                    problems += [f'fault_around {k} = {fa.get(k, 0)}, want at least {m}' for k, m in FILL_COUNTS.get(name, {}).items() if fa.get(k, 0) < m]
+                if mode == '16':
+                    problems += [f"{k} = {c['stats'].get(k)}, want exactly {m}" for k, m in FILL_STATS.get(name, {}).items() if c['stats'].get(k) != m]
+                if name == 'fa-fill-kept':
+                    kept = (c['stats']['k1'].get('kept_resets'), c['stats'].get('shadow_resets'))
+                    retries.setdefault((name, 'kept'), kept)
+                    if kept != retries[(name, 'kept')] or not kept[0] or kept[0] < 2:
+                        problems.append(f"(kept_resets, shadow_resets) {kept}, want at least 2 kept CR3 loads and those of the first run {retries[(name, 'kept')]}")
+                if name in FILL_UC_STEPS and c['stats']['k1']['uncached']['steps'] != FILL_UC_STEPS[name]:
+                    problems.append(f"UC steps {c['stats']['k1']['uncached']['steps']}, want {FILL_UC_STEPS[name]}")
+                if name.startswith('fa-fill-counts'):
+                    retries[(name, mode)] = c['stats'].get('retries')
+            entry = {'name': prog['name'] + f'-fa{mode}', 'max_block': None, 'problems': problems, 'stats': out and [x['stats'].get('k1') for x in out['cpus']]}
+            report.append(entry)
+            print(json.dumps(entry), flush=True)
+            failures += [f"{prog['name']} (fault-around {mode}): {p}" for p in problems]
+    for mode, want in FILL_COUNT_DIFF.items():
+        r32, r1 = retries.get(('fa-fill-counts', mode)), retries.get(('fa-fill-counts-1', mode))
+        if r32 is not None and r1 is not None and r32 - r1 != want:
+            failures.append(f'fa-fill-counts (fault-around {mode}): retries {r32} - {r1} = {r32 - r1}, want {want}')
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
@@ -2310,6 +2563,9 @@ def main():
                 report.append(entry)
                 print(json.dumps(entry), flush=True)
                 failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}: {p}" for p in problems]
+    # Fault-around chunk 2: the fill programs (1 vCPU; on the first shard).
+    if 1 in a.cpus and a.shard[0] == 1:
+        failures += fill_runs(a, report)
     # Counts: translation requests and compiles must not grow with the rounds.
     counts = {}
     if a.programs or a.shard[0] != 1: a.host = a.base_host = None

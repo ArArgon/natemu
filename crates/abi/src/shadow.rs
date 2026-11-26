@@ -159,6 +159,31 @@ pub trait Maintenance {
     fn invalidate(&mut self, va: u64);
     /// The same for every translation of both of the owner's spaces.
     fn invalidate_all(&mut self);
+    /// [`Maintenance::invalidate`] of the pages of the 2 MiB region at `base` whose bits `pages` holds (bit `i` of word
+    /// `i / 64`: page `base + 4096 i`), as one: complete prior table stores once, invalidate each page, complete the
+    /// invalidations once, then ISB (fault-around plan chunk 2: an INVLPG's region drop no longer pays a full barrier
+    /// sequence per valid entry). By default one [`Maintenance::invalidate`] per page.
+    fn invalidate_many(&mut self, base: u64, pages: &[u64; 8]) {
+        for (w, &bits) in pages.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                self.invalidate(base + 4096 * i as u64);
+            }
+        }
+    }
+}
+
+/// One neighbour shadow for [`Space::fill`] (fault-around plan 3.4): its leaf index in the 2 MiB region, its target (an IPA,
+/// page-aligned), whether writable and whether its translation is global; `written` is the fill's answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fill {
+    pub index: u16,
+    pub target: u64,
+    pub writable: bool,
+    pub global: bool,
+    pub written: bool,
 }
 
 /// The owner's private tables: window offset 0 is at resident address
@@ -367,18 +392,68 @@ impl<M: Maintenance> Space<M> {
         Ok(())
     }
     /// Removes every shadow of the 2 MiB-aligned range holding `va` (its leaf table's entries: one walk) and invalidates
-    /// each.
+    /// them, every entry cleared before one batch of invalidations ([`Maintenance::invalidate_many`]).
     pub fn unmap_large(&mut self, va: u64) -> Result<(), Error> {
         let start = va & !0x1f_ffff;
         if let Some((table, _)) = self.leaf(start, false)? {
+            let mut cleared = [0u64; 8];
             for index in 0..512 {
                 if self.get(table, index) & 1 != 0 {
                     self.set(table, index, 0);
-                    self.tlb.invalidate(start + 4096 * index as u64);
+                    cleared[index / 64] |= 1 << (index % 64);
                 }
+            }
+            if cleared != [0; 8] {
+                self.tlb.invalidate_many(start, &cleared);
             }
         }
         Ok(())
+    }
+    /// Fault-around plan 3.2: the slots of `range` (leaf indices) in the leaf table of the 2 MiB region holding `region`
+    /// that hold a valid descriptor (bit `i % 64` of word `i / 64` for index `i`), `None` when the region has no leaf table.
+    pub fn valid_slots(&mut self, region: u64, range: core::ops::Range<usize>) -> Result<Option<[u64; 8]>, Error> {
+        let Some((table, _)) = self.leaf(region & !0x1f_ffff, false)? else {
+            return Ok(None);
+        };
+        let mut valid = [0u64; 8];
+        for index in range.start.min(512)..range.end.min(512) {
+            if self.get(table, index) & 1 != 0 {
+                valid[index / 64] |= 1 << (index % 64);
+            }
+        }
+        Ok(Some(valid))
+    }
+    /// Fault-around plan 3.4: installs the neighbour shadows `entries` in the leaf table of the 2 MiB region holding
+    /// `region`, which a demand install has just made (the fill never allocates: no table, nothing written). Only empty
+    /// slots are written (no entry is replaced, so no break-before-make and no TLB invalidation: an invalid descriptor is
+    /// never cached), then one publish for the batch. Refused (left unwritten): a non-global entry in the kept half (a CR3
+    /// load would have to remove it, and the fill lists nothing, so the kept-half invariant is the install's alone), a
+    /// private target (any page below [`OWN_END`] of the owner's block), a misaligned target, an index past the table.
+    /// Each entry's `written` says whether it was installed; returns how many were.
+    pub fn fill(&mut self, region: u64, entries: &mut [Fill]) -> Result<usize, Error> {
+        let start = region & !0x1f_ffff;
+        let Some((table, _)) = self.leaf(start, false)? else {
+            entries.iter_mut().for_each(|e| e.written = false);
+            return Ok(0);
+        };
+        let kept = self.kept(start);
+        let mut written = 0;
+        for e in entries.iter_mut() {
+            let index = e.index as usize;
+            e.written = index < 512
+                && e.target & !OUTPUT == 0
+                && !(kept && !e.global)
+                && (e.target.wrapping_sub(self.ipa) as usize) >= OWN_END
+                && self.get(table, index) & 1 == 0;
+            if e.written {
+                self.set(table, index, e.target | PAGE | NOT_GLOBAL | if e.writable { 0 } else { READ_ONLY });
+                written += 1;
+            }
+        }
+        if written != 0 {
+            self.tlb.publish();
+        }
+        Ok(written)
     }
     /// The leaf descriptor shadowing `va` (0 when none).
     pub fn descriptor(&mut self, va: u64) -> u64 {
@@ -470,7 +545,17 @@ mod tests {
         fn invalidate_all(&mut self) {
             self.0.push(ALL);
         }
+        fn invalidate_many(&mut self, base: u64, pages: &[u64; 8]) {
+            for i in 0..512 {
+                if pages[i / 64] >> (i % 64) & 1 != 0 {
+                    self.0.push(base + 4096 * i as u64);
+                }
+            }
+            self.0.push(MANY);
+        }
     }
+    /// The end of one [`Maintenance::invalidate_many`] batch.
+    const MANY: u64 = 2;
     const IPA: u64 = 0x4010_0000;
     /// Every shadow leaf: valid page, tagged with the owner's ASID.
     const LEAF: u64 = PAGE | NOT_GLOBAL;
@@ -547,15 +632,101 @@ mod tests {
         }
         s.tlb.0.clear();
         s.unmap_large(0x21_2345).unwrap();
-        assert_eq!(s.tlb.0, vec![0x20_0000, 0x20_3000, 0x3f_f000]);
+        // Every entry cleared, then one batch of invalidations (fault-around plan chunk 2).
+        assert_eq!(s.tlb.0, vec![0x20_0000, 0x20_3000, 0x3f_f000, MANY]);
         assert_eq!(
             [0x20_0000, 0x20_3000, 0x3f_f000].map(|va| s.descriptor(va)),
             [0; 3]
         );
         assert_ne!(s.descriptor(0x40_0000), 0);
-        // A region with no leaf table: nothing to do.
+        // A region with no leaf table, or none valid: nothing to do.
         s.unmap_large(0x80_0000).unwrap();
-        assert_eq!(s.tlb.0.len(), 3);
+        s.unmap_large(0x20_0000).unwrap();
+        assert_eq!(s.tlb.0.len(), 4);
+    }
+    /// The default `invalidate_many` (host-side maintenance) invalidates each page of the batch, in order.
+    #[test]
+    fn default_invalidate_many_invalidates_each_page() {
+        struct Each(Vec<u64>);
+        impl Maintenance for Each {
+            fn publish(&mut self) {}
+            fn invalidate(&mut self, va: u64) {
+                self.0.push(va)
+            }
+            fn invalidate_all(&mut self) {}
+        }
+        let mut e = Each(Vec::new());
+        let mut pages = [0u64; 8];
+        pages[0] = 1 | 1 << 63;
+        pages[7] = 1 << 63;
+        e.invalidate_many(HIGH_BASE, &pages);
+        assert_eq!(e.0, [HIGH_BASE, HIGH_BASE + 63 * 4096, HIGH_BASE + 511 * 4096]);
+    }
+
+    /// Fault-around plan 3.4 (Tier 0; M10): `fill` writes only empty slots of an existing leaf table, never allocates,
+    /// refuses kept-half non-global entries and private targets, publishes once for the batch and returns the count.
+    #[test]
+    fn fill_writes_only_empty_slots_and_publishes_once() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_MAX_PAGES);
+        let fill = |index, target, writable, global| Fill { index, target, writable, global, written: false };
+        // No leaf table: nothing written, nothing allocated, no maintenance.
+        let mut e = [fill(1, 0x4007_1000, false, false)];
+        assert_eq!(s.fill(0x20_0000, &mut e), Ok(0));
+        assert_eq!((s.used(), e[0].written, s.tlb.0.len()), (0, false, 0));
+        // The demand install made the table; its own slot (3) is valid already and is never replaced.
+        s.map(0x20_3000, 0x4007_3000, false).unwrap();
+        let used = s.used();
+        s.tlb.0.clear();
+        let mut e = [
+            fill(0, 0x4007_0000, true, false),
+            fill(3, 0x4009_0000, true, false),
+            fill(4, 0x4007_4000, false, true),
+            fill(5, IPA + STATE_OFFSET as u64, false, false),
+            fill(6, 0x4007_6800, false, false),
+            fill(512, 0x4007_0000, false, false),
+        ];
+        assert_eq!(s.fill(0x20_0000 + 0x1234, &mut e), Ok(2));
+        assert_eq!(e.map(|e| e.written), [true, false, true, false, false, false]);
+        assert_eq!(s.tlb.0, [PUBLISH]);
+        assert_eq!(s.used(), used);
+        assert_eq!(s.descriptor(0x20_0000), 0x4007_0000 | LEAF);
+        assert_eq!(s.descriptor(0x20_3000), 0x4007_3000 | LEAF | READ_ONLY);
+        assert_eq!(s.descriptor(0x20_4000), 0x4007_4000 | LEAF | READ_ONLY);
+        assert_eq!(s.valid_slots(0x20_0000, 0..16), Ok(Some([0b11001, 0, 0, 0, 0, 0, 0, 0])));
+        assert_eq!(s.valid_slots(0x20_0000, 4..512), Ok(Some([0b10000, 0, 0, 0, 0, 0, 0, 0])));
+        assert_eq!(s.valid_slots(0x80_0000, 0..512), Ok(None));
+        assert_eq!([0x20_5000, 0x20_6000].map(|va| s.descriptor(va)), [0, 0]);
+        // Everything refused or present already: no publish.
+        s.tlb.0.clear();
+        let mut e = [fill(0, 0x4008_0000, false, false), fill(3, 0x4008_3000, false, false)];
+        assert_eq!(s.fill(0x20_0000, &mut e), Ok(0));
+        assert!(s.tlb.0.is_empty());
+        assert_eq!(s.descriptor(0x20_0000), 0x4007_0000 | LEAF);
+        // The kept half (supervisor, upper): global entries only; the list is untouched, so a CR3 load keeps the half.
+        let kernel = HIGH_BASE + 0x40_0000;
+        s.map_global(kernel, 0x400a_0000, false).unwrap();
+        let mut e = [fill(1, 0x400a_1000, false, true), fill(2, 0x400a_2000, true, false)];
+        assert_eq!(s.fill(kernel, &mut e), Ok(1));
+        assert_eq!(e.map(|e| e.written), [true, false]);
+        assert!(!s.reset_cr3());
+        assert_eq!(s.descriptor(kernel + 0x1000), 0x400a_1000 | LEAF | READ_ONLY);
+        assert_eq!(s.descriptor(kernel + 0x2000), 0);
+        // The user space's upper half is not kept: non-global entries are written there.
+        s.user = true;
+        s.map(kernel, 0x400a_0000, false).unwrap();
+        let mut e = [fill(2, 0x400a_2000, true, false)];
+        assert_eq!(s.fill(kernel, &mut e), Ok(1));
+        assert_eq!(s.descriptor(kernel + 0x2000), 0x400a_2000 | LEAF);
+        // Every private page of the owner's block is refused, in both spaces.
+        for user in [false, true] {
+            s.user = user;
+            s.map(0x60_0000, 0x4007_0000, false).unwrap();
+            for page in (0..OWN_END / 4096).step_by(97) {
+                let mut e = [fill(1, IPA + (page * 4096) as u64, false, false)];
+                assert_eq!(s.fill(0x60_0000, &mut e), Ok(0), "page {page:#x}");
+            }
+        }
     }
     #[test]
     fn halves_allocate_tables_from_the_pool_and_gap_is_refused() {

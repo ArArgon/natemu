@@ -1115,6 +1115,9 @@ pub struct K1 {
     /// shootdowns run (`Control::mapped_installs`, `remaps`); absent while both are zero (always without regions).
     #[serde(skip_serializing_if = "K1Mapped::is_empty")]
     mapped: K1Mapped,
+    /// Fault-around plan chunk 2 (`natemu_abi::fault_around::count`, by name): absent while every counter is zero.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    fault_around: std::collections::BTreeMap<&'static str, u64>,
 }
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Mapped {
@@ -1461,6 +1464,11 @@ impl K1 {
             chain_dropped: c.chain_dropped,
             relisted: c.relisted,
             mapped: K1Mapped { installs: c.mapped_installs, remaps: c.remaps },
+            fault_around: natemu_abi::fault_around::count::NAMES
+                .into_iter()
+                .zip(c.fault_around_counts)
+                .filter(|&(_, n)| n != 0)
+                .collect(),
         }
     }
 }
@@ -3276,6 +3284,10 @@ pub struct Compiler {
     /// Fault-around plan chunk 1: [`cache::Control::writable_on_read_off`] (a demand read installs the shadow writable when the leaf has D
     /// set and grants the write; on by default; `--writable-on-read on|off`, [`parse_writable_on_read`]; `NATEMU_WRITABLE_ON_READ` overrides it).
     pub writable_on_read: bool,
+    /// Fault-around plan chunk 2: [`cache::Control::fault_around`], the window in pages (0: off; the default
+    /// `natemu_abi::fault_around::DEFAULT_WINDOW`; `--fault-around off|8|16|32|64|512`, [`parse_fault_around`];
+    /// `NATEMU_FAULT_AROUND` overrides it for every driver).
+    pub fault_around: u64,
     /// Gather plan (docs/restructure/gather-fast-path-plan.md): the AVX2 gathers of a `--bulk` request in 64-bit code run inside
     /// the block (the default); false sends fexc `--no-inline-gather`, under which every gather stays the system cut (the
     /// resident's transaction), as in a step (the CLI's `[debug] inline_gather` or `--set debug.inline_gather`; NATEMU_INLINE_GATHER=on|off overrides it for every driver, [`run`]). Fixed for
@@ -3528,6 +3540,7 @@ impl Compiler {
             check_reuse: false,
             page_currency: cache::PAGES_ON,
             writable_on_read: true,
+            fault_around: natemu_abi::fault_around::DEFAULT_WINDOW,
             inline_gather: true,
             pic: cache::PIC_USER,
             pic_check_local: false,
@@ -4682,6 +4695,19 @@ pub fn parse_writable_on_read(text: &str) -> std::result::Result<bool, String> {
     }
 }
 
+/// `--fault-around`'s (and `NATEMU_FAULT_AROUND`'s) value: the window of neighbour shadows a demand install also makes, in
+/// pages (fault-around plan chunk 2), or `off` (0).
+pub fn parse_fault_around(text: &str) -> std::result::Result<u64, String> {
+    match text {
+        "off" => Ok(0),
+        _ => text
+            .parse::<u64>()
+            .ok()
+            .filter(|&w| w != 0 && natemu_abi::fault_around::valid(w))
+            .ok_or_else(|| format!("--fault-around {text}: off, 8, 16, 32, 64 or 512")),
+    }
+}
+
 /// `--fp`'s (and `NATEMU_FP`'s) value: whether the floating-point mode is accurate (AFP accurate plan chunk 1) or fast (the default).
 pub fn parse_fp(text: &str) -> std::result::Result<bool, String> {
     match text {
@@ -4760,6 +4786,15 @@ pub fn run(
     area.write_record(
         control + std::mem::offset_of!(cache::Control, writable_on_read_off),
         u64::from(!writable),
+    );
+    // Fault-around plan chunk 2 (A/B measurement): the window, overridden by NATEMU_FAULT_AROUND=off|8|16|32|64|512.
+    let fault_around = match std::env::var("NATEMU_FAULT_AROUND") {
+        Ok(v) => parse_fault_around(&v)?,
+        Err(_) => compiler.fault_around,
+    };
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, fault_around),
+        fault_around,
     );
     // Gather plan: `inline_gather`, overridden by NATEMU_INLINE_GATHER=on|off (every driver reads it; the CLI's `[debug]
     // inline_gather`).

@@ -24,6 +24,7 @@ use natemu_abi::execution::perf::SysFastDecline;
 mod compat;
 mod delivery;
 mod events;
+mod fault_around;
 mod fp;
 mod gather;
 mod half;
@@ -4024,6 +4025,11 @@ fn translate(
                 s.upgrades += 1;
             }
             install(s, va, t.gpa, writable, t.global && s.cpu.cr4 & CR4_PGE != 0);
+            // Fault-around plan chunk 2: the window's neighbours the guest's leaf already justifies (not for a UC page,
+            // shadowed only for its step block).
+            if !uncached {
+                fault_around::fill(s, b, va, &t);
+            }
             // Recorded once per page (an upgrade to writable or a re-install after a reset installs it again).
             let c = cache::control();
             let recorded = c.uncached_count.min(c.uncached.len() as u64) as usize;

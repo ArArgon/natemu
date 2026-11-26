@@ -119,6 +119,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
 | | `writable_on_read` | `true` | Map a page writable on a demand read of a dirty entry |
+| | `fault_around` | `"16"` | A string. At a shadow miss, also map the neighbouring pages (a window of this many pages) that the guest's page table already maps as accessed: `off`, 8, 16, 32, 64 or 512 (`NATEMU_FAULT_AROUND` overrides it; [the fault-around plan](restructure/fault-around-plan.md)) |
 | | `inline_gather` | `true` | Run the AVX2 gathers inside translated code; `false` keeps every gather in natemu's resident, element by element, as a single-instruction step does (`NATEMU_INLINE_GATHER=on\|off` overrides it; [the gather plan](restructure/gather-fast-path-plan.md)) |
 | | `perf_log` | none | Write the timing log to a file |
 | | `inspect` | `true` | SIGINFO (Ctrl-T in a terminal, `kill -INFO`) prints every vCPU's state and the run goes on |

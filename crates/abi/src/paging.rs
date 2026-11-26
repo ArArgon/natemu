@@ -58,6 +58,14 @@ pub struct Translation {
     pub pat: u8,
     /// The leaf's G bit (a global translation only with CR4.PGE, which the caller knows).
     pub global: bool,
+    /// Fault-around plan (3.2): the guest-physical base of the leaf's page table for a 4 KiB leaf (its neighbours' entries
+    /// are `table + 8 j`), 0 for a 2 MiB leaf (one entry covers all 512 pages).
+    pub table: u64,
+    /// Fault-around plan (3.2): the R/W and U/S bits accumulated over the levels above the leaf (the leaf's own not folded
+    /// in), which a neighbour entry of the same table combines with its own ([`crate::fault_around::pte`]). For a 2 MiB
+    /// leaf, the levels above the PDE.
+    pub parent_rw: bool,
+    pub parent_user: bool,
 }
 /// Outcome of replacing a table entry the walker has just read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +247,7 @@ fn walk_once<T: Tables, const B: bool>(
         {
             return Err(pf(9).into());
         }
+        let (parent_rw, parent_user) = (rw, user);
         rw &= value & 2 != 0;
         user &= value & 4 != 0;
         executable &= value >> 63 == 0;
@@ -271,6 +280,9 @@ fn walk_once<T: Tables, const B: bool>(
                 pat: ((if large { value >> 12 } else { value >> 7 } & 1) << 2 | value >> 3 & 3)
                     as u8,
                 global: value & 256 != 0,
+                table: if large { 0 } else { table },
+                parent_rw,
+                parent_user,
             });
         }
         // The mask (and its CSDB) come before the A-bit RMW below: that RMW reads this level's own slot (`at`, from the
@@ -401,6 +413,33 @@ mod tests {
                 error: 7
             })
         );
+    }
+    /// Fault-around plan (3.2, M12): a 4 KiB leaf hands over its page table's base and the R/W and U/S bits of the levels above
+    /// it, the leaf's own not folded in; a 2 MiB leaf hands over no table (0) and the bits of the levels above the PDE.
+    #[test]
+    fn translation_hands_over_the_leaf_table_and_the_parents_bits() {
+        let (mut m, c) = setup();
+        let t = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+        assert_eq!((t.table, t.parent_rw, t.parent_user, t.leaf_bytes), (0x3000, true, true, 4096));
+        // A supervisor PDE (U/S = 0) and a read-only PDPTE over a user, writable PTE: the parents' bits are clear.
+        m.0[1024] &= !4;
+        m.0[512] &= !2;
+        let t = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+        assert_eq!((t.table, t.parent_rw, t.parent_user, t.user, t.writable), (0x3000, false, false, false, false));
+        // The leaf's own R/W = U/S = 0 never reaches the parents' bits.
+        let (mut m, c) = setup();
+        m.0[1792] &= !6;
+        let t = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+        assert_eq!((t.parent_rw, t.parent_user, t.user), (true, true, false));
+        // A 2 MiB leaf: no table; the parents are levels 4 and 3 (here a supervisor PDPTE).
+        let (mut m, c) = setup();
+        m.0[1024] = 0x20_0087;
+        m.0[512] &= !4;
+        let t = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+        assert_eq!((t.table, t.parent_rw, t.parent_user, t.leaf_bytes, t.gpa), (0, true, false, 0x20_0000, 0x30_0000));
+        m.0[1024] &= !2;
+        let t = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+        assert_eq!((t.parent_rw, t.writable), (true, false));
     }
     /// Fault-around plan chunk 1: a READ walk hands over what the install rule needs: `writable` is exactly the grant of a write walk (every
     /// level's R/W, or WP = 0 at CPL 0) and `dirty` is the leaf's D as it was (a read sets only A). Every combination of the four levels'
