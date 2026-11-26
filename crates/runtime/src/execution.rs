@@ -947,6 +947,11 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     cache::select_l1(context);
     let p = crate::perf::enter(crate::perf::LOOKUP);
     let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
+    // (Frame-keyed plan step 1b: or a shared translation of RIP's frame, entered there with no record.)
+    let found = match found {
+        None => shared_fast(s, s.cpu.rip, context, true, &mut false),
+        found => found,
+    };
     crate::perf::leave(p);
     // (M2 task 4: an IRET that set RF, into a block whose first instruction's test would fire: `find` runs that
     // instruction alone, [`first_test_fires`].)
@@ -1055,7 +1060,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     });
     // Frame-keyed plan step 1b: no block at RIP: a shared translation of RIP's frame, entered there with no record.
     let found = match found {
-        None if !unknown => shared_fast(s, rip, context, &mut unknown),
+        None if !unknown => shared_fast(s, rip, context, false, &mut unknown),
         found => found,
     };
     crate::perf::leave(p);
@@ -1100,18 +1105,28 @@ unsafe fn miss_fast(frame: &NativeFrame) {
 /// answer, as a revalidation there reads it), entered at RIP with no record ([`cache::shared_at`]'s refusals, the second page's
 /// frame the translation's), unless a fence or the stop RIP lies on RIP's page or the next (as [`reused`] refuses). `unknown`:
 /// the record lacks a page (the full path walks it). Not under the reuse check, which compares every such entry ([`find`]).
-fn shared_fast(s: &State, rip: u64, context: u64, unknown: &mut bool) -> Option<&'static Block> {
+/// With `walk` ([`sys_fast`], which may walk as its lookup's revalidation does): the fetch translation of each page (the record's
+/// answer or a walk, which may set an A bit and kill blocks: the translation must still be live after it); a faulting walk is
+/// no answer (the full path delivers the fault).
+fn shared_fast(s: &mut State, rip: u64, context: u64, walk: bool, unknown: &mut bool) -> Option<&'static Block> {
     let c = cache::control();
     if c.reuse != natemu_abi::execution::cache::REUSE_ON || !cache::shares(context) {
         return None;
     }
-    let Some((page, first)) = page_record::answer(s, rip) else {
+    let answer = |s: &mut State, va: u64| {
+        if walk {
+            page_translation(s, va, natemu_abi::page_study::REVAL).ok()
+        } else {
+            page_record::answer(s, va)
+        }
+    };
+    let Some((page, first)) = answer(s, rip) else {
         *unknown = true;
         return None;
     };
     let t = cache::template(rip, page, context).filter(|t| t.flags & cache::TRANSLATION != 0)?;
     let second = if (rip & 4095) + u64::from(t.guest_bytes) > 4096 {
-        let Some((next, flags)) = page_record::answer(s, (rip & !4095).wrapping_add(4096)) else {
+        let Some((next, flags)) = answer(s, (rip & !4095).wrapping_add(4096)) else {
             *unknown = true;
             return None;
         };
@@ -1123,7 +1138,10 @@ fn shared_fast(s: &State, rip: u64, context: u64, unknown: &mut bool) -> Option<
         cache::GLOBAL
     };
     let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
-    if c.reuse_fences.iter().any(|&f| page_fenced(f)) || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)]) {
+    if c.reuse_fences.iter().any(|&f| page_fenced(f))
+        || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)])
+        || t.flags & cache::DEAD != 0
+    {
         return None;
     }
     cache::shared_at(t, rip, leaves(s, [first, second])).ok()
