@@ -412,12 +412,13 @@ pub mod cache {
     /// Frame-keyed plan 8.2: the 12 words of the guard stub of a guarded block at `rip` (frame `gpa`), placed at code-area
     /// offset `at` (its code at `at + GUARD_LEAD`), its entry at code-area offset `entry`, for the guest-state alias
     /// `guest_state_va` (x28): load the code-TLB slot of `rip`'s page, compare it with the entry of its page and frame, and
-    /// enter, or exit to the dispatcher's miss with x0 = `rip`. No word writes NZCV; x1 and x2 are its only scratch.
+    /// enter, or exit to [`GUARD_MISS`] (the dispatcher's miss, counted apart) with x0 = `rip`. No word writes NZCV; x1 and x2 are
+    /// its only scratch.
     ///
     /// ```text
     /// add/sub x1, x28, #pages, lsl #12;  ldr x1, [x1, #off]
     /// movz x2, #e0;  movk x2, #e1, lsl #16;  movk x2, #e2, lsl #32;  eor x1, x1, x2;  cbnz x1, miss;  b entry
-    /// miss: movz x0, #r0;  movk x0, #r1, lsl #16;  movk x0, #r2, lsl #32;  b DISPATCH_MISS
+    /// miss: movz x0, #r0;  movk x0, #r1, lsl #16;  movk x0, #r2, lsl #32;  b GUARD_MISS
     /// ```
     pub const fn guard_words(at: u64, entry: u64, rip: u64, gpa: u64, guest_state_va: u64) -> [u32; 12] {
         let a = ctlb_delta(guest_state_va) + 8 * ctlb_slot(rip) as i64;

@@ -1700,8 +1700,8 @@ fn guard_lead(rip: u64, guest_bytes: u32, context: u64, source_gpa: [u64; 2], wa
 }
 /// Frame-keyed plan 8.2: writes guarded block `b`'s stub (its record as it is filed: `code`, its entry) in the [`GUARD_LEAD`]
 /// bytes before its code. It loads the code-TLB slot of `b`'s page (x28 + the table's distance, [`area::ctlb_delta`]) and
-/// enters `b` only if it holds the entry of `b`'s page and frame; otherwise it exits to the dispatcher's miss with x0 = `b`'s
-/// RIP. No word writes NZCV (guest flags live there across every exit); x1 and x2 are dead at every exit, as the dispatcher
+/// enters `b` only if it holds the entry of `b`'s page and frame; otherwise it exits to [`area::GUARD_MISS`] (a dispatcher miss
+/// the resident counts apart) with x0 = `b`'s RIP. No word writes NZCV (guest flags live there across every exit); x1 and x2 are dead at every exit, as the dispatcher
 /// slots' use shows.
 ///
 /// ```text
@@ -2792,8 +2792,21 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
             link_at(source, offset_of(p))
         }
     };
+    // (Step 1d review, B1: a point already linked keeps the form it was linked in, plain (its first word `b` to the target's
+    // entry or stub) or checked (its `svc` word `b` into a dispatcher slot), whatever form this call chose: the target's
+    // GLOBAL, which the choice reads, changes at a revalidation. Only unlinked points are patched below.)
+    let slots = (area::DISPATCH + area::DISPATCH_SLOT_BYTES) as u64..(area::DISPATCH + area::DISPATCH_BYTES) as u64;
+    let in_some_form = |p: &LinkPoint| {
+        links_to(word_at(p), entry)
+            || links_to(link_at(source, u64::from(p.offset)), link_entry(source, code))
+            || code.flags & GUARDED != 0 && links_to(link_at(source, u64::from(p.offset)), code.guard_entry() - area::CODE_VA)
+            || {
+                let svc = u64::from(source.code) + svc_slot(source, p);
+                word(svc) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(svc))
+            }
+    };
     for p in points() {
-        if !unlinked(source, p) && !links_to(word_at(p), entry) {
+        if !unlinked(source, p) && !in_some_form(p) {
             return Link::Bad;
         }
     }
@@ -3836,7 +3849,10 @@ fn relink(n: usize) {
         if point.offset != r.offset() || point.target != block(n).rip {
             crate::execution::halt_native([n as u64, i, u64::from(r.source)], natemu_abi::execution::stop::BAD_LINK)
         }
-        if source.flags & DEAD != 0 || !unlinked(source, point) {
+        // (Step 1d review, S2: a target that came back non-global is linked checked by default now: the record goes, and the
+        // point's next exit links it in that form.)
+        let checked_now = control().link_form_plain == 0 && !global;
+        if source.flags & DEAD != 0 || !unlinked(source, point) || checked_now {
             remove(i, SUSP, &mut at);
             control().relink_dropped += 1;
             continue;

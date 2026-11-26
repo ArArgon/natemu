@@ -1356,6 +1356,11 @@ def chunk_bodies(k, i, n):
         'guard-flags': ('    mov ecx, 1\n    mov edx, 2\n' + c3('f0', d + GS) + save('r8') + c3('f1', d + GS) + save('r9') + cr3('tb')
                         + c3('f2', d + GS) + save('r10') + '    mov ecx, 2\n' + c3('f3', d + GS) + save('r14')
                         + '    mov ecx, 0x80000000\n    mov edx, 1\n' + c3('f4', d + GS) + save('r15') + cr3('ta')),
+        # Step 1d review, B1: one source S (on GS: `cmp ecx, 0; je V + PY; jmp V + PY`) with two link points to T (V global in table
+        # A), the first taken with PGE off (T not global: checked), the second after PGE on (T revalidated global: plain): the
+        # linker accepts the sibling point linked in the other form. Both calls run T's code.
+        'link-two-forms': ('    xor ecx, ecx\n' + c('t0', d + GS) + save('r8') + pge(True) + '    mov ecx, 1\n' + c('t1', d + GS) + save('r9')
+                           + '    xor ecx, ecx\n' + c('t2', d + GS) + save('r10') + pge(False)),
         'guard-hits': (f'    mov r14d, {k}\n    xor r8d, r8d\n.gl:\n' + c3('h0', d + GS) + '    add r8, rax\n    dec r14\n    jnz .gl\n'),
         'guard-kill': (c3('k0', d + GS) + save('r8') + c3('k1', d + GS) + save('r9') + f'    mov byte [{d + F1 + PY + 1:#x}], 0x13\n'
                        + c3('k2', d + GS) + save('r10') + flush_text(d) + c3('k3', d + GS) + save('r14')),
@@ -1422,6 +1427,8 @@ def chunk_memory(name, i, n):
         out += [mem(t + 0x6000, b''.join(((LF1 + (o << 12)) | P.LEAF).to_bytes(8, 'little') for o in range(512)), capture=False)]
     if name == 'page-counts':
         out += [mem(d + F2 + 0x20 * j, P.asm(f'mov eax, {j}\njmp r13'), capture=False) for j in range(PCN)]
+    if name == 'link-two-forms':
+        out += [mem(d + GS, P.asm(f'org {d + GS:#x}\ncmp ecx, 0\nje {d + PY:#x}\njmp {d + PY:#x}'), capture=False), code(d + F1 + PY, 0x11)]
     if name in GUARD:
         jump = P.asm(f'org {d + GS:#x}\n' + ('cmp ecx, edx\n' if name == 'guard-flags' else '') + f'jmp {d + PY:#x}')
         out += [mem(d + GS, jump, capture=False)]
@@ -1470,6 +1477,7 @@ CHUNK_VALUES = {
     'page-global': {'r8': {1}, 'r9': {0x11}, 'r10': {0x12}, 'r12': {0x21}, 'r14': {0x22}},
     'page-user': lambda i, k: {'r8': {1}, 'r9': {P.SYS_D(i) + PY}, 'r10': {0x21}, 'r14': {0x11}},   # (r9: the faulted call leaves its target in rax)
     'page-user-invlpg': {'r8': {1}, 'r9': {0x12}, 'r10': {0x21}, 'rdi': {1}},
+    'link-two-forms': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x11}},
     'guard-cr3': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}, 'rsi': {0x11}},
     'guard-invlpg': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}},
     'guard-flags': {'r8': {0x81}, 'r9': {0x81}, 'r10': {0x81}, 'r14': {0x40}, 'r15': {0x800}},
@@ -1710,7 +1718,7 @@ def program(name, n, k):
     out = {'format': 'natemu-smp-v1', 'name': f'k1-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': [], 'cpus': [], 'memory': [], 'params': {}}
     for i in range(n):
         d = P.SYS_D(i)
-        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write', 'page-global', 'pf-relist-global') else 0), d + 0x4000: (d + XA) | P.LEAF}
+        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write', 'page-global', 'pf-relist-global', 'link-two-forms') else 0), d + 0x4000: (d + XA) | P.LEAF}
         if name == 'place-global':
             a[d + 0x3000] = (d + 0x3000) | P.LEAF | G
         if name in ('straddle', 'pf-relist-straddle'):
@@ -2084,8 +2092,8 @@ def relink_counts(a, n, name, report):
         for v, c in enumerate(out['cpus'] if out else []):
             r = c['stats']['k1'].get('relink', {})
             cross = c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0)
-            if cross >= RM or r.get('relinked', 0) < RM:
-                failures.append(f"{name}@{n} default cpu{v}: {cross} cross-page links checked, {r.get('relinked', 0)} relinked: want V's plain (fewer than {RM} checked, at least {RM} relinked)")
+            if cross != 2 or r.get('relinked', 0) < RM * (k - 1):
+                failures.append(f"{name}@{n} default cpu{v}: {cross} cross-page links checked, {r.get('relinked', 0)} relinked: want V's plain (Z's 2 checked, at least {RM * (k - 1)} relinked)")
             allowed = EITHER[name](v, k) if callable(EITHER[name]) else EITHER[name]
             for reg, ok in allowed.items():
                 got = smp.num(c['gpr'][P.REGS.index(reg)])
