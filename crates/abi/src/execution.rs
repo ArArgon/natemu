@@ -388,7 +388,17 @@ pub mod cache {
     const _: () = assert!(DL1_BYTES == 2 * BLOCK && L1_SPACE_TABLES * L1_ENTRIES * 16 == BLOCK && DL1 % BLOCK == 0);
     /// PCID gain study (`pcid-study` resident builds; the EL0 sampler's ring in `profile` builds; untouched, so unbacked,
     /// otherwise): the modelled sets, after the page record.
-    pub const PCID_STUDY: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
+    pub const PCID_STUDY: usize = (FKEYS + 8 * FKEY_ENTRIES).next_multiple_of(4096);
+    /// Frame-keyed plan step 1a (docs/restructure/frame-keyed-plan.md): the exact table of templates and shared translations by
+    /// (frame, page offset, half, context), open-addressed, [`FKEY_ENTRIES`] of {32-bit tag, block number + 1} (0: empty). A
+    /// key names at most one block and a block has at most one entry; at most [`FKEY_MAX`] are live (the lookup area's room
+    /// holds 8 MiB of it, not one slot per block). A tag match is a candidate, checked against the block's record. Backed as
+    /// touched; emptied by a reset.
+    pub const FKEYS: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
+    pub const FKEY_ENTRIES: usize = 1 << 20;
+    /// At most this many live entries (half the table): a template placed beyond it is not entered (counted, `Control::fkey_full`),
+    /// so probes stay short and always end at an empty slot.
+    pub const FKEY_MAX: usize = FKEY_ENTRIES / 2;
     pub const PCID_STUDY_BYTES: usize = 18 * MIB;
     /// EL0 sampler (`profile` resident builds): the study part holds the sample ring ([`crate::sample`]).
     /// [`Control::pcid_study`]'s counters: CR3 loads to a space still modelled, to a new one and of the current value, and
@@ -541,9 +551,9 @@ pub mod cache {
     /// blocks hashed to its pages. Dead blocks leave a chain when a walk of it meets them.
     pub const LINEAR_HEADS: usize = PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES;
     pub const LINEAR_BUCKETS: usize = 1 << 16;
-    /// Perf chunk 10, reuse inside the resident: a direct-mapped table of [`HINT_ENTRIES`] u32 (block number + 1) by a hash
-    /// of (guest-physical page, page offset, context), written for every [`RELOCATABLE`] block placed. A hint is only a
-    /// candidate: it is checked against the block's record on use, so nothing ever clears the table.
+    /// Perf chunk 10's hint table, kept only to count what it would have lost (frame-keyed plan step 1a): a direct-mapped table of
+    /// [`HINT_ENTRIES`] u32 (block number + 1) by a hash of (guest-physical page, page offset, context), written for every
+    /// [`RELOCATABLE`] block placed. Templates are found through [`FKEYS`]; a hint is only compared with what that finds.
     pub const HINTS: usize = LINEAR_HEADS + 4 * LINEAR_BUCKETS;
     pub const HINT_ENTRIES: usize = 1 << 18;
     /// PIC study stage 1 (counting, `crate::pic::count`): the linear page each frame was last met at as a user block's first
@@ -1078,6 +1088,16 @@ pub mod cache {
         /// `machine.shadow_pool_pages` caps it, never below [`crate::shadow::POOL_MIN_PAGES`]
         /// ([`crate::shadow::pool_pages_valid`]; the resident does not start with another value). Appended.
         pub shadow_pool_pages: u64,
+        /// Frame-keyed plan step 1a: live entries of [`FKEYS`]; templates found there (by [`crate::execution`]'s reuse path), and of
+        /// them those the old hint table would not have given (its entry overwritten); links suspended whose target an
+        /// absolute-block guard could serve (user, non-global, not shared, one linear page: the plan's step 2 evidence). Plain
+        /// counters in every build. Appended.
+        pub fkey_entries: u64,
+        pub fkey_found: u64,
+        pub fkey_lost: u64,
+        pub suspended_guardable: u64,
+        /// Templates not entered in [`FKEYS`] because it held [`FKEY_MAX`] entries. Appended.
+        pub fkey_full: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1746,7 +1766,9 @@ pub mod cache {
             && HINTS + 4 * HINT_ENTRIES <= PIC_FRAMES
             && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= PAGE_STAMPS
             && PAGE_STAMPS % 64 == 0
-            && PAGE_STAMPS + crate::page_study::BYTES <= LOOKUP_BYTES
+            && PAGE_STAMPS + crate::page_study::BYTES <= FKEYS
+            && FKEYS % 4096 == 0
+            && FKEYS + 8 * FKEY_ENTRIES <= PCID_STUDY
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate.
     const _: () = assert!(

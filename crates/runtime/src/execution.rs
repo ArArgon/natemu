@@ -1273,6 +1273,11 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             .then(|| cache::template(rip, s.fetch[0], context))
             .flatten();
     if let Some(b) = template {
+        // (Frame-keyed plan step 1a: found exactly; counted when the old hint table had lost it.)
+        c.fkey_found += 1;
+        if !cache::hinted(rip, s.fetch[0], context) {
+            c.fkey_lost += 1;
+        }
         let p = crate::perf::enter(crate::perf::REUSE);
         let crosses = (rip & 4095) + u64::from(b.guest_bytes) > 4096;
         let fenced = |fence| natemu_abi::execution::reuse_fenced(rip, crosses, fence);

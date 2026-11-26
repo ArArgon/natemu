@@ -1131,6 +1131,8 @@ struct K1Relink {
     relinked: u64,
     relink_dropped: u64,
     links_susp: u64,
+    /// Frame-keyed plan: suspended records whose target an absolute-block guard could serve (user, non-global, unshared, one page).
+    suspended_guardable: u64,
 }
 impl K1Relink {
     fn is_empty(&self) -> bool {
@@ -1243,6 +1245,12 @@ struct K1Reuse {
     copies: u64,
     refused: [u64; 5],
     checks: u64,
+    /// Frame-keyed plan step 1a: the table's live entries, templates found, of them lost by the old hint table, and templates
+    /// not entered (the table at its cap).
+    fkey_entries: u64,
+    fkey_found: u64,
+    fkey_lost: u64,
+    fkey_full: u64,
 }
 /// The template pool's counters (cross-vCPU reuse plan chunk 3): lookups, blocks copied, refusals by
 /// [`cache::pool_refusal`].
@@ -1339,6 +1347,10 @@ impl K1 {
                 copies: c.reuse_copies,
                 refused: c.reuse_refused,
                 checks: c.reuse_checks,
+                fkey_entries: c.fkey_entries,
+                fkey_found: c.fkey_found,
+                fkey_lost: c.fkey_lost,
+                fkey_full: c.fkey_full,
             },
             pool: K1Pool::new(c),
             slot_writes: c.slot_writes,
@@ -1393,6 +1405,7 @@ impl K1 {
                 relinked: c.relinked,
                 relink_dropped: c.relink_dropped,
                 links_susp: c.links_susp,
+                suspended_guardable: c.suspended_guardable,
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,

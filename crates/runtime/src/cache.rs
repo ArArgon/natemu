@@ -442,6 +442,11 @@ pub fn reset() {
         bind_slot(now, c.l1_contexts[now]);
     }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
+    // (Frame-keyed plan step 1a: only when it holds entries, so a vCPU that never placed a template backs none of it.)
+    if c.fkey_entries != 0 {
+        unsafe { ptr::write_bytes(lookup_area::<u8>(area::FKEYS), 0, area::FKEY_ENTRIES * 8) };
+        c.fkey_entries = 0;
+    }
     unsafe { ptr::write_bytes(lhead(0), 0, area::LINEAR_BUCKETS) };
     // The reverse map's heads: only pages this vCPU marked (its code summary) can hold one.
     for k in 0..pages().div_ceil(MASK_PAGES_PER_WORD * 64) {
@@ -1633,21 +1638,122 @@ pub fn frame_met(b: &Block) {
     }
     unsafe { at.write(now) };
 }
-/// Perf chunk 10: the template the hint table holds for guest-physical page `gpa` (its frame), `rip`'s half and page
-/// offset and `context`, if its record still says so: live, [`RELOCATABLE`] (never a step or system record), from that
-/// frame at that offset and half, in that context. Any such block is a template, whichever hint led to it.
+/// Frame-keyed plan step 1a: the template (or shared translation) for guest-physical page `gpa` (its frame), `rip`'s half and
+/// page offset and `context`, from the exact frame-keyed table ([`area::FKEYS`]): live, [`RELOCATABLE`] (never a step or
+/// system record), from that frame at that offset and half, in that context. A key names at most one block (a translation
+/// before its template, [`fkey_enter`]), so every such block this vCPU holds is found while it is entered.
 pub fn template(rip: u64, gpa: u64, context: u64) -> Option<&'static Block> {
-    let n = unsafe { hint(gpa, rip, context).read() }.checked_sub(1)? as usize;
-    if n >= control().blocks as usize {
-        return None;
+    let h = fkey_hash(gpa, rip, context);
+    let mut i = fkey_home(h);
+    loop {
+        let [tag, number] = unsafe { fkey_slot(i).read() };
+        if number == 0 {
+            return None;
+        }
+        if tag == h as u32 {
+            let b = block(number as usize - 1);
+            if fkey_fits(b, gpa, rip, context) {
+                return Some(b);
+            }
+        }
+        i = (i + 1) & (area::FKEY_ENTRIES - 1);
     }
-    let b = block(n);
-    let fits = b.flags & (DEAD | SYSTEM | STEP | RELOCATABLE) == RELOCATABLE
-        && b.source_gpa[0] == gpa
-        && b.context == context;
-    (fits && (b.rip ^ rip) & (1 << 63 | 0xfff) == 0).then_some(b)
 }
-/// The hint table's entry for (`gpa`'s frame, `rip`'s half and page offset, `context`).
+/// Frame-keyed plan step 1a: what the old hint table would have given for the same key (`template` found `found`): whether its
+/// entry still names a block that fits. Counting only ([`Control::fkey_lost`]).
+pub fn hinted(rip: u64, gpa: u64, context: u64) -> bool {
+    let Some(n) = unsafe { hint(gpa, rip, context).read() }.checked_sub(1) else {
+        return false;
+    };
+    (n as u64) < control().blocks && fkey_fits(block(n as usize), gpa, rip, context)
+}
+/// Block `b` is a template of the key (frame `gpa`, `rip`'s half and page offset, `context`).
+fn fkey_fits(b: &Block, gpa: u64, rip: u64, context: u64) -> bool {
+    b.flags & (DEAD | SYSTEM | STEP | RELOCATABLE) == RELOCATABLE
+        && b.source_gpa[0] & !0xfff == gpa & !0xfff
+        && b.context == context
+        && (b.rip ^ rip) & (1 << 63 | 0xfff) == 0
+}
+/// The 64-bit hash of a frame key: its slot is the top bits ([`fkey_home`]), its tag the low 32.
+fn fkey_hash(gpa: u64, rip: u64, context: u64) -> u64 {
+    let key = (gpa & !0xfff | rip & 0xfff) ^ (rip >> 63) << 62 ^ context.rotate_left(29);
+    (key ^ key >> 31).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+fn fkey_home(h: u64) -> usize {
+    (h >> (64 - area::FKEY_ENTRIES.trailing_zeros())) as usize
+}
+/// Slot `i` of the frame-keyed table: {tag, block number + 1}.
+fn fkey_slot(i: usize) -> *mut [u32; 2] {
+    lookup_area::<[u32; 2]>(area::FKEYS).wrapping_add(i)
+}
+fn fkey_of(b: &Block) -> u64 {
+    fkey_hash(b.source_gpa[0], b.rip, b.context)
+}
+/// Frame-keyed plan step 1a: enters the [`RELOCATABLE`] block `n` (just filed) under its key: in a free slot, or in place of the
+/// key's block when `n` is a shared translation (its template stays valid at its own RIP, found there by L2); a copy of a
+/// template already entered is not entered (the key names one block). Not when the table holds [`area::FKEY_MAX`] entries.
+fn fkey_enter(n: usize) {
+    let b = *block(n);
+    let h = fkey_of(&b);
+    let mut i = fkey_home(h);
+    loop {
+        let [tag, number] = unsafe { fkey_slot(i).read() };
+        if number == 0 {
+            let c = control();
+            if c.fkey_entries as usize >= area::FKEY_MAX {
+                c.fkey_full += 1;
+                return;
+            }
+            unsafe { fkey_slot(i).write([h as u32, n as u32 + 1]) };
+            c.fkey_entries += 1;
+            return;
+        }
+        if tag == h as u32 && fkey_fits(block(number as usize - 1), b.source_gpa[0], b.rip, b.context) {
+            if b.flags & TRANSLATION != 0 {
+                unsafe { fkey_slot(i).write([tag, n as u32 + 1]) };
+            }
+            return;
+        }
+        i = (i + 1) & (area::FKEY_ENTRIES - 1);
+    }
+}
+/// Frame-keyed plan step 1a: takes block `n` (dying) out of the frame-keyed table if a slot names it (backward-shift deletion, as
+/// [`l2_remove`]); a block whose key names another (a copy, a template a translation replaced) has no slot.
+fn fkey_remove(n: usize) {
+    let b = *block(n);
+    if b.flags & RELOCATABLE == 0 {
+        return;
+    }
+    let mask = area::FKEY_ENTRIES - 1;
+    let mut i = fkey_home(fkey_of(&b));
+    loop {
+        let [_, number] = unsafe { fkey_slot(i).read() };
+        if number == 0 {
+            return;
+        }
+        if number as usize == n + 1 {
+            break;
+        }
+        i = (i + 1) & mask;
+    }
+    control().fkey_entries -= 1;
+    let mut j = i;
+    loop {
+        j = (j + 1) & mask;
+        let [tag, number] = unsafe { fkey_slot(j).read() };
+        if number == 0 {
+            unsafe { fkey_slot(i).write([0, 0]) };
+            return;
+        }
+        // The entry at j moves into the hole at i unless its home lies cyclically in (i, j].
+        let home = fkey_home(fkey_of(block(number as usize - 1)));
+        if (j.wrapping_sub(home) & mask) >= (j.wrapping_sub(i) & mask) {
+            unsafe { fkey_slot(i).write([tag, number]) };
+            i = j;
+        }
+    }
+}
+/// The old hint table's entry for (`gpa`'s frame, `rip`'s half and page offset, `context`), kept for [`hinted`].
 fn hint(gpa: u64, rip: u64, context: u64) -> *mut u32 {
     let key = (gpa & !0xfff | rip & 0xfff) ^ (rip >> 63) << 62 ^ context.rotate_left(29);
     let i = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::HINT_ENTRIES.trailing_zeros()))
@@ -2051,10 +2157,11 @@ unsafe fn file(
             }
             l2(i).write([record.rip, n as u64 + 1]);
         }
+        (c.meta_used, c.blocks) = (meta_end, n as u64 + 1);
         if record.flags & RELOCATABLE != 0 {
             hint(record.source_gpa[0], record.rip, record.context).write(n as u32 + 1);
+            fkey_enter(n);
         }
-        (c.meta_used, c.blocks) = (meta_end, n as u64 + 1);
         Some(&*at)
     }
 }
@@ -3231,6 +3338,7 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
         unsafe { (*block_ptr(n)).flags |= DEAD };
         c.killed += 1;
         l2_remove(n);
+        fkey_remove(n);
     } else {
         unsafe { (*block_ptr(n)).checked = 0 };
         c.unvalidated += 1;
@@ -3363,6 +3471,11 @@ fn suspend(scope: usize) -> Option<u64> {
         let r = unsafe { record(i as usize).read() };
         // (A suspended record is named by no outbound slot: its source's point may be linked to another block meanwhile.)
         out_del(i as usize);
+        // (Frame-keyed plan, step 2's evidence: a target an absolute-block guard could serve: user, not global, not shared, on one
+        // linear page.)
+        let t = block(r.target as usize);
+        let [p0, p1] = lpages(t);
+        c.suspended_guardable += u64::from(user(t.context) && p0 == p1 && t.flags & (GLOBAL | PIC | INSTANCE) == 0);
         // (`link-check`: the epoch moved, so no target of the scanned segments is current: the premise of suspending without looking.)
         #[cfg(feature = "link-check")]
         if current(block(r.target as usize)) {
