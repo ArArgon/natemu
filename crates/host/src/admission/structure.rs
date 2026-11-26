@@ -1487,14 +1487,7 @@ impl<'a> Verifier<'a> {
         })
     }
     fn guest_insn(&self, g: u32) -> &[u8] {
-        let end = (self
-            .c
-            .pcs
-            .iter()
-            .map(|p| p.guest_offset)
-            .filter(|&o| o > g)
-            .min())
-        .unwrap_or(self.c.guest_bytes);
+        let end = super::next_boundary(self.c.pcs, g, self.c.guest_bytes);
         &self.c.source[g as usize..end as usize]
     }
     /// A cbz/cbnz/tbz/tbnz at `at` (or the far form `inverse +8; b target`), normalized, and its target.
@@ -1764,18 +1757,11 @@ impl<'a> Verifier<'a> {
         for s in self.c.accesses {
             let at = s.native_offset;
             let lo = s.insn_native_offset;
-            let entry = self
-                .c
-                .pcs
-                .iter()
-                .any(|p| (p.native_offset, p.guest_offset) == (lo, s.guest_offset));
-            if !entry
-                || self.c.pcs.iter().any(|p| {
-                    lo < p.native_offset
-                        && p.native_offset <= at
-                        && p.guest_offset != s.guest_offset
-                })
-            {
+            // (The PC table's native offsets ascend: the entries in (lo, at] are one slice of it.)
+            let pcs = self.c.pcs;
+            let (from, to) = (pcs.partition_point(|p| p.native_offset <= lo), pcs.partition_point(|p| p.native_offset <= at));
+            let inside = &pcs[from.min(to)..to];
+            if !super::pc_entry(pcs, lo, s.guest_offset) || inside.iter().any(|p| p.guest_offset != s.guest_offset) {
                 return Err(format!(
                     "access at {at:#x}: not inside its guest instruction"
                 ));
@@ -2473,18 +2459,22 @@ impl<'a> Verifier<'a> {
 
     /// Every exit: each `svc #LINK` ends a link point to a proven RIP; the dispatch branch follows `mov x0, xR`.
     fn exits(&mut self) -> Result<(), String> {
+        // The link point at each relocation's offset ([`Self::link_point`]: the same for every exit), in the relocations'
+        // order, found once for the block at its first exit; and the unit's last instruction.
+        let mut points: Option<Vec<(u32, Option<(u64, u32)>)>> = None;
+        let last = (self.c.pcs.iter().map(|p| p.guest_offset))
+            .filter(|&g| g < self.c.guest_bytes)
+            .max();
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             if !matches!(self.insn(at), Some(Insn::Svc(svc::LINK))) {
                 continue;
             }
-            let point = self
-                .c
-                .relocs
+            let points = points.get_or_insert_with(|| self.c.relocs.iter().map(|r| (r.offset, self.link_point(r.offset))).collect());
+            let point = points
                 .iter()
-                .map(|r| r.offset)
-                .filter(|&o| o < at)
-                .filter_map(|o| self.link_point(o).map(|p| (o, p)));
-            let Some((offset, (target, _))) = point.into_iter().find(|&(_, (_, end))| end == at)
+                .filter(|&&(o, _)| o < at)
+                .find_map(|&(o, p)| p.filter(|&(_, end)| end == at).map(|p| (o, p)));
+            let Some((offset, (target, _))) = point
             else {
                 return Err(format!(
                     "exit at {at:#x}: a literal exit is not exactly a link point"
@@ -2500,19 +2490,17 @@ impl<'a> Verifier<'a> {
             // exit, placed after the last instruction). Only the unit's last instruction may exit to the whole set (end,
             // ...); another goes to its own direct target (or retries at its own RIP: only an STI and a VERW, [`super::retries_own_rip`]; CLI and
             // SWAPGS never exit).
-            let last = (self.c.pcs.iter().map(|p| p.guest_offset))
-                .filter(|&g| g < self.c.guest_bytes)
-                .max();
             let at_exit = self.instruction(offset);
-            let srcs: Vec<u32> = (self.branches.iter())
-                .filter(|&&(_, t)| t == offset)
-                .map(|&(src, _)| src)
-                .collect();
+            // (The branches are sorted by target: those to the exit are one slice of them, in their order. The PC table's
+            // guest offsets ascend: the instruction before the exit's is the last entry below its guest offset.)
+            let srcs = &self.branches
+                [self.branches.partition_point(|&(_, t)| t < offset)..self.branches.partition_point(|&(_, t)| t <= offset)];
+            let before = at_exit.and_then(|(g, _)| {
+                let pcs = self.c.pcs;
+                pcs[..pcs.partition_point(|p| p.guest_offset < g)].last().map(|p| p.guest_offset)
+            });
             // An exit no branch reaches is entered by falling through: it belongs to the instruction holding it.
-            for src in srcs.iter().map(|&s| Some(s)).chain(srcs.is_empty().then_some(None)) {
-                let before = (self.c.pcs.iter().map(|p| p.guest_offset))
-                    .filter(|&o| at_exit.is_some_and(|(g, _)| o < g))
-                    .max();
+            for src in srcs.iter().map(|&(s, _)| Some(s)).chain(srcs.is_empty().then_some(None)) {
                 let owner = match (at_exit, src.map(|s| self.instruction(s))) {
                     (Some((g, start)), Some(Some((s, _))))
                         if start == offset

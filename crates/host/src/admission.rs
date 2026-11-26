@@ -580,6 +580,19 @@ fn retries_own_rip(insn: &[u8]) -> bool {
     insn == [0xfb] || insn.get(o..o + 2) == Some(&[0x0f, 0x00]) && insn.get(o + 2).is_some_and(|m| m >> 3 & 7 == 5)
 }
 
+/// The guest offset of the first PC-table entry past guest offset `g`, or `end` (the block's guest bytes) if none is: the
+/// end of the instruction at `g`. `pcs` is a PC table admission accepted, its guest offsets ascending (equal ones next to each
+/// other), so this is a binary search where it was the least of a scan.
+pub(super) fn next_boundary(pcs: &[PcEntry], g: u32, end: u32) -> u32 {
+    pcs.get(pcs.partition_point(|p| p.guest_offset <= g)).map_or(end, |p| p.guest_offset)
+}
+
+/// The accepted PC table `pcs` holds the entry (native offset, guest offset): both ascend together, so the entries are in
+/// that pair's order and a binary search finds it.
+pub(super) fn pc_entry(pcs: &[PcEntry], native: u32, guest: u32) -> bool {
+    pcs.binary_search_by(|p| (p.native_offset, p.guest_offset).cmp(&(native, guest))).is_ok()
+}
+
 /// Everything but the code: header, tables, site records, relocations.
 fn admit_records(
     bytes: &[u8],
@@ -686,7 +699,7 @@ fn admit_records(
     for s in &maps {
         if object::x87_map(s).is_none()
             || s.guest_offset >= h.guest_bytes
-            || !pcs.iter().any(|p| (p.native_offset, p.guest_offset) == (s.insn_native_offset, s.guest_offset))
+            || !pc_entry(&pcs, s.insn_native_offset, s.guest_offset)
         {
             return fail(&format!("x87 map at native offset {:#x}", s.native_offset));
         }
@@ -713,8 +726,7 @@ fn admit_records(
                     && s.data_class == object::CLASS_FPR)
                 && object::completion(s).is_none_or(|c| {
                     let end = s.guest_offset + u32::from(c.length);
-                    let next = pcs.iter().map(|p| p.guest_offset).filter(|&g| g > s.guest_offset).min().unwrap_or(h.guest_bytes);
-                    end != next.min(h.guest_bytes)
+                    end != next_boundary(&pcs, s.guest_offset, h.guest_bytes).min(h.guest_bytes)
                 }))
             || !matches!(
                 s.kind,
@@ -753,13 +765,7 @@ fn admit_records(
             .ok()
             .map(|i| &accesses[i]);
         // I5c: an x87 stub's width is its instruction's length (the resident resumes after it): to the next PC-table entry.
-        let length = pcs
-            .iter()
-            .map(|p| p.guest_offset)
-            .filter(|&g| g > s.guest_offset)
-            .min()
-            .unwrap_or(h.guest_bytes)
-            - s.guest_offset;
+        let length = next_boundary(&pcs, s.guest_offset, h.guest_bytes) - s.guest_offset;
         // A split stub is its `brk`, or two words that go to the shared probe of its store and say where to come back
         // (`natemu_abi::execution::probe`; the resident takes a fault at a probe, and its `brk`, as the stub's `brk`):
         // `adr x0, R` with R a word at or before the access, then the placeholder `b .` at a `probe_branch` relocation whose
