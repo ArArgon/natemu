@@ -507,7 +507,7 @@ G2: ldr  x2, E                 // the stub's 8-byte literal
 G3: cmp  x1, x2
 G4: b.ne miss
 G5: b    B's (hot) entry
-miss: movz/movk x0, #r (1-4 words); b DISPATCH_MISS
+miss: movz/movk x0, #r (3 words); b GUARD_MISS   (as built, section 10)
 E:   .quad vpn(r) | VALID << 35 | F << 36
 ```
 
@@ -738,4 +738,61 @@ The review's SHOULD findings, all fixed:
 - A k1 case that stops at every stub word. It needs a kick source; the rented M4's kicker is throttled.
 - The two-candidate slots (8.4 item 5): conflicts are only counted (`ctlb_conflicts`).
 - A large-leaf INVLPG case, and running the link and kill programs once more with guards on.
+
+## 11. Step 1d, guard misses counted, and step 2's A/B
+
+**Guard misses are counted** (d1667718). The stub's miss exits at `GUARD_MISS`, a copy of the dispatcher's `svc #MISS`
+in slot 0's unused words. The resident counts it (`fkeys.guard_misses`) and serves it as a dispatcher miss. Guard hits
+run wholly at EL0, so they could be counted only by a store in every stub; they are not measured. The fast miss path
+enters a guarded block at its body, since it has found the block current.
+
+**Step 1d** (989309b8):
+- **The evidence:** checkpoint 2's attribution put step 1c's cost on `guest-build` at about 4-7%; the plain form was at
+  or below base.
+- **The reasoning:** a link into a global block was never undone by a CR3 load. It sits in the TLB segment, suspended
+  only at a global flush. So checking it bought nothing and cost every kernel cross-page transfer an L1 probe.
+- **The change:** by default only links into non-global blocks are checked. `NATEMU_LINK_FORM=checked` is 1c's form,
+  `plain` the old one.
+- **The check:** `relink-global-many` runs once more in the default form. Exactly Z's 2 links must be checked, and V's
+  must be relinked after each round's global flushes.
+- **Shown to fail:** with the form pinned to `checked` it reports "17 cross-page links checked, 0 relinked".
+
+**Review of d1667718 and 989309b8** (Fable, independent): d1667718 has no defect.
+- **B1, adopted as a defence; its premise rebutted for the tests.** A link's form now follows the target's `GLOBAL`,
+  which a revalidation rewrites. A source with two points naming one target could have one linked checked and the
+  other plain, and the linker's consistency check would halt. The check now accepts a linked point in either sound
+  form.
+  - But `link` links every point naming the target in one call, and every undo (suspension, prune, `unlink_all`,
+    death) undoes them together. Mixed forms need a point unlinked alone: only `relink` dropping one record whose word
+    changed.
+  - The k1 case added for it, `link-two-forms` (`je T; jmp T` across a PGE change), passes with and without the fix.
+    So it is kept as a regression case for two-exit sources across PGE changes, not as the fix's check.
+- **S1, adopted:** the default-form check is exact (Z's 2 checked, RM relinked a round).
+- **S2, adopted:** `relink` drops a suspended record whose target came back non-global, so the point links in the
+  checked form at its next exit.
+- **Notes:** stale comments fixed (the stub exits to `GUARD_MISS`). `guard_misses` sits mid-struct, harmless because
+  host and resident are always built together.
+
+**The kicker cases on the rented M4** fail the same way on `main` (be88e684) on that machine: 28 failed, all `kicks`
+cases of k2 (`sysfast`, `verw`, `stifirst`, `swapgs` kicks and events, `repmovs`, `repbulk`). They pass on the M2 at
+this branch's tip. The machine's host kicker is throttled.
+
+**Step 2's A/B** (Mac mini M4, `~/de-profile`): one build, `step2-measure` 31a0bed4 (checkpoint 2's tip f6010122 plus
+step 2 and step 1d). Guards on is the default; guards off is `NATEMU_GUARDS=off`.
+
+| case | guards on | guards off |
+|---|---|---|
+| `guest-luajit-interp` | 20261126-053942-ce47: 3.654 / 3.504 s | 20261126-053943-6696: 3.562 / 3.449 s |
+| `desktop-kde-profile` + `desktop-kde-browser-profile` | 20261126-053944-b24b | 20261126-053945-b913 |
+| `guest-build` (twice a side) | 20261126-053946-0c53, -11ec | 20261126-053947-882b, -1038 |
+
+- **luajit-interp:** the guards cost about 2%, near noise, on a single-process case.
+- **The reference for `guest-build`:** checkpoint 2's plain-form numbers (second run 5.56-5.59 s; base 5.79-5.99 s;
+  change 67a776e2 5.98-6.22 s).
+
+**If the guards recover `guest-build` only in part,** the policies to try (both cheap, both behind the existing keys):
+- **Plain links for blocks of a low CR3 rate:** count each address space's CR3 loads, and link plainly into blocks whose
+  space is switched to rarely. They are suspended and relinked at most a few times.
+- **Direct links only where the code TLB earns them:** keep a link checked until its target page has been filled in the
+  code TLB in N epochs, then make it guarded.
 
