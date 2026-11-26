@@ -1156,10 +1156,23 @@ struct K1Fkeys {
     tl1_scans: u64,
     tl1_scanned: u64,
     tl1_emptied: u64,
+    /// Plan 8.1: of the reclaimed links, the suspended records dropped (no code written); suspended records dropped at a TLB
+    /// event for their own bound.
+    reclaimed_suspended: u64,
+    suspended_dropped: u64,
 }
 impl K1Fkeys {
     fn is_empty(&self) -> bool {
-        self.entries | self.found | self.lost | self.full | self.suspended_guardable | self.tl1_scans | self.tl1_scanned | self.tl1_emptied
+        self.entries
+            | self.found
+            | self.lost
+            | self.full
+            | self.suspended_guardable
+            | self.tl1_scans
+            | self.tl1_scanned
+            | self.tl1_emptied
+            | self.reclaimed_suspended
+            | self.suspended_dropped
             == 0
     }
 }
@@ -1434,6 +1447,8 @@ impl K1 {
                 tl1_scans: c.tl1_scans,
                 tl1_scanned: c.tl1_scanned,
                 tl1_emptied: c.tl1_emptied,
+                reclaimed_suspended: c.reclaimed_suspended,
+                suspended_dropped: c.suspended_dropped,
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,

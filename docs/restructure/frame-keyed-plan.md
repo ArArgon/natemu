@@ -616,3 +616,20 @@ current, killed by a write). Two defects in the stub as drawn were blocking.
 **Not adopted for now:** the lead form, a guard before the hot entry that falls through on a hit. It saves the taken
 branch but needs room in the hot zone before each split block's hot copy, so it waits for the measurement. The baseline
 to beat is P2 chunk 4's A/B of checked cross-page links in the private cache.
+
+### 8.5 Built: the link record area (a7479c30)
+
+- **The layout:**
+  - `LINKS_VA = PRIVATE + 0x1800_0000`, `LINKS_BYTES` 98 MiB, `LINKS_OFFSET` before the code area in the backing.
+  - `MAX_LINKS = MAX_BLOCKS × MAX_LINK_POINTS + MAX_LINK_POINTS`.
+  - Asserts: the span lies between the code area and its write alias, and the shadow pool ends below it.
+- **The reclaim:** with no test cap, a reclaim drops the suspended records and goes on only if the area is still full.
+  Suspended records are also dropped at `MAX_SUSPENDED` (1 Mi) at a TLB event.
+- **The counters** (`reclaimed_suspended`, `suspended_dropped`) are in the k1 stats' `fkeys` block.
+- **`FKEYS`** takes the freed lookup room: 2^21 entries.
+- **The checks:**
+  - The unit test `link_records_hold_every_live_link_point`.
+  - k1's `link-full` at the production size (`k1-full-links`): the old 512 Ki chain, 580-697 k links, must now fill
+    nothing. At a test cap, `link-full` and `relink-reclaim` still exercise every reclaim stage.
+  - Both are shown to fail with `MAX_LINKS` back at 512 Ki (branch `fk-broken-3`, never merged).
+
