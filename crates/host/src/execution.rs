@@ -2648,8 +2648,9 @@ fn cap_bytes(guest: Option<u64>) -> usize {
 /// The bytes the memory cache may keep on a host of `host` bytes of memory running a guest of `guest` bytes of RAM
 /// (`None`: unknown, a compiler outside a boot: the old bound, 1 GiB or a sixteenth of the host's memory when that is
 /// less). For a boot: a quarter of the guest's RAM ([`ANSWERS_PER_GUEST_RAM`]), at most what the host's memory leaves
-/// after the guest and [`ANSWER_RESERVE`], at least [`ANSWER_FLOOR`]. The Mac mini M4 (16 GB) with an 8 GiB guest gets
-/// 2 GiB, with 4 GiB 1 GiB; the M3 (8 GB) with its usual 4 GiB guest 1 GiB (what the host leaves), with 2 GiB 512 MiB.
+/// after the guest and [`ANSWER_RESERVE`], and never less than that old bound (so no boot keeps fewer answers than
+/// before). The Mac mini M4 (16 GB) with an 8 GiB guest gets 2 GiB, with 4 GiB or less the old 1 GiB; the M3 (8 GB) with
+/// its usual 4 GiB guest 1 GiB (a quarter, and what the host leaves), with 2 GiB the old 512 MiB.
 /// (The guest's display memory is not counted with its RAM: the reserve covers today's sizes. A vCPU whose features
 /// differ from the first's keeps a map of its own at the old bound, beside the run's.)
 /// Why: a KDE desktop with Chromium on the Mac mini M4 (16 GB, the old 1 GiB) compiled 1.37 M of its 3.72 M answers again
@@ -2657,22 +2658,23 @@ fn cap_bytes(guest: Option<u64>) -> usize {
 /// 1.9 GB, of which a third are ever found again: under 1 GiB the sweep compiles about 2.6% of the hits again (experiment:
 /// a replay of one boot's trace; a two-generation flip at that size about 40%).
 pub(crate) fn answer_cap(host: u64, guest: Option<u64>) -> usize {
+    let old = (1u64 << 30).min(host / 16);
     let cap = match guest {
-        None => (1u64 << 30).min(host / 16),
+        None => old,
         Some(guest) => (guest / ANSWERS_PER_GUEST_RAM)
             .min(host.saturating_sub(guest).saturating_sub(ANSWER_RESERVE))
-            .max(ANSWER_FLOOR),
+            .max(old),
     };
     usize::try_from(cap).unwrap_or(usize::MAX)
 }
-/// The cap's share of the guest's RAM: a quarter. Speedometer 3.1 in a 4 GiB guest kept about 0.87 GB under the sweep
-/// (1.9 GB never swept, of which a third was ever found again), so a quarter, 1 GiB there, holds what is found again.
+/// The cap's share of the guest's RAM: a quarter, provisional (the pooled checkpoint's counters decide it). Speedometer 3.1
+/// in a 4 GiB guest kept about 0.87 GB under the sweep (1.9 GB never swept, of which a third was ever found again; an
+/// experiment, a replay of one boot's trace), so a quarter, 1 GiB there, holds what is found again.
 const ANSWERS_PER_GUEST_RAM: u64 = 4;
 /// What the host's memory keeps beside the guest and the cache: macOS and the rest of natemu (code caches, the shadow
 /// pool, the fexc servers, the compile cache's index).
 const ANSWER_RESERVE: u64 = 3 << 30;
-/// The least a boot's cache keeps, however little the host leaves.
-const ANSWER_FLOOR: u64 = 256 << 20;
+
 /// What an answer's bookkeeping costs beside the bytes [`Entry`] holds (the memory cache counts it, [`Entry::size`]): its
 /// `Arc`'s header, its [`Slot`] and its share of the shard's map, the allocator's rounding; and for one in the moved index
 /// ([`movable`]) its [`MovedSlot`] and that map's share (a moved answer's copy, kept outside that index, is counted as if
@@ -6457,8 +6459,8 @@ mod tests {
         assert_eq!(across.size(), own + BOOKKEEPING);
     }
 
-    /// The cap: a quarter of the guest's RAM, at most what the guest and the reserve leave of the host's memory, at least
-    /// the floor; the old bound outside a boot.
+    /// The cap: a quarter of the guest's RAM, at most what the guest and the reserve leave of the host's memory, never less
+    /// than the old bound; the old bound outside a boot.
     #[test]
     fn answer_cap_from_host_and_guest_memory() {
         const G: u64 = 1 << 30;
@@ -6468,7 +6470,8 @@ mod tests {
             (16 * G, Some(4 * G), 1024 * M),
             (8 * G, Some(4 * G), 1024 * M), // the M3 with its usual guest: a quarter, also what the host leaves
             (8 * G, Some(2 * G), 512 * M),
-            (8 * G, Some(5 * G), 256 * M), // the host leaves nothing: the floor
+            (8 * G, Some(5 * G), 512 * M), // the host leaves nothing: the old bound
+            (16 * G, Some(2 * G), 1024 * M), // the default 2 GiB guest: the old bound, not less
             (16 * G, Some(12 * G), 1024 * M), // what the host leaves
             (64 * G, Some(32 * G), 8192 * M), // no ceiling but the host's
             (16 * G, None, 1024 * M), // outside a boot: the old bound

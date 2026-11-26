@@ -37,8 +37,9 @@ to 256 MiB steps (`default_cap`). If statfs fails, the cap is the guest's RAM.
 against cap. Changing it is one constant.
 
 **Why the guest's RAM.** The bytes live on disk, which is plentiful, but every process builds the cache's index in
-memory at open: about 33 bytes for each entry of about 750 bytes, about 4.4% of the cache. Sizing the cache with the
-guest keeps that index a fixed share of the VM, about 0.35 GiB for an 8 GiB guest's 8 GiB cache.
+memory at open: about 5 to 7% of the cache's bytes (33 bytes a slot for each entry of about 750 bytes, in a table sized
+to a power of two; the experiment below measured 267 MiB for 5.8 M entries). Sizing the cache with the guest keeps that
+index a fixed share of the VM, about 0.5 GiB for an 8 GiB guest's 8 GiB cache.
 - 1× rather than 2×: the only measurement is that an 8 GiB cap (1× the desktop's 8 GiB guest) made a KDE desktop's
   second session hit 98–99%. Each open keeps 3/4 of the cap (6 GiB there), about ten times a session's 592 MiB, and
   each run has 2 GiB to write into.
@@ -57,8 +58,9 @@ to spare. The floor keeps the session, not a desktop's apps.
 - A relative cache folder that does not exist yet is measured on the working directory's volume.
 
 **One folder, several guests.** The folder is shared by every VM, and each process evicts down to its own cap at open.
-A small guest's boot therefore trims a large guest's cache to the small guest's size. A guest that needs more sets
-`--compile-cache-mb` or a folder of its own.
+At main the cap came from free space only, the same for every process; now a small guest's boot trims a large guest's
+cache to the small guest's size (a default 2 GiB boot to 1.5 GiB, evicting a desktop guest's warm packs). A guest that
+needs more sets `--compile-cache-mb` or a folder of its own. No guest gets less than main's 512 MiB: the floor is 1 GiB.
 
 **How it got here.**
 - The reviewed design took a tenth of the free space within 1 to 4 GiB. That ceiling was raised to 16 GiB.
@@ -133,10 +135,10 @@ default it was about 120. natemu does not raise its own limit, and macOS's defau
 - **Per-session generations** (a session's packs as one unit, evicted together). Eviction is already by pack in time
   order, and the packs one run writes are consecutive. Last-use stamps give generations' effect without a new
   structure.
-- **Sizing from a measured working set.** The ceiling is set from the KDE numbers above. A per-machine adaptive cap
+- **Sizing from a measured working set.** The factor is set from the KDE numbers above. A per-machine adaptive cap
   (grow while hits keep coming from the oldest packs) makes the cache's behaviour depend on history and is hard to
-  test. A fixed ceiling with a free-space bound is enough for now; the ceiling is provisional until a browser's working
-  set is measured (below).
+  test. A factor of the guest's RAM with a free-space bound is enough for now; the factor is provisional until warm
+  sessions' hit rate against the cap is measured (below).
 - **Memory-mapped packs** (`mmap` instead of `pread` on a hit). This saves a syscall per hit (about 1 µs; the payload
   is copied into a `Vec` either way for admission). Its larger benefit, which the design reviewer pointed out, is
   that a pack mapped and closed holds no descriptor, which removes the descriptor budget's reason to exist. The risk is
@@ -200,7 +202,7 @@ Two independent reviews of the design (Fable) and the code (Opus) found one bloc
   memory-mapped packs, fewer and larger packs, rewriting partly hot packs, a sorted index. The last four are follow-ups
   that the Mac mini measurement decides.
 - **Known, unchanged:** two calls of `Config::new` in the CLI's `old_command_lines_build_the_same_boot` test can in
-  principle get caps a step apart, on a volume with 10 to 40 GiB free whose free space crosses a 2.56 GiB edge
+  principle get caps a step apart, on a volume whose tenth of free space is below the guest's RAM and crosses a 2.56 GiB edge
   between them.
 
 The default cap was then redone at the owner's request, as the guest's RAM, provisional (above). That change was

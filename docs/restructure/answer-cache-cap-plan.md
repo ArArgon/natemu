@@ -8,7 +8,7 @@ the [compile cache's cap](disk-cache-cap-plan.md).
 ## The problem, measured
 
 Measured on the Mac mini M4 (16 GB), on a KDE desktop with Chromium, in one boot of the `desktop-kde-browser-profile`
-case (run 20261126-021552-6362, on the `desktop-profile` branch). That case passes `--compile-cache off`, so its
+case (on the `desktop-profile` branch). That case passes `--compile-cache off`, so its
 recompiles are the in-memory map's drops alone.
 
 - Of 3.72 M fexc compiles, 1.37 M compiled an answer again after the map had dropped it. The performance log counts
@@ -24,15 +24,19 @@ copies moved to other page offsets.
 ## Design
 
 **The cap is proportional to the guest's RAM.** For a boot it is a quarter of the guest's RAM, at most what the host's
-memory leaves after the guest's RAM and a 3 GiB reserve, at least 256 MiB (`answer_cap`). There is no other ceiling.
+memory leaves after the guest's RAM and a 3 GiB reserve, and never less than main's bound: 1 GiB, or a sixteenth of the
+host's memory when that is less (`answer_cap`). No boot keeps fewer answers than before. There is no other ceiling.
+The quarter is provisional, as the compile cache's factor is: it rests on one Speedometer replay in a 4 GiB guest, and
+the pooled checkpoint's counters decide it. The 8 GiB desktop guest's 2.35 M answers, about 3 GB with their
+bookkeeping, will still be swept at 2 GiB.
 
 | Host | Guest RAM | Cap |
 | --- | --- | --- |
 | Mac mini M4, 16 GB | 8 GiB (the desktop cases' `--ram 8`) | 2 GiB (a quarter) |
-| Mac mini M4, 16 GB | 4 GiB | 1 GiB |
+| Mac mini M4, 16 GB | 4 GiB, or the default 2 GiB | 1 GiB (main's) |
 | M3, 8 GB | 4 GiB (its usual guest) | 1 GiB (a quarter; also all the host leaves) |
-| M3, 8 GB | 2 GiB | 512 MiB |
-| 8 GB | 5 GiB | 256 MiB (the floor: the host leaves nothing) |
+| M3, 8 GB | 2 GiB | 512 MiB (main's) |
+| 8 GB | 5 GiB | 512 MiB (main's: the host leaves nothing) |
 | 16 GB | 12 GiB | 1 GiB (what the host leaves) |
 
 **Why a quarter.** Speedometer 3.1 in a 4 GiB guest needed about 1.9 GB of answers in a map that never sweeps. Only
@@ -58,6 +62,10 @@ about 2.6% of its hits: an experiment, a replay of one boot's trace. A quarter o
 - The reviewed version took half of what the host leaves, within 1 to 4 GiB. That ceiling was raised to 8 GiB.
 - The owner then asked for a cap proportional to the VM: 4 GiB of map for an 8 GiB guest is half of what the VM was
   given.
+- Its brief review found that a 256 MiB floor would give small guests less than main (the default 2 GiB guest, and
+  with it the `guest-paper` bench cases, from 1 GiB to 512 MiB), so main's bound is the floor. Bench cases with 2 or
+  4 GiB guests keep main's 1 GiB on the M4. The 8 GiB ones (the io5 and census cases) get 2 GiB and may move: they are
+  measured with the pooled checkpoint, and docs/benchmarks.md follows from that run.
 
 **Counting the bookkeeping.** An answer used to count only its `Entry`, its prefix, its object, its kept form and room
 for the most link points. The bookkeeping around it is now counted too, so the cap bounds resident memory rather than
