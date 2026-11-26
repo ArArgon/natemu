@@ -1,20 +1,25 @@
-//! The recorded admission corpus (`tests/admission-corpus`, built by `tools/fexc/admission_corpus.py` from one recorded
-//! boot's requests): admission's every result on it, digested, must be the digest kept beside it. So a change meant to
+//! The recorded admission corpus (`tests/admission-corpus`, built by `tools/fexc/admission_corpus.py`: `boot.corpus` from one
+//! recorded boot's requests, `gather.corpus` from blocks of AVX2 gathers compiled inline under `--bulk`, at CPL 3 and CPL 0,
+//! which the boot never ran): admission's every result on it, digested, must be the digest kept beside it. So a change meant to
 //! leave admission's answers alone (a faster form of the same checks) is shown to: each object is admitted under the modes
 //! admission tells apart (the code-shape check off, as in production, and on; for 32-bit code the CPL-3 and limited-FS/GS
 //! variants), and so is each of a set of mutants of it (bytes of its header, tables and code and of its guest bytes
-//! changed, PC-table and site fields moved, a literal slot fallen or branched into or moved into the code region), most of
-//! them refused: a result is the admitted form (object, link points and
-//! every other field) or the refusal's message.
+//! changed, PC-table and site fields moved, a literal slot fallen or branched into or moved into the code region; for an
+//! object with an inline gather also its element loads' marks, widths and words changed, the mark put on another load and
+//! the gather's guest bytes made another form or no gather), most of them refused: a result is the admitted form (object,
+//! link points, the bulk flag that keeps the object from a request without `--bulk`, and every other field) or the
+//! refusal's message.
 //!
 //! A change meant to alter what admission admits or refuses, or how it says so, reseeds the digests:
-//! `NATEMU_ADMISSION_CORPUS_RESEED=1 cargo test -p natemu-host --lib recorded_corpus` rewrites the file (and fails, so a
+//! `NATEMU_ADMISSION_CORPUS_RESEED=1 cargo test -p natemu-host --lib recorded_corpus` rewrites the files (and fails, so a
 //! reseed is never a silent pass); the change says why in its commit.
 use super::{Admitted, User32, admit_user, record};
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
 use std::io::Read;
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/admission-corpus");
+/// The corpus files (`NAME.corpus`, digests in `NAME.digests`).
+const CORPORA: [&str; 2] = ["boot", "gather"];
 
 struct Entry {
     flags: u8,
@@ -23,8 +28,8 @@ struct Entry {
     object: Vec<u8>,
 }
 
-fn entries() -> Vec<Entry> {
-    let packed = std::fs::read(format!("{DIR}/boot.corpus")).unwrap();
+fn entries(name: &str) -> Vec<Entry> {
+    let packed = std::fs::read(format!("{DIR}/{name}.corpus")).unwrap();
     let mut b = Vec::new();
     flate2::read::ZlibDecoder::new(&packed[..]).read_to_end(&mut b).unwrap();
     assert_eq!(&b[..8], b"NATADMC1");
@@ -154,6 +159,58 @@ fn mutants(e: &Entry) -> Vec<(Vec<u8>, Vec<u8>)> {
         s[at] ^= (rng.below(255) + 1) as u8;
         out.push((o.clone(), s));
     }
+    out.extend(gather_mutants(e, &h));
+    out
+}
+
+/// Gather plan (2.5): for an object with an inline gather's element loads ([`object::gather_element`]), the first and the
+/// last of them each changed in one of these ways: its mark dropped, its width the other element width (both still valid
+/// sites), its `tbz` skipping past the `ldr` or testing another bit, its `umov` into w1|x1; the mark put on another load of
+/// the block;
+/// and the first gather's guest bytes another form (VEX.L flipped: another element count) or no gather (an FMA's opcode,
+/// the same length). An object without one has none of these.
+fn gather_mutants(e: &Entry, h: &Header) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let o = &e.object;
+    let (size, code) = (size_of::<Site>(), h.code_offset as usize);
+    let table = h.sites_offset as usize..h.sites_offset as usize + h.sites_count as usize * size;
+    if table.end > o.len() {
+        return Vec::new();
+    }
+    let sites: Vec<(usize, Site)> = table.clone().step_by(size).map(|at| (at, record::<Site>(o, at))).collect();
+    let elements: Vec<&(usize, Site)> = sites.iter().filter(|(_, s)| object::gather_element(s)).collect();
+    let Some(&&(_, first)) = elements.first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let field = |at: usize, bytes: &[u8]| {
+        let mut m = o.clone();
+        m[at..at + bytes.len()].copy_from_slice(bytes);
+        m
+    };
+    let word = |at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap());
+    let (g2, width) = (std::mem::offset_of!(Site, guest_offset2), std::mem::offset_of!(Site, width));
+    for &(row, s) in [elements[0], elements[elements.len() - 1]] {
+        out.push(field(row + g2, &object::NONE32.to_le_bytes()));
+        out.push(field(row + width, &[12 - s.width]));
+        let at = code + s.native_offset as usize;
+        if s.native_offset >= 8 && at + 4 <= o.len() {
+            let (umov, tbz) = (word(at - 8), word(at - 4));
+            out.push(field(at - 4, &(tbz.wrapping_add(1 << 5)).to_le_bytes()));
+            out.push(field(at - 4, &(tbz.wrapping_sub(1 << 19)).to_le_bytes()));
+            out.push(field(at - 8, &(umov | 1).to_le_bytes()));
+        }
+    }
+    if let Some(&(row, _)) = sites.iter().find(|(_, s)| s.kind == object::kind::LOAD && !object::gather_element(s) && s.guest_offset2 == object::NONE32) {
+        out.push(field(row + g2, &object::GATHER_ELEMENT.to_le_bytes()));
+    }
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = out.into_iter().map(|m| (m, e.source.clone())).collect();
+    let g = first.guest_offset as usize;
+    if g + 4 <= e.source.len() {
+        let (mut other_l, mut fma) = (e.source.clone(), e.source.clone());
+        other_l[g + 2] ^= 4;
+        fma[g + 3] = 0x98;
+        out.extend([(o.clone(), other_l), (o.clone(), fma)]);
+    }
     out
 }
 
@@ -200,27 +257,44 @@ fn results(e: &Entry, other: &Entry) -> (u64, bool) {
 
 #[test]
 fn recorded_corpus() {
-    let entries = entries();
+    let corpora: Vec<Vec<Entry>> = CORPORA.iter().map(|name| entries(name)).collect();
+    // (One sequence of every corpus's entries, each admitted after the next one in it: the last boot object after the
+    // first gather one, the last gather object after the first boot one.)
+    let all: Vec<&Entry> = corpora.iter().flatten().collect();
     // (Quiet while admission's own panics are caught, then the default hook again for this test's verdict.)
     std::panic::set_hook(Box::new(|_| {}));
-    let got: Vec<(u64, bool)> = (0..entries.len()).map(|i| results(&entries[i], &entries[(i + 1) % entries.len()])).collect();
+    let got: Vec<(u64, bool)> = (0..all.len()).map(|i| results(all[i], all[(i + 1) % all.len()])).collect();
     drop(std::panic::take_hook());
-    let text: String = got.iter().enumerate().map(|(i, (d, _))| format!("{i} {d:016x}\n")).collect();
-    let path = format!("{DIR}/boot.digests");
-    if std::env::var_os("NATEMU_ADMISSION_CORPUS_RESEED").is_some() {
-        std::fs::write(&path, &text).unwrap();
-        panic!("reseeded {path} ({} entries): run again without NATEMU_ADMISSION_CORPUS_RESEED", entries.len());
+    let reseed = std::env::var_os("NATEMU_ADMISSION_CORPUS_RESEED").is_some();
+    let mut start = 0;
+    let mut failures = Vec::new();
+    for (name, entries) in CORPORA.iter().zip(&corpora) {
+        let got = &got[start..start + entries.len()];
+        start += entries.len();
+        let text: String = got.iter().enumerate().map(|(i, (d, _))| format!("{i} {d:016x}\n")).collect();
+        let path = format!("{DIR}/{name}.digests");
+        if reseed {
+            std::fs::write(&path, &text).unwrap();
+            continue;
+        }
+        // (The corpus is real code: nearly all of it is admitted as recorded, in production.)
+        let admitted = got.iter().filter(|(_, a)| *a).count();
+        if admitted * 100 < entries.len() * 95 {
+            failures.push(format!("{name}: only {admitted} of {} recorded objects admitted", entries.len()));
+        }
+        let want = std::fs::read_to_string(&path).unwrap();
+        let differ: Vec<&str> = text.lines().zip(want.lines()).filter(|(a, b)| a != b).map(|(a, _)| a).collect();
+        if !differ.is_empty() || text.lines().count() != want.lines().count() {
+            failures.push(format!(
+                "{name}: admission's results differ from the recorded ones for {} of {} corpus entries (index, digest now): {:?}",
+                differ.len(),
+                entries.len(),
+                &differ[..differ.len().min(10)]
+            ));
+        }
     }
-    // (The corpus is real code: nearly all of it is admitted as recorded, in production.)
-    let admitted = got.iter().filter(|(_, a)| *a).count();
-    assert!(admitted * 100 >= entries.len() * 95, "only {admitted} of {} recorded objects admitted", entries.len());
-    let want = std::fs::read_to_string(&path).unwrap();
-    let differ: Vec<&str> = text.lines().zip(want.lines()).filter(|(a, b)| a != b).map(|(a, _)| a).collect();
-    assert!(
-        differ.is_empty() && text.lines().count() == want.lines().count(),
-        "admission's results differ from the recorded ones for {} of {} corpus entries (index, digest now): {:?}",
-        differ.len(),
-        entries.len(),
-        &differ[..differ.len().min(10)]
-    );
+    if reseed {
+        panic!("reseeded {DIR}/{{{}}}.digests ({} entries): run again without NATEMU_ADMISSION_CORPUS_RESEED", CORPORA.join(","), all.len());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }
