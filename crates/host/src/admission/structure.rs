@@ -1190,7 +1190,7 @@ impl<'a> Verifier<'a> {
                 let t = natemu_abi::execution::probe::adr_x0_target(v.word(st.native_offset), u64::from(st.native_offset))
                     .and_then(|t| u32::try_from(t).ok())
                     .filter(|&t| v.probe_return(at, t))
-                    .ok_or(format!("probing split stub {i} at {:#x}: its way back", st.native_offset))?;
+                    .ok_or_else(|| format!("probing split stub {i} at {:#x}: its way back", st.native_offset))?;
                 returns.push((at, t));
             }
         }
@@ -1202,7 +1202,7 @@ impl<'a> Verifier<'a> {
         }
         v.branches.extend(returns);
         for (at, t) in back {
-            let words = v.bulk_loop(at, t).or_else(|| v.bulk_movs_loop(at, t)).ok_or(format!(
+            let words = v.bulk_loop(at, t).or_else(|| v.bulk_movs_loop(at, t)).ok_or_else(|| format!(
                 "branch at {at:#x} to {t:#x}: not forward to an instruction of the code region"
             ))?;
             v.bulk.push(words);
@@ -1215,7 +1215,7 @@ impl<'a> Verifier<'a> {
         {
             let (words, value) = v
                 .rip_move(r.offset, r.register)
-                .ok_or(format!("guest-RIP move at {:#x}", r.offset))?;
+                .ok_or_else(|| format!("guest-RIP move at {:#x}", r.offset))?;
             // A literal exit's move (into x0, right before `svc #LINK`) holds its target, which `exits` checks.
             let exit = r.register == 0
                 && v.c.code.get(words.end as usize..words.end as usize + 4)
@@ -1610,18 +1610,18 @@ impl<'a> Verifier<'a> {
         }
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             let Some(i) = self.insn(at) else { continue };
-            let w = self.word(at);
+            let (w, writes) = (self.word(at), i.writes());
             // (strb wN, [x28, #X87_RUN], N not the zero register: a run opened.)
             if shape && run_tested && w & !31 == RUN_END[8] & !31 && w & 31 != 31 {
                 return fail(at, "x87 run opened in a block that begins with the test for one");
             }
-            if i.writes() & 1 << 28 != 0 {
+            if writes & 1 << 28 != 0 {
                 return fail(at, "write to x28");
             }
-            if shape && i.writes() & 1 << 31 != 0 {
+            if shape && writes & 1 << 31 != 0 {
                 return fail(at, "write to sp");
             }
-            if i.writes() & 1 << PRE_NZCV_REG != 0 && w != MRS_PRE_NZCV {
+            if writes & 1 << PRE_NZCV_REG != 0 && w != MRS_PRE_NZCV {
                 return fail(at, "write to x25 other than the pre-NZCV save");
             }
             match i {

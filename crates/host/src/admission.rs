@@ -417,15 +417,14 @@ pub(crate) fn admit_user(
     let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0, bits32)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
-    let (fma, rest): (Vec<Site>, Vec<Site>) = parts.sites.iter().partition(|s| s.kind == object::kind::FMA);
-    let split = rest.iter().position(is_stub).unwrap_or(rest.len());
-    let (accesses, stubs) = rest.split_at(split);
+    // (admit_records' own split of the sites: FMA checks apart, then the access sites and the check stubs.)
+    let (fma, (accesses, stubs)) = (&parts.fma, parts.rest.split_at(parts.split));
     let c = structure::Code {
         code,
         literals: &parts.literals,
         accesses,
         stubs,
-        fma: &fma,
+        fma,
         pcs: &parts.pcs,
         relocs: &parts.relocs,
         source,
@@ -488,7 +487,10 @@ pub fn corpus(dir: &std::path::Path, cpl0: bool) -> (String, Vec<String>) {
 /// The records of an object [`admit_records`] accepted.
 struct Parts {
     header: Header,
-    sites: Vec<Site>,
+    /// The FMA check sites, and the other sites (not the x87 maps) split at the first check stub.
+    fma: Vec<Site>,
+    rest: Vec<Site>,
+    split: usize,
     pcs: Vec<PcEntry>,
     relocs: Vec<Reloc>,
     /// Literal slots in the code (offsets from the code start).
@@ -657,7 +659,6 @@ fn admit_records(
         code_end,
         bytes.len(),
     )?;
-    let sorted = |a: &[u32]| a.windows(2).all(|w| w[0] < w[1]);
     // Dense, in emission order: the block entry, every guest instruction, and the
     // block end when code follows the last instruction (guest offset = guest bytes).
     // (Perf chunk 25: the first entry is the block's start, guest offset 0, so an STI there is always seen and marked.)
@@ -674,7 +675,7 @@ fn admit_records(
     {
         return fail("PC table");
     }
-    if !sorted(&sites.iter().map(|s| s.native_offset).collect::<Vec<_>>()) {
+    if !sites.windows(2).all(|w| w[0].native_offset < w[1].native_offset) {
         return fail("access sites not sorted");
     }
     // The FMA NaN checks (AFP accurate plan chunk 4) are in the body, between the access sites: apart; then the access sites, then the
@@ -696,7 +697,8 @@ fn admit_records(
             return fail(&format!("FMA check site at native offset {:#x}", s.native_offset));
         }
     }
-    let (accesses, stubs) = rest.split_at(rest.iter().position(is_stub).unwrap_or(rest.len()));
+    let split = rest.iter().position(is_stub).unwrap_or(rest.len());
+    let (accesses, stubs) = rest.split_at(split);
     for s in accesses {
         if !site_fields_valid(s, &h, region)
             // M3: a load or store site may carry its instruction's completion record (fexc series23-m3): its length must end
@@ -884,7 +886,9 @@ fn admit_records(
         admitted,
         Parts {
             header: h,
-            sites,
+            fma,
+            rest,
+            split,
             pcs,
             relocs,
             literals,
