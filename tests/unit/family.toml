@@ -12,7 +12,7 @@ name = "unit"
 name = "rust"
 kind = "units"
 harness = "units"
-params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp", "rust-fs-sweep"] }
+params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp", "rust-fs-sweep", "rust-admission"] }
 needs = { cores = 4, perf = true }
 
 [[suite]]
@@ -37,6 +37,15 @@ kind = "units"
 harness = "units"
 params = { tool = "nextest", fexc = true, filter = "test(/every_limited_fs_form/)" }
 needs = { cores = 4, perf = true }
+
+[[suite]]
+name = "rust-admission"
+# Admission's results on the recorded corpus (crates/host/src/admission/corpus.rs, tests/admission-corpus): on its own, so a
+# change to admission can run it alone (`-k rust-admission`) and a reseed (NATEMU_ADMISSION_CORPUS_RESEED=1) runs nothing else.
+kind = "units"
+harness = "units"
+params = { tool = "nextest", filter = "test(/^admission::corpus::/)" }
+needs = { cores = 1, perf = true }
 
 [[suite]]
 name = "rust-afp"

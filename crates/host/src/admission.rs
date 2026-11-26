@@ -16,6 +16,8 @@ use natemu_abi::execution::{
 };
 
 mod structure;
+#[cfg(test)]
+mod corpus;
 
 /// The vCPU ID registers features are checked against, in the order of [`Detect::Fields`]' register index. MMFR2 (LSE2) joined for the startup
 /// probe ([`crate::probe`]); no fexc feature reads it.

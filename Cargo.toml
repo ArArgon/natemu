@@ -30,6 +30,9 @@ iced-x86 = { version = "=1.22.0", default-features = false, features = ["std", "
 # base64 in the control API's JSON answer.
 png = "=0.18.1"
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
+# The host crate's tests alone: the admission corpus is zlib-compressed (crates/host/src/admission/corpus.rs); png already
+# depends on this version.
+flate2 = "=1.1.11"
 
 [profile.release]
 panic = "abort"

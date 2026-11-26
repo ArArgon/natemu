@@ -170,6 +170,7 @@ name = "natemu"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "flate2",
  "iced-x86",
  "libc",
  "log",
