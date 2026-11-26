@@ -1358,6 +1358,7 @@ impl Prepared {
                     duplicates: compiler.duplicates,
                     lock_wait: compiler.lock_wait.into(),
                     recompiled: compiler.recompiled,
+                    dropped_disk_hits: compiler.dropped_disk_hits,
                     admissions: crate::execution::why::NAMES
                         .into_iter()
                         .zip(&compiler.admissions)
@@ -2015,6 +2016,8 @@ struct VcpuState {
     duplicates: u64,
     lock_wait: [u64; 2],
     recompiled: [u64; 2],
+    /// Disk hits of answers the memory cache had dropped ([`execution::Compiler::dropped_disk_hits`]).
+    dropped_disk_hits: u64,
     /// Object answers by why they were admitted again or not ([`execution::why`]; their sum is every object answer).
     admissions: crate::report::Members<&'static str, u64>,
     /// The template pool's lookups, copies and refusals (cross-vCPU reuse plan chunk 3; zero without a pool).
@@ -2060,6 +2063,7 @@ mod report_tests {
             duplicates: next(),
             lock_wait: [next(), next()],
             recompiled: [next(), next()],
+            dropped_disk_hits: next(),
             admissions: [("skipped", 1), ("fresh", 2)].into_iter().collect(),
             pool: Default::default(),
         };
@@ -2098,6 +2102,7 @@ mod report_tests {
             v.recompiled[1]
         );
         let mut old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        old["dropped_disk_hits"] = serde_json::json!(v.dropped_disk_hits);
         old["admissions"] = serde_json::json!({"skipped": 1, "fresh": 2});
         old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "candidates": 0, "refused": {}, "recheck": {}});
         assert_eq!(old, serde_json::to_value(&v).unwrap());

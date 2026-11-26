@@ -2650,6 +2650,8 @@ fn cap_bytes(guest: Option<u64>) -> usize {
 /// the guest's RAM, the rest of natemu and macOS need the host's memory first: half of what is left after the guest and
 /// 3 GiB, within the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 4 GiB. 16 GB with an
 /// 8 GiB guest gives 2.5 GiB, with a 4 GiB guest 4 GiB; 8 GB with a 2 GiB guest 1.5 GiB, with 4 GiB the old 512 MiB.
+/// (The guest's display memory is not counted with its RAM: the reserve covers today's sizes. A vCPU whose features
+/// differ from the first's keeps a map of its own at the old bound, beside the run's.)
 /// Why: a KDE desktop with Chromium on the Mac mini M4 (16 GB, the old 1 GiB) compiled 1.37 M of its 3.72 M answers again
 /// after the cache dropped them (docs/restructure/answer-cache-cap-plan.md). Speedometer 3.1 (4 vCPUs) makes 1.55 M answers,
 /// 1.9 GB, of which a third are ever found again: under 1 GiB the sweep compiles about 2.6% of the hits again (experiment:
@@ -2664,7 +2666,8 @@ pub(crate) fn answer_cap(host: u64, guest: Option<u64>) -> usize {
 }
 /// What an answer's bookkeeping costs beside the bytes [`Entry`] holds (the memory cache counts it, [`Entry::size`]): its
 /// `Arc`'s header, its [`Slot`] and its share of the shard's map, the allocator's rounding; and for one in the moved index
-/// ([`movable`]) its [`MovedSlot`] and that map's share. Estimates from the types and a counting allocator (about 90 bytes a
+/// ([`movable`]) its [`MovedSlot`] and that map's share (a moved answer's copy, kept outside that index, is counted as if
+/// in it: a little more than it holds). Estimates from the types and a counting allocator (about 90 bytes a
 /// map's share with its one-element vector at its usual load, about 60 more just after the table doubles).
 const BOOKKEEPING: usize = 128;
 const MOVED_BOOKKEEPING: usize = 96;
@@ -2891,11 +2894,11 @@ impl Shard {
             &entry.prefix[..LEAD.min(entry.prefix.len())],
         );
         self.clock += 1;
-        self.bytes += entry.size().min(u32::MAX as usize);
+        let size = u32::try_from(entry.size()).unwrap_or(u32::MAX);
+        self.bytes += size as usize;
         self.count += 1;
         self.lens.entry((key.0, key.1)).or_default()[LEAD.min(entry.prefix.len())] += 1;
         let (len, tail) = (entry.prefix.len() as u32 & !HIT, tail(&entry.prefix, entry.prefix.len()));
-        let size = u32::try_from(entry.size()).unwrap_or(u32::MAX);
         // One element's room at first: most keys keep one answer (a vector's first push would make room for four).
         self.cache.entry(key).or_insert_with(|| Vec::with_capacity(1)).push(Slot {
             entry,
@@ -3319,8 +3322,10 @@ pub struct Compiler {
     pub hits_by_source: [u64; cache::MAX_VCPUS],
     pub duplicates: u64,
     pub lock_wait: (u64, u64),
-    /// PIC study: compiles of an answer the memory cache had dropped, and of them of this vCPU's own.
+    /// PIC study: compiles of an answer the memory cache had dropped, and of them of this vCPU's own; disk hits of one (with
+    /// the persistent cache on, a dropped user-mode answer comes back from disk instead of fexc).
     pub recompiled: [u64; 2],
+    pub dropped_disk_hits: u64,
     /// Answers kept for another RIP and used at this one (perf chunk 4: [`crate::relocation`]); answers that could not be
     /// (compiled instead); relocated objects admission refused (compiled instead, logged; none expected); fresh compiles
     /// made by the reuse check.
@@ -3587,6 +3592,7 @@ impl Compiler {
             hits_by_source: [0; cache::MAX_VCPUS],
             duplicates: 0,
             recompiled: [0; 2],
+            dropped_disk_hits: 0,
             lock_wait: (0, 0),
             relocated: 0,
             relocation_refused: 0,
@@ -3837,6 +3843,8 @@ impl Compiler {
                     self.recompiled[1] += u64::from(owner == self.vcpu);
                     recompiled = true;
                 }
+            } else if disk_hit && self.answers.recompiled(limit, &entry).is_some() {
+                self.dropped_disk_hits += 1;
             }
             self.read = end;
             self.guess_read = read >> GATING != 0;

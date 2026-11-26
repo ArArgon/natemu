@@ -7,9 +7,9 @@ the [compile cache's cap](disk-cache-cap-plan.md).
 
 ## The problem, measured
 
-Measured by hand on the Mac mini M4 (16 GB), on a KDE desktop with Chromium, in one boot. These are experiments, not
-numbers from a framework case. The note does not know whether that boot had the persistent compile cache on (see
-below).
+Measured on the Mac mini M4 (16 GB), on a KDE desktop with Chromium, in one boot of the `desktop-kde-browser-profile`
+case (run 20261126-021552-6362, on the `desktop-profile` branch). That case passes `--compile-cache off`, so its
+recompiles are the in-memory map's drops alone.
 
 - Of 3.72 M fexc compiles, 1.37 M compiled an answer again after the map had dropped it. The performance log counts
   these as `recompiled` (the map remembers the fingerprints of the answers it dropped).
@@ -101,8 +101,8 @@ still goes once a generation of newer answers outranks it.
   Moved copies clone their prefix. Keeping only the values read, and sharing the prefix, would save about 100 bytes
   and more per answer. That is a follow-up if the measurement shows memory pressure.
 - **Spilling dropped answers to the persistent cache.** Kernel answers (CPL 0) are not stored on disk. With the
-  compile cache on, a dropped user answer already comes back as a disk hit. It still costs an admission, and the
-  `recompiled` counter never sees it.
+  compile cache on, a dropped user answer already comes back as a disk hit. It still costs a host trip, a disk read
+  and an admission. Each vCPU's state line now counts these (`dropped_disk_hits`, beside `recompiled`).
 - **A second-chance (CLOCK) sweep.** It would change which answers go, and the current policy was tuned on a replay of
   Speedometer.
 
@@ -115,7 +115,8 @@ The unit tests are in `execution.rs`:
 - `a_found_answer_outlives_a_byte_bound_sweep`: with bytes binding and answers of unequal sizes, the sweep drops
   exactly the oldest answers never found, down to 3/4 of the bytes. It keeps the found and the newest answers, and a
   found answer not found again goes after four generations.
-- `answers_report_matches_the_former_format` now also checks the line's `cap_bytes` and `sweeps`.
+- `answers_report_matches_the_former_format` now also checks the line's `cap_bytes` and `sweeps`, and
+  `vcpu_state_matches_the_former_format` the state line's `dropped_disk_hits`.
 
 Each new check was shown to fail against a mutant of the code it checks.
 
@@ -132,8 +133,10 @@ Run it on this branch rebased onto the case, and on that base, with the case's c
 - memory pressure. The process's `phys_footprint`, and the system's compressions, swap-outs and swap use over the run,
   not its peak resident memory, which compressed pages leave. Any swap-out rejects the cap.
 
-Also run the cache-on variant (`-warm`). The plain case runs with the compile cache off, and with it on, dropped user
-answers come back from disk instead of being compiled. Optionally run two caps of this branch on the 16/8
+Run it both ways:
+- **cache off** (the case as it is): the recompile count (`recompiled`) and host time;
+- **cache on at the new default cap** (the `-warm` variant, or the case with the compile cache on): the disk hits that
+  map drops caused (`dropped_disk_hits`), and the recompiles left, which are kernel answers (they are never on disk). Optionally run two caps of this branch on the 16/8
 configuration, 2.5 GiB (the default) and 4 GiB (`NATEMU_ANSWER_CACHE_MB=4096`), labelled as an experiment, to settle
 whether a larger share of the host pays.
 
@@ -157,3 +160,12 @@ Not adopted, kept as follow-ups:
 - bounding the `dropped` set;
 - smaller answers (the gating values read, shared prefixes);
 - more shards, decided by the measured frame gaps.
+
+The code was reviewed independently (Opus) and nothing was blocking. Adopted from it:
+- an answer's size is computed once on insert;
+- `answer_cap`'s comment now covers the display memory left out of the guest's RAM, and the map of a vCPU whose
+  features differ;
+- `MOVED_BOOKKEEPING`'s comment says that moved copies are counted as if indexed.
+
+Not adopted: a test of a short-prefix answer swept from the lens map (the code is right; a coverage gap noted here),
+and building `Compiler::answers` lazily (one map thrown away per boot).
