@@ -633,3 +633,30 @@ to beat is P2 chunk 4's A/B of checked cross-page links in the private cache.
     nothing. At a test cap, `link-full` and `relink-reclaim` still exercise every reclaim stage.
   - Both are shown to fail with `MAX_LINKS` back at 512 Ki (branch `fk-broken-3`, never merged).
 
+## 9. Step 1c: checked links by default, and step 2's new rationale
+
+**The evidence:** P2's link-form A/B (shared-code plan chunk 4; scratch commit 650bebb2 on `shared-code-linkform`, Mac
+mini M4, `~/de-linkform`). With `NATEMU_LINK_FORM=checked`, every link that is not local is a checked link through the
+dispatcher slot, on today's private areas:
+- desktop Speedometer: 2.30 and 2.35 without it, 3.00 and 3.06 with it (about +30% over two pairs);
+- app starts: within noise;
+- `guest-luajit-interp`: no regression (3.583/3.451 s against 3.509/3.415 s);
+- no suspensions or relinks at CR3 loads.
+
+**Built (step 1c):** checked is the default.
+- `Control::link_form_plain`, the host's `NATEMU_LINK_FORM=plain`, is the debug key for the plain form.
+- A link from another page patches its exit's `svc` word to the context's dispatcher slot. That slot probes L1 at the RIP
+  the exit built, so a TLB event empties an L1 entry and undoes no link.
+- The plain form's machinery (suspension, relink, the CR3 and TLB segments) stays, used only under the key.
+
+**Tests:**
+- k1's relink programs run under `NATEMU_LINK_FORM=plain`.
+- `relink-many` runs once more in the default form and must suspend and relink nothing. This is shown to fail on a
+  resident that makes plain links whatever the switch (`fk-broken-4`, never merged).
+- The host's end-of-run link checks pass unchanged: the checked form was already one they model.
+
+**Step 2's rationale, revised:** after 1c no link is undone at a CR3 load. What is left is the checked link's cost: an
+L1 probe on every cross-page transfer (about 9 ns against a direct branch), and one L1 refill per block per address-space
+switch. Step 2's guards turn hot cross-page links back into direct branches into a guard stub: 8 instructions and one load,
+with no switch cost. They are measured against step 1c at the pooled checkpoint 2, not against the plain form.
+
