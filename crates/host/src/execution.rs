@@ -2627,13 +2627,13 @@ impl std::hash::Hasher for Words {
     }
 }
 /// The memory cache's bound in answers, over all its shards ([`Shard::sweep`]): far above any run's (a CPython `make -j4` asks
-/// for about 660 k distinct blocks, Speedometer about 1.55 M); the bytes are the bound that matters ([`cap_bytes`]).
+/// for about 660 k distinct blocks, Speedometer about 1.55 M, a KDE desktop with Chromium about 2.35 M); the bytes are the
+/// bound that matters ([`cap_bytes`]: every answer counts at least its bookkeeping, so at 4 GiB they bound it to about 8 M),
+/// and this one a flood of small answers. A `NATEMU_ANSWER_CACHE_MB` above about 6 GiB meets it first.
 const CAP_ANSWERS: usize = 1 << 22;
-/// The memory cache's bound in bytes, over all its shards: 1 GiB, or a sixteenth of the host's memory when that is less
-/// (`NATEMU_ANSWER_CACHE_MB` overrides it). The answers kept are a function of the guest's code, not of its RAM. Speedometer 3.1
-/// (4 vCPUs) makes 1.55 M answers, 1.9 GB, of which a third are ever found again: under 1 GiB the sweep compiles about 2.6%
-/// of the hits again (experiment: a replay of one boot's trace; a two-generation flip at that size about 40%).
-fn cap_bytes() -> usize {
+/// The memory cache's bound in bytes, over all its shards ([`answer_cap`] of the host's memory and, for a boot, the guest's;
+/// `NATEMU_ANSWER_CACHE_MB` overrides it).
+fn cap_bytes(guest: Option<u64>) -> usize {
     if let Some(mb) = std::env::var("NATEMU_ANSWER_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return mb << 20;
     }
@@ -2643,9 +2643,31 @@ fn cap_bytes() -> usize {
     let ok = unsafe {
         libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut mem).cast(), &mut len, std::ptr::null_mut(), 0)
     } == 0;
-    let host = if ok { mem as usize } else { 8 << 30 };
-    (1usize << 30).min(host / 16)
+    answer_cap(if ok { mem } else { 8 << 30 }, guest)
 }
+/// The bytes the memory cache may keep on a host of `host` bytes of memory running a guest of `guest` bytes of RAM
+/// (`None`: unknown, a compiler outside a boot). The answers kept are a function of the guest's code, not of its RAM, but
+/// the guest's RAM, the rest of natemu and macOS need the host's memory first: half of what is left after the guest and
+/// 3 GiB, within the old bound (1 GiB, or a sixteenth of the host's memory when that is less) and 4 GiB. 16 GB with an
+/// 8 GiB guest gives 2.5 GiB, with a 4 GiB guest 4 GiB; 8 GB with a 2 GiB guest 1.5 GiB, with 4 GiB the old 512 MiB.
+/// Why: a KDE desktop with Chromium on the Mac mini M4 (16 GB, the old 1 GiB) compiled 1.37 M of its 3.72 M answers again
+/// after the cache dropped them (docs/restructure/answer-cache-cap-plan.md). Speedometer 3.1 (4 vCPUs) makes 1.55 M answers,
+/// 1.9 GB, of which a third are ever found again: under 1 GiB the sweep compiles about 2.6% of the hits again (experiment:
+/// a replay of one boot's trace; a two-generation flip at that size about 40%).
+pub(crate) fn answer_cap(host: u64, guest: Option<u64>) -> usize {
+    let floor = (1u64 << 30).min(host / 16);
+    let cap = match guest {
+        None => floor,
+        Some(guest) => (host.saturating_sub(guest).saturating_sub(3 << 30) / 2).clamp(floor, 4 << 30),
+    };
+    usize::try_from(cap).unwrap_or(usize::MAX)
+}
+/// What an answer's bookkeeping costs beside the bytes [`Entry`] holds (the memory cache counts it, [`Entry::size`]): its
+/// `Arc`'s header, its [`Slot`] and its share of the shard's map, the allocator's rounding; and for one in the moved index
+/// ([`movable`]) its [`MovedSlot`] and that map's share. Estimates from the types and a counting allocator (about 90 bytes a
+/// map's share with its one-element vector at its usual load, about 60 more just after the table doubles).
+const BOOKKEEPING: usize = 128;
+const MOVED_BOOKKEEPING: usize = 96;
 /// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the caps.
 const SHARDS: usize = 16;
 /// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
@@ -2730,9 +2752,11 @@ impl Entry {
             (k, self.read, read, &self.prefix, self.whole),
         )
     }
-    /// Bytes it keeps (the memory cache's bound).
+    /// Bytes it keeps, its bookkeeping included (the memory cache's bound).
     fn size(&self) -> usize {
         size_of::<Self>()
+            + BOOKKEEPING
+            + if movable(self) { MOVED_BOOKKEEPING } else { 0 }
             + self.prefix.len()
             + if let Answer::Object(o) = &self.answer {
                 // And its kept form ([`Kept`], its link points at most): set after the answer is, but counted with it.
@@ -2754,16 +2778,26 @@ impl Entry {
             }
     }
 }
-/// A kept answer in its shard ([`Shard`]): `used`, the shard's insert count when it was kept or last found; `hit`, found
-/// since it was kept.
+/// A kept answer in its shard ([`Shard`]): `used`, the shard's insert count when it was kept or last found.
 struct Slot {
     entry: Arc<Entry>,
     used: u64,
-    hit: bool,
     /// The prefix's length and its bytes after the lead ([`tail`]), so a lookup passes over an answer for other bytes without
-    /// reading the answer.
+    /// reading the answer; [`HIT`] in the length: found since it was kept.
     len: u32,
+    /// The answer's [`Entry::size`], so a sweep reads no answer.
+    size: u32,
     tail: u64,
+}
+/// A [`Slot`]'s length bit that says it was found since it was kept (prefixes are far shorter).
+const HIT: u32 = 1 << 31;
+impl Slot {
+    fn len(&self) -> usize {
+        (self.len & !HIT) as usize
+    }
+    fn hit(&self) -> bool {
+        self.len & HIT != 0
+    }
 }
 /// The (up to) 8 bytes after the lead [`LEAD`] of `bytes`, cut to `len`, as a little-endian word.
 fn tail(bytes: &[u8], len: usize) -> u64 {
@@ -2787,11 +2821,11 @@ struct Shard {
     count: usize,
     bytes: usize,
     clock: u64,
-    /// Sweeps made and the answers they dropped (the tests look at them).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Sweeps made, the answers they dropped, and their nanoseconds in all and at most (the performance log's).
     sweeps: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
     swept: u64,
+    sweep_ns: u64,
+    sweep_ns_max: u64,
 }
 impl Shard {
     /// The kept answer matching `bytes` at `at` (key, index): one kept for that RIP itself in any bucket first, then one for
@@ -2818,7 +2852,7 @@ impl Shard {
             };
             let all = tail(bytes, bytes.len());
             let mut matching = v.iter().enumerate().filter(|(_, s)| {
-                let len = s.len as usize;
+                let len = s.len();
                 let n = len.min(LEAD + 8).saturating_sub(LEAD);
                 let mask = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
                 len <= bytes.len() && all & mask == s.tail && s.entry.matches(bytes, gating)
@@ -2845,7 +2879,7 @@ impl Shard {
     fn take(&mut self, (key, i): (Key, usize)) -> Arc<Entry> {
         let clock = self.clock;
         let s = &mut self.cache.get_mut(&key).unwrap()[i];
-        (s.used, s.hit) = (clock, true);
+        (s.used, s.len) = (clock, s.len | HIT);
         s.entry.clone()
     }
     /// Keeps `entry`; past `cap` (the shard's bytes and answers) sweeps. Returns the answers dropped with their limits, for the
@@ -2857,11 +2891,19 @@ impl Shard {
             &entry.prefix[..LEAD.min(entry.prefix.len())],
         );
         self.clock += 1;
-        self.bytes += entry.size();
+        self.bytes += entry.size().min(u32::MAX as usize);
         self.count += 1;
         self.lens.entry((key.0, key.1)).or_default()[LEAD.min(entry.prefix.len())] += 1;
-        let (len, tail) = (entry.prefix.len() as u32, tail(&entry.prefix, entry.prefix.len()));
-        self.cache.entry(key).or_default().push(Slot { entry, used: self.clock, hit: false, len, tail });
+        let (len, tail) = (entry.prefix.len() as u32 & !HIT, tail(&entry.prefix, entry.prefix.len()));
+        let size = u32::try_from(entry.size()).unwrap_or(u32::MAX);
+        // One element's room at first: most keys keep one answer (a vector's first push would make room for four).
+        self.cache.entry(key).or_insert_with(|| Vec::with_capacity(1)).push(Slot {
+            entry,
+            used: self.clock,
+            len,
+            size,
+            tail,
+        });
         if self.bytes > cap.0 || self.count > cap.1 {
             self.sweep(cap)
         } else {
@@ -2870,9 +2912,10 @@ impl Shard {
     }
     /// Drops the lowest-ranked answers until at most three quarters of `cap` (bytes, answers) are kept.
     fn sweep(&mut self, cap: (usize, usize)) -> Vec<(Option<u32>, Arc<Entry>)> {
+        let start = std::time::Instant::now();
         let bonus = self.count as u64 / 2;
-        let rank = |s: &Slot| s.used + if s.hit { bonus } else { 0 };
-        let mut ranks: Vec<(u64, usize)> = self.cache.values().flatten().map(|s| (rank(s), s.entry.size())).collect();
+        let rank = |s: &Slot| s.used + if s.hit() { bonus } else { 0 };
+        let mut ranks: Vec<(u64, usize)> = self.cache.values().flatten().map(|s| (rank(s), s.size as usize)).collect();
         ranks.sort_unstable();
         let (want_bytes, want_count) = (cap.0 / 4 * 3, cap.1 / 4 * 3);
         let (mut bytes, mut count, mut n) = (self.bytes, self.count, 0usize);
@@ -2888,7 +2931,7 @@ impl Shard {
             Some(i) => (ranks[i].0, ranks[..n].iter().rev().take_while(|r| r.0 == ranks[i].0).count()),
             None => (0, 0),
         };
-        let mut dropped = Vec::new();
+        let (mut dropped, mut gone) = (Vec::new(), Vec::new());
         self.cache.retain(|k, v| {
             let limit = (k.0 != 1 << 32).then_some(k.0 as u32);
             let mut i = 0;
@@ -2896,25 +2939,29 @@ impl Shard {
                 let r = rank(&v[i]);
                 if n > 0 && (r < last || (r == last && ties > 0)) {
                     ties -= usize::from(r == last);
-                    dropped.push((limit, v.swap_remove(i).entry));
+                    let s = v.swap_remove(i);
+                    gone.push(((k.0, k.1), s.len(), s.size as usize));
+                    dropped.push((limit, s.entry));
                 } else {
                     i += 1;
                 }
             }
             !v.is_empty()
         });
-        for (limit, e) in &dropped {
-            self.bytes -= e.size();
-            let k = key(*limit, e.rip | e.tag, &[]);
-            let lens = self.lens.get_mut(&(k.0, k.1)).unwrap();
-            lens[LEAD.min(e.prefix.len())] -= 1;
+        // From the slots and their keys (the map's first two words are the lens map's): no answer is read under the lock.
+        for (k, len, size) in gone {
+            self.bytes -= size;
+            let lens = self.lens.get_mut(&k).unwrap();
+            lens[LEAD.min(len)] -= 1;
             if lens.iter().all(|&n| n == 0) {
-                self.lens.remove(&(k.0, k.1));
+                self.lens.remove(&k);
             }
         }
         self.count -= dropped.len();
         self.sweeps += 1;
         self.swept += dropped.len() as u64;
+        let ns = start.elapsed().as_nanos() as u64;
+        (self.sweep_ns, self.sweep_ns_max) = (self.sweep_ns + ns, self.sweep_ns_max.max(ns));
         dropped
     }
 }
@@ -2989,7 +3036,7 @@ fn movable(e: &Entry) -> bool {
 }
 impl Answers {
     pub(crate) fn new(supported: u64) -> Arc<Self> {
-        Self::with_cap(supported, cap_bytes(), CAP_ANSWERS)
+        Self::with_cap(supported, cap_bytes(None), CAP_ANSWERS)
     }
     /// With the caps `bytes` and `answers` over all shards.
     pub(crate) fn with_cap(supported: u64, bytes: usize, answers: usize) -> Arc<Self> {
@@ -3065,7 +3112,8 @@ impl Answers {
         }
         let k = moved_key(limit, half, lead);
         let slot = MovedSlot { len: e.prefix.len() as u32, hash: fnv(FNV_BASIS, &e.prefix), entry: e.clone() };
-        self.moved[self.moved_shard(&k)].lock().unwrap_or_else(|e| e.into_inner()).entry(k).or_default().push(slot);
+        let mut m = self.moved[self.moved_shard(&k)].lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(k).or_insert_with(|| Vec::with_capacity(1)).push(slot);
     }
     fn moved_remove(&self, limit: Option<u32>, e: &Arc<Entry>) {
         let n = MOVED_LEAD.min(e.prefix.len());
@@ -3160,10 +3208,9 @@ impl Answers {
                 self.moved_remove(*limit, e);
             }
         }
-        let mut set = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
-        for (limit, e) in &dropped {
-            set.insert(e.fingerprint(*limit), e.owner);
-        }
+        // Hashed before the lock, which every vCPU's fresh compile takes ([`Answers::recompiled`]).
+        let prints: Vec<_> = dropped.iter().map(|(limit, e)| (e.fingerprint(*limit), e.owner)).collect();
+        self.dropped.lock().unwrap_or_else(|e| e.into_inner()).extend(prints);
     }
     /// Sweeps and the answers they dropped, over the shards (the tests').
     #[cfg(test)]
@@ -3187,7 +3234,7 @@ impl Answers {
             let s = s.lock().unwrap_or_else(|e| e.into_inner());
             let all = || s.cache.values().flatten();
             (
-                b + all().map(|e| e.entry.size()).sum::<usize>(),
+                b + all().map(|s| s.size as usize).sum::<usize>(),
                 n + all().count(),
             )
         })
@@ -3199,8 +3246,15 @@ impl Answers {
             lock_waits: Vec<[u64; 2]>,
             kept_bytes: usize,
             kept_answers: usize,
+            cap_bytes: usize,
+            /// Over the shards: sweeps, answers they dropped, their nanoseconds in all and the longest.
+            sweeps: [u64; 4],
         }
         let (kept_bytes, kept_answers) = self.kept();
+        let sweeps = self.shards.iter().fold([0; 4], |[n, d, ns, max], s| {
+            let s = s.lock().unwrap_or_else(|e| e.into_inner());
+            [n + s.sweeps, d + s.swept, ns + s.sweep_ns, max.max(s.sweep_ns_max)]
+        });
         let report = Report {
             lock_waits: self
                 .waits
@@ -3209,6 +3263,8 @@ impl Answers {
                 .collect(),
             kept_bytes,
             kept_answers,
+            cap_bytes: self.cap.0,
+            sweeps,
         };
         format!("answers {}", serde_json::to_string(&report).unwrap())
     }
@@ -3874,7 +3930,17 @@ impl Compiler {
     /// Uses the run's `answers` (perf chunk 13: one map for its vCPUs; the first compiler makes it) when they were made for
     /// this compiler's features; else keeps its own.
     pub fn share(&mut self, answers: &std::sync::OnceLock<Arc<Answers>>) {
-        let shared = answers.get_or_init(|| self.answers.clone());
+        let own = self.answers.clone();
+        self.share_made(answers, || own);
+    }
+    /// [`Compiler::share`] for a boot whose guest has `guest_ram` bytes of RAM: the first compiler makes the run's map with
+    /// the cap for that guest ([`answer_cap`]).
+    pub fn share_for(&mut self, answers: &std::sync::OnceLock<Arc<Answers>>, guest_ram: u64) {
+        let supported = self.supported;
+        self.share_made(answers, || Answers::with_cap(supported, cap_bytes(Some(guest_ram)), CAP_ANSWERS));
+    }
+    fn share_made(&mut self, answers: &std::sync::OnceLock<Arc<Answers>>, make: impl FnOnce() -> Arc<Answers>) {
+        let shared = answers.get_or_init(make);
         if shared.supported == self.supported {
             self.answers = shared.clone();
         } else {
@@ -6105,9 +6171,11 @@ mod tests {
             .map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed)))
             .collect();
         let (bytes, answers) = a.kept();
+        // The former fields, in their order, then the cap and the sweeps.
         let old = format!(
-            "answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}",
-            w.join(",")
+            "answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers},\"cap_bytes\":{},\"sweeps\":[0,0,0,0]}}",
+            w.join(","),
+            a.cap.0
         );
         assert_eq!(a.report(), old, "byte for byte");
     }
@@ -6317,6 +6385,83 @@ mod tests {
         assert!(hit(&a, &never, 0x1100, None, &g).is_none(), "an older answer never found was kept");
     }
 
+    /// With bytes the bound that binds (answers of unequal sizes, no answer bound): a sweep drops exactly the oldest answers
+    /// never found until three quarters of the bytes are left, keeps the one found and the newest; and a found answer not
+    /// found again goes too once a generation of newer answers outranks its bonus.
+    #[test]
+    fn a_found_answer_outlives_a_byte_bound_sweep() {
+        let g = [0; GATING];
+        // Same limit and page offset: one shard. Prefixes of 8 to 72 bytes, so sizes differ.
+        let bytes = |i: u64| [&i.to_le_bytes()[..], &[0x5a; 64][..(i % 9 * 8) as usize]].concat();
+        let rip = |i: u64| 0x1100 + (i << 12);
+        let size = |i: u64| entry(rip(i), 0, &bytes(i), 0, g).size();
+        const N: u64 = 40;
+        let shard_cap: usize = (0..N).map(size).sum::<usize>() - 1; // the N-th answer passes it
+        let a = Answers::with_cap(u64::MAX, SHARDS * shard_cap, usize::MAX);
+        let put = |i: u64| {
+            a.insert(None, entry(rip(i), 0, &bytes(i), 0, g), &bytes(i), 0x1100);
+        };
+        put(0);
+        assert!(hit(&a, &bytes(0), 0x1100, None, &g).is_some());
+        for i in 1..N {
+            put(i);
+        }
+        // The expected sweep: answers 1, 2, ... go (0 was found) until three quarters of the cap are left.
+        let (mut kept, mut gone) = ((0..N).map(size).sum::<usize>(), 0u64);
+        for i in 1..N {
+            if kept <= shard_cap / 4 * 3 {
+                break;
+            }
+            (kept, gone) = (kept - size(i), gone + 1);
+        }
+        assert_eq!(a.sweeps(), (1, gone));
+        assert_eq!(a.kept().0, kept);
+        assert!(hit(&a, &bytes(1), 0x1100, None, &g).is_none(), "the oldest answer never found was kept");
+        assert!(hit(&a, &bytes(N - 1), 0x1100, None, &g).is_some(), "the newest answer was dropped");
+        assert!(hit(&a, &bytes(0), 0x1100, None, &g).is_some(), "the answer found was dropped");
+        // Found at the clock's N; its bonus is half the answers kept. Four generations later, never found again, it is gone.
+        for i in N..5 * N {
+            put(i);
+        }
+        assert!(a.sweeps().0 >= 4);
+        assert!(hit(&a, &bytes(0), 0x1100, None, &g).is_none(), "a found answer outlived every newer one");
+    }
+
+    /// An answer's size counts its bookkeeping, and the moved index's for one that can move.
+    #[test]
+    fn the_byte_cap_counts_the_bookkeeping() {
+        let g = [0; GATING];
+        let own = size_of::<Entry>() + 2 * 16 + size_of::<Kept>() + exec::MAX_LINK_POINTS * size_of::<exec::LinkPoint>();
+        let movable_one = entry(0x1100, 0, &[7; 16], 0, g);
+        assert!(movable(&movable_one));
+        assert_eq!(movable_one.size(), own + BOOKKEEPING + MOVED_BOOKKEEPING);
+        let across = entry(0x1ff8, 0, &[7; 16], 0, g); // its prefix leaves the page: never moved
+        assert!(!movable(&across));
+        assert_eq!(across.size(), own + BOOKKEEPING);
+    }
+
+    /// The cap: half of what the guest and 3 GiB leave of the host's memory, within the old bound and 4 GiB; the old bound
+    /// outside a boot.
+    #[test]
+    fn answer_cap_from_host_and_guest_memory() {
+        const G: u64 = 1 << 30;
+        const M: usize = 1 << 20;
+        let cases = [
+            (16 * G, Some(8 * G), 2560 * M),
+            (16 * G, Some(4 * G), 4096 * M),
+            (16 * G, Some(12 * G), 1024 * M), // the old 1 GiB
+            (8 * G, Some(2 * G), 1536 * M),
+            (8 * G, Some(4 * G), 512 * M), // the old sixteenth
+            (64 * G, Some(8 * G), 4096 * M),
+            (4 * G, Some(8 * G), 256 * M),
+            (16 * G, None, 1024 * M),
+            (8 * G, None, 512 * M),
+        ];
+        for (host, guest, cap) in cases {
+            assert_eq!(answer_cap(host, guest), cap, "{host} {guest:?}");
+        }
+    }
+
     /// The bytes kept stay within the byte cap, sweeping to three quarters of it.
     #[test]
     fn the_byte_cap_bounds_the_kept_bytes() {
@@ -6334,7 +6479,7 @@ mod tests {
         assert!(a.sweeps().0 >= 5 && bytes >= cap / SHARDS / 4 * 3 - size && n >= 14, "{bytes} {n}");
         // The default: at most 1 GiB, and at least a sixteenth of an 8 GiB host's memory.
         if std::env::var_os("NATEMU_ANSWER_CACHE_MB").is_none() {
-            assert!(cap_bytes() <= 1 << 30 && cap_bytes() >= 512 << 20, "{}", cap_bytes());
+            assert!(cap_bytes(None) <= 1 << 30 && cap_bytes(None) >= 512 << 20, "{}", cap_bytes(None));
         }
     }
 

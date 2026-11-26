@@ -862,6 +862,7 @@ impl Boot {
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
+            ram: self.ram,
             mapped: mapped.regions,
             mapped_publishes: mapped.publishes,
             loaded,
@@ -991,6 +992,7 @@ impl Boot {
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
+            ram: self.ram,
             mapped: Vec::new(),
             mapped_publishes: Arc::default(),
             loaded,
@@ -1058,6 +1060,8 @@ fn sampler(
 /// A loaded VM, ready to run.
 pub struct Prepared {
     backing: Backing,
+    /// The guest's RAM in bytes (the memory cache's cap, `Compiler::share_for`).
+    ram: u64,
     /// Mapped device memory, in the region table's order (the bus's (slot, function, BAR) order, `pci::Mapped::regions`):
     /// the VM maps each above the backing and every window aliases it at `MAPPED_VA` (`vm::mapping_plan`). Empty: none,
     /// the default launch.
@@ -1281,7 +1285,7 @@ impl Prepared {
             compiler.perf = crate::perf::Recorder::new(v, start)?;
             compiler.vcpu = v as u8;
             compiler.pool = backing.pool.clone();
-            compiler.share(&answers);
+            compiler.share_for(&answers, self.ram);
             compiler.check_reuse = self.check_reuse;
             compiler.page_currency = self.page_currency;
             compiler.writable_on_read = self.writable_on_read;
