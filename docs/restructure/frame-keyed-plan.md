@@ -376,4 +376,43 @@ Step 2 stays held until checkpoint 1 is read. It is built only if both hold:
 - Most suspended links are guardable (`fkeys.suspended_guardable` / `relink.suspended` above one half).
 
 Otherwise P2 (the store shared by the vCPUs, which the counting boot gives 59-71% of pool and host time) comes before it.
-The decision and its numbers are recorded here when checkpoint 1 is read.
+**Read at checkpoint 1 (run 20261126-032146-6203 against 20261126-024119-6d48; Mac mini M4):**
+
+- **Guardable share:** 70-83% of suspended links per vCPU (8.66 M of 10.43 M, 4.98 of 6.77, 4.40 of 6.25, 5.01 of
+  6.76).
+- **Switch share of warm-start busy time:** the report's switch seconds are 20% of Konsole's and 15% of Dolphin's.
+  `link + relink + patch + tlb` alone is 13-14%, about 17-19% with the misses.
+
+**Decision: both conditions hold, so step 2 is justified,** but with two conditions:
+
+- **It needs the link record area fixed first.** With fewer capacity flushes (2/2/2/1 per vCPU against 4/3/3/3), link
+  records now fill the area: 1-2 reclaims per vCPU undid 0.28-0.77 M links, where the base had none. Persistent links
+  would add to that pressure.
+- **Its order against P2 is the coordinator's call.** P2 still holds the largest share (59-71% of pool and host time).
+
+### 7.3 Checkpoint 1's numbers (Mac mini M4, one run each side)
+
+`desktop-kde-profile`, base 20261126-024119-6d48 (e86dbab6) against change 20261126-032146-6203 (eded8385), app starts
+to first window:
+
+| window | base s | change s | base busy vCPU-s | change busy vCPU-s |
+|---|---|---|---|---|
+| Konsole cold (`app-konsole-1:start`) | 1.801 | 1.518 | 2.508 | 2.070 |
+| Konsole warm (`app-konsole-2:start`) | 1.176 | 0.806 | 1.607 | 1.066 |
+| Dolphin cold (`app-dolphin-1:start`) | 1.698 | 1.706 | 2.415 | 2.427 |
+| Dolphin warm (`app-dolphin-2:start`) | 1.041 | 1.372 | 1.548 | 1.936 |
+
+- **Konsole warm, by bucket:** `pool` 0.353 → 0.100 s, `host` 0.177 → 0.094 s, `miss` 0.114 → 0.036 s, `link` 0.152 →
+  0.095 s.
+- **Dolphin warm:** 21,622 → 73,036 translation requests. It is outside its earlier range (1.04-1.23 s), so it is run
+  again (run 20261126-034139-bb8f) before any reading of it.
+- **Counters per vCPU:**
+  - `fkeys.lost` is 0.40-0.45 M of 1.10-1.21 M templates found: the old hint table lost about 35% of them.
+  - `fkeys.full` is 0.
+  - INVLPG/#PF scans: 1,254-1,799, with 6.4-23.6 M list slots read (about 5,000-16,600 per scan).
+- **Others (the coordinator's reading of the same runs):**
+  - `desktop-kde-browser-profile`: Chromium cold start 9.41 → 8.57 s, warm 6.61 → 5.90 s, host requests 828k → 642k
+    and 643k → 494k. Speedometer 2.42 → 2.35, within its ±16% spread.
+  - `guest-luajit-interp` (base 20261126-030949-67a2, change 20261126-032144-aa00): 3.563 / 3.470 s → 3.426 / 3.289 s,
+    no regression.
+
