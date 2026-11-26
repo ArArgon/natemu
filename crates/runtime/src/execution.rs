@@ -1746,7 +1746,8 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
     natemu_abi::execution::link_point(|at| staged_word(h, at), cache::placed_size(h), p, h.guest_bitness == 32)
 }
 /// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` and its leaf's flags into byte i of
-/// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
+/// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]). The host reads the flags'
+/// [`cache::LEAF_DIRTY`] (the persistent cache's choice).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     let p = crate::perf::enter(crate::perf::FETCH);
     match page_translation(s, va, natemu_abi::page_study::PLACE) {
@@ -1761,8 +1762,8 @@ fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     }
     crate::perf::leave(p);
 }
-/// The guest-physical page `va` is fetched from and its leaf's [`cache::GLOBAL`] (its G bit) and [`cache::LARGE`] (a
-/// 2 MiB leaf) (the walk sets A bits like the CPU's), or why not ([`fetch`]). A walk
+/// The guest-physical page `va` is fetched from and its leaf's [`cache::GLOBAL`] (its G bit), [`cache::LARGE`] (a
+/// 2 MiB leaf) and [`cache::LEAF_DIRTY`] (its D bit) (the walk sets A bits like the CPU's), or why not ([`fetch`]). A walk
 /// losing its A/D races to peers walks again, as x86 does (the watchdog contains a livelock). No block of this vCPU runs
 /// now (a step's source block is abandoned, and the linker checks that its source is not dead after finding the
 /// target), so an A write into a page holding translations just invalidates it ([`cache::written`]).
@@ -1781,7 +1782,8 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
             // image (docs/restructure/firmware-mode.md), asked out of line only for a page that is not RAM.
             Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() || rom_page(t.gpa & !4095) => {
                 let flags = if t.global { cache::GLOBAL } else { 0 }
-                    | if t.leaf_bytes > 4096 { cache::LARGE } else { 0 };
+                    | if t.leaf_bytes > 4096 { cache::LARGE } else { 0 }
+                    | if t.dirty { cache::LEAF_DIRTY } else { 0 };
                 return Ok((t.gpa & !4095, flags));
             }
             Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),

@@ -2984,6 +2984,9 @@ pub struct Compiler {
     /// Perf chunk 27: a request at CPL 3, translate or step: only these look up and store answers in the persistent cache
     /// (`compile_cache`); the cache in memory serves every CPL.
     pub(crate) cpl3: bool,
+    /// The request's code lies on a page whose leaf has D set ([`runtime_code`]): run-time-generated code (a JIT's), whose
+    /// bytes rarely come again in another run, so the persistent cache neither looks it up nor stores it.
+    pub(crate) runtime_code: bool,
     /// Perf chunk 26: a translate request (never a step) without alignment checking or a data breakpoint (`alignment_gated`
     /// off, which is part of `Cpu::code_context`): fexc's `--bulk`, under which REP STOS stores the part of its string inside
     /// RDI's page in bulk (each store a site at an iteration boundary). A step runs one element: TF traps after each
@@ -3200,6 +3203,7 @@ impl Compiler {
             cpl0: false,
             tsc: false,
             cpl3: false,
+            runtime_code: false,
             bulk: false,
             push_run: true,
             x87_guess: 0,
@@ -3892,7 +3896,7 @@ impl Compiler {
     }
     /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
     /// (an answer for any RIP of that half and offset, stored with its RIP), else from the server (then stored); the
-    /// persistent cache only at CPL 3 (`cpl3`).
+    /// persistent cache only at CPL 3 (`cpl3`) and for code that is not run-time generated (`runtime_code`).
     fn ask(
         &mut self,
         bytes: &[u8],
@@ -3902,7 +3906,7 @@ impl Compiler {
         _hook: &mut impl Hook,
     ) -> Result<(Reply, u64)> {
         let t = self.stamp();
-        let cache = self.disk.clone().filter(|_| self.cpl3);
+        let cache = self.disk.clone().filter(|_| self.cpl3 && !self.runtime_code);
         let key = cache
             .as_ref()
             .filter(|d| disk && !d.is_empty())
@@ -4033,6 +4037,18 @@ impl FexcEnd {
     }
 }
 
+/// Whether the `length` bytes at `rip` lie on a page whose leaf has D set, as the resident's fetch walks for the request
+/// found it (`Control::fetched`'s [`cache::LEAF_DIRTY`]: RIP's page and, when the bytes reach it, the next). D set means the
+/// page was written through this mapping since its leaf was made, as a JIT's output always is and file-backed code (mapped
+/// by read faults) never is ([`cache::LEAF_DIRTY`] has the edge cases): a guess at what is worth keeping on disk only, the
+/// answer being fexc's either way.
+fn runtime_code(area: Area, rip: u64, length: u64) -> bool {
+    let fetched: u64 = area.read_record(
+        cache::LOOKUP_OFFSET + cache::CONTROL + std::mem::offset_of!(cache::Control, fetched),
+    );
+    let pages = if (rip & 4095) + length > 4096 { 2 } else { 1 };
+    (0..pages).any(|i| (fetched >> (8 * i)) as u32 & cache::LEAF_DIRTY != 0)
+}
 /// The guest bytes at a RIP, copied from the guest-physical pages the resident walked for the request.
 struct Fetched {
     bytes: Vec<u8>,
@@ -4865,6 +4881,11 @@ fn translation(
         compiler.cpl0 = state.cpu.cpl == 0 && !step && !compiler.bits32;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         compiler.cpl3 = state.cpu.cpl == 3;
+        // (64-bit code only, as measured: the prototype's Speedometer boots.)
+        compiler.runtime_code = compiler.cpl3
+            && !compiler.bits32
+            && compiler.disk.is_some()
+            && runtime_code(area, rip, bytes.len() as u64);
         compiler.bulk = !step && !compiler.alignment_gated;
         compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
         if !step {
@@ -7954,6 +7975,92 @@ mod tests {
             accurate_fp: 0,
             stack_traps: 0,
         }
+    }
+
+    /// Run-time code and the persistent cache: [`runtime_code`] reads the D bit of the leaves the request's fetch walks found
+    /// (`Control::fetched`'s [`cache::LEAF_DIRTY`], byte i for page i), of RIP's page and of the next only when the bytes
+    /// reach it.
+    #[test]
+    fn run_time_code_is_code_on_a_dirty_leaf() {
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram: unsafe { GuestRam::new(0, 0, memory.0 as u64) },
+        };
+        let fetched = cache::LOOKUP_OFFSET + cache::CONTROL + std::mem::offset_of!(cache::Control, fetched);
+        let dirty = u64::from(cache::LEAF_DIRTY);
+        let at = |flags: u64, rip: u64, length: u64| {
+            area.write_record(fetched, flags);
+            runtime_code(area, rip, length)
+        };
+        let g = u64::from(cache::GLOBAL);
+        assert!(!at(0, 0x40_1000, 64) && !at(g, 0x40_1000, 64) && at(dirty | g, 0x40_1000, 64));
+        // The next page's leaf counts only when the bytes reach into it.
+        assert!(!at(dirty << 8, 0x40_1000, 4096) && at(dirty << 8, 0x40_1ffc, 5) && !at(dirty << 8, 0x40_1ffc, 4));
+    }
+
+    /// A code page executed, then written (with the real fexc, `FEXC`): while its leaf is clean its code is stored in the
+    /// persistent cache, and a later compiler is answered from it; once the guest wrote the page (the resident's next fetch
+    /// walk finds D set, `Control::fetched`) the code there, the new code or the old bytes again, is neither looked up nor
+    /// stored.
+    #[test]
+    fn code_on_a_written_page_stays_out_of_the_persistent_cache() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let (fexc, dir) = (
+            std::path::PathBuf::from(fexc),
+            std::env::temp_dir().join(format!("natemu-rtc-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let memory = Memory::with_size(exec::BACKING_BYTES + (2 << 20)).unwrap();
+        let ram =
+            unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        let fetched = cache::LOOKUP_OFFSET + cache::CONTROL + std::mem::offset_of!(cache::Control, fetched);
+        let (old, new) = ([0x48, 0x01, 0xd8, 0xc3], [0x48, 0x29, 0xd8, 0xc3]); // add rax, rbx; ret / sub rax, rbx; ret
+        let new_compiler = || Compiler {
+            disk: Some(Arc::new(
+                crate::compile_cache::DiskCache::open(&dir, &fexc, 1 << 30).unwrap(),
+            )),
+            ..Compiler::with_features(&fexc, u64::MAX, None)
+        };
+        // A translate request at CPL 3 for `code` at 0x40_1000 (guest-physical 0x5000), its leaf's flags as the walk found them.
+        let request = |c: &mut Compiler, code: &[u8], leaf: u32| {
+            assert!(ram.copy_in(0x5000, code));
+            area.write_record(fetched, u64::from(leaf));
+            let mut s = State::new(0, test_cpu(0x40_1000));
+            s.fetch = [0x5000, u64::MAX];
+            let reply = translation(area, c, &mut s, false, None, &mut Requests::default(), &mut ());
+            assert_eq!(reply.unwrap().unwrap(), exec::REPLY_ADMITTED);
+            (c.compiles, c.disk_hits)
+        };
+        // Executed: stored. Written, then executed: compiled, not stored.
+        let mut c = new_compiler();
+        assert_eq!(request(&mut c, &old, 0), (1, 0));
+        assert_eq!(request(&mut c, &new, cache::LEAF_DIRTY), (2, 0));
+        drop(c); // writes the pack
+        // A later run: the clean page's code is answered from disk; on a dirty leaf the same bytes are not looked up.
+        let mut c = new_compiler();
+        assert_eq!(c.disk.as_ref().unwrap().entries, 1, "only the clean page's code was stored");
+        assert_eq!(request(&mut c, &old, 0), (0, 1));
+        let mut c = new_compiler();
+        assert_eq!(request(&mut c, &old, cache::LEAF_DIRTY), (1, 0));
+        assert_eq!(request(&mut c, &new, cache::LEAF_DIRTY | cache::GLOBAL), (2, 0));
+        drop(c);
+        assert_eq!(new_compiler().disk.as_ref().unwrap().entries, 1, "nothing stored from a dirty leaf");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The template pool through the request path (`translation`, with the real fexc, `FEXC`): a template request is

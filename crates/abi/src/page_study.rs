@@ -19,6 +19,13 @@ pub const LARGE_BYTES: u64 = 2 << 20;
 pub const GLOBAL: u64 = 8;
 /// The flag a 2 MiB leaf's result carries (`cache::LARGE`).
 pub const LARGE: u64 = 32;
+/// The leaf's D bit as the walk saw it, in [`Record::frame`] (`cache::LEAF_DIRTY`): a hit gives it as a TLB entry would.
+pub const DIRTY: u64 = 1;
+const _: () = assert!(
+    GLOBAL == crate::execution::cache::GLOBAL as u64
+        && LARGE == crate::execution::cache::LARGE as u64
+        && DIRTY == crate::execution::cache::LEAF_DIRTY as u64
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -27,7 +34,7 @@ pub struct Record {
     pub key: u64,
     /// The `Control::epoch` of the walk; 0: empty (an epoch is at least 1, `cache::reset`), which never hits.
     pub epoch: u64,
-    /// The leaf's guest-physical base (4 KiB or 2 MiB aligned) with the leaf's G bit in [`GLOBAL`].
+    /// The leaf's guest-physical base (4 KiB or 2 MiB aligned) with the leaf's G bit in [`GLOBAL`] and its D bit in [`DIRTY`].
     pub frame: u64,
     pub _pad: u64,
 }
@@ -58,10 +65,10 @@ pub const fn index(key: u64) -> usize {
 }
 
 /// A fetch walk's result as the record holds it: the 4 KiB page `gpa` is in (the walk's answer, as `fetch_walk` returns it)
-/// and the leaf's flags (`GLOBAL`, `LARGE`; the `cache` values), for a leaf of 4 KiB or 2 MiB.
+/// and the leaf's flags (`GLOBAL`, `LARGE`, `DIRTY`; the `cache` values), for a leaf of 4 KiB or 2 MiB.
 pub const fn leaf_frame(gpa_page: u64, flags: u64) -> u64 {
     let large = flags & LARGE != 0;
-    base(gpa_page, large) | flags & GLOBAL
+    base(gpa_page, large) | flags & (GLOBAL | DIRTY)
 }
 /// A new record for the walk of `va` under the class at epoch `epoch`, found with `flags`, whose page is in `gpa_page`.
 pub const fn record(va: u64, gpa_page: u64, flags: u64, user: bool, epoch: u64) -> Record {
@@ -93,7 +100,7 @@ pub const fn hits(r: &Record, key: u64, epoch: u64, global_epoch: u64, pge: bool
 pub const fn answer(r: &Record, va: u64) -> (u64, u64) {
     let large = key_large(r.key);
     let page = (r.frame & !(PAGE - 1)) | if large { va & (LARGE_BYTES - 1) & !(PAGE - 1) } else { 0 };
-    (page, (r.frame & GLOBAL) | if large { LARGE } else { 0 })
+    (page, (r.frame & (GLOBAL | DIRTY)) | if large { LARGE } else { 0 })
 }
 
 /// The table's answer for `va` under `user`: the 4 KiB key's record, else the 2 MiB key's (plan 3.2): `(page, flags,
@@ -276,6 +283,23 @@ mod tests {
         put(&mut t, V + 0x77, 0x9000 + 0x5000, 0, false, 4);
         assert_eq!(probe(&t, V, false, 4, 1, false), Some((0xe000, 0, false)));
         assert_eq!(probe(&t, V + 0x1000, false, 4, 1, false), None);
+    }
+
+    /// The leaf's D bit is kept as its walk saw it, for both leaf sizes, beside G; it changes neither the key nor the frame.
+    #[test]
+    fn a_record_answers_the_dirty_bit_its_walk_saw() {
+        let mut t = table();
+        put(&mut t, V, 0x9000, DIRTY, true, 4);
+        put(&mut t, V + 0x1000, 0xa000, GLOBAL, true, 4);
+        assert_eq!(probe(&t, V + 0x10, true, 4, 1, false), Some((0x9000, DIRTY, false)));
+        assert_eq!(probe(&t, V + 0x1010, true, 4, 1, false), Some((0xa000, GLOBAL, false)));
+        let region = 0x7f00_0040_0000u64;
+        put(&mut t, region, 6 << 20, LARGE | GLOBAL | DIRTY, true, 4);
+        assert_eq!(
+            probe(&t, region + 0x3000, true, 4, 1, false),
+            Some(((6 << 20) + 0x3000, LARGE | GLOBAL | DIRTY, true))
+        );
+        assert_eq!(record(V, 0x9000, DIRTY, true, 4).key, record(V, 0x9000, 0, true, 4).key);
     }
 
     #[test]

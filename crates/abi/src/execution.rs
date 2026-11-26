@@ -867,7 +867,8 @@ pub mod cache {
         pub links_local: u64,
         /// The linear 2 MiB regions (bit r % 1024) a live [`LARGE`] block's guest bytes may lie in (as `regions`).
         pub large_regions: [u64; 16],
-        /// The last request's fetch walks: byte i holds page i's leaf's [`GLOBAL`] (its G bit) and [`LARGE`].
+        /// The last request's fetch walks: byte i holds page i's leaf's [`GLOBAL`] (its G bit), [`LARGE`] and [`LEAF_DIRTY`]
+        /// (its D bit).
         pub fetched: u64,
         /// Perf chunk 8: the link records found full, so the local links into blocks not current were undone (as every link
         /// into them was before chunk 8), and how many; since perf chunk 11 every link is undone too when that leaves less
@@ -1412,6 +1413,16 @@ pub mod cache {
     /// Perf chunk 8: a source leaf was larger than 4 KiB when it was last checked: an INVLPG anywhere in its 2 MiB
     /// region reaches it (SDM Vol.3 4.10.4.1).
     pub const LARGE: u32 = 32;
+    /// A fetch walk's leaf flag, never a block's (DEAD's value; the resident's `leaves` drops it from a translation's flags):
+    /// the leaf's D bit, in [`Control::fetched`] and the page record (`crate::page_study::DIRTY`) next to [`GLOBAL`] and
+    /// [`LARGE`]. The page was written through this mapping since its leaf was made: run-time-generated code (a JIT
+    /// writes its pages before running them; file-backed code, mapped by read faults, keeps D clear), which the host keeps
+    /// out of the persistent cache. Only that decision reads it: a wrong guess costs time, never a result. A record keeps
+    /// the D its walk saw, as a TLB entry does, so the page record's check mode does not compare it. Edge cases where D
+    /// says nothing about how the code was made: a writable shared file mapping the guest wrote, and kernels with user
+    /// shadow stacks, whose non-writable pages carry D (Linux moves a non-writable page's D to its software SavedDirty
+    /// bit); neither is code a run makes again.
+    pub const LEAF_DIRTY: u32 = 1;
     /// Perf chunk 8: a local link (records `[Control::links_tlb, Control::links)`) may enter it (never cleared: only its death prunes those links).
     pub const LOCAL_INBOUND: u32 = 64;
     /// Perf chunk 10: the block may be copied to another RIP of its half and page offset (the host's template rule, kept

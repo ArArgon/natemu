@@ -106,7 +106,8 @@ pub(super) fn translate(s: &mut State, va: u64, who: usize) -> Result<(u64, u32)
         (Ok((gpa, f)), Some((page, aflags, large))) => {
             k.hit_4k[who] += u64::from(!large);
             k.hit_2m[who] += u64::from(large);
-            let same_flags = u64::from(*f) & (ps::GLOBAL | ps::LARGE) == aflags;
+            // (D is not compared: the record keeps the D its walk saw, `page_record::checked`.)
+            let same_flags = u64::from(*f) & (ps::GLOBAL | ps::LARGE) == aflags & (ps::GLOBAL | ps::LARGE);
             if *gpa != page {
                 k.disagree_frame += 1;
             } else if !same_flags {

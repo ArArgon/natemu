@@ -100,11 +100,13 @@ fn record(s: &State, va: u64, gpa: u64, flags: u32) {
 
 /// Check mode: the walk after a hit, compared with it (the walk may kill blocks and set A bits, as any walk; it never touches the
 /// record). A different frame or other flags (a size, G), or a walk that faults, is a difference: counted, and a halt in
-/// `check-halt`.
+/// `check-halt`. D ([`cache::LEAF_DIRTY`]) is not compared: the record keeps the D its walk saw, as a TLB entry does, and the
+/// guest's writes since may have set it.
 #[inline(never)]
 fn checked(s: &mut State, va: u64, (page, flags): (u64, u32)) {
     let walked = fetch_walk(s, va);
-    if walked == Ok((page, flags)) {
+    let clean = |(page, flags): (u64, u32)| (page, flags & !cache::LEAF_DIRTY);
+    if walked.map(clean) == Ok(clean((page, flags))) {
         return;
     }
     cache::control().page_disagree += 1;
