@@ -431,3 +431,125 @@ to first window:
   - `guest-luajit-interp` (base 20261126-030949-67a2, change 20261126-032144-aa00): 3.563 / 3.470 s → 3.426 / 3.289 s,
     no regression.
 
+
+## 8. After checkpoint 1: the link record area, then step 2 (design for review)
+
+The coordinator's decision (November 26): fix the link record area first, then build step 2, absolute user blocks
+first, in parallel with P2.
+
+### 8.1 The link record area no longer fills
+
+**Measured:**
+- At checkpoint 1 the link record area filled 1-2 times per vCPU.
+- Each reclaim undid 0.28-0.77 M links (`reclaims`); the base had none.
+- With no instance records the arena fills more slowly, so a flush empties the record area less often.
+- P2's regions (a larger code cache) and step 2's persistent links both raise the pressure.
+
+**Why it can fill at all:** live link records are bounded by the link points of live blocks: at most
+`MAX_BLOCKS × MAX_LINK_POINTS` = 2^20 × 4 = 4 Mi. The area holds 512 Ki (`MAX_LINKS`, 24 B each, 12 MiB in the lookup
+area). Suspended records (the relink plan's) come on top, up to one per suspended link. They are dropped first at a
+reclaim, with no code written (`drop_suspended`).
+
+**Change:**
+- The records move out of the lookup area into a span of their own, `LINKS_VA = PRIVATE + 0x1800_0000`, with
+  `MAX_LINKS = 4 Mi` (96 MiB, backed as touched).
+- That address range is free in `main`'s layout (between the code area and its write alias) and in P2's (whose code
+  area moves to PRIVATE + 64 GiB, `shared-code-regions` 53e35f01).
+- With this size only suspended records can fill the area. The reclaim then drops them and nothing else: the `prune`
+  and `unlink_all` stages are reached only under a test cap (`NATEMU_LINK_CAP`, K1's `link-full`), which stays as it is.
+- The lookup area gives up 12 MiB.
+
+**Code:**
+- **abi:** `LINKS_VA`, `LINKS_BYTES`, and a backing offset (`LINKS_OFFSET`) in the vCPU's block, before the code area.
+- **host:** map the span, EL1 read-write and never executable, as the metadata arena is; read records from
+  `LINKS_OFFSET` (`execution.rs`'s end-of-run checks, the program driver's record writer).
+- **runtime:** `record(i)` from `LINKS_VA`.
+
+**Checks:**
+- K1's `link-full` still fills a capped area: it runs with `NATEMU_LINK_CAP`, and its counts are unchanged.
+- A unit test asserts `MAX_LINKS ≥ MAX_BLOCKS × MAX_LINK_POINTS`. It is shown to fail at the old 512 Ki.
+- A k1 program fills more than 512 Ki links with no reclaim: it is shown to fail on the old layout.
+
+### 8.2 Step 2, absolute user blocks first
+
+The review's step 2 findings (6, 4-16) are part of this design. Only what changes from 2.3-2.5 is listed.
+
+**Which blocks get a guard:**
+- Absolute (not PIC) blocks of a user (CPL 3) context, with a non-global leaf and all bytes on one linear page.
+- Not the step block, nor a SYSTEM record.
+- Shared translations keep step 1's scheme; their guard is the meeting point with P2 (8.3).
+
+**The code TLB:**
+- 32 Ki entries of 8 bytes (256 KiB, review finding 8), direct-mapped by `(va >> 12) & 0x7fff`. An entry is
+  `vpn | VALID << 35 | frame << 36`.
+- It is mapped EL0 read-only in the 64 pages after the guest-state page. `guest_state_alias_valid` gains the room
+  check (finding 15).
+- **Filled** at every resident entry into a guarded block that is current (finding 5): the block's `checked == epoch`
+  says a walk in this epoch found its page at its frame. Also filled by each revalidation and placement of a guarded
+  block.
+- **Never filled** under `REUSE_CHECK`, a page-record check mode, `pic-count`, or an armed DR7 (finding 14), nor for a
+  page holding a host fence or the stop RIP.
+- **Emptied** at:
+  - every `tlb` (CR3 load and global flush);
+  - a reset;
+  - a change of the host's `stop_at` (finding 10);
+  - INVLPG and #PF: the page's entry, and the region's 512 entries if a large leaf filled one there.
+  
+  The emptied indices come from a fill list of 4096 entries; past that, the whole table is cleared.
+
+**The guard of an absolute block B** (RIP r, frame F, constant index i and expected entry E): a stub after B's code
+(finding 7):
+
+```
+G0: add  x1, x28, #(4096 + 8 i) >> 12, lsl #12
+G1: ldr  x1, [x1, #(4096 + 8 i) & 0xfff]
+G2: ldr  x2, E                 // the stub's 8-byte literal
+G3: cmp  x1, x2
+G4: b.ne miss
+G5: b    B's (hot) entry
+miss: movz/movk x0, #r (1-4 words); b DISPATCH_MISS
+E:   .quad vpn(r) | VALID << 35 | F << 36
+```
+
+- **Cost:** a hit runs 6 instructions, with two loads (the table and the literal) and one taken branch more than a plain
+  link. Today's cross-page link runs 1, but is undone and made again at every CR3 load.
+- **Registers:** x0 is not needed on a hit, so a link into B patches the move's first word to `b stub`, as a plain link
+  does. x1 and x2 are dead at every exit and after the dispatcher slot (review finding 10).
+- **L1:** an L1 entry for B holds the stub's address (x0 = r from the dispatcher).
+
+**Persistence:**
+- Links into a guarded block go in a new segment, `GUARDED`. Neither a CR3 load nor a global flush suspends or
+  prunes it; the death of either end does.
+- L1 entries owned by guarded blocks are not listed, so `tlb(false)` leaves them (finding 6). `tlb(true)` still
+  clears whole tables (finding 16).
+- INVLPG and #PF go on making B not current (linear chains). They leave B's guarded links and L1 entries alone: the
+  code-TLB entry goes, so the guard misses.
+- An L1 fill replaces the way whose tag equals the RIP, for every block (finding 4). Step 1b does this for translations
+  already.
+- Guarded links keep the checked links' exclusions (finding 12): no guarded link from a REP self-exit or into an
+  `STI_FIRST` self-target, and none while DR7 is armed.
+
+**PC classes:**
+- A stop or interrupt at any stub word means "B not entered; RIP = r" (finding 13). `block_at` maps the stub's range to
+  B through a new `Block` field, `guard` (the stub's code-area offset; 0: none).
+- `interrupted` treats the stub like B's first word.
+- A k1 case stops at every stub word.
+
+**What the measurement must show** (pooled checkpoint 2):
+- The switch buckets drop (`link`, `relink`, `patch`, `tlb`, misses after CR3 loads).
+- `guest-luajit-interp` within twice its noise.
+- Fallbacks if it fails: guard links only, L1 cleared as now (section 5); then entry poisoning.
+
+### 8.3 Where step 2 meets P2
+
+P2's shared code (`shared-code-plan.md` on `shared-code-regions`, section 2) links across pages only by checked links: a
+`b` to the dispatcher slot, which probes the running vCPU's own L1, about 9 ns more than a direct branch. Its plan
+expects this: "When P1's guarded entries land, a checked link becomes a direct branch to the target's guard".
+
+The guard reads the running vCPU's code TLB through x28, so a guarded link is right on every vCPU and in every address
+space. It is the form P2 can patch once, in shared code, for all vCPUs. For that, P2's shared translations need the
+PIC form of the guard (2.4's sequence, x0-indexed), not 8.2's constant-index stub, which serves one RIP.
+
+Order: step 2 builds the absolute stub and the code TLB, and the PIC guard after it. P2 then turns its checked links into
+guarded ones. The link records' segments (`GUARDED`) and `cache::link`'s forms are this plan's; P2's chunk 2 does not
+touch them.
