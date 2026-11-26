@@ -33,13 +33,64 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
 /// [`object`] between RIPs of the same half at any page offsets, for 64-bit code whose guest bytes lie in one page at both
 /// RIPs (so its page crossing, and the bytes fexc was given before the page's end, are alike): the same relocation, by the
 /// same records. The reuse check (`Compiler::check_reuse`) compares its result with fexc's own answer at the new RIP.
+///
+/// A guest-RIP-addressed access's checks are fexc's decision at compile time, from its address (fexc_sites.inc, the
+/// RIP-relative path of the split and alignment checks): an SSE/AVX operand gets `b` to its alignment stub when misaligned
+/// and no check when aligned, a store `b` to its split stub when it crosses a page and no check when not. Moving the code
+/// moves those addresses by `to - from`, so every access whose base register a guest-RIP move sets (each such move's value
+/// with the access's offset, [`rip_addressed_alike`]) must be aligned alike, for every alignment a check may test, and
+/// cross a page alike at both RIPs; else `None`.
 pub(crate) fn object_moved(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
     let h: Header = read(o, 0)?;
     let in_page = |r: u64| (r & 0xfff) + u64::from(h.guest_bytes) <= 4096;
     if (from ^ to) >> 63 != 0 || h.guest_bitness != 64 || !in_page(from) || !in_page(to) {
         return None;
     }
+    if !rip_addressed_alike(o, &h, to.wrapping_sub(from))? {
+        return None;
+    }
     moved(o, from, to)
+}
+
+/// [`object_moved`]'s rule for the accesses whose base register a guest-RIP move sets, the code moved by `d`: `Some(true)`
+/// when every such access is aligned alike at both addresses to each alignment a check may test (SSE/AVX's 16 and 32 bytes,
+/// and with alignment checking the operand's width: the access's, or half of a pair's) and crosses a page alike.
+/// An access is paired with the last guest-RIP move into its base register before it (fexc materialises a RIP-relative
+/// operand's address right before its access, and reuses the register for the next; a move into x0 is a literal exit's,
+/// never a base); an access with an index register has its checks at run time (fexc decides at compile time only without
+/// one).
+fn rip_addressed_alike(o: &[u8], h: &Header, d: u64) -> Option<bool> {
+    let mut moves = vec![];
+    for i in 0..h.relocs_count as usize {
+        let r: Reloc = read(o, (h.relocs_offset as usize).checked_add(i * size_of::<Reloc>())?)?;
+        if r.kind == object::RELOC_GUEST_RIP_MOVE && r.register != 0 {
+            moves.push((r.offset, r.register, r.value));
+        }
+    }
+    if moves.is_empty() {
+        return Some(true);
+    }
+    let crosses = |a: u64, w: u64| w > 1 && (a ^ a.wrapping_add(w - 1)) & 0x1000 != 0;
+    for i in 0..h.sites_count as usize {
+        let s: object::Site = read(o, (h.sites_offset as usize).checked_add(i * size_of::<object::Site>())?)?;
+        if object::kind::is_stub_kind(s.kind) || s.kind == object::kind::X87MAP || s.index_reg != object::NO_REG {
+            continue;
+        }
+        let w = u64::from(s.width);
+        let pair = matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR | object::kind::PUSH_PAIR | object::kind::POP_PAIR);
+        let masks = [16, 32, w, if pair { w / 2 } else { w }].map(|n| n.max(1) - 1);
+        let last = moves
+            .iter()
+            .filter(|&&(at, reg, _)| reg == s.base_reg && at < s.native_offset)
+            .max_by_key(|&&(at, ..)| at);
+        if let Some(&(_, _, v)) = last {
+            let (a, b) = (v.wrapping_add(s.imm as i64 as u64), v.wrapping_add(s.imm as i64 as u64).wrapping_add(d));
+            if masks.iter().any(|&m| (a & m == 0) != (b & m == 0)) || crosses(a, w) != crosses(b, w) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
 }
 
 fn moved(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {

@@ -2786,19 +2786,27 @@ impl Shard {
         let mut ranks: Vec<(u64, usize)> = self.cache.values().flatten().map(|s| (rank(s), s.entry.size())).collect();
         ranks.sort_unstable();
         let (want_bytes, want_count) = (cap.0 / 4 * 3, cap.1 / 4 * 3);
-        let (mut bytes, mut count, mut below) = (self.bytes, self.count, 0);
-        for &(r, size) in &ranks {
+        let (mut bytes, mut count, mut n) = (self.bytes, self.count, 0usize);
+        for &(_, size) in &ranks {
             if bytes <= want_bytes && count <= want_count {
                 break;
             }
-            (bytes, count, below) = (bytes - size, count - 1, r + 1);
+            (bytes, count, n) = (bytes - size, count - 1, n + 1);
         }
+        // The n lowest-ranked go: every answer ranked below the last of them, and as many of those ranked as it as are among
+        // the n (ranks tie: hits share the clock), so a sweep never drops more answers than it counted.
+        let (last, mut ties) = match n.checked_sub(1) {
+            Some(i) => (ranks[i].0, ranks[..n].iter().rev().take_while(|r| r.0 == ranks[i].0).count()),
+            None => (0, 0),
+        };
         let mut dropped = Vec::new();
         self.cache.retain(|k, v| {
             let limit = (k.0 != 1 << 32).then_some(k.0 as u32);
             let mut i = 0;
             while i < v.len() {
-                if rank(&v[i]) < below {
+                let r = rank(&v[i]);
+                if n > 0 && (r < last || (r == last && ties > 0)) {
+                    ties -= usize::from(r == last);
                     dropped.push((limit, v.swap_remove(i).entry));
                 } else {
                     i += 1;
@@ -6304,6 +6312,40 @@ mod tests {
         let (_, compiles, _, _, n) =
             std::thread::scope(|s| s.spawn(|| run(2, 0x7f12_3456_9ff0)).join().unwrap());
         assert_eq!((compiles, n[why::MOVED]), (1, 0));
+    }
+
+    /// With `FEXC` set: fexc decides a guest-RIP-addressed access's checks from its address, so an answer moves to another
+    /// page offset only where those come out alike (`relocation::object_moved`), under the reuse check: a misaligned MOVAPS
+    /// operand (its alignment stub) that would be aligned there, and an 8-byte store that crosses a page (its split check)
+    /// and would not, are compiled; a store aligned alike and inside its page at both RIPs is moved.
+    #[test]
+    fn moved_answers_keep_the_checks_of_rip_relative_accesses() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        // `insn` (7 bytes, its disp32 last) at `from` addressing `target`, then `ret` and bytes after it (an answer that did
+        // not read to the end of its bytes); compiled at `from`, then asked at `to`: (compiles, moved) of the second.
+        let case = |insn: [u8; 3], from: u64, target: u64, to: u64| {
+            let disp = (target.wrapping_sub(from + 7) as i64 as i32).to_le_bytes();
+            let code = [&insn[..], &disp, &[0xc3], &[0xcc; 16]].concat();
+            let answers = std::sync::OnceLock::new();
+            let run = |v: u8, rip: u64| {
+                let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+                (c.vcpu, c.check_reuse) = (v, true);
+                c.share(&answers);
+                assert!(matches!(c.compile(&code, rip, false, &mut ()).unwrap(), Code::Block(_)));
+                (c.compiles, c.admissions[why::MOVED].get())
+            };
+            std::thread::scope(|s| s.spawn(|| run(0, from)).join().unwrap());
+            std::thread::scope(|s| s.spawn(|| run(1, to)).join().unwrap())
+        };
+        let (movaps, store) = ([0x0f, 0x28, 0x05], [0x48, 0x89, 0x05]); // movaps xmm0, [rip+d]; mov [rip+d], rax
+        // Misaligned at 0x7f12_3456_8008; 0x1238 further, aligned.
+        assert_eq!(case(movaps, 0x7f12_3456_7100, 0x7f12_3456_8008, 0x7f12_3456_8338), (1, 0));
+        // Crossing at 0x...8ffc; 0x1240 further (a multiple of 32), inside its page.
+        assert_eq!(case(store, 0x7f12_3456_7100, 0x7f12_3456_8ffc, 0x7f12_3456_8340), (1, 0));
+        // Inside its page at both.
+        assert_eq!(case(store, 0x7f12_3456_7100, 0x7f12_3456_8100, 0x7f12_3456_8340), (0, 1));
     }
 
     /// With `FEXC` set (perf chunk 13): two compilers sharing one map on two threads: the second's request at another RIP is
