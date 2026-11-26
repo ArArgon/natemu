@@ -48,13 +48,16 @@ stays in the plan but waits until step 1 is measured (section 7 says what eviden
 
 ### 2.1 Frame-keyed table (step 1a)
 
-The lossy hint table (2^18 direct-mapped u32, `area::HINTS`, `cache::hint` and `cache::template`) is replaced by an
-exact open-addressed table of its own, `area::FKEYS`: 2^21 entries of 8 bytes (16 MiB per vCPU), each a 32-bit tag of
-the key and the block number + 1. The key is `(frame, page offset, half, context)`: the first source page's
-guest-physical page, `rip & 0xfff`, `rip >> 63` and the code context. It names no linear address and no vCPU, so a shared
-(cross-vCPU) table in P2 can use the same key. A tag match is only a candidate: the record is checked as `lookup`
-checks its own (live, `RELOCATABLE` or `TRANSLATION`, never `SYSTEM` or `STEP`, `source_gpa[0] == frame`, same page
-offset, half and context).
+The lossy hint table (2^18 direct-mapped u32, `area::HINTS`) is replaced by an exact open-addressed table of its own,
+`area::FKEYS`: 2^20 entries of 8 bytes (8 MiB per vCPU), each a 32-bit tag of the key and the block number + 1. The table's
+algorithm is pure functions with unit tests (`natemu_abi::fkeys`). The lookup area has no room for 2^21 entries, so the
+table caps its load: templates are entered up to half the table, shared translations up to three quarters, and a
+template beyond the cap is counted (`fkey_full`) and not entered. The hint table stays as a write-only shadow, read only
+to count what it would have lost (`fkey_lost`); it goes once that is measured. The key is `(frame, page offset, half,
+context)`: the first source page's guest-physical page, `rip & 0xfff`, `rip >> 63` and the code context. It names no
+linear address and no vCPU, so a shared (cross-vCPU) table in P2 can use the same key. A tag match is only a candidate: the
+record is checked as `lookup` checks its own (live, `RELOCATABLE` or `TRANSLATION`, never `SYSTEM` or `STEP`,
+`source_gpa[0] == frame`, same page offset, half and context).
 
 - Each key names at most one block. A placed [`RELOCATABLE`] block (a template, from the host, the pool or a copy) is
   entered if its key is free or names a dead block. A translation made from a template replaces the template's slot
@@ -62,8 +65,8 @@ offset, half and context).
   template. A copy of an unshareable template does not replace its source.
 - A block leaves the table when it dies, and only if the slot still names it (copies of an unshareable template share one
   key). Removal uses backward-shift deletion, as `l2_remove` does.
-- Every block has at most one entry and the table has 2^21 slots against [`MAX_BLOCKS`] = 2^20 blocks, so the load stays
-  below one half and probes end at an empty slot (review finding 2). `cache::reset` empties it.
+- Every block has at most one entry, and the caps keep the load below three quarters, so probes end at an empty slot
+  (review finding 2). `cache::reset` empties it.
 
 `reused` then finds every template this vCPU holds for the bytes at RIP, wherever it was placed. The lost-hint share
 (case (c) below) goes to an in-VM instance or copy instead of the pool or the host.
@@ -85,6 +88,13 @@ The refusals `instance` applies are made at every such entry (review finding 3):
 - a fence or stop RIP on RIP's page or the next.
 
 A refused RIP gets an absolute copy, as today.
+
+Three paths resolve a RIP by frame:
+
+- `miss_fast` uses the page record only (no walk).
+- `sys_fast` (SYSRET, SYSCALL, IRET and the rest) uses the page record or a walk, as its lookup's revalidation may. It
+  tests fences, the stop RIP and the RIP's range before it walks (code review, finding 3).
+- `find` uses the walk that `reused` makes.
 
 What instances did, and how each is done without them:
 
@@ -205,9 +215,9 @@ that address" (pic-plan section 4).
 
 | Structure | Size | Step | Note |
 |---|---|---|---|
-| Frame-keyed table `FKEYS` | 2^21 × 8 B = 16 MiB per vCPU | 1a | Exact; tag + number; load below one half. |
-| Hint table | −1 MiB | 1a | Removed. |
-| Translation L1 page filter | 2^15 bits = 4 KiB, and a 64-word region filter | 1b | In the lookup area. |
+| Frame-keyed table `FKEYS` | 2^20 × 8 B = 8 MiB per vCPU | 1a | Exact; tag + number; templates to 1/2, translations to 3/4 of it. |
+| Hint table | 1 MiB, kept for now | 1a | A shadow for the `fkey_lost` count only; removed once measured. |
+| Translation L1 page filter | 2^15 bits = 4 KiB, and a 16-word region filter | 1b | `area::TL1_PAGES`; `Control::tl1_regions`. |
 | Instance records | about 216 B each, gone | 1b | The arena and the index fill more slowly. |
 | Code TLB | 4096 × 8 B = 32 KiB (or 32 Ki entries, 256 KiB: review finding 8), and a fill list | 2 | Lookup area, mapped EL0 read-only at x28 + 4096. |
 | Guarded lead | +32 B per guarded translation; a 5-word stub per guarded absolute block | 2 | |
@@ -281,6 +291,30 @@ reviewer's alternatives are kept:
 The reviewer's cheaper lost-hint fix, scanning the frame's reverse-map chain, is not taken. A frame's chain also holds
 every copy and instance of its blocks, so its length grows with the number of processes. It would also give P2 no table
 to grow from.
+
+### 6.1 Code review of step 1 (Fable, independent, November 26)
+
+The reviewer read `be88e684..7041c596` and found no blocking defect: no path enters a shared translation at a RIP whose
+pages do not map its frames. The findings:
+
+1. **Cap (SHOULD).** Templates past the cap lose reuse, and a translation left out was reachable only by local links.
+   **Adopted:** translations are entered up to three quarters. `fkey_full` is read in the deciding runs; if it is not 0,
+   the table needs room the lookup area does not have now.
+2. **Scan counters (SHOULD).** `tl1_scans`, `tl1_scanned` and `tl1_emptied` never reached the host. **Adopted:** they are
+   in the k1 stats' `fkeys` block. If scans are long, test the tag's page against the filter before reading the record.
+3. **`sys_fast` walked before its fence test (SHOULD).** **Adopted** (2.2).
+4. **Hot-path costs (SHOULD).** The virtual instance is now built only under the check, and `suspended_guardable` counts
+   in `perf` builds only. **Adopted.** The hint shadow goes after measurement.
+5. **NOTE.** A translation that dies alone leaves its live template with no slot until the next placement of that key.
+   This is sound and converges.
+6. **NOTE.** The key ignores the second frame: two crossing blocks that differ only there share a key, and `link`'s share
+   can alternate them. This is rare, and the hint table had the same weakness.
+7. **NOTE.** One translation holds at most one way of an L1 set.
+8. **NOTE.** Counter meanings moved: `INSTANCES` and `reuse_copies` now count entries, not records; refusals can count
+   twice (fast path, then full path); `dispatch-study`'s miss classes and `page-study`'s shadow are not adjusted.
+9. **NOTE.** Instance code paths are dead now (`lookup`'s global refusal, `code_of`'s arm outside the check, `cut_one`'s
+   scope). They are removed when step 1 is kept.
+10. **NOTE.** The region filter is 2 MiB, as `large_held` is; 1 GiB leaves would need more (inherited).
 
 ## 7. Measurements that decide
 
