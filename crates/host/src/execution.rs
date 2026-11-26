@@ -4007,7 +4007,19 @@ impl Compiler {
                             }
                             // Option (d): kept for the next hit, from the admission at the answer's own RIP.
                             if let Some(e) = kept.filter(|e| e.rip == rip) {
-                                let form = admission::Admitted { object: Vec::new(), ..a.clone() };
+                                // (Its fields but the object, which the kept form never holds: no copy of the object.)
+                                let form = admission::Admitted {
+                                    object: Vec::new(),
+                                    links: a.links.clone(),
+                                    guest_bytes: a.guest_bytes,
+                                    guest_insns: a.guest_insns,
+                                    end_reason: a.end_reason,
+                                    dispatch_exit: a.dispatch_exit,
+                                    rep_self: a.rep_self,
+                                    sti_first: a.sti_first,
+                                    bulk: a.bulk,
+                                    last: a.last,
+                                };
                                 let (cpl0, bulk, shape) = (self.cpl0, self.bulk, self.shape);
                                 let _ = e.kept.set(Box::new(Kept { cpl0, bulk, shape, form }));
                             }
