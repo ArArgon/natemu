@@ -2596,7 +2596,11 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     let local_shared = local_ok
         && (target.flags & (INSTANCE | TRANSLATION) != 0 || now.is_some())
         && same_frames(code, source);
-    let checked = !local_shared && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
+    // Frame-keyed plan step 1c (shared-code plan chunk 4's A/B): every link that is not local is checked too, unless the
+    // host's debug key asks for plain ones (`Control::link_form_plain`): it probes L1 at the RIP the exit built, so no TLB
+    // event undoes it (an L1 entry is emptied instead) and none is patched again.
+    let checked = !local_shared
+        && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (c.link_form_plain == 0 && !local(target, source)));
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
     if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {

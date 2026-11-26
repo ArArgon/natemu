@@ -4812,6 +4812,19 @@ pub fn run(
         SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_CAP={v}: link record area capacity reduced (test hook)"));
     }
     area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
+    // Frame-keyed plan step 1c: every link that is not local is checked by default; `NATEMU_LINK_FORM=plain` (a debug key)
+    // makes them plain again, undone at TLB events and relinked.
+    let plain = match std::env::var("NATEMU_LINK_FORM").as_deref() {
+        Ok("plain") => 1u64,
+        Ok("checked") | Ok("") | Err(std::env::VarError::NotPresent) => 0,
+        Ok(other) => return Err(format!("NATEMU_LINK_FORM={other}: checked (the default) or plain")),
+        Err(e) => return Err(format!("NATEMU_LINK_FORM: {e}")),
+    };
+    if plain != 0 {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_FORM=plain: links between pages are plain (debug key)"));
+    }
+    area.write_record(control + std::mem::offset_of!(cache::Control, link_form_plain), plain);
     // The template pool (chunk 3): the resident looks in it (mapped read-only at `cache::POOL_VA` by `prepare_with_pool`) unless
     // `NATEMU_POOL_LOOKUP=off` (publication without lookup, the A/B of the pool's cost).
     if let Some(pool) = &compiler.pool {

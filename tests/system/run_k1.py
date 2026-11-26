@@ -2008,6 +2008,19 @@ def relink_counts(a, n, name, report):
         more = (y[0] - x[0], y[1] - x[1])
         if more != want:
             failures.append(f'{name}@{n} cpu{v}: {k} more rounds added (linker entries, relinked) {more}, want {want}')
+    # Frame-keyed plan step 1c: in the default form the same rounds' links from other pages are checked: no CR3 load suspends
+    # one, none is relinked.
+    if name == 'relink-many':
+        prog = program(name, n, k)
+        prog['link_form'] = 'checked'
+        out, problems = run(a, prog, [], None, None, '-checked')
+        failures += [f'{name}@{n} checked: {p}' for p in problems]
+        for v, c in enumerate(out['cpus'] if out else []):
+            r = c['stats']['k1'].get('relink', {})
+            if r.get('suspended', 0) or r.get('relinked', 0):
+                failures.append(f"{name}@{n} checked cpu{v}: suspended {r.get('suspended', 0)}, relinked {r.get('relinked', 0)}, want none")
+        if not out:
+            failures.append(f'{name}@{n} checked: no output')
     report.append({'name': f'k1-{name}@{n}-relink-counts', 'max_block': None, 'stats': got, 'problems': failures})
     print(json.dumps(report[-1]), flush=True)
     return failures
@@ -2072,6 +2085,13 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
     mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
     env = dict(os.environ, **({'NATEMU_PIC': mode} if mode else {}))
     env.pop('NATEMU_LINK_CAP', None)   # (an inherited export must not shrink the full size, or any other program)
+    # Frame-keyed plan step 1c: links that are not local are checked by default (no TLB event undoes one); the relink programs
+    # test the plain form's suspension and relinking, behind the host's debug key `NATEMU_LINK_FORM=plain` (a program may name
+    # its own form, `link_form`: the default's check of `relink-many`).
+    env.pop('NATEMU_LINK_FORM', None)
+    form = prog.get('link_form', 'plain' if prog['name'][3:].split('@')[0] in RELINK_PROGRAMS else None)
+    if form:
+        env['NATEMU_LINK_FORM'] = form
     for var in ('NATEMU_POOL_RING_KB', 'NATEMU_POOL_INDEX_SLOTS', 'NATEMU_POOL_LOOKUP'):
         env.pop(var, None)
     if pooled:

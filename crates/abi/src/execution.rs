@@ -1154,6 +1154,12 @@ pub mod cache {
         /// records dropped at a TLB event for [`MAX_SUSPENDED`]. Appended.
         pub reclaimed_suspended: u64,
         pub suspended_dropped: u64,
+        /// Frame-keyed plan step 1c (shared-code plan chunk 4's A/B, 650bebb2): 0, the default: a link that is not local
+        /// ([`crate::execution::cache`]'s linker, `local`) is made in the checked form (its `svc` word becomes `b` to its
+        /// context's dispatcher slot, which probes L1 at the RIP the exit built), so no TLB event undoes it; nonzero (the
+        /// host's `NATEMU_LINK_FORM=plain`, a debug key): such links are plain, undone at TLB events and patched again
+        /// (the relink plan). Appended.
+        pub link_form_plain: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
