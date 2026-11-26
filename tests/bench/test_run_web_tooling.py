@@ -90,21 +90,42 @@ class Sampling(unittest.TestCase):
         self.assertEqual(cmd[-4:], ['--profile', 'o/x', '--profile-us', '250'])
 
     def test_the_elf_image_holds_the_userlands_elf_files_only(self):
-        import io, stat, tempfile
-        from compression import zstd
+        """Both decompressors: Python 3.14's compression.zstd and the zstd program (older Pythons), each given the
+        recipes' zero padding; each mode runs where this machine has it."""
+        import io, shutil, stat, subprocess, tempfile
+        from unittest import mock
         from play.mkcpio import entry
-        d = pathlib.Path(tempfile.mkdtemp())
+        import sample_symbols
         raw = io.BytesIO()
         for ino, (name, data) in enumerate([('usr/bin/node', b'\x7fELF' + b'n' * 60), ('etc/passwd', b'root:x:0:0\n'),
                                             ('usr/lib/libxul.so', b'\x7fELF' + b'x' * 9)], 1):
             entry(raw, ino, name, stat.S_IFREG | 0o755, data)
         entry(raw, 0, 'TRAILER!!!', 0)
-        (d / 'userland.cpio.zst').write_bytes(zstd.compress(raw.getvalue()) + b'\0\0')      # padded to 4 bytes, as the recipes'
-        got = gu.elf_image(d / 'userland.cpio.zst', d / 'userland.cpio')
-        import sample_symbols
-        files = sample_symbols.cpio_files((d / 'userland.cpio').read_bytes())
-        self.assertEqual((got['files'], sorted(files)), (2, ['usr/bin/node', 'usr/lib/libxul.so']))
-        self.assertEqual(list(d.glob('*.cpio')), [d / 'userland.cpio'])      # the decompressed copy is gone
+        exe = shutil.which('zstd') or next((q for q in sample_symbols.ZSTD_PATHS if pathlib.Path(q).is_file()), None)
+        try:
+            from compression import zstd
+            packed, modes = zstd.compress(raw.getvalue()), [None]
+        except ImportError:
+            packed, modes = None, []
+        if exe:
+            modes.append(exe)
+            packed = packed or subprocess.run([exe, '-cq'], input=raw.getvalue(), stdout=subprocess.PIPE, check=True).stdout
+        if not modes: self.skipTest('neither compression.zstd nor the zstd program')
+        for mode in modes:
+            for pad in (b'', b'\0', b'\0\0', b'\0\0\0'):
+                with self.subTest(mode=mode or 'compression.zstd', pad=len(pad)), \
+                        mock.patch.object(sample_symbols, 'zstd_tool', lambda: mode):
+                    d = pathlib.Path(tempfile.mkdtemp())
+                    (d / 'userland.cpio.zst').write_bytes(packed + pad)      # padded to 4 bytes, as the recipes'
+                    got = gu.elf_image(d / 'userland.cpio.zst', d / 'userland.cpio')
+                    files = sample_symbols.cpio_files((d / 'userland.cpio').read_bytes())
+                    self.assertEqual((got['files'], sorted(files)), (2, ['usr/bin/node', 'usr/lib/libxul.so']))
+                    self.assertEqual(list(d.glob('*.cpio')), [d / 'userland.cpio'])      # the decompressed copy is gone
+            with self.subTest(mode=mode or 'compression.zstd', junk=True), \
+                    mock.patch.object(sample_symbols, 'zstd_tool', lambda: mode):
+                d = pathlib.Path(tempfile.mkdtemp())
+                (d / 'userland.cpio.zst').write_bytes(packed + b'\0x')      # not zeros after the frame: refused
+                with self.assertRaises(SystemExit): gu.elf_image(d / 'userland.cpio.zst', d / 'userland.cpio')
 
 
 class Tail(unittest.TestCase):

@@ -87,17 +87,31 @@ def elf_image(src: Path, dest: Path) -> dict:
     import mmap
     import tempfile
     from sample_symbols import cpio_files
-    from compression import zstd          # Python 3.14 and later; the zstd program refuses the archive's padding
+    from sample_symbols import zstd_tool
+    exe = zstd_tool()                     # None: Python 3.14's compression.zstd; else the zstd program
     with tempfile.NamedTemporaryFile(dir=dest.parent, suffix='.cpio') as raw:
         # The recipes zero-pad the archive to 4 bytes (for the kernel), after its one zstd frame: decompress the frame and
         # accept only zeros after it.
-        dec, rest = zstd.ZstdDecompressor(), b''
-        with open(src, 'rb') as f:
-            while chunk := f.read(1 << 24):
-                if dec.eof: rest += chunk; continue
-                raw.write(dec.decompress(chunk))
-                if dec.eof: rest += dec.unused_data
-        if not dec.eof or rest.strip(b'\0'): raise SystemExit(f'{src}: not one zstd frame and zero padding')
+        if exe is None:
+            from compression import zstd
+            dec, rest = zstd.ZstdDecompressor(), b''
+            with open(src, 'rb') as f:
+                while chunk := f.read(1 << 24):
+                    if dec.eof: rest += chunk; continue
+                    raw.write(dec.decompress(chunk))
+                    if dec.eof: rest += dec.unused_data
+            if not dec.eof or rest.strip(b'\0'): raise SystemExit(f'{src}: not one zstd frame and zero padding')
+        else:
+            # The zstd program refuses trailing zeros, and the padding is at most 3 of them: exactly one cut length
+            # leaves a whole frame (fewer leaves zeros after it, more truncates it).
+            data, ok = src.read_bytes(), False
+            for cut in range(4):
+                if any(data[len(data) - cut:]): break       # only padding zeros may be cut
+                raw.seek(0); raw.truncate()
+                if subprocess.run([exe, '-dcq'], input=data[:len(data) - cut], stdout=raw,
+                                  stderr=subprocess.DEVNULL).returncode == 0:
+                    ok = True; break
+            if not ok: raise SystemExit(f'{src}: not one zstd frame and zero padding')
         raw.flush()
         with open(raw.name, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d, open(dest, 'wb') as out:
             n = 0
