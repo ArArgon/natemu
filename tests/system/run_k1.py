@@ -1233,16 +1233,21 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 # `jmp rbx`); EXIT (user) ends in the nop to CPL 0 and is followed by BACK (supervisor: `jmp r12`); S is a supervisor code page. A
 # CPL-3 call sets r12 = the return label, rbx = the target and r13 = EXIT's nop (the code ends `jmp r13`).
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
-STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3', 'guard-invlpg', 'guard-flags')
+STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3', 'guard-invlpg', 'guard-flags', 'guard-hits', 'guard-kill')
 # Frame-keyed plan 8.2, guarded blocks (natemu only: CPL 3). GS (CPU i's page d + GS, mapped at its own address) holds CPL-3 code
 # that jumps straight to V + PY, a link from another page into an absolute user block: its guard stub. Table A maps V -> F1,
 # table B V -> F2 (each frame's code at PY: `mov eax, 0x11|0x12; jmp r13`, or for `guard-flags` RFLAGS' OF|SF|ZF|CF).
 # - `guard-cr3`: twice under A (the link made, then a guard hit); twice under B with no INVLPG (the CR3 load emptied the code TLB:
 #   the stub misses, F2's block runs; then F2's entry is in the slot and F1's stub still misses); twice under A again (F1).
 # - `guard-invlpg`: under A, V remapped to F2 with INVLPG and back: the slot goes with the INVLPG, each frame's code runs.
-# - `guard-flags`: `cmp ecx, edx` in GS before the jump, the flags read at the target: through the linker, a guard hit, a guard
-#   miss after a CR3 load (B), and a hit with other flags: the stub keeps NZCV (guest flags) on both paths.
-GUARD = ('guard-cr3', 'guard-invlpg', 'guard-flags')
+# - `guard-flags`: `cmp ecx, edx` in GS before the jump, the flags read at the target: through the linker (CF|SF), a guard hit, a
+#   guard miss after a CR3 load (B), then under B (GS still linked to F1's stub: a miss, then F2's block) ZF, and OF: the stub
+#   keeps NZCV (guest flags) on both paths.
+# - `guard-hits`: K calls under A: after the first, every transfer is a guard hit, so the fast and full misses stay far below K
+#   (a guard that always missed would cost one each).
+# - `guard-kill`: the guarded link live, F1's code rewritten (its block dies, the link into its stub is undone), then the cache
+#   flushed (every link undone): each later call runs the bytes now there.
+GUARD = ('guard-cr3', 'guard-invlpg', 'guard-flags', 'guard-hits', 'guard-kill')
 GS = 0x8000
 GUARD_FLAGS = b'\x9c\x58\x25\xc1\x08\x00\x00\x41\xff\xe5'   # pushfq; pop rax; and eax, 0x8c1; jmp r13
 # `fa-ro` (fault-around plan chunk 1, natemu only: QEMU cannot switch CPL): at CPL 3 (the user code on FAUC) a page NRW (R/W = 1, D = 1) read and
@@ -1349,7 +1354,11 @@ def chunk_bodies(k, i, n):
         'guard-invlpg': (c3('b0', d + GS) + save('r8') + c3('b1', d + GS) + save('r9') + put(d + F2) + inv(d) + c3('b2', d + GS)
                          + save('r10') + c3('b3', d + GS) + save('r14') + put(d + F1) + inv(d) + c3('b4', d + GS) + save('r15')),
         'guard-flags': ('    mov ecx, 1\n    mov edx, 2\n' + c3('f0', d + GS) + save('r8') + c3('f1', d + GS) + save('r9') + cr3('tb')
-                        + c3('f2', d + GS) + save('r10') + '    mov ecx, 2\n' + c3('f3', d + GS) + save('r14') + cr3('ta')),
+                        + c3('f2', d + GS) + save('r10') + '    mov ecx, 2\n' + c3('f3', d + GS) + save('r14')
+                        + '    mov ecx, 0x80000000\n    mov edx, 1\n' + c3('f4', d + GS) + save('r15') + cr3('ta')),
+        'guard-hits': (f'    mov r14d, {k}\n    xor r8d, r8d\n.gl:\n' + c3('h0', d + GS) + '    add r8, rax\n    dec r14\n    jnz .gl\n'),
+        'guard-kill': (c3('k0', d + GS) + save('r8') + c3('k1', d + GS) + save('r9') + f'    mov byte [{d + F1 + PY + 1:#x}], 0x13\n'
+                       + c3('k2', d + GS) + save('r10') + flush_text(d) + c3('k3', d + GS) + save('r14')),
         # The fast miss path: K rounds of A, B, C (one L1 set of three RIPs: each call misses into a current block).
         'miss-counts': f'    mov ecx, {k}\n.r:\n' + add('a', A, 'r8') + add('b', B, 'r9') + add('c', C, 'r10') + '    dec ecx\n    jnz .r\n',
         # A CPUID decode (kept, never in L1) reached by a computed jump each round: always a miss, always declined (`system`).
@@ -1463,7 +1472,9 @@ CHUNK_VALUES = {
     'page-user-invlpg': {'r8': {1}, 'r9': {0x12}, 'r10': {0x21}, 'rdi': {1}},
     'guard-cr3': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}, 'rsi': {0x11}},
     'guard-invlpg': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x12}, 'r14': {0x12}, 'r15': {0x11}},
-    'guard-flags': {'r8': {0x81}, 'r9': {0x81}, 'r10': {0x81}, 'r14': {0x40}},
+    'guard-flags': {'r8': {0x81}, 'r9': {0x81}, 'r10': {0x81}, 'r14': {0x40}, 'r15': {0x800}},
+    'guard-hits': lambda i, k: {'r8': {0x11 * k}},
+    'guard-kill': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x13}, 'r14': {0x13}},
     'page-mark': {'r8': {1}, 'r9': {0x11}, 'r10': {0x41}},
     'page-size-check': {'r8': {1}, 'r9': {0x11}},
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
@@ -2131,6 +2142,9 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
     # test the plain form's suspension and relinking, behind the host's debug key `NATEMU_LINK_FORM=plain` (a program may name
     # its own form, `link_form`: the default's check of `relink-many`).
     env.pop('NATEMU_LINK_FORM', None)
+    env.pop('NATEMU_GUARDS', None)
+    if prog.get('guards'):   # (frame-keyed plan 8.2: `guard-hits`' baseline run with no guarded block)
+        env['NATEMU_GUARDS'] = prog['guards']
     form = prog.get('link_form', 'plain' if prog['name'][3:].split('@')[0] in RELINK_PROGRAMS else None)
     if form:
         env['NATEMU_LINK_FORM'] = form
@@ -2505,8 +2519,16 @@ def main():
                 # Frame-keyed plan 8.2: the guard programs made a guarded link and filled the code TLB (not vacuous).
                 for v, c in enumerate(out['cpus'] if out and name in GUARD and not check and not os.environ.get('NATEMU_PIC_TEST') else []):
                     f = c['stats']['k1'].get('fkeys', {})
-                    if f.get('links_guarded', 0) < 1 or f.get('ctlb_fills', 0) < 2:
-                        problems.append(f"cpu{v} guarded links {f.get('links_guarded', 0)}, code-TLB fills {f.get('ctlb_fills', 0)}: want at least 1 and 2")
+                    if f.get('links_guarded', 0) < 1 or f.get('ctlb_fills', 0) < 1:
+                        problems.append(f"cpu{v} guarded links {f.get('links_guarded', 0)}, code-TLB fills {f.get('ctlb_fills', 0)}: want at least 1 each")
+                # (`guard-hits`: the dispatcher misses against the same run with no guarded block, whose cross-page link is checked
+                # and hits L1: a guard that missed would add one a call.)
+                if out and name == 'guard-hits' and not check and not os.environ.get('NATEMU_PIC_TEST'):
+                    base, _ = run(a, dict(prog, guards='off'), extra, check=check, tag='-noguards')
+                    misses = lambda c: c['stats']['k1'].get('fast_miss', {}).get('taken', 0) + sum(c['stats']['k1'].get('fast_miss', {}).get('declined', {}).values())
+                    for v, (c, b) in enumerate(zip(out['cpus'], base['cpus'] if base else [])):
+                        if misses(c) > misses(b) + a.k // 4:
+                            problems.append(f'cpu{v} {misses(c)} dispatcher misses over {a.k} calls, {misses(b)} with no guards: the guard does not hit')
                 # A block's death undoes its links out by its outbound list: no pass over the records (the pass's records count as scanned).
                 for v, c in enumerate(out['cpus'] if out and name in NO_SWEEP else []):
                     if c['stats']['k1']['scanned']:

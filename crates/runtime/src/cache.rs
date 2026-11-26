@@ -884,7 +884,8 @@ pub fn fill_l1(rip: u64, block: &Block) {
     // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever. (Frame-keyed plan
     // step 1b: a shared translation is entered at several RIPs, which may share a set, as its instances did: its way is the one
     // whose tag is this RIP, so two of its RIPs hold both ways; `cut_one` empties every way it owns.)
-    let f = if block.flags & (TRANSLATION | GUARDED) != 0 {
+    // (Frame-keyed plan 8.2, review S7: for every block, so a stale guarded entry of the RIP never shadows its refill.)
+    let f = if true {
         let tags = unsafe { [dl1(t, w0).read()[0], dl1(t, w1).read()[0]] };
         match tags.iter().position(|&tag| tag == rip) {
             Some(way) if !(way == 1 && area::segment_slot(t, w1)) => area::L1Fill { way, there: true, victim: false },
@@ -1709,28 +1710,7 @@ fn write_guard(b: &Block) {
         return;
     }
     let at = u64::from(b.code) - u64::from(GUARD_LEAD);
-    let a = area::ctlb_delta(control().guest_state_va) + 8 * area::ctlb_slot(b.rip) as i64;
-    let off = a.rem_euclid(4096) as u32;
-    let pages = if a >= 0 { 0x9140_0000u32 | ((a >> 12) as u32) << 10 } else { 0xd140_0000 | (((i64::from(off) - a) >> 12) as u32) << 10 };
-    let base = pages | 28 << 5 | 1;
-    let e = area::ctlb_entry(b.rip, b.source_gpa[0]);
-    let mov = |keep: bool, hw: u32, v: u64, rd: u32| {
-        (if keep { 0xf280_0000u32 } else { 0xd280_0000 }) | hw << 21 | ((v >> (16 * hw)) as u32 & 0xffff) << 5 | rd
-    };
-    let words = [
-        base,
-        0xf940_0000 | (off >> 3) << 10 | 1 << 5 | 1,
-        mov(false, 0, e, 2),
-        mov(true, 1, e, 2),
-        mov(true, 2, e, 2),
-        0xca02_0021,
-        0xb500_0001 | 2 << 5,
-        branch(at + 28, b.entry() - area::CODE_VA),
-        mov(false, 0, b.rip, 0),
-        mov(true, 1, b.rip, 0),
-        mov(true, 2, b.rip, 0),
-        branch(at + 44, area::DISPATCH_MISS as u64),
-    ];
+    let words = area::guard_words(at, b.entry() - area::CODE_VA, b.rip, b.source_gpa[0], control().guest_state_va);
     for (k, w) in words.into_iter().enumerate() {
         unsafe { ((area::CODE_WRITE_VA + at + 4 * k as u64) as *mut u32).write(w) };
     }
@@ -3314,8 +3294,11 @@ fn unlink_word(r: LinkRecord) -> Option<u64> {
         let into = word(at) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(at));
         return (into && r.original == pic::SVC_LINK).then(|| restore(at));
     }
-    let entry = link_entry(source, block(r.target as usize));
-    links_to(at, entry).then(|| restore(at))
+    let target = block(r.target as usize);
+    let entry = link_entry(source, target);
+    // (Frame-keyed plan 8.2, review B1: a guarded block's link from another page enters its stub.)
+    let guard = (target.flags & GUARDED != 0).then(|| target.guard_entry() - area::CODE_VA);
+    (links_to(at, entry) || guard.is_some_and(|g| links_to(at, g))).then(|| restore(at))
 }
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
@@ -3965,9 +3948,12 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
         }
         lo.checked_sub(1)
     };
+    // (Frame-keyed plan 8.2, review B2: a guarded block's stub is the [`GUARD_LEAD`] bytes before its code: the last record at
+    // or below `offset` + the lead, or the one before it when a block with no code lies between.)
+    let ahead = last(offset + u64::from(GUARD_LEAD));
     let n = [last(offset), last(offset + 4)]
         .into_iter()
-        .chain([last_hot(offset.wrapping_sub(4))])
+        .chain([last_hot(offset.wrapping_sub(4)), ahead, ahead.and_then(|n| n.checked_sub(1))])
         .flatten()
         .find(|&n| holds(block(n)))?;
     let b = block(n);

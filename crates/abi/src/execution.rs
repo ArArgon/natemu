@@ -406,10 +406,47 @@ pub mod cache {
     pub const fn ctlb_entry(va: u64, gpa: u64) -> u64 {
         ((gpa >> 12) | (va >> 27) << 28) + 1
     }
+    /// Frame-keyed plan 8.2: the 12 words of the guard stub of a guarded block at `rip` (frame `gpa`), placed at code-area
+    /// offset `at` (its code at `at + GUARD_LEAD`), its entry at code-area offset `entry`, for the guest-state alias
+    /// `guest_state_va` (x28): load the code-TLB slot of `rip`'s page, compare it with the entry of its page and frame, and
+    /// enter, or exit to the dispatcher's miss with x0 = `rip`. No word writes NZCV; x1 and x2 are its only scratch.
+    ///
+    /// ```text
+    /// add/sub x1, x28, #pages, lsl #12;  ldr x1, [x1, #off]
+    /// movz x2, #e0;  movk x2, #e1, lsl #16;  movk x2, #e2, lsl #32;  eor x1, x1, x2;  cbnz x1, miss;  b entry
+    /// miss: movz x0, #r0;  movk x0, #r1, lsl #16;  movk x0, #r2, lsl #32;  b DISPATCH_MISS
+    /// ```
+    pub const fn guard_words(at: u64, entry: u64, rip: u64, gpa: u64, guest_state_va: u64) -> [u32; 12] {
+        let a = ctlb_delta(guest_state_va) + 8 * ctlb_slot(rip) as i64;
+        let off = a.rem_euclid(4096) as u32;
+        let pages = if a >= 0 { 0x9140_0000u32 | ((a >> 12) as u32) << 10 } else { 0xd140_0000 | (((off as i64 - a) >> 12) as u32) << 10 };
+        let e = ctlb_entry(rip, gpa);
+        const fn mov(keep: bool, hw: u32, v: u64, rd: u32) -> u32 {
+            (if keep { 0xf280_0000u32 } else { 0xd280_0000 }) | hw << 21 | ((v >> (16 * hw)) as u32 & 0xffff) << 5 | rd
+        }
+        const fn b(from: u64, to: u64) -> u32 {
+            0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
+        }
+        [
+            pages | 28 << 5 | 1,
+            0xf940_0000 | (off >> 3) << 10 | 1 << 5 | 1,
+            mov(false, 0, e, 2),
+            mov(true, 1, e, 2),
+            mov(true, 2, e, 2),
+            0xca02_0021,
+            0xb500_0001 | 2 << 5,
+            b(at + 28, entry),
+            mov(false, 0, rip, 0),
+            mov(true, 1, rip, 0),
+            mov(true, 2, rip, 0),
+            b(at + 44, DISPATCH_MISS as u64),
+        ]
+    }
     /// A block of a user page at `va` from the frame at `gpa` can have a code-TLB entry: the frame's page number fits 28
     /// bits and the address is a user one below 2^47.
     pub const fn ctlb_frame_ok(va: u64, gpa: u64) -> bool {
-        gpa >> 12 < 1 << 28 && va >> 47 == 0
+        // (Review S3: below 2^28 - 1, so the entry plus one stays below 2^48: three move words never build an empty 0.)
+        gpa >> 12 < (1 << 28) - 1 && va >> 47 == 0
     }
     /// The dispatcher's data tables: table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves
     /// ([`DL1_EMPTY`]: none) and the address to branch to. Filling or emptying one is two stores: no code is written,
@@ -5110,7 +5147,9 @@ mod tests {
     fn ctlb_entry_packs_frame_and_page_and_is_never_empty() {
         use super::cache::{CTLB_ENTRIES, ctlb_entry, ctlb_frame_ok, ctlb_slot};
         let (va, gpa) = (0x7fff_1234_5000u64, 0xff_ffff_f000u64);
-        assert!(ctlb_frame_ok(va, gpa) && !ctlb_frame_ok(1 << 47, gpa) && !ctlb_frame_ok(va, 1 << 40));
+        assert!(ctlb_frame_ok(va, gpa - 4096) && !ctlb_frame_ok(1 << 47, gpa) && !ctlb_frame_ok(va, 1 << 40) && !ctlb_frame_ok(va, gpa));
+        // The largest entry a placement can make still fits 48 bits and is not empty.
+        assert!(ctlb_entry((1 << 47) - 4096, gpa - 4096) < 1 << 48);
         assert_eq!(ctlb_entry(0, 0), 1, "0 is empty");
         assert!(ctlb_entry(va, gpa) < 1 << 48, "three move words");
         // Two pages of one slot, or two frames, give two entries.
@@ -5118,6 +5157,36 @@ mod tests {
         assert_eq!(ctlb_slot(va), ctlb_slot(other));
         assert_ne!(ctlb_entry(va, gpa), ctlb_entry(other, gpa));
         assert_ne!(ctlb_entry(va, gpa), ctlb_entry(va, gpa - 4096));
+    }
+    #[test]
+    fn guard_words_reach_the_slot_and_compare_the_entry() {
+        // Decoded as the CPU runs them: x1 = x28 +/- pages * 4096, then [x1 + off] must be the slot's address; x2 = the entry;
+        // the branches go to the miss word, the entry and the dispatcher's miss; nothing writes NZCV (no `subs`/`cmp`).
+        use super::cache::{BLOCK, CTLB_ENTRIES, DISPATCH_MISS, ctlb_delta, ctlb_entry, ctlb_slot, guard_words};
+        let branch = |w: u32, from: u64| from.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+        for block in [0u64, 1, 300, 509, 510, 511] {
+            let gsv = 0xffff_8f00_0000_0000u64 | block << 21 | 0x7000;
+            for rip in [0x4000u64, 0x7fff_ffff_f000, 0x55_5555_5123, (CTLB_ENTRIES as u64 - 1) << 12] {
+                let (at, entry, gpa) = (0x2_0000u64, 0x2_0400u64, 0x1234_5000u64);
+                let w = guard_words(at, entry, rip, gpa, gsv);
+                let pages = u64::from(w[0] >> 10 & 0xfff) << 12;
+                let x1 = if w[0] & 0xff00_0000 == 0x9100_0000 { gsv.wrapping_add(pages) } else { gsv.wrapping_sub(pages) };
+                assert!(w[0] & 0x3f80_001f == 0x1100_0001 && w[0] >> 22 & 1 == 1 && w[0] >> 5 & 31 == 28, "add/sub x1, x28, #pages, lsl #12");
+                assert_eq!(w[1] & 0xffc0_03ff, 0xf940_0021, "ldr x1, [x1, #off]");
+                let slot = x1 + u64::from(w[1] >> 10 & 0xfff) * 8;
+                assert_eq!(slot as i64 - gsv as i64, ctlb_delta(gsv) + 8 * ctlb_slot(rip) as i64, "{block} {rip:#x}");
+                let e = (2..5).fold(0u64, |v, k| v | u64::from(w[k] >> 5 & 0xffff) << (16 * (k - 2)));
+                assert_eq!(e, ctlb_entry(rip, gpa));
+                assert_eq!(w[5], 0xca02_0021);
+                assert_eq!(w[6] & 0xff00_001f, 0xb500_0001);
+                assert_eq!(at + 24 + u64::from(w[6] >> 5 & 0x7_ffff) * 4, at + 32, "cbnz to the miss words");
+                assert_eq!(branch(w[7], at + 28), entry);
+                let r = (8..11).fold(0u64, |v, k| v | u64::from(w[k] >> 5 & 0xffff) << (16 * (k - 8)));
+                assert_eq!(r, rip);
+                assert_eq!(branch(w[11], at + 44), DISPATCH_MISS as u64);
+                assert!(ctlb_delta(gsv).unsigned_abs() < 4 * BLOCK as u64);
+            }
+        }
     }
     #[test]
     fn ctlb_block_sits_beside_the_data_tables() {

@@ -1664,10 +1664,18 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let mut entries = HashMap::new();
     for (i, t) in blocks.iter().enumerate().filter(|(_, t)| t.flags & (cache::SYSTEM | cache::INSTANCE) == 0) {
         entries.entry(t.entry() - cache::CODE_VA).or_insert(i);
-        // (Frame-keyed plan 8.2: a link from another page into a guarded block enters its guard stub.)
-        if t.flags & cache::GUARDED != 0 {
-            entries.entry(t.guard_entry() - cache::CODE_VA).or_insert(i);
+    }
+    // Frame-keyed plan 8.2: a link from another page into a guarded block enters its guard stub (no x87 run-test skip: review
+    // S1), and each guarded block's stub is the one its record makes (review S4: the host recomputes it).
+    let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    let mut stubs = HashMap::new();
+    for (i, t) in blocks.iter().enumerate().filter(|(_, t)| t.flags & cache::GUARDED != 0 && t.flags & cache::DEAD == 0) {
+        let at = u64::from(t.code) - u64::from(cache::GUARD_LEAD);
+        let want = cache::guard_words(at, t.entry() - cache::CODE_VA, t.rip, t.source_gpa[0], control.guest_state_va);
+        if (0..12).any(|k| word(at + 4 * k as u64) != want[k]) {
+            return Err(format!("the guard stub of the block at {:#x} is not its record's", t.rip));
         }
+        stubs.insert(at, i);
     }
     let mut linked = HashMap::new();
     let mut points = 0;
@@ -1746,6 +1754,8 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 entries.get(&to).copied().filter(|&t| !(run_tested(b) && run_tested(&blocks[t]))).or_else(|| {
                     entries.get(&to.wrapping_sub(8)).copied().filter(|&t| run_tested(b) && run_tested(&blocks[t]))
                 })
+                // (A guarded target's stub: only from absolute code on another page, as the resident's `link` makes it.)
+                .or_else(|| stubs.get(&to).copied().filter(|&t| !pic(b) && blocks[t].rip >> 12 != b.rip >> 12))
             });
             match target {
                 Some(t) if fits(&blocks[t]) => linked.insert((b.number, p.offset), t as u32),

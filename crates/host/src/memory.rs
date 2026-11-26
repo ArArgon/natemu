@@ -670,7 +670,13 @@ pub(crate) mod tests {
                 let l1 = next(word(root + slot * 8));
                 assert_eq!(valid(l1), [(va >> 30 & 511) as usize]);
                 let l2 = next(word(l1 + (va >> 30 & 511) as usize * 8));
-                assert_eq!(valid(l2), { let mut v = vec![i, at]; v.sort(); v });
+                // (Frame-keyed plan 8.2: the user space also maps the code TLB's block, EL0 read-only, after the data tables.)
+                let ctlb = natemu_abi::execution::cache::ctlb_block(va);
+                assert_eq!(valid(l2), { let mut v = if k == 1 { vec![i, at, ctlb] } else { vec![i, at] }; v.sort(); v });
+                if k == 1 {
+                    let c = natemu_abi::execution::cache::CTLB - natemu_abi::execution::cache::DL1;
+                    assert_eq!(word(l2 + ctlb * 8), (IPA + (dl1 + c) as u64) | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
+                }
                 assert_eq!(
                     word(l2 + at * 8),
                     (IPA + (dl1 + k * MIB2) as u64) | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN
