@@ -10,7 +10,7 @@ natemu compared with QEMU TCG, both running the same x86 Linux guest on the same
 | 32-bit programs, 8 items, 1 vCPU (the CPython build at 4) | **5.1×** (geometric mean; 0.97× to 83×; **4.1×** without the x87 builds) |
 | Context-switch-heavy Debian workload (cloud image), 4 vCPUs, November 14 | **1.7×** |
 | OpenGL on the CPU (glmark2 on llvmpipe), 4 vCPUs, the glmark2 score | **15×** (AVX2); **23×** (SSE4.1) |
-| Web browsing (Speedometer 3.1 in Firefox), 4 vCPUs, the Speedometer score | **1.6×** |
+| Web browsing (Speedometer 3.1 in Firefox), 4 vCPUs, the Speedometer score | **2.2×** |
 
 32-bit and 64-bit code are summarised separately. A program measured in several builds or kernels (c-ray's builds,
 SciMark's five kernels) counts as one item, the geometric mean of its ratios. At 4 vCPUs the c-ray item is `cray`
@@ -253,12 +253,15 @@ the same files. A start is timed from `java -jar` to Paper's "Done" line, after 
 has no internet at any point it is measured, and Paper needs none: its launcher finds Mojang's server jar already in
 place. `tests/bench/run_paper.py` describes the case in full.
 
-Bench case `guest-paper`; Apple M4; natemu 9f35eb96; November 22, 2026; seconds, the median of 3 boots:
+Bench case `guest-paper`; Apple M4; natemu c3f074b7 (the shadow-pool work before its rebase onto the gather work made
+535ca1e9; no gather runs in this workload); November 25, 2026; seconds, the median of 3 boots:
 
 | Start in the boot | Time | The 3 boots | Paper's own "Done" | The 3 boots |
 | --- | ---: | ---: | ---: | ---: |
-| first | 23.86 | 24.20, 23.86, 23.82 | 21.37 | 21.62, 21.37, 21.34 |
-| second | 23.77 | 23.77, 23.67, 24.22 | 21.76 | 21.76, 21.60, 22.12 |
+| first | 20.88 | 21.20, 20.77, 20.88 | 18.65 | 18.83, 18.47, 18.65 |
+| second | 20.14 | 19.82, 20.14, 20.36 | 18.27 | 17.87, 18.27, 18.48 |
+
+The shadow-pool work (the shadow pool, cheaper compiles and admission) moved these times.
 
 ## Display
 
@@ -333,51 +336,54 @@ that server, which prints them on the console. Firefox starts with a fresh profi
 translates the browser from nothing. Each boot runs Speedometer's 20 suites 5 times (`iterationCount=5`); its score is
 the mean of the 5 iterations' scores.
 
-Bench case `speedometer-natemu` (4 vCPUs, 4 GiB, translation cache off); Apple M4; natemu 9db554b9; November 25, 2026.
+Bench case `speedometer-natemu` (4 vCPUs, 4 GiB, translation cache off); Apple M4; natemu 535ca1e9; November 25, 2026.
 QEMU 11.1.2 on the same M4 (TCG, the CPU model of the other guest benchmarks): case `speedometer-qemu`, the same day.
 Real x86: case `speedometer-kvm`, the same kernel and guest under KVM on the Ryzen with the same CPU model, the same
 day. The median of 3 boots:
 
 | | Speedometer score | the 3 boots |
 | --- | ---: | ---: |
-| natemu | **2.33** | 2.27 to 2.36 |
+| natemu | **3.10** | 3.04 to 3.13 |
 | QEMU | **1.43** | 1.39 to 1.45 |
 | real x86 | **16.1** | 16.1 to 16.2 |
 
-natemu is 1.6 times as fast as QEMU here and reaches 14% of the real x86 machine's score. Within a boot the 5
-iterations differ more than the boots do (Speedometer's own spread is 13 to 17% on natemu, 6 to 8% on QEMU, 5 to 7% on
+natemu is 2.2 times as fast as QEMU here and reaches 19% of the real x86 machine's score. The shadow pool (a vCPU's
+shadow page tables are no longer all reset when a small fixed pool fills, which the browser's scattered heap pages did
+constantly) and the faster translation path (cheaper compiles and admission) moved natemu's numbers. Within a boot the 5
+iterations differ more than the boots do (Speedometer's own spread is 18 to 20% on natemu, 6 to 8% on QEMU, 5 to 7% on
 real x86). Each suite's time per iteration, in ms (lower is better; the median of the 3 boots' means):
 
 | Suite | natemu | QEMU | speed-up | real x86 |
 | --- | ---: | ---: | ---: | ---: |
-| `TodoMVC-JavaScript-ES5` | 423 | 832 | 2.0× | 73 |
-| `TodoMVC-JavaScript-ES6-Webpack-Complex-DOM` | 352 | 770 | 2.2× | 73 |
-| `TodoMVC-WebComponents` | 187 | 348 | 1.9× | 30 |
-| `TodoMVC-React-Complex-DOM` | 493 | 609 | 1.2× | 62 |
-| `TodoMVC-React-Redux` | 479 | 675 | 1.4× | 68 |
-| `TodoMVC-Backbone` | 456 | 538 | 1.2× | 49 |
-| `TodoMVC-Angular-Complex-DOM` | 489 | 682 | 1.4× | 62 |
-| `TodoMVC-Vue` | 326 | 399 | 1.2× | 35 |
-| `TodoMVC-jQuery` | 995 | 2564 | 2.6× | 215 |
-| `TodoMVC-Preact-Complex-DOM` | 172 | 209 | 1.2× | 19 |
-| `TodoMVC-Svelte-Complex-DOM` | 139 | 189 | 1.4× | 18 |
-| `TodoMVC-Lit-Complex-DOM` | 206 | 296 | 1.4× | 26 |
-| `NewsSite-Next` | 859 | 1815 | 2.1× | 154 |
-| `NewsSite-Nuxt` | 643 | 1410 | 2.2× | 124 |
-| `Editor-CodeMirror` | 356 | 349 | 0.98× | 30 |
-| `Editor-TipTap` | 617 | 1143 | 1.9× | 103 |
-| `Charts-observable-plot` | 602 | 711 | 1.2× | 65 |
-| `Charts-chartjs` | 600 | 1306 | 2.2× | 95 |
-| `React-Stockcharts-SVG` | 956 | 1275 | 1.3× | 103 |
-| `Perf-Dashboard` | 687 | 1635 | 2.4× | 132 |
+| `TodoMVC-JavaScript-ES5` | 313 | 832 | 2.7× | 73 |
+| `TodoMVC-JavaScript-ES6-Webpack-Complex-DOM` | 232 | 770 | 3.3× | 73 |
+| `TodoMVC-WebComponents` | 160 | 348 | 2.2× | 30 |
+| `TodoMVC-React-Complex-DOM` | 367 | 609 | 1.7× | 62 |
+| `TodoMVC-React-Redux` | 421 | 675 | 1.6× | 68 |
+| `TodoMVC-Backbone` | 357 | 538 | 1.5× | 49 |
+| `TodoMVC-Angular-Complex-DOM` | 344 | 682 | 2.0× | 62 |
+| `TodoMVC-Vue` | 259 | 399 | 1.5× | 35 |
+| `TodoMVC-jQuery` | 649 | 2564 | 4.0× | 215 |
+| `TodoMVC-Preact-Complex-DOM` | 127 | 209 | 1.6× | 19 |
+| `TodoMVC-Svelte-Complex-DOM` | 128 | 189 | 1.5× | 18 |
+| `TodoMVC-Lit-Complex-DOM` | 179 | 296 | 1.7× | 26 |
+| `NewsSite-Next` | 594 | 1815 | 3.1× | 154 |
+| `NewsSite-Nuxt` | 508 | 1410 | 2.8× | 124 |
+| `Editor-CodeMirror` | 259 | 349 | 1.3× | 30 |
+| `Editor-TipTap` | 476 | 1143 | 2.4× | 103 |
+| `Charts-observable-plot` | 448 | 711 | 1.6× | 65 |
+| `Charts-chartjs` | 507 | 1306 | 2.6× | 95 |
+| `React-Stockcharts-SVG` | 683 | 1275 | 1.9× | 103 |
+| `Perf-Dashboard` | 451 | 1635 | 3.6× | 132 |
 
-**With the translation cache warm** (bench case `speedometer-natemu-warm`, the same M4, commit cc1d42b7 with the same
-natemu, the same day): natemu keeps its translated code on disk across boots, as a desktop keeps it across sessions.
-One untimed boot fills the cache, then 3 timed boots reuse it. The score is **2.13** (2.04 to 2.15), below the cold
-2.33. The debug tier's `speedometer-profile-warm` shows why: about half of the blocks natemu would compile are found
-in the cache, but reading and checking a cached block costs nearly as much as compiling it, and each boot still writes
-about 800 MiB of code it has not seen before to the cache (most likely what Firefox's JavaScript compiler wrote that
-run).
+**With the translation cache warm** (bench case `speedometer-natemu-warm`, the same M4, natemu c3f074b7, the same
+day): natemu keeps its translated code on disk across boots, as a desktop keeps it across sessions. One untimed boot
+fills the cache, then 3 timed boots reuse it. The score is **3.12** (3.11 to 3.13), the same as cold. (c3f074b7 is
+the shadow-pool work alone, before its rebase onto the gather work made 535ca1e9; the gathers do not move
+Speedometer: c3f074b7's cold score, 3.13, is 535ca1e9's within the boots' spread.) The disk cache no longer looks up
+or stores code on pages the guest writes at run time (such as what Firefox's JavaScript compiler writes), and an answer
+cached for one address is moved to the address that asks for it; the debug tier's `speedometer-profile-warm` shows
+where the warm boots' time goes.
 
 A browser runs JavaScript compiled by its own JIT, in several processes per vCPU, so natemu translates a stream of
 freshly written code and switches address spaces often; its lead over QEMU is far smaller here than on the compiled
