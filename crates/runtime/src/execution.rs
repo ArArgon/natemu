@@ -352,7 +352,14 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             None => match (s.generation, unsafe { reused(s, context) }) {
                 // Perf chunk 10: a copy of a template on the same frame, placed in the resident.
                 (missed, Err(Some(copy))) => {
-                    if !kept(s, copy, missed) {
+                    // (Frame-keyed plan step 1b: a shared translation entered by frame was placed earlier and serves every address
+                    // of its frame: a race this entry lost (a write or flush meanwhile) is not entered, as a discarded instance was
+                    // not, but the translation is not discarded for it; a write to its frames kills it by its own invalidation.)
+                    if copy.flags & cache::TRANSLATION != 0 {
+                        if !entered_shared(s, copy, missed) {
+                            return None;
+                        }
+                    } else if !kept(s, copy, missed) {
                         return None;
                     }
                     // (Frame-keyed plan step 1b: a shared translation entered with no record is checked as the instance stage 3
@@ -649,6 +656,15 @@ fn kept(s: &mut State, b: &Block, missed: u64) -> bool {
         return false;
     }
     true
+}
+/// Frame-keyed plan step 1b, [`kept`] for a shared translation `t` entered at `s.cpu.rip` with no record (`missed` the cache
+/// generation of the request): invalidations taken; entered only if no flush came, `t` is live and its source pages are still
+/// marked. Nothing is discarded: `t` serves its frames at every address, and a write that raced this entry killed it, or is
+/// posted to this vCPU and kills it at the next drain.
+fn entered_shared(s: &mut State, t: &Block, missed: u64) -> bool {
+    take_invalidations(s);
+    let unmarked = |g: u64| g != u64::MAX && !cache::marked(g);
+    s.generation == missed && t.flags & cache::DEAD == 0 && !t.source_gpa.iter().any(|&g| unmarked(g))
 }
 /// Executes the decoded system instruction `i` at `s.cpu.rip` ([`system`]); a BT* form found aligned under alignment
 /// checking (X2) then runs alone, compiled without the cut: its step block.
