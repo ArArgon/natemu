@@ -134,8 +134,10 @@ def transition_judge(got, n, alias=None):
 # tables at CPL 0, user tables at CPL 3) in the 2 MiB after the alias's, or before it when the alias is in its GiB's
 # last 2 MiB. Aliases: (selected, the tables' block, addresses that must #GP at both CPLs: the rest of that GiB's blocks
 # where the tables and a removed study's block used to be, and the neighbouring GiB).
-TABLE_ALIASES = [('after', strict.FRAME, 0xffff400000200000, [0xffff400000400000, 0xffff400000600000, 0xffff400000a00000]),
-                 ('before', 0xffff40003fe01000, 0xffff40003fc00000, [0xffff40003fa00000, 0xffff400040000000])]
+# (tag, alias, the data tables' block, the code TLB's block, holes). The code TLB (frame-keyed plan 8.2, `cache::ctlb_block`:
+# two blocks after the alias's, or two before when the tables are before it) is mapped EL0 read-only in the user space only.
+TABLE_ALIASES = [('after', strict.FRAME, 0xffff400000200000, 0xffff400000400000, [0xffff400000600000, 0xffff400000a00000]),
+                 ('before', 0xffff40003fe01000, 0xffff40003fc00000, 0xffff40003fa00000, [0xffff400040000000])]
 
 
 def table_program(block):
@@ -226,7 +228,7 @@ def main():
                 got, rc = execute(a, transition_program(n, cpl, alias), a.out / name, alias)
                 record(name, transition_judge(got, n, alias) if got else [f'driver failed: {rc}'],
                        classification='known selected-page deviation plus private-frame and transition checks')
-    for tag, alias, block, holes in TABLE_ALIASES:
+    for tag, alias, block, ctlb, holes in TABLE_ALIASES:
         name = f'tables-{tag}-own-class-only'
         if a.only in name:
             got, rc = execute(a, table_program(block), a.out / name, alias)
@@ -244,6 +246,28 @@ def main():
                 errors = ([f'prefix/probe failed: {rc0}/{rc}'] if not before or before['stop'] != 'reached' or not got
                           else alias_errors(got, alias) + strict.judge(c, before, got, at, end))
                 record(name, errors, classification='architectural GP')
+        # The code TLB's block: a known deviation for CPL 3 loads only (frame-keyed plan 2.3: the frames of the space's own
+        # user code pages, the same class as the readable tables). A CPL 0 load and a CPL 3 store still #GP without effects.
+        for kind, cpl, store in [('load', 0, False), ('load', 3, False), ('store', 3, True)]:
+            name = f'tables-{tag}-ctlb-{kind}-cpl{cpl}'
+            if a.only not in name:
+                continue
+            c = dict(name=name, regs={7: ctlb + 0x800, 3: MARKER}, fault=13,
+                     insn='mov [rdi], rbx' if store else 'mov rax, [rdi]')
+            text, at, end = strict.description(c, cpl)
+            before, rc0 = execute(a, strict.description(c, cpl, True)[0], a.out / name / 'prefix', alias)
+            got, rc = execute(a, text, a.out / name / 'probe', alias)
+            if not before or before['stop'] != 'reached' or not got:
+                record(name, [f'prefix/probe failed: {rc0}/{rc}'])
+            elif cpl == 3 and not store:
+                cpu = got.get('cpus', [got])[0]
+                errors = alias_errors(got, alias)
+                if cpu['stop'] != 'reached' or strict.ref.num(cpu['rip']) != end:
+                    errors.append(f'CPL 3 load of the code TLB did not complete: {cpu["stop"]} {cpu.get("fault")} '
+                                  '(known deviation changed)')
+                record(name, errors, classification="known deviation: user code reads its space's code TLB")
+            else:
+                record(name, alias_errors(got, alias) + strict.judge(c, before, got, at, end), classification='architectural GP')
     for i in range(a.samples):
         n = 1 if i % 2 == 0 else 4
         name = f'random-transitions-{i}-n{n}'
