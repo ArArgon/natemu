@@ -116,6 +116,17 @@ fn checked(s: &mut State, va: u64, (page, flags): (u64, u32)) {
     }
 }
 
+/// Frame-keyed plan step 1b: the record's answer for `va` (its page, the leaf's flags) on the fast miss path, as
+/// [`revalidated_from_record`] reads it: `None` where it holds none, or is off, checking, or a `page-study` build's shadow.
+pub(super) fn answer(s: &State, va: u64) -> Option<(u64, u32)> {
+    if cfg!(feature = "page-study") || cache::control().pages != PAGES_ON {
+        return None;
+    }
+    let hit = probe(s, va)?;
+    cache::control().page_hits += 1;
+    Some(hit)
+}
+
 /// A block's revalidation from the record alone ([`cache::lookup`] on the fast miss path): the answer a walk of each source
 /// page would give where every page is recorded ([`Mapped::Yes`] when each page is the block's own, [`Mapped::No`] when a
 /// recorded frame differs), else [`Mapped::Unknown`]: some page has no record, so a walk is owed, which may fault or write an A

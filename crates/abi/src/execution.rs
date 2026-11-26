@@ -388,7 +388,7 @@ pub mod cache {
     const _: () = assert!(DL1_BYTES == 2 * BLOCK && L1_SPACE_TABLES * L1_ENTRIES * 16 == BLOCK && DL1 % BLOCK == 0);
     /// PCID gain study (`pcid-study` resident builds; the EL0 sampler's ring in `profile` builds; untouched, so unbacked,
     /// otherwise): the modelled sets, after the page record.
-    pub const PCID_STUDY: usize = (FKEYS + 8 * FKEY_ENTRIES).next_multiple_of(4096);
+    pub const PCID_STUDY: usize = (TL1_PAGES + TL1_BITS / 8).next_multiple_of(4096);
     /// Frame-keyed plan step 1a (docs/restructure/frame-keyed-plan.md): the exact table of templates and shared translations by
     /// (frame, page offset, half, context), open-addressed, [`FKEY_ENTRIES`] of {32-bit tag, block number + 1} (0: empty). A
     /// key names at most one block and a block has at most one entry; at most [`FKEY_MAX`] are live (the lookup area's room
@@ -396,6 +396,11 @@ pub mod cache {
     /// touched; emptied by a reset.
     pub const FKEYS: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
     pub const FKEY_ENTRIES: usize = 1 << 20;
+    /// Frame-keyed plan step 1b: a filter of linear pages (bit `page % TL1_BITS`) holding a byte of a shared translation that
+    /// an L1 entry enters at that address since the filter was last cleared ([`Control::tl1_any`]): an INVLPG or #PF of a
+    /// page whose bit is clear has no such entry to empty.
+    pub const TL1_PAGES: usize = FKEYS + 8 * FKEY_ENTRIES;
+    pub const TL1_BITS: usize = 1 << 15;
     /// At most this many live entries (half the table): a template placed beyond it is not entered (counted, `Control::fkey_full`),
     /// so probes stay short and always end at an empty slot.
     pub const FKEY_MAX: usize = FKEY_ENTRIES / 2;
@@ -1098,6 +1103,17 @@ pub mod cache {
         pub suspended_guardable: u64,
         /// Templates not entered in [`FKEYS`] because it held [`FKEY_MAX`] entries. Appended.
         pub fkey_full: u64,
+        /// Frame-keyed plan step 1b (no instance records): the 2 MiB regions (bit `r % 1024`, as [`Control::regions`]) holding
+        /// an L1 entry of a shared translation filled after a walk that found a large leaf; whether any such entry was filled
+        /// since the filter was last cleared (a CR3 load, a global flush, a reset); the walk flags of the translation the
+        /// resident is about to enter (its fill's [`LARGE`]); INVLPG and #PF scans of the L1 lists the filters asked for, the
+        /// list slots they looked at and the entries they emptied. Appended.
+        pub tl1_regions: [u64; 16],
+        pub tl1_any: u64,
+        pub tl1_walked: u64,
+        pub tl1_scans: u64,
+        pub tl1_scanned: u64,
+        pub tl1_emptied: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -1768,7 +1784,8 @@ pub mod cache {
             && PAGE_STAMPS % 64 == 0
             && PAGE_STAMPS + crate::page_study::BYTES <= FKEYS
             && FKEYS % 4096 == 0
-            && FKEYS + 8 * FKEY_ENTRIES <= PCID_STUDY
+            && FKEYS + 8 * FKEY_ENTRIES <= TL1_PAGES
+            && TL1_PAGES + TL1_BITS / 8 <= PCID_STUDY
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate.
     const _: () = assert!(

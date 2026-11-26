@@ -443,6 +443,7 @@ pub fn reset() {
         bind_slot(now, c.l1_contexts[now]);
     }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
+    tl1_clear();
     // (Frame-keyed plan step 1a: only when it holds entries, so a vCPU that never placed a template backs none of it.)
     if c.fkey_entries != 0 {
         unsafe { ptr::write_bytes(lookup_area::<u8>(area::FKEYS), 0, area::FKEY_ENTRIES * 8) };
@@ -893,6 +894,22 @@ pub fn fill_l1(rip: u64, block: &Block) {
             unsafe { l1_owner(t, w0).write(o0 ^ area::L1_NEXT) };
         }
     }
+    // Frame-keyed plan step 1b: a shared translation entered with no record: its pages (and its large leaf's region) in the
+    // filters INVLPG and #PF look at ([`tl1_invalidate`]).
+    if block.flags & TRANSLATION != 0 {
+        let c = control();
+        let last = rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1);
+        for page in [rip >> 12, last >> 12] {
+            unsafe { *tl1_word(page) |= tl1_bit(page) };
+        }
+        if c.tl1_walked & u64::from(LARGE) != 0 {
+            for r in [rip >> 21, last >> 21] {
+                let (w, bit) = region(r);
+                c.tl1_regions[w] |= bit;
+            }
+        }
+        c.tl1_any = 1;
+    }
     unsafe { dl1(t, i).write([rip, code_of(block).full_entry()]) };
 }
 
@@ -1087,6 +1104,8 @@ pub fn tlb(global: bool) -> Option<u64> {
             c.l1_listed[t] = kept as u64;
         }
     }
+    // Frame-keyed plan step 1b: every L1 entry of a shared translation (never current) is gone.
+    tl1_clear();
     #[cfg(feature = "link-check")]
     check_l1_lists();
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
@@ -1470,22 +1489,14 @@ pub fn share(t: &Block) -> Option<&'static Block> {
     counted(count::SHARES);
     Some(placed)
 }
-/// PIC study stage 3: an [`INSTANCE`] of translation `t` at `rip` (same half and page offset; `source_gpa` its frames now,
-/// `t`'s, checked by the caller; `walked` as for [`place`]): `t`'s link-point targets moved to `rip`, no code. `Ok(None)`
-/// when full (as [`place`]); `Err`: perf chunk 10's `PLACE` refusal (counted [`count::INSTANCE_REFUSED`]): another half or
-/// page offset, a page within the rewrite's reach of a canonical edge ([`pic::reaches`]), a block end not canonical, a
-/// global mapping (shared code is for non-global mappings only: a CR3 load ends every instance's currency). 32-bit code:
-/// the block below 4 GiB, as a copy's ([`natemu_abi::execution::in_32_bits`]: its 32-bit form wraps there exactly), its
-/// targets moved modulo 2^32 ([`pic::moved`]).
-pub fn instance(
-    t: &Block,
-    rip: u64,
-    source_gpa: [u64; 2],
-    walked: u32,
-) -> Result<Option<&'static Block>, usize> {
-    let c = control();
-    let bits32 = bits32(t.context);
-    let place = if bits32 {
+/// Frame-keyed plan step 1b: translation `t` entered at `rip` with no record (same half and page offset; `t`'s frames are
+/// where `rip`'s pages are fetched from now, checked by the caller; `walked` the fetch translation's flags): `t`, or perf chunk
+/// 10's `PLACE` refusal (counted [`count::INSTANCE_REFUSED`]) that stage 3's instances made: another half or page offset, a
+/// page within the rewrite's reach of a canonical edge ([`pic::reaches`]), a block end not canonical, a global mapping (shared
+/// code is for non-global mappings only: a CR3 load ends every entry's currency). 32-bit code: the block below 4 GiB, as a
+/// copy's ([`natemu_abi::execution::in_32_bits`]). Counted [`count::INSTANCES`] (the entries the k1 cases count).
+pub fn shared_at(t: &'static Block, rip: u64, walked: u32) -> Result<&'static Block, usize> {
+    let place = if bits32(t.context) {
         natemu_abi::execution::in_32_bits(rip, t.guest_bytes)
     } else {
         pic::reaches(rip & !0xfff)
@@ -1493,30 +1504,32 @@ pub fn instance(
                 .checked_add(t.guest_bytes.into())
                 .is_some_and(natemu_abi::execution::canonical)
     };
-    if (t.rip ^ rip) & (1 << 63 | 0xfff) != 0 || !place || walked & GLOBAL != 0 {
+    if t.flags & TRANSLATION == 0 || (t.rip ^ rip) & (1 << 63 | 0xfff) != 0 || !place || walked & GLOBAL != 0 {
         counted(count::INSTANCE_REFUSED);
         return Err(natemu_abi::execution::refusal::PLACE);
     }
+    counted(count::INSTANCES);
+    control().tl1_walked = u64::from(walked);
+    Ok(t)
+}
+/// Frame-keyed plan step 1b: the record stage 3 filed as `t`'s instance at `rip` (`source_gpa` its frames there, `walked` as
+/// for [`place`]), made only for the reuse check's comparison ([`REUSE_CHECK`]): `t`'s link-point targets moved to `rip`.
+/// Never filed: its `number` names `t`.
+pub fn virtual_instance(t: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) -> Block {
     let mut links = t.links;
     for p in links.iter_mut().filter(|p| p.offset != 0) {
-        p.target = pic::moved(p.target, t.rip, rip, bits32);
+        p.target = pic::moved(p.target, t.rip, rip, bits32(t.context));
     }
-    // `code` at the fill point keeps the records in address order ([`block_at`]); a size of 0 holds no PC.
-    let record = Block {
+    Block {
         rip,
-        context: t.context,
-        checked: c.epoch,
+        checked: control().epoch,
         source_gpa,
         next: [0; 2],
         lnext: [0; 2],
-        code: c.code_used as u32,
         code_size: 0,
         sites_count: 0,
-        guest_bytes: t.guest_bytes,
-        number: 0,
         flags: INSTANCE | walked & LARGE | t.flags & STI_FIRST,
         dispatch_exit: 0,
-        rep_exits: t.rep_exits,
         links,
         shared: t.number,
         inbound: 0,
@@ -1525,16 +1538,64 @@ pub fn instance(
         hot_size: 0,
         hot_body: 0,
         patch: [0; MAX_LINK_POINTS],
-    };
-    let placed = unsafe { file(record, core::ptr::null(), 0, 0) };
-    if placed.is_some() {
-        counted(count::INSTANCES);
+        ..*t
     }
-    #[cfg(feature = "pic-count")]
-    if let Some(p) = placed.filter(|p| user(p.context)) {
-        frame_met(p);
+}
+/// Frame-keyed plan step 1b: the L1 entries a shared translation was entered through (none has a record) whose bytes touch
+/// linear page `page`, or (`region`) the 2 MiB region of a large leaf, leave L1: INVLPG and #PF (SDM Vol.3 4.10.4.1). Only
+/// when the filters say one may ([`area::TL1_PAGES`], [`Control::tl1_regions`]); then every table's list of non-global
+/// fills is scanned (each such entry is listed: a translation is never [`GLOBAL`]). The filters only grow until a CR3 load,
+/// a global flush or a reset, which empties every such entry.
+fn tl1_invalidate(address: u64) {
+    let c = control();
+    if c.tl1_any == 0 {
+        return;
     }
-    Ok(placed)
+    let page = address >> 12;
+    let r = address >> 21;
+    let (w, bit) = region(r);
+    let on_page = unsafe { tl1_word(page).read() } & tl1_bit(page) != 0;
+    let in_region = c.tl1_regions[w] & bit != 0;
+    if !on_page && !in_region {
+        return;
+    }
+    c.tl1_scans += 1;
+    for t in 0..area::L1_TABLES {
+        if c.l1_contexts[t] == area::NO_CONTEXT {
+            continue;
+        }
+        for k in 0..c.l1_listed[t] as usize {
+            let i = unsafe { l1_list(t, k).read() } as usize;
+            c.tl1_scanned += 1;
+            let owner = l1_block(t, i);
+            if owner == 0 || block(owner as usize - 1).flags & TRANSLATION == 0 {
+                continue;
+            }
+            let tag = unsafe { dl1(t, i).read()[0] };
+            let last = tag.wrapping_add(u64::from(block(owner as usize - 1).guest_bytes).max(1) - 1);
+            let touches = on_page && (tag >> 12 == page || last >> 12 == page) || in_region && (tag >> 21 == r || last >> 21 == r);
+            if touches {
+                empty_l1(t, i);
+                c.tl1_emptied += 1;
+            }
+        }
+    }
+}
+/// The filter word and bit of linear page `page` ([`area::TL1_PAGES`]).
+fn tl1_word(page: u64) -> *mut u64 {
+    lookup_area::<u64>(area::TL1_PAGES).wrapping_add((page as usize % area::TL1_BITS) / 64)
+}
+fn tl1_bit(page: u64) -> u64 {
+    1 << (page % 64)
+}
+/// Frame-keyed plan step 1b: the filters cleared (every L1 entry of a shared translation is gone: a CR3 load, a global flush,
+/// a reset).
+fn tl1_clear() {
+    let c = control();
+    if c.tl1_any != 0 {
+        unsafe { ptr::write_bytes(lookup_area::<u8>(area::TL1_PAGES), 0, area::TL1_BITS / 8) };
+        (c.tl1_regions, c.tl1_any) = ([0; 16], 0);
+    }
 }
 /// PIC study stage 3: the word at offset `o` of `t`'s code with its link points' words as admitted (their first words and,
 /// for every link point, `svc #LINK` after the move): what its static proof reads ([`pic::proved`]) while links patch it.
@@ -2416,11 +2477,12 @@ fn link_entry(source: &Block, code: &Block) -> u64 {
 /// to the target's entry, recorded with the original word in the segment of its kind ([`Control::links_tlb`]: local,
 /// else by the target's [`GLOBAL`], which stays as it is while the target is current, that is while the link is there).
 /// Link points already branching there stay, unless the record area is full: then links are dropped first.
-pub fn link(source: &Block, target: &Block, at: u64) -> Link {
+pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     let c = control();
-    // (A shared source's link points name its translation's targets; `at` is the address it runs for.)
+    // (A shared source's link points name its translation's targets; `at` is the address it runs for. Frame-keyed plan step
+    // 1b: `to` is the address the target is entered at, a shared translation's at any address of its page offset.)
     let named = |p: &LinkPoint| {
-        p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == target.rip
+        p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == to
     };
     let points = || source.links.iter().filter(move |p| named(p));
     if source.context != target.context || points().next().is_none() {
@@ -2445,7 +2507,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     let local_ok = shared
         && (c.reuse != REUSE_CHECK || c.pic_check_local != 0)
         && c.pic_test != natemu_abi::execution::cache::PIC_TEST_NOLOCAL
-        && target.rip >> 12 == at >> 12;
+        && to >> 12 == at >> 12;
     // From shared code into an absolute template on its own page and frames (most links out of shared code: its
     // neighbours there have not needed a second address yet): the target is shared now (or its translation found) and
     // the link made local, so it never depends on an L1 entry. A template with no position-independent form stays
@@ -2462,9 +2524,10 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     })
     .flatten();
     let code = now.unwrap_or_else(|| code_of(target));
-    let local_shared =
-        local_ok && (target.flags & INSTANCE != 0 || now.is_some()) && same_frames(code, source);
-    let checked = !local_shared && (shared || target.flags & INSTANCE != 0);
+    let local_shared = local_ok
+        && (target.flags & (INSTANCE | TRANSLATION) != 0 || now.is_some())
+        && same_frames(code, source);
+    let checked = !local_shared && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
     if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {
@@ -2527,7 +2590,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     // PIC study (`pic-count` builds only): the link's class, and the link enters the target through a counting stub
     // ([`stub`]).
     #[cfg(feature = "pic-count")]
-    let class = pic::class(shared, at, code.flags & PIC != 0, target.rip);
+    let class = pic::class(shared, at, code.flags & PIC != 0, to);
     // an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
     #[cfg(feature = "pic-count")]
     let class = if class == pic::Class::Absolute && segment != LOCAL { pic::Class::CrossPage } else { class };
@@ -2582,7 +2645,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
         counted(count::LINKS + class as usize);
         if shared
             && code.flags & PIC == 0
-            && target.rip >> 12 == at >> 12
+            && to >> 12 == at >> 12
             && same_frames(code, source)
         {
             counted(count::SHAREABLE_TARGETS);
@@ -3145,6 +3208,8 @@ pub fn invlpg(address: u64) -> Option<u64> {
     if held(&c.regions) {
         on_linear_page(address >> 12, &mut cut);
     }
+    // Frame-keyed plan step 1b: the L1 entries of shared translations entered at the page or region.
+    tl1_invalidate(address);
     if large_held(c, r) {
         for page in r << 9..(r + 1) << 9 {
             on_linear_page(page, |n| {
@@ -3286,11 +3351,16 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
         c.unvalidated += 1;
     }
     // Both slots of the block's set, each keyed on its owner (a block is in at most one, but a duplicate would go too).
-    let (w0, w1) = area::l1_slots_of(b.rip);
-    for t in 0..area::L1_TABLES {
-        for i in [w0, w1] {
-            if l1_block(t, i) == b.number + 1 {
-                empty_l1(t, i);
+    // Frame-keyed plan step 1b: a shared translation, entered at any address of its page offset, in every such set (RIP bits
+    // 12 up to the set index's top vary).
+    let sets = if b.flags & TRANSLATION != 0 { 1 << (area::L1_SET_BITS - 12) } else { 1 };
+    for k in 0..sets {
+        let (w0, w1) = area::l1_slots_of(b.rip ^ (k << 12));
+        for t in 0..area::L1_TABLES {
+            for i in [w0, w1] {
+                if l1_block(t, i) == b.number + 1 {
+                    empty_l1(t, i);
+                }
             }
         }
     }

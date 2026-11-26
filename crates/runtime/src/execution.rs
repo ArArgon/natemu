@@ -355,7 +355,12 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                     if !kept(s, copy, missed) {
                         return None;
                     }
-                    if cache::control().reuse == cache::REUSE_CHECK && !unsafe { checked(s, copy) }
+                    // (Frame-keyed plan step 1b: a shared translation entered with no record is checked as the instance stage 3
+                    // filed at RIP, at every such entry.)
+                    let virtual_instance = (copy.flags & cache::TRANSLATION != 0)
+                        .then(|| cache::virtual_instance(copy, s.cpu.rip, s.source_gpa, walked(s)));
+                    if cache::control().reuse == cache::REUSE_CHECK
+                        && !unsafe { checked(s, virtual_instance.as_ref().unwrap_or(copy)) }
                     {
                         return None;
                     }
@@ -488,7 +493,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             }
         }
         // S4: a block at an armed instruction breakpoint is entered only from here, after the check above.
-        if !at_breakpoint(&s.cpu, block) {
+        if !at_breakpoint(&s.cpu, s.cpu.rip) {
             cache::fill_l1(s.cpu.rip, block);
         }
         return Some(block);
@@ -527,8 +532,8 @@ fn uncached_end(s: &mut State) {
 }
 /// S4: whether `b` starts at an armed instruction breakpoint: it is never linked to nor put in L1 (every entry passes
 /// [`find`]'s check).
-fn at_breakpoint(c: &Cpu, b: &Block) -> bool {
-    c.dr[5] & DR7_ENABLES != 0 && c.code_breakpoints().any(|a| a == b.rip)
+fn at_breakpoint(c: &Cpu, rip: u64) -> bool {
+    c.dr[5] & DR7_ENABLES != 0 && c.code_breakpoints().any(|a| a == rip)
 }
 /// S4: delivers the trap-class #DB pending at this boundary (`State::debug_trap`), unless a MOV SS shadow holds, which
 /// discards a single-step trap (delivery_model A9). True when delivered, or (M2 Part 2) when the interpreter ran.
@@ -786,19 +791,20 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             }
             // The exit's target was a system instruction: the block found follows it, nothing to link. (Against the exit's
             // own target, whatever moved the RIP before `find`.)
-            Some(_) if target.rip != exit => {}
+            // (Frame-keyed plan step 1b: the RIP the target is entered at, `find`'s, which a shared translation's own does not say.)
+            Some(_) if s.cpu.rip != exit => {}
             // An instruction run alone to end a shadow (X2): never linked to.
             Some(_) if target.flags & cache::STEP != 0 => {}
             // S4: nor a block at an armed instruction breakpoint.
-            Some(_) if at_breakpoint(&s.cpu, target) => {}
+            Some(_) if at_breakpoint(&s.cpu, s.cpu.rip) => {}
             // Perf chunk 25: nor, from a block that starts with a translated STI, a block that starts with one at the same
             // RIP (the STI's exit to its own start must reach `find`, which runs it when an event is held: linked, it would
             // re-enter the block in a loop; one live block per RIP and context makes this the block itself).
             Some(source)
-                if target.flags & source.flags & cache::STI_FIRST != 0 && target.rip == here => {}
+                if target.flags & source.flags & cache::STI_FIRST != 0 && s.cpu.rip == here => {}
             Some(source) => match {
                 let p = crate::perf::enter(crate::perf::PATCH);
-                let linked = cache::link(source, target, here);
+                let linked = cache::link(source, target, here, s.cpu.rip);
                 crate::perf::leave(p);
                 linked
             } {
@@ -1047,6 +1053,11 @@ unsafe fn miss_fast(frame: &NativeFrame) {
         }
         mapped => mapped,
     });
+    // Frame-keyed plan step 1b: no block at RIP: a shared translation of RIP's frame, entered there with no record.
+    let found = match found {
+        None if !unknown => shared_fast(s, rip, context, &mut unknown),
+        found => found,
+    };
     crate::perf::leave(p);
     let Some(target) = found else {
         // (A `No` the search passed over is counted again by the full path's walk.)
@@ -1084,6 +1095,38 @@ unsafe fn miss_fast(frame: &NativeFrame) {
             alignment_check(&s.cpu),
         )
     }
+}
+/// Frame-keyed plan step 1b, [`miss_fast`]: the shared translation of the frame RIP's page is fetched from (the page record's
+/// answer, as a revalidation there reads it), entered at RIP with no record ([`cache::shared_at`]'s refusals, the second page's
+/// frame the translation's), unless a fence or the stop RIP lies on RIP's page or the next (as [`reused`] refuses). `unknown`:
+/// the record lacks a page (the full path walks it). Not under the reuse check, which compares every such entry ([`find`]).
+fn shared_fast(s: &State, rip: u64, context: u64, unknown: &mut bool) -> Option<&'static Block> {
+    let c = cache::control();
+    if c.reuse != natemu_abi::execution::cache::REUSE_ON || !cache::shares(context) {
+        return None;
+    }
+    let Some((page, first)) = page_record::answer(s, rip) else {
+        *unknown = true;
+        return None;
+    };
+    let t = cache::template(rip, page, context).filter(|t| t.flags & cache::TRANSLATION != 0)?;
+    let second = if (rip & 4095) + u64::from(t.guest_bytes) > 4096 {
+        let Some((next, flags)) = page_record::answer(s, (rip & !4095).wrapping_add(4096)) else {
+            *unknown = true;
+            return None;
+        };
+        if next != t.source_gpa[1] {
+            return None;
+        }
+        flags
+    } else {
+        cache::GLOBAL
+    };
+    let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
+    if c.reuse_fences.iter().any(|&f| page_fenced(f)) || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)]) {
+        return None;
+    }
+    cache::shared_at(t, rip, leaves(s, [first, second])).ok()
 }
 /// One more decline of [`miss_fast`] for `reason` (`fast_decline`): a plain increment.
 #[inline(always)]
@@ -1320,8 +1363,9 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             } else {
                 None
             };
+            // (Frame-keyed plan step 1b: a shared translation is entered at RIP with no record.)
             let made = match shared {
-                Some(t) => cache::instance(t, rip, s.source_gpa, walk),
+                Some(t) => cache::shared_at(t, rip, walk).map(Some),
                 None => cache::copy(b, rip, s.source_gpa, walk),
             };
             match made {
@@ -1570,12 +1614,12 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
     let generation = s.generation;
     let reply = unsafe { ask(s, REQUEST_TRANSLATE) };
     take_invalidations(s);
-    if s.generation != generation || copy.flags & cache::DEAD != 0 {
+    // PIC study stage 3: an instance's code, sites, relocations and computed exit are its translation's.
+    let t = cache::code_of(copy);
+    if s.generation != generation || copy.flags & cache::DEAD != 0 || t.flags & cache::DEAD != 0 {
         crate::perf::leave(p);
         return false;
     }
-    // PIC study stage 3: an instance's code, sites, relocations and computed exit are its translation's.
-    let t = cache::code_of(copy);
     let same = match reply {
         Reply::Block(h) => {
             let code = |k: u64| unsafe {
@@ -2311,13 +2355,14 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
         unsafe {
             (FRAME_VA as *mut u64)
                 .byte_add(frame::PAGE_BASE as usize)
-                .write_volatile(block.rip & !0xfff ^ forged)
+                .write_volatile(s.cpu.rip & !0xfff ^ forged)
         };
         // The tests' entries ([`cache::Control::pic_test`]): x0 as an L1 entry or the full entry's `and` leaves it (the
-        // next resident entry zeroes it again, [`returned`]).
+        // next resident entry zeroes it again, [`returned`]). (Frame-keyed plan step 1b: the RIP entered at, `find`'s: a
+        // shared translation entered with no record does not say it.)
         match test {
-            cache::PIC_TEST_AND => (f.x[0], pc) = (block.rip, code.full_entry()),
-            cache::PIC_TEST_STR => (f.x[0], pc) = (block.rip & !0xfff, code.code_va()),
+            cache::PIC_TEST_AND => (f.x[0], pc) = (s.cpu.rip, code.full_entry()),
+            cache::PIC_TEST_STR => (f.x[0], pc) = (s.cpu.rip & !0xfff, code.code_va()),
             _ => {}
         }
         if matches!(
