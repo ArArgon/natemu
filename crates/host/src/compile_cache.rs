@@ -22,13 +22,16 @@
 //! the cap, other builds' packs go (they can never hit), then this build's least recently used, until it is at most 3/4
 //! of the cap, so every run has a quarter of the cap to write into; during a run, nothing more is written once the total
 //! reaches the cap. A pack's modification time is when it was last used: written, or hit by a process (the writer thread
-//! sets it to the time of the process's first hit in that pack, once per pack and process, off the compile path), so
-//! the packs a desktop's sessions keep hitting outlive newer ones nothing hit again.
+//! sets it to the time of the process's first hit in that pack, and again at most every [`STAMP_EVERY`] while hits go
+//! on, off the compile path), so the packs a desktop's sessions keep hitting outlive newer ones nothing hit again. A
+//! process keeps each pack it reads open, most recently used first and at most half its descriptor limit
+//! ([`descriptor_budget`]); the rest stay on disk, counted and unread.
 //!
-//! In memory, the index keys an entry by the first 8 bytes of its key and keeps the first 8 bytes of its sum (33 bytes a
-//! table slot, against 89 for the whole key and sum; sized once for every pack's entries at open): a hit checks the sum,
-//! computed with the lookup's whole key, so a key sharing only those 8 bytes, or a damaged payload, is a miss but for a
-//! chance of 2^-64.
+//! In memory, the index keys an entry by the first 8 bytes of its key and keeps 12 bytes of its sum (33 bytes a table
+//! slot, against 89 for the whole key and sum; sized once for every pack's entries at open). A hit checks those 12 bytes
+//! of the sum, computed with the lookup's whole key: that check alone tells a key sharing only the 8 bytes from the
+//! stored one (admission validates the object, not that it is this key's), and finds a damaged payload, but for a
+//! chance of 2^-96.
 //!
 //! Configuration: [`Config`], by [`Config::new`] from the entries' `--compile-cache DIR|off` (default
 //! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap; default [`default_cap`], a tenth of the cache
@@ -41,7 +44,7 @@ use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const HEAD: &[u8; 8] = b"NFXPACK1";
@@ -51,6 +54,8 @@ const RECORD: usize = 32 + 8 + 4 + 32;
 /// A pending pack is written once its payloads reach this size, or its oldest entry this age.
 pub(crate) const PACK_BYTES: usize = 4 << 20;
 pub(crate) const PACK_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+/// A pack a process keeps hitting is stamped again once this has passed since its last stamp (a session left running).
+const STAMP_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -174,9 +179,9 @@ fn sha256_with(parts: &[&[u8]], compress: fn(&mut [u32; 8], &[u8])) -> [u8; 32] 
     out
 }
 
-/// An entry in the in-memory index: the first 8 bytes of its sum, and where its payload is.
+/// An entry in the in-memory index: 12 bytes of its sum ([`check`]), and where its payload is.
 struct Slot {
-    sum: u64,
+    sum: (u64, u32),
     pack: u32,
     offset: u32,
     len: u32,
@@ -184,6 +189,10 @@ struct Slot {
 /// The index's key: the first 8 bytes of an entry's key.
 fn prefix(bytes: &[u8; 32]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+/// The part of an entry's sum the index keeps: its first 12 bytes.
+fn check(sum: &[u8; 32]) -> (u64, u32) {
+    (prefix(sum), u32::from_le_bytes(sum[8..12].try_into().unwrap()))
 }
 /// Hashes the index's keys as they are: they are bytes of SHA-256, already uniform.
 #[derive(Default)]
@@ -238,8 +247,12 @@ pub(crate) enum Stored {
 pub struct DiskCache {
     identity: [u8; 32],
     packs: Arc<Vec<File>>,
-    /// Per pack, whether this process has hit it (its time is set once).
-    hit: Vec<AtomicBool>,
+    /// Per pack, when this process last had it stamped: [`STAMP_EVERY`] periods since `opened`, plus one (0: never).
+    hit: Vec<AtomicU32>,
+    opened: std::time::Instant,
+    /// Stamps sent (the tests').
+    #[cfg(test)]
+    stamps: std::sync::atomic::AtomicUsize,
     index: Index,
     writer: Mutex<Option<std::sync::mpsc::Sender<Msg>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -265,6 +278,12 @@ fn key(identity: &[u8; 32], body: &[u8]) -> [u8; 32] {
 impl DiskCache {
     /// Opens (creating) the cache in `dir` for answers of the fexc binary at `fexc`, evicting down to `cap` bytes.
     pub(crate) fn open(dir: &Path, fexc: &Path, cap: u64) -> Result<Self, String> {
+        Self::open_with(dir, fexc, cap, descriptor_budget())
+    }
+
+    /// The same, opening at most `budget` packs.
+    fn open_with(dir: &Path, fexc: &Path, cap: u64, mut budget: usize) -> Result<Self, String> {
+        let now = std::time::SystemTime::now();
         let identity = sha256(&[&fs::read(fexc).map_err(|e| format!("{}: {e}", fexc.display()))?]);
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (mut packs, tag) = (vec![], tag(&identity));
@@ -286,7 +305,8 @@ impl DiskCache {
                     let own = name.strip_prefix(&tag).is_some_and(|n| n.starts_with('-'));
                     packs.push((
                         own,
-                        m.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        // A time ahead of the clock (set before it was put back) counts as now.
+                        m.modified().unwrap_or(std::time::UNIX_EPOCH).min(now),
                         m.len(),
                         path,
                     ));
@@ -305,14 +325,33 @@ impl DiskCache {
             total -= size;
         }
         let mut bytes = 0;
-        // Each kept pack of this build, open, with its entry count: the index is sized for all of them at once.
+        // This build's kept packs, open, most recently used first and at most `budget` of them, with their entry counts:
+        // the index is sized for all of them at once. Another build's pack is on disk and counted but not read (its keys
+        // are another build's), and so is a pack past the budget or the process's descriptors: the least recently used,
+        // it goes first at a later open. A pack another process removed meanwhile is not counted; one that cannot be read
+        // for another reason (its permissions, say) can never hit, so it goes.
         let mut opened = vec![];
-        for (own, _, size, path) in packs {
-            bytes += size; // on disk and counted, read or not
-            // Another build's pack is not read (its keys are another build's), nor is one that cannot be opened (out of
-            // descriptors, say): it is left alone.
-            if let Some(file) = own.then(|| File::open(&path).ok()).flatten() {
-                opened.push((file, size, path));
+        for (own, _, size, path) in packs.into_iter().rev() {
+            if !own || budget == 0 {
+                bytes += size;
+                continue;
+            }
+            match File::open(&path) {
+                Ok(file) => {
+                    budget -= 1;
+                    bytes += size;
+                    opened.push((file, size, path));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                    budget = 0;
+                    bytes += size;
+                }
+                Err(_) => {
+                    if fs::remove_file(&path).is_err() {
+                        bytes += size;
+                    }
+                }
             }
         }
         let mut index = Index::with_capacity_and_hasher(
@@ -329,15 +368,13 @@ impl DiskCache {
             let pack = files.len() as u32;
             files.push(file);
             for (key, offset, len, sum) in records {
-                index.insert(
-                    prefix(&key),
-                    Slot {
-                        sum: prefix(&sum),
-                        pack,
-                        offset,
-                        len,
-                    },
-                );
+                // A key stored twice (by two processes at once) is the most recently used pack's.
+                index.entry(prefix(&key)).or_insert(Slot {
+                    sum: check(&sum),
+                    pack,
+                    offset,
+                    len,
+                });
             }
         }
         let files = Arc::new(files);
@@ -377,7 +414,10 @@ impl DiskCache {
         let entries = index.len();
         Ok(Self {
             identity,
-            hit: (0..files.len()).map(|_| AtomicBool::new(false)).collect(),
+            hit: (0..files.len()).map(|_| AtomicU32::new(0)).collect(),
+            opened: std::time::Instant::now(),
+            #[cfg(test)]
+            stamps: Default::default(),
             packs: files,
             index,
             writer: Mutex::new(Some(tx)),
@@ -396,17 +436,21 @@ impl DiskCache {
         self.index.is_empty()
     }
 
-    /// The payload stored under `key`, if any and intact. The first hit in a pack has the writer thread stamp it.
+    /// The payload stored under `key`, if any and intact. The first hit in a pack, and the first after each [`STAMP_EVERY`]
+    /// since its last stamp, has the writer thread stamp it.
     pub(crate) fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
         let slot = self.index.get(&prefix(key))?;
         let mut payload = vec![0; slot.len as usize];
         self.packs[slot.pack as usize]
             .read_exact_at(&mut payload, u64::from(slot.offset))
             .ok()?;
-        if prefix(&sha256(&[key, &payload])) != slot.sum {
+        if check(&sha256(&[key, &payload])) != slot.sum {
             return None;
         }
-        if !self.hit[slot.pack as usize].swap(true, Ordering::Relaxed) {
+        let period = (self.opened.elapsed().as_secs() / STAMP_EVERY.as_secs()) as u32 + 1;
+        if self.hit[slot.pack as usize].swap(period, Ordering::Relaxed) != period {
+            #[cfg(test)]
+            self.stamps.fetch_add(1, Ordering::Relaxed);
             self.send(Msg::Hit(slot.pack));
         }
         Some(payload)
@@ -477,13 +521,14 @@ impl Writer {
             .join(format!("{}-{name}.pack", tag(&self.identity)));
         if fs::write(&tmp, &f)
             .and_then(|_| fs::rename(&tmp, pack))
-            .is_err()
+            .is_ok()
         {
+            self.bytes += f.len() as u64;
+        } else {
             let _ = fs::remove_file(&tmp); // a full disk costs the entries, not the run
         }
         *p = Pack::default();
         self.written += 1;
-        self.bytes += f.len() as u64;
     }
 }
 
@@ -553,6 +598,16 @@ fn read_index(f: &File, size: u64) -> Option<Vec<([u8; 32], u32, u32, [u8; 32])>
         .collect()
 }
 
+/// How many packs a process keeps open: half its soft descriptor limit, so a large cache never takes the descriptors
+/// the rest of the run needs (the vCPUs' compiler channels, disks, logs).
+fn descriptor_budget() -> usize {
+    let mut l: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) } != 0 {
+        return 128; // half macOS's default of 256
+    }
+    usize::try_from(l.rlim_cur / 2).unwrap_or(usize::MAX)
+}
+
 fn alive(pid: i32) -> bool {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -588,12 +643,12 @@ impl Config {
     }
 }
 
-/// The default cap's bounds. The ceiling holds a desktop's sessions and apps (a KDE session alone writes 592 MiB before
-/// any app starts); the floor keeps that session across opens (3/4 of it, 768 MiB, is kept at each).
+/// The default cap's bounds: the ceiling holds a desktop's sessions and apps, the floor at least one KDE session across
+/// opens (3/4 of it, 768 MiB, is kept at each). The measurements: `docs/restructure/disk-cache-cap-plan.md`.
 pub const CAP_FLOOR: u64 = 1 << 30;
 pub const CAP_CEILING: u64 = 4 << 30;
 /// The default cap for a cache volume with `free` bytes free (`None`: unknown): a tenth of it within [`CAP_FLOOR`] and
-/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 40 GiB free, and moves in steps).
+/// [`CAP_CEILING`], rounded down to 256 MiB (so it is the ceiling on any volume with 40 GiB free).
 pub fn default_cap(free: Option<u64>) -> u64 {
     let step = 256 << 20;
     free.map_or(CAP_CEILING, |f| (f / 10).clamp(CAP_FLOOR, CAP_CEILING)) / step * step
@@ -601,7 +656,9 @@ pub fn default_cap(free: Option<u64>) -> u64 {
 
 /// The bytes free to an unprivileged writer on the volume `dir` is on (or would be on: its nearest existing ancestor's).
 fn free_bytes(dir: &Path) -> Option<u64> {
-    let dir = dir.ancestors().find(|d| d.exists())?;
+    let dir = (dir.ancestors())
+        .map(|d| if d.as_os_str().is_empty() { Path::new(".") } else { d })
+        .find(|d| d.exists())?;
     let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str())).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     (unsafe { libc::statfs(path.as_ptr(), &mut st) } == 0)
@@ -870,6 +927,7 @@ mod tests {
             let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
             assert_eq!(c.get(&c.key(&[0])), Some(vec![0; 1000])); // the older pack's first hit: stamped
             assert_eq!(c.get(&c.key(&[1])), Some(vec![1; 1000])); // its second: not again
+            assert_eq!(c.stamps.load(Ordering::Relaxed), 1);
         } // the writer thread has stamped it before the drop returns
         let cap = dir_bytes(&store) * 2 / 3 + 64; // 3/4 of it is just over one pack: one goes
         let c = DiskCache::open(&store, &fexc, cap).unwrap();
@@ -880,20 +938,41 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A pack of this build that cannot be opened is kept on disk (and counted), not taken for a damaged one.
+    /// A pack of this build that cannot be read (here its permissions) can never hit, so it goes.
     #[test]
-    fn unopenable_pack_is_kept() {
+    fn unreadable_pack_goes() {
         use std::os::unix::fs::PermissionsExt;
-        let (dir, fexc, store) = scratch("unopenable");
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root opens a file of mode 0
+        }
+        let (dir, fexc, store) = scratch("unreadable");
         fill(&store, &fexc, 2);
         let pack = fs::read_dir(&store).unwrap().flatten().next().unwrap().path();
         fs::set_permissions(&pack, fs::Permissions::from_mode(0)).unwrap();
         let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
-        assert_eq!((c.entries, c.bytes), (0, fs::metadata(&pack).unwrap().len()));
-        drop(c);
-        assert!(pack.exists());
-        fs::set_permissions(&pack, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(DiskCache::open(&store, &fexc, 1 << 30).unwrap().entries, 2);
+        assert_eq!((c.entries, c.bytes), (0, 0));
+        assert!(!pack.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Past the descriptor budget, packs stay on disk, counted and unread: the most recently used are the ones read.
+    #[test]
+    fn packs_past_the_descriptor_budget_are_kept_unread() {
+        let (dir, fexc, store) = scratch("budget");
+        fill_keys(&store, &fexc, 0..1);
+        fill_keys(&store, &fexc, 10..11);
+        fill_keys(&store, &fexc, 20..21);
+        {
+            let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
+            assert!(c.get(&c.key(&[0])).is_some()); // the oldest written, now the most recently used
+        }
+        let total = dir_bytes(&store);
+        let c = DiskCache::open_with(&store, &fexc, 1 << 30, 2).unwrap();
+        assert_eq!(
+            ([0u8, 10, 20].map(|i| c.get(&c.key(&[i])).is_some()), c.bytes),
+            ([true, false, true], total)
+        );
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -933,11 +1012,20 @@ mod tests {
         let os = |p: &Path| p.as_os_str().to_owned();
         let c = Config::new(Some(&os(&store)), Some(64)).unwrap();
         assert_eq!((c.dir.as_deref(), c.cap), (Some(store.as_path()), 64 << 20));
-        let free = free_bytes(&store.join("not/made")).unwrap();
-        assert!(free > 0 && free < 1 << 50, "{free}");
+        let free = || free_bytes(&store.join("not/made")).unwrap();
+        let before = free();
+        assert!(before > 0 && before < 1 << 50, "{before}");
         let c = Config::new(Some(&os(&store)), None).unwrap();
         assert!(c.cap >= CAP_FLOOR && c.cap <= CAP_CEILING, "{}", c.cap);
-        assert_eq!(c.cap, default_cap(Some(free)));
+        // Other tests write meanwhile: the free space may cross a step's edge between the calls.
+        let after = free();
+        assert!(
+            [before, after].map(|f| default_cap(Some(f))).contains(&c.cap),
+            "{} for {before} to {after} free",
+            c.cap
+        );
+        // A relative folder not made yet: its volume is the working directory's.
+        assert!(free_bytes(Path::new("not/made/yet")).is_some());
         let off = Config::new(Some(std::ffi::OsStr::new("off")), None).unwrap();
         assert_eq!((off.dir, off.cap), (None, 0));
         assert!(Config::new(None, Some(u64::MAX)).is_err());

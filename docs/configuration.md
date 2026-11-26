@@ -94,7 +94,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `runtime` | the resident built beside the binary | The resident runtime ELF |
 | | `fp` | `"fast"` | `"fast"` or `"accurate"` |
 | | `compile_cache` | the user cache folder | A folder, or `"off"` |
-| | `compile_cache_mb` | a tenth of the cache folder's free disk space, at least 1024 and at most 4096 | Cache cap in MiB: when a run starts above 3/4 of it, the code no run has used for longest goes first ([why these numbers](restructure/disk-cache-cap-plan.md)) |
+| | `compile_cache_mb` | a tenth of the cache folder's free disk space, at least 1024 and at most 4096 | Cache cap in MiB: when a run starts above 3/4 of it, other fexc builds' code goes first, then the code no run has used for longest ([why these numbers](restructure/disk-cache-cap-plan.md)) |
 | | `speculation_barriers` | `false` | Page-walk barriers (needs FEAT_SB) |
 | `[boot.kernel]` | `image` | none (required) | The Linux bzImage |
 | | `initrd`, `cmdline` | none, empty | Initramfs and kernel command line |
