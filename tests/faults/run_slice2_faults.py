@@ -182,7 +182,9 @@ def main():
                     entry['outcome'], diffs = 'unsupported', [limit]
                 else:
                     if info['fault']:
-                        expected, diffs = answers.derive(want, f'expected_fault/{muts}', lambda w: expected_fault(p, muts, w))
+                        expected, policy_diffs = answers.derive(want, f'expected_fault/{muts}', lambda w: expected_fault(p, muts, w))
+                        # The same locked answer is reused across block sizes. Keep this run's diagnostics local.
+                        diffs = list(policy_diffs)
                         if expected: diffs += compare_fault(expected, out, int(p.get('cpl', 3)))
                     else:
                         diffs = [] if out['stop'] == 'reached' else [f"QEMU ran to the end; VM stopped {out['stop']} {out['reason']} at {out['rip']}"]
