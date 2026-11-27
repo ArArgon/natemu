@@ -658,11 +658,13 @@ def analyse_boot(b: dict, perf: Path | None) -> dict:
     sl = bnames = req = sc = None
     if perf and perf.exists():
         sl, bnames, sc = snaps(perf), bucket_names(), snapc(perf)
-        req = Requests(perf)
-        ml = map_lines(lines)
-        names = {pid: path.rsplit('/', 1)[-1] for pid, _, _, kind, path in ml if kind == 'exe'}   # the program, where no PS line names it
-        names.update({pid: n for _, _, procs in ps_blocks(lines) for pid, (n, *_) in procs.items()})
-        req.attribute([m[:4] for m in ml], names)
+        r = Requests(perf)
+        if r.files:
+            req = r
+            ml = map_lines(lines)
+            names = {pid: path.rsplit('/', 1)[-1] for pid, _, _, kind, path in ml if kind == 'exe'}   # the program, where no PS line names it
+            names.update({pid: n for _, _, procs in ps_blocks(lines) for pid, (n, *_) in procs.items()})
+            req.attribute([m[:4] for m in ml], names)
     out = []
     for w in wins:
         d = {k: v for k, v in w.items()}
@@ -749,20 +751,146 @@ def sp_results(lines):
             'webgl': gpu, 'page_errors': [d for d in logs if 'error' in d][:10]} if (res or gpu) else None
 
 
+EXPECTED_WINDOWS = {
+    'idle': ('idle',),
+    'ui': ('ui-launcher-open', 'ui-launcher-close', 'ui-overview-open', 'ui-overview-close',
+           'ui-desktop-next', 'ui-desktop-prev'),
+    'apps': ('app-konsole-1:start', 'app-konsole-1:settle', 'app-konsole-1',
+             'app-konsole-2:start', 'app-konsole-2:settle', 'app-konsole-2',
+             'app-dolphin-1:start', 'app-dolphin-1:settle', 'app-dolphin-1',
+             'app-dolphin-2:start', 'app-dolphin-2:settle', 'app-dolphin-2',
+             'ui-window-place', 'ui-window-move', 'ui-window-grow',
+             'ui-window-maximize', 'ui-window-restore', 'ui-window-switch'),
+    'click': ('click-konsole-1:start', 'click-konsole-1:settle', 'click-konsole-1',
+              'click-konsole-2:start', 'click-konsole-2:settle', 'click-konsole-2',
+              'click-dolphin-1:start', 'click-dolphin-1:settle', 'click-dolphin-1',
+              'click-dolphin-2:start', 'click-dolphin-2:settle', 'click-dolphin-2'),
+    'browsers': ('app-chromium-1:start', 'app-chromium-1:settle', 'app-chromium-1',
+                 'app-chromium-2:start', 'app-chromium-2:settle', 'app-chromium-2',
+                 'app-firefox-1:start', 'app-firefox-1:settle', 'app-firefox-1',
+                 'app-firefox-2:start', 'app-firefox-2:settle', 'app-firefox-2'),
+    'speedometer': ('app-chromium-3:start', 'app-chromium-3:settle', 'app-chromium-3'),
+}
+
+
+def _geom(val):
+    if not val or val == 'none': return None
+    parts = val.split(',')
+    if len(parts) != 4: return None
+    try: return tuple(int(p) for p in parts)
+    except ValueError: return None
+
+
+def _ui_effect_ok(name, k):
+    if k.get('effect') != 'ok': return False
+    if name in ('ui-overview-open', 'ui-overview-close'):
+        return (k.get('before_ov'), k.get('after_ov')) == (('0', '1') if name == 'ui-overview-open' else ('1', '0'))
+    if name in ('ui-desktop-next', 'ui-desktop-prev'):
+        bd, ad = k.get('before_desk'), k.get('after_desk')
+        bdi, adi = k.get('before_deskid'), k.get('after_deskid')
+        try: bd_i, ad_i = int(bd), int(ad)
+        except (TypeError, ValueError): return False
+        if bdi in (None, 'none') or adi in (None, 'none') or bdi == adi: return False
+        return ad_i > bd_i if name == 'ui-desktop-next' else ad_i < bd_i
+    bw, aw = k.get('before_win'), k.get('after_win')
+    if bw in (None, 'none') or aw in (None, 'none') or bw != aw: return False
+    if k.get('before_normal') != '1' or k.get('after_normal') != '1': return False
+    if name == 'ui-window-switch':
+        bc, ac = k.get('before_cls'), k.get('after_cls')
+        if bc in (None, 'none') or ac != bc: return False
+        if k.get('switches') != '4' or k.get('distinct') != '2': return False
+        opid, epid = k.get('other_pid'), k.get('expected_other_pid')
+        if opid in (None, 'none') or (epid not in (None, 'none') and opid != epid): return False
+        seq = [s for s in k.get('seq', '').split(',') if s and s != 'none']
+        if len(seq) != 4 or len(set(seq)) != 2 or seq[-1] != aw: return False
+        prev = bw
+        for item in seq:
+            if item == prev: return False
+            prev = item
+        return True
+    bg, ag = _geom(k.get('before_geom')), _geom(k.get('after_geom'))
+    if not bg or not ag: return False
+    bx, by, bw_, bh_ = bg
+    ax, ay, aw_, ah_ = ag
+    if name == 'ui-window-place':
+        return ag != bg and ag == (80, 60, 900, 600)
+    if name == 'ui-window-move':
+        return (aw_, ah_) == (bw_, bh_) and ax - bx == 480 and ay - by == 240
+    if name == 'ui-window-grow':
+        return aw_ - bw_ == 360 and ah_ > bh_
+    if name == 'ui-window-maximize':
+        return k.get('before_max') == '0' and k.get('after_max') == '3' and aw_ > bw_ and ah_ > bh_
+    if name == 'ui-window-restore':
+        return k.get('before_max') == '3' and k.get('after_max') == '0' and aw_ < bw_ and ah_ < bh_
+    return False
+
+
 def problems(args, b, a) -> list:
     out = []
     texts = [t for _, t in b['stamps']]
+    driver_lines = [t for t in texts if t.startswith('DE-DRIVER ')]
+    if not driver_lines: out.append('missing DE-DRIVER header')
+    else:
+        d_phases = [p for p in kv(driver_lines[0]).get('phases', '').split(',') if p]
+        if set(d_phases) != set(args.phases): out.append(f'phases mismatch: driver={d_phases} args={list(args.phases)}')
     if not any(t.startswith('DE-END-ALL') for t in texts): out.append('the driver did not reach its end (no DE-END-ALL)')
+    if b.get('exit') != 0: out.append(f'vm exit: {b.get("exit")}')
     if any(t.startswith('DE-SHELL-MAPPED timeout') for t in texts): out.append("plasmashell's window never came")
     if any(t.startswith('DE-KWIN-SCRIPT missing') for t in texts): out.append("KWin's demarker script reported nothing")
+    elif not any(t.startswith('DE-KWIN-SCRIPT ') for t in texts): out.append("KWin's demarker script missing (no DE-KWIN-SCRIPT)")
+    idle_lines = [t for t in texts if t.startswith('DE-IDLE-READY ')]
+    if not idle_lines: out.append('session never reached idle (no DE-IDLE-READY)')
+    elif any(kv(t).get('quiet') != 'ok' for t in idle_lines):
+        out.append('session never reached idle (DE-IDLE-READY not quiet=ok)')
+    if (a.get('session') or {}).get('idle_desktop_s') is None: out.append('session never reached idle')
     for t in texts:
-        if t.startswith('DE-MAPPED') and 'timeout' in t: out.append(f'no window: {t.split()[1]}')
+        w = t.split()
+        if t.startswith('DE-MAPPED') and 'timeout' in t: out.append(f'no window: {w[1] if len(w) > 1 else t}')
+        if len(w) >= 2 and w[0] == 'DE-END' and w[1].startswith('ui-') and kv(t).get('quiet') != 'ok':
+            out.append(f'ui timeout: {w[1]} (quiet={kv(t).get("quiet", "missing")})')
+        if len(w) >= 2 and w[0] == 'DE-SETTLED':
+            q = kv(t).get('quiet')
+            if w[1] == 'app-chromium-3':
+                if q not in ('ok', 'timeout'): out.append(f'settle error: {w[1]} (quiet={q or "missing"})')
+            elif q != 'ok':
+                out.append(f'settle timeout: {w[1]} (quiet={q or "missing"})')
+        if t.startswith('DE-KILLED '): out.append(f'close killed: {t}')
+        if t.startswith('DE-QUIET-TIMEOUT '): out.append(f'quiet timeout: {t}')
+    if any(t.startswith(('DE-SP-TIMEOUT', 'SP-TIMEOUT')) for t in texts): out.append('Speedometer: timeout (DE-SP-TIMEOUT)')
+    if any(t.startswith(('DE-SP-NO-HOOK', 'SP-NO-HOOK')) for t in texts): out.append('Speedometer: hook missing (DE-SP-NO-HOOK)')
     for ph in args.phases:
         if ph in ('idle', 'ui', 'apps', 'click', 'browsers') and not any(w['kind'] == {'apps': 'app', 'browsers': 'app'}.get(ph, ph)
                                                                for w in a['windows']):
             out.append(f'phase {ph}: no windows')
+    win_names = {w['name'] for w in a['windows']}
+    expected = ['session:shell', 'session:idle-ready']
+    for ph in args.phases: expected.extend(EXPECTED_WINDOWS.get(ph, ()))
+    for name in expected:
+        if name not in win_names: out.append(f'missing row: {name}')
+    dk = kv(driver_lines[0]) if driver_lines else {}
+    dv_raw = dk.get('v')
+    if dv_raw is not None and (not dv_raw.isdigit() or int(dv_raw) < 2):
+        out.append(f'invalid DE-DRIVER version: {dv_raw}')
+    driver_v = int(dv_raw) if dv_raw and dv_raw.isdigit() else 0
+    ui_effects = collections.defaultdict(list)
+    for t in texts:
+        if t.startswith('DE-UI-EFFECT ') and len(t.split()) >= 2:
+            ui_effects[t.split()[1]].append(kv(t))
+    if driver_v >= 2 or dv_raw is not None or ui_effects:
+        expected_ui = []
+        if 'ui' in args.phases: expected_ui += ['ui-overview-open', 'ui-overview-close', 'ui-desktop-next', 'ui-desktop-prev']
+        if 'apps' in args.phases:
+            expected_ui += ['ui-window-place', 'ui-window-move', 'ui-window-grow',
+                            'ui-window-maximize', 'ui-window-restore', 'ui-window-switch']
+        for name in expected_ui:
+            recs = ui_effects.get(name, [])
+            if not recs: out.append(f'ui effect missing: {name}')
+            elif len(recs) > 1: out.append(f'ui effect duplicate: {name}')
+            elif not _ui_effect_ok(name, recs[0]):
+                out.append(f'ui no-op: {name} ({recs[0].get("effect", "unchanged")})')
+    a['ui_effects_verified'] = bool(driver_v >= 2)
     if 'speedometer' in args.phases and not (a.get('speedometer') or {}).get('score'): out.append('Speedometer: no score')
-    if b['capped']: out.append('capped')
+    if b.get('capped'): out.append('capped')
     return out
 
 
@@ -830,20 +958,37 @@ def write_guest_perf(out: Path, i: int, lines: list):
 def analyse(args) -> int:
     """The analysis again from a finished run's files (result.json's boots, their markers, display and timing logs)."""
     result = json.loads((args.out / 'result.json').read_text())
+    pargs = argparse.Namespace(phases=result.get('phases', []))
     for r in result['boots']:
         i = r['boot']
-        b = {'stamps': json.loads((args.out / f'boot-{i}.markers.json').read_text()),
+        stamps_data = json.loads((args.out / f'boot-{i}.markers.json').read_text())
+        serial = args.out / f'boot-{i}.serial'
+        lines = serial.read_text(errors='replace').splitlines() if serial.exists() else [t for _, t in stamps_data]
+        b = {'stamps': stamps_data,
              'display': [tuple(json.loads(l)) for l in (args.out / f'boot-{i}.display.jsonl').read_text().splitlines()],
-             'lines': (args.out / f'boot-{i}.serial').read_text(errors='replace').splitlines() if (args.out / f'boot-{i}.serial').exists() else [],
-             'capped': r['capped']}
+             'lines': lines,
+             'capped': r.get('capped', False),
+             'exit': r.get('exit')}
+        prev_analysis = r.get('analysis') or {}
+        prev_wins = {w['name']: w for w in prev_analysis.get('windows', [])}
         perf = args.out / f'boot-{i}.perf'
         a = analyse_boot(b, perf if perf.exists() else None)
+        if a.get('requests_files') is None and prev_analysis.get('requests_files') is not None:
+            a['requests_files'] = prev_analysis['requests_files']
+            for w in a['windows']:
+                if 'translate' not in w and 'translate' in prev_wins.get(w['name'], {}):
+                    w['translate'] = prev_wins[w['name']]['translate']
         a['speedometer'] = sp_results(b['lines'])
         r['analysis'], r['speedometer'] = a, a['speedometer']
+        r['problems'] = problems(pargs, b, a)
+    ok = bool(result['boots']) and not any(r['problems'] for r in result['boots'])
+    result['pass'] = ok
     write_json(args.out / 'result.json', result)
     (args.out / 'report.md').write_text(report_md(result))
     print(args.out / 'report.md')
-    return 0
+    print('PASS' if ok else 'FAIL', args.out)
+    if not ok: return 1
+    return 3 if any(r.get('contended') for r in result['boots']) else 0
 
 
 def run(args) -> int:
@@ -935,5 +1080,6 @@ def main():
 
 
 if __name__ == '__main__':
-    testenv.require_framework(__file__)
+    if not (len(sys.argv) > 1 and sys.argv[1] == 'analyse'):
+        testenv.require_framework(__file__)
     sys.exit(main())

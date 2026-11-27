@@ -682,6 +682,11 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/desktop-k
         "--out", "{out}", "--name", "desktop-kde-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--phases", "idle,ui,apps", "--sample-us", "{sample_us}", "--guest-perf"]
 
+[suite.cases.desktop-kde]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--phases", "idle,ui,apps"]
+
 [suite.cases.desktop-kde-profile]
 argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
         "--out", "{out}", "--name", "desktop-kde-profile", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
@@ -722,6 +727,11 @@ argv = ["python3", "tests/bench/sample_report.py", "--profile", "{out}/desktop-k
         "--", "python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
         "--out", "{out}", "--name", "desktop-kde-browser-sample", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_profile}",
         "--phases", "idle,browsers", "--sample-us", "{sample_us}", "--guest-perf"]
+
+[suite.cases.desktop-kde-browser]
+argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",
+        "--out", "{out}", "--name", "desktop-kde-browser", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--phases", "idle,browsers,speedometer"]
 
 [suite.cases.desktop-kde-browser-profile]
 argv = ["python3", "tests/bench/run_desktop.py", "run", "--emu", "natemu", "--kernel", "{kernel}", "--inputs", "{desktop_inputs}",

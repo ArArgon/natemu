@@ -113,13 +113,145 @@ gone() {   # gone PID SECONDS: wait until PID has exited, else kill it
   return 0
 }
 snap() { say SNAP $1; sleep 1.5; }
+get_state() {
+  local from end l
+  from=$(lines)
+  shortcut "DE State"
+  end=$(( $(date +%s) + 5 ))
+  while [ "$(date +%s)" -lt $end ]; do
+    l=$(tail -n +$(($from + 1)) $WINLOG | grep -m1 '^DEWIN state ')
+    if [ -n "$l" ]; then echo "$l"; return 0; fi
+    sleep 0.05
+  done
+  return 1
+}
+state_val() {
+  local w
+  for w in $2; do case $w in "$1"=*) echo "${w#*=}"; return 0;; esac; done
+  echo none
+}
+check_ui_effect() {
+  local name=$1 before=$2 after=$3 from=$4 to=$5 end_ms=$6
+  local bd ad bdi adi bov aov bw aw bc ac bp ap bn an bg ag bm am sw dist seq opid ocls eff=noop
+  local bxy axy bwh awh bx by bw_ bh_ ax ay aw_ ah_
+  bd=$(state_val desk "$before"); ad=$(state_val desk "$after")
+  bdi=$(state_val deskid "$before"); adi=$(state_val deskid "$after")
+  bov=$(state_val ov "$before"); aov=$(state_val ov "$after")
+  bw=$(state_val win "$before"); aw=$(state_val win "$after")
+  bc=$(state_val cls "$before"); ac=$(state_val cls "$after")
+  bp=$(state_val pid "$before"); ap=$(state_val pid "$after")
+  bn=$(state_val normal "$before"); an=$(state_val normal "$after")
+  bg=$(state_val geom "$before"); ag=$(state_val geom "$after")
+  bm=$(state_val max "$before"); am=$(state_val max "$after")
+  case $name in
+    overview-open)
+      if [ "$bov" = 0 ] && [ "$aov" = 1 ]; then eff=ok; fi
+      say UI-EFFECT ui-$name before_ov=$bov after_ov=$aov effect=$eff
+      ;;
+    overview-close)
+      if [ "$bov" = 1 ] && [ "$aov" = 0 ]; then eff=ok; fi
+      say UI-EFFECT ui-$name before_ov=$bov after_ov=$aov effect=$eff
+      ;;
+    desktop-next)
+      if [ "$bd" != none ] && [ "$ad" != none ] && [ "$bdi" != none ] && [ "$adi" != none ] \
+         && [ "$ad" -gt "$bd" ] 2>/dev/null && [ "$bdi" != "$adi" ]; then eff=ok; fi
+      say UI-EFFECT ui-$name before_desk=$bd after_desk=$ad before_deskid=$bdi after_deskid=$adi effect=$eff
+      ;;
+    desktop-prev)
+      if [ "$bd" != none ] && [ "$ad" != none ] && [ "$bdi" != none ] && [ "$adi" != none ] \
+         && [ "$ad" -lt "$bd" ] 2>/dev/null && [ "$bdi" != "$adi" ]; then eff=ok; fi
+      say UI-EFFECT ui-$name before_desk=$bd after_desk=$ad before_deskid=$bdi after_deskid=$adi effect=$eff
+      ;;
+    window-place)
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bg" != none ] && [ "$ag" = "80,60,900,600" ] && [ "$bg" != "$ag" ]; then eff=ok; fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_cls=$bc after_cls=$ac before_pid=$bp after_pid=$ap before_normal=$bn after_normal=$an before_geom=$bg after_geom=$ag effect=$eff
+      ;;
+    window-move)
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bg" != none ] && [ "$ag" != none ]; then
+        bxy=${bg%,*,*}; axy=${ag%,*,*}; bwh=${bg#*,*,}; awh=${ag#*,*,}
+        bx=${bxy%,*}; by=${bxy#*,}; ax=${axy%,*}; ay=${axy#*,}
+        if [ "$bwh" = "$awh" ] && [ $((ax - bx)) -eq 480 ] 2>/dev/null && [ $((ay - by)) -eq 240 ] 2>/dev/null; then eff=ok; fi
+      fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_normal=$bn after_normal=$an before_geom=$bg after_geom=$ag effect=$eff
+      ;;
+    window-grow)
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bg" != none ] && [ "$ag" != none ]; then
+        bwh=${bg#*,*,}; awh=${ag#*,*,}
+        bw_=${bwh%,*}; bh_=${bwh#*,}; aw_=${awh%,*}; ah_=${awh#*,}
+        if [ $((aw_ - bw_)) -eq 360 ] 2>/dev/null && [ "$ah_" -gt "$bh_" ] 2>/dev/null; then eff=ok; fi
+      fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_normal=$bn after_normal=$an before_geom=$bg after_geom=$ag effect=$eff
+      ;;
+    window-maximize)
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bm" = 0 ] && [ "$am" = 3 ] && [ "$bg" != none ] && [ "$ag" != none ]; then
+        bwh=${bg#*,*,}; awh=${ag#*,*,}
+        bw_=${bwh%,*}; bh_=${bwh#*,}; aw_=${awh%,*}; ah_=${awh#*,}
+        if [ "$aw_" -gt "$bw_" ] 2>/dev/null && [ "$ah_" -gt "$bh_" ] 2>/dev/null; then eff=ok; fi
+      fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_normal=$bn after_normal=$an before_geom=$bg after_geom=$ag before_max=$bm after_max=$am effect=$eff
+      ;;
+    window-restore)
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bm" = 3 ] && [ "$am" = 0 ] && [ "$bg" != none ] && [ "$ag" != none ]; then
+        bwh=${bg#*,*,}; awh=${ag#*,*,}
+        bw_=${bwh%,*}; bh_=${bwh#*,}; aw_=${awh%,*}; ah_=${awh#*,}
+        if [ "$aw_" -lt "$bw_" ] 2>/dev/null && [ "$ah_" -lt "$bh_" ] 2>/dev/null; then eff=ok; fi
+      fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_normal=$bn after_normal=$an before_geom=$bg after_geom=$ag before_max=$bm after_max=$am effect=$eff
+      ;;
+    window-switch)
+      read -r sw dist seq opid ocls <<EOF
+$(sed -n "$((from + 1)),${to}p" $WINLOG | awk -v init="$bw" -v bpid="$bp" -v endms="$end_ms" '
+  BEGIN { prev = init; sw = 0; seq = ""; opid = "none"; ocls = "none"; if (init != "none" && init != "") seen[init] = 1 }
+  $1 == "DEWIN" && $2 == "active" {
+    cls = $3; norm = ""; id = ""; pid = ""; ms = 0
+    for (i = 4; i <= NF; i++) {
+      if ($i ~ /^normal=/) norm = substr($i, 8)
+      else if ($i ~ /^id=/) id = substr($i, 4)
+      else if ($i ~ /^pid=/) pid = substr($i, 5)
+      else if ($i ~ /^ms=/) ms = substr($i, 4) + 0
+    }
+    if (norm == "1" && id != "" && id != "none" && (endms == 0 || ms <= endms) && id != prev) {
+      sw++; prev = id; seen[id] = 1
+      seq = (seq == "" ? id : seq "," id)
+      if (id != init && opid == "none" && pid != "" && pid != bpid) { opid = pid; ocls = cls }
+    }
+  }
+  END { n = 0; for (k in seen) n++; print sw, n, (seq == "" ? "none" : seq), opid, ocls }')
+EOF
+      if [ "$bw" != none ] && [ "$aw" != none ] && [ "$bw" = "$aw" ] && [ "$bn" = 1 ] && [ "$an" = 1 ] \
+         && [ "$bc" != none ] && [ "$ac" = "$bc" ] && [ "${sw:-0}" = 4 ] && [ "${dist:-0}" = 2 ] \
+         && [ "$opid" != none ] && { [ -z "$K" ] || [ "$opid" = "$K" ]; }; then
+        eff=ok
+      fi
+      say UI-EFFECT ui-$name before_win=$bw after_win=$aw before_cls=$bc after_cls=$ac before_pid=$bp after_pid=$ap before_normal=$bn after_normal=$an switches=${sw:-0} distinct=${dist:-0} seq=${seq:-none} other_pid=${opid:-none} expected_other_pid=${K:-none} other_cls=${ocls:-none} effect=$eff
+      ;;
+  esac
+}
 # ui NAME COMMAND...: one interaction, from its command to the CPUs quiet again.
 ui() {
-  local name=$1 r=ok; shift
+  local name=$1 r=ok track=0 before="" after="" from=0 to=0 end_ms=0; shift
+  case $name in overview-open|overview-close|desktop-next|desktop-prev|window-place|window-move|window-grow|window-maximize|window-restore|window-switch) track=1;; esac
+  if [ $track = 1 ]; then
+    before=$(get_state || true)
+    from=$(lines)
+  fi
   say BEGIN ui-$name; counters ui-$name-begin
   "$@"
   quiet 1 30 || r=timeout
+  if [ $track = 1 ]; then
+    [ "$name" = window-switch ] && end_ms=$(date +%s%3N)
+    after=$(get_state || true)
+    to=$(lines)
+  fi
   counters ui-$name-end; say END ui-$name quiet=$r
+  if [ $track = 1 ]; then
+    check_ui_effect "$name" "$before" "$after" "$from" "$to" "$end_ms"
+  fi
   snap ui-$name
 }
 steps() { local i; for i in $(seq $2); do shortcut "DE $1"; sleep 0.1; done; }
@@ -164,8 +296,8 @@ click() {
   local name=$1 n=$2 cls=$3 query=$4 from r ms t0 q=ok dm dbus unit exec at
   dm=/tmp/de-dbus-$name-$n.log
   asuser dbus-monitor --session "type='method_call',member='StartTransientUnit'" > $dm 2>&1 & DMON=$!
-  input key MetaLeft; quiet 1 30
-  input text $query; quiet 1 30
+  input key MetaLeft; quiet 1 30 || say QUIET-TIMEOUT click-$name-$n-meta
+  input text $query; quiet 1 30 || say QUIET-TIMEOUT click-$name-$n-query
   from=$(lines)
   say BEGIN click-$name-$n; counters click-$name-$n-begin
   input key Enter
@@ -194,10 +326,10 @@ close() {   # close NAME: the front window (KWin's "DE Close Top"), then its pro
   say CLOSE $1 pid=$pid
   shortcut "DE Close Top"
   [ -n "$pid" ] && gone $pid 60
-  quiet 2 30
+  quiet 2 30 || say QUIET-TIMEOUT close-$1
 }
 
-say DRIVER phases=$PHASES guestperf=${GPERF:-0} spiter=$SPITER rt=$RT0 up0=$UP0
+say DRIVER v=2 phases=$PHASES guestperf=${GPERF:-0} spiter=$SPITER rt=$RT0 up0=$UP0
 echo "DE-KTEXT $(grep ' _text$' /proc/kallsyms | cut -d' ' -f1)"
 : > $WINLOG
 ( journalctl -b -f -o cat _UID=1000 2>/dev/null & while [ ! -f /tmp/de-session.log ]; do sleep 1; done; tail -n +1 -F /tmp/de-session.log 2>/dev/null ) \

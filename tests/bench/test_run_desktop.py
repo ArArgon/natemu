@@ -2,7 +2,7 @@
 translation requests begun in a window (first-seen code), the frames, the processes' CPU time, the sampler's markers
 and the harness appended to the initramfs."""
 import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
-import io, shutil, tempfile, unittest
+import io, json, shutil, tempfile, tomllib, types, unittest
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import run_desktop as rd
 import sample_symbols
@@ -162,6 +162,207 @@ class Harness(unittest.TestCase):
         for n in ('de-harness/driver.sh', 'de-harness/setup.sh', 'de-harness/session.sh', 'de-harness/serve.py', 'de-harness/hook.js',
                   'de-harness/de-gpu.js', 'de-harness/kwin-demarker/contents/code/main.js', 'de-harness/home-config/kwinrc'):
             self.assertIn(n, names)
+
+
+def full_console(phases=rd.PHASES, v2=True):
+    lines = [
+        f'DE-DRIVER {"v=2 " if v2 else ""}phases=,{",".join(phases)}, t=10.0',
+        'DE-KTEXT ffffffff81000000',
+        'DE-SESSION t=20.0 rt=1.0',
+        'DE-SHELL-MAPPED at=50.0 t=50.3',
+        'DE-KWIN-SCRIPT loaded t=50.4',
+        'DE-IDLE-READY quiet=ok t=63.0',
+    ]
+    t = 64.0
+    if 'idle' in phases:
+        lines += [f'DE-BEGIN idle t={t}', stat('idle-begin', t, 100, 1000, 1000, 0, 0),
+                  stat('idle-end', t + 20, 300, 8000, 1100, 0, 0), f'DE-END idle t={t + 20}']
+        t += 22.0
+    if 'ui' in phases:
+        for name in ('launcher-open', 'launcher-close', 'overview-open', 'overview-close', 'desktop-next', 'desktop-prev'):
+            lines += [f'DE-BEGIN ui-{name} t={t}', f'DE-END ui-{name} quiet=ok t={t + 1.0}']
+            if v2 and name == 'overview-open':
+                lines.append(f'DE-UI-EFFECT ui-{name} before_ov=0 after_ov=1 effect=ok t={t + 1.1}')
+            elif v2 and name == 'overview-close':
+                lines.append(f'DE-UI-EFFECT ui-{name} before_ov=1 after_ov=0 effect=ok t={t + 1.1}')
+            elif v2 and name == 'desktop-next':
+                lines.append(f'DE-UI-EFFECT ui-{name} before_desk=1 after_desk=2 before_deskid=d1 after_deskid=d2 effect=ok t={t + 1.1}')
+            elif v2 and name == 'desktop-prev':
+                lines.append(f'DE-UI-EFFECT ui-{name} before_desk=2 after_desk=1 before_deskid=d2 after_deskid=d1 effect=ok t={t + 1.1}')
+            t += 2.0
+    if 'apps' in phases:
+        for app, pid in (('konsole-1', 301), ('konsole-2', 302), ('dolphin-1', 401), ('dolphin-2', 402)):
+            lines += [f'DE-BEGIN app-{app} t={t}', f'DE-MAPPED app-{app} at={t + 1.0} started={t + 0.1} pid={pid} t={t + 1.2}',
+                      f'DE-SETTLED app-{app} quiet=ok t={t + 3.0}', f'DE-END app-{app} t={t + 3.1}']
+            t += 4.0
+        effects = {
+            'window-place': 'before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 before_geom=200,200,1000,700 after_geom=80,60,900,600 effect=ok',
+            'window-move': 'before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=80,60,900,600 after_geom=560,300,900,600 effect=ok',
+            'window-grow': 'before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=560,300,900,600 after_geom=560,300,1260,840 effect=ok',
+            'window-maximize': 'before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=560,300,1260,840 after_geom=0,0,1920,1036 before_max=0 after_max=3 effect=ok',
+            'window-restore': 'before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=0,0,1920,1036 after_geom=560,300,1260,840 before_max=3 after_max=0 effect=ok',
+            'window-switch': 'before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=4 distinct=2 seq=w1,w2,w1,w2 other_pid=302 expected_other_pid=302 other_cls=konsole effect=ok',
+        }
+        for name, extra in effects.items():
+            lines += [f'DE-BEGIN ui-{name} t={t}', f'DE-END ui-{name} quiet=ok t={t + 1.0}']
+            if v2: lines.append(f'DE-UI-EFFECT ui-{name} {extra} t={t + 1.1}')
+            t += 2.0
+    if 'click' in phases:
+        for app, pid in (('konsole-1', 501), ('konsole-2', 502), ('dolphin-1', 601), ('dolphin-2', 602)):
+            lines += [f'DE-BEGIN click-{app} t={t}', f'DE-INPUT key Enter t={t + 0.1}',
+                      f'DE-MAPPED click-{app} at={t + 1.0} started={t + 0.2} pid={pid} t={t + 1.2}',
+                      f'DE-SETTLED click-{app} quiet=ok t={t + 3.0}', f'DE-END click-{app} t={t + 3.1}']
+            t += 4.0
+    if 'browsers' in phases:
+        for app, pid in (('chromium-1', 701), ('chromium-2', 702), ('firefox-1', 801), ('firefox-2', 802)):
+            lines += [f'DE-BEGIN app-{app} t={t}', f'DE-MAPPED app-{app} at={t + 2.0} started={t + 0.1} pid={pid} t={t + 2.2}',
+                      f'DE-SETTLED app-{app} quiet=ok t={t + 5.0}', f'DE-END app-{app} t={t + 5.1}']
+            t += 6.0
+    if 'speedometer' in phases:
+        lines += [f'DE-BEGIN app-chromium-3 t={t}', f'DE-MAPPED app-chromium-3 at={t + 2.0} started={t + 0.1} pid=901 t={t + 2.2}',
+                  f'DE-SETTLED app-chromium-3 quiet=timeout t={t + 92.0}', f'DE-END app-chromium-3 t={t + 92.5}',
+                  'SP /done {"score":3.14,"scoreText":"3.14"}']
+        t += 95.0
+    lines.append(f'DE-END-ALL t={t}')
+    return lines
+
+
+def eval_problems(lines, phases=rd.PHASES, exit_code=0, capped=False):
+    b = {'stamps': stamps(lines), 'display': [], 'lines': lines, 'exit': exit_code, 'capped': capped}
+    a = rd.analyse_boot(b, None)
+    a['speedometer'] = rd.sp_results(lines)
+    return rd.problems(types.SimpleNamespace(phases=list(phases)), b, a)
+
+
+class ProblemsAndAnalyse(unittest.TestCase):
+    def test_valid_full_v2_and_legacy_boots_pass(self):
+        self.assertEqual(eval_problems(full_console(rd.PHASES, v2=True)), [])
+        self.assertEqual(eval_problems(full_console(('idle', 'ui', 'apps'), v2=False), phases=('idle', 'ui', 'apps')), [])
+
+    def test_missing_rows_fail(self):
+        base = full_console()
+        for needle, expected in [
+            ('DE-END app-dolphin-2', 'missing row: app-dolphin-2'),
+            ('DE-MAPPED app-dolphin-2', 'missing row: app-dolphin-2:start'),
+            ('DE-SETTLED app-konsole-1', 'missing row: app-konsole-1:settle'),
+            ('DE-END ui-window-grow', 'missing row: ui-window-grow'),
+            ('DE-END click-dolphin-1', 'missing row: click-dolphin-1'),
+            ('DE-END app-firefox-2', 'missing row: app-firefox-2'),
+            ('DE-END app-chromium-3', 'missing row: app-chromium-3'),
+        ]:
+            broken = [l for l in base if not l.startswith(needle)]
+            probs = eval_problems(broken)
+            self.assertTrue(any(expected in p for p in probs), (needle, probs))
+
+    def test_timeouts_errors_exit_and_never_idle_fail(self):
+        base = full_console()
+        cases = [
+            (lambda ls: [l for l in ls if not l.startswith('DE-DRIVER ')], 'missing DE-DRIVER'),
+            (lambda ls: [l.replace('DE-DRIVER v=2', 'DE-DRIVER v=bad') for l in ls], 'invalid DE-DRIVER version'),
+            (lambda ls: [l.replace('phases=,idle,ui,apps,click,browsers,speedometer,', 'phases=,idle,') for l in ls], 'phases mismatch'),
+            (lambda ls: [l for l in ls if not l.startswith('DE-END-ALL')], 'no DE-END-ALL'),
+            (lambda ls: [l.replace('DE-IDLE-READY quiet=ok', 'DE-IDLE-READY quiet=timeout') for l in ls], 'DE-IDLE-READY not quiet=ok'),
+            (lambda ls: [l.replace('DE-IDLE-READY quiet=ok', 'DE-IDLE-READY') for l in ls], 'DE-IDLE-READY not quiet=ok'),
+            (lambda ls: [l for l in ls if not l.startswith('DE-IDLE-READY')], 'no DE-IDLE-READY'),
+            (lambda ls: [l.replace('DE-END ui-overview-open quiet=ok', 'DE-END ui-overview-open quiet=timeout') for l in ls], 'ui timeout: ui-overview-open'),
+            (lambda ls: [l.replace('DE-END ui-overview-open quiet=ok', 'DE-END ui-overview-open') for l in ls], 'ui timeout: ui-overview-open'),
+            (lambda ls: [l.replace('DE-SETTLED app-konsole-1 quiet=ok', 'DE-SETTLED app-konsole-1 quiet=timeout') for l in ls], 'settle timeout: app-konsole-1'),
+            (lambda ls: [l.replace('DE-SETTLED app-konsole-1 quiet=ok', 'DE-SETTLED app-konsole-1') for l in ls], 'settle timeout: app-konsole-1'),
+            (lambda ls: [l.replace('DE-SETTLED click-konsole-1 quiet=ok', 'DE-SETTLED click-konsole-1 quiet=timeout') for l in ls], 'settle timeout: click-konsole-1'),
+            (lambda ls: [l.replace('DE-SETTLED app-chromium-1 quiet=ok', 'DE-SETTLED app-chromium-1 quiet=timeout') for l in ls], 'settle timeout: app-chromium-1'),
+            (lambda ls: [l.replace('DE-KWIN-SCRIPT loaded', 'DE-KWIN-SCRIPT missing') for l in ls], 'demarker script'),
+            (lambda ls: [l for l in ls if not l.startswith('DE-KWIN-SCRIPT ')], 'no DE-KWIN-SCRIPT'),
+            (lambda ls: [l.replace('DE-SHELL-MAPPED at=50.0', 'DE-SHELL-MAPPED timeout') for l in ls], 'plasmashell'),
+            (lambda ls: ls[:-1] + ['DE-KILLED pid=901 t=299.0', ls[-1]], 'close killed'),
+            (lambda ls: ls[:-1] + ['DE-QUIET-TIMEOUT close-konsole t=299.0', ls[-1]], 'quiet timeout'),
+            (lambda ls: ls[:-1] + ['DE-SP-TIMEOUT t=299.0', ls[-1]], 'DE-SP-TIMEOUT'),
+            (lambda ls: ls[:-1] + ['DE-SP-NO-HOOK t=299.0', ls[-1]], 'DE-SP-NO-HOOK'),
+            (lambda ls: [l for l in ls if not l.startswith('SP /done')], 'Speedometer: no score'),
+        ]
+        for mutate, expected in cases:
+            probs = eval_problems(mutate(base))
+            self.assertTrue(any(expected in p for p in probs), (expected, probs))
+        self.assertIn('vm exit: 1', eval_problems(base, exit_code=1))
+        self.assertIn('vm exit: None', eval_problems(base, exit_code=None))
+        self.assertIn('capped', eval_problems(base, capped=True))
+
+    def test_ui_effect_noops_fail(self):
+        base = full_console(('idle', 'ui', 'apps'), v2=True)
+        bad_lines = [
+            ('DE-UI-EFFECT ui-overview-open ', 'DE-UI-EFFECT ui-overview-open before_ov=0 after_ov=0 effect=noop t=90.0'),
+            ('DE-UI-EFFECT ui-overview-close ', 'DE-UI-EFFECT ui-overview-close before_ov=1 after_ov=1 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-desktop-next ', 'DE-UI-EFFECT ui-desktop-next before_desk=1 after_desk=1 before_deskid=d1 after_deskid=d1 effect=noop t=90.0'),
+            ('DE-UI-EFFECT ui-desktop-next ', 'DE-UI-EFFECT ui-desktop-next before_desk=1 after_desk=2 before_deskid=d1 after_deskid=d1 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-place ', 'DE-UI-EFFECT ui-window-place before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=200,200,1000,700 after_geom=200,200,1000,700 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-move ', 'DE-UI-EFFECT ui-window-move before_win=w2 after_win=w1 before_normal=1 after_normal=1 before_geom=80,60,900,600 after_geom=560,300,900,600 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-move ', 'DE-UI-EFFECT ui-window-move before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=80,60,900,600 after_geom=104,72,900,600 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-grow ', 'DE-UI-EFFECT ui-window-grow before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=560,300,900,600 after_geom=560,300,900,600 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-maximize ', 'DE-UI-EFFECT ui-window-maximize before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=560,300,1260,840 after_geom=560,300,1261,841 before_max=0 after_max=0 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-restore ', 'DE-UI-EFFECT ui-window-restore before_win=w2 after_win=w2 before_normal=1 after_normal=1 before_geom=0,0,1920,1036 after_geom=560,300,1260,840 before_max=3 after_max=3 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-switch ', 'DE-UI-EFFECT ui-window-switch before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=0 distinct=1 seq=none other_pid=none expected_other_pid=302 effect=noop t=90.0'),
+            ('DE-UI-EFFECT ui-window-switch ', 'DE-UI-EFFECT ui-window-switch before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=1 distinct=2 seq=w1 other_pid=302 expected_other_pid=302 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-switch ', 'DE-UI-EFFECT ui-window-switch before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=4 distinct=2 seq=w1,w1,w2,w2 other_pid=302 expected_other_pid=302 effect=ok t=90.0'),
+            ('DE-UI-EFFECT ui-window-switch ', 'DE-UI-EFFECT ui-window-switch before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=4 distinct=2 seq=w1,w2,w1,w2 other_pid=999 expected_other_pid=302 effect=ok t=90.0'),
+        ]
+        for prefix, replacement in bad_lines:
+            mutated = [replacement if l.startswith(prefix) else l for l in base]
+            probs = eval_problems(mutated, phases=('idle', 'ui', 'apps'))
+            self.assertTrue(any('ui no-op:' in p for p in probs), (replacement, probs))
+        missing_effect = [l for l in base if not l.startswith('DE-UI-EFFECT ui-window-place ')]
+        self.assertIn('ui effect missing: ui-window-place', eval_problems(missing_effect, phases=('idle', 'ui', 'apps')))
+        dup_effect = [l.replace('effect=ok', 'effect=noop') if l.startswith('DE-UI-EFFECT ui-window-switch ') else l for l in base]
+        dup_effect.insert(-1, 'DE-UI-EFFECT ui-window-switch before_win=w2 after_win=w2 before_cls=dolphin after_cls=dolphin before_pid=402 after_pid=402 before_normal=1 after_normal=1 switches=4 distinct=2 seq=w1,w2,w1,w2 other_pid=302 expected_other_pid=302 effect=ok t=199.0')
+        self.assertIn('ui effect duplicate: ui-window-switch', eval_problems(dup_effect, phases=('idle', 'ui', 'apps')))
+
+    def test_analyse_rejudges_stored_runs_and_preserves_contention_and_translate(self):
+        d = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, d, True)
+        lines = full_console(('idle', 'browsers', 'speedometer'), v2=True)
+        (d / 'boot-1.markers.json').write_text(json.dumps(stamps(lines)))
+        (d / 'boot-1.display.jsonl').write_text('')
+        (d / 'boot-1.perf').write_text('')
+        tr_idle = {'count': 1418, 'host_s': 0.5, 'parts_s': {'fexc': 0.1}, 'first_seen': 10,
+                   'answers': {'memory': 1400, 'disk': 0, 'fexc': 18, 'none': 0}}
+        stored = {'name': 'desktop-kde-browser', 'emu': 'natemu', 'vcpus': 4, 'ram_gib': 8,
+                  'phases': ['idle', 'browsers', 'speedometer'], 'compile_cache': 'off', 'pass': False,
+                  'boots': [{'boot': 1, 'seconds': 100.0, 'exit': 0, 'capped': False, 'contended': [], 'problems': ['stale'],
+                             'analysis': {'requests_files': 4, 'windows': [{'name': 'idle', 'translate': tr_idle}]}}]}
+        (d / 'result.json').write_text(json.dumps(stored))
+        self.assertEqual(rd.analyse(types.SimpleNamespace(out=d)), 0)
+        res = json.loads((d / 'result.json').read_text())
+        self.assertTrue(res['pass'])
+        self.assertEqual(res['boots'][0]['problems'], [])
+        self.assertEqual(res['boots'][0]['speedometer']['score'], 3.14)
+        self.assertEqual(res['boots'][0]['analysis']['requests_files'], 4)
+        idle_w = next(w for w in res['boots'][0]['analysis']['windows'] if w['name'] == 'idle')
+        self.assertEqual(idle_w['translate']['count'], 1418)
+
+        stored['boots'][0]['contended'] = ['qemu']
+        (d / 'result.json').write_text(json.dumps(stored))
+        self.assertEqual(rd.analyse(types.SimpleNamespace(out=d)), 3)
+
+        broken = [l.replace('DE-SETTLED app-chromium-1 quiet=ok', 'DE-SETTLED app-chromium-1 quiet=timeout') for l in lines]
+        (d / 'boot-1.markers.json').write_text(json.dumps(stamps(broken)))
+        stored['pass'] = True
+        stored['boots'][0]['contended'] = []
+        stored['boots'][0]['problems'] = []
+        (d / 'result.json').write_text(json.dumps(stored))
+        self.assertEqual(rd.analyse(types.SimpleNamespace(out=d)), 1)
+        res = json.loads((d / 'result.json').read_text())
+        self.assertFalse(res['pass'])
+        self.assertIn('settle timeout: app-chromium-1 (quiet=timeout)', res['boots'][0]['problems'])
+
+    def test_family_toml_has_plain_build_desktop_cases(self):
+        fam = tomllib.loads((pathlib.Path(__file__).with_name('family.toml')).read_text())
+        desktop = next(s for s in fam['suite'] if s['name'] == 'desktop')
+        cases = desktop['cases']
+        self.assertIn('desktop-kde', cases)
+        self.assertIn('desktop-kde-browser', cases)
+        for name, phases in (('desktop-kde', 'idle,ui,apps'), ('desktop-kde-browser', 'idle,browsers,speedometer')):
+            argv = cases[name]['argv']
+            self.assertIn('{runtime}', argv)
+            self.assertNotIn('{runtime_perf}', argv)
+            self.assertNotIn('--perf-log', argv)
+            self.assertEqual(argv[argv.index('--phases') + 1], phases)
 
 
 if __name__ == '__main__':
