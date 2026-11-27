@@ -11,7 +11,7 @@ verification run can cite its corpus.  A file is regenerated if it, or build.jso
 (seed, generator/reference source, pins).  programs.json needs host clang; expected.json also needs Docker and the
 pinned image/QEMU (without them: exit nonzero with a message; programs.json is still built).
 """
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys
+import argparse, fcntl, hashlib, json, os, pathlib, shutil, subprocess, sys
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 FIX = REPO / 'fixtures' / 'slice1'
@@ -53,7 +53,15 @@ def run(script, *args):
 
 def build(programs_only=False):
     """Ensure the files exist and are current for the manifest inputs; returns the list of files (re)generated."""
-    m = json.loads(MANIFEST.read_text()); gen = m['generator']; check_pins(m)
+    # Concurrent cold precision shards request the same fixture. The three files form a single generation:
+    # a programs-only call can invalidate expected_inputs while a full build publishes its matching answers.
+    with MANIFEST.open() as manifest:
+        fcntl.flock(manifest.fileno(), fcntl.LOCK_EX)
+        return _build(json.load(manifest), programs_only)
+
+
+def _build(m, programs_only):
+    gen = m['generator']; check_pins(m)
     assert gen['script'] == 'tools/reference/gen_slice1.py', 'manifest names a different generator'
     rec = json.loads(RECORD.read_text()) if RECORD.exists() else {}
     p_in = {'seed': gen['seed'], 'generator_sha256': sha(REPO / gen['script'], HERE / 'flags.py', HERE / 'ref.py')}
@@ -70,7 +78,10 @@ def build(programs_only=False):
             os.replace(new, EXPECTED); done.append('expected.json'); rec['expected_inputs'] = e_in
         check_pins(m)
     rec['sha256'] = {'programs.json': sha(PROGRAMS), **({'expected.json': sha(EXPECTED)} if EXPECTED.exists() else {})}
-    if done or not RECORD.exists(): RECORD.write_text(json.dumps(rec, indent=1) + '\n')
+    if done or not RECORD.exists():
+        new = RECORD.with_suffix('.json.new')
+        new.write_text(json.dumps(rec, indent=1) + '\n')
+        os.replace(new, RECORD)
     return done
 
 
