@@ -2753,7 +2753,10 @@ acknowledgement passed every run; the order is an invariant of `events::wait_mai
 commented there. `adversarial` (the review's cases, both block sizes): `reversed` (command before APIC ID), `early` (the
 Wakeup in the mailbox before any vCPU runs), `alias` (the mailbox through a second linear page), `noise` (an awake AP
 storing into the page's OS area while the others are woken), `nowait` (two Wakeups with no wait for the first
-acknowledgement; AP 2 starts, AP 1 starts or keeps waiting, never at AP 2's vector): 28/28. `trampoline` 6/6 vs pinned QEMU at N = 2..4, both block
+acknowledgement). The original run passed 28/28. The overlapping writes let either addressed AP sample either
+vector, and a late acknowledgement from AP 1 can clear AP 2's command. The current fixture records the entry vector
+by actual APIC ID, checks each AP's endpoint or parked state, and forces both APs through the first vector in
+`nowait-mixed`. `trampoline` 6/6 vs pinned QEMU at N = 2..4, both block
 sizes: Linux 6.12's `trampoline_start64` 64-bit branch (LIDT, LGDT, the LA57 check, LOCK BTS lock with PAUSE, the
 real-mode stack, MOV SS/DS/ES/FS/GS, MOV CR3, LRETQ) and `secondary_startup_64` to the lock release (`verify_cpu`
 inlined, CR3, CR4 PSE then PGE, STARTUP_READ_APICID through the xAPIC page, the CPU-number lookup, the per-CPU stack, the

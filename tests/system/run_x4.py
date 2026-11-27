@@ -23,8 +23,9 @@
   last AP is in the mailbox before any vCPU runs), `alias` (every AP woken through a second linear page mapped onto the
   mailbox page), `noise` (AP 1, once woken, stores 5,000 times into the page's OS area while the BSP wakes the others),
   `nowait` (two Wakeups, AP 1's and AP 2's, with no wait for the first acknowledgement, an OS protocol violation: AP 2
-  starts, AP 1 starts or keeps waiting, never at AP 2's vector, nothing hangs). Started APs run once at their vector and
-  reach their end; the others end halted.
+  can see the old vector, AP 1 can see the new one, and a late acknowledgement can consume the second command). Each AP
+  identifies itself with CPUID, records its entry vector and reaches its own end once, or stays parked. `nowait-mixed`
+  forces both APs to enter the first vector before the BSP leaves a new command for the already-running AP 2.
 - `trampoline`: Linux 6.12's AP path after the wakeup, transcribed (`trampoline_start64`'s 64-bit branch: LIDT, LGDT, the
   LA57 check, the LOCK BTS trampoline lock with PAUSE, the real-mode stack, MOV SS/DS/ES/FS/GS, MOV CR3, LRETQ; then
   `secondary_startup_64`: `verify_cpu`, CR3, the CR4 PSE/PGE writes, the APIC ID from the xAPIC page, the CPU number
@@ -274,8 +275,91 @@ def adversarial_description(n, bsp, mailbox=bytes(16), extra=(), ap_bodies=None)
     return '\n'.join(lines[:at] + list(extra) + lines[at:])
 
 
+def nowait_ap():
+    # Record the entry vector in the real CPU's slot, even if both APs ran the same body.
+    # The driver stops each AP at the end of its own initial body (V(APIC ID) + .end).
+    return f"""    lea r8, [rel $]
+    mov eax, 1
+    cpuid
+    shr ebx, 24
+    mov edi, ebx
+    shl edi, 8
+    mov [rdi + {SLOT(0) + 8:#x}], r8
+    lock inc qword [rdi + {SLOT(0) + 0x10:#x}]
+    shl ebx, 12
+    lea eax, [rbx + {V(0):#x} + (.end - $$)]
+    jmp rax
+.end:"""
+
+
+def nowait_description(n, mixed):
+    if mixed:
+        # Force the two observations from the failing race. First AP 1 acknowledges vector 1.
+        # AP 2 then samples the still-old vector and acknowledges before the BSP reissues the command.
+        bsp = wake(MB, 1, 0) + f"""    mov dword [{MB + 4:#x}], 2
+    mov word [{MB:#x}], 1
+""" + wait_ack(MB, 1)
+    else:
+        # The BSP changes the ID and vector without waiting for AP 1 to acknowledge.
+        bsp = f"""    mov dword [{MB + 4:#x}], 1
+    mov qword [{MB + 8:#x}], {V(1):#x}
+    mov word [{MB:#x}], 1
+    mov dword [{MB + 4:#x}], 2
+"""
+    bsp += f"""    mov qword [{MB + 8:#x}], {V(2):#x}
+    mov word [{MB:#x}], 1
+.wait: cmp word [{MB:#x}], 0
+    je .done
+    cmp qword [{SLOT(2) + 0x10:#x}], 0
+    jne .done
+    pause
+    jmp .wait
+.done: movzx eax, word [{MB:#x}]
+    mov [{R + 16:#x}], rax
+    cmp r11, r11"""
+    return adversarial_description(n, bsp, ap_bodies={i: nowait_ap() for i in range(1, n)})
+
+
+def judge_nowait(n, mixed, out):
+    cpus = out['cpus']
+    if len(cpus) != n:
+        return [f'got {len(cpus)} CPU reports, expected {n}']
+    problems = []
+    mem = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpus[0]['memory']}
+
+    def q(base, offset):
+        return int.from_bytes(mem[base][offset:offset + 8], 'little')
+
+    if cpus[0]['stop'] != 'reached':
+        problems.append(f"BSP stopped {cpus[0]['stop']} {cpus[0]['reason']}")
+    started = {}
+    body_bytes = len(asm(nowait_ap()))
+    for i, c in enumerate(cpus[1:], 1):
+        vector, count = (q(SLOT(0), 0x100 * i + o) for o in (8, 0x10))
+        mailbox, _, ack_time, _ = c['stats']['mailbox']
+        if count:
+            started[i] = vector
+            if i not in (1, 2) or count != 1 or vector not in (V(1), V(2)):
+                problems.append(f'cpu{i} ran {count} times at {vector:#x}')
+            if mailbox or not ack_time or c['stop'] != 'reached' or smp.num(c['rip']) != V(i) + body_bytes:
+                problems.append(f"cpu{i} ran but stopped {c['stop']} {c['reason']} at {c['rip']}, mailbox {mailbox:#x}, ack {ack_time}")
+        elif (vector or mailbox != MB or ack_time or smp.num(c['rip']) != V(i)
+              or c['stop'] != 'resident' or 'halted' not in c['reason']):
+            problems.append(f"cpu{i} has no entry but stopped {c['stop']} {c['reason']} at {c['rip']}, vector {vector:#x}, mailbox {mailbox:#x}, ack {ack_time}")
+    # Once the final command is written the only possible change is an ACK (1 -> 0). A late AP 1
+    # ACK may clear it, leaving AP 2 parked. It can stay pending only if AP 2 was already awake.
+    seen, final = q(R, 16), int.from_bytes(mem[MB][:2], 'little')
+    if not started or (seen, final) not in ((0, 0), (1, 1), (1, 0)) or seen == 1 and 2 not in started:
+        problems.append(f'AP starts {started}, final command at BSP/join {seen}/{final}')
+    if seen == 1 and final == 0 and 1 not in started:
+        problems.append('the command cleared after the BSP saw AP 2 awake, but AP 1 never acknowledged')
+    if mixed and (started != {1: V(1), 2: V(1)} or (q(R, 0), q(R, 8), seen, final) != (1, 1, 1, 1)):
+        problems.append(f'mixed control: starts {started}, acknowledgements {q(R, 0)}/{q(R, 8)}, command {seen}/{final}')
+    return problems
+
+
 def adversarial_cases():
-    """name -> (vCPU counts, n -> (description, the APs that must start; None: `nowait`'s either-or))."""
+    """name -> (vCPU counts, n -> (description, required APs; None for the overlapping-command cases))."""
     noise_ap = f"""    lea rax, [rel $]
     mov [{SLOT(1) + 8:#x}], rax
     lock inc qword [{SLOT(1) + 0x10:#x}]
@@ -294,11 +378,8 @@ def adversarial_cases():
             extra=[f'region {ALIAS:#x} 0x1000', f'entry {ALIAS:#x} 1 clear 0xf0000']), set(range(1, n)))),
         'noise': ((2, 3, 4), lambda n: (adversarial_description(n, ''.join(wake(MB, i, i - 1) for i in range(1, n)) + '    cmp r11, r11',
             mailbox=bytes(0x200), ap_bodies={1: noise_ap}), set(range(1, n)))),
-        'nowait': ((3, 4), lambda n: (adversarial_description(n, f"""    mov dword [{MB + 4:#x}], 1
-    mov rax, {V(1):#x}
-    mov [{MB + 8:#x}], rax
-    mov word [{MB:#x}], 1
-""" + wake(MB, 2, 0) + '    cmp r11, r11'), None)),
+        'nowait': ((3, 4), lambda n: (nowait_description(n, mixed=False), None)),
+        'nowait-mixed': ((3,), lambda n: (nowait_description(n, mixed=True), None)),
     }
 
 
@@ -311,22 +392,14 @@ def cmd_adversarial(a, report):
                 text, want = make(n)
                 rc, out, err = driver(a.host, a.runtime, a.fexc, text, a.out / 'adversarial' / tag, block, timeout=120)
                 problems = [f'driver exit {rc}: {err.strip()[-400:]}'] if rc else []
-                if not rc:
+                if not rc and want is None:
+                    problems += judge_nowait(n, name == 'nowait-mixed', out)
+                elif not rc:
                     cpus = out['cpus']
                     mem = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpus[0]['memory']}
                     slot = lambda i, o: int.from_bytes(mem[SLOT(0)][0x100 * i + o:0x100 * i + o + 8], 'little')
                     started = {i for i in range(1, n) if slot(i, 0x10)}
-                    # `nowait`'s violation leaves AP 1's command pending while the BSP writes AP 2's ID, then its
-                    # vector: AP 2 can read the command and its own ID before the new vector and start at AP 1's
-                    # (as firmware would). It then runs AP 1's body (slot 1) and fails however that code fails, while
-                    # AP 1 keeps waiting. Only the BSP's end and "nothing hangs" (driver exit 0) remain required.
-                    if want is None and started == {1} and cpus[1]['stop'] == 'resident' and 'halted' in cpus[1]['reason']:
-                        problems += [f"cpu0 stopped {cpus[0]['stop']} {cpus[0]['reason']}"] if cpus[0]['stop'] != 'reached' else []
-                        report.append({'name': tag, 'problems': problems, 'outcome': 'AP 2 took the pending wakeup'})
-                        failures += [f'{tag}: {p}' for p in problems]
-                        print(tag, 'ok (AP 2 took the pending wakeup)' if not problems else problems[:3], flush=True)
-                        continue
-                    if not (started == want or want is None and started in ({2}, {1, 2})):
+                    if started != want:
                         problems.append(f'started {sorted(started)}, want {want}')
                     problems += [f'cpu{i} ran {slot(i, 0x10)} times at {slot(i, 8):#x}' for i in started if slot(i, 0x10) != 1 or slot(i, 8) != V(i)]
                     problems += [f"cpu{i} stopped {c['stop']} {c['reason']}" for i, c in enumerate(cpus)
