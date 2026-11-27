@@ -850,3 +850,27 @@ item 5).
 - **Direct links only where the code TLB earns them:** keep a link checked until its target page has been filled in the
   code TLB in N epochs, then make it guarded.
 
+## 12. L2: block_at fix, guard-stub regression, and predeclared desktop runs
+
+**The fix (`91fe2a1b`):** `block_at` now binary-searches the extent-start table rather than failing when a guard-stub
+lookup lands near zero-sized trailing blocks, with an exact guard-stop regression (`guard_stop.rs` + `guard-stub-records`).
+
+**Verification and negative controls:**
+- **Negative control (`20261127-024240-abc0`):** the old `block_at` search failed 9/41 across `two-system` and
+  `system-then-code` with `bad_stop detail=11`.
+- **Mutant control (`20261127-025338-ba8e`):** a skipped-bank mutant failed 38/38 stub schedules.
+- **Passing regression (`20261127-025259-cf00`):** `guard-stub-records` passed 41/41.
+- **Branch suite (`20261127-025619-983f`):** `run --base 320133c8` passed 102,852 checks across 13 families; `k2-stifirst`
+  passed 20/20 isolated (`20261127-033658-3482`).
+- **Independent review:** Codex (`gpt-6.2-astra`) review and sign-off (`task-82` + `01a21ca6`).
+
+**Predeclared desktop runs on `91fe2a1b`** (six clean runs, zero `BAD_STOP`, `problems=[]`):
+- **M4:**
+  - `desktop-kde-profile` `20261127-033911-b388` (`idle_desktop` 24.48 s)
+  - `desktop-kde-browser-profile` `20261127-034301-c5cc` (Chromium cold 8.57 s, warm 4.16 s; Firefox 9.10 / 5.06 s; Speedometer 3.04)
+  - `desktop-kde-browser-profile` `20261127-034859-a9c8` (Chromium cold 7.94 s, warm 4.07 s; Firefox 8.99 / 3.87 s; Speedometer 3.17)
+- **M2 Max:**
+  - `desktop-kde-profile` `20261127-033829-5335` and `20261127-034204-e3ec`
+  - `desktop-kde-browser-profile` `20261127-034738-3191`
+
+
