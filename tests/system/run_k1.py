@@ -2487,6 +2487,76 @@ def fill_runs(a, report):
     return failures
 
 
+def guard_stub_records(a):
+    """A short guarded block followed in INDEX by CPUID and either another CPUID or an unguarded block."""
+    host, runtime = hooks_build(a)
+    d = P.SYS_D(0)
+    owner, second_page, switch = d + 0x5108, d + 0x6000, d + STUB['enter']
+    start = P.SYS_CODE(0)
+    outcomes = []
+    for layout, name in ((1, 'two-system'), (2, 'system-then-code')):
+        system = owner - 4 if layout == 1 else second_page - 2
+        trigger = owner if layout == 1 else second_page
+        bootstrap = P.body(start, f"""
+    mov rax, {P.SYS_T(0, 0):#x}
+    mov cr3, rax
+    mov rax, cr4
+    or eax, 0x80
+    mov cr4, rax
+    mov rbx, {owner:#x}
+    mov r13, {system:#x}
+    mov rax, {switch:#x}
+    jmp rax
+""")
+        memory = P.sys_tables(0, 0, 1, {second_page: second_page | P.LEAF | G})
+        for at, data in ((owner, P.asm('jmp r13')), (switch, P.asm('nop\njmp rbx')),
+                         (system, bytes.fromhex('0fa2') * (2 if layout == 1 else 1)),
+                         (second_page, CODE(0x12))):
+            memory.append({'addr': hex(at), 'data': data.hex()})
+        cpu = P.cpu(0, start, r8=0x123456789abcdef0, r9=0x76543210fedcba98)
+        cpu.update(cpl=0, rflags=0xa97, switches=[(switch, 3)])
+        text = s3.smp_description(dict(system=True, cpus=[cpu], bodies=[bootstrap], memory=memory))
+        env = dict(os.environ, NATEMU_GUARDS='on', NATEMU_PIC='off', NATEMU_MISS_FAST='off')
+        env.pop('NATEMU_PIC_TEST', None)
+
+        # Both paths execute words 0–6. A hit executes 7 and branches to the body. A miss skips 7 and takes 8–11.
+        variants = [('body', 12)] + [(f'hit-{i}', i) for i in range(8)] + [(f'miss-{i}', 16 + i) for i in (*range(7), *range(8, 12))]
+        baseline, guard_entry = None, None
+        for at, word in variants:
+            label = f'guard-stub-records/{name}/{at}'
+            env['NATEMU_GUARD_STOP_TEST'] = f'{owner:x},{trigger:x},{layout:x},{word:x}'
+            rc, out, err = s3.driver(host, runtime, a.fexc, text, a.out / name / at, timeout=a.timeout, env=env, shape=False)
+            problems = []
+            if rc != 0 or not out:
+                problems.append(f'driver exit {rc}: {err}')
+            else:
+                got = out['cpus'][0]
+                intid, wanted, elr = map(smp.num, got['native'])
+                if got['stop'] != 'resident' or not got['reason'].startswith('guard_test '):
+                    problems.append(f"{got['stop']} {got['reason']}, native {got['native']}")
+                else:
+                    if intid != 1 or wanted == 0 or elr != wanted or got['kicks']['stops_entry'] != 1:
+                        problems.append(f"exact entry SGI not observed: {got['native']}, {got['kicks']}")
+                    if smp.num(got['rip']) != owner or got['gpr'][8:10] != cpu['gpr'][8:10]:
+                        problems.append(f"wrong RIP or sentinels: {got['rip']} {got['gpr'][8:10]}")
+                    if smp.num(got['gpr'][10]) != 0x1122334455667788:
+                        problems.append(f"r10 = {got['gpr'][10]}, want 0x1122334455667788 (banked from live entry frame)")
+                    state = tuple(got[k] for k in ('gpr', 'rflags', 'xmm', 'ymmh', 'mxcsr', 'x87'))
+                    if at == 'body':
+                        baseline = state
+                    elif state != baseline:
+                        problems.append(f'banked state {state} differs from body entry {baseline}')
+                    if word == 0:
+                        guard_entry = elr
+                    if guard_entry is not None and elr != guard_entry + (word % 16) * 4:
+                        problems.append(f'ELR {elr:#x} is not guard word {word % 16} from {guard_entry:#x}')
+                    problems += s3.per_vcpu_checks(got)
+            outcomes.append((label, problems))
+            print(json.dumps({'name': label, 'problems': problems}), flush=True)
+    s3.write_results(a.out, outcomes)
+    return int(any(problems for _, problems in outcomes))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
@@ -2505,8 +2575,11 @@ def main():
     ap.add_argument('--page-currency', default='on', choices=('on', 'off', 'check', 'check-halt'), help='the page record mode of every run (local-gpa and the check programs keep their own)')
     ap.add_argument('--hooks-host', type=pathlib.Path, help='an io-test-hooks host for the hold cases (default: built into target/hooks)')
     ap.add_argument('--hooks-runtime', type=pathlib.Path, help='its resident')
+    ap.add_argument('--guard-stub-records', action='store_true', help='run the exact guard-stop regression')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
+    if a.guard_stub_records:
+        return guard_stub_records(a)
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()

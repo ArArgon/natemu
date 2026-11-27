@@ -1268,6 +1268,10 @@ pub mod cache {
         pub fault_around: u64,
         /// Its counters ([`crate::fault_around::count`]; plain increments in every build). Appended.
         pub fault_around_counts: [u64; crate::fault_around::count::COUNT],
+        /// K1's exact guard-stop fixture (`io-test-hooks` only): guest owner and trigger RIPs, then layout and word.
+        pub guard_stop_test: [u64; 4],
+        /// Native PC, original word and whether the fixture's breakpoint has rung the SGI. Zero PC when inactive.
+        pub guard_stop_break: [u64; 3],
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -4336,6 +4340,8 @@ pub mod stop {
     /// (Not a typed stop: no record.) The interpreter found its own invariant broken (an access its checks did not cover,
     /// a record it cannot key): a bug of natemu's, never the guest's.
     pub const INTERP_BUG: u64 = 86;
+    /// The K1 guard-stop fixture banked state at the requested exact SGI (`io-test-hooks` only).
+    pub const GUARD_TEST: u64 = 87;
     /// The details of the interpreter's stops (`State::native[0]` bits 31:24).
     pub mod interp {
         pub const GATE: u64 = 6;
@@ -4391,6 +4397,7 @@ pub mod stop {
             INTERP_DEBUG => "interp_debug",
             INTERP_MODE => "interp_mode",
             INTERP_BUG => "interp_bug",
+            GUARD_TEST => "guard_test",
             _ => "none",
         }
     }

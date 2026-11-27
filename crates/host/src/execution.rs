@@ -4882,6 +4882,21 @@ pub fn run(
         cache::REUSE_ON
     };
     let control = cache::LOOKUP_OFFSET + cache::CONTROL;
+    #[cfg(feature = "io-test-hooks")]
+    if let Ok(spec) = std::env::var("NATEMU_GUARD_STOP_TEST") {
+        let fields = spec
+            .split(',')
+            .map(|v| u64::from_str_radix(v, 16))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| format!("NATEMU_GUARD_STOP_TEST: {err}"))?;
+        let [owner, trigger, layout, word] = fields.as_slice() else {
+            return Err("NATEMU_GUARD_STOP_TEST needs four hexadecimal fields".into());
+        };
+        area.write_record(
+            control + std::mem::offset_of!(cache::Control, guard_stop_test),
+            [*owner, *trigger, *layout, *word],
+        );
+    }
     area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
     area.write_record(
         control + std::mem::offset_of!(cache::Control, pages),

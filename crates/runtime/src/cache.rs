@@ -294,7 +294,7 @@ fn index(n: usize) -> *mut u32 {
 fn block_ptr(n: usize) -> *mut Block {
     unsafe { (area::META_VA + u64::from(*index(n))) as *mut Block }
 }
-fn block(n: usize) -> &'static Block {
+pub(crate) fn block(n: usize) -> &'static Block {
     unsafe { &*block_ptr(n) }
 }
 /// The single-step block's record (zero, so holding no code, until the first step).
@@ -1617,6 +1617,16 @@ pub fn guards_on() -> bool {
 fn ctlb_table() -> *mut u64 {
     lookup_area::<u64>(area::CTLB)
 }
+#[cfg(feature = "io-test-hooks")]
+pub(crate) fn guard_stop_ctlb(b: &Block, miss: bool) -> u64 {
+    let slot = unsafe { ctlb_table().add(area::ctlb_slot(b.rip)) };
+    if miss {
+        unsafe { slot.write(0) };
+    } else {
+        ctlb_fill(b);
+    }
+    unsafe { slot.read() }
+}
 fn ctlb_list() -> *mut u32 {
     lookup_area::<u32>(area::CTLB_LIST)
 }
@@ -2513,11 +2523,11 @@ fn invalidate_pou(ctr: u64, a: u64) {
 }
 
 /// Code-area word at `offset` (read through the writable alias: the same memory).
-fn word(offset: u64) -> u32 {
+pub(crate) fn word(offset: u64) -> u32 {
     unsafe { ((area::CODE_WRITE_VA + offset) as *const u32).read_volatile() }
 }
 /// Rewrites one placed word and makes it visible to instruction fetch.
-fn rewrite(offset: u64, w: u32) {
+pub(crate) fn rewrite(offset: u64, w: u32) {
     unsafe { ((area::CODE_WRITE_VA + offset) as *mut u32).write_volatile(w) };
     synchronize_code(area::CODE_WRITE_VA + offset, area::CODE_VA + offset, 4);
 }
@@ -3935,26 +3945,23 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     }
     let offset = pc.checked_sub(area::CODE_VA)?;
     let count = control().blocks as usize;
-    let holds = |b: &Block| {
-        u64::from(b.start()) <= offset && offset < u64::from(b.code) + u64::from(b.code_size)
-            || in_hot(b, offset)
+    let in_code = |b: &Block| {
+        b.code_size != 0 && u64::from(b.start()) <= offset && offset < u64::from(b.code) + u64::from(b.code_size)
     };
     // Perf chunk 12: the block found at this word last ([`Control::pc_hints`]).
     let hint = (offset >> 2) as usize % area::PC_HINTS;
     let n = control().pc_hints[hint] as usize;
-    if n < count && holds(block(n)) {
-        return Some(block(n));
+    if n < count {
+        let b = block(n);
+        if in_code(b) || in_hot(b, offset) {
+            return Some(b);
+        }
     }
-    // The last record whose code starts at or below `offset`, or at or below `offset` + 4 (a [`PIC`] block's first word
-    // is 4 bytes before its code): placement order is address order, and a record with no code of its own (a kept record,
-    // an instance; any number back to back) has the fill point of its making, so it never lies between a block holding
-    // `offset` and the last record at or below `offset`, nor after the block starting at `offset` + 4 among those at or
-    // below it.
-    let last = |x: u64| {
+    let last = |x: u64, start: fn(&Block) -> u32| {
         let (mut lo, mut hi) = (0, count);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if u64::from(block(mid).code) <= x {
+            if u64::from(start(block(mid))) <= x {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -3962,28 +3969,15 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
         }
         lo.checked_sub(1)
     };
-    // Hot/cold: else the last record whose hot copy starts at or below (hot addresses are in placement order too; a record
-    // not split has the hot fill point of its making, never below a split block's before it nor at or below a PC in it).
-    let last_hot = |x: u64| {
-        let (mut lo, mut hi) = (0, count);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if u64::from(block(mid).hot) <= x {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo.checked_sub(1)
-    };
-    // (Frame-keyed plan 8.2, review B2: a guarded block's stub is the [`GUARD_LEAD`] bytes before its code: the last record at
-    // or below `offset` + the lead, or the one before it when a block with no code lies between.)
-    let ahead = last(offset + u64::from(GUARD_LEAD));
-    let n = [last(offset), last(offset + 4)]
-        .into_iter()
-        .chain([last_hot(offset.wrapping_sub(4)), ahead, ahead.and_then(|n| n.checked_sub(1))])
-        .flatten()
-        .find(|&n| holds(block(n)))?;
+    // Reserve starts each extent at or above the previous extent's end, including any guard stub or PIC entry.
+    // Records with no code hold the code fill point. A block may start there too, but is filed after those records.
+    let n = last(offset, Block::start)
+        .filter(|&n| in_code(block(n)))
+        .or_else(|| {
+            // A hot copy starts at `hot + 4`. A record with no copy uses the current hot fill point, which may be
+            // the previous copy's last trampoline. Search from four bytes below the PC to keep that trampoline's owner.
+            last(offset.checked_sub(4)?, |b| b.hot).filter(|&n| in_hot(block(n), offset))
+        })?;
     let b = block(n);
     control().pc_hints[hint] = n as u32;
     Some(b)

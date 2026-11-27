@@ -27,6 +27,8 @@ mod events;
 mod fault_around;
 mod fp;
 mod gather;
+#[cfg(feature = "io-test-hooks")]
+mod guard_stop;
 mod half;
 mod helpers;
 mod interpret;
@@ -2396,6 +2398,10 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // slot's only writer but the code's own full entry (`pic::STORE_BASE`).
     let code = cache::code_of(block);
     let mut pc = code.entry();
+    #[cfg(feature = "io-test-hooks")]
+    if let Some(test_entry) = guard_stop::entry(s, f, code) {
+        pc = test_entry;
+    }
     if code.flags & cache::PIC != 0 {
         let test = match cache::control().pic_test {
             t if s.blocks % 2 == 0 => t,
@@ -2523,6 +2529,10 @@ pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64, esr: u64, far: u6
         }
         if kind == 3 {
             interrupted(frame)
+        }
+        #[cfg(feature = "io-test-hooks")]
+        if esr >> 26 == 0x3c && esr & 0xffff == guard_stop::BRK_IMM {
+            guard_stop::breakpoint(frame, elr, spsr)
         }
         if esr >> 26 == 0x3c && esr & 0xffff == u64::from(STOP_IMM) {
             stopped(frame, elr, spsr, armed)
@@ -2771,6 +2781,8 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     }
     // In a page-crossing store's shared probe (`natemu_abi::execution::probe`): the block it returns to (the word after
     // the stub's split check: in x0 at the probe's first word, in d0 after it) runs on to an exit, as from inside a block.
+    #[cfg(feature = "io-test-hooks")]
+    let guard_test = guard_stop::interrupt(&s, intid, elr);
     let pc = probe_returns_to(frame, elr);
     let Some(b) = cache::block_at(pc).filter(|b| b.flags & cache::DEAD == 0) else {
         bad(s)
@@ -2806,6 +2818,11 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     {
         let mut s = at_once(s, entered);
         s.stops_entry += 1;
+        #[cfg(feature = "io-test-hooks")]
+        if guard_test {
+            s.native = [intid, pc, elr];
+            halt(&s, stop::GUARD_TEST)
+        }
         // The step block is entered again (see [`stopped`]).
         if b.flags & cache::STEP != 0 {
             take_invalidations(&mut s);
