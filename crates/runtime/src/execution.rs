@@ -179,6 +179,7 @@ pub unsafe fn start() -> ! {
     #[cfg(feature = "page-study")]
     page_study::init();
     cache::read_ctr_el0();
+    cache::read_cntfrq_el0();
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     fp::reset();
@@ -332,6 +333,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
         let p = crate::perf::enter(crate::perf::LOOKUP);
         let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
         crate::perf::leave(p);
+        s.unlinks += cache::take_demoted();
         let block = match found {
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
             // (M2 Part 2: the boot-time interpreter's records are SYSTEM records too, [`cache::INTERPRETED`], but under an
@@ -510,10 +512,12 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             }
         }
         // S4: a block at an armed instruction breakpoint is entered only from here, after the check above.
+        let n = block.number as usize;
         if !at_breakpoint(&s.cpu, s.cpu.rip) {
-            cache::fill_l1(s.cpu.rip, block);
+            cache::fill_l1(s.cpu.rip, n);
+            s.unlinks += cache::take_demoted();
         }
-        return Some(block);
+        return Some(cache::block(n));
     }
 }
 /// M2 (owner decision, November 2): uncached RAM keeps x86 strong ordering. UC reads and writes are made in program
@@ -689,8 +693,9 @@ unsafe fn executed(s: &mut State, i: System) -> Option<&'static Block> {
 /// K2: the decode kept for the system instruction at `s.cpu.rip` in this context, unless the instruction must be compiled
 /// plain (`State::plain_step`).
 fn kept_system(s: &mut State) -> Option<System> {
-    let b = cache::lookup(s.cpu.rip, s.cpu.code_context(), |b| mapped(s, b))
-        .filter(|b| b.flags & cache::SYSTEM != 0)?;
+    let found = cache::lookup(s.cpu.rip, s.cpu.code_context(), |b| mapped(s, b));
+    s.unlinks += cache::take_demoted();
+    let b = found.filter(|b| b.flags & cache::SYSTEM != 0)?;
     if s.plain_step != 0 {
         return None;
     }
@@ -790,7 +795,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             // no target of the exit's point, and linking the points that name it would patch links the exit did not
             // take (for shared code, maybe in another form: the BAD_LINK the slices hit).
             Some(b) if b.flags & cache::DEAD == 0 && target(b) && s.cpu.rip != exit => None,
-            Some(b) if b.flags & cache::DEAD == 0 && target(b) => Some(b),
+            Some(b) if b.flags & cache::DEAD == 0 && target(b) => Some(b.number as usize),
             _ => {
                 s.native = [0, 0, elr];
                 halt(&s, stop::BAD_LINK)
@@ -810,9 +815,11 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             }
             step(&mut s)
         };
+        let target_num = target.number as usize;
+        let target_flags = target.flags;
         match source {
             // Flushed, or its page invalidated (queued), while the target was found.
-            Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => {
+            Some(src) if s.generation != generation || cache::block(src).flags & cache::DEAD != 0 => {
                 s.stale_links += 1
             }
             // The exit's target was a system instruction: the block found follows it, nothing to link. (Against the exit's
@@ -820,18 +827,19 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             // (Frame-keyed plan step 1b: the RIP the target is entered at, `find`'s, which a shared translation's own does not say.)
             Some(_) if s.cpu.rip != exit => {}
             // An instruction run alone to end a shadow (X2): never linked to.
-            Some(_) if target.flags & cache::STEP != 0 => {}
+            Some(_) if target_flags & cache::STEP != 0 => {}
             // S4: nor a block at an armed instruction breakpoint.
             Some(_) if at_breakpoint(&s.cpu, s.cpu.rip) => {}
             // Perf chunk 25: nor, from a block that starts with a translated STI, a block that starts with one at the same
             // RIP (the STI's exit to its own start must reach `find`, which runs it when an event is held: linked, it would
             // re-enter the block in a loop; one live block per RIP and context makes this the block itself).
-            Some(source)
-                if target.flags & source.flags & cache::STI_FIRST != 0 && s.cpu.rip == here => {}
-            Some(source) => match {
+            Some(src)
+                if target_flags & cache::block(src).flags & cache::STI_FIRST != 0 && s.cpu.rip == here => {}
+            Some(src) => match {
                 let p = crate::perf::enter(crate::perf::PATCH);
-                let linked = cache::link(source, target, here, s.cpu.rip);
+                let linked = cache::link(src, target_num, here, s.cpu.rip);
                 crate::perf::leave(p);
+                s.unlinks += cache::take_demoted();
                 linked
             } {
                 cache::Link::Linked(n) => {
@@ -846,7 +854,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             },
             None => {}
         }
-        enter(&mut s, target)
+        enter(&mut s, cache::block_or_step(target_num))
     }
 }
 
@@ -921,15 +929,16 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     {
         return declined(s, rip, SysFastDecline::Boundary);
     }
-    unsafe { sys_commit(s, frame, rip, i, Some(ran)) }
+    let ran_num = ran.number as usize;
+    unsafe { sys_commit(s, frame, rip, i, Some(ran_num)) }
 }
 /// [`sys_fast`] from the bank on: the boundary before the instruction `i` at `rip` has nothing to do but the events (tested
-/// here, after the bank), and `ran` is the block whose literal exit came here. M2 task 4: also for a dispatcher miss into a
+/// here, after the bank), and `ran` is the block number whose literal exit came here. M2 task 4: also for a dispatcher miss into a
 /// kept IRET ([`miss_fast`], whose checks are that boundary's; `ran` is `None`: a computed exit has no link to be stale):
 /// the kernel's return from an interrupt or an INT 0x80 system call is reached by an indirect jump in Linux. Returns as
 /// `sys_fast` does when it declines.
 #[inline(always)]
-unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ran: Option<&Block>) {
+unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ran: Option<usize>) {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     s.cpu.rip = rip;
     completed(s);
@@ -973,6 +982,7 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
     cache::select_l1(context);
     let p = crate::perf::enter(crate::perf::LOOKUP);
     let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
+    s.unlinks += cache::take_demoted();
     // (Frame-keyed plan step 1b: or a shared translation of RIP's frame, entered there with no record.)
     let found = match found {
         None => shared_fast(s, s.cpu.rip, context, true, &mut false),
@@ -991,18 +1001,20 @@ unsafe fn sys_commit(s: &mut State, frame: &NativeFrame, rip: u64, i: System, ra
         declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
     };
+    let target_num = target.number as usize;
     s.l2_hits += 1;
     // As `linker` counts it: the exit's block killed meanwhile (an A write of the target's revalidation walk).
-    if ran.is_some_and(|ran| s.generation != generation || ran.flags & cache::DEAD != 0) {
+    if ran.is_some_and(|n| s.generation != generation || cache::block(n).flags & cache::DEAD != 0) {
         s.stale_links += 1;
     }
     // (DR7 arms nothing: no block is at a breakpoint.)
-    cache::fill_l1(s.cpu.rip, target);
+    cache::fill_l1(s.cpu.rip, target_num);
+    s.unlinks += cache::take_demoted();
     #[cfg(feature = "perf")]
     {
         cache::control().system_from[SYS_FAST] += 1;
     }
-    unsafe { enter(s, target) }
+    unsafe { enter(s, cache::block(target_num)) }
 }
 /// Fast miss path (docs/restructure/fast-miss-plan.md): a dispatcher miss into a block that is current (or whose source pages the
 /// page record says are mapped as the block's, [`page_record::revalidated_from_record`]) is served from the exit's frame, as
@@ -1033,8 +1045,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     let s = unsafe { &mut *record() };
     #[cfg(feature = "io-test-hooks")]
     crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::MISS_FAST_CHECK);
-    let c = cache::control();
-    if c.miss_fast_off != 0 {
+    if cache::control().miss_fast_off != 0 {
         return;
     }
     if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {
@@ -1064,18 +1075,18 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     if !events::none(s) {
         return decline_fast(fast_decline::EVENT);
     }
-    if c.uncached_count | c.uncached_fence != 0 {
+    if cache::control().uncached_count | cache::control().uncached_fence != 0 {
         return decline_fast(fast_decline::UNCACHED);
     }
     // The tests' and studies' builds count (or perturb) every miss by what it needs: they take the full path.
-    if c.pic_test != 0 || cfg!(any(feature = "pic-count", feature = "dispatch-study")) {
+    if cache::control().pic_test != 0 || cfg!(any(feature = "pic-count", feature = "dispatch-study")) {
         return decline_fast(fast_decline::STUDY);
     }
     // The target (generated code changes none of the code context's inputs, as `sys_fast`'s contract states).
     let rip = frame.x[0];
     let context = s.cpu.code_context();
     cache::select_l1(context);
-    let (remapped, mut unknown) = (c.remapped, false);
+    let (remapped, mut unknown) = (cache::control().remapped, false);
     let p = crate::perf::enter(crate::perf::LOOKUP);
     let found = cache::lookup(rip, context, |b| match page_record::revalidated_from_record(s, b) {
         Mapped::Unknown => {
@@ -1084,6 +1095,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
         }
         mapped => mapped,
     });
+    s.unlinks += cache::take_demoted();
     // Frame-keyed plan step 1b: no block at RIP: a shared translation of RIP's frame, entered there with no record.
     let found = match found {
         None if !unknown => shared_fast(s, rip, context, false, &mut unknown),
@@ -1092,7 +1104,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     crate::perf::leave(p);
     let Some(target) = found else {
         // (A `No` the search passed over is counted again by the full path's walk.)
-        c.remapped = remapped;
+        cache::control().remapped = remapped;
         return decline_fast(if unknown { fast_decline::UNKNOWN } else { fast_decline::NO_BLOCK });
     };
     if target.flags & cache::SYSTEM != 0 {
@@ -1108,12 +1120,19 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     }
     // Commit: all writes are resident-side. `completed`'s effect (`stepped` is a no-op with `debug` 0); what `enter` writes with
     // no shadow; the counts `find` and `enter` make; the L1 refill (the point of the path: with its code synchronization).
+    let target_num = target.number as usize;
+    let target_entry = if target.flags & cache::GUARDED != 0 {
+        target.entry()
+    } else {
+        cache::code_of(target).full_entry()
+    };
     s.cpu.rflags &= !RFLAGS_RF;
     s.shadow_entry = 0;
     s.blocks += 1;
     s.l2_hits += 1;
-    c.fast_taken += 1;
-    cache::fill_l1(rip, target);
+    cache::control().fast_taken += 1;
+    cache::fill_l1(rip, target_num);
+    s.unlinks += cache::take_demoted();
     select_guest_space(s);
     crate::perf::enter(crate::perf::GUEST);
     // SAFETY: the target is a live block; the frame is the gate's, intact (see `resume_exception`'s layout contract). PSTATE as
@@ -1121,9 +1140,7 @@ unsafe fn miss_fast(frame: &NativeFrame) {
     unsafe {
         resume_exception(
             frame,
-            // (Frame-keyed plan 8.2: a guarded block at its body: the resident found it current, so its stub's check is not
-            // needed, and the entry depends on no fill having worked.)
-            if target.flags & cache::GUARDED != 0 { target.entry() } else { cache::code_of(target).full_entry() },
+            target_entry,
             BLOCK_SPSR | frame.nzcv,
             alignment_check(&s.cpu),
         )
@@ -1228,11 +1245,11 @@ fn declined(s: &State, rip: u64, reason: SysFastDecline) {
 /// [`sys_fast`] after its instruction committed: the state is in the record; `find` goes on from its next boundary, and
 /// the rest is the linker's (`ran`, the block whose exit it was; `generation`, the cache's before the instruction).
 #[inline(never)]
-unsafe fn after_system(ran: Option<&Block>, generation: u64) -> ! {
+unsafe fn after_system(ran: Option<usize>, generation: u64) -> ! {
     let mut s = unsafe { load() };
     let found = unsafe { find_from(&mut s, true) };
     // As `linker` counts them: a target killed as it was placed (stepped), or the exit's block gone meanwhile.
-    if ran.is_some_and(|ran| found.is_none() || s.generation != generation || ran.flags & cache::DEAD != 0) {
+    if ran.is_some_and(|n| found.is_none() || s.generation != generation || cache::block(n).flags & cache::DEAD != 0) {
         s.stale_links += 1;
     }
     match found {
@@ -1418,6 +1435,7 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
             // PIC study stage 3: a shared translation's instance; an eligible absolute template is shared first, the first
             // time a second address needs its code (the lazy rewrite: fixed-address code never pays); others are copied.
+            let b_num = b.number as usize;
             let walk = walked(s);
             // None where the stop RIP or a host fence lies on RIP's page or the next (review of stage 3, finding 1): the
             // fence check above sees only this block's bytes, while its translation's local links (made at another
@@ -1426,22 +1444,23 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
             let limited = c.reuse_fences.iter().any(|&f| page_fenced(f))
                 || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)]);
-            let shared = if limited {
-                None
-            } else if b.flags & cache::TRANSLATION != 0 {
-                Some(b)
-            } else if b.flags & cache::UNSHAREABLE == 0
+            let need_share = !limited
+                && b.flags & cache::TRANSLATION == 0
+                && b.flags & cache::UNSHAREABLE == 0
                 && walk & cache::GLOBAL == 0
-                && cache::shares(b.context)
-            {
-                cache::share(b)
+                && cache::shares(b.context);
+            let already_translation = !limited && b.flags & cache::TRANSLATION != 0;
+            let shared_num = if already_translation {
+                Some(b_num)
+            } else if need_share {
+                cache::share(b_num).map(|t| t.number as usize)
             } else {
                 None
             };
             // (Frame-keyed plan step 1b: a shared translation is entered at RIP with no record.)
-            let made = match shared {
-                Some(t) => cache::shared_at(t, rip, walk).map(Some),
-                None => cache::copy(b, rip, s.source_gpa, walk),
+            let made = match shared_num {
+                Some(t) => cache::shared_at(cache::block(t), rip, walk).map(Some),
+                None => cache::copy(cache::block(b_num), rip, s.source_gpa, walk),
             };
             match made {
                 Ok(placed) => {
@@ -2117,8 +2136,11 @@ fn tlb(s: &mut State, global: bool) {
     let p = crate::perf::enter(crate::perf::TLB);
     let t0 = ticks();
     match cache::tlb(global) {
-        Some(n) => s.unlinks += n,
-        None => halt(s, stop::BAD_LINK),
+        Some(n) => s.unlinks += n + cache::take_demoted(),
+        None => {
+            s.unlinks += cache::take_demoted();
+            halt(s, stop::BAD_LINK);
+        }
     }
     if global || tables::reset_cr3() {
         crate::study::holding(!global); // a CR3 load's own full reset is what the study asks about

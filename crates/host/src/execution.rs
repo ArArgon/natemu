@@ -1172,6 +1172,14 @@ struct K1Fkeys {
     ctlb_conflicts: u64,
     ctlb_clears: u64,
     ctlb_invalidated: u64,
+    /// Low-CR3 plain links: cross-page links made plainly in `CR3`, suspended `CR3` records dropped for upgrade,
+    /// `0 -> 1` mode entries, pre-existing cross-page guarded links demoted on entry, and whether low-CR3 plain mode
+    /// was active at the last sample.
+    links_plain_low_cr3: u64,
+    relink_upgraded: u64,
+    low_cr3_entries: u64,
+    guarded_demoted: u64,
+    low_cr3_active: u64,
 }
 impl K1Fkeys {
     fn is_empty(&self) -> bool {
@@ -1192,6 +1200,11 @@ impl K1Fkeys {
             | self.ctlb_conflicts
             | self.ctlb_clears
             | self.ctlb_invalidated
+            | self.links_plain_low_cr3
+            | self.relink_upgraded
+            | self.low_cr3_entries
+            | self.guarded_demoted
+            | self.low_cr3_active
             == 0
     }
 }
@@ -1475,6 +1488,16 @@ impl K1 {
                 ctlb_conflicts: c.ctlb_conflicts,
                 ctlb_clears: c.ctlb_clears,
                 ctlb_invalidated: c.ctlb_invalidated,
+                links_plain_low_cr3: c.links_plain_low_cr3,
+                relink_upgraded: c.relink_upgraded,
+                low_cr3_entries: c.low_cr3_entries,
+                guarded_demoted: c.guarded_demoted,
+                low_cr3_active: u64::from(
+                    c.low_cr3.active != 0
+                        && c.low_cr3_off == 0
+                        && c.link_form_plain == 0
+                        && c.pic_test == 0,
+                ),
             },
             writers: c.writers,
             page_fault_scanned: c.page_fault_scanned,
@@ -1680,6 +1703,14 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         }
         stubs.insert(at, i);
     }
+    let is_local = |target: &cache::Block, source: &cache::Block| {
+        let pages = |b: &cache::Block| {
+            [(b.rip >> 12, b.source_gpa[0]), ((b.rip >> 12).wrapping_add(1), b.source_gpa[1])]
+        };
+        pages(target)
+            .iter()
+            .all(|&(p, g)| g == u64::MAX || pages(source).contains(&(p, g)))
+    };
     let mut linked = HashMap::new();
     let mut points = 0;
     // PIC study stage 3: an instance's link points are its translation's (which holds the words); the dispatcher slots.
@@ -1732,7 +1763,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 if !branch(svc, w).is_some_and(slot) {
                     return Err(bad());
                 }
-                linked.insert((b.number, (svc - u64::from(b.code)) as u32), cache::CHECKED);
+                linked.insert((b.number, (svc - u64::from(b.code)) as u32), (cache::CHECKED, false));
                 continue;
             }
             // Its first word: `b` to a block's body. From absolute code, an absolute block keyed (target, context); from
@@ -1754,14 +1785,28 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             let run_tested =
                 |t: &cache::Block| t.code_size != 0 && exec::run_test_end(|o| word(u64::from(t.code) + o), u64::from(t.code_size)).is_some();
             let target = branch(at, w).and_then(|to| {
-                entries.get(&to).copied().filter(|&t| !(run_tested(b) && run_tested(&blocks[t]))).or_else(|| {
-                    entries.get(&to.wrapping_sub(8)).copied().filter(|&t| run_tested(b) && run_tested(&blocks[t]))
-                })
-                // (A guarded target's stub: only from absolute code on another page, as the resident's `link` makes it.)
-                .or_else(|| stubs.get(&to).copied().filter(|&t| !pic(b) && blocks[t].rip >> 12 != b.rip >> 12))
+                entries
+                    .get(&to)
+                    .copied()
+                    .filter(|&t| !(run_tested(b) && run_tested(&blocks[t])))
+                    .or_else(|| {
+                        entries
+                            .get(&to.wrapping_sub(8))
+                            .copied()
+                            .filter(|&t| run_tested(b) && run_tested(&blocks[t]))
+                    })
+                    .map(|t| (t, false))
+                    // (A guarded target's stub: only from absolute code that is not local, as the resident's `link` makes it.)
+                    .or_else(|| {
+                        stubs
+                            .get(&to)
+                            .copied()
+                            .filter(|&t| !pic(b) && !is_local(&blocks[t], b))
+                            .map(|t| (t, true))
+                    })
             });
             match target {
-                Some(t) if fits(&blocks[t]) => linked.insert((b.number, p.offset), t as u32),
+                Some((t, is_stub)) if fits(&blocks[t]) => linked.insert((b.number, p.offset), (t as u32, is_stub)),
                 _ => return Err(bad()),
             };
         }
@@ -1862,7 +1907,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     p.offset == r.offset()
                 }
         });
-        linked.get(&(r.source, r.offset())) == Some(&r.target)
+        linked.get(&(r.source, r.offset())).map(|&(t, _)| t) == Some(r.target)
             && point.is_some_and(|p| {
                 r.original
                     == if checked {
@@ -1897,7 +1942,19 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     // that is current now (the resident's `current`) with INBOUND set; every local one, a block with LOCAL_INBOUND.
     for (i, r) in records.iter().enumerate() {
         if r.target & cache::CHECKED != 0 {
+            if (i as u64) < control.links_local {
+                return Err(format!(
+                    "checked record {i} lies before links_local {}",
+                    control.links_local
+                ));
+            }
             continue;
+        }
+        if (i as u64) >= control.links_local {
+            return Err(format!(
+                "unchecked record {i} lies at or after links_local {}",
+                control.links_local
+            ));
         }
         let Some(t) = blocks.get(r.target as usize) else {
             return Err(format!("record {i} names block {}", r.target));
@@ -1931,7 +1988,22 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     && source.flags & (cache::PIC | cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
                     && t.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
             });
-            let held = linked.contains_key(&(r.source, r.offset()));
+            let held = source
+                .out
+                .get(r.point())
+                .copied()
+                .filter(|&s| s as u64 > control.links_susp)
+                .and_then(|s| records.get(s as usize - 1))
+                .is_some_and(|l| {
+                    l.source == r.source
+                        && l.point() == r.point()
+                        && linked.contains_key(&(l.source, l.offset()))
+                        && (l.target & cache::CHECKED == 0
+                            || point.is_some_and(|p| {
+                                word(source.link_at(p.offset)) == source.admitted_at(p)
+                                    && word(u64::from(source.code) + u64::from(p.offset)) == p.word
+                            }))
+                });
             let mut why = None;
             if t.flags & cache::DEAD != 0 {
                 why = Some("a dead target");
@@ -1969,6 +2041,17 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 t.rip,
                 t.flags
             ));
+        }
+        if local {
+            if let Some(source) = blocks.get(r.source as usize) {
+                let is_stub = linked.get(&(r.source, r.offset())).is_some_and(|&(_, stub)| stub);
+                if !is_stub && source.flags & cache::PIC == 0 && !is_local(t, source) {
+                    return Err(format!(
+                        "local record {i} from non-PIC block at {:#x} enters body of non-local block at {:#x}",
+                        source.rip, t.rip
+                    ));
+                }
+            }
         }
     }
     let unchecked = records.iter().filter(|r| r.target & cache::CHECKED == 0).count();
@@ -4998,7 +5081,7 @@ pub fn run(
         Ok("plain") => 1u64,
         Ok("checked") => 2,
         Ok("") | Err(std::env::VarError::NotPresent) => 0,
-        Ok(other) => return Err(format!("NATEMU_LINK_FORM={other}: checked or plain (unset: links into global blocks plain, the rest checked)")),
+        Ok(other) => return Err(format!("NATEMU_LINK_FORM={other}: checked or plain (unset: global links plain, adaptive low-CR3 plain, guarded or checked otherwise)")),
         Err(e) => return Err(format!("NATEMU_LINK_FORM: {e}")),
     };
     if plain != 0 {
@@ -5006,6 +5089,13 @@ pub fn run(
         SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_FORM set: link forms changed (debug key)"));
     }
     area.write_record(control + std::mem::offset_of!(cache::Control, link_form_plain), plain);
+    let low_cr3_off = match std::env::var("NATEMU_LOW_CR3").as_deref() {
+        Ok("off") => 1u64,
+        Ok("on") | Ok("") | Err(std::env::VarError::NotPresent) => 0,
+        Ok(other) => return Err(format!("NATEMU_LOW_CR3={other}: on or off")),
+        Err(e) => return Err(format!("NATEMU_LOW_CR3: {e}")),
+    };
+    area.write_record(control + std::mem::offset_of!(cache::Control, low_cr3_off), low_cr3_off);
     // The template pool (chunk 3): the resident looks in it (mapped read-only at `cache::POOL_VA` by `prepare_with_pool`) unless
     // `NATEMU_POOL_LOOKUP=off` (publication without lookup, the A/B of the pool's cost).
     if let Some(pool) = &compiler.pool {

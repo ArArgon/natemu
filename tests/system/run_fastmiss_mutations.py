@@ -28,7 +28,7 @@ MUTATIONS = {
     'fm-entry-not-full-entry': ([(RES, 'cache::code_of(target).full_entry(),\n            BLOCK_SPSR | frame.nzcv', 'cache::code_of(target).entry(),\n            BLOCK_SPSR | frame.nzcv')], 'miss-pic'),
     'fm-ignores-tf-debug': ([(RES, 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {', 'if s.cpu.dr[5] & DR7_ENABLES != 0 {')], 'miss-step'),
     'fm-ignores-dr7': ([(RES, 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {', 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 {')], 'miss-dr7'),
-    'fm-skips-fill-l1': ([(RES, 'c.fast_taken += 1;\n    cache::fill_l1(rip, target);', 'c.fast_taken += 1;')], 'miss-counts'),
+    'fm-skips-fill-l1': ([(RES, 'cache::control().fast_taken += 1;\n    cache::fill_l1(rip, target_num);', 'cache::control().fast_taken += 1;')], 'miss-counts'),
     'fm-resumes-without-alignment-check': ([(RES, 'BLOCK_SPSR | frame.nzcv,\n            alignment_check(&s.cpu),', 'BLOCK_SPSR | frame.nzcv,\n            0,')], 'miss-ac'),
     'fm-takes-system-target': ([(RES, 'if target.flags & cache::SYSTEM != 0 {\n        return decline_fast(fast_decline::SYSTEM);\n    }', '')], 'miss-system'),
     # ---- checks whose programs are other runners' (`slice3:MODE` = tests/smp/run_slice3_vm.py MODE; `m2:ONLY` = tests/system/run_m2.py --only ONLY)
@@ -38,7 +38,7 @@ MUTATIONS = {
     'fm-ignores-lapic-due': ([(RES, 'if lapic::due() {\n        return decline_fast(fast_decline::LAPIC);', 'if false {\n        return decline_fast(fast_decline::LAPIC);')], 'hold-lapic'),
     'fm-ignores-events': ([(RES, 'if !events::none(s) {\n        return decline_fast(fast_decline::EVENT);', 'if false {\n        return decline_fast(fast_decline::EVENT);')], 'hold-event,miss-event'),
     'fm-reads-if-from-record': ([(RES, '    if s.cpu.cpl == 0 {\n        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.', '    if false {\n        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.')], 'hold-event'),
-    'fm-ignores-uncached': ([(RES, 'if c.uncached_count | c.uncached_fence != 0 {', 'if false {')], 'miss-uc'),
+    'fm-ignores-uncached': ([(RES, 'if cache::control().uncached_count | cache::control().uncached_fence != 0 {', 'if false {')], 'miss-uc'),
     # ---- the page record (the plan's M1-M14; M9 is the key without the privilege class: see the table of what is not covered)
     'pr-m1-hit-ignores-frame': ([(RES, '.filter(|&(at, _)| at == gpa)?', '.filter(|&(at, _)| at == gpa || true)?')], 'page-share,page-cross,cr3-switch'),
     'pr-m2-epoch-ignored': ([(ABI, '(r.epoch == epoch || (r.frame', '(true || (r.frame')], 'page-share,remap-cr3,cr3-switch,page-cross'),

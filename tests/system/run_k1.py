@@ -1233,7 +1233,7 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 # `jmp rbx`); EXIT (user) ends in the nop to CPL 0 and is followed by BACK (supervisor: `jmp r12`); S is a supervisor code page. A
 # CPL-3 call sets r12 = the return label, rbx = the target and r13 = EXIT's nop (the code ends `jmp r13`).
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
-STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3', 'guard-invlpg', 'guard-flags', 'guard-hits', 'guard-kill')
+STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3', 'guard-invlpg', 'guard-flags', 'guard-hits', 'guard-kill', 'low-cr3')
 # Frame-keyed plan 8.2, guarded blocks (natemu only: CPL 3). GS (CPU i's page d + GS, mapped at its own address) holds CPL-3 code
 # that jumps straight to V + PY, a link from another page into an absolute user block: its guard stub. Table A maps V -> F1,
 # table B V -> F2 (each frame's code at PY: `mov eax, 0x11|0x12; jmp r13`, or for `guard-flags` RFLAGS' OF|SF|ZF|CF).
@@ -1248,7 +1248,8 @@ STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro', 'guard-cr3
 # - `guard-kill`: the guarded link live, F1's code rewritten (its block dies, the link into its stub is undone), then the cache
 #   flushed (every link undone): each later call runs the bytes now there.
 GUARD = ('guard-cr3', 'guard-invlpg', 'guard-flags', 'guard-hits', 'guard-kill')
-GS = 0x8000
+LOW_CR3 = ('low-cr3',)
+GS, GS2, GS3 = 0x8000, 0xe000, 0xf000
 GUARD_FLAGS = b'\x9c\x58\x25\xc1\x08\x00\x00\x41\xff\xe5'   # pushfq; pop rax; and eax, 0x8c1; jmp r13
 # `fa-ro` (fault-around plan chunk 1, natemu only: QEMU cannot switch CPL): at CPL 3 (the user code on FAUC) a page NRW (R/W = 1, D = 1) read and
 # written (the read installs it writable: no upgrade abort), then NRO (R/W = 0, A = 1, D = 1) read and written: #PF error 7 (present, write,
@@ -1364,6 +1365,32 @@ def chunk_bodies(k, i, n):
         'guard-hits': (f'    mov r14d, {k}\n    xor r8d, r8d\n.gl:\n' + c3('h0', d + GS) + '    add r8, rax\n    dec r14\n    jnz .gl\n'),
         'guard-kill': (c3('k0', d + GS) + save('r8') + c3('k1', d + GS) + save('r9') + f'    mov byte [{d + F1 + PY + 1:#x}], 0x13\n'
                        + c3('k2', d + GS) + save('r10') + flush_text(d) + c3('k3', d + GS) + save('r14')),
+        'low-cr3': (adv_idt(d) + c3('lc_pre', d + GS3)
+                    + f'    mov ecx, 32\n.wu:\n    mov rax, {{ta:#x}}\n    mov cr3, rax\n    dec ecx\n    jnz .wu\n'
+                    + '    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    mov rcx, rax\n    add rcx, 220000000\n'
+                    '.lw:\n    pause\n    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    cmp rax, rcx\n    jb .lw\n'
+                    + c3('lc0', d + GS) + save('r8') + c3('lc1', d + GS) + save('r9')
+                    + c3('lc1b', d + PY)
+                    + cr3('tb') + c3('lc2', d + PY) + save('r10') + c3('lc2b', d + GS) + '    add r10, rax\n'
+                    + cr3('ta') + c3('lc3', d + GS) + save('rbp')
+                    + c3('lc3b', d + PY) + c3('lc3c', d + PY)
+                    + put(d + F2) + inv(d) + c3('lc4', d + PY) + save('r14') + c3('lc4b', d + GS) + '    add r14, rax\n'
+                    + put(d + F1) + inv(d) + c3('lc5', d + GS) + save('r15')
+                    + c3('lc5b', d + PY)
+                    + put(d + F1, P.LEAF & ~1) + f'    mov rax, [{d:#x}]\n'
+                    + c3('lcpf1', d + PY) + '    add r15, rax\n' + c3('lcpf2', d + GS) + '    add r15, rax\n'
+                    + put(d + F1) + inv(d)
+                    + c3('lc6', d + GS2) + save('rsi')
+                    + f'    mov byte [{d + F1 + PZ + 1:#x}], 0x23\n'
+                    + c3('lc7', d + GS2) + save('rdi')
+                    + c3('lc7b', d + GS)
+                    + f'    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    mov [{d + P.SAVE + 8:#x}], rax\n'
+                    + f'    mov ecx, 48\n.bu:\n    mov rax, {{ta:#x}}\n    mov cr3, rax\n    dec ecx\n    jnz .bu\n'
+                    + c3('lc8', d + GS) + '    add r8, rax\n' + c3('lc9', d + GS) + '    add r9, rax\n'
+                    + c3('lc10', d + GS2) + '    add rdi, rax\n' + c3('lc11', d + GS2)
+                    + f'    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    sub rax, [{d + P.SAVE + 8:#x}]\n'
+                    + '    xor ebx, ebx\n    cmp rax, 50000000\n    jae .late\n    mov ebx, 1\n.late:\n'
+                    + f'    jmp .end\n.h:\n    mov rax, {(d + F2) | P.LEAF:#x}\n    mov [{leaf(d):#x}], rax\n    add rsp, 8\n    iretq\n.end:\n'),
         # The fast miss path: K rounds of A, B, C (one L1 set of three RIPs: each call misses into a current block).
         'miss-counts': f'    mov ecx, {k}\n.r:\n' + add('a', A, 'r8') + add('b', B, 'r9') + add('c', C, 'r10') + '    dec ecx\n    jnz .r\n',
         # A CPUID decode (kept, never in L1) reached by a computed jump each round: always a miss, always declined (`system`).
@@ -1417,7 +1444,7 @@ def chunk_memory(name, i, n):
     mem = lambda at, data, **kw: dict({'addr': f'0x{at:x}', 'data': data.hex()}, **kw)
     code = lambda at, k: mem(at, CODE(k), capture=False)
     out = []
-    if name in ('page-global', 'page-user', 'page-user-invlpg', 'page-mark'):
+    if name in ('page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'low-cr3'):
         out += [code(d + F1 + PY, 0x11), code(d + F2 + PY, 0x12), code(d + F1 + PZ, 0x21), code(d + F2 + PZ, 0x22)]
     if name == 'page-cross':
         out += [mem(d + PCX + 0xffe, b'\xb8\x07', capture=False), code(d + XA + 0x100, 0x11)]
@@ -1434,10 +1461,15 @@ def chunk_memory(name, i, n):
         out += [mem(d + GS, jump, capture=False)]
         out += ([mem(d + f + PY, GUARD_FLAGS, capture=False) for f in (F1, F2)] if name == 'guard-flags'
                 else [code(d + F1 + PY, 0x11), code(d + F2 + PY, 0x12)])
+    if name in LOW_CR3:
+        out += [mem(d + GS, P.asm(f'org {d + GS:#x}\njmp {d + PY:#x}'), capture=False),
+                mem(d + GS2, P.asm(f'org {d + GS2:#x}\njmp {d + PZ:#x}'), capture=False),
+                mem(d + GS3, P.asm(f'org {d + GS3:#x}\njmp {d + PY:#x}'), capture=False),
+                dict(P.zero(d + P.SAVE + 8, 8), capture=False)]
     if name in STUB_PROGRAMS:
         out += [mem(d + STUB['enter'], b'\x90', capture=False), mem(d + STUB['user'], b'\xff\xe3', capture=False), mem(d + STUB['exit'], b'\x90', capture=False),
                 mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
-    if name in ('page-user', 'page-user-invlpg'):
+    if name in ('page-user', 'page-user-invlpg', 'low-cr3'):
         out += [dict(P.zero(d + IDT, 0x1000), capture=False)]
     if name in ('miss-step', 'miss-dr7', 'miss-event', 'hold-event', 'hold-lapic'):
         out += [dict(P.zero(d + MIDT, 0x1000), capture=False)]
@@ -1483,6 +1515,7 @@ CHUNK_VALUES = {
     'guard-flags': {'r8': {0x81}, 'r9': {0x81}, 'r10': {0x81}, 'r14': {0x40}, 'r15': {0x800}},
     'guard-hits': lambda i, k: {'r8': {0x11 * k}},
     'guard-kill': {'r8': {0x11}, 'r9': {0x11}, 'r10': {0x13}, 'r14': {0x13}},
+    'low-cr3': {'r8': {0x22}, 'r9': {0x22}, 'r10': {0x24}, 'rbp': {0x11}, 'r14': {0x24}, 'r15': {0x35}, 'rsi': {0x21}, 'rdi': {0x46}},
     'page-mark': {'r8': {1}, 'r9': {0x11}, 'r10': {0x41}},
     'page-size-check': {'r8': {1}, 'r9': {0x11}},
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
@@ -2170,8 +2203,11 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
     # its own form, `link_form`: the default's check of `relink-many`).
     env.pop('NATEMU_LINK_FORM', None)
     env.pop('NATEMU_GUARDS', None)
+    env.pop('NATEMU_LOW_CR3', None)
     if prog.get('guards'):   # (frame-keyed plan 8.2: `guard-hits`' baseline run with no guarded block)
         env['NATEMU_GUARDS'] = prog['guards']
+    if prog.get('low_cr3'):
+        env['NATEMU_LOW_CR3'] = prog['low_cr3']
     form = prog.get('link_form', 'plain' if prog['name'][3:].split('@')[0] in RELINK_PROGRAMS else None)
     if form:
         env['NATEMU_LINK_FORM'] = form
@@ -2594,7 +2630,7 @@ def main():
             want = None if name in EITHER else k1_expected.expected(name, n, a.k, prog)
             # (The pool's programs also without the reuse check: production's, where a pool copy is not asked of the host.)
             # (Frame-keyed plan 8.2: the guard programs too: guarded blocks are placed only without the reuse check.)
-            for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL or name in GUARD else []):
+            for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL or name in GUARD or name in LOW_CR3 else []):
                 out, problems = run(a, prog, extra, check=check)
                 if name in ('pic-ctx', 'pic-xm'):  # (as `contexts`: once per context)
                     problems = [p for p in problems if 'host requests' not in p]
@@ -2634,6 +2670,57 @@ def main():
                     for v, (c, b) in enumerate(zip(out['cpus'], base['cpus'] if base else [])):
                         if misses(c) > misses(b) + a.k // 4:
                             problems.append(f'cpu{v} {misses(c)} dispatcher misses over {a.k} calls, {misses(b)} with no guards: the guard does not hit')
+                # Low-CR3 plain links: quiet phase links plainly, CR3/INVLPG/SMC invalidate, high-CR3 burst drops suspended plain
+                # records (`relink_upgraded > 0`) and upgrades subsequent links to guarded (or checked when guards are off).
+                if out and name in LOW_CR3 and not check and not os.environ.get('NATEMU_PIC_TEST'):
+                    guards_expected = a.page_currency == 'on' and prog.get('guards') != 'off'
+                    on_time_ok = lambda c: (
+                        c['stats']['k1'].get('fkeys', {}).get('relink_upgraded', 0) >= 2
+                        and c['stats']['k1'].get('relink', {}).get('relink_dropped', 0) >= 2
+                        and ((c['stats']['k1'].get('fkeys', {}).get('links_guarded', 0) >= 3
+                              and c['stats']['k1'].get('fkeys', {}).get('ctlb_fills', 0) >= 1)
+                             if guards_expected else
+                             c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0) >= 3)
+                    )
+                    # Retry at most once ONLY when post-burst transitions lacked evidence AND a >50 ms host stall occurred.
+                    pre_ok = not problems and all(
+                        c['stats']['k1'].get('fkeys', {}).get('links_plain_low_cr3', 0) >= 2
+                        and c['stats']['k1'].get('fkeys', {}).get('low_cr3_entries', 0) >= 1
+                        and (not guards_expected or c['stats']['k1'].get('fkeys', {}).get('guarded_demoted', 0) >= 1)
+                        and c['stats']['k1'].get('fkeys', {}).get('guard_misses', 0) == 0
+                        and c['stats']['k1'].get('relink', {}).get('relinked', 0) >= 1
+                        and all(smp.num(c['gpr'][P.REGS.index(reg)]) in ok for reg, ok in EITHER[name].items())
+                        and (on_time_ok(c) or smp.num(c['gpr'][P.REGS.index('rbx')]) == 0)
+                        for c in out['cpus']
+                    )
+                    if pre_ok and any(not on_time_ok(c) and smp.num(c['gpr'][P.REGS.index('rbx')]) == 0 for c in out['cpus']):
+                        out, problems = run(a, prog, extra, check=check, tag='-retry')
+                    for v, c in enumerate(out['cpus'] if out else []):
+                        f = c['stats']['k1'].get('fkeys', {})
+                        r = c['stats']['k1'].get('relink', {})
+                        if (f.get('links_plain_low_cr3', 0) < 2
+                                or f.get('low_cr3_entries', 0) < 1
+                                or (guards_expected and f.get('guarded_demoted', 0) < 1)
+                                or f.get('guard_misses', 0) != 0
+                                or r.get('relinked', 0) < 1
+                                or not on_time_ok(c)):
+                            problems.append(f'cpu{v} low-cr3 fkeys={f} relink={r} rbx={c["gpr"][P.REGS.index("rbx")]}: unexpected low/high CR3 transition counts')
+                    off, off_probs = run(a, dict(prog, low_cr3='off'), extra, check=check, tag='-lowcr3off')
+                    problems += [f'low-cr3=off: {p}' for p in off_probs]
+                    for v, c in enumerate(off['cpus'] if off else []):
+                        f = c['stats']['k1'].get('fkeys', {})
+                        off_ok = f.get('links_guarded', 0) >= 1 if guards_expected else f.get('links_checked_cross', 0) >= 1
+                        if (f.get('links_plain_low_cr3', 0) != 0 or f.get('relink_upgraded', 0) != 0
+                                or f.get('low_cr3_entries', 0) != 0 or f.get('guarded_demoted', 0) != 0
+                                or f.get('low_cr3_active', 0) != 0 or not off_ok):
+                            problems.append(f'cpu{v} low-cr3=off fkeys={f}: low-CR3 switch ignored')
+                        if want:
+                            problems += [f'low-cr3=off {p}' for p in s3.smp.compare(prog, s3.vm_state(prog, off), want)]
+                        allowed = EITHER[name](v, a.k) if callable(EITHER[name]) else EITHER[name]
+                        for reg, ok in allowed.items():
+                            got = smp.num(c['gpr'][P.REGS.index(reg)])
+                            if got not in ok:
+                                problems.append(f'low-cr3=off cpu{v} {reg} = {got:#x}, allowed {[hex(x) for x in sorted(ok)]}')
                 # A block's death undoes its links out by its outbound list: no pass over the records (the pass's records count as scanned).
                 for v, c in enumerate(out['cpus'] if out and name in NO_SWEEP else []):
                     if c['stats']['k1']['scanned']:

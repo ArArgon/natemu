@@ -1272,6 +1272,134 @@ pub mod cache {
         pub guard_stop_test: [u64; 4],
         /// Native PC, original word and whether the fixture's breakpoint has rung the SGI. Zero PC when inactive.
         pub guard_stop_break: [u64; 3],
+        /// Low-CR3 plain links: disabled by host (`NATEMU_LOW_CR3=off`), per-vCPU CR3 switch-rate classifier state,
+        /// link points linked plainly in `CR3` under low-CR3 policy, suspended `CR3` records dropped in `relink`
+        /// because high-CR3 policy requires guarded/checked upgrading, `0 -> 1` mode entries, and pre-existing
+        /// cross-page guarded links demoted on entry. Appended.
+        pub low_cr3_off: u64,
+        pub low_cr3: LowCr3,
+        pub links_plain_low_cr3: u64,
+        pub relink_upgraded: u64,
+        pub low_cr3_entries: u64,
+        pub guarded_demoted: u64,
+        pub demoted_pending: u64,
+    }
+    /// Minimum non-global CR3 loads before low-CR3 plain links can activate (keeps bare-metal guard tests deterministic).
+    pub const LOW_CR3_WARMUP: u64 = 32;
+    /// Sliding-window bucket divisor of `cntfrq_el0` (`cntfrq_el0 / 10` = 100 ms at 24 MHz).
+    pub const LOW_CR3_WINDOW_DIV: u64 = 10;
+    /// Maximum weighted CR3 loads in one `100 ms` window to enter low-CR3 mode (`<= 3` = `<= 30 Hz`).
+    pub const LOW_CR3_ENTER_MAX: u64 = 3;
+    /// Minimum weighted CR3 loads in one `100 ms` window to exit low-CR3 mode (`>= 15` = `>= 150 Hz`).
+    pub const LOW_CR3_EXIT_MIN: u64 = 15;
+    /// Cap on per-bucket CR3 load counts so division-free `u64` numerator math never overflows.
+    const LOW_CR3_CAP: u32 = 1024;
+    /// Per-vCPU two-bucket sliding-window CR3 switch-rate classifier.
+    ///
+    /// Tracks recent `MOV CR3` rate over `[now - W, now]` with hysteresis (`LOW_CR3_ENTER_MAX` vs `LOW_CR3_EXIT_MIN`)
+    /// so single-process workloads after boot transition into plain `CR3`-segment links and direct L1 entries without
+    /// flapping during high-switch workloads. Comparisons use exact division-free `u64` scaling by `W`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct LowCr3 {
+        pub cntfrq_el0: u64,
+        pub win_start: u64,
+        pub win_cur: u32,
+        pub win_prev: u32,
+        pub active: u32,
+        pub initialized: u32,
+    }
+    impl LowCr3 {
+        fn window(&self) -> Option<u64> {
+            let w = self.cntfrq_el0 / LOW_CR3_WINDOW_DIV;
+            (w != 0).then_some(w)
+        }
+        fn advance(&mut self, now: u64, window: u64) -> u64 {
+            if self.initialized == 0 || now < self.win_start {
+                (self.win_start, self.win_cur, self.win_prev, self.initialized) = (now, 0, 0, 1);
+                return 0;
+            }
+            let mut dt = now - self.win_start;
+            if dt >= 2 * window {
+                (self.win_start, self.win_cur, self.win_prev) = (now, 0, 0);
+                return 0;
+            }
+            if dt >= window {
+                self.win_prev = self.win_cur;
+                self.win_cur = 0;
+                self.win_start += window;
+                dt -= window;
+            }
+            let cur = u64::from(self.win_cur.min(LOW_CR3_CAP));
+            let prev = u64::from(self.win_prev.min(LOW_CR3_CAP));
+            cur.saturating_mul(window)
+                .saturating_add(prev.saturating_mul(window - dt))
+        }
+        fn update_active(
+            &mut self,
+            weighted_num: u64,
+            window: u64,
+            total_cr3_loads: u64,
+            can_enter: bool,
+        ) -> bool {
+            if total_cr3_loads < LOW_CR3_WARMUP {
+                self.active = 0;
+                return false;
+            }
+            if self.active != 0 {
+                if weighted_num >= LOW_CR3_EXIT_MIN.saturating_mul(window) {
+                    self.active = 0;
+                }
+                return false;
+            }
+            if can_enter && weighted_num <= LOW_CR3_ENTER_MAX.saturating_mul(window) {
+                self.active = 1;
+                return true;
+            }
+            false
+        }
+        /// Records one CR3 load (`total_cr3_loads` already includes it), updates `active`, and returns whether
+        /// `active` transitioned `0 -> 1`. Skips timer read (`now`) when `disabled` is true.
+        pub fn on_cr3_load(
+            &mut self,
+            now: impl FnOnce() -> u64,
+            total_cr3_loads: u64,
+            disabled: bool,
+            can_enter: bool,
+        ) -> bool {
+            if disabled {
+                self.active = 0;
+                return false;
+            }
+            let Some(window) = self.window() else {
+                self.active = 0;
+                return false;
+            };
+            let weighted_num = self.advance(now(), window).saturating_add(window);
+            self.win_cur = self.win_cur.saturating_add(1).min(LOW_CR3_CAP);
+            self.update_active(weighted_num, window, total_cr3_loads, can_enter)
+        }
+        /// Evaluates whether low-CR3 plain links are currently enabled at `now` (advancing quiet periods too),
+        /// returning `(active, entered_0_to_1)`. Skips timer read (`now`) when `disabled` is true.
+        pub fn evaluate(
+            &mut self,
+            now: impl FnOnce() -> u64,
+            total_cr3_loads: u64,
+            disabled: bool,
+            can_enter: bool,
+        ) -> (bool, bool) {
+            if disabled {
+                self.active = 0;
+                return (false, false);
+            }
+            let Some(window) = self.window() else {
+                self.active = 0;
+                return (false, false);
+            };
+            let weighted_num = self.advance(now(), window);
+            let entered = self.update_active(weighted_num, window, total_cr3_loads, can_enter);
+            (self.active != 0, entered)
+        }
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
@@ -6743,5 +6871,102 @@ mod tests {
             (data.attributes, data.limit, data.base),
             (0x00f3, 0x1234, 0xff00_0001)
         );
+    }
+
+    #[test]
+    fn low_cr3_classifier_warmup_transitions_and_overrides() {
+        const HZ: u64 = 24_000_000;
+        const W: u64 = HZ / cache::LOW_CR3_WINDOW_DIV;
+        assert_eq!(W, 2_400_000);
+
+        let mut lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
+        // Loads 1..31 never activate even if widely spaced (`0` timestamp sentinel safe).
+        let mut total = 0u64;
+        for i in 0..(cache::LOW_CR3_WARMUP - 1) {
+            total += 1;
+            assert!(!lc.on_cr3_load(|| i * 10 * W, total, false, true));
+            assert_eq!(lc.evaluate(|| i * 10 * W, total, false, true), (false, false));
+        }
+        // Load 32 spaced far past 2*W activates cleanly and reports 0 -> 1 entry.
+        total += 1;
+        let t_base = cache::LOW_CR3_WARMUP * 10 * W;
+        assert!(lc.on_cr3_load(|| t_base, total, false, true));
+        assert_eq!(lc.evaluate(|| t_base, total, false, true), (true, false));
+
+        // Burst of 32 loads in < 1 ms suppresses activation during warmup and stays inactive.
+        let mut burst = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
+        for i in 0..cache::LOW_CR3_WARMUP {
+            assert!(!burst.on_cr3_load(|| 1_000 + i * 100, i + 1, false, true));
+        }
+        assert_eq!(burst.evaluate(|| 1_000 + 3200, cache::LOW_CR3_WARMUP, false, true), (false, false));
+
+        // Quiet period decays across W and activates once weighted_num <= ENTER_MAX * W (3 * W).
+        // At 1*W + W/2, prev=32 has weight 32 * 0.5 = 16 > 3.
+        let t_still_high = 1_000 + W + W / 2;
+        assert_eq!(burst.evaluate(|| t_still_high, cache::LOW_CR3_WARMUP, false, true), (false, false));
+        // At 1*W + (W - W/16), prev=32 has weight 32 / 16 = 2 <= 3.
+        let t_decayed = 1_000 + W + (W - W / 16);
+        assert_eq!(burst.evaluate(|| t_decayed, cache::LOW_CR3_WARMUP, false, true), (true, true));
+        assert_eq!(burst.evaluate(|| t_decayed, cache::LOW_CR3_WARMUP, false, true), (true, false));
+
+        // Exact rational boundary (no integer-floor distortion):
+        // prev=3, cur=0 at dt = 0 -> 3*W <= 3*W enters; prev=3, cur=1 at dt = 0.5*W -> 2.5*W <= 3*W enters;
+        // prev=3, cur=1 at dt = 0.25*W -> 3.25*W > 3*W does not enter.
+        let mut eq_lc = cache::LowCr3 {
+            cntfrq_el0: HZ,
+            win_start: 10 * W,
+            win_cur: 0,
+            win_prev: 3,
+            active: 0,
+            initialized: 1,
+        };
+        assert_eq!(eq_lc.evaluate(|| 10 * W, 32, false, true), (true, true));
+
+        let mut exact_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
+        assert!(!exact_lc.on_cr3_load(|| 0, 32, false, false)); // deferred by can_enter=false
+        exact_lc.win_cur = 1;
+        exact_lc.win_prev = 3;
+        exact_lc.win_start = 10 * W;
+        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 4, 32, false, true), (false, false));
+        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 2, 32, false, true), (true, true));
+
+        // Deferral when can_enter=false (`armed != 0`): active stays 0 until can_enter=true.
+        let mut armed_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
+        assert!(!armed_lc.on_cr3_load(|| 100, 32, false, false));
+        assert_eq!(armed_lc.evaluate(|| 100, 32, false, false), (false, false));
+        assert_eq!(armed_lc.evaluate(|| 100, 32, false, true), (true, true));
+
+        // Hysteresis: active stays true for 14 loads in W (< 15), demotes on 15th (>= EXIT_MIN).
+        let t0 = t_decayed + 2 * W;
+        assert_eq!(burst.evaluate(|| t0, cache::LOW_CR3_WARMUP, false, true), (true, false));
+        for k in 1..cache::LOW_CR3_EXIT_MIN {
+            assert!(!burst.on_cr3_load(|| t0 + k * 100, cache::LOW_CR3_WARMUP + k, false, true));
+            assert_eq!(burst.evaluate(|| t0 + k * 100, cache::LOW_CR3_WARMUP + k, false, true), (true, false));
+        }
+        assert!(!burst.on_cr3_load(|| t0 + 1500, cache::LOW_CR3_WARMUP + 15, false, true));
+        assert_eq!(burst.evaluate(|| t0 + 1500, cache::LOW_CR3_WARMUP + 15, false, true), (false, false));
+
+        // Cap at 1024 prevents u64 overflow even for huge burst counts.
+        let mut cap_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
+        for i in 0..2048u64 {
+            assert!(!cap_lc.on_cr3_load(|| 5_000 + i, i + 1, false, true));
+        }
+        assert_eq!(cap_lc.win_cur, 1024);
+        assert_eq!(cap_lc.evaluate(|| 5_000 + 2048 + W, 2048, false, true), (false, false));
+
+        // 2*W silence re-activates with zero CR3 loads; timestamp regression resets safely.
+        let t_quiet = t0 + 1500 + 2 * W;
+        assert_eq!(burst.evaluate(|| t_quiet, cache::LOW_CR3_WARMUP + 15, false, true), (true, true));
+        assert_eq!(burst.evaluate(|| t_quiet - 10, cache::LOW_CR3_WARMUP + 15, false, true), (true, false));
+
+        // Disabled flag clears active and skips the clock closure.
+        assert_eq!(burst.evaluate(|| panic!("timer read when disabled"), cache::LOW_CR3_WARMUP + 15, true, true), (false, false));
+        assert!(!burst.on_cr3_load(|| panic!("timer read when disabled"), cache::LOW_CR3_WARMUP + 16, true, true));
+        assert_eq!(burst.active, 0);
+
+        // Uninitialized frequency disables safely.
+        let mut zero_hz = cache::LowCr3::default();
+        assert!(!zero_hz.on_cr3_load(|| 100, 64, false, true));
+        assert_eq!(zero_hz.evaluate(|| 100, 64, false, true), (false, false));
     }
 }

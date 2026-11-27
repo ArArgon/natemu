@@ -301,6 +301,14 @@ pub(crate) fn block(n: usize) -> &'static Block {
 fn step_block() -> &'static Block {
     unsafe { &*lookup_area::<Block>(area::STEP_RECORD) }
 }
+/// Live cache block `n`, or the single-step slot's block when `n == u32::MAX as usize`.
+pub fn block_or_step(n: usize) -> &'static Block {
+    if n == u32::MAX as usize {
+        step_block()
+    } else {
+        block(n)
+    }
+}
 fn record(i: usize) -> *mut LinkRecord {
     (area::LINKS_VA as *mut LinkRecord).wrapping_add(i)
 }
@@ -568,7 +576,7 @@ fn relist(n: usize) {
 fn check_chains() {
     let line = u64::from(core::panic::Location::caller().line());
     let halt = |a: u64, b: u64| -> ! { crate::execution::halt_native([line, a, b], natemu_abi::execution::stop::LINK_CHECK) };
-    let c = control();
+    let blocks = control().blocks;
     // (A finite chain holds each pair once: its successor follows from the pair. So pairs met, all with a clear bit, and as many as the
     // index's pairs with a clear bit, are those pairs.)
     let mut met = 0;
@@ -577,7 +585,7 @@ fn check_chains() {
         while cur != 0 {
             let n = cur as usize - 1;
             steps += 1;
-            if steps > c.blocks || n as u64 >= c.blocks {
+            if steps > blocks || n as u64 >= blocks {
                 halt(h as u64, u64::from(cur))
             }
             let b = block(n);
@@ -591,7 +599,7 @@ fn check_chains() {
         }
     }
     let mut pairs = 0;
-    for n in 0..c.blocks as usize {
+    for n in 0..blocks as usize {
         let b = block(n);
         if b.flags & TRANSLATION != 0 {
             continue;
@@ -601,39 +609,71 @@ fn check_chains() {
             halt(1 << 32 | n as u64, u64::from(b.flags))
         }
         pairs += u64::from(b.flags & OFF0 == 0) + u64::from(b0 != b1 && b.flags & OFF1 == 0);
-        if b.flags & DEAD != 0 || b.flags & (OFF0 | OFF1) == 0 {
+        if b.flags & DEAD != 0 {
             continue;
         }
-        if current(b) {
+        let off = b.flags & (OFF0 | OFF1) != 0;
+        let is_current = current(b);
+        if off && is_current {
             halt(2 << 32 | n as u64, u64::from(b.flags))
         }
-        // (Frame-keyed plan 8.2: a guarded block's L1 entries and links outlive its currency, by design: its stub checks the code
-        // TLB, whose slot of its page went with the event that made it not current.)
+        // (Frame-keyed plan 8.2: a guarded block's L1 entries outlive its currency: the code-TLB slot of its page goes at the same
+        // event, so they miss. Only its death takes them. Plain CR3 links into it still must be gone whenever `!current(b)`.)
+        if off && b.flags & GUARDED == 0 {
+            // (Only tables with a context: a global flush or a reset leaves the others' entries, unreachable, until a context takes one
+            // and `select_l1` clears it.)
+            let (w0, w1) = area::l1_slots_of(b.rip);
+            let contexts = control().l1_contexts;
+            if (0..area::L1_TABLES)
+                .filter(|&t| contexts[t] != area::NO_CONTEXT)
+                .any(|t| [w0, w1].iter().any(|&i| l1_block(t, i) == b.number + 1))
+            {
+                halt(3 << 32 | n as u64, 0)
+            }
+        }
         if b.flags & GUARDED != 0 {
-            continue;
-        }
-        // (Only tables with a context: a global flush or a reset leaves the others' entries, unreachable, until a context takes one
-        // and `select_l1` clears it.)
-        let (w0, w1) = area::l1_slots_of(b.rip);
-        if (0..area::L1_TABLES)
-            .filter(|&t| c.l1_contexts[t] != area::NO_CONTEXT)
-            .any(|t| [w0, w1].iter().any(|&i| l1_block(t, i) == b.number + 1))
-        {
-            halt(3 << 32 | n as u64, 0)
-        }
-        let mut at = b.inbound;
-        for _ in 0..=area::MAX_LINKS {
-            if at == 0 {
-                break;
+            let (w0, w1) = area::l1_slots_of(b.rip);
+            let contexts = control().l1_contexts;
+            for t in (0..area::L1_TABLES).filter(|&t| contexts[t] != area::NO_CONTEXT) {
+                for i in [w0, w1] {
+                    if l1_block(t, i) != b.number + 1 {
+                        continue;
+                    }
+                    let [tag, target] = unsafe { dl1(t, i).read() };
+                    if !is_current && target != b.guard_entry() {
+                        halt(3 << 32 | n as u64, target)
+                    }
+                    if is_current
+                        && target != b.guard_entry()
+                        && (target != b.entry()
+                            || tag != b.rip
+                            || contexts[t] != b.context
+                            || unsafe { l1_owner(t, i).read() } & area::L1_LISTED == 0)
+                    {
+                        halt(3 << 32 | n as u64, target)
+                    }
+                }
             }
-            let i = u64::from(at) - 1;
-            if i >= c.links_susp && i < c.links_tlb {
-                halt(4 << 32 | n as u64, i)
-            }
-            at = unsafe { record(i as usize).read() }.next_in;
         }
-        if at != 0 {
-            halt(5 << 32 | n as u64, u64::from(at))
+        if !is_current {
+            let (links_susp, links_tlb) = {
+                let c = control();
+                (c.links_susp, c.links_tlb)
+            };
+            let mut at = b.inbound;
+            for _ in 0..=area::MAX_LINKS {
+                if at == 0 {
+                    break;
+                }
+                let i = u64::from(at) - 1;
+                if i >= links_susp && i < links_tlb {
+                    halt(4 << 32 | n as u64, i)
+                }
+                at = unsafe { record(i as usize).read() }.next_in;
+            }
+            if at != 0 {
+                halt(5 << 32 | n as u64, u64::from(at))
+            }
         }
     }
     if met != pairs {
@@ -866,21 +906,29 @@ pub fn select_l1(context: u64) {
     };
     c.l1_table = t as u64;
 }
-/// Enters `block` for `rip` in the dispatcher's L1 table if the block's context is the table's ([`select_l1`] ran for
+/// Enters block `n` for `rip` in the dispatcher's L1 table if the block's context is the table's ([`select_l1`] ran for
 /// it before the lookup that found it); otherwise nothing is entered (the block is still entered from the resident).
-pub fn fill_l1(rip: u64, block: &Block) {
+pub fn fill_l1(rip: u64, n: usize) {
     // Frame-keyed plan 8.2: every resident entry into a guarded block that is current fills its page's code-TLB slot.
-    ctlb_fill(block);
+    let (context, flags) = {
+        let b = block(n);
+        ctlb_fill(b);
+        (b.context, b.flags)
+    };
     let t = control().l1_table as usize;
     // (PIC study test [`PIC_TEST_SVC`]: none, so every computed exit and checked link enters the resident, which then
     // enters blocks armed after their links are made.)
-    if control().l1_contexts[t] != block.context || control().pic_test == PIC_TEST_SVC {
+    if control().l1_contexts[t] != context || control().pic_test == PIC_TEST_SVC {
         #[cfg(feature = "dispatch-study")]
         {
             control().l1_counts[area::L1_SKIPPED] += 1;
         }
         return;
     }
+    let direct_guarded = flags & (PIC | TRANSLATION | INSTANCE | GLOBAL) == 0
+        && flags & GUARDED != 0
+        && plain_cr3_ok();
+    let block = block(n);
     let (w0, w1) = area::l1_slots_of(rip);
     let (o0, o1) = unsafe { (l1_owner(t, w0).read(), l1_owner(t, w1).read()) };
     let want = block.number + 1;
@@ -912,8 +960,9 @@ pub fn fill_l1(rip: u64, block: &Block) {
     }
     let flip = if f.victim { area::L1_NEXT } else { 0 };
     let mut listed = [o0, o1][f.way] & area::L1_LISTED;
-    // (Frame-keyed plan 8.2: a guarded block's entry outlives CR3 loads, so it is not listed for them.)
-    if listed == 0 && block.flags & (GLOBAL | GUARDED) == 0 {
+    // (Frame-keyed plan 8.2: a guarded block's entry outlives CR3 loads, so it is not listed for them; in low-CR3 mode it
+    // enters the body directly and is listed so the next CR3 load empties it.)
+    if listed == 0 && (block.flags & (GLOBAL | GUARDED) == 0 || direct_guarded) {
         let c = control();
         unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
         (c.l1_listed[t], listed) = (c.l1_listed[t] + 1, area::L1_LISTED);
@@ -943,7 +992,8 @@ pub fn fill_l1(rip: u64, block: &Block) {
         }
         c.tl1_any = 1;
     }
-    unsafe { dl1(t, i).write([rip, code_of(block).full_entry()]) };
+    let entry = if direct_guarded { block.entry() } else { code_of(block).full_entry() };
+    unsafe { dl1(t, i).write([rip, entry]) };
 }
 
 /// Dispatch study (`dispatch-study` builds only: its loads and stores cost measurable time in the `perf` gate builds):
@@ -1050,6 +1100,7 @@ pub fn lookup(
                 continue; // (its L2 entry is removed: entry i holds the next one now)
             }
             if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {
+                let was_global = b.flags & GLOBAL != 0;
                 c.revalidated += 1;
                 crate::study::revalidated(b.checked, walked & GLOBAL != 0);
                 unsafe { (*block_ptr(n)).checked = c.epoch };
@@ -1067,7 +1118,7 @@ pub fn lookup(
                 // have killed their sources; after the flags: a global target's records belong to the TLB segment).
                 #[cfg(not(feature = "pic-count"))]
                 if block(n).inbound != 0 && c.links_susp != 0 {
-                    relink(n);
+                    relink(n, was_global);
                 }
                 #[cfg(feature = "pic-count")]
                 if user(b.context) {
@@ -1090,31 +1141,52 @@ pub fn tlb(global: bool) -> Option<u64> {
         check_out_slots();
         check_chains();
     }
-    let c = control();
-    c.epoch += 1;
+    {
+        let c = control();
+        c.epoch += 1;
+        if global {
+            c.global_epoch = c.epoch;
+            c.global_flushes += 1;
+        }
+    }
     if global {
-        c.global_epoch = c.epoch;
-        c.global_flushes += 1;
         // No block is current: the dispatcher's table is emptied, the others hold no context any more (perf chunk 12: their
         // contexts' slots miss until those take a table again, as at a reset).
-        let now = c.l1_table as usize;
+        let now = control().l1_table as usize;
         clear_l1(now);
         for t in (0..area::L1_TABLES).filter(|&t| t != now) {
-            (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
-            if c.l1_slots[t] != 0 {
-                write_slot(c.l1_slots[t] as usize, None);
+            let slot = {
+                let c = control();
+                (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
+                let slot = c.l1_slots[t] as usize;
                 c.l1_slots[t] = 0;
+                slot
+            };
+            if slot != 0 {
+                write_slot(slot, None);
             }
         }
     } else {
-        c.cr3_loads += 1;
+        let entered = {
+            let c = control();
+            c.cr3_loads += 1;
+            let disabled = low_cr3_disabled(c);
+            c.low_cr3
+                .on_cr3_load(cntvct_el0, c.cr3_loads, disabled, c.armed == 0)
+        };
+        if entered {
+            enter_low_cr3();
+        }
         // Perf chunk 19: a CR3 load moves `epoch`, not `global_epoch`, so every global block stays current: only the
         // listed entries (filled with a non-global block) are looked at. Each one emptied is cleaned to the point of
         // unification; after one barrier its instructions are invalidated as the list is compacted (an entry still
         // filled stays listed, the rest leave it).
         for t in 0..area::L1_TABLES {
-            let listed = c.l1_listed[t] as usize;
-            if c.l1_contexts[t] == area::NO_CONTEXT || listed == 0 {
+            let (ctx, listed) = {
+                let c = control();
+                (c.l1_contexts[t], c.l1_listed[t] as usize)
+            };
+            if ctx == area::NO_CONTEXT || listed == 0 {
                 continue;
             }
             for k in 0..listed {
@@ -1134,7 +1206,7 @@ pub fn tlb(global: bool) -> Option<u64> {
                     unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_NEXT) };
                 }
             }
-            c.l1_listed[t] = kept as u64;
+            control().l1_listed[t] = kept as u64;
         }
     }
     // Frame-keyed plan step 1b: every L1 entry of a shared translation (never current) is gone. Plan 8.2: and the code TLB
@@ -1407,125 +1479,138 @@ pub fn bits32(context: u64) -> bool {
 /// sites and relocations (the hint table names it from now on); `t` stays as it is, absolute and valid at its address.
 /// `None` (nothing filed): the code area or the arena is full, or the rewrite or its proof refused (counted
 /// [`count::UNPROVED`], a resident fault the check halts on).
-pub fn share(t: &Block) -> Option<&'static Block> {
+pub fn share(t_num: usize) -> Option<&'static Block> {
     // (M2 task 4: a block whose code the resident changed, [`split`]'s re-pointed return: 32-bit code with the x87 run
     // test, left unshared.)
-    if run_tested(t) {
-        unsafe { (*block_ptr(t.number as usize)).flags |= UNSHAREABLE };
+    if run_tested(block(t_num)) {
+        unsafe { (*block_ptr(t_num)).flags |= UNSHAREABLE };
         return None;
     }
-    let c = control();
-    let start = c.code_used.next_multiple_of(CODE_ALIGN);
-    let code = start + u64::from(PIC_LEAD);
-    let code_end = code + u64::from(t.code_size);
-    if code_end > c.code_bytes {
-        c.full[0] += 1;
-        return None;
-    }
-    let (from, size) = (u64::from(t.code), t.code_size as usize);
-    // `t`'s link points' words as admitted: (offset, first word) and (its `svc` word's offset, `svc #LINK`).
-    let mut admitted = [(u64::MAX, 0u32); 2 * MAX_LINK_POINTS];
-    for (k, p) in t.links.iter().enumerate().filter(|(_, p)| p.offset != 0) {
-        admitted[2 * k] = (u64::from(p.offset), p.word);
-        admitted[2 * k + 1] = (svc_slot(t, p), pic::SVC_LINK);
-    }
-    // (The probing split stubs' branches to their shared probes, as admitted: the placeholder, pointed again below.)
-    // (Only they branch into the probes: every other branch of a block goes inside it, to a block or to the dispatcher.)
-    let probe_branch = |o: u64| probe_branch(from + o);
-    let original = |o: usize| {
-        if probe_branch(o as u64) {
-            return natemu_abi::execution::DISPATCH_PLACEHOLDER;
+    let (start, code, code_end, from, size) = {
+        let t = block(t_num);
+        let c = control();
+        let start = c.code_used.next_multiple_of(CODE_ALIGN);
+        let code = start + u64::from(PIC_LEAD);
+        let code_end = code + u64::from(t.code_size);
+        if code_end > c.code_bytes {
+            c.full[0] += 1;
+            return None;
         }
-        // (Split-check plan step A: a probing stub's `adr` re-pointed at `t`'s hot copy, as admitted.)
-        if let Some(w) = admitted_adr(t, o as u64) {
-            return w;
-        }
-        admitted
-            .iter()
-            .find(|&&(at, _)| at == o as u64)
-            .map_or_else(|| word(from + o as u64), |&(_, w)| w)
+        (start, code, code_end, u64::from(t.code), t.code_size as usize)
     };
-    let mut links = t.links;
-    unsafe {
-        let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, size);
-        copy_record(
-            at.as_mut_ptr(),
-            (area::CODE_WRITE_VA + from) as *const u8,
-            size,
-        );
-        for &(o, w) in admitted.iter().filter(|(o, _)| *o != u64::MAX) {
-            at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+    let (ineligible, record, tail_ptr, tail) = {
+        let t = block(t_num);
+        // `t`'s link points' words as admitted: (offset, first word) and (its `svc` word's offset, `svc #LINK`).
+        let mut admitted = [(u64::MAX, 0u32); 2 * MAX_LINK_POINTS];
+        for (k, p) in t.links.iter().enumerate().filter(|(_, p)| p.offset != 0) {
+            admitted[2 * k] = (u64::from(p.offset), p.word);
+            admitted[2 * k + 1] = (svc_slot(t, p), pic::SVC_LINK);
         }
-        for o in sites(t).iter().map(|s| u64::from(s.native_offset) + 4).filter(|&o| o + 4 <= size as u64 && probe_branch(o)) {
-            at[o as usize..o as usize + 4].copy_from_slice(&natemu_abi::execution::DISPATCH_PLACEHOLDER.to_le_bytes());
-        }
-        // (Split-check plan step A: and their `adr` words as admitted, [`admitted_adr`]: the translation is never split.)
-        for o in sites(t).iter().map(|s| u64::from(s.native_offset)).filter(|&o| o + 4 <= size as u64) {
-            if let Some(w) = admitted_adr(t, o) {
+        // (The probing split stubs' branches to their shared probes, as admitted: the placeholder, pointed again below.)
+        // (Only they branch into the probes: every other branch of a block goes inside it, to a block or to the dispatcher.)
+        let probe_branch = |o: u64| probe_branch(from + o);
+        let original = |o: usize| {
+            if probe_branch(o as u64) {
+                return natemu_abi::execution::DISPATCH_PLACEHOLDER;
+            }
+            // (Split-check plan step A: a probing stub's `adr` re-pointed at `t`'s hot copy, as admitted.)
+            if let Some(w) = admitted_adr(t, o as u64) {
+                return w;
+            }
+            admitted
+                .iter()
+                .find(|&&(at, _)| at == o as u64)
+                .map_or_else(|| word(from + o as u64), |&(_, w)| w)
+        };
+        let mut links = t.links;
+        unsafe {
+            let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, size);
+            copy_record(
+                at.as_mut_ptr(),
+                (area::CODE_WRITE_VA + from) as *const u8,
+                size,
+            );
+            for &(o, w) in admitted.iter().filter(|(o, _)| *o != u64::MAX) {
                 at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
             }
+            for o in sites(t).iter().map(|s| u64::from(s.native_offset) + 4).filter(|&o| o + 4 <= size as u64 && probe_branch(o)) {
+                at[o as usize..o as usize + 4].copy_from_slice(&natemu_abi::execution::DISPATCH_PLACEHOLDER.to_le_bytes());
+            }
+            // (Split-check plan step A: and their `adr` words as admitted, [`admitted_adr`]: the translation is never split.)
+            for o in sites(t).iter().map(|s| u64::from(s.native_offset)).filter(|&o| o + 4 <= size as u64) {
+                if let Some(w) = admitted_adr(t, o) {
+                    at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
+            let bits32 = bits32(t.context);
+            if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip, bits32).is_err() {
+                (true, None, core::ptr::null(), 0)
+            } else {
+                if pic::rewrite(at, relocs(t), &mut links, t.rip, bits32).is_err() {
+                    counted(count::UNPROVED);
+                    return None;
+                }
+                relocate(code, u64::from(t.dispatch_exit), dispatcher_for(t.context));
+                ((area::CODE_WRITE_VA + code - 16) as *mut [u32; 4]).write_volatile([
+                    0,
+                    0,
+                    0,
+                    pic::AND_PAGE,
+                ]);
+                let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, size);
+                poison(t, at);
+                let rewritten = |o: usize| u32::from_le_bytes(at[o..o + 4].try_into().unwrap_or([0; 4]));
+                if !pic::proved(
+                    original,
+                    rewritten,
+                    size,
+                    relocs(t),
+                    &links,
+                    t.rip,
+                    t.dispatch_exit,
+                    bits32,
+                ) {
+                    counted(count::UNPROVED);
+                    return None;
+                }
+                point_probes(code, sites(t).iter().copied(), t.context);
+                let record = Block {
+                    checked: 0,
+                    next: [0; 2],
+                    lnext: [0; 2],
+                    code: code as u32,
+                    number: 0,
+                    flags: TRANSLATION
+                        | PIC
+                        | t.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | LARGE),
+                    links,
+                    shared: 0,
+                    inbound: 0,
+                    out: [0; MAX_LINK_POINTS],
+                    hot: 0,
+                    hot_size: 0,
+                    hot_body: 0,
+                    patch: [0; MAX_LINK_POINTS],
+                    ..*t
+                };
+                let tail = size_of::<Site>() * t.sites_count as usize + 4 * relocs(t).len();
+                (false, Some(record), sites(t).as_ptr().cast(), tail)
+            }
         }
-        // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
-        let bits32 = bits32(t.context);
-        if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip, bits32).is_err() {
-            (*block_ptr(t.number as usize)).flags |= UNSHAREABLE;
-            return None;
-        }
-        if pic::rewrite(at, relocs(t), &mut links, t.rip, bits32).is_err() {
-            counted(count::UNPROVED);
-            return None;
-        }
-        relocate(code, u64::from(t.dispatch_exit), dispatcher_for(t.context));
-        ((area::CODE_WRITE_VA + code - 16) as *mut [u32; 4]).write_volatile([
-            0,
-            0,
-            0,
-            pic::AND_PAGE,
-        ]);
-        poison(t, at);
-        let rewritten = |o: usize| u32::from_le_bytes(at[o..o + 4].try_into().unwrap_or([0; 4]));
-        if !pic::proved(
-            original,
-            rewritten,
-            size,
-            relocs(t),
-            &links,
-            t.rip,
-            t.dispatch_exit,
-            bits32,
-        ) {
-            counted(count::UNPROVED);
-            return None;
-        }
-        point_probes(code, sites(t).iter().copied(), t.context);
-    }
-    let record = Block {
-        checked: 0,
-        next: [0; 2],
-        lnext: [0; 2],
-        code: code as u32,
-        number: 0,
-        flags: TRANSLATION
-            | PIC
-            | t.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | LARGE),
-        links,
-        shared: 0,
-        inbound: 0,
-        out: [0; MAX_LINK_POINTS],
-        hot: 0,
-        hot_size: 0,
-        hot_body: 0,
-        patch: [0; MAX_LINK_POINTS],
-        ..*t
     };
-    let tail = size_of::<Site>() * t.sites_count as usize + 4 * relocs(t).len();
-    let placed = unsafe { file(record, sites(t).as_ptr().cast(), tail, 0)? };
+    if ineligible {
+        unsafe { (*block_ptr(t_num)).flags |= UNSHAREABLE };
+        return None;
+    }
+    let record = record?;
+    let placed = unsafe { file(record, tail_ptr, tail, 0)? };
     synchronize_code(
         area::CODE_WRITE_VA + start,
         area::CODE_VA + start,
         (code_end - start) as usize,
     );
-    c.code_used = code_end;
+    control().code_used = code_end;
     counted(count::SHARES);
     Some(placed)
 }
@@ -1613,6 +1698,111 @@ pub fn guards_on() -> bool {
         && c.pages == natemu_abi::execution::cache::PAGES_ON
         && c.pic_test == 0
         && !cfg!(feature = "pic-count")
+}
+fn low_cr3_disabled(c: &Control) -> bool {
+    c.low_cr3_off != 0 || c.link_form_plain != 0 || c.pic_test != 0 || cfg!(feature = "pic-count")
+}
+/// One-shot demotion on transitioning `LowCr3::active` from 0 to 1: unlinks pre-existing non-global
+/// cross-page guarded links from `LOCAL` (so their next execution re-links plainly in `CR3`) and
+/// clears active user-context L1 tables (so direct `dl1 -> entry()` fills replace guard-stub entries).
+fn enter_low_cr3() {
+    let (ctr, old) = {
+        let c = control();
+        c.low_cr3_entries += 1;
+        (c.ctr_el0, ends(c).map(|e| *e))
+    };
+    let (from, to) = (old[TLB], old[LOCAL]);
+    let is_demotable = |r: &LinkRecord| {
+        let source = block(r.source as usize);
+        let target = block(r.target as usize);
+        source.flags & PIC == 0 && target.flags & (GUARDED | GLOBAL) == GUARDED && !local(target, source)
+    };
+    let mut any = false;
+    for i in from..to {
+        let r = unsafe { record(i as usize).read() };
+        if !is_demotable(&r) {
+            continue;
+        }
+        #[cfg(feature = "link-check")]
+        {
+            let source = block(r.source as usize);
+            let target = block(r.target as usize);
+            let at = link_at(source, u64::from(r.offset()));
+            if !links_to(at, target.guard_entry() - area::CODE_VA) {
+                crate::execution::halt_native(
+                    [i, u64::from(r.source), u64::from(r.target)],
+                    natemu_abi::execution::stop::LINK_CHECK,
+                )
+            }
+        }
+        let Some(at) = unlink_word(r) else {
+            crate::execution::halt_native(
+                [i, u64::from(r.source), u64::from(r.target)],
+                natemu_abi::execution::stop::BAD_LINK,
+            )
+        };
+        clean_pou(ctr, area::CODE_WRITE_VA + at);
+        any = true;
+    }
+    if any {
+        clean_barrier(ctr);
+        let mut w = from;
+        let mut demoted = 0u64;
+        for i in from..to {
+            let r = unsafe { record(i as usize).read() };
+            if is_demotable(&r) {
+                let at = link_at(block(r.source as usize), u64::from(r.offset()));
+                invalidate_pou(ctr, area::CODE_VA + at);
+                out_del(i as usize);
+                list_del(i as usize);
+                demoted += 1;
+            } else {
+                if w != i {
+                    unsafe { record(w as usize).write(r) };
+                    list_moved(i, w);
+                }
+                w += 1;
+            }
+        }
+        unsafe { asm!("dsb ish", "isb") };
+        let mut new = old;
+        new[LOCAL] = w;
+        fill_gap(old, LOCAL, w, &mut new);
+        let c = control();
+        for (e, v) in ends(c).into_iter().zip(new) {
+            *e = v;
+        }
+        c.guarded_demoted += demoted;
+        c.demoted_pending += demoted;
+    }
+    let contexts = control().l1_contexts;
+    for t in 0..area::L1_TABLES {
+        if contexts[t] != area::NO_CONTEXT && user(contexts[t]) {
+            clear_l1(t);
+        }
+    }
+}
+/// Drains link unlinks performed by [`enter_low_cr3`] so `State::unlinks` matches live links.
+pub fn take_demoted() -> u64 {
+    let c = control();
+    let n = c.demoted_pending;
+    c.demoted_pending = 0;
+    n
+}
+/// Low-CR3 plain links: when CR3 switches are rare past warmup and no host override (`NATEMU_LOW_CR3=off`,
+/// `NATEMU_LINK_FORM=plain|checked`) or PIC test/count mode disables them, non-global cross-page absolute links
+/// bypass guard stubs and dispatcher probes as plain `CR3`-segment direct branches.
+pub fn plain_cr3_ok() -> bool {
+    let (active, entered) = {
+        let c = control();
+        let disabled = low_cr3_disabled(c);
+        c.low_cr3
+            .evaluate(cntvct_el0, c.cr3_loads, disabled, c.armed == 0)
+    };
+    if entered {
+        enter_low_cr3();
+    }
+    active
 }
 fn ctlb_table() -> *mut u64 {
     lookup_area::<u64>(area::CTLB)
@@ -2494,6 +2684,17 @@ pub fn read_ctr_el0() {
     unsafe { asm!("mrs {0}, ctr_el0", out(reg) ctr) };
     control().ctr_el0 = ctr;
 }
+/// Reads CNTFRQ_EL0 once into [`Control::low_cr3`] at start-up so low-CR3 rate windows scale with hardware timer frequency.
+pub fn read_cntfrq_el0() {
+    let hz: u64;
+    unsafe { asm!("mrs {0}, cntfrq_el0", out(reg) hz, options(nomem, nostack)) };
+    control().low_cr3.cntfrq_el0 = hz;
+}
+fn cntvct_el0() -> u64 {
+    let t: u64;
+    unsafe { asm!("mrs {0}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+    t
+}
 /// CTR_EL0.IDC = 1: a data cache clean to the point of unification is not required for instruction-to-data coherence, so
 /// `dc cvau` is skipped and a store-ordering barrier suffices (as Linux's `caches_clean_inval_pou`); CTR_EL0.DIC = 1:
 /// `ic ivau` is not required either (only `dsb ish; isb`).
@@ -2706,127 +2907,246 @@ fn link_entry(source: &Block, code: &Block) -> u64 {
 /// to the target's entry, recorded with the original word in the segment of its kind ([`Control::links_tlb`]: local,
 /// else by the target's [`GLOBAL`], which stays as it is while the target is current, that is while the link is there).
 /// Link points already branching there stay, unless the record area is full: then links are dropped first.
-pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
-    let c = control();
+pub fn link(source_num: usize, target_num: usize, at: u64, to: u64) -> Link {
     // (A shared source's link points name its translation's targets; `at` is the address it runs for. Frame-keyed plan step
     // 1b: `to` is the address the target is entered at, a shared translation's at any address of its page offset.)
-    let named = |p: &LinkPoint| {
-        p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == to
+    let (shared, now_num, local_shared, can_low_cr3, link_form_plain) = {
+        let (shared, need_share, target_rip, target_gpa, target_ctx, local_ok, link_form_plain) = {
+            let source = block(source_num);
+            let target = block(target_num);
+            let named = |p: &LinkPoint| {
+                p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == to
+            };
+            if source.context != target.context || !source.links.iter().any(named) {
+                return Link::Bad;
+            }
+            // PIC study stage 3, the link's form (section 3 of the plan): from a shared translation into an instance of a shared
+            // one starting on the source's start frame, the move's first word becomes `b` to that translation's body (local:
+            // right for every instance, the page base being the same); every other link out of shared code or into an instance
+            // is checked: the move stays and the `svc` word becomes `b` to the source context's dispatcher slot, which probes L1 at
+            // x0's own entry (the address the exit built: as current as any dispatcher hit, a miss is the dispatcher's; a slot
+            // serves one context until a flush, missing while its context has no table). One fixed L1 entry would not do: L1 is
+            // indexed by the address's low 16 bits and instances of one translation differ in bits 12-15, so it reaches only the
+            // linking instance's entry (the plan's first form: every other instance missed into the resident, 727 M lookups
+            // against 53 M on the slice). Absolute to absolute as before.
+            let shared = source.flags & PIC != 0;
+            let same_frames = |code: &Block, source: &Block| {
+                code.source_gpa[0] == source.source_gpa[0]
+                    && (code.source_gpa[1] == u64::MAX || code.source_gpa[1] == source.source_gpa[1])
+            };
+            // (Under the check none: a local link runs its target's translation at the source's address with no instance there,
+            // which the check would never compare; the slot's probe finds or makes one. Review of stage 3, finding 4c.)
+            let (reuse, pic_check_local, pic_test, link_form_plain) = {
+                let c = control();
+                (c.reuse, c.pic_check_local, c.pic_test, c.link_form_plain)
+            };
+            let local_ok = shared
+                && (reuse != REUSE_CHECK || pic_check_local != 0)
+                && pic_test != natemu_abi::execution::cache::PIC_TEST_NOLOCAL
+                && to >> 12 == at >> 12;
+            let need_share = local_ok
+                && target.flags & (INSTANCE | PIC | SYSTEM | STEP | DEAD | GLOBAL | UNSHAREABLE) == 0
+                && target.flags & RELOCATABLE != 0
+                && same_frames(target, source)
+                && shares(target.context);
+            (
+                shared,
+                need_share,
+                target.rip,
+                target.source_gpa,
+                target.context,
+                local_ok,
+                link_form_plain,
+            )
+        };
+        // From shared code into an absolute template on its own page and frames (most links out of shared code: its
+        // neighbours there have not needed a second address yet): the target is shared now (or its translation found) and
+        // the link made local, so it never depends on an L1 entry. A template with no position-independent form stays
+        // absolute (the link is checked).
+        let now_num = if need_share {
+            template(target_rip, target_gpa[0], target_ctx)
+                .filter(|t| t.flags & TRANSLATION != 0 && t.source_gpa == target_gpa)
+                .map(|t| t.number as usize)
+                .or_else(|| share(target_num).map(|t| t.number as usize))
+        } else {
+            None
+        };
+        let source = block(source_num);
+        let target = block(target_num);
+        let same_frames = |code: &Block, source: &Block| {
+            code.source_gpa[0] == source.source_gpa[0]
+                && (code.source_gpa[1] == u64::MAX || code.source_gpa[1] == source.source_gpa[1])
+        };
+        let code = now_num.map(block).unwrap_or_else(|| code_of(target));
+        let local_shared = local_ok
+            && (target.flags & (INSTANCE | TRANSLATION) != 0 || now_num.is_some())
+            && same_frames(code, source);
+        let can_low_cr3 = !local_shared
+            && !shared
+            && target.flags & (INSTANCE | TRANSLATION) == 0
+            && !local(target, source)
+            && target.flags & GLOBAL == 0;
+        (shared, now_num, local_shared, can_low_cr3, link_form_plain)
     };
-    let points = || source.links.iter().filter(move |p| named(p));
-    if source.context != target.context || points().next().is_none() {
-        return Link::Bad;
-    }
-    // PIC study stage 3, the link's form (section 3 of the plan): from a shared translation into an instance of a shared
-    // one starting on the source's start frame, the move's first word becomes `b` to that translation's body (local:
-    // right for every instance, the page base being the same); every other link out of shared code or into an instance
-    // is checked: the move stays and the `svc` word becomes `b` to the source context's dispatcher slot, which probes L1 at
-    // x0's own entry (the address the exit built: as current as any dispatcher hit, a miss is the dispatcher's; a slot
-    // serves one context until a flush, missing while its context has no table). One fixed L1 entry would not do: L1 is
-    // indexed by the address's low 16 bits and instances of one translation differ in bits 12-15, so it reaches only the
-    // linking instance's entry (the plan's first form: every other instance missed into the resident, 727 M lookups
-    // against 53 M on the slice). Absolute to absolute as before.
-    let shared = source.flags & PIC != 0;
-    let same_frames = |code: &Block, source: &Block| {
-        code.source_gpa[0] == source.source_gpa[0]
-            && (code.source_gpa[1] == u64::MAX || code.source_gpa[1] == source.source_gpa[1])
-    };
-    // (Under the check none: a local link runs its target's translation at the source's address with no instance there,
-    // which the check would never compare; the slot's probe finds or makes one. Review of stage 3, finding 4c.)
-    let local_ok = shared
-        && (c.reuse != REUSE_CHECK || c.pic_check_local != 0)
-        && c.pic_test != natemu_abi::execution::cache::PIC_TEST_NOLOCAL
-        && to >> 12 == at >> 12;
-    // From shared code into an absolute template on its own page and frames (most links out of shared code: its
-    // neighbours there have not needed a second address yet): the target is shared now (or its translation found) and
-    // the link made local, so it never depends on an L1 entry. A template with no position-independent form stays
-    // absolute (the link is checked).
-    let now = (local_ok
-        && target.flags & (INSTANCE | PIC | SYSTEM | STEP | DEAD | GLOBAL | UNSHAREABLE) == 0
-        && target.flags & RELOCATABLE != 0
-        && same_frames(target, source)
-        && shares(target.context))
-    .then(|| {
-        template(target.rip, target.source_gpa[0], target.context)
-            .filter(|t| t.flags & TRANSLATION != 0 && t.source_gpa == target.source_gpa)
-            .or_else(|| share(target))
-    })
-    .flatten();
-    let code = now.unwrap_or_else(|| code_of(target));
-    let local_shared = local_ok
-        && (target.flags & (INSTANCE | TRANSLATION) != 0 || now.is_some())
-        && same_frames(code, source);
     // Frame-keyed plan step 1c (shared-code plan chunk 4's A/B): every link that is not local is checked too, unless the
     // host's debug key asks for plain ones (`Control::link_form_plain`): it probes L1 at the RIP the exit built, so no TLB
     // event undoes it (an L1 entry is emptied instead) and none is patched again.
-    // Frame-keyed plan 8.2: from absolute code into a guarded block on another page, the link enters the target's guard stub, a
-    // direct branch that outlives CR3 loads and global flushes as a local link does (the stub checks the code TLB): it takes
-    // the place of step 1c's checked form there.
-    let guarded = !local_shared
-        && !shared
-        && target.flags & (INSTANCE | TRANSLATION) == 0
-        && code.flags & GUARDED != 0
-        && !local(target, source);
-    // (Step 1d: a link into a global block stays plain by default: no CR3 load undoes it (it is in the TLB segment, which only a
-    // global flush suspends), so checking it would buy nothing and cost the kernel's cross-page transfers an L1 probe each;
-    // `link_form_plain` 2, `NATEMU_LINK_FORM=checked`, checks those too, as step 1c did.)
-    let cross_checked = match c.link_form_plain {
-        0 => target.flags & GLOBAL == 0,
-        2 => true,
-        _ => false,
-    };
-    let checked = !local_shared
-        && !guarded
-        && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (cross_checked && !local(target, source)));
-    // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
-    // word would not see the REP boundary, which the resident finds by the link point's offset.)
-    if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {
-        return Link::Linked(0);
-    }
-    let entry = if checked {
-        match dispatcher_for(source.context) {
-            d if d == area::DISPATCH_MISS as u64 => return Link::Linked(0), // (no slot: no link)
-            d => d,
+    // Low-CR3 plain links: when CR3 switches are rare, non-global cross-page transfers between absolute blocks use
+    // plain direct branches in segment `CR3` (suspended at CR3 loads and relinked, or dropped on a CR3 burst).
+    let low_cr3_plain = can_low_cr3 && plain_cr3_ok();
+    let (checked, guarded, segment, inbound, dest, code_num, pic_checked, pic_meta) = {
+        let source = block(source_num);
+        let target = block(target_num);
+        let named = |p: &LinkPoint| {
+            p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == to
+        };
+        let points = || source.links.iter().filter(move |p| named(p));
+        let code = now_num.map(block).unwrap_or_else(|| code_of(target));
+        let code_num = code.number as usize;
+        // Frame-keyed plan 8.2: from absolute code into a guarded block on another page, the link enters the target's guard stub, a
+        // direct branch that outlives CR3 loads and global flushes as a local link does (the stub checks the code TLB): it takes
+        // the place of step 1c's checked form there.
+        let guarded = !local_shared
+            && !shared
+            && !low_cr3_plain
+            && target.flags & (INSTANCE | TRANSLATION) == 0
+            && code.flags & GUARDED != 0
+            && !local(target, source);
+        // (Step 1d: a link into a global block stays plain by default: no CR3 load undoes it (it is in the TLB segment, which only a
+        // global flush suspends), so checking it would buy nothing and cost the kernel's cross-page transfers an L1 probe each;
+        // `link_form_plain` 2, `NATEMU_LINK_FORM=checked`, checks those too, as step 1c did.)
+        let cross_checked = match link_form_plain {
+            0 => target.flags & GLOBAL == 0 && !low_cr3_plain,
+            2 => true,
+            _ => false,
+        };
+        let checked = !local_shared
+            && !guarded
+            && (shared || target.flags & (INSTANCE | TRANSLATION) != 0 || (cross_checked && !local(target, source)));
+        // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
+        // word would not see the REP boundary, which the resident finds by the link point's offset.)
+        if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {
+            return Link::Linked(0);
         }
-    } else if guarded {
-        code.guard_entry() - area::CODE_VA
-    } else {
-        link_entry(source, code)
-    };
-    // (The record keeps the native offset; the word a plain link patches is [`link_at`]'s.)
-    let offset_of = |p: &LinkPoint| if checked { svc_slot(source, p) } else { u64::from(p.offset) };
-    let word_at = |p: &LinkPoint| {
-        if checked {
-            u64::from(source.code) + offset_of(p)
-        } else {
-            link_at(source, offset_of(p))
-        }
-    };
-    // (Step 1d review, B1: a point already linked keeps the form it was linked in, plain (its first word `b` to the target's
-    // entry or stub) or checked (its `svc` word `b` into a dispatcher slot), whatever form this call chose: the target's
-    // GLOBAL, which the choice reads, changes at a revalidation. Only unlinked points are patched below.)
-    let slots = (area::DISPATCH + area::DISPATCH_SLOT_BYTES) as u64..(area::DISPATCH + area::DISPATCH_BYTES) as u64;
-    let in_some_form = |p: &LinkPoint| {
-        links_to(word_at(p), entry)
-            || links_to(link_at(source, u64::from(p.offset)), link_entry(source, code))
-            || code.flags & GUARDED != 0 && links_to(link_at(source, u64::from(p.offset)), code.guard_entry() - area::CODE_VA)
-            || {
-                let svc = u64::from(source.code) + svc_slot(source, p);
-                word(svc) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(svc))
+        let entry = if checked {
+            match dispatcher_for(source.context) {
+                d if d == area::DISPATCH_MISS as u64 => return Link::Linked(0), // (no slot: no link)
+                d => d,
             }
-    };
-    for p in points() {
-        if !unlinked(source, p) && !in_some_form(p) {
-            return Link::Bad;
+        } else if guarded {
+            code.guard_entry() - area::CODE_VA
+        } else {
+            link_entry(source, code)
+        };
+        // (The record keeps the native offset; the word a plain link patches is [`link_at`]'s.)
+        let offset_of = |p: &LinkPoint| if checked { svc_slot(source, p) } else { u64::from(p.offset) };
+        let word_at = |p: &LinkPoint| {
+            if checked {
+                u64::from(source.code) + offset_of(p)
+            } else {
+                link_at(source, offset_of(p))
+            }
+        };
+        // (Step 1d review, B1: a point already linked keeps the form it was linked in, plain (its first word `b` to the target's
+        // entry or stub) or checked (its `svc` word `b` into a dispatcher slot), whatever form this call chose: the target's
+        // GLOBAL, which the choice reads, changes at a revalidation. Only unlinked points are patched below. A surviving
+        // guard or local link into an earlier live block for the same target RIP is also valid via `source.out[k]`.)
+        let slots = (area::DISPATCH + area::DISPATCH_SLOT_BYTES) as u64..(area::DISPATCH + area::DISPATCH_BYTES) as u64;
+        let (links_susp, links) = {
+            let c = control();
+            (c.links_susp, c.links)
+        };
+        let in_some_form = |k: usize, p: &LinkPoint| {
+            links_to(word_at(p), entry)
+                || links_to(link_at(source, u64::from(p.offset)), link_entry(source, code))
+                || code.flags & GUARDED != 0 && links_to(link_at(source, u64::from(p.offset)), code.guard_entry() - area::CODE_VA)
+                || {
+                    let svc = u64::from(source.code) + svc_slot(source, p);
+                    word(svc) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(svc))
+                }
+                || u64::from(source.out[k]).checked_sub(1).is_some_and(|idx| {
+                    idx >= links_susp && idx < links && {
+                        let r = unsafe { record(idx as usize).read() };
+                        r.target & area::CHECKED == 0 && {
+                            let t = block(r.target as usize);
+                            t.flags & DEAD == 0
+                                && t.rip == p.target
+                                && t.context == source.context
+                                && ((t.flags & GUARDED != 0
+                                    && links_to(link_at(source, u64::from(p.offset)), t.guard_entry() - area::CODE_VA))
+                                    || (local(t, source)
+                                        && links_to(link_at(source, u64::from(p.offset)), link_entry(source, t))))
+                        }
+                    }
+                })
+        };
+        for (k, p) in source.links.iter().enumerate().filter(|(_, p)| named(p)) {
+            if !unlinked(source, p) && !in_some_form(k, p) {
+                return Link::Bad;
+            }
         }
-    }
-    let cap = area::link_cap(c.link_cap);
-    if area::links_full(c.links as usize, cap) {
+        let (segment, inbound) = if checked {
+            (CHECKED, 0)
+        } else if local_shared || local(target, source) || guarded {
+            (LOCAL, LOCAL_INBOUND)
+        } else if target.flags & GLOBAL != 0 {
+            (TLB, INBOUND)
+        } else {
+            (CR3, INBOUND)
+        };
+        #[cfg(feature = "pic-count")]
+        let class = {
+            let class = pic::class(shared, at, code.flags & PIC != 0, to);
+            if class == pic::Class::Absolute && segment != LOCAL {
+                pic::Class::CrossPage
+            } else {
+                class
+            }
+        };
+        #[cfg(feature = "pic-count")]
+        let dest = if points().any(|p| unlinked(source, p)) {
+            stub(entry, class)
+        } else {
+            entry
+        };
+        #[cfg(not(feature = "pic-count"))]
+        let dest = entry;
+        let pic_checked = checked && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
+        #[cfg(feature = "pic-count")]
+        let pic_meta = {
+            let same_frames = |code: &Block, source: &Block| {
+                code.source_gpa[0] == source.source_gpa[0]
+                    && (code.source_gpa[1] == u64::MAX || code.source_gpa[1] == source.source_gpa[1])
+            };
+            (
+                class,
+                code.flags & PIC == 0 && dest >> 12 == at >> 12 && same_frames(code, source),
+            )
+        };
+        #[cfg(not(feature = "pic-count"))]
+        let pic_meta = ();
+        (
+            checked,
+            guarded,
+            segment,
+            inbound,
+            dest,
+            code_num,
+            pic_checked,
+            pic_meta,
+        )
+    };
+    let (links, link_cap) = {
+        let c = control();
+        (c.links, c.link_cap)
+    };
+    let cap = area::link_cap(link_cap);
+    if area::links_full(links as usize, cap) {
         // Full (perf chunk 11): any link may go, its point then enters the linker again. Local links outlive their
         // targets' currency, so those into blocks not current go first (chunk 8); if that leaves less than a quarter
         // free, every link goes. Each such pass is followed by at least a quarter of the area's links: amortised O(1)
         // per link (before, a pass that freed nothing was repeated at every linker entry).
-        c.reclaims += 1;
+        control().reclaims += 1;
         // Suspended records first (relink plan): their words are restored already, so dropping them writes no code.
         let dropped = drop_suspended();
         control().reclaimed_suspended += dropped;
@@ -2850,59 +3170,57 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
         }
         control().reclaimed += n;
     }
-    let (segment, inbound) = if checked {
-        (CHECKED, 0)
-    } else if local_shared || local(target, source) || guarded {
-        (LOCAL, LOCAL_INBOUND)
-    } else if target.flags & GLOBAL != 0 {
-        (TLB, INBOUND)
-    } else {
-        (CR3, INBOUND)
-    };
-    // PIC study (`pic-count` builds only): the link's class, and the link enters the target through a counting stub
-    // ([`stub`]).
-    #[cfg(feature = "pic-count")]
-    let class = pic::class(shared, at, code.flags & PIC != 0, to);
-    // an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
-    #[cfg(feature = "pic-count")]
-    let class = if class == pic::Class::Absolute && segment != LOCAL { pic::Class::CrossPage } else { class };
-    #[cfg(feature = "pic-count")]
-    let to = if points().any(|p| unlinked(source, p)) {
-        stub(entry, class)
-    } else {
-        entry
-    };
-    #[cfg(not(feature = "pic-count"))]
-    let to = entry;
+    let mut todo = [(0usize, 0u64, 0u64, 0u32); MAX_LINK_POINTS];
+    let mut ntodo = 0usize;
+    {
+        let source = block(source_num);
+        let named = |p: &LinkPoint| {
+            p.offset != 0 && pic::moved(p.target, source.rip, at, bits32(source.context)) == to
+        };
+        let offset_of = |p: &LinkPoint| if checked { svc_slot(source, p) } else { u64::from(p.offset) };
+        let word_at = |p: &LinkPoint| {
+            if checked {
+                u64::from(source.code) + offset_of(p)
+            } else {
+                link_at(source, offset_of(p))
+            }
+        };
+        for (k, p) in source.links.iter().enumerate().filter(|&(_, p)| named(p) && unlinked(source, p)) {
+            let patch_at = word_at(p);
+            todo[ntodo] = (k, offset_of(p), patch_at, word(patch_at));
+            ntodo += 1;
+        }
+    }
     let mut linked = 0;
-    for (k, p) in source.links.iter().enumerate().filter(|&(_, p)| named(p) && unlinked(source, p)) {
-        let at = word_at(p);
-        let original = word(at);
-        rewrite(at, link_word(at, to));
+    for &(k, offset, patch_at, original) in &todo[..ntodo] {
+        rewrite(patch_at, link_word(patch_at, dest));
         insert(
             LinkRecord {
-                source: source.number,
-                offset_point: LinkRecord::pack(offset_of(p) as u32, k),
+                source: source_num as u32,
+                offset_point: LinkRecord::pack(offset as u32, k),
                 original,
-                target: if checked { area::CHECKED } else { code.number },
+                target: if checked { area::CHECKED } else { code_num as u32 },
                 prev_in: 0,
                 next_in: 0,
             },
             segment,
         );
         if inbound != 0 {
-            unsafe { (*block_ptr(code.number as usize)).flags |= inbound };
+            unsafe { (*block_ptr(code_num)).flags |= inbound };
         }
         linked += 1;
     }
     // (Frame-keyed plan step 1c, review S1: the PIC counters count what they counted before 1c, links out of or into shared
     // code; a link checked only because it is not local is counted on its own, `Control::links_checked_cross`.)
-    let pic_checked = checked && (shared || target.flags & (INSTANCE | TRANSLATION) != 0);
+    let c = control();
     if linked != 0 && checked && !pic_checked {
         c.links_checked_cross += linked;
     }
     if guarded {
         c.links_guarded += linked;
+    }
+    if linked != 0 && low_cr3_plain {
+        c.links_plain_low_cr3 += linked;
     }
     if linked != 0 && pic_checked {
         counted(count::CHECKED_LINKS);
@@ -2921,14 +3239,13 @@ pub fn link(source: &Block, target: &Block, at: u64, to: u64) -> Link {
     }
     // (Study, `pic-count` builds: links by class, and a shared source's into an absolute block on its own page and
     // frame, which sharing the target at link time would make local.)
+    #[cfg(not(feature = "pic-count"))]
+    let _ = pic_meta;
     #[cfg(feature = "pic-count")]
     if linked != 0 {
+        let (class, shareable) = pic_meta;
         counted(count::LINKS + class as usize);
-        if shared
-            && code.flags & PIC == 0
-            && to >> 12 == at >> 12
-            && same_frames(code, source)
-        {
+        if shared && shareable {
             counted(count::SHAREABLE_TARGETS);
         }
     }
@@ -3640,14 +3957,13 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
     // Frame-keyed plan step 1b: a shared translation, entered at any address of its page offset, in every such set (RIP bits
     // 12 up to the set index's top vary).
     let sets = if b.flags & TRANSLATION != 0 { 1 << (area::L1_SET_BITS - 12) } else { 1 };
-    // (Frame-keyed plan 8.2: a guarded block's L1 entries outlive its currency: the code-TLB slot of its page goes at the same
-    // event, so they miss. Only its death takes them.)
-    let sets = if !dead && b.flags & GUARDED != 0 { 0 } else { sets };
     for k in 0..sets {
         let (w0, w1) = area::l1_slots_of(b.rip ^ (k << 12));
         for t in 0..area::L1_TABLES {
             for i in [w0, w1] {
-                if l1_block(t, i) == b.number + 1 {
+                if l1_block(t, i) == b.number + 1
+                    && (dead || b.flags & GUARDED == 0 || unsafe { dl1(t, i).read()[1] } != b.guard_entry())
+                {
                     empty_l1(t, i);
                 }
             }
@@ -3830,13 +4146,15 @@ fn drop_suspended() -> u64 {
 /// else (the point was linked elsewhere meanwhile), is dropped. The walk keeps a cursor on the next record (`remove` and
 /// [`resume`] keep it right as records move).
 #[cfg(not(feature = "pic-count"))]
-fn relink(n: usize) {
+fn relink(n: usize, was_global: bool) {
     let p = crate::perf::enter(crate::perf::RELINK);
     if control().armed != 0 {
         // (Every resident entry disarms first: a stop word could be overwritten here.)
         crate::execution::halt_native([n as u64, control().armed, 0], natemu_abi::execution::stop::BAD_LINK)
     }
     let global = block(n).flags & GLOBAL != 0;
+    let plain_cr3 = plain_cr3_ok();
+    let checked_now = control().link_form_plain == 0 && !global && !plain_cr3;
     let mut batch = [0u32; 64];
     let mut held = 0;
     let mut at = block(n).inbound;
@@ -3859,12 +4177,15 @@ fn relink(n: usize) {
         if point.offset != r.offset() || point.target != block(n).rip {
             crate::execution::halt_native([n as u64, i, u64::from(r.source)], natemu_abi::execution::stop::BAD_LINK)
         }
-        // (Step 1d review, S2: a target that came back non-global is linked checked by default now: the record goes, and the
-        // point's next exit links it in that form.)
-        let checked_now = control().link_form_plain == 0 && !global;
-        if source.flags & DEAD != 0 || !unlinked(source, point) || checked_now {
+        // (Step 1d review, S2: a non-global target drops its suspended record unless low-CR3 plain mode or `NATEMU_LINK_FORM=plain`
+        // keeps it plain, letting the next exit upgrade to guarded or checked.)
+        let stale = source.flags & DEAD != 0 || !unlinked(source, point);
+        if stale || checked_now {
             remove(i, SUSP, &mut at);
             control().relink_dropped += 1;
+            if checked_now && !stale && !was_global {
+                control().relink_upgraded += 1;
+            }
             continue;
         }
         unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(link_word(word_at, link_entry(source, block(n)))) };
