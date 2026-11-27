@@ -1285,13 +1285,13 @@ pub mod cache {
         pub demoted_pending: u64,
     }
     /// Minimum non-global CR3 loads before low-CR3 plain links can activate (keeps bare-metal guard tests deterministic).
-    pub const LOW_CR3_WARMUP: u64 = 32;
-    /// Sliding-window bucket divisor of `cntfrq_el0` (`cntfrq_el0 / 10` = 100 ms at 24 MHz).
-    pub const LOW_CR3_WINDOW_DIV: u64 = 10;
-    /// Maximum weighted CR3 loads in one `100 ms` window to enter low-CR3 mode (`<= 3` = `<= 30 Hz`).
+    pub const LOW_CR3_WARMUP: u64 = 8;
+    /// Sliding-window bucket divisor of `cntfrq_el0` (`cntfrq_el0 / 5` = 200 ms at 24 MHz).
+    pub const LOW_CR3_WINDOW_DIV: u64 = 5;
+    /// Maximum weighted CR3 loads in one `200 ms` window to enter low-CR3 mode (`<= 3` = `<= 15 Hz`).
     pub const LOW_CR3_ENTER_MAX: u64 = 3;
-    /// Minimum weighted CR3 loads in one `100 ms` window to exit low-CR3 mode (`>= 15` = `>= 150 Hz`).
-    pub const LOW_CR3_EXIT_MIN: u64 = 15;
+    /// Minimum weighted CR3 loads in one `200 ms` window to exit low-CR3 mode (`>= 10` = `>= 50 Hz`).
+    pub const LOW_CR3_EXIT_MIN: u64 = 10;
     /// Cap on per-bucket CR3 load counts so division-free `u64` numerator math never overflows.
     const LOW_CR3_CAP: u32 = 1024;
     /// Per-vCPU two-bucket sliding-window CR3 switch-rate classifier.
@@ -6877,34 +6877,37 @@ mod tests {
     fn low_cr3_classifier_warmup_transitions_and_overrides() {
         const HZ: u64 = 24_000_000;
         const W: u64 = HZ / cache::LOW_CR3_WINDOW_DIV;
-        assert_eq!(W, 2_400_000);
+        assert_eq!(W, 4_800_000);
 
         let mut lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
-        // Loads 1..31 never activate even if widely spaced (`0` timestamp sentinel safe).
+        // Loads 1..7 never activate even if widely spaced (`0` timestamp sentinel safe).
         let mut total = 0u64;
         for i in 0..(cache::LOW_CR3_WARMUP - 1) {
             total += 1;
             assert!(!lc.on_cr3_load(|| i * 10 * W, total, false, true));
             assert_eq!(lc.evaluate(|| i * 10 * W, total, false, true), (false, false));
         }
-        // Load 32 spaced far past 2*W activates cleanly and reports 0 -> 1 entry.
+        // Load 8 spaced far past 2*W activates cleanly and reports 0 -> 1 entry.
         total += 1;
         let t_base = cache::LOW_CR3_WARMUP * 10 * W;
         assert!(lc.on_cr3_load(|| t_base, total, false, true));
         assert_eq!(lc.evaluate(|| t_base, total, false, true), (true, false));
 
-        // Burst of 32 loads in < 1 ms suppresses activation during warmup and stays inactive.
+        // Burst of 8 loads in < 1 ms suppresses activation during warmup and stays inactive.
         let mut burst = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
         for i in 0..cache::LOW_CR3_WARMUP {
             assert!(!burst.on_cr3_load(|| 1_000 + i * 100, i + 1, false, true));
         }
-        assert_eq!(burst.evaluate(|| 1_000 + 3200, cache::LOW_CR3_WARMUP, false, true), (false, false));
+        assert_eq!(
+            burst.evaluate(|| 1_000 + cache::LOW_CR3_WARMUP * 100, cache::LOW_CR3_WARMUP, false, true),
+            (false, false)
+        );
 
         // Quiet period decays across W and activates once weighted_num <= ENTER_MAX * W (3 * W).
-        // At 1*W + W/2, prev=32 has weight 32 * 0.5 = 16 > 3.
+        // At 1*W + W/2, prev=8 has weight 8 * 0.5 = 4 > 3.
         let t_still_high = 1_000 + W + W / 2;
         assert_eq!(burst.evaluate(|| t_still_high, cache::LOW_CR3_WARMUP, false, true), (false, false));
-        // At 1*W + (W - W/16), prev=32 has weight 32 / 16 = 2 <= 3.
+        // At 1*W + (W - W/16), prev=8 has weight 8 / 16 = 0.5 <= 3.
         let t_decayed = 1_000 + W + (W - W / 16);
         assert_eq!(burst.evaluate(|| t_decayed, cache::LOW_CR3_WARMUP, false, true), (true, true));
         assert_eq!(burst.evaluate(|| t_decayed, cache::LOW_CR3_WARMUP, false, true), (true, false));
@@ -6920,31 +6923,31 @@ mod tests {
             active: 0,
             initialized: 1,
         };
-        assert_eq!(eq_lc.evaluate(|| 10 * W, 32, false, true), (true, true));
+        assert_eq!(eq_lc.evaluate(|| 10 * W, cache::LOW_CR3_WARMUP, false, true), (true, true));
 
         let mut exact_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
-        assert!(!exact_lc.on_cr3_load(|| 0, 32, false, false)); // deferred by can_enter=false
+        assert!(!exact_lc.on_cr3_load(|| 0, cache::LOW_CR3_WARMUP, false, false)); // deferred by can_enter=false
         exact_lc.win_cur = 1;
         exact_lc.win_prev = 3;
         exact_lc.win_start = 10 * W;
-        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 4, 32, false, true), (false, false));
-        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 2, 32, false, true), (true, true));
+        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 4, cache::LOW_CR3_WARMUP, false, true), (false, false));
+        assert_eq!(exact_lc.evaluate(|| 10 * W + W / 2, cache::LOW_CR3_WARMUP, false, true), (true, true));
 
         // Deferral when can_enter=false (`armed != 0`): active stays 0 until can_enter=true.
         let mut armed_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
-        assert!(!armed_lc.on_cr3_load(|| 100, 32, false, false));
-        assert_eq!(armed_lc.evaluate(|| 100, 32, false, false), (false, false));
-        assert_eq!(armed_lc.evaluate(|| 100, 32, false, true), (true, true));
+        assert!(!armed_lc.on_cr3_load(|| 100, cache::LOW_CR3_WARMUP, false, false));
+        assert_eq!(armed_lc.evaluate(|| 100, cache::LOW_CR3_WARMUP, false, false), (false, false));
+        assert_eq!(armed_lc.evaluate(|| 100, cache::LOW_CR3_WARMUP, false, true), (true, true));
 
-        // Hysteresis: active stays true for 14 loads in W (< 15), demotes on 15th (>= EXIT_MIN).
+        // Hysteresis: active stays true for 9 loads in W (< 10), demotes on 10th (>= EXIT_MIN).
         let t0 = t_decayed + 2 * W;
         assert_eq!(burst.evaluate(|| t0, cache::LOW_CR3_WARMUP, false, true), (true, false));
-        for k in 1..cache::LOW_CR3_EXIT_MIN {
+        for k in 1..=9u64 {
             assert!(!burst.on_cr3_load(|| t0 + k * 100, cache::LOW_CR3_WARMUP + k, false, true));
             assert_eq!(burst.evaluate(|| t0 + k * 100, cache::LOW_CR3_WARMUP + k, false, true), (true, false));
         }
-        assert!(!burst.on_cr3_load(|| t0 + 1500, cache::LOW_CR3_WARMUP + 15, false, true));
-        assert_eq!(burst.evaluate(|| t0 + 1500, cache::LOW_CR3_WARMUP + 15, false, true), (false, false));
+        assert!(!burst.on_cr3_load(|| t0 + 1_000, cache::LOW_CR3_WARMUP + 10, false, true));
+        assert_eq!(burst.evaluate(|| t0 + 1_000, cache::LOW_CR3_WARMUP + 10, false, true), (false, false));
 
         // Cap at 1024 prevents u64 overflow even for huge burst counts.
         let mut cap_lc = cache::LowCr3 { cntfrq_el0: HZ, ..Default::default() };
@@ -6955,13 +6958,26 @@ mod tests {
         assert_eq!(cap_lc.evaluate(|| 5_000 + 2048 + W, 2048, false, true), (false, false));
 
         // 2*W silence re-activates with zero CR3 loads; timestamp regression resets safely.
-        let t_quiet = t0 + 1500 + 2 * W;
-        assert_eq!(burst.evaluate(|| t_quiet, cache::LOW_CR3_WARMUP + 15, false, true), (true, true));
-        assert_eq!(burst.evaluate(|| t_quiet - 10, cache::LOW_CR3_WARMUP + 15, false, true), (true, false));
+        let t_quiet = t0 + 1_000 + 2 * W;
+        assert_eq!(burst.evaluate(|| t_quiet, cache::LOW_CR3_WARMUP + 10, false, true), (true, true));
+        assert_eq!(burst.evaluate(|| t_quiet - 10, cache::LOW_CR3_WARMUP + 10, false, true), (true, false));
 
         // Disabled flag clears active and skips the clock closure.
-        assert_eq!(burst.evaluate(|| panic!("timer read when disabled"), cache::LOW_CR3_WARMUP + 15, true, true), (false, false));
-        assert!(!burst.on_cr3_load(|| panic!("timer read when disabled"), cache::LOW_CR3_WARMUP + 16, true, true));
+        assert_eq!(
+            burst.evaluate(
+                || panic!("timer read when disabled"),
+                cache::LOW_CR3_WARMUP + 10,
+                true,
+                true,
+            ),
+            (false, false)
+        );
+        assert!(!burst.on_cr3_load(
+            || panic!("timer read when disabled"),
+            cache::LOW_CR3_WARMUP + 11,
+            true,
+            true,
+        ));
         assert_eq!(burst.active, 0);
 
         // Uninitialized frequency disables safely.

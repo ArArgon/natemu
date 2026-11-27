@@ -1706,9 +1706,13 @@ fn low_cr3_disabled(c: &Control) -> bool {
 /// cross-page guarded links from `LOCAL` (so their next execution re-links plainly in `CR3`) and
 /// clears active user-context L1 tables (so direct `dl1 -> entry()` fills replace guard-stub entries).
 fn enter_low_cr3() {
+    let guards = guards_on();
     let (ctr, old) = {
         let c = control();
         c.low_cr3_entries += 1;
+        if !guards {
+            return;
+        }
         (c.ctr_el0, ends(c).map(|e| *e))
     };
     let (from, to) = (old[TLB], old[LOCAL]);

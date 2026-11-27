@@ -1366,8 +1366,8 @@ def chunk_bodies(k, i, n):
         'guard-kill': (c3('k0', d + GS) + save('r8') + c3('k1', d + GS) + save('r9') + f'    mov byte [{d + F1 + PY + 1:#x}], 0x13\n'
                        + c3('k2', d + GS) + save('r10') + flush_text(d) + c3('k3', d + GS) + save('r14')),
         'low-cr3': (adv_idt(d) + c3('lc_pre', d + GS3)
-                    + f'    mov ecx, 32\n.wu:\n    mov rax, {{ta:#x}}\n    mov cr3, rax\n    dec ecx\n    jnz .wu\n'
-                    + '    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    mov rcx, rax\n    add rcx, 220000000\n'
+                    + f'    mov ecx, 8\n.wu:\n    mov rax, {{ta:#x}}\n    mov cr3, rax\n    dec ecx\n    jnz .wu\n'
+                    + '    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    mov rcx, rax\n    add rcx, 420000000\n'
                     '.lw:\n    pause\n    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    cmp rax, rcx\n    jb .lw\n'
                     + c3('lc0', d + GS) + save('r8') + c3('lc1', d + GS) + save('r9')
                     + c3('lc1b', d + PY)
@@ -2673,41 +2673,58 @@ def main():
                 # Low-CR3 plain links: quiet phase links plainly, CR3/INVLPG/SMC invalidate, high-CR3 burst drops suspended plain
                 # records (`relink_upgraded > 0`) and upgrades subsequent links to guarded (or checked when guards are off).
                 if out and name in LOW_CR3 and not check and not os.environ.get('NATEMU_PIC_TEST'):
+                    def check_low_cr3(run_prog, run_out, run_probs, guards_expected, tag):
+                        on_time_ok = lambda c: (
+                            c['stats']['k1'].get('fkeys', {}).get('relink_upgraded', 0) >= 2
+                            and c['stats']['k1'].get('relink', {}).get('relink_dropped', 0) >= 2
+                            and ((c['stats']['k1'].get('fkeys', {}).get('links_guarded', 0) >= 3
+                                  and c['stats']['k1'].get('fkeys', {}).get('ctlb_fills', 0) >= 1)
+                                 if guards_expected else
+                                 (c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0) >= 3
+                                  and c['stats']['k1'].get('fkeys', {}).get('links_guarded', 0) == 0))
+                        )
+                        # Retry at most once ONLY when post-burst transitions lacked evidence AND a >50 ms host stall occurred.
+                        pre_ok = run_out and not run_probs and all(
+                            c['stats']['k1'].get('fkeys', {}).get('links_plain_low_cr3', 0) >= 2
+                            and c['stats']['k1'].get('fkeys', {}).get('low_cr3_entries', 0) >= 1
+                            and ((c['stats']['k1'].get('fkeys', {}).get('guarded_demoted', 0) >= 1)
+                                 if guards_expected else
+                                 (c['stats']['k1'].get('fkeys', {}).get('guarded_demoted', 0) == 0))
+                            and c['stats']['k1'].get('fkeys', {}).get('guard_misses', 0) == 0
+                            and c['stats']['k1'].get('relink', {}).get('relinked', 0) >= 1
+                            and all(smp.num(c['gpr'][P.REGS.index(reg)]) in ok for reg, ok in EITHER[name].items())
+                            and (on_time_ok(c) or smp.num(c['gpr'][P.REGS.index('rbx')]) == 0)
+                            for c in run_out['cpus']
+                        )
+                        if pre_ok and any(not on_time_ok(c) and smp.num(c['gpr'][P.REGS.index('rbx')]) == 0 for c in run_out['cpus']):
+                            run_out, run_probs = run(a, run_prog, extra, check=check, tag=tag)
+                        for v, c in enumerate(run_out['cpus'] if run_out else []):
+                            f = c['stats']['k1'].get('fkeys', {})
+                            r = c['stats']['k1'].get('relink', {})
+                            if (f.get('links_plain_low_cr3', 0) < 2
+                                    or f.get('low_cr3_entries', 0) < 1
+                                    or (f.get('guarded_demoted', 0) < 1 if guards_expected else f.get('guarded_demoted', 0) != 0)
+                                    or f.get('guard_misses', 0) != 0
+                                    or r.get('relinked', 0) < 1
+                                    or not on_time_ok(c)):
+                                run_probs.append(f'cpu{v} low-cr3 fkeys={f} relink={r} rbx={c["gpr"][P.REGS.index("rbx")]}: unexpected low/high CR3 transition counts')
+                        return run_out, run_probs
+
                     guards_expected = a.page_currency == 'on' and prog.get('guards') != 'off'
-                    on_time_ok = lambda c: (
-                        c['stats']['k1'].get('fkeys', {}).get('relink_upgraded', 0) >= 2
-                        and c['stats']['k1'].get('relink', {}).get('relink_dropped', 0) >= 2
-                        and ((c['stats']['k1'].get('fkeys', {}).get('links_guarded', 0) >= 3
-                              and c['stats']['k1'].get('fkeys', {}).get('ctlb_fills', 0) >= 1)
-                             if guards_expected else
-                             c['stats']['k1'].get('fkeys', {}).get('links_checked_cross', 0) >= 3)
-                    )
-                    # Retry at most once ONLY when post-burst transitions lacked evidence AND a >50 ms host stall occurred.
-                    pre_ok = not problems and all(
-                        c['stats']['k1'].get('fkeys', {}).get('links_plain_low_cr3', 0) >= 2
-                        and c['stats']['k1'].get('fkeys', {}).get('low_cr3_entries', 0) >= 1
-                        and (not guards_expected or c['stats']['k1'].get('fkeys', {}).get('guarded_demoted', 0) >= 1)
-                        and c['stats']['k1'].get('fkeys', {}).get('guard_misses', 0) == 0
-                        and c['stats']['k1'].get('relink', {}).get('relinked', 0) >= 1
-                        and all(smp.num(c['gpr'][P.REGS.index(reg)]) in ok for reg, ok in EITHER[name].items())
-                        and (on_time_ok(c) or smp.num(c['gpr'][P.REGS.index('rbx')]) == 0)
-                        for c in out['cpus']
-                    )
-                    if pre_ok and any(not on_time_ok(c) and smp.num(c['gpr'][P.REGS.index('rbx')]) == 0 for c in out['cpus']):
-                        out, problems = run(a, prog, extra, check=check, tag='-retry')
-                    for v, c in enumerate(out['cpus'] if out else []):
-                        f = c['stats']['k1'].get('fkeys', {})
-                        r = c['stats']['k1'].get('relink', {})
-                        if (f.get('links_plain_low_cr3', 0) < 2
-                                or f.get('low_cr3_entries', 0) < 1
-                                or (guards_expected and f.get('guarded_demoted', 0) < 1)
-                                or f.get('guard_misses', 0) != 0
-                                or r.get('relinked', 0) < 1
-                                or not on_time_ok(c)):
-                            problems.append(f'cpu{v} low-cr3 fkeys={f} relink={r} rbx={c["gpr"][P.REGS.index("rbx")]}: unexpected low/high CR3 transition counts')
+                    out, problems = check_low_cr3(prog, out, problems, guards_expected, '-retry')
+                    if guards_expected and not extra:
+                        ng_prog = dict(prog, guards='off')
+                        ng, ng_probs = run(a, ng_prog, extra, check=check, tag='-noguards')
+                        ng, ng_probs = check_low_cr3(ng_prog, ng, ng_probs, False, '-noguards-retry')
+                        problems += [f'guards=off: {p}' for p in ng_probs]
+                        for v, c in enumerate(ng['cpus'] if ng else []):
+                            for reg, ok in EITHER[name].items():
+                                got = smp.num(c['gpr'][P.REGS.index(reg)])
+                                if got not in ok:
+                                    problems.append(f'guards=off cpu{v} {reg} = {got:#x}, allowed {[hex(x) for x in sorted(ok)]}')
                     off, off_probs = run(a, dict(prog, low_cr3='off'), extra, check=check, tag='-lowcr3off')
                     problems += [f'low-cr3=off: {p}' for p in off_probs]
-                    for v, c in enumerate(off['cpus'] if off else []):
+                    for v, c in enumerate(off['cpus'] if out and off else []):
                         f = c['stats']['k1'].get('fkeys', {})
                         off_ok = f.get('links_guarded', 0) >= 1 if guards_expected else f.get('links_checked_cross', 0) >= 1
                         if (f.get('links_plain_low_cr3', 0) != 0 or f.get('relink_upgraded', 0) != 0
