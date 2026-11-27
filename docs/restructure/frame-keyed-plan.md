@@ -873,4 +873,15 @@ lookup lands near zero-sized trailing blocks, with an exact guard-stop regressio
   - `desktop-kde-profile` `20261127-033829-5335` and `20261127-034204-e3ec`
   - `desktop-kde-browser-profile` `20261127-034738-3191`
 
+### L4 Guard-cost decision
+
+Measured on Mac mini M4 (November 27, 2026), comparing guard local-skip (`4d523e73` on branch `m1-l4`) against L2 (`91fe2a1b`):
+
+- **`guest-build`** (two clean alternating pairs, 1 vCPU, `contended=[]`, no `foreign_load`; first / second run):
+  - **L2 (`91fe2a1b`):** `20261127-041051-6a33` (`6.507 s` / `5.213 s`) and `20261127-041258-d877` (`6.617 s` / `5.326 s`), mean `6.562 s` / `5.270 s`.
+  - **L4 (`4d523e73`):** `20261127-041117-e999` (`6.796 s` / `5.384 s`) and `20261127-041314-4559` (`6.733 s` / `5.392 s`), mean `6.765 s` / `5.388 s` (`+3.1%` / `+2.2%` slower).
+- **`desktop-kde-browser-profile`** (`4d523e73`, run `20261127-041334-4d17`, `problems=[]`, 0 `BAD_STOP`):
+  - Cold Chromium start `7.927 s` (within noise of L2 `91fe2a1b`: `20261127-034301-c5cc` `8.566 s` and `20261127-034859-a9c8` `7.935 s`); warm Chromium `3.988 s`, cold Firefox `9.165 s`, Speedometer `3.38 ± 0.69`.
+- **Decision:** Leave guard local-skip out of `m1` (slower on `guest-build` in both pairs and within noise on cold Chromium; branch `m1-l4` preserved locally). `m1`'s code tip remains `91fe2a1b` (with L3 `ecb5717e`).
+
 
